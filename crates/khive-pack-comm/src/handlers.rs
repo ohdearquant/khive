@@ -1634,8 +1634,9 @@ pub(crate) async fn handle_reply(
     // that is not the root note's id, so a thread opened by an inbound mail has
     // no note AT the thread id, and an id lookup would silently fall back to
     // the drifted subject for exactly the exchanges this rule exists for.
-    // Ordering is by the message's own `sent_at` (a legacy row without one
-    // sorts first and is treated as the root; it has no subject to disclose).
+    // Ordering is by the message's own `sent_at`; only rows that carry a text
+    // `sent_at` are candidates, because SQL NULL sorts first under ASC and a
+    // legacy member without one would otherwise be taken for the root.
     //
     // The root's subject is used only when the caller is a party to the root,
     // the same thread-participant predicate `reply` enforces on the replied-to
@@ -1651,11 +1652,18 @@ pub(crate) async fn handle_reply(
                 .collect();
             let root_filter = NoteFilter {
                 kind: Some("message".to_string()),
-                property_filters: vec![PropertyFilter {
-                    json_path: "$.thread_id".to_string(),
-                    op: FilterOp::In(spellings),
-                    value: SqlValue::Null,
-                }],
+                property_filters: vec![
+                    PropertyFilter {
+                        json_path: "$.thread_id".to_string(),
+                        op: FilterOp::In(spellings),
+                        value: SqlValue::Null,
+                    },
+                    PropertyFilter {
+                        json_path: "$.sent_at".to_string(),
+                        op: FilterOp::JsonTypeEq,
+                        value: SqlValue::Text("text".to_string()),
+                    },
+                ],
                 order_by: Some(("$.sent_at".to_string(), SortDir::Asc)),
                 ..Default::default()
             };

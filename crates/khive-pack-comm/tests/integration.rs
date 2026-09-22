@@ -1085,6 +1085,73 @@ async fn reply_subject_for_ingest_rooted_thread_is_byte_stable_over_three_round_
     );
 }
 
+/// A legacy thread member that carries no `sent_at` but has a subject of its
+/// own must not be taken for the root: SQL NULL sorts first under ascending
+/// order, so without a type guard the earliest-by-`sent_at` lookup would pick
+/// the legacy row and the reply would echo its subject instead of the root's.
+#[tokio::test]
+async fn reply_subject_ignores_a_legacy_member_without_sent_at() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root_props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "opening mail",
+            "subject": "Budget review",
+            "default_inbound_actor": "local",
+            "external_id": "imap:mail:11:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+    let thread_id = root_props["thread_id"]
+        .as_str()
+        .expect("ingest assigns a thread id")
+        .to_string();
+    let root_id = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "thread_id": thread_id, "limit": 5 }),
+        )
+        .await
+        .expect("inbox lists the ingested root")["messages"][0]["full_id"]
+        .as_str()
+        .expect("root full_id")
+        .to_string();
+
+    // Seed a pre-`sent_at` member of the same thread through the raw store,
+    // addressed so the caller counts as a party to it.
+    let legacy = Note::new("local", "message", "legacy row from before sent_at existed")
+        .with_properties(serde_json::json!({
+            "thread_id": thread_id,
+            "subject": "LEGACY DRIFT",
+            "from_actor": "local",
+            "to_actor": "email:user@example.com",
+        }));
+    rt.backend()
+        .notes()
+        .expect("raw notes store")
+        .upsert_note(legacy)
+        .await
+        .expect("legacy row seeded");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_id, "content": "answer" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(
+        reply["subject"].as_str(),
+        Some("Re: Budget review"),
+        "the root's subject wins over a legacy member that has no sent_at"
+    );
+}
+
 /// A caller who knows another actor's thread id and self-sends into it must not
 /// learn that thread's root subject through its own reply: the root lookup
 /// applies the same thread-participant predicate as the reply itself.
