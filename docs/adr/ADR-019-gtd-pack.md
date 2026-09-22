@@ -102,8 +102,8 @@ table described below. Core migration V16 adds cycle-guard triggers to `notes` a
 ```text
 inbox     → next | waiting | someday | active | done | cancelled
 next      → active | waiting | someday | done | cancelled
-active    → next | waiting | done | cancelled
-waiting   → next | active | done | cancelled
+active    → next | waiting | someday | done | cancelled
+waiting   → next | active | someday | done | cancelled
 someday   → next | active | done | cancelled
 done      → (terminal — no outgoing transitions)
 cancelled → (terminal — no outgoing transitions)
@@ -883,3 +883,19 @@ The handler acquires only a SQL reader. Existing dispatch audit behavior is
 unchanged. Gate classification is explicit Read, with a classifier-version bump
 so installed policy identity reflects the added operation. No schema migration,
 status mutation, history rewrite, or fleet database access is part of this change.
+
+## Amendment 5 (2026-09-22): park active and waiting work directly in someday
+
+`active` and `waiting` each gain a direct transition to `someday`. Before this
+amendment a task could reach `someday` only from `inbox` or `next`, so deferring
+work that had started or was blocked took two writes, `active → next → someday`
+or `waiting → next → someday`. The intermediate `next` state also listed the task
+as actionable in `gtd.next` between the two writes, and two transitions submitted
+in one parallel batch could run out of order, leaving the second refused.
+
+Deferral is a decision about the work, not about its current state, so the
+lifecycle permits it from every non-terminal state. The table in §GTD lifecycle
+is updated in place. `someday` keeps its existing outgoing transitions, and the
+terminal rule is unchanged. `NoteKindSpec` declares the two new pairs, and the
+consistency test that checks every declared pair against `can_transition`
+covers them.
