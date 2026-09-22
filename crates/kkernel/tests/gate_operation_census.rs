@@ -16,40 +16,27 @@ use kkernel as _;
 
 #[test]
 fn every_production_handler_has_an_explicit_reviewed_access_class() {
-    let discovered: BTreeSet<_> = PackRegistry::discovered_names().into_iter().collect();
-    let mut expected_packs: BTreeSet<_> = [
-        "agent",
-        "blob",
-        "brain",
-        "code",
-        "comm",
-        "exec",
-        "git",
-        "gtd",
-        "kg",
-        "knowledge",
-        "memory",
-        "schedule",
-        "session",
-        "telemetry",
-        "tool",
-        "web",
-        "workspace",
-    ]
-    .into_iter()
-    .collect();
+    let discovered: BTreeSet<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut expected_packs: BTreeSet<String> =
+        RuntimeConfig::built_in_packs().into_iter().collect();
+    // These packs are linked by the executable but are not enabled by default;
+    // the access census must cover their handlers as well as the shipping set.
+    expected_packs.extend(["agent", "telemetry", "web"].map(String::from));
     if cfg!(feature = "pack-formal") {
-        expected_packs.insert("formal");
+        expected_packs.insert("formal".into());
     }
     if cfg!(feature = "pack-moodboard") {
-        expected_packs.insert("moodboard");
+        expected_packs.insert("moodboard".into());
     }
     assert_eq!(
         discovered, expected_packs,
         "review new production packs; do not silently narrow the census"
     );
 
-    let packs: Vec<String> = discovered.into_iter().map(str::to_owned).collect();
+    let packs: Vec<String> = discovered.into_iter().collect();
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         packs: packs.clone(),
