@@ -482,7 +482,7 @@ pub(crate) async fn handle_delivered(
 
 /// `inbox` — list inbound messages by default, or caller-authored sent rows (ADR-057).
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
-const MAX_INBOX_WAIT_MS: u64 = 30_000;
+pub const MAX_INBOX_WAIT_MS: u64 = 30_000;
 
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,

@@ -1053,6 +1053,10 @@ handler's admitted work correlatable in the audit substrate.
 
 ## Amendment 9 (2026-09-10): bounded reconnect and classified read replay
 
+Amendment 10 supersedes this amendment's replay eligibility, retry count, and
+replay-window rules. Its lifecycle, missing-socket reconnect, and terminal
+framing/protocol failure rules remain in force.
+
 This amendment chooses client-side reconnect rather than simultaneous live-socket
 replacement. Binding a temporary socket and renaming it over the public path is
 not sufficient under the current live-incumbent refusal, exclusive PID claim,
@@ -1133,3 +1137,41 @@ same harness against base and candidate binaries and report both failure counts
 per restart and the longest failure gap in milliseconds, even when the target
 of zero failures is missed. Compilation, tests, and these measurements are
 separate gates; source inspection does not establish their results.
+
+## Amendment 10 (2026-09-22): long-poll allowance and one classified read resend
+
+A request containing `comm.inbox` long polls uses
+`max(configured_read_timeout, sum(effective_wait_ms) + 5 seconds)` for its
+request-read scope and otherwise unscoped socket exchange. An absent/zero wait
+adds no allowance. Valid literal waits use the handler's bound of 30,000 ms;
+invalid literals add no allowance. A chain reference to a not-yet-known wait
+reserves the handler maximum. The 100-operation parser cap bounds the derived
+allowance to 3,005 seconds; the configured read ceiling remains bounded at
+3,600 seconds. A single ceiling poll therefore has a 35-second default budget.
+The fixed margin covers transport and response work beyond the intentional
+wait. An earlier caller deadline always wins; nested dispatch cannot renew it.
+
+Both CLI built-in forwarding and MCP forwarding may resend a fully written
+request **once** after EOF/reset loses its response, provided every parsed
+operation is `Read` according to the shared `classify_operation` authority.
+MCP also requires trusted canonical pack registration, so custom and mounted
+handlers cannot obtain this permission by adopting a known name or category.
+Unknown, mixed, Write, malformed, and empty requests are ineligible, including
+requests that attach `help` or `dry_run` to a Write operation. The conservative
+unclassified forwarding entry point retains its no-replay behavior.
+
+This replaces Amendment 9's two additional completed attempts, five-name
+MCP-only opt-in, and ten-second replay window. There is one resend attempt,
+preceded by a 100 ms delay, within one request allowance plus that delay and
+capped by any original caller or active reconnect deadline. A missing socket
+consumes that attempt too. Cancellation prevents another attempt. No replay
+failure can enable local dispatch or lifecycle recovery after the original
+full write. Request identity, config fingerprint, namespace and request-group
+id stay unchanged; the id is correlation, not deduplication. A later read can
+observe a later snapshot and repeat incidental audit/cache effects.
+
+Timeouts remain terminal `ParseFailure`; malformed responses, protocol or
+identity mismatches, and explicit errors remain nonretryable. A lost mutation
+response retains the existing ambiguity error and never triggers redispatch.
+See [daemon lifecycle](../../crates/khive-mcp/docs/api/daemon-lifecycle.md#long-poll-deadlines-and-one-read-replay-3045)
+for transport and regression details.

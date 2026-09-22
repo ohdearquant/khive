@@ -457,6 +457,10 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         self.plan_ops(ops)
     }
 
+    fn request_read_timeout(&self, ops: &str) -> std::time::Duration {
+        crate::request_policy::read_timeout(ops, khive_storage::request_read_timeout_from_env())
+    }
+
     async fn dispatch(
         &self,
         ops: String,
@@ -620,13 +624,17 @@ async fn try_forward_before(
     // deadline the rest of the request already obeys. Callers that never
     // scoped a request context (this function's own unit tests, or any
     // future caller outside the MCP bridge) fall back to a fresh relative
-    // ceiling: the same `request_read_timeout_from_env()` bound the read
-    // phase alone used before this change.
+    // ceiling derived from the configured read timeout and the request's
+    // valid long-poll waits plus a five-second transport margin.
     let deadline = khive_storage::capture_request_read_context()
         .deadline()
         .map(khive_storage::RequestReadDeadline::async_at)
         .unwrap_or_else(|| {
-            tokio::time::Instant::now() + khive_storage::request_read_timeout_from_env()
+            tokio::time::Instant::now()
+                + crate::request_policy::read_timeout(
+                    &frame.ops,
+                    khive_storage::request_read_timeout_from_env(),
+                )
         });
     let deadline = retry_deadline.map_or(deadline, |retry| retry.min(deadline));
 
@@ -705,9 +713,8 @@ async fn try_forward_before(
         }
         Err(_elapsed) => {
             // The daemon never answered within the deadline. The write
-            // already completed, so — exactly like the connection-closed case
-            // above — the request may already have committed; there is no
-            // safe retry or local fallback, only a terminal ambiguity error.
+            // already completed, so a timeout remains terminal. It does not
+            // establish whether the daemon is still executing this request.
             tracing::warn!(
                 "daemon response read timed out after the request was fully \
                  written — returning terminal ambiguity"
@@ -843,7 +850,7 @@ struct ReadReplayBudget {
 impl ReadReplayBudget {
     fn new(enabled: bool) -> Self {
         Self {
-            remaining: if enabled { 2 } else { 0 },
+            remaining: if enabled { 1 } else { 0 },
             deadline: None,
         }
     }
@@ -859,7 +866,15 @@ async fn try_forward_with_read_replay(
         return outcome;
     }
     let deadline = *replay.deadline.get_or_insert_with(|| {
-        let deadline = bounded_retry_deadline();
+        let allowance = crate::request_policy::read_timeout(
+            &frame.ops,
+            khive_storage::request_read_timeout_from_env(),
+        );
+        let deadline = tokio::time::Instant::now() + allowance + HANDOVER_RETRY_INTERVAL;
+        let deadline = khive_storage::capture_request_read_context()
+            .deadline()
+            .map(khive_storage::RequestReadDeadline::async_at)
+            .map_or(deadline, |caller| caller.min(deadline));
         attempt_deadline.map_or(deadline, |attempt| attempt.min(deadline))
     });
     while replay.remaining > 0
@@ -870,9 +885,9 @@ async fn try_forward_with_read_replay(
         if tokio::time::Instant::now() >= deadline || khive_storage::request_read_is_cancelled() {
             break;
         }
+        replay.remaining -= 1;
         match try_forward_before(frame, Some(deadline)).await {
-            ForwardOutcome::NoSocket => {}
-            ForwardOutcome::ResponseLost => replay.remaining -= 1,
+            ForwardOutcome::NoSocket | ForwardOutcome::ResponseLost => {}
             ForwardOutcome::Response(response)
                 if response.config_mismatch
                     || response.namespace_mismatch
@@ -2528,8 +2543,9 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit caller
 /// opt-out, not a fallback).
 ///
-/// The real (possibly mutating) request frame is written to the daemon
-/// socket at most once per call; a `NoSocket` outcome never writes anything,
+/// This conservative entry point never replays a fully written frame.
+/// The CLI/MCP policy-aware entry points additionally permit one classified
+/// read replay after EOF/reset. A `NoSocket` outcome never writes anything,
 /// so it is safe to recover the daemon and retry. Once the real frame IS
 /// fully written (`ParseFailure`/`ProtocolMismatch`), this returns a hard
 /// error immediately instead of killing/respawning/retrying or falling back
@@ -2559,7 +2575,11 @@ pub async fn forward_or_spawn_with_config_and_packs(
     db: Option<&str>,
     packs: Option<&[String]>,
 ) -> Option<Result<String, McpError>> {
-    forward_or_spawn_with_replay_policy(frame, config, db, packs, false).await
+    let replay_read_only = !frame.probe_only
+        && !frame.metrics_only
+        && !frame.plan
+        && crate::request_policy::read_replay_safe(&frame.ops);
+    forward_or_spawn_with_replay_policy(frame, config, db, packs, replay_read_only).await
 }
 
 pub(crate) async fn forward_or_spawn_with_replay_policy(
@@ -2699,7 +2719,9 @@ where
         return None;
     }
 
-    let mut replay = ReadReplayBudget::new(replay_read_only);
+    let mut replay = ReadReplayBudget::new(
+        replay_read_only && crate::request_policy::read_replay_safe(&frame.ops),
+    );
     let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
     // A live-pid supervision marker earns the same bounded reconnect wait as
     // a recorded-alive daemon: the supervised job may simply not have bound
@@ -3019,6 +3041,7 @@ mod tests {
 
     mod handover {
         use super::*;
+        include!("daemon/long_poll_tests.rs");
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -3337,7 +3360,7 @@ mod tests {
                 let _ = done_tx.send(());
                 assert!(result.unwrap().is_err());
                 peer.await.unwrap();
-                assert_eq!(calls.load(Ordering::SeqCst), if drift { 2 } else { 3 });
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
                 assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
             }
         }
@@ -3403,7 +3426,7 @@ mod tests {
 
         #[tokio::test]
         #[serial]
-        async fn classified_reads_do_not_replay_malformed_timeout_or_protocol_failures() {
+        async fn malformed_protocol_and_exhausted_deadlines_are_not_replayed() {
             let _cleanup = RecoveryTestGuard::new();
             for kind in ["malformed", "timeout", "protocol"] {
                 let dir = tempfile::tempdir().unwrap();
@@ -3445,7 +3468,7 @@ mod tests {
                     }
                     _ => assert!(matches!(outcome, ForwardOutcome::ParseFailure)),
                 }
-                assert_eq!(budget.remaining, 2);
+                assert_eq!(budget.remaining, 1);
                 peer.await.unwrap();
             }
         }

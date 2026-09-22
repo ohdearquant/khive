@@ -6,6 +6,51 @@ stale/dead one, and forwards request frames over the daemon socket. This
 document is the extended rationale for the concurrency and safety properties
 that the inline doc comments summarize.
 
+## Long-poll deadlines and one read replay (#3045)
+
+For each request, MCP admission, local/daemon dispatch, and a socket exchange
+without an inherited deadline use the greater of the configured read timeout
+and the sum of effective `comm.inbox` waits plus five seconds. The five seconds
+cover transport, scheduling, and response serialization beyond the intentional
+wait. A single `wait_ms=30000` therefore receives 35 seconds under the default
+30-second read timeout. Only values allowed by the handler's exported
+`MAX_INBOX_WAIT_MS` contribute; invalid literal values do not extend the budget.
+A chain's unresolved `wait_ms=$prev...` reserves that handler maximum. Summing
+also covers batches that execute in bounded waves. The parser's 100-op cap
+bounds the allowance to 3,005 seconds, or the larger configured timeout
+(itself capped at 3,600 seconds). An earlier inherited caller deadline always
+wins; nested dispatch cannot renew it.
+
+The CLI forwarding adapter and MCP bridge permit **one full resend** after
+EOF/reset loses a fully written request's response, only when every operation
+is `Read` in the shared `classify_operation` table. This replaces Amendment 9's
+two-resend, five-handler MCP opt-in. MCP additionally requires trusted
+registration under the canonical owning pack; custom and mounted handlers
+cannot inherit eligibility from a familiar name or speech-act category. CLI
+forwarding uses the built-in classification before constructing a local
+runtime. Empty, malformed, unknown, Write, and mixed requests never qualify;
+`help`/`dry_run` do not change classification.
+
+The resend follows a 100 ms delay. Its single window is one request allowance
+plus that delay, capped by the original caller deadline and any active
+reconnect deadline. The attempt consumes its allowance even if the socket is
+missing. Cancellation prevents another attempt. Request identity, namespace,
+pack fingerprint, and correlation id remain unchanged; results may reflect a
+later snapshot and incidental audit/cache effects may repeat. This is not
+exactly-once delivery. A failed resend never permits local dispatch or daemon
+lifecycle recovery after the original full write.
+
+Read timeouts remain nonretryable `ParseFailure`, as do malformed responses;
+protocol/identity mismatch and explicit errors also stay terminal. A fully
+written mutation with a lost response retains the existing ambiguity error.
+
+Regression sources use the production Unix frame handler and CommPack schema:
+two concurrent empty-inbox ceiling polls, including one injected response
+loss, and a real committed send whose lost response must never be redispatched.
+An async-only peer separately exercises MCP admission with manually advanced
+Tokio time and an earlier outer deadline. These fixtures make no production
+latency guarantee beyond the finite configured allowance.
+
 ## Recoverer lock — mutual exclusion across concurrent recoverers (#838)
 
 `kill_and_respawn` kills a stale daemon and spawns a fresh one. It implements
