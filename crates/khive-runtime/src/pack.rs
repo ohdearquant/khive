@@ -598,6 +598,18 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &Value,
     ) -> Result<(), RuntimeError>;
 
+    /// Validate an approved AddEntity draft before preparing domain writes.
+    /// The draft kind is canonical.
+    /// This must not mutate storage or normalize the approved draft. The default
+    /// accepts it. This separate seam never invokes shared-create lifecycle
+    /// hooks and does not apply to AddNote.
+    fn validate_proposal_entity(
+        &self,
+        _entity: &khive_types::EntityDraft,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     /// Normalize caller-facing note-update fields before validation runs.
     ///
     /// Override this when a kind-owning pack's caller-facing note fields

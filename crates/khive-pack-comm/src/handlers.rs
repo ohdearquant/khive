@@ -13,7 +13,7 @@ use uuid::Uuid;
 use khive_runtime::{
     is_valid_mailbox_actor_label, KhiveRuntime, MailboxView, NamespaceToken, RuntimeError,
 };
-use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::idempotency::MessageIdentity;
@@ -1503,6 +1503,29 @@ fn read_response(
     }
 }
 
+/// `Re: ` + the subject with every leading reply prefix removed and whitespace
+/// runs collapsed; empty stays empty. Idempotent, so replying to a reply keeps
+/// one `Re: ` and a subject that drifted by whitespace maps back to one form.
+pub(crate) fn reply_subject_for(subject: &str) -> String {
+    let mut base = subject.split_whitespace().collect::<Vec<_>>().join(" ");
+    loop {
+        let stripped = base
+            .strip_prefix("Re:")
+            .or_else(|| base.strip_prefix("RE:"))
+            .or_else(|| base.strip_prefix("re:"))
+            .map(|rest| rest.trim_start().to_string());
+        match stripped {
+            Some(rest) => base = rest,
+            None => break,
+        }
+    }
+    if base.is_empty() {
+        String::new()
+    } else {
+        format!("Re: {base}")
+    }
+}
+
 /// `reply` — reply to a message, threading linkage. See
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_reply
 pub(crate) async fn handle_reply(
@@ -1626,11 +1649,82 @@ pub(crate) async fn handle_reply(
         .unwrap_or("")
         .to_string();
 
-    let reply_subject = if original_subject.starts_with("Re: ") || original_subject.is_empty() {
-        original_subject.clone()
-    } else {
-        format!("Re: {original_subject}")
+    // The reply subject derives from the thread ROOT's stored subject, not from
+    // the message being replied to. An inbound subject is a decoded mail header
+    // and can drift (whitespace at encoded-word boundaries, client re-encoding);
+    // echoing it compounds the drift on every round trip until mail clients stop
+    // threading the exchange. The root is the one subject this side authored or
+    // first received.
+    //
+    // The root is resolved by thread MEMBERSHIP, the earliest message carrying
+    // this `thread_id`, never by id equality: `comm.ingest` mints a thread id
+    // that is not the root note's id, so a thread opened by an inbound mail has
+    // no note AT the thread id, and an id lookup would silently fall back to
+    // the drifted subject for exactly the exchanges this rule exists for.
+    // Ordering is by the message's own `sent_at`; only rows that carry a text
+    // `sent_at` are candidates, because SQL NULL sorts first under ASC and a
+    // legacy member without one would otherwise be taken for the root.
+    //
+    // The root's subject is used only when the caller is a party to the root,
+    // the same thread-participant predicate `reply` enforces on the replied-to
+    // message above (issue #113): a caller who self-sends into a foreign
+    // thread id must not learn that thread's subject through its own reply.
+    // Falls back to the replied-to message's subject when the root is the
+    // message itself, unreadable, not the caller's, or has no subject.
+    let root_subject = match Uuid::parse_str(&thread_id) {
+        Ok(root_uuid) if root_uuid != original.id => {
+            let spellings = thread_id_query_spellings(root_uuid, None)
+                .into_iter()
+                .map(SqlValue::Text)
+                .collect();
+            let root_filter = NoteFilter {
+                kind: Some("message".to_string()),
+                property_filters: vec![
+                    PropertyFilter {
+                        json_path: "$.thread_id".to_string(),
+                        op: FilterOp::In(spellings),
+                        value: SqlValue::Null,
+                    },
+                    PropertyFilter {
+                        json_path: "$.sent_at".to_string(),
+                        op: FilterOp::JsonTypeEq,
+                        value: SqlValue::Text("text".to_string()),
+                    },
+                ],
+                order_by: Some(("$.sent_at".to_string(), SortDir::Asc)),
+                ..Default::default()
+            };
+            let caller_actor = token.actor().id.as_str();
+            store
+                .query_notes_filtered_count_free(
+                    token.namespace().as_str(),
+                    &root_filter,
+                    PageRequest {
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|page| page.items.into_iter().next())
+                .and_then(|root| {
+                    let props = root.properties?;
+                    let is_party =
+                        |key: &str| props.get(key).and_then(Value::as_str) == Some(caller_actor);
+                    if !(is_party("from_actor") || is_party("to_actor")) {
+                        return None;
+                    }
+                    props
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|subject| !subject.trim().is_empty())
+        }
+        _ => None,
     };
+    let base_subject = root_subject.unwrap_or(original_subject);
+    let reply_subject = reply_subject_for(&base_subject);
 
     let caller_ns = token.namespace().as_str().to_string();
     let from_actor_label = token.actor().id.clone();

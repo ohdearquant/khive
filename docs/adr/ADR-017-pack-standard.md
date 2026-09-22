@@ -240,6 +240,16 @@ A pack registers a hook for kinds it wants to specialize. Storage-shape kinds
 (no defaults, no derived data, no side effects) skip the hook entirely and ride pure
 shared CRUD.
 
+Approved proposal `AddEntity` uses a separate default-accepting
+`KindHook::validate_proposal_entity(&EntityDraft)` validator before
+domain SQL preparation. The applying worker resolves the owner through its supplied
+registry and passes a canonical draft kind. The synchronous validator receives no
+runtime handle and must not mutate storage or normalize approved content. Workspace
+shares its pure integer `properties.schema_version` predicate with this method,
+shared create, and entity update. This does not invoke `prepare_create` or `after_create`
+on proposals, change multi-step Compound admission, or alter `AddNote`'s separate
+contract and the memory exception in ADR-021.
+
 The 2026-08-01 dependency-integrity amendment adds the two default-accepting
 pre-write validators after GTD demonstrated a cross-record invariant that generic
 CRUD cannot own: task dependency acyclicity. `validate_note_update` receives only

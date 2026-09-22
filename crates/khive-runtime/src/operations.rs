@@ -4338,6 +4338,15 @@ impl KhiveRuntime {
                     mode: TextQueryMode::Plain,
                     filter: Some(TextFilter {
                         namespaces: visible_ns.clone(),
+                        // Push the note-kind filter into the FTS query. Without it the
+                        // text arm returns the top `candidates` rows across EVERY note
+                        // kind in the namespace and the kind is applied post-fetch, so a
+                        // store where short message/session rows outrank task
+                        // descriptions under BM25 hands the caller one or two task hits
+                        // while the store holds many more carrying the literal.
+                        record_kinds: note_kind
+                            .map(|kind| vec![kind.to_string()])
+                            .unwrap_or_default(),
                         ..TextFilter::default()
                     }),
                     top_k: candidates,
@@ -9868,6 +9877,72 @@ mod tests {
         assert_eq!(
             hits[0].note_id, target.id,
             "tag-filtered note must be returned even when ranked below limit in raw fusion"
+        );
+    }
+
+    /// Regression: the text arm fetched the top `candidates` rows across EVERY note kind
+    /// and applied `note_kind` post-fetch. On a store where many short rows of another
+    /// kind carry the query literal, they fill the window under BM25's length
+    /// normalisation and the caller sees one or two task hits while the store holds
+    /// every task carrying the literal.
+    ///
+    /// Scenario: `limit=8`, `note_kind="task"`. Forty short observation decoys carry
+    /// the literal; six task notes carry it inside a longer description. All six tasks
+    /// must come back.
+    #[tokio::test]
+    async fn search_notes_kind_filter_pushed_into_text_arm() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        for i in 0..40 {
+            rt.create_note(
+                &tok,
+                "observation",
+                None,
+                &format!("ref needle-93 decoy {i}"),
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut targets = Vec::new();
+        for i in 0..6 {
+            let target = rt
+                .create_note(
+                    &tok,
+                    "task",
+                    Some(&format!("task {i} tracking the review")),
+                    &format!(
+                        "Long description number {i}: the work item needle-93 waits on the \
+                         build, the test report, the release, and the follow-up sweep of every \
+                         row that cited it; none of that shortens the row."
+                    ),
+                    Some(0.5),
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            targets.push(target.id);
+        }
+
+        let hits = rt
+            .search_notes(&tok, "needle-93", None, 8, Some("task"), false, &[], None)
+            .await
+            .unwrap();
+
+        let mut got: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
+        got.sort();
+        targets.sort();
+        assert_eq!(
+            got,
+            targets,
+            "every task carrying the literal must be returned when the caller asks for tasks; \
+             got {} hit(s)",
+            hits.len()
         );
     }
 
