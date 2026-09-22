@@ -10,11 +10,11 @@ use khive_storage::EntityFilter;
 use khive_runtime::EdgeListFilter;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, event_filter_from_params,
-    normalize_entity_timestamps, normalize_entity_timestamps_array,
+    canonical_entity_kind, canonical_note_kind, deser, entity_type_filter_matches,
+    event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_specific,
     remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json,
-    validate_entity_type, KindSpec, ListParams,
+    validate_entity_type_filter, KindSpec, ListParams,
 };
 use crate::sql::sql;
 use crate::KgPack;
@@ -309,6 +309,10 @@ impl KgPack {
             return self.handle_list_proposals(token, params).await;
         }
 
+        // Presence matters for scope: even a null filter must not silently
+        // become accepted on an unrelated substrate or note kind.
+        let has_schedule_filters =
+            params.get("status").is_some() || params.get("created_by_actor").is_some();
         let mut p: ListParams = deser(params)?;
         if p.after.is_some() && p.offset.is_some() {
             return Err(RuntimeError::InvalidInput(
@@ -321,6 +325,11 @@ impl KgPack {
             ));
         }
         let spec = resolve_kind_spec(&p.kind, registry)?;
+        if has_schedule_filters && !matches!(&spec, KindSpec::Note { .. }) {
+            return Err(RuntimeError::InvalidInput(
+                "status and created_by_actor filters require scheduled_event notes; proposal lists retain their own status filter".into(),
+            ));
+        }
         if !matches!(&spec, KindSpec::Note { .. })
             && (p.key_prefix.is_some()
                 || p.after_key.is_some()
@@ -350,31 +359,32 @@ impl KgPack {
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?;
-                let validated_et: Option<String> = if let Some(ref raw_et) = p.entity_type {
-                    if let Some(ref kf) = kind_filter {
-                        validate_entity_type(kf, Some(raw_et), registry)?
-                    } else {
-                        let norm = raw_et.trim().to_ascii_lowercase();
-                        Some(norm)
-                    }
-                } else {
-                    None
+                let validated_et = validate_entity_type_filter(
+                    kind_filter.as_deref(),
+                    p.entity_type.as_deref(),
+                    registry,
+                )?;
+                let filter = EntityFilter {
+                    kinds: kind_filter
+                        .as_deref()
+                        .map(|kind| vec![kind.to_string()])
+                        .unwrap_or_default(),
+                    entity_types_by_kind: entity_type_filter_matches(
+                        kind_filter.as_deref(),
+                        validated_et.as_deref(),
+                        registry,
+                    ),
+                    legacy_entity_type_fallback: true,
+                    tags_any: p.tags.clone().unwrap_or_default(),
+                    ..Default::default()
                 };
                 let requested = p.limit.unwrap_or(50);
                 let limit = effective_list_limit(requested, ENTITY_LIST_CAP);
                 if let Some(after_raw) = p.after.as_deref() {
                     let after = parse_after_cursor(after_raw)?;
-                    let tags = p.tags.as_deref().unwrap_or_default();
                     let (entities, next_after) = self
                         .runtime
-                        .list_entities_after(
-                            token,
-                            kind_filter.as_deref(),
-                            validated_et.as_deref(),
-                            tags,
-                            after,
-                            limit,
-                        )
+                        .list_entities_after_filtered(token, filter, after, limit)
                         .await?;
                     let mut response = serde_json::json!({
                         "entities": normalize_entity_timestamps_array(to_json(&entities)?),
@@ -387,62 +397,10 @@ impl KgPack {
                 }
                 let offset = p.offset.unwrap_or(0);
                 let fetch = overfetch_limit(limit);
-                let entities = if let Some(ref tag_list) = p.tags {
-                    if tag_list.is_empty() {
-                        self.runtime
-                            .list_entities(
-                                token,
-                                kind_filter.as_deref(),
-                                validated_et.as_deref(),
-                                fetch,
-                                offset,
-                            )
-                            .await?
-                    } else {
-                        let filter = EntityFilter {
-                            kinds: kind_filter
-                                .as_deref()
-                                .map(|k| vec![k.to_string()])
-                                .unwrap_or_default(),
-                            entity_types: validated_et
-                                .as_deref()
-                                .map(|t| vec![t.to_string()])
-                                .unwrap_or_default(),
-                            legacy_entity_type_fallback: true,
-                            tags_any: tag_list.clone(),
-                            namespaces: token
-                                .visible_namespace_strs()
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect(),
-                            ..Default::default()
-                        };
-                        let page = self
-                            .runtime
-                            .entities(token)?
-                            .query_entities(
-                                token.namespace().as_str(),
-                                filter,
-                                PageRequest {
-                                    offset: offset.into(),
-                                    limit: fetch,
-                                },
-                            )
-                            .await
-                            .map_err(RuntimeError::Storage)?;
-                        page.items
-                    }
-                } else {
-                    self.runtime
-                        .list_entities(
-                            token,
-                            kind_filter.as_deref(),
-                            validated_et.as_deref(),
-                            fetch,
-                            offset,
-                        )
-                        .await?
-                };
+                let entities = self
+                    .runtime
+                    .list_entities_filtered(token, filter, fetch, offset)
+                    .await?;
                 let (entities, has_more) = split_overfetched(entities, limit);
                 Ok(render_list_response(
                     normalize_entity_timestamps_array(to_json(&entities)?),
@@ -517,6 +475,11 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                if has_schedule_filters && kind_filter.as_deref() != Some("scheduled_event") {
+                    return Err(RuntimeError::InvalidInput(
+                        "status and created_by_actor filters require kind=scheduled_event or kind=note with note_kind=scheduled_event".into(),
+                    ));
+                }
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
                         resolve_message_thread_filter(

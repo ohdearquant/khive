@@ -660,7 +660,7 @@ impl KhiveRuntime {
             build_hash,
         );
 
-        khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
+        let mut report = khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,
             build,
             legacy_sweep_interval,
@@ -668,7 +668,13 @@ impl KhiveRuntime {
             runtime_audit_batch_metrics,
         )
         .await
-        .map_err(RuntimeError::from)
+        .map_err(RuntimeError::from)?;
+        report.writer_contention.audit_obligation_append_failures =
+            Some(crate::pack::audit_obligation_append_failure_count());
+        report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason = None;
+        Ok(report)
     }
 
     // ---- Store accessors (token-scoped) ----
@@ -695,8 +701,9 @@ impl KhiveRuntime {
     /// evidence `comm.health` trusts at face value — and refuses patching
     /// those keys through the property-mutation seams on any note kind, so
     /// the guard cannot be sidestepped by inserting a clean message note and
-    /// patching the evidence onto it afterward. The trusted channel-ingest
-    /// path does not go through this accessor; see
+    /// patching the evidence onto it afterward. Full-row writes also preserve
+    /// existing channel-health coordinates while allowing heartbeat metadata to
+    /// change. The trusted channel-ingest path does not go through this accessor; see
     /// `Self::raw_notes` and [`Self::try_create_note_as_trusted_ingest`].
     pub fn notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
         Ok(crate::note_store_guard::PolicyEnforcingNoteStore::wrap(
@@ -2151,6 +2158,14 @@ mod tests {
             report.writer_contention.audit_append_failures.is_some(),
             "the runtime path must supply its process-wide swallowed-audit counter"
         );
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures
+            .is_some());
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason
+            .is_none());
         assert!(report
             .writer_contention
             .audit_append_failures_unavailable_reason

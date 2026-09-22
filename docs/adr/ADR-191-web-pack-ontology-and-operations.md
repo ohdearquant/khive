@@ -147,8 +147,11 @@ redirect cap, search provider.
 
 Every network action writes one observation note annotating the entity it touched (or standing alone
 for a search): method, final URL, redirect chain, status, content type, negotiated `Accept`, bytes,
-timing, egress classification, blob reference. Receipts chain by `supersedes`, so the fetch history of a
-resource is a note chain, and content that did not change produces a receipt and nothing else.
+timing, egress classification, and the stored reference when `persist` is true, else the content
+digest and size (amended by A1.2: a request that stores no body, `persist` false or a HEAD, writes a
+receipt with no blob reference and records the content digest, size, final URL and fetch time). Receipts chain by `supersedes`,
+so the fetch history of a resource is a note chain, and content that did not change produces a receipt
+and nothing else.
 
 ### D5. Deletions against the superseded revision
 
@@ -205,7 +208,8 @@ Controls are stated before the arms run; an arm without its control is not evide
 - A8 `links_to`: relation count 18; `Document links_to Document` accepted; `Document links_to
   Service` and `Concept links_to Document` refused with the endpoint-contract error, in one test;
   certificate disposition present; endpoint-signature tripwire green.
-- A9 with two backends configured, web writes land in the web backend only.
+- A9 with two backends configured, web writes land in the web backend only. Amended by A1.3: attachment rows are the
+  exception and land on the main backend.
 
 ## Consequences
 
@@ -213,3 +217,86 @@ The pack shrinks to what the web is: three subtypes, one new relation, two rules
 Every application-level concept previously hosted here is expressible on top of it by a consumer pack
 through D6, and none of it lives in this repository. The runtime gains one relation, which is the cost of
 having a web ontology at all.
+
+## Amendment 1 (2026-09-20): disk ingest confinement, and how stored bodies stay alive
+
+Two normative additions found during implementation review. Both narrow the record; neither changes
+the ontology, the relation rules, or a verb signature.
+
+### A1.1 D3: `web.ingest` reads disk only under `[web] read_roots`, decided on the opened descriptor
+
+D3 lets `web.ingest` take a served tree on disk. As written it bounds nothing about which directories
+that may be, so the verb would read any file the daemon can read and store it as a `resource` under a
+caller-chosen origin. The configuration section `[web]` gains `read_roots`, a list of directory paths.
+A disk source is admitted only when it lies under one of them; an absent or empty list refuses every
+disk source with a message naming the setting. This mirrors `[exec] read_roots`, the same shape for the
+same reason. URL sources are unaffected.
+
+Confinement is a property of the bytes that are read, not of a path that was checked earlier. A check
+that canonicalizes a path and then opens it by name again is racy: between the check and the open, a
+writer with access to a configured root can replace the checked file with a symbolic link to any file
+the daemon can read, and the daemon would store those bytes as a `resource`. So the rule is stated on
+the descriptor: the file is opened with symbolic links refused at every path component, the confinement
+check is made against the identity of the file as opened (its resolved path read back from the
+descriptor, or its device and inode numbers compared with the entry that was checked), and the bytes
+stored are read from that same descriptor. A path check followed by a separate open by name satisfies
+nothing here. Acceptance A5 keeps its arm and gains two controls: the identical ingest with the tree
+outside every root is refused, and a tree in which a regular file is swapped for a symbolic link to a
+file outside the root between the listing and the read is refused for that entry and stores no body.
+This clause is the contract, not a description of the tree at the time it merges: the web pack change
+that implements D3 (pull request #3000) admits disk sources under `read_roots` and reads through the descriptor as stated
+here, and cites A1.1 as its acceptance. Until that change lands, D3 disk ingest is unenforced and is
+not to be relied on.
+
+### A1.2 D4: bodies are rooted by attachment on the main backend; `persist` false stores no bytes
+
+D4 said every receipt carries a blob reference; this amendment rewrites that sentence of D4 to read
+"the stored reference when `persist` is true, else the content digest and size" (the D4 text above
+carries the amended wording). D3 says a `page` or `resource` carries `blob_ref`. Neither keeps the
+blob alive: blob reclamation consults the attachments table
+([ADR-121](ADR-121-attachments-first-class.md)), so a body named only by a property is collectable
+once the grace period passes.
+
+The body of a fetched page or resource is that entity's own content in another modality, which is
+exactly what ADR-121 makes an attachment. So a persisted `page` or `resource` carries one attachment
+with role `content` naming the stored reference, and the receipt note of the request that stored it
+annotates the entity (D4) and carries no attachment: the receipt is the utterance, the body is the
+thing, and ADR-121's note boundary keeps the two apart. A fetched page is never a note's own content,
+so a receipt never carries a body. When the caller asks for no persisted row (`persist` false) no
+bytes are stored at all: the body is returned in the response, the receipt records the final URL,
+content digest, size and fetch time as properties, and a caller who wants the bytes kept asks for an
+entity. A HEAD request stores no body and roots nothing.
+
+Placement follows [ADR-160](ADR-160-shared-pack-infrastructure.md) and ADR-121: the canonical main
+backend is the sole owner of attachment rows and the sole liveness authority for the shared blob
+store, whatever backend holds the record. A web pack routed to its own backend (ADR-028 Amendment 4)
+therefore writes its entity and receipt rows there and its attachment rows on the main backend
+through the core accessor, which is also how the pack keeps its bodies alive under one sweep. A9 is
+amended below to say exactly that. Because the record and its attachment row live in different
+databases, ADR-121's same-transaction delete cascade does not reach across, and
+[ADR-073](ADR-073-multi-backend-storage.md) grants no atomicity across backends and asks handlers
+for idempotent or compensating writes. So hard-deleting a routed `page` or `resource` is one verb
+invocation with two commits in a fixed order: the record's own backend commits the delete first,
+then the main backend deletes the attachment rows that named the record, and that second delete is
+idempotent (deleting rows that are already gone succeeds). A crash between the two commits leaves
+attachment rows whose record is gone; those rows root nothing that matters (the record they would
+keep alive no longer exists) but they keep the blob alive until something removes them. Today the
+attachment orphan sweep exists as a routine with no production caller, so this leak is unbounded
+in time until that sweep is scheduled; scheduling it, with a stated cadence and a count of rows
+reclaimed as its artifact, is an obligation this amendment records and does not discharge (tracked
+as issue #3038). The
+reverse order is forbidden: a crash after the attachment
+rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
+which is data loss, and this amendment exists to make stored bodies stay alive.
+
+Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
+attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the
+receipt carries digest and size, and neither record carries an attachment; hard-deleting a routed
+entity leaves no attachment row for it on the main backend.
+
+### A1.3 A9: attachment rows are the one web write that lands on the main backend
+
+A9 reads "with two backends configured, web writes land in the web backend only". Under ADR-160
+that is true of entity, note and edge rows and false of attachment rows by design, so A9 is amended
+to: with two backends configured, a web pack's entity, note and edge rows land in the web backend
+only, and its attachment rows land on the main backend only (ADR-160); the arm asserts both halves.

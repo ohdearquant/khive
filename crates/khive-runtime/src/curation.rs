@@ -547,6 +547,23 @@ pub struct EdgePatch {
     pub properties: Option<Value>,
 }
 
+/// Kind-owned property semantics carried from validated hook preparation to
+/// the shared note merge. The default preserves ordinary JSON merge behavior.
+#[derive(Clone, Debug, Default)]
+pub struct NoteUpdatePolicy {
+    kind: Option<String>,
+    null_clearing_properties: &'static [&'static str],
+}
+
+impl NoteUpdatePolicy {
+    pub(crate) fn for_kind(kind: &str, null_clearing_properties: &'static [&'static str]) -> Self {
+        Self {
+            kind: Some(kind.to_owned()),
+            null_clearing_properties,
+        }
+    }
+}
+
 /// Patch for `update_note`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
 ///
 /// For `salience`/`decay_factor`:
@@ -562,6 +579,7 @@ pub struct NotePatch {
     pub properties: Option<Value>,
     pub(crate) kind_status: Option<String>,
     pub write_options: crate::note_write::NoteWriteOptions,
+    pub(crate) update_policy: NoteUpdatePolicy,
 }
 
 /// Normalize the public note tag replacement into its stored property before
@@ -612,11 +630,19 @@ impl NotePatch {
             properties,
             kind_status: None,
             write_options: Default::default(),
+            update_policy: Default::default(),
         }
     }
 
     pub fn with_write_options(mut self, options: crate::note_write::NoteWriteOptions) -> Self {
         self.write_options = options;
+        self
+    }
+
+    /// Apply the owning kind's policy returned by validated hook preparation.
+    /// This is not a caller-facing property-deletion parameter.
+    pub fn with_update_policy(mut self, policy: NoteUpdatePolicy) -> Self {
+        self.update_policy = policy;
         self
     }
 }
@@ -1751,6 +1777,16 @@ impl KhiveRuntime {
         let original_decay_factor = note.decay_factor;
         let original_properties = note.properties.clone();
         let original_status = note.status.clone();
+        if patch
+            .update_policy
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != note.kind)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "note update policy does not match the stored note kind".into(),
+            ));
+        }
         if patch.content.is_some() || patch.properties.is_some() {
             if let Some(error) = self.stream_member_error(&note).await? {
                 return Err(error);
@@ -1802,26 +1838,39 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
-            // ADR-056 makes these three properties transport evidence owned
-            // exclusively by `comm.ingest`. This check lives at the runtime
-            // patch seam, not only in comm's shared-CRUD hook, because direct
-            // Rust callers and atomic update preparation both arrive here
-            // without dispatching that hook. Scope it to `message`: the same
-            // JSON names remain ordinary caller metadata on every other kind.
-            if note.kind == "message" {
-                if !props.is_object() {
-                    return Err(RuntimeError::InvalidInput(
-                        "properties on a `message` note must be patched with an object: a \
-                         non-object patch would replace the transport-owned quarantine and \
-                         channel provenance established by `comm.ingest`"
-                            .into(),
-                    ));
-                }
-                if let Some(named) = message_transport_owned_property_named_in(&props) {
+            // Kind-owned identity is protected below pack hooks, including
+            // direct runtime and atomic/proposal update preparation. The merge
+            // path restores these same keys on its surviving row.
+            let owned_keys = kind_owned_properties(&note.kind);
+            if !owned_keys.is_empty() {
+                let object = props.as_object().ok_or_else(|| {
+                    if note.kind == "message" {
+                        RuntimeError::InvalidInput(
+                            "properties on a `message` note must be patched with an object: a \
+                             non-object patch would replace the transport-owned quarantine and \
+                             channel provenance established by `comm.ingest`"
+                                .into(),
+                        )
+                    } else {
+                        RuntimeError::InvalidInput(format!(
+                            "properties on a `{}` note must be patched with an object; \
+                             a non-object patch would erase its owner-established identity",
+                            note.kind
+                        ))
+                    }
+                })?;
+                if let Some(named) = owned_keys.iter().find(|key| object.contains_key(**key)) {
+                    if note.kind == "message" {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "`{named}` is transport-owned on a `message` note and cannot be patched; \
+                             only `comm.ingest` may establish quarantine disposition and channel \
+                             provenance"
+                        )));
+                    }
                     return Err(RuntimeError::InvalidInput(format!(
-                        "`{named}` is transport-owned on a `message` note and cannot be patched; \
-                         only `comm.ingest` may establish quarantine disposition and channel \
-                         provenance"
+                        "`{named}` is not patchable on a `{}` note; \
+                         use `comm.heartbeat` to report health without changing the row's identity",
+                        note.kind
                     )));
                 }
             }
@@ -1866,11 +1915,23 @@ impl KhiveRuntime {
                     )));
                 }
             }
-            let (merged, _) = merge_properties(
+            let incoming_properties = Some(props);
+            let (mut merged, _) = merge_properties(
                 &note.properties,
-                &Some(props),
+                &incoming_properties,
                 EntityDedupMergePolicy::PreferFrom,
             );
+            if let Some(properties) = merged.as_mut().and_then(Value::as_object_mut) {
+                for key in patch.update_policy.null_clearing_properties {
+                    if incoming_properties
+                        .as_ref()
+                        .and_then(|incoming| incoming.get(*key))
+                        .is_some_and(Value::is_null)
+                    {
+                        properties.remove(*key);
+                    }
+                }
+            }
             note.properties = merged;
         }
         if let Some(status) = patch.kind_status {
@@ -2055,19 +2116,25 @@ impl KhiveRuntime {
 
     /// Non-wire outbox scan for the channel delivery loops.
     ///
-    /// Fetches live `message` notes matching the SQL-side pending predicate,
-    /// sorts that bounded candidate set newest-first, and returns those that
-    /// are still pending delivery, capped at `limit`.
-    /// Direction, `delivered_at`, and terminal `delivery` state are filtered
-    /// by SQLite; a valid `next_attempt_at` and the optional `to_actor`
-    /// channel prefix remain Rust checks. Pending means `delivered_at` is
-    /// absent or null, `properties.delivery` carries no terminal state
+    /// Fetches live `message` notes matching the SQL-side pending predicate
+    /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
+    /// cap, and returns those that are still due, capped at `limit`.
+    /// Direction, `delivered_at`, terminal `delivery` state and the optional
+    /// `to_actor` channel prefix are all filtered by SQLite; only a valid
+    /// `next_attempt_at` remains a Rust check. Pending means `delivered_at`
+    /// is absent or null, `properties.delivery` carries no terminal state
     /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
     /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
-    /// property cannot strand mail forever. When `to_prefix` is given,
-    /// only rows whose `properties.to_actor` starts with it are counted —
-    /// the channel predicate must run BEFORE the limit, otherwise a backlog
-    /// of another channel's pending rows starves this channel indefinitely.
+    /// property cannot strand mail forever.
+    ///
+    /// The channel prefix has to be in the statement, not applied to the
+    /// fetched page: every actor-to-actor outbound row matches the pending
+    /// predicate forever (nothing marks those delivered), so that population
+    /// outgrows any scan cap and a page-then-filter scan never reaches a
+    /// channel's rows once enough other rows sort ahead of them. The prefix
+    /// renders as an index range served by
+    /// `idx_comm_message_outbound_recipient`, and the newest-first order
+    /// means a future predicate miss still surfaces new rows first.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2085,32 +2152,39 @@ impl KhiveRuntime {
             return Ok(Vec::new());
         }
         let now_micros = chrono::Utc::now().timestamp_micros();
+        let mut property_filters = vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("outbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.delivered_at".to_string(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.delivery".to_string(),
+                op: FilterOp::NotInOrMissing(vec![
+                    SqlValue::Text("delivered".to_string()),
+                    SqlValue::Text("failed".to_string()),
+                ]),
+                value: SqlValue::Null,
+            },
+        ];
+        if let Some(prefix) = to_prefix {
+            property_filters.push(PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::TextStartsWithIndexed,
+                value: SqlValue::Text(prefix.to_string()),
+            });
+        }
         let filter = NoteFilter {
             kind: Some("message".to_string()),
-            unordered: true,
-            property_filters: vec![
-                PropertyFilter {
-                    json_path: "$.direction".to_string(),
-                    op: FilterOp::Eq,
-                    value: SqlValue::Text("outbound".to_string()),
-                },
-                PropertyFilter {
-                    json_path: "$.delivered_at".to_string(),
-                    op: FilterOp::JsonTypeMissingOrNullIndexed,
-                    value: SqlValue::Null,
-                },
-                PropertyFilter {
-                    json_path: "$.delivery".to_string(),
-                    op: FilterOp::NotInOrMissing(vec![
-                        SqlValue::Text("delivered".to_string()),
-                        SqlValue::Text("failed".to_string()),
-                    ]),
-                    value: SqlValue::Null,
-                },
-            ],
+            property_filters,
             ..Default::default()
         };
-        let mut candidates = self
+        let candidates = self
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
@@ -2122,25 +2196,10 @@ impl KhiveRuntime {
             )
             .await?
             .items;
-        candidates.sort_unstable_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
 
         let mut collected: Vec<khive_storage::note::Note> = Vec::new();
         for note in candidates {
             let props = note.properties.as_ref().and_then(|v| v.as_object());
-            if let Some(prefix) = to_prefix {
-                let to_matches = props
-                    .and_then(|p| p.get("to_actor"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|actor| actor.starts_with(prefix));
-                if !to_matches {
-                    continue;
-                }
-            }
             let retry_deferred = props
                 .and_then(|p| p.get("next_attempt_at"))
                 .and_then(|v| v.as_str())
@@ -3695,9 +3754,11 @@ fn merge_note_sql(
     if preserve_owner_established {
         preserve_owner_established_properties(&into_note.properties, &mut merged_props);
     }
-    if into_note.kind == "message" {
-        preserve_message_transport_properties(&into_note.properties, &mut merged_props);
-    }
+    preserve_property_keys(
+        kind_owned_properties(&into_note.kind),
+        &into_note.properties,
+        &mut merged_props,
+    );
 
     // Recomputed from the final retained properties rather than carried
     // forward from the fold's own count. The fold's count and post-
@@ -4111,15 +4172,22 @@ pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
     "external_id",
 ];
 
-/// Transport evidence that only `comm.ingest` may establish on a `message`.
-///
-/// This list is deliberately separate from [`OWNER_ESTABLISHED_PROPERTIES`].
-/// The latter applies to every pack-owned note kind; quarantine disposition
-/// and channel attribution are message-only, and protecting these names on a
-/// task, memory, or another pack-owned note would reserve ordinary metadata
-/// outside ADR-056's scope.
-pub(crate) const MESSAGE_TRANSPORT_OWNED_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug"];
+/// Kind-specific identity that generic updates cannot patch and merges must
+/// retain from the surviving record. Message transport evidence belongs to
+/// `comm.ingest`; health coordinates determine the UUID used by `comm.heartbeat`.
+/// Unlike OWNER_ESTABLISHED_PROPERTIES, these names remain ordinary metadata
+/// on other kinds, including tasks and memories.
+const KIND_OWNED_PROPERTIES: &[(&str, &[&str])] = &[
+    ("message", &["quarantined", "channel_kind", "channel_slug"]),
+    ("channel_health", &["channel_kind", "channel_slug"]),
+];
+
+pub(crate) fn kind_owned_properties(kind: &str) -> &'static [&'static str] {
+    KIND_OWNED_PROPERTIES
+        .iter()
+        .find_map(|(owned_kind, keys)| (*owned_kind == kind).then_some(*keys))
+        .unwrap_or(&[])
+}
 
 /// Whether a stored message note carries a live quarantine disposition.
 ///
@@ -4138,16 +4206,6 @@ fn message_is_quarantined(note: &khive_storage::note::Note) -> bool {
         Some(Value::String(value)) => value != "false",
         Some(_) => true,
     }
-}
-
-fn message_transport_owned_property_named_in(patch: &Value) -> Option<&'static str> {
-    let Value::Object(map) = patch else {
-        return None;
-    };
-    MESSAGE_TRANSPORT_OWNED_PROPERTIES
-        .iter()
-        .copied()
-        .find(|key| map.contains_key(*key))
 }
 
 /// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
@@ -4196,10 +4254,6 @@ pub(crate) fn preserve_owner_established_properties(
     merged: &mut Option<Value>,
 ) {
     preserve_property_keys(OWNER_ESTABLISHED_PROPERTIES, into, merged);
-}
-
-fn preserve_message_transport_properties(into: &Option<Value>, merged: &mut Option<Value>) {
-    preserve_property_keys(MESSAGE_TRANSPORT_OWNED_PROPERTIES, into, merged);
 }
 
 fn preserve_property_keys(keys: &[&str], into: &Option<Value>, merged: &mut Option<Value>) {
@@ -4471,6 +4525,164 @@ mod tests {
         KhiveRuntime::memory().unwrap()
     }
 
+    async fn seed_health_identity_note(runtime: &KhiveRuntime, slug: &str) -> Note {
+        let mut note = Note::new("local", "channel_health", "health state");
+        note.properties = Some(serde_json::json!({
+            "channel_kind": "email", "channel_slug": slug, "operator_note": "original"
+        }));
+        runtime
+            .notes(&NamespaceToken::local())
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        note
+    }
+
+    /// Must fail without the runtime coordinate guard: the first plain update
+    /// succeeds and changes channel_kind even though no pack hook ran.
+    #[tokio::test]
+    async fn channel_health_identity_plain_update_refuses_coordinate_changes() {
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let note = seed_health_identity_note(&runtime, "original@example.com").await;
+        let before = serde_json::to_value(&note).unwrap();
+        for properties in [
+            serde_json::json!({"channel_kind": "telegram", "operator_note": "changed"}),
+            serde_json::json!({"channel_slug": "other@example.com"}),
+            serde_json::json!({"channel_kind": null}),
+            serde_json::json!({"channel_slug": null}),
+            serde_json::json!({"channel_kind": "email"}),
+            serde_json::json!({"channel_slug": "original@example.com"}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            let error = runtime
+                .update_note(
+                    &token,
+                    note.id,
+                    NotePatch::new(None, None, None, None, Some(properties)),
+                )
+                .await
+                .expect_err("plain runtime update must preserve heartbeat coordinates");
+            assert!(error.to_string().contains("channel_health"), "{error}");
+            let stored = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(stored).unwrap(), before);
+        }
+        let changed = runtime
+            .update_note(
+                &token,
+                note.id,
+                NotePatch::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(serde_json::json!({"operator_note": "changed"})),
+                ),
+            )
+            .await
+            .unwrap();
+        let properties = changed.properties.unwrap();
+        assert_eq!(properties["channel_kind"], "email");
+        assert_eq!(properties["channel_slug"], "original@example.com");
+        assert_eq!(properties["operator_note"], "changed");
+    }
+
+    #[tokio::test]
+    async fn channel_health_identity_atomic_prepare_refuses_coordinates() {
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let note = seed_health_identity_note(&runtime, "original@example.com").await;
+        let error = crate::atomic_prepare::prepare_update(
+            &runtime,
+            &token,
+            &serde_json::json!({
+                "id": note.id.to_string(),
+                "properties": {"channel_slug": "other@example.com"}
+            }),
+            None,
+        )
+        .await
+        .expect_err("atomic/proposal preparation must use the runtime identity guard");
+        assert!(error.to_string().contains("channel_slug"), "{error}");
+        let stored = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(note).unwrap()
+        );
+    }
+
+    /// Must fail without merge restoration: PreferFrom replaces the surviving
+    /// row's coordinates with the absorbed row's values.
+    #[tokio::test]
+    async fn channel_health_identity_merge_retains_survivor_coordinates() {
+        for strategy in [
+            EntityDedupMergePolicy::PreferFrom,
+            EntityDedupMergePolicy::Union,
+            EntityDedupMergePolicy::PreferInto,
+        ] {
+            let runtime = rt();
+            let token = NamespaceToken::local();
+            let into = seed_health_identity_note(&runtime, "survivor@example.com").await;
+            let mut from = seed_health_identity_note(&runtime, "absorbed@example.com").await;
+            from.properties = Some(serde_json::json!({
+                "channel_kind": "telegram", "channel_slug": "absorbed@example.com", "new_metadata": true
+            }));
+            // Trusted fixture setup establishes a distinct source identity;
+            // the public store must refuse changing an existing health row.
+            runtime
+                .raw_notes(&token)
+                .unwrap()
+                .upsert_note(from.clone())
+                .await
+                .unwrap();
+            runtime
+                .merge_note(
+                    &token,
+                    into.id,
+                    from.id,
+                    strategy,
+                    ContentMergeStrategy::PreferInto,
+                    false,
+                )
+                .await
+                .unwrap();
+            let stored = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(into.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.id, into.id);
+            assert_eq!(stored.created_at, into.created_at);
+            let properties = stored.properties.unwrap();
+            assert_eq!(properties["channel_kind"], "email");
+            assert_eq!(properties["channel_slug"], "survivor@example.com");
+            assert_eq!(properties["new_metadata"], true);
+            assert!(runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(from.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
     async fn entity_update_events(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
@@ -4569,6 +4781,69 @@ mod tests {
             .await
             .expect("zero-limit scan succeeds");
         assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    /// Regression guard for the scan window (#1859). The pending predicate
+    /// admits every actor-to-actor outbound row forever (nothing marks them
+    /// delivered), so the pending population outgrows any scan cap. With
+    /// more such rows than the cap, an email row that sorts past the cap in
+    /// every candidate index order (older `created_at`, later rowid, a
+    /// `to_actor` that collates after the fillers') must still be returned:
+    /// the channel prefix has to bound the SQL candidate set, not trim it
+    /// afterwards. `list_undelivered_outbound_messages_matches_legacy_predicate`
+    /// is the under-cap control.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_email_row_past_the_scan_window() {
+        const FILLERS: usize = 10_050;
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut email = outbound_message_note();
+        email.created_at -= 1_000_000;
+        email.updated_at = email.created_at;
+        email.properties = Some(
+            serde_json::json!({"direction": "outbound", "to_actor": "email:ocean@example.test"}),
+        );
+        let email_id = email.id;
+
+        let mut fillers = Vec::with_capacity(FILLERS);
+        for i in 0..FILLERS {
+            let mut filler = outbound_message_note();
+            filler.created_at += i as i64;
+            filler.updated_at = filler.created_at;
+            filler.properties =
+                Some(serde_json::json!({"direction": "outbound", "to_actor": "daemon:filler"}));
+            fillers.push(filler);
+        }
+        // Fillers first so the email row also takes the later rowid.
+        let summary = store.upsert_notes(fillers).await.expect("seed fillers");
+        assert_eq!(
+            summary.affected as usize, FILLERS,
+            "every filler row seeded"
+        );
+        store.upsert_note(email).await.expect("seed email row");
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 200)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            hits.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![email_id],
+            "the email row is found behind {FILLERS} pending actor-to-actor rows"
+        );
+
+        let daemon_hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("daemon:"), 3)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            daemon_hits.len(),
+            3,
+            "the other prefix still sees its own rows"
+        );
     }
 
     fn legacy_outbox_pending(note: &Note, to_prefix: Option<&str>, now_micros: i64) -> bool {

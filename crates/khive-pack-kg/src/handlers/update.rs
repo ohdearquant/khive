@@ -298,8 +298,8 @@ impl KgPack {
                             .into(),
                     ));
                 }
-                registry
-                    .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
+                let update_policy = registry
+                    .prepare_note_update_policy(&self.runtime, token, &note, &mut params)
                     .await?;
                 let p: UpdateParams = deser(params)?;
                 super::common::require_object_param(p.properties.as_ref(), "properties")?;
@@ -310,6 +310,7 @@ impl KgPack {
                     p.decay_factor,
                     p.properties,
                 )
+                .with_update_policy(update_policy)
                 .with_write_options(khive_runtime::note_write::NoteWriteOptions {
                     expected_version: p.expected_version,
                     fence: p.fence,

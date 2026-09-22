@@ -80,7 +80,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             plane; feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
-            with signal (by_profile_and_signal, for per-seat negative-share); events \
+            with signal (by_profile_and_signal, keyed by served_by_profile_id then signal, \
+            for per-profile negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. Events carrying \
@@ -309,7 +310,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
-                description: "Profile ID that served the result being rated. Recorded in the event payload.",
+                description: "Profile ID that served the result being rated. A known ID wins; an unknown ID falls back only to the caller's matching recall binding, otherwise not_found. The resolved ID is recorded in the event payload.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -1122,7 +1123,7 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         // #34: signal breakdown for `feedback_explicit`, both flat (negative-signal
         // saturation as a first-class metric) and crossed with the profile split
-        // above (negative-share per seat/profile) — same source field
+        // above (negative-share per profile) — same source field
         // (`payload.signal`, stamped by `brain.feedback`/`brain.auto_feedback`) as
         // `by_profile` reads `payload.served_by_profile_id` from.
         let mut counts_by_signal: std::collections::BTreeMap<String, u64> =
@@ -1591,10 +1592,12 @@ impl BrainPack {
     }
 
     /// Resolve the effective serving profile for feedback attribution
-    /// (ADR-035 tiers 1-2, #697): explicit `served_by_profile_id` wins outright;
+    /// (ADR-035 tiers 1-2, #697, #1851): a known explicit profile wins;
     /// otherwise resolve an actor+namespace-scoped binding via the same
     /// `resolve_with_match` table `brain.resolve` uses, before falling back to
-    /// the system default. `brain.auto_feedback` forwards into `handle_feedback`
+    /// the system default only when no explicit ID was supplied. An unknown
+    /// explicit ID without a matching binding is refused, never credited to
+    /// the default. `brain.auto_feedback` forwards into `handle_feedback`
     /// unresolved so it inherits this without duplicating the logic.
     ///
     /// Consumer kind is fixed to `recall`: feedback routed directly through
@@ -1609,16 +1612,24 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         explicit: Option<&str>,
-    ) -> (String, &'static str) {
+    ) -> Result<(String, &'static str), RuntimeError> {
+        let state = self.state.lock().unwrap();
         if let Some(profile_id) = explicit {
-            return (profile_id.to_string(), "explicit");
+            if state.profiles.contains_key(profile_id) {
+                return Ok((profile_id.to_string(), "explicit"));
+            }
         }
         let actor = token.actor().binding_id();
         let namespace = token.namespace().as_str();
-        let state = self.state.lock().unwrap();
         match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
-            Some((record, _matched_kind, true)) => (record.id.clone(), "binding"),
-            _ => ("balanced-recall-v1".to_string(), "default"),
+            Some((record, _matched_kind, true)) => Ok((record.id.clone(), "binding")),
+            _ => match explicit {
+                Some(profile_id) => Err(RuntimeError::NotFound(format!(
+                    "serving profile {:?} not found in profile registry",
+                    profile_id
+                ))),
+                None => Ok(("balanced-recall-v1".to_string(), "default")),
+            },
         }
     }
 
@@ -1752,8 +1763,9 @@ impl BrainPack {
             _ => {}
         }
 
-        // Compute the effective serving profile (explicit, else a matching
-        // actor+namespace binding, else the system default — #697), unless the
+        // Compute the effective serving profile (known explicit, else a matching
+        // actor+namespace binding; only an omitted ID may use the system default
+        // — #697, #1851), unless the
         // serve was explicitly unattributed, in which case there is no profile
         // to resolve at all. Then perform a warm-state fast-path check that it
         // exists and is not Archived; the persistence transaction repeats this
@@ -1764,7 +1776,7 @@ impl BrainPack {
                 (None, "serve_unattributed")
             } else {
                 let (profile_id, resolution) = self
-                    .resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
+                    .resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref())?;
                 (Some(profile_id), resolution)
             };
 

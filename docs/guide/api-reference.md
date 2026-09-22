@@ -174,7 +174,16 @@ its siblings (chain failures do abort the remainder of the chain):
 {
   "results": [
     { "ok": true, "tool": "search", "result": { "...": "..." } },
-    { "ok": false, "tool": "get", "error": "not found: ..." }
+    {
+      "ok": false,
+      "tool": "get",
+      "domain_disposition": "unknown",
+      "error": {
+        "kind": "runtime_error",
+        "message": "not found: ...",
+        "domain_disposition": "unknown"
+      }
+    }
   ],
   "summary": { "total": 2, "succeeded": 1, "failed": 1, "aborted": 0 }
 }
@@ -182,6 +191,22 @@ its siblings (chain failures do abort the remainder of the chain):
 
 `aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
 parallel batches, since parallel failures do not cascade.
+
+Every `ok: false` entry has a required top-level `domain_disposition`. Inspect it
+before retrying: `ok: false` alone does not mean that a write failed to commit.
+
+| `domain_disposition` | Meaning and response                                                                                                                                                                                                                           |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `committed`          | The domain operation completed before a later audit or response failure. Read `error.domain_result` for its canonical result; if the result was omitted for a size/depth limit, read the stored outcome back. Do not repeat the write blindly. |
+| `not_committed`      | This operation has a proven pre-dispatch refusal or another explicitly proven no-write outcome. Aborted chain operations always have this value.                                                                                               |
+| `unknown`            | The operation's effects are not established. Reconcile by a known operation/record identity before deciding whether to retry.                                                                                                                  |
+
+Non-aborted failures retain an `error` object, whose `domain_disposition` matches
+the entry-level field. Aborted entries have no `error` object. A required audit
+append failure after a committed write still counts as failed and keeps `ok: false`;
+the new entry-level field makes that committed outcome visible beside `ok`.
+Presentation and daemon frame-budget omission preserve this disposition. See
+[ADR-133 Amendment 3](../adr/ADR-133-incidental-writes-off-the-request-hot-path.md#a31-the-error-carries-a-machine-readable-domain-disposition).
 
 A successful entry can also carry a transport-owned `advisories` array beside `result`.
 These warnings describe execution context without changing the verb's canonical result or
@@ -1048,12 +1073,30 @@ process-wide best-effort audit appends whose storage error was logged and swallo
 pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
 unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
 it instead fails the dispatch that produced it directly, or — for a denial whose dispatch already
-fails independent of the row — is tracked by a separate internal counter. `audit_append_failures`
+fails independent of the row — is tracked by `audit_obligation_append_failures`. `audit_append_failures`
 and `audit_batch_flush_failures` are therefore disjoint for that case; summing them does not
 double-count an obligation-bearing generation failure. Zero-wait
 checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.
+
+`audit_obligation_append_failures` counts process-wide failed obligation-bearing audit
+submissions, including audit failures for already-denied calls. It is separate from swallowed
+best-effort failures. One failed batch generation can contain several such submissions, so
+do not sum it with `audit_batch_flush_failures` as if those were disjoint failures. Runtime
+diagnostics supplies the count even without an audit-batch control handle; direct `khive-db`
+collectors return `null` plus `audit_obligation_append_failures_unavailable_reason`.
+
+Audit obligations attach to gate denials, dispatch success/failure outcomes, unknown-verb
+attempts, and `git.digest` receipts. This preserves the link between a caller-visible outcome
+and its durable audit; `whoami` and `comm.heartbeat` have no exemption from outcome audit
+commit failure. A configured sink failure can therefore refuse identity and liveness calls
+too. Config-lock rows, recall telemetry, and gate-unavailable observability are best-effort.
+The existing bounded queue-admission degradation rules are separate from a sink commit
+failure and do not change these producer classes. This counter adds visibility without
+changing the fail-closed policy or making diagnostics independent of its own configured audit
+sink. Channel startup reports a failed quarantine-readiness check with the actual cause; an
+audit error on that check does not by itself prove quarantine blob storage is unavailable.
 
 `writer_task_request_failures` counts dequeued writer-task requests whose processing at the
 writer seam terminated in error, regardless of the specific terminal state; a request that never

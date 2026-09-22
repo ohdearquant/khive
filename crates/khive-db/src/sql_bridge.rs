@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{PageRequest, SqlColumn, SqlRow, SqlStatement, SqlValue};
-use khive_storage::{AtomicUnitOp, StorageCapability};
+use khive_storage::{AtomicUnitOp, StorageCapability, TopLevelMaintenance};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SqliteError;
@@ -2408,10 +2408,11 @@ impl khive_storage::SqlWriter for SqliteWriter {
 
     async fn execute_script_top_level(
         &mut self,
-        script: String,
+        maintenance: TopLevelMaintenance,
     ) -> khive_storage::types::StorageResult<()> {
-        // Boundary: this internal maintenance/migration path deliberately
-        // bypasses the `execute_batch` transaction-control rejection.
+        // Only the closed maintenance enum can supply unbound SQL here.
+        // This is not the separate raw migration-script interface.
+        let script = maintenance.as_sql();
         // ADR-067 Component A: unlike
         // `execute_script`, this must NOT run inside the writer task's
         // per-request `BEGIN IMMEDIATE` — statements such as VACUUM are
@@ -2422,7 +2423,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send_top_level_bounded(move |conn| {
-                    conn.execute_batch(&script)
+                    conn.execute_batch(script)
                         .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
                 })
                 .await;
@@ -2436,7 +2437,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
             message: "connection already consumed".into(),
         })?;
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let res = handle.conn.execute_batch(&script);
+            let res = handle.conn.execute_batch(script);
             (handle, res)
         })
         .await

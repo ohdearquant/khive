@@ -153,8 +153,7 @@ impl KindHook for MessageHook {
     }
 }
 
-/// Refuses shared creation of `channel_health`, the kind this pack owns and writes by
-/// derived id.
+/// Keeps shared mutations from changing the derived identity of `channel_health` rows.
 #[derive(Debug, Default)]
 struct ChannelHealthHook;
 
@@ -200,6 +199,29 @@ impl KindHook for ChannelHealthHook {
         _id: uuid::Uuid,
         _args: &Value,
     ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn validate_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(properties) = properties.and_then(Value::as_object) {
+            for key in ["channel_kind", "channel_slug"] {
+                if properties.contains_key(key) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "`{key}` is not patchable on a `channel_health` note: \
+                         `comm.heartbeat` derives its id from the namespace, channel kind \
+                         and slug; changing a coordinate would detach the row from that \
+                         identity. Omit `{key}` from the patch and use `comm.heartbeat` \
+                         to report a channel's health"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -453,7 +475,7 @@ mod help_tests {
     #[test]
     fn list_reads_declare_sent_box_and_shared_projection_contract() {
         let inbox = find_handler("comm.inbox");
-        for name in ["box", "to_actor", "fields"] {
+        for name in ["box", "to_actor", "fields", "mailbox_actor"] {
             let param = inbox
                 .params
                 .iter()
@@ -471,6 +493,22 @@ mod help_tests {
         assert_eq!(fields.param_type, "array of string");
         assert!(!fields.required);
         assert!(fields.description.contains("comm.inbox"));
+
+        let mailbox_actor = thread
+            .params
+            .iter()
+            .find(|param| param.name == "mailbox_actor")
+            .expect("comm.thread help must declare mailbox_actor");
+        assert_eq!(mailbox_actor.param_type, "string");
+        assert!(!mailbox_actor.required);
+        for handler in &COMM_HANDLERS {
+            if !matches!(handler.name, "comm.inbox" | "comm.thread") {
+                assert!(handler
+                    .params
+                    .iter()
+                    .all(|param| param.name != "mailbox_actor"));
+            }
+        }
     }
 
     #[test]

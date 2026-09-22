@@ -368,6 +368,11 @@ impl ProposalApplyWorker {
                     let kind =
                         crate::handlers::canonical_entity_kind(entity.kind.as_str(), registry)?;
                     budget.consume_new_entry()?;
+                    if let Some(hook) = registry.find_kind_hook(&kind) {
+                        let mut draft = entity.clone();
+                        draft.kind.clone_from(&kind);
+                        hook.validate_proposal_entity(&draft)?;
+                    }
                     let args = serde_json::json!({
                         "kind": kind,
                         "name": entity.name,

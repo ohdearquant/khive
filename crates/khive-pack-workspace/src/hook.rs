@@ -13,8 +13,8 @@ use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
 pub struct WorkspaceHook;
 
 /// `properties.schema_version` must be present and an integer. Shared by
-/// `prepare_create` and `validate_entity_update` (issue #2943) so a value
-/// refused on create is refused on a generic `update` too.
+/// shared creation, approved AddEntity, and `validate_entity_update` so the
+/// owner invariant does not depend on which mutation path is used.
 fn require_integer_schema_version(properties: Option<&Value>) -> Result<(), RuntimeError> {
     let has_schema_version = properties
         .and_then(Value::as_object)
@@ -45,6 +45,13 @@ impl KindHook for WorkspaceHook {
         _args: &Value,
     ) -> Result<(), RuntimeError> {
         Ok(())
+    }
+
+    fn validate_proposal_entity(
+        &self,
+        entity: &khive_types::EntityDraft,
+    ) -> Result<(), RuntimeError> {
+        require_integer_schema_version(entity.properties.as_ref())
     }
 
     async fn validate_entity_update(

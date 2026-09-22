@@ -2990,7 +2990,147 @@ async fn feedback_697_unspecified_no_binding_falls_back_to_default() {
     );
 }
 
-/// #697 (d): an explicit `served_by_profile_id` always wins over a matching
+/// #1851: unknown IDs (including bare roles) use the caller's recall binding,
+/// and both feedback entry points persist the resolved attribution.
+#[tokio::test]
+async fn feedback_1851_unknown_profile_uses_recall_binding() {
+    use khive_storage::event::EventFilter;
+    use khive_storage::types::PageRequest;
+
+    for (verb, requested, selected_metadata) in [
+        ("brain.feedback", "researcher", false),
+        ("brain.auto_feedback", "unknown-profile-v1", false),
+        ("brain.auto_feedback", "researcher", true),
+    ] {
+        let (pack, rt) = make_pack_with_actor("bound-feedback-actor");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        for (setup_verb, params) in [
+            (
+                "brain.create_profile",
+                json!({"name": "actual-recall-v1", "consumer_kind": "recall"}),
+            ),
+            ("brain.activate", json!({"profile_id": "actual-recall-v1"})),
+            (
+                "brain.bind",
+                json!({"actor": "bound-feedback-actor", "profile_id": "actual-recall-v1", "consumer_kind": "recall"}),
+            ),
+        ] {
+            pack.dispatch(setup_verb, params, &registry, &token)
+                .await
+                .unwrap();
+        }
+        let before = pack.snapshot();
+        let mut params = json!({"target_id": target, "signal": "useful"});
+        if selected_metadata {
+            params["results"] = json!([{"id": target, "served_by_profile_id": requested}]);
+        } else {
+            params["served_by_profile_id"] = json!(requested);
+            params["results"] = json!([{"id": target}]);
+        }
+        if verb == "brain.feedback" {
+            params.as_object_mut().unwrap().remove("results");
+        } else {
+            params["query"] = json!("profile fallback");
+        }
+        let result = pack
+            .dispatch(verb, params, &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(result["served_by_profile_id"], "actual-recall-v1");
+        let after = pack.snapshot();
+        assert_eq!(after.balanced_recall, before.balanced_recall);
+        assert_eq!(after.profiles.len(), before.profiles.len());
+        assert!(!after.profiles.contains_key(requested));
+        assert_eq!(
+            after.profile_states["actual-recall-v1"].total_events,
+            before.profile_states["actual-recall-v1"].total_events + 1
+        );
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        let feedback: Vec<_> = events
+            .items
+            .iter()
+            .filter(|e| e.verb == "brain.feedback")
+            .collect();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(
+            feedback[0].payload["served_by_profile_id"],
+            "actual-recall-v1"
+        );
+        assert_eq!(feedback[0].payload["profile_resolution"], "binding");
+    }
+}
+
+/// An unknown explicit ID without a matching binding cannot train the default.
+#[tokio::test]
+async fn feedback_1851_unknown_unbound_profile_refuses_without_writes() {
+    use khive_storage::event::EventFilter;
+    use khive_storage::types::PageRequest;
+
+    for verb in ["brain.feedback", "brain.auto_feedback"] {
+        let (pack, rt) = make_pack_with_actor("unbound-feedback-actor");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        // Materialize the lazily loaded default before taking the no-write
+        // baseline; otherwise its construction timestamp changes on first dispatch.
+        pack.dispatch(
+            "brain.profile",
+            json!({"profile_id":"balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        let before = pack.snapshot();
+        let mut params =
+            json!({"target_id": target, "signal": "useful", "served_by_profile_id": "researcher"});
+        if verb == "brain.auto_feedback" {
+            params["results"] = json!([{"id": target}]);
+            params["query"] = json!("profile fallback");
+        }
+        let err = pack
+            .dispatch(verb, params, &registry, &token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::NotFound(message) if message.contains("researcher")),
+            "{err:?}"
+        );
+        let after = pack.snapshot();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!events.items.iter().any(|e| e.verb == "brain.feedback"));
+    }
+}
+
+/// #697 (d): a known explicit `served_by_profile_id` always wins over a matching
 /// actor binding.
 #[tokio::test]
 async fn feedback_697_explicit_profile_overrides_actor_binding() {
@@ -9253,7 +9393,7 @@ mod event_counts_tests {
     }
 
     /// #34: `counts_by_signal` (flat) and `by_profile_and_signal` (crossed with
-    /// `served_by_profile_id`) let a caller compute per-seat negative-signal share
+    /// `served_by_profile_id`) let a caller compute per-profile negative-signal share
     /// in one call, mirroring the profile-only split above.
     #[tokio::test]
     async fn feedback_events_split_by_signal_and_crossed_with_profile() {
