@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::idempotency::MessageIdentity;
@@ -1627,23 +1627,65 @@ pub(crate) async fn handle_reply(
     // and can drift (whitespace at encoded-word boundaries, client re-encoding);
     // echoing it compounds the drift on every round trip until mail clients stop
     // threading the exchange. The root is the one subject this side authored or
-    // first received. Falls back to the replied-to message's subject when the
-    // root is the message itself, unreadable, or has no subject.
+    // first received.
+    //
+    // The root is resolved by thread MEMBERSHIP, the earliest message carrying
+    // this `thread_id`, never by id equality: `comm.ingest` mints a thread id
+    // that is not the root note's id, so a thread opened by an inbound mail has
+    // no note AT the thread id, and an id lookup would silently fall back to
+    // the drifted subject for exactly the exchanges this rule exists for.
+    // Ordering is by the message's own `sent_at` (a legacy row without one
+    // sorts first and is treated as the root; it has no subject to disclose).
+    //
+    // The root's subject is used only when the caller is a party to the root,
+    // the same thread-participant predicate `reply` enforces on the replied-to
+    // message above (issue #113): a caller who self-sends into a foreign
+    // thread id must not learn that thread's subject through its own reply.
+    // Falls back to the replied-to message's subject when the root is the
+    // message itself, unreadable, not the caller's, or has no subject.
     let root_subject = match Uuid::parse_str(&thread_id) {
-        Ok(root_id) if root_id != original.id => store
-            .get_note(root_id)
-            .await
-            .ok()
-            .flatten()
-            .filter(|root| root.namespace == token.namespace().as_str())
-            .and_then(|root| {
-                root.properties
-                    .as_ref()
-                    .and_then(|props| props.get("subject"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|subject| !subject.trim().is_empty()),
+        Ok(root_uuid) if root_uuid != original.id => {
+            let spellings = thread_id_query_spellings(root_uuid, None)
+                .into_iter()
+                .map(SqlValue::Text)
+                .collect();
+            let root_filter = NoteFilter {
+                kind: Some("message".to_string()),
+                property_filters: vec![PropertyFilter {
+                    json_path: "$.thread_id".to_string(),
+                    op: FilterOp::In(spellings),
+                    value: SqlValue::Null,
+                }],
+                order_by: Some(("$.sent_at".to_string(), SortDir::Asc)),
+                ..Default::default()
+            };
+            let caller_actor = token.actor().id.as_str();
+            store
+                .query_notes_filtered_count_free(
+                    token.namespace().as_str(),
+                    &root_filter,
+                    PageRequest {
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|page| page.items.into_iter().next())
+                .and_then(|root| {
+                    let props = root.properties?;
+                    let is_party =
+                        |key: &str| props.get(key).and_then(Value::as_str) == Some(caller_actor);
+                    if !(is_party("from_actor") || is_party("to_actor")) {
+                        return None;
+                    }
+                    props
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|subject| !subject.trim().is_empty())
+        }
         _ => None,
     };
     let base_subject = root_subject.unwrap_or(original_subject);

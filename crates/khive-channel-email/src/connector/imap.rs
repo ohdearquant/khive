@@ -520,11 +520,6 @@ pub(crate) fn process_selected_page(
     Ok(result)
 }
 
-/// Parse raw RFC 822 bytes into a `RawEmail`.
-///
-/// `host` and `uidvalidity` are combined with `uid` to form the stable
-/// `imap_external_id` dedup key. This avoids relying on the `Message-ID`
-/// header, which is optional and could be absent or spoofed.
 /// Subject text with every run of whitespace collapsed to one ASCII space and
 /// the ends trimmed. Subjects are display text, so this loses nothing a client
 /// shows; it removes the boundary whitespace that encoded-word decoding adds.
@@ -532,6 +527,11 @@ pub(crate) fn normalize_subject(subject: &str) -> String {
     subject.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Parse raw RFC 822 bytes into a `RawEmail`.
+///
+/// `host` and `uidvalidity` are combined with `uid` to form the stable
+/// `imap_external_id` dedup key. This avoids relying on the `Message-ID`
+/// header, which is optional and could be absent or spoofed.
 pub(crate) fn parse_raw_bytes(
     uid: u32,
     raw: &[u8],
