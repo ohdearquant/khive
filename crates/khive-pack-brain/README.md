@@ -51,6 +51,14 @@ event counts additionally require `all_actors=true` and a serving-runtime
 [API reference](../../docs/guide/api-reference.md#brainevent_counts--assertive)
 for the exact actor filters and anonymous-caller behavior.
 
+For a verb-by-caller dispatch-audit census, add
+`group_by=["verb","actor"]` and `kind="audit"` to `brain.event_counts`.
+The requested cross is nested by verb, then actor; omission or null preserves the
+existing response. Sampled windows expose the cross only as
+`counts_by_verb_and_actor_page_scoped`. `exhaustive=true` uses the existing
+full-window walk and safety bound. Grouping adds no separate cell-count budget
+or authorization path. See the [grouping contract](docs/api/event-count-groups.md).
+
 Feedback uses a known `served_by_profile_id` as supplied. If that ID is unknown
 (including a bare role name), it resolves through the caller's actor, namespace,
 and recall-consumer binding, using the same table as recall. It does not create
