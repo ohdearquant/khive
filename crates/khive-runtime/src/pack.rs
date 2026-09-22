@@ -786,6 +786,7 @@ pub struct VerbRegistryBuilder {
     /// `pack.name()` alone cannot be trusted for this decision.
     pack_trusted: Vec<bool>,
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
+    kg_read_resolver: Option<Arc<crate::kg_read::KgReadResolver>>,
     gate: GateRef,
     default_namespace: String,
     /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
@@ -830,6 +831,7 @@ impl VerbRegistryBuilder {
             packs: Vec::new(),
             pack_trusted: Vec::new(),
             resolvers: Vec::new(),
+            kg_read_resolver: None,
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
@@ -1286,6 +1288,7 @@ impl VerbRegistryBuilder {
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             resolvers: Arc::new(self.resolvers),
+            kg_read_resolver: self.kg_read_resolver,
             gate: self.gate,
             default_namespace: self.default_namespace,
             visible_namespaces: self.visible_namespaces,
@@ -1520,6 +1523,8 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     /// Pack-level by-ID resolvers, in registration order.
     resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
+    /// Read-only KG lookup topology; never used to redirect a pack write.
+    kg_read_resolver: Option<Arc<crate::kg_read::KgReadResolver>>,
     gate: GateRef,
     default_namespace: String,
     /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
@@ -1852,6 +1857,49 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 }
 
 impl VerbRegistry {
+    /// Resolve a KG entity/note handle across the configured backend inventory.
+    ///
+    /// The caller must supply its dispatch-authorized token. By-ID reads do not
+    /// filter the stored namespace (ADR-007); no new token is minted here. With
+    /// ordinary single-runtime registration, retain the supplied runtime's
+    /// existing behavior. This does not route mutations or pack-private records.
+    pub async fn resolve_kg_read_by_id(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+        include_deleted: bool,
+    ) -> Result<Option<crate::Resolved>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.by_id(token, id, include_deleted).await,
+            None if include_deleted => runtime.resolve_by_id_including_deleted(token, id).await,
+            None => runtime.resolve_by_id(token, id).await,
+        }
+    }
+
+    /// Resolve a prefix across the same inventory, rejecting distinct UUIDs.
+    ///
+    /// Retains the local prefix scanner's entity/note/event/edge collision domain,
+    /// including sidecar events. The returned UUID is not a substrate assertion:
+    /// consumers must still fetch/type-check it. All backend failures propagate.
+    pub async fn resolve_kg_read_prefix(
+        &self,
+        runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        prefix: &str,
+        include_deleted: bool,
+    ) -> Result<Option<uuid::Uuid>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.prefix(prefix, include_deleted).await,
+            None if include_deleted => {
+                runtime
+                    .resolve_prefix_unfiltered_including_deleted(prefix)
+                    .await
+            }
+            None => runtime.resolve_prefix_unfiltered(prefix).await,
+        }
+    }
+
     /// This registry's construction-baked default namespace.
     ///
     /// Used as the fallback when a request carries no [`RequestIdentity`]
@@ -4589,6 +4637,11 @@ impl PackRegistry {
                 }
             }
         }
+
+        builder.kg_read_resolver = Some(Arc::new(crate::kg_read::KgReadResolver::new(
+            default_runtime,
+            runtimes,
+        )));
 
         for name in names {
             let factory = factory_for(name.as_str()).unwrap();

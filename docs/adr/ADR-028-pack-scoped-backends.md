@@ -328,7 +328,8 @@ fn instantiate_backends(
   edge insert. No coordinator involvement. This is the common case for hot packs.
 - **Different backends**: cross-pack operations route through SubstrateCoordinator
   (ADR-029). The coordinator owns cross-backend edges, fan-out search, and partition
-  tolerance.
+  tolerance. Amendment A5 adds a narrower registry-owned path for entity/note
+  handle reads; it does not introduce general cross-backend mutation routing.
 
 For a deployment that declares one backend with all packs assigned to it (the default
 shape), the coordinator degenerates to a thin pass-through. Multi-backend complexity is
@@ -763,3 +764,45 @@ Amendments A2 and A3 already describe behavior that only exists because these fi
 parsed. A reader deciding where a new pack's data lives should read the config schema from
 `engine_config.rs` and the examples in Sections 4 through 7, and treat the "deferred" list in
 Section 1 as a record of the original plan. Of the tuning fields named there, `cache_mb` and `journal_mode` keep the A3 position (parsed, rejected at validation), `read_only` carries the A2 snapshot-inspection semantics, and `pragma_synchronous` is not parsed.
+
+## Amendment A5: shared KG handle reads across pack backends (2026-09-22)
+
+**Status**: Accepted
+
+A KG entity or note returned from a configured secondary backend must remain
+readable by `get` and eligible as a `brain.feedback` / `brain.auto_feedback`
+target. These consumers share a read-only resolver held by `VerbRegistry`,
+installed by `PackRegistry::register_packs_with_runtimes` from the default
+runtime and configured pack runtimes, deduplicated by `BackendId`. Direct
+registry dispatch and MCP dispatch use the same resolver; coordinator attachment
+is not required for these handle reads. Ordinary single-runtime registration
+retains its supplied runtime's local behavior.
+
+The Rust seams are `resolve_kg_read_by_id(runtime, token, id, include_deleted)`
+and `resolve_kg_read_prefix(runtime, token, prefix, include_deleted)`. Callers
+provide the token already authorized by dispatch. UUID reads do not filter the
+stored namespace, consistent with ADR-007. `get(include_deleted=true)` retains
+its existing namespace ownership check for deleted records; feedback admits
+only live entities and notes.
+
+Prefix lookup combines distinct UUIDs across the configured backend inventory
+and retains the existing entity/note/edge/event collision domain, including
+sidecar events. Repeated sightings of the same UUID count once; different UUIDs
+produce `AmbiguousPrefix`. A uniquely resolved UUID is not a substrate assertion:
+the consumer still fetches and checks its target type. Backend failures propagate
+even if another backend already has a match; a failure is not absence.
+
+Only entity/note payload reads gain this routing. Name/key lookup, existing
+edge/event and pack-private payload paths, `update`, `delete`, and other mutation
+routes remain unchanged. Brain uses the resolver to read its target, while its
+events, private event log, profiles and snapshots remain on its configured home
+runtime. This creates no cross-database write transaction. Knowledge-private
+atom/domain targets remain outside brain's KG target API and continue through
+`knowledge.feedback`.
+
+For example, with `comm` on a secondary backend and the search coordinator
+configured to include it, copy a full UUID from `search(kind="message",
+query="handoff")` into `get(id="<uuid>")` or
+`brain.feedback(target_id="<uuid>", signal="useful")`. Search selection and
+fan-out remain governed by ADR-029; this amendment makes the returned KG handle
+usable by those consumers without changing the message's backend or namespace.

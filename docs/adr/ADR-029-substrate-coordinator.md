@@ -729,3 +729,26 @@ empty (one entry per substrate kind, all pointing at `main`).
   this ADR's D4 is at a different layer (backend-level)
 - RuVector `crates/ruvector-graph/src/distributed/coordinator.rs` — shape adapted
 - oxigraph `lib/oxigraph/src/storage/mod.rs` — `StorageKind` pattern referenced
+
+## Amendment (2026-09-22): Searchable KG handles across pack backends
+
+A KG entity or note returned by multi-backend search must remain addressable by
+`get`, `brain.feedback`, and `brain.auto_feedback`. The shared pack registry holds
+an immutable, read-only backend inventory installed by
+`register_packs_with_runtimes`. These consumers resolve through that inventory
+rather than assuming their own pack backend owns the target. Feedback events and
+posterior state remain on the brain pack's backend.
+
+Normal dispatch authorization precedes lookup. Full UUID reads are namespace-blind
+under ADR-007. Prefix resolution combines distinct UUIDs across configured
+backends and refuses ambiguity; it retains the existing entity/note/event/edge
+collision domain, including event sidecars. A backend error, including a missing
+base table after configured bootstrap, propagates even when another backend found
+a match. It cannot become a unique match or not-found result. Multiple packs on one
+backend do not duplicate that backend's candidates.
+
+This amendment adds read routing for KG entity/note records only. Brain target
+validation still excludes events, edges, and pack-private records. Existing
+single-runtime construction, name/key lookups, mutation routing, and pack-private
+resolvers retain their contracts. `get(include_deleted=true)` retains its existing
+caller-owned namespace restriction for deleted rows.
