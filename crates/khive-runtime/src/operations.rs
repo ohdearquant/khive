@@ -4533,7 +4533,7 @@ impl KhiveRuntime {
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
         let namespaces = [token.namespace().as_str().to_owned()];
-        self.resolve_prefix_inner(Some(&namespaces), prefix, false)
+        self.resolve_prefix_inner(Some(&namespaces), prefix, false, false)
             .await
     }
 
@@ -4543,7 +4543,7 @@ impl KhiveRuntime {
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
         let namespaces = [token.namespace().as_str().to_owned()];
-        self.resolve_prefix_inner(Some(&namespaces), prefix, true)
+        self.resolve_prefix_inner(Some(&namespaces), prefix, true, false)
             .await
     }
 
@@ -4555,7 +4555,7 @@ impl KhiveRuntime {
     /// their already-unfiltered full-UUID path. No token param: unlike
     /// `resolve_prefix`, there is no namespace to derive from one.
     pub async fn resolve_prefix_unfiltered(&self, prefix: &str) -> RuntimeResult<Option<Uuid>> {
-        self.resolve_prefix_inner(None, prefix, false).await
+        self.resolve_prefix_inner(None, prefix, false, false).await
     }
 
     /// `resolve_prefix_unfiltered`, including soft-deleted rows — used by the
@@ -4564,7 +4564,18 @@ impl KhiveRuntime {
         &self,
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
-        self.resolve_prefix_inner(None, prefix, true).await
+        self.resolve_prefix_inner(None, prefix, true, false).await
+    }
+
+    /// The configured multi-backend read inventory has completed base schema
+    /// bootstrap. A missing table is a backend failure there, not an absent ID.
+    pub(crate) async fn resolve_prefix_for_kg_read(
+        &self,
+        prefix: &str,
+        include_deleted: bool,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.resolve_prefix_inner(None, prefix, include_deleted, true)
+            .await
     }
 
     /// Shared indexed prefix-range lookup over an explicit namespace set.
@@ -4583,6 +4594,7 @@ impl KhiveRuntime {
         namespaces: Option<&[String]>,
         prefix: &str,
         include_deleted: bool,
+        require_tables: bool,
     ) -> RuntimeResult<Option<Uuid>> {
         // Every caller is expected to pre-validate hex-only input, but this is
         // the single choke point every `resolve_prefix*` variant funnels
@@ -4652,7 +4664,7 @@ impl KhiveRuntime {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("no such table") {
+                    if !require_tables && msg.contains("no such table") {
                         continue;
                     }
                     return Err(RuntimeError::Storage(e));
@@ -4704,7 +4716,7 @@ impl KhiveRuntime {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        if !msg.contains("no such table") {
+                        if require_tables || !msg.contains("no such table") {
                             return Err(RuntimeError::Storage(e));
                         }
                     }

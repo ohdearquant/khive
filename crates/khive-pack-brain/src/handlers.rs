@@ -1629,8 +1629,9 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        self.handle_feedback_from(token, params, "brain.feedback")
+        self.handle_feedback_from(token, params, "brain.feedback", registry)
             .await
     }
 
@@ -1639,6 +1640,7 @@ impl BrainPack {
         token: &NamespaceToken,
         params: Value,
         originating_verb: &'static str,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let feedback_start = Instant::now();
 
@@ -1677,7 +1679,8 @@ impl BrainPack {
             ));
         }
 
-        let target: uuid::Uuid = resolve_auto_feedback_target(&self.runtime, &p.target_id).await?;
+        let target: uuid::Uuid =
+            resolve_auto_feedback_target(&self.runtime, token, registry, &p.target_id).await?;
 
         let signal = match p.signal.as_str() {
             "useful" => "useful",
@@ -1712,11 +1715,9 @@ impl BrainPack {
         // ADR-041 permits both entity and note signal targets; the resolved
         // substrate is threaded onto the emitted event below (#831) so the decoder can tell entity and
         // note signal observations apart instead of hard-coding entity.
-        let target_substrate = match self
-            .runtime
-            .resolve_by_id(token, target)
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+        let target_substrate = match registry
+            .resolve_kg_read_by_id(&self.runtime, token, target, false)
+            .await?
         {
             Some(Resolved::Entity(_)) => khive_types::SubstrateKind::Entity,
             Some(Resolved::Note(_)) => khive_types::SubstrateKind::Note,
@@ -2171,6 +2172,7 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -2320,7 +2322,9 @@ impl BrainPack {
                     "auto_feedback: invalid full_id {full_id:?}; expected full UUID"
                 ))
             })?,
-            None => resolve_auto_feedback_target(&self.runtime, &selected.id).await?,
+            None => {
+                resolve_auto_feedback_target(&self.runtime, token, registry, &selected.id).await?
+            }
         };
 
         let mut feedback_params = json!({
@@ -2359,7 +2363,7 @@ impl BrainPack {
             json!(p.results.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
 
         let mut out = self
-            .handle_feedback_from(token, feedback_params, "brain.auto_feedback")
+            .handle_feedback_from(token, feedback_params, "brain.auto_feedback", registry)
             .await?;
         out["verb"] = json!("brain.auto_feedback");
         out["feedback_verb"] = json!("brain.feedback");
@@ -2496,8 +2500,10 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        self.handle_feedback_from(token, params, "brain.emit").await
+        self.handle_feedback_from(token, params, "brain.emit", registry)
+            .await
     }
 
     // ── brain.bind ────────────────────────────────────────────────────────
@@ -3464,36 +3470,25 @@ fn route_via_fann(context: &[f32]) -> Vec<f32> {
 
 // ── brain.auto_feedback helpers ───────────────────────────────────────────────
 
-/// Resolve an `id` from `memory.recall` output to a full UUID.
+/// Resolve a recall/search handle to a full UUID under the dispatch token.
 ///
-/// Accepts a 36-char UUID directly, or an 8-char hex prefix (Agent-mode short
-/// form). Returns `InvalidInput` if neither form matches or the prefix is
-/// ambiguous.
-///
-/// #38: the full-UUID path above is already namespace-agnostic (ADR-007 Rev 6
-/// — by-ID resolution has no namespace check; the Gate, not storage-layer
-/// filtering, is the authz seam). The prefix path used to be scoped to the
-/// caller's own namespace via `resolve_prefix`, which broke the documented
-/// `memory.recall` -> `brain.auto_feedback` chain whenever the recalled
-/// record lived outside that scope: recall itself fans out cross-namespace by
-/// design (root CLAUDE.md "Rule 3b"), so a namespace-scoped prefix resolution
-/// could fail on an id recall had just served, with
-/// `"no record matches id prefix"`. `resolve_prefix_unfiltered` closes that
-/// asymmetry — same by-ID contract as the four CRUD-by-ID verbs
-/// (get/update/delete/merge) already use, no namespace filter, no `token`
-/// needed (there is no namespace to derive from one).
+/// UUID parsing is namespace-blind. Prefix lookup spans the registry's configured
+/// backends, preserves distinct-UUID ambiguity and propagates backend errors.
+/// The feedback handler subsequently admits only live KG entities and notes;
+/// event, edge, and private-table targets remain ineligible.
 pub(crate) async fn resolve_auto_feedback_target(
     runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
     raw: &str,
 ) -> Result<uuid::Uuid, RuntimeError> {
     if let Ok(uuid) = raw.parse::<uuid::Uuid>() {
         return Ok(uuid);
     }
     if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return runtime
-            .resolve_prefix_unfiltered(raw)
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+        return registry
+            .resolve_kg_read_prefix(runtime, token, raw, false)
+            .await?
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
                     "auto_feedback: no record matches id prefix: {raw:?}"
@@ -3616,8 +3611,8 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.deactivate" => self.handle_deactivate(token, params).await,
             "brain.archive" => self.handle_archive(token, params).await,
             "brain.reset" => self.handle_reset(token, params).await,
-            "brain.feedback" => self.handle_feedback(token, params).await,
-            "brain.auto_feedback" => self.handle_auto_feedback(token, params).await,
+            "brain.feedback" => self.handle_feedback(token, params, registry).await,
+            "brain.auto_feedback" => self.handle_auto_feedback(token, params, registry).await,
             "brain.record_serve" => self.handle_record_serve(token, params).await,
             "brain.mark_turn" => self.handle_mark_turn(token, params).await,
             // Declaration
@@ -3626,7 +3621,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.create_profile" => self.handle_create_profile(token, params).await,
             "brain.register_adapter" => self.handle_register_adapter(token, params).await,
             // Legacy
-            "brain.emit" => self.handle_emit(token, params).await,
+            "brain.emit" => self.handle_emit(token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "brain pack does not handle verb {verb:?}"
             ))),
