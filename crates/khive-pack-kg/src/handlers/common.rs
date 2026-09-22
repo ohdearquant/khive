@@ -1016,10 +1016,12 @@ pub(crate) fn merge_note_tags(
     properties: Option<Value>,
     tags: Option<Vec<String>>,
 ) -> Result<Option<Value>, RuntimeError> {
-    let tags = match tags {
-        Some(t) if !t.is_empty() => t,
-        _ => return Ok(properties),
+    let khive_runtime::EffectiveCreateTags::TopLevel(tags) =
+        khive_runtime::effective_create_tags(tags.as_deref(), properties.as_ref())
+    else {
+        return Ok(properties);
     };
+    let tags = json!(tags);
     let mut obj = match properties {
         None => serde_json::Map::new(),
         Some(Value::Object(m)) => m,
@@ -1029,7 +1031,7 @@ pub(crate) fn merge_note_tags(
             )));
         }
     };
-    obj.insert("tags".to_string(), json!(tags));
+    obj.insert("tags".to_string(), tags);
     Ok(Some(Value::Object(obj)))
 }
 

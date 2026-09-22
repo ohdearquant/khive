@@ -337,7 +337,11 @@ struct StreamCreateFields {
 }
 
 fn normalize_stream_create_fields(fields: &mut StreamCreateFields) -> RuntimeResult<()> {
-    if let Some(tags) = fields.tags.take().filter(|tags| !tags.is_empty()) {
+    let tags = fields.tags.take();
+    if let crate::EffectiveCreateTags::TopLevel(tags) =
+        crate::effective_create_tags(tags.as_deref(), fields.properties.as_ref())
+    {
+        let tags = json!(tags);
         let mut properties = match fields.properties.take() {
             None => serde_json::Map::new(),
             Some(Value::Object(properties)) => properties,
@@ -347,7 +351,7 @@ fn normalize_stream_create_fields(fields: &mut StreamCreateFields) -> RuntimeRes
                 ))
             }
         };
-        properties.insert("tags".into(), json!(tags));
+        properties.insert("tags".into(), tags);
         fields.properties = Some(Value::Object(properties));
     }
     Ok(())

@@ -41,6 +41,25 @@ fixes a code citation (§4).
 
 ## Decision
 
+### Amendment 2 (2026-09-21): shared session creation validation
+
+`session.store` and shared creation of `session` notes use one pure validator:
+content must be nonblank; optional title, provider and provider session ID must be
+nonblank strings; tags must be strings with no blank entries. Shared creation
+maps `name` to the title and reads provider metadata from `properties`. Optional
+null values remain equivalent to omission. Extra generic properties remain
+allowed, and valid values are stored verbatim.
+
+The session pack registers a `KindHook::prepare_create` validator. It checks the
+effective tags under the existing shared precedence: nonempty top-level `tags`
+replace `properties.tags`; absent, null or empty top-level tags preserve them.
+Existing stream creation paths also reach this hook. Standalone append retains
+its JSON record content and uses the existing object-field promotion for hooked
+kinds; keyed batch writes retain their existing serialized-doc semantics. This
+does not change updates, the session mirror, raw imports or approved proposal
+`AddNote`, whose separate admission contract remains in force. No schema or
+migration is introduced.
+
 ### Amendment 1 (2026-08-01): complete the list filter contract
 
 Issue #1493 establishes the concrete query need anticipated below: callers

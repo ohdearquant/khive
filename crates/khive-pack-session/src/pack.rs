@@ -2,9 +2,12 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
+};
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackSchemaPlan};
 
 use crate::{handlers, vocab::SESSION_HANDLERS};
@@ -61,6 +64,10 @@ impl PackRuntime for SessionPack {
 
     fn note_kinds(&self) -> &'static [&'static str] {
         <SessionPack as Pack>::NOTE_KINDS
+    }
+
+    fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+        (kind == "session").then(|| Arc::new(crate::hook::SessionKindHook) as Arc<dyn KindHook>)
     }
 
     fn entity_kinds(&self) -> &'static [&'static str] {
