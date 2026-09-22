@@ -398,3 +398,19 @@ caller set and does not count as verification.
   class, so automated callers can report "denied by gate" rather than
   misreporting their own work as failed. A zero-privilege "am I gated?"
   probe surface is follow-up work tracked separately.
+
+## Amendment: submitted gate arguments (2026-09-22, #2047)
+
+`GateRequest.args` is a compatibility field containing the submitted arguments at the
+runtime dispatch boundary, before handler canonicalization and kind hooks. It is available
+to a gate, but is not the effective argument set that the handler will execute. A policy
+requiring effective values must be enforced inside the handler after normalization.
+
+The observed distinction is deliberate: hooks may rewrite or derive values after the gate
+allows dispatch. Moving those hooks before authorization would expose handler validation
+to unauthorized callers and change dispatch ordering. This amendment documents the existing
+boundary; it removes no request field and changes neither policy evaluation nor ordering.
+
+This supplements [ADR-018](ADR-018-authorization-gate.md)'s gate seam. The superseded
+[ADR-053](ADR-053-authorization-gate.md) remains the historical caller-propagation pointer;
+its historical body and status are unchanged.
