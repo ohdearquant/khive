@@ -51,6 +51,14 @@ event counts additionally require `all_actors=true` and a serving-runtime
 [API reference](../../docs/guide/api-reference.md#brainevent_counts--assertive)
 for the exact actor filters and anonymous-caller behavior.
 
+Feedback uses a known `served_by_profile_id` as supplied. If that ID is unknown
+(including a bare role name), it resolves through the caller's actor, namespace,
+and recall-consumer binding, using the same table as recall. It does not create
+profiles or interpret role aliases. An unknown ID with no matching binding is
+`not_found`, naming the requested ID; only an omitted ID may use the default
+profile. Events record the resolved profile ID and `profile_resolution=binding`
+when this fallback applies. A known archived profile is still refused.
+
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
 reduction logic in another crate:
 
