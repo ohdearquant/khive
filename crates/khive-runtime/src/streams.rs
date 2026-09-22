@@ -1155,8 +1155,8 @@ impl KhiveRuntime {
             registry
                 .prepare_note_update_hook(self, token, &snapshot, &mut args)
                 .await?;
-            let plan = crate::atomic_prepare::prepare_update_from_note_snapshot(
-                self, token, &args, None, snapshot,
+            let (_, plan) = crate::atomic_prepare::prepare_update_from_note_snapshot(
+                self, token, &args, None, snapshot, registry,
             )
             .await?;
             return Ok(StreamBatchPreparation::Ready(Box::new(

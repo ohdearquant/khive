@@ -5035,6 +5035,7 @@ impl KhiveRuntime {
             });
         }
         let plan = AtomicOpPlan::Update(UpdatePlan {
+            graph_effects: Vec::new(),
             target_id: id,
             statements,
             post_commit: PostCommitEffect::None,
@@ -5158,6 +5159,7 @@ impl KhiveRuntime {
             });
         }
         let plan = AtomicOpPlan::Update(UpdatePlan {
+            graph_effects: Vec::new(),
             target_id: id,
             statements,
             post_commit: PostCommitEffect::None,
@@ -5225,6 +5227,7 @@ impl KhiveRuntime {
         }
         let updated_at = Utc::now();
         let plan = AtomicOpPlan::Update(UpdatePlan {
+            graph_effects: Vec::new(),
             target_id: id,
             statements: vec![PlanStatement {
                 statement: SqlStatement {

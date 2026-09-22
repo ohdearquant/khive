@@ -633,6 +633,23 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Describe graph changes coupled to a validated note patch, without writing.
+    ///
+    /// The dispatcher calls this only after normalization, kind validation, and
+    /// preparation of the note's guarded write. The runtime prepares these typed
+    /// effects and commits them with that write in one atomic unit. Implementors
+    /// must derive effects from this exact snapshot and patch; omitted or unchanged
+    /// owned fields should return no effects. This is not an after-update hook.
+    async fn note_update_effects(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        _patch: &crate::curation::NotePatch,
+    ) -> Result<Vec<NoteUpdateEffect>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
     /// Validate a shared entity-property update before storage is mutated.
     ///
     /// Runs after the caller's patch has been merged into the entity's
@@ -673,6 +690,19 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     ) -> Result<(), RuntimeError> {
         Ok(())
     }
+}
+
+/// A kind-owned graph mutation committed with its note update. SQL and deferred
+/// callbacks are deliberately not part of this interface.
+#[derive(Clone, Debug)]
+pub enum NoteUpdateEffect {
+    /// Create or explicitly resurrect an outgoing edge using normal link guards.
+    Link(LinkSpec),
+    /// Soft-delete one existing outgoing edge by ID, guarded by this snapshot.
+    DeleteEdge(khive_storage::types::Edge),
+    /// Preserve a live outgoing edge and assert its identity and endpoints at
+    /// commit time without changing its ID, timestamps, weight, or metadata.
+    AssertLink(khive_storage::types::Edge),
 }
 
 /// Optional sub-trait for packs that own private SQL tables and issue UUIDs
@@ -13526,6 +13556,8 @@ mod note_update_sequencing_tests {
         normalize_calls: AtomicUsize,
         validate_calls: AtomicUsize,
         validate_saw_marker: StdMutex<Option<bool>>,
+        effects_calls: AtomicUsize,
+        effects: StdMutex<Vec<NoteUpdateEffect>>,
     }
 
     #[async_trait]
@@ -13584,6 +13616,16 @@ mod note_update_sequencing_tests {
                 ));
             }
             Ok(())
+        }
+        async fn note_update_effects(
+            &self,
+            _runtime: &KhiveRuntime,
+            _token: &NamespaceToken,
+            _note: &khive_storage::Note,
+            _patch: &crate::NotePatch,
+        ) -> Result<Vec<NoteUpdateEffect>, RuntimeError> {
+            self.effects_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.effects.lock().unwrap().clone())
         }
     }
 
@@ -13718,6 +13760,375 @@ mod note_update_sequencing_tests {
         assert_eq!(hook.normalize_calls.load(Ordering::SeqCst), 1);
         assert_eq!(hook.validate_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*hook.validate_saw_marker.lock().unwrap(), Some(false));
+    }
+    async fn effects_fixture() -> (
+        KhiveRuntime,
+        NamespaceToken,
+        VerbRegistry,
+        Arc<SequencerProbeHook>,
+        khive_storage::Note,
+    ) {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let hook = Arc::new(SequencerProbeHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ProbePack(hook.clone()));
+        let registry = builder.build().unwrap();
+        let note = khive_storage::Note::new("local", "probe-note", "before");
+        let id = note.id;
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(note)
+            .await
+            .unwrap();
+        let note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap();
+        (runtime, token, registry, hook, note)
+    }
+
+    #[tokio::test]
+    async fn note_update_effects_are_not_computed_for_invalid_or_known_stale_patches() {
+        use crate::atomic_prepare::prepare_update_from_note_snapshot;
+        use serde_json::json;
+        let (runtime, token, registry, hook, snapshot) = effects_fixture().await;
+        let mut invalid = json!({"id": snapshot.id, "raw_marker": true});
+        registry
+            .prepare_note_update_hook(&runtime, &token, &snapshot, &mut invalid)
+            .await
+            .expect_err("kind validator refuses");
+        assert_eq!(hook.effects_calls.load(Ordering::SeqCst), 0);
+        for extra in [
+            json!({"salience": 2.0}),
+            json!({"expected_version": snapshot.version + 1}),
+        ] {
+            let mut args = json!({"id": snapshot.id, "raw_marker": false});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            registry
+                .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+                .await
+                .unwrap();
+            prepare_update_from_note_snapshot(
+                &runtime,
+                &token,
+                &args,
+                None,
+                snapshot.clone(),
+                &registry,
+            )
+            .await
+            .expect_err("invalid/stale update must be refused before effects");
+            assert_eq!(hook.effects_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .get_note(snapshot.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                snapshot
+            );
+        }
+        runtime
+            .update_note(
+                &token,
+                snapshot.id,
+                crate::NotePatch::new(None, Some("winner".into()), None, None, None),
+            )
+            .await
+            .unwrap();
+        let current = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut args = json!({"id": snapshot.id, "raw_marker": false});
+        registry
+            .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+            .await
+            .unwrap();
+        prepare_update_from_note_snapshot(
+            &runtime,
+            &token,
+            &args,
+            None,
+            snapshot.clone(),
+            &registry,
+        )
+        .await
+        .expect_err("known stale snapshot");
+        assert_eq!(hook.effects_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(snapshot.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn note_update_effects_missing_target_must_fail_without_note_changes() {
+        use serde_json::json;
+        let (runtime, token, registry, hook, snapshot) = effects_fixture().await;
+        *hook.effects.lock().unwrap() = vec![NoteUpdateEffect::Link(LinkSpec {
+            namespace: None,
+            source_id: snapshot.id,
+            target_id: uuid::Uuid::new_v4(),
+            relation: khive_storage::EdgeRelation::Annotates,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        })];
+        let mut args = json!({"id": snapshot.id, "raw_marker": false});
+        registry
+            .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+            .await
+            .unwrap();
+        let error = runtime
+            .update_note_from_snapshot_with_kind_effects(&token, snapshot.clone(), &args, &registry)
+            .await
+            .expect_err("missing link target must not become a successful note update");
+        assert!(matches!(error, RuntimeError::NotFound(_)), "{error}");
+        assert_eq!(hook.effects_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(snapshot.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn note_update_effects_do_not_replace_a_live_annotation_that_appeared_during_prepare() {
+        use khive_storage::EdgeRelation;
+        use serde_json::json;
+        let (runtime, token, registry, hook, snapshot) = effects_fixture().await;
+        let target = runtime
+            .create_entity(&token, "concept", None, "new target", None, None, vec![])
+            .await
+            .unwrap();
+        runtime
+            .link(
+                &token,
+                snapshot.id,
+                target.id,
+                EdgeRelation::Annotates,
+                0.3,
+                Some(json!({"keep": true})),
+            )
+            .await
+            .unwrap();
+        let before = runtime
+            .get_edge_by_natural_key_including_deleted(
+                &token,
+                "local",
+                snapshot.id,
+                target.id,
+                EdgeRelation::Annotates,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Models an owner's absent-edge observation followed by another writer
+        // creating the natural key before the runtime prepares the Link request.
+        *hook.effects.lock().unwrap() = vec![NoteUpdateEffect::Link(LinkSpec {
+            namespace: None,
+            source_id: snapshot.id,
+            target_id: target.id,
+            relation: EdgeRelation::Annotates,
+            weight: 1.0,
+            metadata: None,
+            resurrect: true,
+        })];
+        let mut args = json!({"id": snapshot.id, "raw_marker": false});
+        registry
+            .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+            .await
+            .unwrap();
+        let error = runtime
+            .update_note_from_snapshot_with_kind_effects(&token, snapshot.clone(), &args, &registry)
+            .await
+            .expect_err("typed create must not replace an intervening live edge");
+        assert!(error.to_string().contains("live edge appeared"), "{error}");
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(snapshot.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            snapshot
+        );
+        let after = runtime
+            .get_edge_by_natural_key_including_deleted(
+                &token,
+                "local",
+                snapshot.id,
+                target.id,
+                EdgeRelation::Annotates,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn note_update_effects_commit_guards_roll_back_note_and_prior_edge_effects() {
+        use crate::atomic_prepare::prepare_update_from_note_snapshot;
+        use crate::{run_atomic_unit, AtomicRunOutcome, EdgeListFilter};
+        use khive_storage::EdgeRelation;
+        use serde_json::json;
+        for stale_note in [false, true] {
+            let (runtime, token, registry, hook, snapshot) = effects_fixture().await;
+            let a = runtime
+                .create_entity(&token, "concept", None, "A", None, None, vec![])
+                .await
+                .unwrap();
+            let b = runtime
+                .create_entity(&token, "concept", None, "B", None, None, vec![])
+                .await
+                .unwrap();
+            let a_id = a.id;
+            let b_id = b.id;
+            runtime
+                .link(
+                    &token,
+                    snapshot.id,
+                    a_id,
+                    EdgeRelation::Annotates,
+                    1.0,
+                    None,
+                )
+                .await
+                .unwrap();
+            let old = runtime
+                .get_edge_by_natural_key_including_deleted(
+                    &token,
+                    "local",
+                    snapshot.id,
+                    a_id,
+                    EdgeRelation::Annotates,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            *hook.effects.lock().unwrap() = vec![
+                NoteUpdateEffect::DeleteEdge(old.clone()),
+                NoteUpdateEffect::Link(LinkSpec {
+                    namespace: None,
+                    source_id: snapshot.id,
+                    target_id: b_id,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                }),
+            ];
+            let mut args = json!({"id": snapshot.id, "raw_marker": false});
+            registry
+                .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+                .await
+                .unwrap();
+            let (_, plan) = prepare_update_from_note_snapshot(
+                &runtime,
+                &token,
+                &args,
+                None,
+                snapshot.clone(),
+                &registry,
+            )
+            .await
+            .unwrap();
+            let expected = if stale_note {
+                runtime
+                    .update_note(
+                        &token,
+                        snapshot.id,
+                        crate::NotePatch::new(
+                            None,
+                            Some("concurrent winner".into()),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                runtime.delete_entity(&token, b_id, false).await.unwrap();
+                snapshot.clone()
+            };
+            let outcome = run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    AtomicRunOutcome::RolledBack {
+                        failed_op_index: 0,
+                        ..
+                    }
+                ),
+                "missing endpoint / stale note MUST refuse: {outcome:?}"
+            );
+            assert_eq!(
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .get_note(snapshot.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            let edges = runtime
+                .list_edges(
+                    &token,
+                    EdgeListFilter {
+                        source_id: Some(snapshot.id),
+                        ..Default::default()
+                    },
+                    10,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_value(edges).unwrap(), json!([old]));
+            assert!(runtime
+                .get_edge_by_natural_key_including_deleted(
+                    &token,
+                    "local",
+                    snapshot.id,
+                    b_id,
+                    EdgeRelation::Annotates,
+                )
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 }
 

@@ -759,9 +759,11 @@ async fn prepare_one(
                     &resolved,
                     expected_kind,
                     note,
+                    registry,
                 )
                 .await
                 .map_err(anyhow::Error::new)?
+                .1
             } else {
                 khive_runtime::atomic_prepare::prepare_update(
                     runtime,

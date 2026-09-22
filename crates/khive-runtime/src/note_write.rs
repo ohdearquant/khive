@@ -718,6 +718,7 @@ impl KhiveRuntime {
                     .push_str(&format!(" AND version = ?{}", assertion.params.len()));
             }
             let plan = UpdatePlan {
+                graph_effects: Vec::new(),
                 target_id: note.id,
                 statements: vec![PlanStatement {
                     statement: assertion,
@@ -832,6 +833,7 @@ impl KhiveRuntime {
                 PostCommitEffect::None
             };
         let plan = UpdatePlan {
+            graph_effects: Vec::new(),
             target_id: note.id,
             statements,
             post_commit,

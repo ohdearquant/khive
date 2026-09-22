@@ -100,6 +100,35 @@ fn endpoint_exists_clause(id_param: &str) -> String {
     )
 }
 
+/// Assert an exact live edge snapshot without updating its row or firing write
+/// triggers. Retained links additionally require their endpoints to remain live;
+/// deletion assertions may remove an annotation whose former target is gone.
+pub fn edge_snapshot_assertion_statement(edge: &Edge, require_endpoints: bool) -> SqlStatement {
+    let mut sql = "SELECT 1 FROM graph_edges WHERE id=?1 AND namespace=?2 \
+        AND source_id=?3 AND target_id=?4 AND relation=?5 \
+        AND updated_at=?6 AND deleted_at IS NULL"
+        .to_string();
+    if require_endpoints {
+        sql.push_str(&format!(
+            " AND ({}) AND ({})",
+            endpoint_exists_clause("?3"),
+            endpoint_exists_clause("?4")
+        ));
+    }
+    SqlStatement {
+        sql,
+        params: vec![
+            SqlValue::Text(Uuid::from(edge.id).to_string()),
+            SqlValue::Text(edge.namespace.clone()),
+            SqlValue::Text(edge.source_id.to_string()),
+            SqlValue::Text(edge.target_id.to_string()),
+            SqlValue::Text(edge.relation.to_string()),
+            SqlValue::Integer(edge.updated_at.timestamp_micros()),
+        ],
+        label: Some("edge-snapshot-assertion".into()),
+    }
+}
+
 /// The exact natural-key-upserting `INSERT ... ON CONFLICT` this store's
 /// `upsert_edge` issues. Canonicalizes symmetric-relation endpoints first,
 /// matching `upsert_edge`'s own call to `canonical_edge_endpoints`.

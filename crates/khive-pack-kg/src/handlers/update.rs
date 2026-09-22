@@ -3,19 +3,16 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{
-    EdgePatch, EntityPatch, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
-};
+use khive_runtime::{EdgePatch, EntityPatch, NamespaceToken, RuntimeError, VerbRegistry};
 
 use khive_storage::Entity;
 use khive_types::pack::PACK_REGISTRY_TAGS;
 
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
-    optional_string_patch, pack_private_record_error, parse_relation, remap_note_status,
-    resolve_kind_spec, resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted,
-    string_value, to_json, validate_entity_type, DeleteParams, KindSpec, RestoreParams,
-    UpdateParams,
+    pack_private_record_error, parse_relation, remap_note_status, resolve_kind_spec,
+    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, string_value, to_json,
+    validate_entity_type, DeleteParams, KindSpec, RestoreParams, UpdateParams,
 };
 use crate::KgPack;
 
@@ -301,25 +298,15 @@ impl KgPack {
                 registry
                     .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
                     .await?;
-                let p: UpdateParams = deser(params)?;
+                let p: UpdateParams = deser(params.clone())?;
                 super::common::require_object_param(p.properties.as_ref(), "properties")?;
-                let patch = NotePatch::new(
-                    optional_string_patch(p.name, "name")?,
-                    p.content,
-                    p.salience,
-                    p.decay_factor,
-                    p.properties,
-                )
-                .with_write_options(khive_runtime::note_write::NoteWriteOptions {
-                    expected_version: p.expected_version,
-                    fence: p.fence,
-                    embed: p.embed,
-                    key: None,
-                });
+                // The shared plan consumes an exact UUID; retain canonical
+                // dispatch's earlier name/short-ID resolution.
+                params["id"] = serde_json::json!(id);
                 let original_version = note.version;
                 let (note, report) = self
                     .runtime
-                    .update_note_from_snapshot_with_embedding_report(token, note, patch)
+                    .update_note_from_snapshot_with_kind_effects(token, note, &params, registry)
                     .await?;
                 let mut response = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
                 if note.version == original_version {

@@ -382,7 +382,7 @@ operations known to be idempotent.
   no-ops, not rejections — canonical's field type is `Option<Value>`, and serde's derived
   `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the outer `Option`
   boundary and maps it straight to `None` regardless of the inner type, so canonical's own
-  "reject null" arms in `string_value`/`optional_string_patch` are unreachable through normal
+  literal-null branches in `string_value`/`description_patch` are unreachable through normal
   struct deserialization. This test deliberately does NOT implement the naive expectation
   ("`update(name=null)` REJECTED") since that doesn't match the live system. What canonical
   DOES still reject is a non-null, non-string `name` (e.g. `name: 123`) — pre-fix, atomic
