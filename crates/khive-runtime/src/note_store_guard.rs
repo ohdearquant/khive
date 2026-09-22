@@ -11,7 +11,10 @@
 //! validator does not cover a caller reaching `notes(&token)` directly and
 //! calling the raw storage insert/upsert methods — this decorator closes
 //! that seam by refusing the same three properties on a `kind = "message"`
-//! note at every full-note write.
+//! note at every full-note write. Existing non-message kinds with kind-owned
+//! identity (currently `channel_health`) may retain those fields on a full-row
+//! write, but cannot change or remove them. This allows heartbeat metadata/CAS
+//! updates through the public accessor while preserving its channel coordinates.
 //!
 //! The boundary this decorator enforces is the runtime's TYPED accessor
 //! surface — the seams pack code actually reaches. `KhiveRuntime::backend()`
@@ -38,6 +41,7 @@
 //! only when called with a `ChannelIngestCapability`. That keeps the trusted
 //! ingest path exempt by construction rather than by call site.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,13 +52,12 @@ use khive_storage::{
 use serde_json::Value;
 use uuid::Uuid;
 
-const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug"];
+use crate::curation::kind_owned_properties;
 
 fn transport_owned_message_property_named_in(
     properties: &serde_json::Map<String, Value>,
 ) -> Option<&'static str> {
-    TRANSPORT_OWNED_MESSAGE_PROPERTIES
+    kind_owned_properties("message")
         .iter()
         .copied()
         .find(|key| properties.contains_key(*key))
@@ -123,7 +126,7 @@ fn reject_reserved_patch_target(target: &str, operation: &'static str) -> Storag
             ),
         });
     }
-    if !TRANSPORT_OWNED_MESSAGE_PROPERTIES.contains(&first_segment) {
+    if !kind_owned_properties("message").contains(&first_segment) {
         return Ok(());
     }
     Err(StorageError::InvalidInput {
@@ -158,12 +161,66 @@ fn reject_reserved_replacement_properties(
     })
 }
 
+fn reject_changed_identity_properties(
+    existing: &Note,
+    properties: Option<&Value>,
+    operation: &'static str,
+) -> StorageResult<()> {
+    // Message admission remains presence-based, with its existing error text.
+    if existing.kind == "message" {
+        return Ok(());
+    }
+    for key in kind_owned_properties(&existing.kind) {
+        let before = existing
+            .properties
+            .as_ref()
+            .and_then(|value| value.get(*key));
+        let after = properties.and_then(|value| value.get(*key));
+        if before != after {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: operation.into(),
+                message: format!(
+                    "`{key}` is kind-owned on a `{}` note and cannot be changed through the \
+                     public NoteStore accessor",
+                    existing.kind
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_changed_identity_note(
+    existing: &Note,
+    note: &Note,
+    operation: &'static str,
+) -> StorageResult<()> {
+    if existing.kind != "message"
+        && !kind_owned_properties(&existing.kind).is_empty()
+        && existing.kind != note.kind
+    {
+        // Otherwise a caller could remove the owning kind first and change its
+        // coordinates in the next public write.
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: operation.into(),
+            message: format!(
+                "the kind of a `{}` note with kind-owned identity cannot be changed through \
+                 the public NoteStore accessor",
+                existing.kind
+            ),
+        });
+    }
+    reject_changed_identity_properties(existing, note.properties.as_ref(), operation)
+}
+
 /// Wraps `inner` so every full-note insert/upsert seam AND every
 /// property-patch seam enforces the reserved-transport-property policy
-/// described at module level. Insert/upsert refusal is scoped to
-/// `kind = "message"` notes (the note is in hand); the patch seams refuse
-/// the reserved keys on any note, since kind is not in their signatures and
-/// no public-store caller legitimately patches those keys at all.
+/// described at module level. Message writes retain their presence-based
+/// refusal. Other kind-owned identities are compared with the existing row,
+/// including tombstones, before replacement. Patch targets retain their existing
+/// transport-key refusal; whole-property replacement also cannot erase identity.
 pub(crate) struct PolicyEnforcingNoteStore {
     inner: Arc<dyn NoteStore>,
 }
@@ -171,6 +228,17 @@ pub(crate) struct PolicyEnforcingNoteStore {
 impl PolicyEnforcingNoteStore {
     pub(crate) fn wrap(inner: Arc<dyn NoteStore>) -> Arc<dyn NoteStore> {
         Arc::new(Self { inner })
+    }
+
+    async fn reject_identity_change(
+        &self,
+        note: &Note,
+        operation: &'static str,
+    ) -> StorageResult<()> {
+        if let Some(existing) = self.inner.get_note_including_deleted(note.id).await? {
+            reject_changed_identity_note(&existing, note, operation)?;
+        }
+        Ok(())
     }
 }
 
@@ -200,6 +268,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
 
     async fn upsert_note(&self, note: Note) -> StorageResult<()> {
         reject_if_forged_message_note(&note, "upsert_note")?;
+        self.reject_identity_change(&note, "upsert_note").await?;
         self.inner.upsert_note(note).await
     }
 
@@ -215,6 +284,8 @@ impl NoteStore for PolicyEnforcingNoteStore {
         expected_deleted_at: Option<i64>,
     ) -> StorageResult<bool> {
         reject_if_forged_message_note(&note, "replace_note_if_unchanged")?;
+        self.reject_identity_change(&note, "replace_note_if_unchanged")
+            .await?;
         self.inner
             .replace_note_if_unchanged(note, expected_updated_at, expected_deleted_at)
             .await
@@ -223,6 +294,19 @@ impl NoteStore for PolicyEnforcingNoteStore {
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary> {
         for note in &notes {
             reject_if_forged_message_note(note, "upsert_notes")?;
+        }
+        {
+            // Validate every row before the batch write. Repeated IDs must also
+            // preserve identity established earlier in this same batch.
+            let mut preceding: HashMap<Uuid, &Note> = HashMap::new();
+            for note in &notes {
+                if let Some(existing) = preceding.get(&note.id) {
+                    reject_changed_identity_note(existing, note, "upsert_notes")?;
+                } else {
+                    self.reject_identity_change(note, "upsert_notes").await?;
+                }
+                preceding.insert(note.id, note);
+            }
         }
         self.inner.upsert_notes(notes).await
     }
@@ -246,6 +330,13 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_replacement_properties(properties.as_ref(), "update_note_properties")?;
+        if let Some(existing) = self.inner.get_note_including_deleted(id).await? {
+            reject_changed_identity_properties(
+                &existing,
+                properties.as_ref(),
+                "update_note_properties",
+            )?;
+        }
         self.inner
             .update_note_properties(id, properties, updated_at)
             .await
@@ -405,3 +496,6 @@ impl NoteStore for PolicyEnforcingNoteStore {
         self.inner.get_notes_batch(ids).await
     }
 }
+
+#[cfg(test)]
+mod tests;

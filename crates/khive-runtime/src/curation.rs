@@ -4136,7 +4136,7 @@ const KIND_OWNED_PROPERTIES: &[(&str, &[&str])] = &[
     ("channel_health", &["channel_kind", "channel_slug"]),
 ];
 
-fn kind_owned_properties(kind: &str) -> &'static [&'static str] {
+pub(crate) fn kind_owned_properties(kind: &str) -> &'static [&'static str] {
     KIND_OWNED_PROPERTIES
         .iter()
         .find_map(|(owned_kind, keys)| (*owned_kind == kind).then_some(*keys))
@@ -4595,8 +4595,10 @@ mod tests {
             from.properties = Some(serde_json::json!({
                 "channel_kind": "telegram", "channel_slug": "absorbed@example.com", "new_metadata": true
             }));
+            // Trusted fixture setup establishes a distinct source identity;
+            // the public store must refuse changing an existing health row.
             runtime
-                .notes(&token)
+                .raw_notes(&token)
                 .unwrap()
                 .upsert_note(from.clone())
                 .await

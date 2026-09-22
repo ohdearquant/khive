@@ -695,8 +695,9 @@ impl KhiveRuntime {
     /// evidence `comm.health` trusts at face value — and refuses patching
     /// those keys through the property-mutation seams on any note kind, so
     /// the guard cannot be sidestepped by inserting a clean message note and
-    /// patching the evidence onto it afterward. The trusted channel-ingest
-    /// path does not go through this accessor; see
+    /// patching the evidence onto it afterward. Full-row writes also preserve
+    /// existing channel-health coordinates while allowing heartbeat metadata to
+    /// change. The trusted channel-ingest path does not go through this accessor; see
     /// `Self::raw_notes` and [`Self::try_create_note_as_trusted_ingest`].
     pub fn notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
         Ok(crate::note_store_guard::PolicyEnforcingNoteStore::wrap(
