@@ -20,7 +20,7 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `gtd`       | 6     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
@@ -1210,7 +1210,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 5 verbs
+## `gtd` pack — 6 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1309,6 +1309,22 @@ audit row is written, and a `note` passed with the request is not persisted, rep
 
 ```
 request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
+```
+
+### `gtd.census` — Assertive
+
+Read-only count of live task timestamps by raw numeric magnitude, for `created_at` and
+`properties.archived_at`. Every bucket (`null`, `nonnumeric`, `epoch_zero`, 10-, 13- and
+16-digit magnitudes, `other`) is returned, zeros included. No unit is inferred and nothing is
+repaired; `created_at_gt_archived_at_raw` compares raw numbers and is not temporal ordering.
+See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timestamp-census.md).
+
+| Param       | Type   | Required | Notes                                       |
+| ----------- | ------ | -------- | ------------------------------------------- |
+| `namespace` | string | no       | Count one visible namespace instead of all. |
+
+```
+request(ops="gtd.census()")
 ```
 
 ---

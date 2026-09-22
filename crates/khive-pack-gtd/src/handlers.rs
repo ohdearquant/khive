@@ -3,8 +3,8 @@
 //! Each handler: deserialize params from Value → validate → mutate via runtime
 //! → serialize a stable response shape (`id` short hex + `full_id` UUID).
 //!
-//! FILE SIZE JUSTIFICATION: All five GTD verb handlers (`assign`, `next`, `complete`,
-//! `tasks`, `transition`) share internal helpers (`load_task`, `atomic_gtd_transition`,
+//! FILE SIZE JUSTIFICATION: The task-lifecycle verb handlers (`assign`, `next`, `complete`,
+//! `tasks`, `transition`; the read-only `census` lives in `census.rs`) share internal helpers (`load_task`, `atomic_gtd_transition`,
 //! `ensure_audit_schema`, `write_audit_record_with_status`) that access `pub(crate)` symbols and
 //! must stay co-located to avoid circular imports within the crate. Splitting by verb
 //! would require either making those helpers `pub` (which widens the API surface) or
