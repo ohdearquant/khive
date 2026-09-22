@@ -253,8 +253,12 @@ impl LiveImap {
                     Err((e, _)) => {
                         // A token the server refused is dropped so the next
                         // poll fetches a new one instead of repeating the
-                        // refusal until the cached deadline passes.
-                        token_provider.invalidate(&token).await;
+                        // refusal until the cached deadline passes. A lost
+                        // connection or an unparsable reply says nothing about
+                        // the token, so it stays cached.
+                        if matches!(e, async_imap::error::Error::No(_)) {
+                            token_provider.invalidate(&token).await;
+                        }
                         return Err(ChannelError::Auth(format!(
                             "IMAP XOAUTH2 authenticate failed: {e}"
                         )));

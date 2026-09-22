@@ -25,14 +25,18 @@ than deadlocking concurrent callers.
 
 `get_token` fetches a new token whenever the cached one has less than 60 seconds of life
 remaining (`refresh_at`, computed as `expires_in - 60s` from the server-reported value).
-The deadline is kept on the wall clock (`SystemTime`). The token expires in wall time, and
-the monotonic clock on macOS does not advance while the system sleeps, so a deadline on that
-clock would keep serving an expired token after a sleep for as long as the machine was asleep.
+The deadline is kept on two clocks, and the token is served only while neither has passed.
+The monotonic clock on macOS does not advance while the system sleeps, so after a sleep a
+monotonic deadline alone would keep serving a token that has expired in wall time. The wall
+clock can be stepped backward, which alone would move an expired token back inside its
+deadline. Checking both refreshes the token in either case.
 
 `invalidate(rejected)` drops the cached token if it is still the one passed in, so the next
-`get_token` fetches a new one. The IMAP connector calls it when the server refuses an XOAUTH2
-authentication, which lets the next poll recover without waiting for the cached deadline. A
-token another caller has already replaced is left in place.
+`get_token` fetches a new one. A token another caller has already replaced is left in place.
+The IMAP connector calls it when the server answers the XOAUTH2 authentication with `NO`. The
+SMTP connector calls it when the connect/AUTH stage fails permanently (`ChannelError::Auth`).
+A timeout, a lost connection, an unparsable reply or a transient SMTP failure says nothing
+about the token and leaves it cached.
 
 ## Token response validation
 

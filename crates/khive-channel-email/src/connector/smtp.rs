@@ -364,21 +364,44 @@ impl SmtpConnector for LettreSmtp {
             references,
         )?;
 
-        let (credentials, mechanisms) = match &self.auth {
-            SmtpAuthConfig::Basic(credentials) => (credentials.clone(), DEFAULT_MECHANISMS),
+        self.deliver_message_with_connect(msg, || self.connect())
+            .await
+    }
+}
+
+impl LettreSmtp {
+    async fn deliver_message_with_connect<F, Fut>(
+        &self,
+        msg: Message,
+        connect: F,
+    ) -> Result<(), ChannelError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<AsyncSmtpConnection, ChannelError>>,
+    {
+        let (credentials, mechanisms, oauth) = match &self.auth {
+            SmtpAuthConfig::Basic(credentials) => (credentials.clone(), DEFAULT_MECHANISMS, None),
             SmtpAuthConfig::OAuth {
                 mailbox,
                 token_provider,
             } => {
                 let token = token_provider.get_token().await?;
                 (
-                    Credentials::new(mailbox.clone(), token),
+                    Credentials::new(mailbox.clone(), token.clone()),
                     &[Mechanism::Xoauth2][..],
+                    Some((token_provider, token)),
                 )
             }
         };
-        self.send_message_with_connect(msg, credentials, mechanisms, || self.connect())
-            .await
+        let result = self
+            .send_message_with_connect(msg, credentials, mechanisms, connect)
+            .await;
+        // `Auth` is the permanent connect/AUTH-stage refusal; a transient
+        // failure leaves the token cached.
+        if let (Err(ChannelError::Auth(_)), Some((token_provider, token))) = (&result, oauth) {
+            token_provider.invalidate(&token).await;
+        }
+        result
     }
 }
 
@@ -766,6 +789,57 @@ mod tests {
             ),
             (2, 2, 1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn smtp_oauth_refusal_drops_the_cached_token_but_a_transient_failure_keeps_it() {
+        let message = || {
+            build_message(
+                "sender@example.com",
+                "recipient@example.com",
+                "subject",
+                "body",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        for (reply, kept) in [
+            ("535 authentication refused", None),
+            ("454 temporary authentication failure", Some("oauth-token")),
+        ] {
+            let provider = Arc::new(TokenProvider::new("t".into(), "c".into(), "s".into()));
+            provider.cache_for_test("oauth-token").await;
+            let connector = LettreSmtp::new_oauth(
+                "unused.invalid",
+                587,
+                "sender@example.com",
+                Arc::clone(&provider),
+            );
+            let server =
+                ScriptedSmtp::new(vec![handshake(Mechanism::Xoauth2, "oauth-token", reply)]);
+            let err = tokio::time::timeout(
+                Duration::from_secs(2),
+                connector.deliver_message_with_connect(message(), || server.connect()),
+            )
+            .await
+            .expect("scripted delivery must finish")
+            .unwrap_err();
+            assert_eq!(
+                matches!(err, ChannelError::Auth(_)),
+                kept.is_none(),
+                "{reply}: {err:?}"
+            );
+            assert_eq!(
+                provider.cached_token_for_test().await.as_deref(),
+                kept,
+                "{reply}"
+            );
+            drop(connector);
+            assert_eq!(server.finish().await.messages, 0);
+        }
     }
 
     #[tokio::test]

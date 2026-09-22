@@ -6,7 +6,7 @@
 
 use std::{
     future::Future,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[cfg(test)]
@@ -95,14 +95,26 @@ impl async_imap::Authenticator for XOAuth2Authenticator {
 
 // ─────────────────────────────────────────────────── token provider cache
 
-/// A cached OAuth2 access token together with its expiry deadline.
+/// A cached OAuth2 access token together with its refresh deadline, kept on
+/// two clocks. The token is served only while neither deadline has passed.
+///
+/// Each clock alone misses one failure. The monotonic clock on macOS does not
+/// advance while the system sleeps, so after a sleep its deadline outlives the
+/// token by the time spent asleep. The wall clock can be stepped backward, which
+/// moves an expired token back inside its deadline. A token past either
+/// deadline is refreshed.
 struct CachedToken {
     access_token: String,
-    /// Wall-clock time at which a refresh should be attempted (60 s before
-    /// the server-reported `expires_in`). The token expires in wall time, and
-    /// the monotonic clock on macOS does not advance while the system sleeps,
-    /// so a deadline measured on it outlives the token by the time spent asleep.
-    expires_at: SystemTime,
+    /// Monotonic refresh deadline (60 s before the server-reported `expires_in`).
+    refresh_at: Instant,
+    /// Wall-clock refresh deadline for the same moment.
+    refresh_at_wall: SystemTime,
+}
+
+impl CachedToken {
+    fn is_fresh(&self) -> bool {
+        self.refresh_at > Instant::now() && self.refresh_at_wall > SystemTime::now()
+    }
 }
 
 /// Thread-safe OAuth2 token provider with a 60-second early-refresh margin.
@@ -149,7 +161,7 @@ impl TokenProvider {
         let mut guard = self.cached.lock().await;
 
         if let Some(cached) = guard.as_ref() {
-            if cached.expires_at > SystemTime::now() {
+            if cached.is_fresh() {
                 let access_token = cached.access_token.clone();
                 drop(guard);
                 return Ok(access_token);
@@ -170,15 +182,34 @@ impl TokenProvider {
             }
         };
 
-        let expires_at =
-            SystemTime::now() + Duration::from_secs(resp.expires_in.saturating_sub(60));
+        let lifetime = Duration::from_secs(resp.expires_in.saturating_sub(60));
         *guard = Some(CachedToken {
             access_token: resp.access_token.clone(),
-            expires_at,
+            refresh_at: Instant::now() + lifetime,
+            refresh_at_wall: SystemTime::now() + lifetime,
         });
         drop(guard);
 
         Ok(resp.access_token)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cache_for_test(&self, token: &str) {
+        const HOUR: Duration = Duration::from_secs(3600);
+        *self.cached.lock().await = Some(CachedToken {
+            access_token: token.to_string(),
+            refresh_at: Instant::now() + HOUR,
+            refresh_at_wall: SystemTime::now() + HOUR,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cached_token_for_test(&self) -> Option<String> {
+        self.cached
+            .lock()
+            .await
+            .as_ref()
+            .map(|cached| cached.access_token.clone())
     }
 
     /// Drop the cached token if it is still `rejected`, so the next
@@ -734,18 +765,38 @@ mod tests {
         assert_eq!(second, "hit_token");
     }
 
+    fn seed(
+        provider: &TokenProvider,
+        token: &str,
+        refresh_at: Instant,
+        refresh_at_wall: SystemTime,
+    ) {
+        *provider
+            .cached
+            .try_lock()
+            .expect("seed an uncontended cache") = Some(CachedToken {
+            access_token: token.to_string(),
+            refresh_at,
+            refresh_at_wall,
+        });
+    }
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
     /// A token the server rejected must not be served again: after
-    /// `invalidate`, the next call fetches even though the cached deadline
-    /// has not passed.
+    /// `invalidate`, the next call fetches even though neither deadline has
+    /// passed.
     #[tokio::test]
     async fn invalidated_token_is_refetched_before_its_deadline() {
         let provider = TokenProvider::new("t".into(), "c".into(), "s".into());
-        let stale = provider
-            .get_token_with_fetcher(|| async { Ok(success_resp("stale")) })
-            .await
-            .expect("first refresh must succeed");
+        seed(
+            &provider,
+            "stale",
+            Instant::now() + HOUR,
+            SystemTime::now() + HOUR,
+        );
 
-        provider.invalidate(&stale).await;
+        provider.invalidate("stale").await;
 
         let fresh = provider
             .get_token_with_fetcher(|| async { Ok(success_resp("fresh")) })
@@ -754,18 +805,28 @@ mod tests {
         assert_eq!(fresh, "fresh");
     }
 
-    /// Invalidating a token that is no longer cached must not discard the
-    /// replacement another caller already fetched.
+    /// A caller that saw the old token refused after another caller already
+    /// replaced it must not discard the replacement.
     #[tokio::test]
-    async fn invalidate_keeps_a_token_that_replaced_the_rejected_one() {
+    async fn late_invalidate_of_a_replaced_token_keeps_the_replacement() {
         let provider = TokenProvider::new("t".into(), "c".into(), "s".into());
-        provider
-            .get_token_with_fetcher(|| async { Ok(success_resp("current")) })
+        seed(
+            &provider,
+            "old",
+            Instant::now() + HOUR,
+            SystemTime::now() + HOUR,
+        );
+
+        // The first caller to see the refusal drops the token and fetches anew.
+        provider.invalidate("old").await;
+        let replacement = provider
+            .get_token_with_fetcher(|| async { Ok(success_resp("new")) })
             .await
-            .expect("first refresh must succeed");
+            .expect("replacement fetch must succeed");
+        assert_eq!(replacement, "new");
 
-        provider.invalidate("older").await;
-
+        // A second caller holding the same refused token reports it late.
+        provider.invalidate("old").await;
         let token = provider
             .get_token_with_fetcher(|| async {
                 panic!("the replacement token must still be cached");
@@ -774,23 +835,42 @@ mod tests {
             })
             .await
             .expect("cache hit must succeed without fetching");
-        assert_eq!(token, "current");
+        assert_eq!(token, "new");
     }
 
-    /// The cache deadline is compared on the wall clock, which keeps running
-    /// while the machine sleeps.
+    /// Sleep: the monotonic deadline has not passed because the monotonic
+    /// clock stood still, but wall time has moved past the token's expiry.
     #[tokio::test]
-    async fn token_past_its_wall_clock_deadline_is_refetched() {
+    async fn token_past_its_wall_deadline_is_refetched_while_monotonic_is_fresh() {
         let provider = TokenProvider::new("t".into(), "c".into(), "s".into());
-        *provider.cached.lock().await = Some(CachedToken {
-            access_token: "expired".to_string(),
-            expires_at: SystemTime::now() - Duration::from_secs(1),
-        });
+        seed(
+            &provider,
+            "expired",
+            Instant::now() + HOUR,
+            SystemTime::now() - Duration::from_secs(1),
+        );
 
         let token = provider
             .get_token_with_fetcher(|| async { Ok(success_resp("renewed")) })
             .await
-            .expect("refresh past the deadline must succeed");
+            .expect("refresh past the wall deadline must succeed");
+        assert_eq!(token, "renewed");
+    }
+
+    /// Backward clock step: the wall deadline reads as still ahead, but the
+    /// monotonic deadline has passed.
+    #[tokio::test]
+    async fn token_past_its_monotonic_deadline_is_refetched_while_wall_is_ahead() {
+        let provider = TokenProvider::new("t".into(), "c".into(), "s".into());
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock is past one second");
+        seed(&provider, "expired", past, SystemTime::now() + HOUR);
+
+        let token = provider
+            .get_token_with_fetcher(|| async { Ok(success_resp("renewed")) })
+            .await
+            .expect("refresh past the monotonic deadline must succeed");
         assert_eq!(token, "renewed");
     }
 
