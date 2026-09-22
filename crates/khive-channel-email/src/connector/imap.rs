@@ -239,19 +239,36 @@ impl LiveImap {
                 let token = token_provider.get_token().await?;
                 let authenticator = XOAuth2Authenticator {
                     mailbox: mailbox.clone(),
-                    token,
+                    token: token.clone(),
                 };
-                tokio::time::timeout(
+                match tokio::time::timeout(
                     Duration::from_secs(15),
                     client.authenticate("XOAUTH2", authenticator),
                 )
                 .await
                 .map_err(|_| {
                     ChannelError::Auth("IMAP XOAUTH2 authenticate timed out (15s)".into())
-                })?
-                .map_err(|(e, _)| {
-                    ChannelError::Auth(format!("IMAP XOAUTH2 authenticate failed: {e}"))
-                })?
+                })? {
+                    Ok(session) => session,
+                    Err((e, _)) => {
+                        // A token the server refused is dropped so the next
+                        // poll fetches a new one instead of repeating the
+                        // refusal until the cached deadline passes. A lost
+                        // connection or an unparsable reply says nothing about
+                        // the token, so it stays cached. Any tagged `NO` to
+                        // AUTHENTICATE counts, a temporary `[UNAVAILABLE]`
+                        // included: providers differ in whether a refused
+                        // bearer carries a response code, and dropping a good
+                        // token costs one refresh where keeping a refused one
+                        // repeats the refusal on every poll.
+                        if matches!(e, async_imap::error::Error::No(_)) {
+                            token_provider.invalidate(&token).await;
+                        }
+                        return Err(ChannelError::Auth(format!(
+                            "IMAP XOAUTH2 authenticate failed: {e}"
+                        )));
+                    }
+                }
             }
         };
 
