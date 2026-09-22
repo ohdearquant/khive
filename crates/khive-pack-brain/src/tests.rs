@@ -11377,7 +11377,26 @@ mod anonymous_feedback_admission_tests {
         assert!(khive_runtime::actor_is_unattributed(token.actor()));
         let registry = empty_registry();
         let target = create_test_entity(&rt, &token).await;
+        // Seed one attributed judgment so the default profile is persisted;
+        // an unpersisted default is minted per snapshot with a fresh timestamp.
+        let (_, attributed_rt) = make_pack();
+        let attributed_token = attributed_rt
+            .authorize(Namespace::local())
+            .expect("attributed seed token");
+        pack.dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1",
+            }),
+            &registry,
+            &attributed_token,
+        )
+        .await
+        .expect("attributed seed feedback");
         let before = feedback_state(&pack, &rt, &token).await;
+        assert_eq!(before["public"].as_array().unwrap().len(), 1);
         for verb in ["brain.feedback", "brain.auto_feedback"] {
             for signal in EXPLICIT_SIGNALS {
                 let error = pack
