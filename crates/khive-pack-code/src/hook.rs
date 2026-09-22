@@ -178,7 +178,7 @@ impl KindHook for FindingHook {
     /// resolving a finding is the one lifecycle action it has. That makes this
     /// the path that matters, not a secondary one.
     ///
-    /// Patch semantics follow the shared tri-state contract: a key that is
+    /// The finding update contract is tri-state: a key that is
     /// absent leaves the stored value alone, and a key present as `null` clears
     /// it. `severity` and `confidence` are optional on create, so clearing them
     /// lands in a state the create path can also produce. `kind_status` is not:
@@ -224,5 +224,9 @@ impl KindHook for FindingHook {
         validate_finding_evidence(map)?;
 
         Ok(())
+    }
+
+    fn note_update_null_clearing_properties(&self) -> &'static [&'static str] {
+        &["severity", "confidence"]
     }
 }

@@ -782,6 +782,7 @@ async fn prepare_note_update_plan_from_snapshot(
     args: &Value,
     expected_kind: &Option<AtomicUpdateKind>,
     note: khive_storage::note::Note,
+    policy: crate::NoteUpdatePolicy,
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
     if note.id != id {
@@ -830,6 +831,7 @@ async fn prepare_note_update_plan_from_snapshot(
             token,
             note,
             crate::curation::NotePatch::new(name, content, salience, decay_factor, properties)
+                .with_update_policy(policy)
                 .with_write_options(options),
         )
         .await?;
@@ -839,12 +841,35 @@ async fn prepare_note_update_plan_from_snapshot(
 /// Build an atomic update plan from the exact note snapshot already supplied
 /// to a pack update hook. Persistence is guarded by that snapshot's revision
 /// and deletion marker, so hook normalization cannot race a second read.
+/// This compatibility entry uses ordinary property merging; writers carrying a
+/// kind hook's policy use [`prepare_update_from_note_snapshot_with_policy`].
 pub async fn prepare_update_from_note_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
     expected_kind: Option<AtomicUpdateKind>,
     note: khive_storage::note::Note,
+) -> RuntimeResult<AtomicOpPlan> {
+    prepare_update_from_note_snapshot_with_policy(
+        runtime,
+        token,
+        args,
+        expected_kind,
+        note,
+        crate::NoteUpdatePolicy::default(),
+    )
+    .await
+}
+
+/// Prepare the validated note snapshot with the owning kind's property policy.
+/// Canonical and atomic writers retain the same merge and revision guards.
+pub async fn prepare_update_from_note_snapshot_with_policy(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    expected_kind: Option<AtomicUpdateKind>,
+    note: khive_storage::note::Note,
+    policy: crate::NoteUpdatePolicy,
 ) -> RuntimeResult<AtomicOpPlan> {
     if obj(args)?.get("entity_kind").is_some_and(|v| !v.is_null()) {
         return Err(RuntimeError::InvalidInput(
@@ -853,7 +878,7 @@ pub async fn prepare_update_from_note_snapshot(
                 .into(),
         ));
     }
-    prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
+    prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note, policy).await
 }
 
 /// `expected_kind`: `None` when the caller omitted `kind` (no check, parity
@@ -932,7 +957,15 @@ pub async fn prepare_update(
             // `prepare_update_note_from_snapshot` — the same implementation
             // canonical guarded update calls, including salience/decay range
             // validation. The plan retains this exact snapshot's revision.
-            prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
+            prepare_note_update_plan_from_snapshot(
+                runtime,
+                token,
+                args,
+                &expected_kind,
+                note,
+                crate::NoteUpdatePolicy::default(),
+            )
+            .await
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
             "update target {id} must be an entity, note, or edge"

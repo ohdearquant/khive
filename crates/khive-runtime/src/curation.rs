@@ -547,6 +547,23 @@ pub struct EdgePatch {
     pub properties: Option<Value>,
 }
 
+/// Kind-owned property semantics carried from validated hook preparation to
+/// the shared note merge. The default preserves ordinary JSON merge behavior.
+#[derive(Clone, Debug, Default)]
+pub struct NoteUpdatePolicy {
+    kind: Option<String>,
+    null_clearing_properties: &'static [&'static str],
+}
+
+impl NoteUpdatePolicy {
+    pub(crate) fn for_kind(kind: &str, null_clearing_properties: &'static [&'static str]) -> Self {
+        Self {
+            kind: Some(kind.to_owned()),
+            null_clearing_properties,
+        }
+    }
+}
+
 /// Patch for `update_note`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
 ///
 /// For `salience`/`decay_factor`:
@@ -562,6 +579,7 @@ pub struct NotePatch {
     pub properties: Option<Value>,
     pub(crate) kind_status: Option<String>,
     pub write_options: crate::note_write::NoteWriteOptions,
+    pub(crate) update_policy: NoteUpdatePolicy,
 }
 
 /// Normalize the public note tag replacement into its stored property before
@@ -612,11 +630,19 @@ impl NotePatch {
             properties,
             kind_status: None,
             write_options: Default::default(),
+            update_policy: Default::default(),
         }
     }
 
     pub fn with_write_options(mut self, options: crate::note_write::NoteWriteOptions) -> Self {
         self.write_options = options;
+        self
+    }
+
+    /// Apply the owning kind's policy returned by validated hook preparation.
+    /// This is not a caller-facing property-deletion parameter.
+    pub fn with_update_policy(mut self, policy: NoteUpdatePolicy) -> Self {
+        self.update_policy = policy;
         self
     }
 }
@@ -1751,6 +1777,16 @@ impl KhiveRuntime {
         let original_decay_factor = note.decay_factor;
         let original_properties = note.properties.clone();
         let original_status = note.status.clone();
+        if patch
+            .update_policy
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != note.kind)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "note update policy does not match the stored note kind".into(),
+            ));
+        }
         if patch.content.is_some() || patch.properties.is_some() {
             if let Some(error) = self.stream_member_error(&note).await? {
                 return Err(error);
@@ -1879,11 +1915,23 @@ impl KhiveRuntime {
                     )));
                 }
             }
-            let (merged, _) = merge_properties(
+            let incoming_properties = Some(props);
+            let (mut merged, _) = merge_properties(
                 &note.properties,
-                &Some(props),
+                &incoming_properties,
                 EntityDedupMergePolicy::PreferFrom,
             );
+            if let Some(properties) = merged.as_mut().and_then(Value::as_object_mut) {
+                for key in patch.update_policy.null_clearing_properties {
+                    if incoming_properties
+                        .as_ref()
+                        .and_then(|incoming| incoming.get(*key))
+                        .is_some_and(Value::is_null)
+                    {
+                        properties.remove(*key);
+                    }
+                }
+            }
             note.properties = merged;
         }
         if let Some(status) = patch.kind_status {
