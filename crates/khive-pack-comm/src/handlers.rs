@@ -482,6 +482,28 @@ pub(crate) async fn handle_delivered(
     }))
 }
 
+fn caller_inherits_legacy_pool(token: &NamespaceToken) -> bool {
+    token.actor().is_anonymous() && token.actor().id == "local"
+}
+
+fn legacy_recipient(properties: Option<&Value>) -> bool {
+    properties
+        .and_then(|properties| properties.get("to_actor"))
+        .is_none_or(Value::is_null)
+}
+
+fn addressed_recipient(properties: Option<&Value>) -> Option<&str> {
+    properties
+        .and_then(|properties| properties.get("to_actor"))
+        .and_then(Value::as_str)
+        .filter(|recipient| *recipient == "local" || is_valid_mailbox_actor_label(recipient))
+}
+
+fn caller_is_addressee(token: &NamespaceToken, properties: Option<&Value>) -> bool {
+    addressed_recipient(properties) == Some(token.actor().id.as_str())
+        || (caller_inherits_legacy_pool(token) && legacy_recipient(properties))
+}
+
 /// `inbox` — list inbound messages by default, or caller-authored sent rows (ADR-057).
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
 const MAX_INBOX_WAIT_MS: u64 = 30_000;
@@ -495,6 +517,7 @@ pub(crate) async fn handle_inbox(
     let p: InboxParams = deser(params.clone())?;
     let view =
         runtime.authorize_mailbox_view(token, "comm.inbox", p.mailbox_actor.as_deref(), &params)?;
+    let include_legacy = !view.delegated && caller_inherits_legacy_pool(token);
     let thread_id = p
         .thread_id
         .as_deref()
@@ -595,7 +618,13 @@ pub(crate) async fn handle_inbox(
     if raw_limit == 0 {
         let unread = if mailbox == "inbox" {
             let store = runtime.notes(token)?;
-            count_unread_messages(store.as_ref(), token.namespace().as_str(), &view).await?
+            count_unread_messages(
+                store.as_ref(),
+                token.namespace().as_str(),
+                &view,
+                include_legacy,
+            )
+            .await?
         } else {
             UnreadCount::zero()
         };
@@ -643,23 +672,18 @@ pub(crate) async fn handle_inbox(
     }
 
     if mailbox == "inbox" {
-        // ADR-057 Q3: own views keep legacy to_actor-less messages visible;
-        // closes the #199 multi-actor read leak for non-"local" callers.
-        // EqOrLegacyIndexed (not EqOrMissing) so this seeks
-        // idx_notes_unread_probe_recipient_direction on status="unread" instead of
-        // falling back to a namespace-wide direction-only scan; both partitions match
-        // the same rows EqOrMissing would (khive-storage/src/note.rs FilterOp docs).
-        // Delegated views use only the exact non-empty recipient index partition.
+        // Only the anonymous fallback inherits the missing/null partition.
+        // Every named/delegated view uses the typed exact-recipient seek.
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
-            op: if view.delegated {
+            op: if !include_legacy {
                 FilterOp::EqOrMissingIndexed
             } else {
                 FilterOp::EqOrLegacyIndexed
             },
             value: SqlValue::Text(view.actor_id.clone()),
         });
-        if view.delegated {
+        if !include_legacy {
             property_filters.push(PropertyFilter {
                 json_path: "$.to_actor".to_string(),
                 op: FilterOp::JsonTypeEq,
@@ -676,7 +700,7 @@ pub(crate) async fn handle_inbox(
     } else {
         property_filters.push(PropertyFilter {
             json_path: "$.from_actor".to_string(),
-            op: if view.actor_id == "local" {
+            op: if include_legacy {
                 FilterOp::EqOrMissing
             } else {
                 FilterOp::Eq
@@ -726,6 +750,7 @@ pub(crate) async fn handle_inbox(
             store,
             namespace,
             &view,
+            include_legacy,
             &filter,
             &p,
             before_micros,
@@ -793,6 +818,7 @@ async fn query_inbox_response(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
     view: &MailboxView,
+    include_legacy: bool,
     filter: &NoteFilter,
     params: &InboxParams,
     before_micros: Option<i64>,
@@ -885,7 +911,7 @@ async fn query_inbox_response(
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
     let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
-        count_unread_messages(store, namespace, view).await?
+        count_unread_messages(store, namespace, view, include_legacy).await?
     } else {
         UnreadCount::zero()
     };
@@ -926,7 +952,13 @@ pub(crate) async fn handle_unread(
         actor_id: caller_actor.clone(),
         delegated: false,
     };
-    let unread = count_unread_messages(store.as_ref(), token.namespace().as_str(), &view).await?;
+    let unread = count_unread_messages(
+        store.as_ref(),
+        token.namespace().as_str(),
+        &view,
+        caller_inherits_legacy_pool(token),
+    )
+    .await?;
 
     Ok(json!({
         "count": unread.count,
@@ -959,6 +991,7 @@ async fn count_unread_messages(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
     view: &MailboxView,
+    include_legacy: bool,
 ) -> Result<UnreadCount, RuntimeError> {
     let mut base_filters = vec![
         PropertyFilter {
@@ -972,7 +1005,7 @@ async fn count_unread_messages(
             value: SqlValue::Text("true".to_string()),
         },
     ];
-    if view.delegated {
+    if !include_legacy {
         // json_extract also returns object/array JSON as text; only string labels
         // may match an attributed recipient, even if an actor label looks like JSON.
         base_filters.push(PropertyFilter {
@@ -995,20 +1028,11 @@ async fn count_unread_messages(
             ..Default::default()
         }
     };
-    // Own views count the disjoint addressed and legacy-recipient partitions in one
-    // storage snapshot. Both predicates retain the recipient key expression
-    // required by idx_notes_unread_probe_recipient_direction, and the
-    // leading `direction = 'inbound'` filter in base_filters retains that
-    // index's direction key column, so the scan never walks the recipient's
-    // own outbound send history (every comm.send leaves a durable outbound
-    // copy addressed to the recipient that is never marked read). Each
-    // limited subquery stops after cap + 1 matches; together they retain the
-    // exact value below the public cap and make saturation explicit above
-    // it. A delegated view includes only the exact string-recipient partition:
-    // idx_notes_unread_probe_recipient_type_direction also seeks the JSON type so
-    // malformed rows sharing a JSON-text key cannot expand the count scan.
+    // Anonymous fallback views count addressed and missing/null partitions in
+    // one snapshot. Named/delegated views count only the typed exact partition;
+    // every bounded subquery retains the corresponding pinned recipient seek.
     let mut filters = vec![count_filter(FilterOp::EqOrMissingIndexed)];
-    if !view.delegated {
+    if include_legacy {
         filters.push(count_filter(FilterOp::JsonTypeMissingOrNullIndexed));
     }
     let counts = store
@@ -1158,7 +1182,7 @@ async fn mark_read_targets_atomic(
         .patch_note_property_atomic(
             ids,
             token.namespace().as_str(),
-            &read_recheck_filter(token.actor().id.as_str()),
+            &read_recheck_filter(token),
             "$.read",
             json!(true),
             Utc::now().timestamp_micros(),
@@ -1253,28 +1277,15 @@ async fn validate_read_target(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if direction == "outbound" {
-        // #2866: a sent copy is refused either way, but only a party to the
-        // exchange may learn that it is a sent copy and what its full id is. The
-        // outbound refusal names the resolved uuid, so a caller who asked by
-        // prefix about someone else's sent message would otherwise learn that it
-        // exists, exactly which one it is and its direction: the disclosure
-        // #2564 removed from the addressee refusal below. A non-party gets that
-        // refusal verbatim instead, so a sent copy and an inbound message
-        // addressed to someone else are indistinguishable to it. The party rule
-        // is `reply`'s (#113): sender or addressee, failing open only when the
-        // row carries neither attribution (pre-ADR-057 legacy).
-        let party = |key: &str| {
-            note.properties
-                .as_ref()
-                .and_then(|p| p.get(key))
-                .and_then(Value::as_str)
-        };
         let caller_actor = token.actor().id.as_str();
-        let (from_actor, to_actor) = (party("from_actor"), party("to_actor"));
-        if (from_actor.is_some() || to_actor.is_some())
-            && from_actor != Some(caller_actor)
-            && to_actor != Some(caller_actor)
-        {
+        let properties = note.properties.as_ref();
+        let from_actor = properties
+            .and_then(|p| p.get("from_actor"))
+            .and_then(Value::as_str);
+        let is_participant = addressed_recipient(properties)
+            .is_some_and(|recipient| recipient == caller_actor || from_actor == Some(caller_actor))
+            || (caller_inherits_legacy_pool(token) && legacy_recipient(properties));
+        if !is_participant {
             return Err(RuntimeError::InvalidInput(format!(
                 "read: that message is not addressed to caller actor {caller_actor:?}"
             )));
@@ -1284,64 +1295,44 @@ async fn validate_read_target(
         )));
     }
 
-    // #87: `read` mutates delivery state that belongs to the addressee — restrict
-    // it to the message's own `to_actor`, mirroring the strictness of the direction
-    // check above. Without this, any caller actor in the namespace could flip another
-    // actor's inbound message to read, corrupting the unread counts that fleet-wide
-    // wake/sweep logic polls. The error names only the caller's own actor, never the
-    // real addressee, so a non-addressee cannot use this to enumerate who a message
-    // was meant for.
-    //
-    // Pre-ADR-057 messages may carry no `to_actor` at all. That is treated as
-    // fail-open (with a warning), matching the inbox `EqOrMissing` filter's
-    // precedent (#199): those legacy messages are already visible to any caller via
-    // `comm.inbox` (no to_actor to filter on), so fail-closed here would leave them
-    // permanently unreadable and stuck "unread" — defeating the same wake/sweep logic
-    // this fix protects. The anonymous single-tenant default ("local") deployment is
-    // unaffected either way: caller and to_actor are both "local", so the equality
-    // check passes normally.
     let caller_actor = token.actor().id.as_str();
-    if let Some(to_actor) = note
-        .properties
-        .as_ref()
-        .and_then(|p| p.get("to_actor"))
-        .and_then(Value::as_str)
-    {
-        if to_actor != caller_actor {
-            // The resolved uuid stays out of this message: a caller who asked by
-            // 8-char prefix would otherwise learn both that a message exists and
-            // its full id from a refusal (issue #2564).
-            return Err(RuntimeError::InvalidInput(format!(
-                "read: that message is not addressed to caller actor {caller_actor:?}"
-            )));
-        }
-    } else {
-        tracing::warn!(
-            id = %id,
-            caller_actor = %caller_actor,
-            "comm mark-read: message has no `to_actor` (pre-ADR-057 legacy); allowing read \
-             without addressee verification (issue #87)"
-        );
+    if !caller_is_addressee(token, note.properties.as_ref()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "read: that message is not addressed to caller actor {caller_actor:?}"
+        )));
     }
 
     Ok((id, note))
 }
 
-fn read_recheck_filter(caller_actor: &str) -> NoteFilter {
+fn read_recheck_filter(token: &NamespaceToken) -> NoteFilter {
+    let include_legacy = caller_inherits_legacy_pool(token);
+    let mut property_filters = vec![
+        PropertyFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
+            value: SqlValue::Null,
+        },
+        PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: if include_legacy {
+                FilterOp::EqOrMissing
+            } else {
+                FilterOp::Eq
+            },
+            value: SqlValue::Text(token.actor().id.clone()),
+        },
+    ];
+    if !include_legacy {
+        property_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::JsonTypeEq,
+            value: SqlValue::Text("text".to_string()),
+        });
+    }
     NoteFilter {
         kind: Some("message".to_string()),
-        property_filters: vec![
-            PropertyFilter {
-                json_path: "$.direction".to_string(),
-                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
-                value: SqlValue::Null,
-            },
-            PropertyFilter {
-                json_path: "$.to_actor".to_string(),
-                op: FilterOp::EqOrMissing,
-                value: SqlValue::Text(caller_actor.to_string()),
-            },
-        ],
+        property_filters,
         ..Default::default()
     }
 }
@@ -1383,7 +1374,6 @@ async fn mark_read_target(
     // response can report exactly what is stored.
     let orig_props = note.properties.clone();
     let updated_at = Utc::now().timestamp_micros();
-    let caller_actor = token.actor().id.as_str();
 
     // Storage-side compare-and-swap: patches only the `$.read` key via
     // `json_set` instead of overwriting the whole `properties` column with
@@ -1394,7 +1384,7 @@ async fn mark_read_target(
     // the same `UPDATE` — the same eligibility predicate
     // `validate_read_target` already checked, re-evaluated at mutation time
     // rather than trusted from an earlier read.
-    let recheck_filter = read_recheck_filter(caller_actor);
+    let recheck_filter = read_recheck_filter(token);
 
     // Best-effort: under multi-client writer contention the pool checkout can
     // time out. The read itself already succeeded above — failing the whole
@@ -1595,42 +1585,18 @@ pub(crate) async fn handle_reply(
         .and_then(Value::as_str)
         .map(|s| s.to_string());
 
-    // #113: sibling of #87 — `reply` never checked who the caller is, so a
-    // caller holding a message id could reply to a message addressed to a
-    // different actor entirely (the reply then routes via the "other party"
-    // logic below, which assumes the caller IS one of the two parties). The
-    // rule chosen is thread-participant, not addressee-only: either party to
-    // the exchange (the addressee or the original sender) may reply, mirroring
-    // #94's thread-visibility filter rather than #87's stricter read-only
-    // rule — a reply from either party is a normal continuation of the
-    // exchange, unlike a third party silently flipping delivery state. #85's
-    // read-mark scoping at `d782709` closed the read-state side of this hole;
-    // the reply itself was still open.
-    //
-    // Fail open only when the original carries neither `to_actor` nor
-    // `from_actor` (pre-ADR-057 legacy — no attributed party to restrict
-    // against, matching #87/#94's rule for such rows). An unattributed caller
-    // is still actor `local`, so it may reply to local party-line messages but
-    // not messages attributed to other participants.
-    if original_to_actor.is_some() || original_from_actor.is_some() {
-        let caller_actor = token.actor().id.as_str();
-        let is_participant = original_from_actor.as_deref() == Some(caller_actor)
-            || original_to_actor.as_deref() == Some(caller_actor);
-        if !is_participant {
-            // Same non-disclosure rule as `read` above: the refusal names the
-            // caller's own actor and nothing the caller did not already supply
-            // (issue #2564).
-            return Err(RuntimeError::InvalidInput(format!(
-                "reply: that message is not addressed to or from caller actor {caller_actor:?}"
-            )));
-        }
-    } else {
-        tracing::warn!(
-            id = %id,
-            caller_actor = %token.actor().id,
-            "comm.reply: message has no `to_actor`/`from_actor` (pre-ADR-057 legacy); \
-             allowing reply without participant verification (issue #113)"
-        );
+    let caller_actor = token.actor().id.as_str();
+    let is_participant = addressed_recipient(Some(&orig_props)).is_some_and(|recipient| {
+        recipient == caller_actor || original_from_actor.as_deref() == Some(caller_actor)
+    }) || (caller_inherits_legacy_pool(token)
+        && legacy_recipient(Some(&orig_props))
+        && original_from_actor
+            .as_deref()
+            .is_none_or(|sender| sender == caller_actor));
+    if !is_participant {
+        return Err(RuntimeError::InvalidInput(format!(
+            "reply: that message is not addressed to or from caller actor {caller_actor:?}"
+        )));
     }
 
     let original_from = original_from_actor
@@ -1793,20 +1759,13 @@ pub(crate) async fn handle_reply(
     // no-op patch degrades to `marked_read: false` rather than failing a
     // delivered reply.
     //
-    // The mark is also addressee-scoped: "I read it" is only a claim the
-    // addressee can make. Replying does not give a third party the right to
-    // flip someone else's message, which is the same rule handle_read
-    // enforces. A legacy original with no `to_actor` fails open, matching
-    // handle_inbox's EqOrMissing visibility — a message anyone can see in
-    // their inbox must stay markable by someone, or it inflates unread
-    // counts forever.
+    // Reply participation does not grant addressee-owned read state. The
+    // mutation rechecks the same recipient policy as read/mark_read.
     let original_direction = orig_props
         .get("direction")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let caller_is_addressee = original_to_actor
-        .as_deref()
-        .is_none_or(|addressee| addressee == from_actor_label);
+    let caller_is_addressee = caller_is_addressee(token, Some(&orig_props));
     let marked_read = if replayed || original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
@@ -1817,7 +1776,14 @@ pub(crate) async fn handle_reply(
         // preserves every unrelated key without a race window (#1483).
         Some(
             store
-                .set_note_property(id, "read", json!(true), updated_at)
+                .try_patch_note_property(
+                    id,
+                    &original.namespace,
+                    &read_recheck_filter(token),
+                    "$.read",
+                    json!(true),
+                    updated_at,
+                )
                 .await
                 .unwrap_or(false),
         )
@@ -1982,16 +1948,8 @@ pub(crate) async fn handle_thread(
         });
     }
 
-    // #94 fix 1/2 — actor visibility: mirror `handle_inbox`'s EqOrMissing model
-    // (ADR-057 Q3) instead of the unfiltered namespace-wide read `thread` had
-    // before. In an own view, a caller may see a row iff they are a party to it
-    // (its sender or its addressee) or the row predates actor labeling (`to_actor` absent,
-    // back-compat visible-to-all — same rule `inbox` already applies). Before
-    // this filter, any caller who could resolve a thread id saw every actor's
-    // copies in that thread, including another actor's unread inbound state
-    // (issue #94 symptom 1/2: thread crossed the caller boundary that inbox
-    // already enforced). Delegated views exclude the unattributed pool before
-    // deduplication so an excluded twin cannot contribute its body or read flag.
+    // Exclude pool/malformed physical rows before pair deduplication and read
+    // folding. Named own views retain participation only on addressed rows.
     rows.retain(|r| {
         let props = r.json.get("properties");
         let to_actor = props
@@ -2007,9 +1965,9 @@ pub(crate) async fn handle_thread(
                         || recipient == view.actor_id.as_str())
             })
         } else {
-            from_actor == Some(view.actor_id.as_str())
-                || to_actor.is_none()
-                || to_actor == Some(view.actor_id.as_str())
+            addressed_recipient(props).is_some_and(|recipient| {
+                from_actor == Some(view.actor_id.as_str()) || recipient == view.actor_id.as_str()
+            }) || (caller_inherits_legacy_pool(token) && legacy_recipient(props))
         }
     });
 
@@ -3148,10 +3106,11 @@ stats AS ( \
     SELECT COUNT(*) AS stale_unread_count \
     FROM ( \
         SELECT 1 \
-        FROM notes INDEXED BY idx_notes_unread_probe_recipient_direction \
+        FROM notes INDEXED BY idx_notes_unread_probe_recipient_type_direction \
         WHERE notes.namespace = ?1 \
           AND notes.kind = 'message' \
           AND notes.deleted_at IS NULL \
+          AND json_type(notes.properties, '$.to_actor') = 'text' \
           AND ifnull(json_extract(notes.properties, '$.to_actor'), '') = ?2 \
           AND json_extract(notes.properties, '$.direction') = 'inbound' \
           AND (json_type(notes.properties, '$.read') IS NULL \
@@ -3172,6 +3131,7 @@ new_rows AS ( \
     WHERE notes.namespace = ?1 \
       AND notes.kind = 'message' \
       AND notes.deleted_at IS NULL \
+      AND json_type(notes.properties, '$.to_actor') = 'text' \
       AND json_extract(notes.properties, '$.to_actor') = ?2 \
       AND json_extract(notes.properties, '$.direction') = 'inbound' \
       AND (?3 IS NULL OR notes_seq.seq > ?3) \
