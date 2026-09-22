@@ -1083,7 +1083,7 @@ async fn probe_survives_vacuum_between_probes() {
     {
         let mut writer = sql.writer().await.expect("writer");
         writer
-            .execute_script_top_level("VACUUM;".to_string())
+            .execute_script_top_level(khive_storage::TopLevelMaintenance::Vacuum)
             .await
             .expect("vacuum succeeds");
     }

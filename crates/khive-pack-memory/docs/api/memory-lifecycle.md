@@ -8,10 +8,10 @@ The memory lifecycle begins with `memory.remember`, continues through recall fee
 
 Defaults differ by type:
 
-| Type | Salience | Decay factor | Default namespace |
-| --- | ---: | ---: | --- |
-| episodic | `0.3` | `0.02` | caller/actor namespace |
-| semantic | `0.5` | `0.005` | shared `local` namespace |
+| Type     | Salience | Decay factor | Default namespace        |
+| -------- | -------: | -----------: | ------------------------ |
+| episodic |    `0.3` |       `0.02` | caller/actor namespace   |
+| semantic |    `0.5` |      `0.005` | shared `local` namespace |
 
 An explicit namespace overrides both routing rules. Salience must be finite and inside `[0, 1]`. Decay factor must be finite and non-negative; there is no arbitrary upper clamp. Explicit caller values always replace defaults.
 
@@ -53,4 +53,4 @@ Deletion is soft, performed directly through `NoteStore`. That raw path bypasses
 
 Vacuum reclaims database pages after soft deletion. It accepts only an omitted or empty parameter object; any unknown field is rejected with an invalid-input error.
 
-SQLite `VACUUM` must run outside an open transaction. The handler issues `VACUUM;` through the writer's top-level script path (`execute_script_top_level`), which skips the usual transaction wrapper while still serializing on the single writer. Failures are returned as runtime storage errors; success reports completion without claiming how many bytes SQLite reclaimed.
+SQLite `VACUUM` must run outside an open transaction. The handler selects `TopLevelMaintenance::Vacuum` through the writer's typed top-level maintenance path (`execute_script_top_level`), which skips the usual transaction wrapper while still serializing on the single writer. Failures are returned as runtime storage errors; success reports completion without claiming how many bytes SQLite reclaimed.

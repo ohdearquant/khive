@@ -96,9 +96,13 @@ pub struct EntityFilter {
     pub kinds: Vec<String>,
     /// Filter by exact `entity_type` value. Multiple values are ORed.
     pub entity_types: Vec<String>,
+    /// Kind-qualified accepted subtype spellings. Groups are ORed; each group
+    /// requires its kind and one of its values. An empty value group matches nothing.
+    #[serde(default)]
+    pub entity_types_by_kind: std::collections::BTreeMap<String, Vec<String>>,
     /// For entity listing, fall back to a string `properties.type` only when
     /// `entity_type` is null. Does not change the returned entity or apply when
-    /// `entity_types` is empty. Other query callers retain exact-column filtering.
+    /// both type filters are empty. Other query callers retain exact-column filtering.
     #[serde(default)]
     pub legacy_entity_type_fallback: bool,
     pub name_prefix: Option<String>,

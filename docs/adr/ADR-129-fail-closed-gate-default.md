@@ -13,7 +13,7 @@
   invariant with store-held caller grants and hierarchical subactor identity,
   delivering per-caller differentiation in per-view form
 
-> **Implementation status (2026-08-30):** This accepted staged design is
+> **Implementation status (2026-09-21):** This accepted staged design is
 > partially shipped. Stage 1a has landed: every `Gate::check` call-site in
 > `khive-runtime` — both `dispatch_with_identity` and
 > `dispatch_intercepted_with_identity` — now treats a `GateError` as a
@@ -24,7 +24,9 @@
 > credentials and stays in the server-side log only). A static compatibility
 > `[gate]` roster is also shipped and enforced: exact `granted_actors` plus
 > the independent `grant_unattributed` flag install a fail-closed enrollment
-> gate when the table is present. Stage 1b through Stage 2 remain unshipped:
+> gate when the table is present. Amendment 3 adds an optional actor-pattern
+> restriction on caller-requested domain mutations to this compatibility gate.
+> Stage 1b through Stage 2 remain unshipped:
 > the current runtime default is still `AllowAllGate`, and the ADR-143
 > store-held caller-grant model has not been implemented. The static roster is
 > read on every boot rather than imported once. This note records
@@ -399,7 +401,99 @@ caller set and does not count as verification.
   misreporting their own work as failed. A zero-privilege "am I gated?"
   probe surface is follow-up work tracked separately.
 
-## Amendment: submitted gate arguments (2026-09-22, #2047)
+## Amendment 3 — static caller write restrictions (accepted 2026-09-21)
+
+The shipped static enrollment gate accepts an optional `deny_writes_for` list:
+
+```toml
+[gate]
+granted_actors = ["service:writer", "service:duty"]
+grant_unattributed = false
+deny_writes_for = ["*:duty"]
+```
+
+This deployment policy denies caller-requested domain mutations for matching,
+already enrolled actors. It does not replace enrollment, authenticate actors,
+implement the capability substrate, or change ADR-143's eventual grant model.
+It deliberately permits a reviewed set of reads with their existing incidental
+audit, cache, telemetry, and maintenance effects. Zero persistent-write read-only
+operation is outside this amendment's scope; that requires storage/token and
+maintenance semantics beyond a dispatch restriction.
+
+### Enrollment, matching, and classification
+
+For valid configuration, enrollment is checked first. An enrolled actor whose
+resolved ID matches any pattern may execute only explicit `Read` entries in the
+[reviewed operation table](../../crates/khive-gate/docs/api/operation-access.md).
+All other operations deny: explicit `Write` and any unclassified name, including
+internal subhandlers and mounted/plugin names. Classification is by exact
+operation name, never speech-act category or an inferred prefix. The table
+covers all statically linked handlers, optional packs, aliases, and the two
+authorization pseudo-operations. A production registry census must fail when a
+new handler lacks an explicit classification.
+
+Patterns are anchored to the complete actor ID and are case-sensitive. `*` alone
+is a wildcard, matching zero or more characters including `:`. All other Unicode
+characters are literal; no trimming, escape syntax, regular expressions, or
+hierarchy applies. At most 256 patterns are accepted, each nonblank and at most
+256 UTF-8 bytes. The anonymous fallback remains independently enrolled by
+`grant_unattributed`; after admission, its ID `local` is subject to matching.
+Argument fields such as `actor`, namespace, and `process_ref` never replace the
+effective gate actor. Per-request identity and host-verified `dispatch_as`
+identity use the existing dispatch identity resolution.
+
+### Authorization and nested calls
+
+`authorize` is `Write`: both `KhiveRuntime::authorize` and
+`authorize_with_visibility` must refuse broad read-and-write token minting for
+a restricted actor. `authorize.visible` is `Read`, but never grants the primary
+token by itself. The atomic CLI mutation path also requires the broad token and
+must fail without domain writes. Approved concrete read dispatch checks its own
+verb and can still supply the handler's existing token.
+
+There is no new internal authorization exemption. The earlier Amendment 1
+description of handler-internal calls does not imply an already-authorized
+bypass: raw runtime authorization checks the runtime's configured identity;
+nested registry calls that carry `RequestIdentity::from_token` check that
+request's actor again. In particular, `memory.recall` is `Read`, but
+`brain.record_serve` is `Write`: a restricted recall returns its hits and may
+persist `RecallExecuted` telemetry while the nested serve-ledger dispatch is
+denied and warns. Direct `brain.record_serve`, mutation aliases, and both
+`comm.read` and `comm.mark_read` remain denied. Existing `help=true` metadata
+introspection does not invoke the operation and retains its pre-gate behavior.
+
+### Compatibility and configuration identity
+
+Absent `[gate]` preserves the programmatic base gate, currently `AllowAllGate`
+by default. An empty table remains deny-all. Missing or empty
+`deny_writes_for` preserves enrollment-only behavior and its exact fingerprint;
+the existing `CallerEnrollmentGate::new` constructor is unchanged.
+
+Nonempty policy fingerprints include the enrollment fingerprint, sorted and
+deduplicated patterns, and a versioned classifier identity, with length-prefixed
+fields. Classification changes require a version change. The existing
+warm-daemon configuration identity therefore distinguishes changed effective
+restrictions. Invalid file configuration refuses startup. Because programmatic
+configuration conversion is infallible, an invalid programmatic list creates a
+distinct fingerprinted error state that refuses every gate check, even for an
+actor that would not match the malformed patterns.
+
+This boot-time policy does not revoke already-issued tokens or recheck direct
+storage mutations using them. A same-UID operator who controls actor labels or
+configuration is outside its authentication boundary. Future live revocation
+or zero-persistence read-only guarantees require a separate contract.
+
+### Required verification
+
+Regression coverage must exercise enrollment compatibility and invalid input,
+the whole-ID matcher including Unicode, all reviewed classifications, real
+approved reads and denied mutations with audit evidence, unknown and mounted
+operations, aliases, both broad authorization APIs, atomic no-mutation and
+writer controls, per-request/verified/intercepted identity, nested recall
+effects, and warm-daemon policy fingerprints. Default and optional-pack registry
+censuses must enumerate internal handlers as well as public verbs.
+
+## Amendment 4 — submitted gate arguments (2026-09-22)
 
 `GateRequest.args` is a compatibility field containing the submitted arguments at the
 runtime dispatch boundary, before handler canonicalization and kind hooks. It is available

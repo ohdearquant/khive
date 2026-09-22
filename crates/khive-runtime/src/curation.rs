@@ -1802,26 +1802,39 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
-            // ADR-056 makes these three properties transport evidence owned
-            // exclusively by `comm.ingest`. This check lives at the runtime
-            // patch seam, not only in comm's shared-CRUD hook, because direct
-            // Rust callers and atomic update preparation both arrive here
-            // without dispatching that hook. Scope it to `message`: the same
-            // JSON names remain ordinary caller metadata on every other kind.
-            if note.kind == "message" {
-                if !props.is_object() {
-                    return Err(RuntimeError::InvalidInput(
-                        "properties on a `message` note must be patched with an object: a \
-                         non-object patch would replace the transport-owned quarantine and \
-                         channel provenance established by `comm.ingest`"
-                            .into(),
-                    ));
-                }
-                if let Some(named) = message_transport_owned_property_named_in(&props) {
+            // Kind-owned identity is protected below pack hooks, including
+            // direct runtime and atomic/proposal update preparation. The merge
+            // path restores these same keys on its surviving row.
+            let owned_keys = kind_owned_properties(&note.kind);
+            if !owned_keys.is_empty() {
+                let object = props.as_object().ok_or_else(|| {
+                    if note.kind == "message" {
+                        RuntimeError::InvalidInput(
+                            "properties on a `message` note must be patched with an object: a \
+                             non-object patch would replace the transport-owned quarantine and \
+                             channel provenance established by `comm.ingest`"
+                                .into(),
+                        )
+                    } else {
+                        RuntimeError::InvalidInput(format!(
+                            "properties on a `{}` note must be patched with an object; \
+                             a non-object patch would erase its owner-established identity",
+                            note.kind
+                        ))
+                    }
+                })?;
+                if let Some(named) = owned_keys.iter().find(|key| object.contains_key(**key)) {
+                    if note.kind == "message" {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "`{named}` is transport-owned on a `message` note and cannot be patched; \
+                             only `comm.ingest` may establish quarantine disposition and channel \
+                             provenance"
+                        )));
+                    }
                     return Err(RuntimeError::InvalidInput(format!(
-                        "`{named}` is transport-owned on a `message` note and cannot be patched; \
-                         only `comm.ingest` may establish quarantine disposition and channel \
-                         provenance"
+                        "`{named}` is not patchable on a `{}` note; \
+                         use `comm.heartbeat` to report health without changing the row's identity",
+                        note.kind
                     )));
                 }
             }
@@ -3693,9 +3706,11 @@ fn merge_note_sql(
     if preserve_owner_established {
         preserve_owner_established_properties(&into_note.properties, &mut merged_props);
     }
-    if into_note.kind == "message" {
-        preserve_message_transport_properties(&into_note.properties, &mut merged_props);
-    }
+    preserve_property_keys(
+        kind_owned_properties(&into_note.kind),
+        &into_note.properties,
+        &mut merged_props,
+    );
 
     // Recomputed from the final retained properties rather than carried
     // forward from the fold's own count. The fold's count and post-
@@ -4109,15 +4124,22 @@ pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
     "external_id",
 ];
 
-/// Transport evidence that only `comm.ingest` may establish on a `message`.
-///
-/// This list is deliberately separate from [`OWNER_ESTABLISHED_PROPERTIES`].
-/// The latter applies to every pack-owned note kind; quarantine disposition
-/// and channel attribution are message-only, and protecting these names on a
-/// task, memory, or another pack-owned note would reserve ordinary metadata
-/// outside ADR-056's scope.
-pub(crate) const MESSAGE_TRANSPORT_OWNED_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug"];
+/// Kind-specific identity that generic updates cannot patch and merges must
+/// retain from the surviving record. Message transport evidence belongs to
+/// `comm.ingest`; health coordinates determine the UUID used by `comm.heartbeat`.
+/// Unlike OWNER_ESTABLISHED_PROPERTIES, these names remain ordinary metadata
+/// on other kinds, including tasks and memories.
+const KIND_OWNED_PROPERTIES: &[(&str, &[&str])] = &[
+    ("message", &["quarantined", "channel_kind", "channel_slug"]),
+    ("channel_health", &["channel_kind", "channel_slug"]),
+];
+
+pub(crate) fn kind_owned_properties(kind: &str) -> &'static [&'static str] {
+    KIND_OWNED_PROPERTIES
+        .iter()
+        .find_map(|(owned_kind, keys)| (*owned_kind == kind).then_some(*keys))
+        .unwrap_or(&[])
+}
 
 /// Whether a stored message note carries a live quarantine disposition.
 ///
@@ -4136,16 +4158,6 @@ fn message_is_quarantined(note: &khive_storage::note::Note) -> bool {
         Some(Value::String(value)) => value != "false",
         Some(_) => true,
     }
-}
-
-fn message_transport_owned_property_named_in(patch: &Value) -> Option<&'static str> {
-    let Value::Object(map) = patch else {
-        return None;
-    };
-    MESSAGE_TRANSPORT_OWNED_PROPERTIES
-        .iter()
-        .copied()
-        .find(|key| map.contains_key(*key))
 }
 
 /// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
@@ -4194,10 +4206,6 @@ pub(crate) fn preserve_owner_established_properties(
     merged: &mut Option<Value>,
 ) {
     preserve_property_keys(OWNER_ESTABLISHED_PROPERTIES, into, merged);
-}
-
-fn preserve_message_transport_properties(into: &Option<Value>, merged: &mut Option<Value>) {
-    preserve_property_keys(MESSAGE_TRANSPORT_OWNED_PROPERTIES, into, merged);
 }
 
 fn preserve_property_keys(keys: &[&str], into: &Option<Value>, merged: &mut Option<Value>) {
@@ -4467,6 +4475,164 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    async fn seed_health_identity_note(runtime: &KhiveRuntime, slug: &str) -> Note {
+        let mut note = Note::new("local", "channel_health", "health state");
+        note.properties = Some(serde_json::json!({
+            "channel_kind": "email", "channel_slug": slug, "operator_note": "original"
+        }));
+        runtime
+            .notes(&NamespaceToken::local())
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        note
+    }
+
+    /// Must fail without the runtime coordinate guard: the first plain update
+    /// succeeds and changes channel_kind even though no pack hook ran.
+    #[tokio::test]
+    async fn channel_health_identity_plain_update_refuses_coordinate_changes() {
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let note = seed_health_identity_note(&runtime, "original@example.com").await;
+        let before = serde_json::to_value(&note).unwrap();
+        for properties in [
+            serde_json::json!({"channel_kind": "telegram", "operator_note": "changed"}),
+            serde_json::json!({"channel_slug": "other@example.com"}),
+            serde_json::json!({"channel_kind": null}),
+            serde_json::json!({"channel_slug": null}),
+            serde_json::json!({"channel_kind": "email"}),
+            serde_json::json!({"channel_slug": "original@example.com"}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            let error = runtime
+                .update_note(
+                    &token,
+                    note.id,
+                    NotePatch::new(None, None, None, None, Some(properties)),
+                )
+                .await
+                .expect_err("plain runtime update must preserve heartbeat coordinates");
+            assert!(error.to_string().contains("channel_health"), "{error}");
+            let stored = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(stored).unwrap(), before);
+        }
+        let changed = runtime
+            .update_note(
+                &token,
+                note.id,
+                NotePatch::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(serde_json::json!({"operator_note": "changed"})),
+                ),
+            )
+            .await
+            .unwrap();
+        let properties = changed.properties.unwrap();
+        assert_eq!(properties["channel_kind"], "email");
+        assert_eq!(properties["channel_slug"], "original@example.com");
+        assert_eq!(properties["operator_note"], "changed");
+    }
+
+    #[tokio::test]
+    async fn channel_health_identity_atomic_prepare_refuses_coordinates() {
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let note = seed_health_identity_note(&runtime, "original@example.com").await;
+        let error = crate::atomic_prepare::prepare_update(
+            &runtime,
+            &token,
+            &serde_json::json!({
+                "id": note.id.to_string(),
+                "properties": {"channel_slug": "other@example.com"}
+            }),
+            None,
+        )
+        .await
+        .expect_err("atomic/proposal preparation must use the runtime identity guard");
+        assert!(error.to_string().contains("channel_slug"), "{error}");
+        let stored = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(note).unwrap()
+        );
+    }
+
+    /// Must fail without merge restoration: PreferFrom replaces the surviving
+    /// row's coordinates with the absorbed row's values.
+    #[tokio::test]
+    async fn channel_health_identity_merge_retains_survivor_coordinates() {
+        for strategy in [
+            EntityDedupMergePolicy::PreferFrom,
+            EntityDedupMergePolicy::Union,
+            EntityDedupMergePolicy::PreferInto,
+        ] {
+            let runtime = rt();
+            let token = NamespaceToken::local();
+            let into = seed_health_identity_note(&runtime, "survivor@example.com").await;
+            let mut from = seed_health_identity_note(&runtime, "absorbed@example.com").await;
+            from.properties = Some(serde_json::json!({
+                "channel_kind": "telegram", "channel_slug": "absorbed@example.com", "new_metadata": true
+            }));
+            // Trusted fixture setup establishes a distinct source identity;
+            // the public store must refuse changing an existing health row.
+            runtime
+                .raw_notes(&token)
+                .unwrap()
+                .upsert_note(from.clone())
+                .await
+                .unwrap();
+            runtime
+                .merge_note(
+                    &token,
+                    into.id,
+                    from.id,
+                    strategy,
+                    ContentMergeStrategy::PreferInto,
+                    false,
+                )
+                .await
+                .unwrap();
+            let stored = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(into.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.id, into.id);
+            assert_eq!(stored.created_at, into.created_at);
+            let properties = stored.properties.unwrap();
+            assert_eq!(properties["channel_kind"], "email");
+            assert_eq!(properties["channel_slug"], "survivor@example.com");
+            assert_eq!(properties["new_metadata"], true);
+            assert!(runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(from.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     async fn entity_update_events(

@@ -12,6 +12,8 @@ pub enum GateValidationError {
     EmptyActorId,
     #[error("verb must not be empty")]
     EmptyVerb,
+    #[error("invalid deny_writes_for configuration: {0}")]
+    InvalidWriteDenyPatterns(String),
     #[error("deny reason must not be empty")]
     EmptyDenyReason,
     #[error("audit tag must not be empty")]
