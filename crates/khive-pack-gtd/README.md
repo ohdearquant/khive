@@ -1,20 +1,21 @@
 # khive-pack-gtd
 
 The GTD (Getting Things Done) verb pack for khive. Adds the `task` note kind
-and five lifecycle verbs (`assign`, `next`, `complete`, `tasks`, `transition`)
-over the notes substrate.
+and five task-management verbs (`assign`, `next`, `complete`, `tasks`, `transition`)
+over the notes substrate, plus the read-only `gtd.census` timestamp census.
 
 ## Verbs
 
-| Verb             | What it does                                                                  |
-| ---------------- | ----------------------------------------------------------------------------- |
-| `gtd.assign`     | Create a task (note with `kind=task`); defaults `status=inbox`, `priority=p2` |
-| `gtd.next`       | List actionable tasks; optionally include blocked/broken dependency states    |
-| `gtd.complete`   | Mark a task `done` (or `cancelled`) with an optional result note              |
-| `gtd.tasks`      | Filtered task listing by status, assignee, priority                           |
-| `gtd.transition` | Explicit lifecycle change, validated against the state machine below          |
+| Verb             | What it does                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------- |
+| `gtd.census`     | Count task timestamp values by raw numeric magnitude without repair or unit inference |
+| `gtd.assign`     | Create a task (note with `kind=task`); defaults `status=inbox`, `priority=p2`         |
+| `gtd.next`       | List actionable tasks; optionally include blocked/broken dependency states            |
+| `gtd.complete`   | Mark a task `done` (or `cancelled`) with an optional result note                      |
+| `gtd.tasks`      | Filtered task listing by status, assignee, priority                                   |
+| `gtd.transition` | Explicit lifecycle change, validated against the state machine below                  |
 
-All five verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
+All six verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
 by `GtdPack::dispatch` (`src/pack.rs`).
 
 `gtd.complete` and `gtd.transition` are by-ID operations: a full UUID or a
@@ -26,6 +27,15 @@ authorization remains the Gate's responsibility.
 transition table as `gtd.transition`. Successful state changes report
 `audit_persisted`; `false` means the task write committed but the best-effort
 lifecycle-audit append failed.
+
+## Timestamp census
+
+`gtd.census()` reports counts for live task rows in the caller-visible namespaces
+on the bound runtime backend. An explicit `namespace` selects that query scope.
+It returns no task IDs or payloads, accepts no unit or repair option, and changes
+no stored values. Magnitude buckets are evidence for an operator to investigate;
+they do not identify the original units or a correct replacement date. See the
+[exact census contract](docs/api/task-timestamp-census.md).
 
 ## Task lifecycle
 

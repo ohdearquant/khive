@@ -2037,6 +2037,7 @@ impl VerbRegistry {
         ("comm", "comm.health"),
         ("comm", "comm.probe"),
         // gtd
+        ("gtd", "gtd.census"),
         ("gtd", "gtd.next"),
         ("gtd", "gtd.tasks"),
         // kg
