@@ -634,7 +634,7 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// property has invariants that generic CRUD cannot know about (for
     /// example, GTD task dependency acyclicity). This always runs after
     /// [`Self::normalize_note_update`], because
-    /// [`VerbRegistry::prepare_note_update_hook`] calls them in that order.
+    /// [`VerbRegistry::prepare_note_update_policy`] calls them in that order.
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -643,6 +643,14 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         _properties: Option<&Value>,
     ) -> Result<(), RuntimeError> {
         Ok(())
+    }
+
+    /// Optional top-level properties whose explicit null update deletes the
+    /// stored key after the shared merge. Omission still preserves the key.
+    /// The default changes no property semantics. This policy is returned only
+    /// after normalization and validation have accepted the update.
+    fn note_update_null_clearing_properties(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// Validate a shared entity-property update before storage is mutated.
@@ -3440,8 +3448,9 @@ impl VerbRegistry {
 
     /// Run the owning kind's shared-note-update normalizer/validator, if it declares one.
     ///
-    /// Both canonical KG dispatch and user-facing atomic preparation call this
-    /// seam so pack-specific property invariants cannot drift between them.
+    /// Compatibility wrapper for callers that only need normalization and
+    /// validation. Writers use [`Self::prepare_note_update_policy`] and attach
+    /// its returned policy so kind-specific property removals reach storage.
     ///
     /// The ordering lives here, at the single dispatch site, rather than in a
     /// [`KindHook`] method a pack could override: a pack implements the two
@@ -3454,6 +3463,22 @@ impl VerbRegistry {
         note: &khive_storage::Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
+        self.prepare_note_update_policy(runtime, token, note, args)
+            .await
+            .map(|_| ())
+    }
+
+    /// Normalize and validate a note update, then carry the owning kind's
+    /// property policy into the shared prepared write. Writers must attach the
+    /// returned policy to their `NotePatch` or snapshot update preparation;
+    /// [`Self::prepare_note_update_hook`] remains the validation-only wrapper.
+    pub async fn prepare_note_update_policy(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        args: &mut Value,
+    ) -> Result<crate::NoteUpdatePolicy, RuntimeError> {
         crate::curation::normalize_note_update_tags(args)?;
         if let Some(hook) = self.find_kind_hook(&note.kind) {
             hook.normalize_note_update(runtime, token, note, args)
@@ -3461,8 +3486,12 @@ impl VerbRegistry {
             let properties = args.get("properties").filter(|value| !value.is_null());
             hook.validate_note_update(runtime, token, note, properties)
                 .await?;
+            return Ok(crate::NoteUpdatePolicy::for_kind(
+                &note.kind,
+                hook.note_update_null_clearing_properties(),
+            ));
         }
-        Ok(())
+        Ok(crate::NoteUpdatePolicy::default())
     }
 
     /// Run the owning kind's shared-note-update property validator, if it
