@@ -7,7 +7,8 @@
   remainder of that record in force
 - Depends on: ADR-127 (authenticated actor and grant primitive), the capability
   substrate this design builds on — the published `lion-core` crate (crates.io,
-  Apache-2.0) plus `khive-capability`
+  Apache-2.0) plus the planned, currently unimplemented `khive-capability` crate
+  (a design dependency, not a current workspace/Cargo dependency)
 - Amended by: [ADR-143](ADR-143-store-held-caller-grants.md), which supersedes
   Amendment 2's configuration-text roster and "no runtime registration API"
   invariant with store-held caller grants and hierarchical subactor identity,
@@ -26,7 +27,10 @@
 > the independent `grant_unattributed` flag install a fail-closed enrollment
 > gate when the table is present. Amendment 3 adds an optional actor-pattern
 > restriction on caller-requested domain mutations to this compatibility gate.
-> Stage 1b through Stage 2 remain unshipped:
+> `khive-capability` has not yet been created or declared in the workspace;
+> the dependency above names accepted implementation work, not an installed
+> substrate (#2920). Stage 1b must supply that crate and its concrete gate before
+> Stage 2 can land. Stage 1b through Stage 2 remain unshipped:
 > the current runtime default is still `AllowAllGate`, and the ADR-143
 > store-held caller-grant model has not been implemented. The static roster is
 > read on every boot rather than imported once. This note records
