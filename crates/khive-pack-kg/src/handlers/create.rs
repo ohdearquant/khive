@@ -75,41 +75,121 @@ impl PreparedBulkEntity {
 }
 
 impl KgPack {
+    async fn prepare_create_fields(
+        &self,
+        kind: &str,
+        mut fields: CreateParams,
+        args: &mut Value,
+        hook: Option<&Arc<dyn KindHook>>,
+        registry: &VerbRegistry,
+    ) -> Result<(CreateParams, Option<Value>), RuntimeError> {
+        // Callers establish the shared field types and canonical kind first.
+        // Owners may then normalize values before semantic validation; both
+        // singleton and bulk creation pass through this same boundary.
+        if let Some(hook) = hook {
+            hook.prepare_create(&self.runtime, args).await?;
+            fields = deser(args.clone())?;
+        }
+        super::common::require_object_param(fields.properties.as_ref(), "properties")?;
+        if fields.kind != "note"
+            && (fields.key.is_some() || fields.embed.is_some() || fields.fence.is_some())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "key, embed and fence apply only to notes".into(),
+            ));
+        }
+        let normalized = if fields.kind == "entity" {
+            if fields.embedding_content.is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "embedding_content is only valid for kind=note".into(),
+                ));
+            }
+            let name = fields
+                .name
+                .as_deref()
+                .ok_or_else(|| RuntimeError::InvalidInput("kind=entity requires 'name'".into()))?;
+            if name.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+            }
+            let entity_type = validate_entity_type(kind, fields.entity_type.as_deref(), registry)?;
+            let normalized = describe_entity_type_normalization(
+                fields.entity_type.as_deref(),
+                entity_type.as_deref(),
+            );
+            fields.entity_type = entity_type;
+            normalized
+        } else {
+            None
+        };
+        Ok((fields, normalized))
+    }
+
     async fn prepare_bulk_entity(
         &self,
         kind: String,
-        mut args: Value,
+        entry: super::params::BulkCreateEntry,
+        token: &NamespaceToken,
         registry: &VerbRegistry,
     ) -> Result<(PreparedBulkEntity, Option<Value>), RuntimeError> {
         let hook = registry.find_kind_hook(&kind);
-        if let Some(hook) = &hook {
-            hook.prepare_create(&self.runtime, &mut args).await?;
-        }
-        let fields: CreateParams = deser(args.clone())?;
-        super::common::require_object_param(fields.properties.as_ref(), "properties")?;
-        if fields.kind != "entity"
-            || fields.key.is_some()
-            || fields.embed.is_some()
-            || fields.fence.is_some()
-            || fields.embedding_content.is_some()
-        {
+        // Bulk entries already crossed their typed deserialization boundary.
+        // Only hooks need a JSON argument object; the no-hook path stays typed.
+        let mut args = if hook.is_some() {
+            let mut args = json!({
+                "kind": "entity",
+                "entity_kind": kind,
+                "name": entry.name,
+                "namespace": token.namespace().as_str(),
+            });
+            if let Some(value) = &entry.entity_type {
+                args["entity_type"] = json!(value);
+            }
+            if let Some(value) = &entry.description {
+                args["description"] = json!(value);
+            }
+            if let Some(value) = &entry.properties {
+                args["properties"] = value.clone();
+            }
+            if let Some(value) = &entry.tags {
+                args["tags"] = json!(value);
+            }
+            args
+        } else {
+            Value::Null
+        };
+        let fields = CreateParams {
+            kind: "entity".into(),
+            entity_type: entry.entity_type,
+            name: Some(entry.name),
+            description: entry.description,
+            properties: entry.properties,
+            tags: entry.tags,
+            content: None,
+            salience: None,
+            annotates: None,
+            skip_dedup_check: None,
+            edges: None,
+            embedding_content: None,
+            key: None,
+            embed: None,
+            fence: None,
+        };
+        let (fields, normalized) = self
+            .prepare_create_fields(&kind, fields, &mut args, hook.as_ref(), registry)
+            .await?;
+        if fields.kind != "entity" {
             return Err(RuntimeError::InvalidInput(
                 "bulk create requires entity fields after kind-hook preparation".into(),
             ));
         }
         let name = fields
             .name
-            .ok_or_else(|| RuntimeError::InvalidInput("kind=entity requires 'name'".into()))?;
-        let entity_type = validate_entity_type(&kind, fields.entity_type.as_deref(), registry)?;
-        let normalized = describe_entity_type_normalization(
-            fields.entity_type.as_deref(),
-            entity_type.as_deref(),
-        );
+            .expect("entity fields validated during preparation");
         Ok((
             PreparedBulkEntity {
                 spec: EntityCreateSpec {
                     kind,
-                    entity_type,
+                    entity_type: fields.entity_type,
                     name,
                     description: fields.description,
                     properties: fields.properties,
@@ -221,15 +301,11 @@ impl KgPack {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                // Preserve the bulk shape/kind/type preflight. Owner preparation uses
+                // Preserve the bulk shape/kind preflight. Owner preparation uses
                 // this dispatch's registry, not the optional runtime update-hook map.
                 let mut inputs = Vec::with_capacity(attempted);
                 let mut entity_type_normalized: Vec<Value> = Vec::new();
                 for (idx, entry) in entries.into_iter().enumerate() {
-                    super::common::require_object_param(
-                        entry.properties.as_ref(),
-                        &format!("items[{idx}].properties"),
-                    )?;
                     // Resolve the item's own kind.
                     let item_kind_spec = resolve_kind_spec(&entry.kind, registry).map_err(|e| {
                         RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}"))
@@ -257,32 +333,17 @@ impl KgPack {
                             )));
                         }
                     };
-                    validate_entity_type(&canonical, entry.entity_type.as_deref(), registry)
-                        .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
-                    let mut args = json!({
-                        "kind": "entity",
-                        "entity_kind": canonical,
-                        "name": entry.name,
-                        "namespace": token.namespace().as_str(),
-                    });
-                    if let Some(value) = entry.entity_type {
-                        args["entity_type"] = json!(value);
-                    }
-                    if let Some(value) = entry.description {
-                        args["description"] = json!(value);
-                    }
-                    if let Some(value) = entry.properties {
-                        args["properties"] = value;
-                    }
-                    if let Some(value) = entry.tags {
-                        args["tags"] = json!(value);
-                    }
-                    inputs.push((canonical, args));
+                    inputs.push((canonical, entry));
                 }
 
                 let mut prepared = Vec::with_capacity(attempted);
-                for (idx, (kind, args)) in inputs.into_iter().enumerate() {
-                    let result = self.prepare_bulk_entity(kind, args, registry).await;
+                for (idx, (kind, entry)) in inputs.into_iter().enumerate() {
+                    let result = self
+                        .prepare_bulk_entity(kind, entry, token, registry)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
+                        });
                     if let Ok((_, Some(applied))) = &result {
                         let mut applied = applied.clone();
                         if let Some(obj) = applied.as_object_mut() {
@@ -474,19 +535,18 @@ impl KgPack {
         // `CreateParams` intentionally accepts the flavored hook-only keys as
         // unknown fields, so this validates the shared subset without
         // precluding pack-specific input.
-        let _: CreateParams = deser(params.clone())?;
-
-        if let Some(ref h) = hook {
-            h.prepare_create(&self.runtime, &mut params).await?;
-        }
-
-        let p: CreateParams = deser(params.clone())?;
-        super::common::require_object_param(p.properties.as_ref(), "properties")?;
-        if p.kind != "note" && (p.key.is_some() || p.embed.is_some() || p.fence.is_some()) {
-            return Err(RuntimeError::InvalidInput(
-                "key, embed and fence apply only to notes".into(),
-            ));
-        }
+        let fields: CreateParams = deser(params.clone())?;
+        let (p, entity_type_normalized) = self
+            .prepare_create_fields(
+                sub_kind
+                    .as_deref()
+                    .expect("create kind canonicalized above"),
+                fields,
+                &mut params,
+                hook.as_ref(),
+                registry,
+            )
+            .await?;
         let skip_dedup = p.skip_dedup_check.unwrap_or(false);
 
         let dedup_name: Option<String> = if !skip_dedup && p.kind == "entity" {
@@ -502,31 +562,15 @@ impl KgPack {
 
         let (mut response, new_id, embedding_input_truncated) = match p.kind.as_str() {
             "entity" => {
-                if p.embedding_content.is_some() {
-                    return Err(RuntimeError::InvalidInput(
-                        "embedding_content is only valid for kind=note".into(),
-                    ));
-                }
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
-                let name = p.name.ok_or_else(|| {
-                    RuntimeError::InvalidInput("kind=entity requires 'name'".into())
-                })?;
-                if name.trim().is_empty() {
-                    return Err(RuntimeError::InvalidInput("name must not be empty".into()));
-                }
+                let name = p.name.expect("entity fields validated during preparation");
                 let tags = p.tags.unwrap_or_default();
-                let validated_type =
-                    validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
-                let entity_type_normalized = describe_entity_type_normalization(
-                    p.entity_type.as_deref(),
-                    validated_type.as_deref(),
-                );
                 let (entity, embedding_report) = self
                     .runtime
                     .create_entity_with_embedding_report(
                         token,
                         &canonical,
-                        validated_type.as_deref(),
+                        p.entity_type.as_deref(),
                         &name,
                         p.description.as_deref(),
                         p.properties,

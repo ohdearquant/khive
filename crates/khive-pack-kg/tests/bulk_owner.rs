@@ -129,6 +129,112 @@ fn fixture() -> (KhiveRuntime, VerbRegistry, Arc<OwnerHook>) {
 }
 
 #[tokio::test]
+async fn owner_normalizes_raw_entity_type_for_singleton_and_bulk() {
+    for atomic in [true, false] {
+        let (_, registry, hook) = fixture();
+        let singleton = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept", "name": "singleton",
+                    "entity_type": "owner-shorthand", "skip_dedup_check": true,
+                }),
+            )
+            .await
+            .expect("the owner normalizes the raw entity_type before validation");
+        let bulk = registry
+            .dispatch(
+                "create",
+                json!({
+                    "atomic": atomic, "verbose": true,
+                    "items": [{
+                        "kind": "concept", "name": "bulk",
+                        "entity_type": "owner-shorthand",
+                    }],
+                }),
+            )
+            .await
+            .expect("bulk must use the same preparation order as singleton creation");
+        assert_eq!(bulk["created"], 1);
+        assert_eq!(bulk["failed"], 0);
+        for id in [&singleton["id"], &bulk["entities"][0]["id"]] {
+            let stored = registry.dispatch("get", json!({"id": id})).await.unwrap();
+            assert_eq!(stored["entity_type"], "function");
+        }
+        assert_eq!(singleton["entity_type_normalized"]["requested"], "method");
+        assert_eq!(singleton["entity_type_normalized"]["stored"], "function");
+        assert_eq!(bulk["entity_type_normalized"][0]["requested"], "method");
+        assert_eq!(bulk["entity_type_normalized"][0]["stored"], "function");
+        assert_eq!(bulk["entity_type_normalized"][0]["index"], 0);
+        let prepared = hook.prepared.lock().unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared
+            .iter()
+            .all(|args| args["entity_type"] == "owner-shorthand"));
+        assert_eq!(hook.created.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn invalid_entity_type_after_preparation_fails_for_singleton_and_bulk() {
+    for atomic in [true, false] {
+        for owner_installed in [true, false] {
+            let (runtime, hooked_registry, hook) = fixture();
+            let registry = if owner_installed {
+                hooked_registry
+            } else {
+                let mut builder = VerbRegistryBuilder::new();
+                builder.register(KgPack::new(runtime.clone()));
+                builder.build().unwrap()
+            };
+            // Must fail: an installed owner emits an unknown type, or no owner
+            // is available to normalize the caller's unknown type.
+            let fields = json!({
+                "kind": "concept", "name": "invalid",
+                "entity_type": "owner-shorthand",
+                "properties": {"corrupt": "entity_type"},
+            });
+            registry
+                .dispatch("create", fields.clone())
+                .await
+                .expect_err("entity_type must be valid after preparation");
+            let bulk = registry
+                .dispatch("create", json!({"atomic": atomic, "items": [fields]}))
+                .await;
+            if atomic {
+                let error = bulk.expect_err("an invalid prepared type rejects the batch");
+                assert!(error.to_string().contains("items[0]"));
+            } else {
+                let bulk = bulk.expect("a preparation error is an indexed item failure");
+                assert_eq!(bulk["created"], 0);
+                assert_eq!(bulk["failed"], 1);
+                assert_eq!(bulk["errors"][0]["index"], 0);
+                assert!(bulk["errors"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("items[0]"));
+            }
+            let listed = registry
+                .dispatch("list", json!({"kind": "entity"}))
+                .await
+                .unwrap();
+            assert!(listed["items"].as_array().unwrap().is_empty());
+            assert!(hook.created.lock().unwrap().is_empty());
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            assert_eq!(
+                runtime
+                    .text(&token)
+                    .unwrap()
+                    .count(khive_storage::TextFilter::default())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn bulk_owner_normalization_and_postcommit_effects_match_written_entities() {
     for atomic in [true, false] {
         let (_, registry, hook) = fixture();
