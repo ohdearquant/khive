@@ -51,6 +51,14 @@ event counts additionally require `all_actors=true` and a serving-runtime
 [API reference](../../docs/guide/api-reference.md#brainevent_counts--assertive)
 for the exact actor filters and anonymous-caller behavior.
 
+For a verb-by-caller dispatch-audit census, add
+`group_by=["verb","actor"]` and `kind="audit"` to `brain.event_counts`.
+The requested cross is nested by verb, then actor; omission or null preserves the
+existing response. Sampled windows expose the cross only as
+`counts_by_verb_and_actor_page_scoped`. `exhaustive=true` uses the existing
+full-window walk and safety bound. Grouping adds no separate cell-count budget
+or authorization path. See the [grouping contract](docs/api/event-count-groups.md).
+
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
 reduction logic in another crate:
 

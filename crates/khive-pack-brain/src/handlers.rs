@@ -77,7 +77,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     HandlerDef {
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
-            plane; feedback_explicit events additionally split by \
+            plane. Optional group_by=[\"verb\",\"actor\"] emits a nested counts_by_verb_and_actor \
+            map over the same events; when truncated it is named counts_by_verb_and_actor_page_scoped. \
+            Only that ordered pair is supported; omission/null adds no cross. Grouping reuses the \
+            existing actor scope and event-row caps, with no distinct-cell budget. Use kind=\"audit\" \
+            for a dispatch-audit census and exhaustive=true when the complete window is needed. \
+            feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
             with signal (by_profile_and_signal, keyed by served_by_profile_id then signal, \
@@ -157,6 +162,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Filter to a single EventKind (e.g. \"recall_executed\", \"feedback_explicit\"). Omit for all kinds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "group_by",
+                param_type: "array",
+                required: false,
+                description: "Optional ordered pair [\"verb\", \"actor\"] only. Returns a nested verb→actor count map over the same authorized event window; uses the _page_scoped key when truncated. Omission or null emits no cross. Reversed, repeated, unknown, or other dimensions are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -972,6 +984,7 @@ impl BrainPack {
             actor: Option<String>,
             all_actors: Option<bool>,
             kind: Option<String>,
+            group_by: Option<crate::event_counts_grouping::EventCountGroupBy>,
             // `Option`, not a required `String`: a bare-missing `since` must go through
             // the same named-field-plus-example-format error as a malformed one, not
             // serde's generic "missing field `since`" message.
@@ -1210,6 +1223,14 @@ impl BrainPack {
             },
         });
         result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
+        if let Some(group_by) = p.group_by {
+            group_by.add_to_result(
+                &mut result,
+                &items,
+                default_scope.then_some(caller.as_str()),
+                truncated,
+            );
+        }
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
         }

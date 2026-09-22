@@ -8,6 +8,7 @@ pub mod serve_ledger;
 pub mod tunable;
 
 mod event;
+mod event_counts_grouping;
 mod pack;
 mod sql;
 
@@ -101,3 +102,6 @@ pub(crate) fn validate_section_signals(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod event_counts_group_tests;
