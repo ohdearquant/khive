@@ -267,6 +267,18 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
         self.0.brain_consumer_kinds()
     }
 
+    async fn apply_profile_section_feedback(
+        &self,
+        token: &NamespaceToken,
+        profile_id: &str,
+        section_signals: serde_json::Value,
+        target_attribution: Option<String>,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        self.0
+            .apply_profile_section_feedback(token, profile_id, section_signals, target_attribution)
+            .await
+    }
+
     fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
         self.0.handlers()
     }

@@ -713,22 +713,28 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     // ── feedback tier ─────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.feedback",
-        description: "Apply per-section feedback signals to update section posterior weights",
+        description: "Record feedback on knowledge atoms/domains; optional section signals tune the selected profile or namespace prior. Knowledge event commits before profile learning; a later profile failure reports the committed event ID and unconfirmed profile outcome.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
-                name: "section_signals",
-                param_type: "object",
-                required: true,
-                description: "Map of section_type → signal string: {\"overview\": \"useful\", \"formalism\": \"not_useful\"}. Valid signals: useful | not_useful | wrong",
+                name: "section_signals", param_type: "object", required: false,
+                description: "Non-empty section_type to useful | not_useful | wrong map. At least signal or section_signals is required. Section learning requires an attributed caller; no scalar signal is invented.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
-                name: "target_id",
-                param_type: "string",
-                required: false,
-                description: "Optional UUID of the atom or entity being rated. It is forwarded to brain.feedback for profile-scoped section tracking only when a profile resolves: one configured on the pack, or one bound to this namespace for consumer_kind knowledge_compose. When neither resolves, the signals are applied to this namespace's pack-local section posteriors and the id is not consulted at all, which the response reports as tier=namespace_local with target_id_used=false. A forwarded id must name an entity or a note, the only kinds brain.feedback resolves; a domain id, such as the ones suggest returns, is not one of them and is refused there.",
+                name: "target_id", param_type: "string", required: false,
+                description: "Live knowledge atom/domain UUID or unique undashed hex prefix (at least 8 characters). Required with signal; optional for section-only feedback. KG entity/note IDs and slugs are not feedback targets. Supplied IDs are always resolved and recorded.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "signal", param_type: "string", required: false,
+                description: "Scalar judgment: useful | not_useful | wrong. Requires target_id; scalar-only feedback records the judgment without changing section weights.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "served_by_profile_id", param_type: "string", required: false,
+                description: "Explicit serving profile, ahead of pack configuration and actor/namespace knowledge_compose binding. Profile feedback requires an attributed caller. Omit all profile selectors to use namespace-local section state when no binding exists.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -873,7 +879,15 @@ mod tests {
             ),
             ("knowledge.cite", &["concept_id", "source_id", "weight"]),
             ("knowledge.topic", &["domain", "query", "limit"]),
-            ("knowledge.feedback", &["section_signals", "target_id"]),
+            (
+                "knowledge.feedback",
+                &[
+                    "section_signals",
+                    "target_id",
+                    "signal",
+                    "served_by_profile_id",
+                ],
+            ),
         ]
     }
 

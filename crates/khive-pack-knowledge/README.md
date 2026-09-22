@@ -25,9 +25,9 @@ rerank, and composed into markdown briefings under a token budget.
 - **Concept sugar over the KG** (`knowledge.learn`, `knowledge.cite`,
   `knowledge.topic`) — register a `concept` entity and link it to its introducing
   `document`/`person`/`org` without hand-rolling `create`/`link` calls
-- **Section feedback** (`knowledge.feedback`) — per-section `useful`/`not_useful`/
-  `wrong` signals update posterior weights, optionally forwarded to a configured
-  brain profile (ADR-032)
+- **Knowledge feedback** (`knowledge.feedback`) — scalar judgments on live atoms
+  and domains, plus optional per-section `useful`/`not_useful`/`wrong` signals
+  that update a configured/bound brain profile or namespace-local prior.
 
 ## Usage
 
@@ -147,3 +147,25 @@ ADRs:
 ## License
 
 Apache-2.0.
+
+### Feedback targets and commit order
+
+`knowledge.feedback` resolves `target_id` in knowledge atoms/domains using a full
+UUID or unique undashed hex prefix of at least 8 characters. KG entity/note IDs
+and slugs are refused. Supply `signal`, `section_signals`, or both; `target_id`
+is required with a scalar signal and optional for section-only feedback. Scalar
+judgments are preserved verbatim and scalar-only calls do not train sections.
+
+Section learning and explicit/bound profile feedback require an attributed
+caller. The serving profile resolves from `served_by_profile_id`, then pack
+configuration, then the actor/namespace `knowledge_compose` binding. A trusted
+in-process brain hook updates section weights without resolving a KG target or
+inventing a scalar signal; regular `brain.feedback` retains its KG-only target
+contract. Without a profile, section learning remains namespace-local.
+
+The knowledge event commits first. Profile section learning then commits its
+own public event, private learning log and snapshot atomically. These steps may
+use different databases, so there is no cross-database transaction: a later hook
+failure returns the committed knowledge event ID and reports the profile
+outcome as unconfirmed. Inspect that event before retrying; an error does not
+mean the knowledge judgment was rolled back.

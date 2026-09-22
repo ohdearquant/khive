@@ -1,7 +1,7 @@
 //! Integration tests for `knowledge.feedback` 3-tier profile resolution (ADR-035).
 //!
 //! Tier order (exclusive flow per ADR-035):
-//! 1. Explicit brain profile in pack config → route via `brain.feedback`, return early
+//! 1. Explicit brain profile in pack config → learn through the trusted brain section hook
 //! 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")`, matched_binding=true → return early
 //! 3. Namespace-keyed section_posteriors → update pack-local prior (only when tiers 1 and 2 do not resolve)
 
@@ -64,31 +64,28 @@ fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     .expect("runtime with actor")
 }
 
-/// Create a KG concept entity for use as brain.feedback target_id.
-///
-/// brain.feedback validates that target_id resolves to a real record in the
-/// namespace. Knowledge atoms are stored in a separate table outside the KG
-/// entity/note graph, so a KG entity (concept) must be used as the target.
-async fn make_entity(registry: &khive_runtime::VerbRegistry, ns: &str) -> String {
-    let r = registry
+/// Create a real corpus atom; knowledge feedback never borrows KG identity.
+async fn make_atom(registry: &khive_runtime::VerbRegistry, ns: &str) -> String {
+    registry.dispatch("knowledge.upsert_atoms", json!({
+        "namespace": ns,
+        "atoms": [{"slug":"feedback-target-atom", "name":"Feedback Target Atom",
+            "content":"dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"}]
+    })).await.expect("upsert atom");
+    let result = registry
         .dispatch(
-            "create",
-            json!({
-                "namespace": ns,
-                "kind": "concept",
-                "name": "TestConcept",
-                "description": "A test concept entity for knowledge feedback tests",
-            }),
+            "knowledge.get",
+            json!({"namespace":ns,"id":"feedback-target-atom"}),
         )
         .await
-        .expect("create entity");
-    r["id"].as_str().expect("entity id from create").to_string()
+        .expect("get atom");
+    assert_eq!(result["kind"], "atom");
+    result["id"].as_str().unwrap().to_owned()
 }
 
 // ── Tier-1 tests ──────────────────────────────────────────────────────────────
 
-/// Tier-1: explicit brain_profile in pack config routes exclusively to brain.feedback.
-/// When brain pack is not loaded, brain.feedback is absent → the call errors (not falls through).
+/// Tier-1: explicit brain_profile in pack config uses the trusted brain section hook.
+/// When brain pack is not loaded, brain.profile is absent → the call errors (not falls through).
 #[tokio::test]
 async fn feedback_tier1_explicit_profile_routes_to_brain() {
     let rt = make_rt(Some("balanced-recall-v1".into()), false);
@@ -100,9 +97,9 @@ async fn feedback_tier1_explicit_profile_routes_to_brain() {
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
-    // brain.feedback is not registered → explicit profile → error propagates.
+    // brain.profile is not registered → explicit profile → error propagates.
     let result = registry
         .dispatch(
             "knowledge.feedback",
@@ -134,7 +131,7 @@ async fn feedback_tier1_explicit_wins_over_bound_profile() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     // Create and bind a secondary profile as the "tier-2" candidate.
     registry
@@ -215,7 +212,7 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     // Create a secondary profile and bind it explicitly for consumer_kind="knowledge_compose".
     registry
@@ -274,7 +271,7 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
         "tier-2 feedback must route to brain pack: {r:?}"
     );
 
-    // ns-bound-compose must have total_events == 1.
+    // The selected profile must learn the section judgment.
     let prof = registry
         .dispatch(
             "brain.profile",
@@ -283,8 +280,10 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
         .await
         .expect("brain.profile");
     assert_eq!(
-        prof["total_events"].as_u64().unwrap_or(0),
-        1,
+        prof["section_posteriors"]["overview"]["alpha"]
+            .as_f64()
+            .unwrap(),
+        3.0,
         "ns-bound-compose must receive the feedback event"
     );
 }
@@ -301,6 +300,7 @@ async fn feedback_tier2_actor_bound_profile_credited() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -311,7 +311,7 @@ async fn feedback_tier2_actor_bound_profile_credited() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     registry
         .dispatch(
@@ -365,8 +365,10 @@ async fn feedback_tier2_actor_bound_profile_credited() {
         .await
         .expect("brain.profile");
     assert_eq!(
-        prof["total_events"].as_u64().unwrap_or(0),
-        1,
+        prof["section_posteriors"]["overview"]["alpha"]
+            .as_f64()
+            .unwrap(),
+        3.0,
         "actor-bound-compose must receive the feedback event"
     );
 }
@@ -394,7 +396,7 @@ async fn feedback_tier3_namespace_fallback_no_explicit_binding() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     // Confirm brain.resolve reports no explicit binding for consumer_kind=
     // "knowledge_compose". Unlike "recall" (which always has the seeded
@@ -417,7 +419,7 @@ async fn feedback_tier3_namespace_fallback_no_explicit_binding() {
         );
     }
 
-    // Tier-3 must fire: section_posteriors updated, ok=true, no emitted key.
+    // Tier-3 records its own event and updates namespace-local sections.
     let r = registry
         .dispatch(
             "knowledge.feedback",
@@ -435,10 +437,8 @@ async fn feedback_tier3_namespace_fallback_no_explicit_binding() {
         r.get("total_events").is_some(),
         "tier-3 must include total_events from section_posteriors: {r:?}"
     );
-    assert!(
-        r.get("emitted").is_none(),
-        "tier-3 must not route to brain.feedback (no emitted key): {r:?}"
-    );
+    assert_eq!(r["emitted"], true, "tier-3 persists a knowledge event");
+    assert!(r["profile_event_id"].is_null());
 }
 
 /// Tier-3 without brain pack: feedback falls through to its namespace-local prior.
@@ -454,7 +454,7 @@ async fn feedback_tier3_no_brain_pack() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     let r = registry
         .dispatch(
@@ -533,7 +533,7 @@ async fn feedback_tier1_response_names_its_tier() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     let r = registry
         .dispatch(
@@ -554,7 +554,7 @@ async fn feedback_tier1_response_names_its_tier() {
     );
     assert_eq!(
         r["target_id_used"], true,
-        "tier-1 forwards target_id to brain.feedback: {r:?}"
+        "tier-1 records target_id in its knowledge event: {r:?}"
     );
 }
 
@@ -572,7 +572,7 @@ async fn feedback_tier2_response_names_its_tier() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     registry
         .dispatch(
@@ -620,14 +620,13 @@ async fn feedback_tier2_response_names_its_tier() {
     );
     assert_eq!(
         r["target_id_used"], true,
-        "tier-2 forwards target_id to brain.feedback: {r:?}"
+        "tier-2 records target_id in its knowledge event: {r:?}"
     );
 }
 
-/// Tier-3 names its own tier and reports that the supplied id was not consulted,
-/// even though the id is a real record.
+/// Tier-3 records the target and names its section-learning tier.
 #[tokio::test]
-async fn feedback_tier3_response_names_its_tier_and_reports_the_id_unused() {
+async fn feedback_tier3_response_names_its_tier_and_records_the_resolved_id() {
     let rt = make_rt(None, false);
     let ns = Namespace::parse("local").expect("ns");
 
@@ -638,7 +637,7 @@ async fn feedback_tier3_response_names_its_tier_and_reports_the_id_unused() {
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
 
     let r = registry
         .dispatch(
@@ -658,54 +657,33 @@ async fn feedback_tier3_response_names_its_tier_and_reports_the_id_unused() {
         "tier-3 must name its tier: {r:?}"
     );
     assert_eq!(
-        r["target_id_used"], false,
-        "tier-3 records against the namespace only; a real id is still not consulted: {r:?}"
+        r["target_id_used"], true,
+        "tier-3 records the resolved knowledge target: {r:?}"
     );
 }
 
-/// Tier-3 accepts a syntactically valid id that names no record, and says so.
-/// This is the behaviour the response now reports rather than hides: the pack
-/// has no resolver on this path, so the call cannot be refused on the id's
-/// account without also refusing knowledge atoms (which the entity/note
-/// resolver does not cover).
+/// An unresolved target is refused even without a configured profile.
 #[tokio::test]
-async fn feedback_tier3_accepts_a_target_id_naming_nothing_and_says_it_was_unused() {
+async fn feedback_tier3_rejects_a_missing_target() {
     let rt = make_rt(None, false);
-    let ns = Namespace::parse("local").expect("ns");
-
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(KnowledgePack::new(rt.clone()));
-    let registry = builder.build().expect("registry");
-
-    let r = registry
+    builder.register(KnowledgePack::new(rt));
+    let registry = builder.build().unwrap();
+    let error = registry
         .dispatch(
             "knowledge.feedback",
             json!({
-                "namespace": ns.as_str(),
-                "target_id": ID_NAMING_NOTHING,
-                "section_signals": {"overview": "useful"},
+                "target_id": ID_NAMING_NOTHING, "section_signals":{"overview":"useful"}
             }),
         )
         .await
-        .expect("tier-3 accepts an id it never resolves");
-
-    assert_eq!(r["ok"], true, "tier-3 still applies the signals: {r:?}");
-    assert_eq!(
-        r.get("tier").and_then(|v| v.as_str()),
-        Some("namespace_local"),
-        "tier-3 must name its tier: {r:?}"
-    );
-    assert_eq!(
-        r["target_id_used"], false,
-        "the response must not let an unresolvable id read as a credited one: {r:?}"
-    );
+        .unwrap_err();
+    assert!(error.to_string().contains("knowledge target"), "{error}");
 }
 
-/// The same id, under a resolving profile, is refused: `brain.feedback` resolves
-/// the target and returns NotFound. This arm is what makes the tier-3 arm above
-/// a statement about tier 3 rather than about the id.
+/// Missing corpus targets are refused with a configured profile too.
 #[tokio::test]
 async fn feedback_tier1_rejects_a_target_id_naming_nothing() {
     let rt = make_rt(Some("balanced-recall-v1".into()), true);
@@ -721,7 +699,7 @@ async fn feedback_tier1_rejects_a_target_id_naming_nothing() {
 
     // Positive control in the same arm: a real id under the same runtime is
     // accepted, so the refusal below is about the id and not about the setup.
-    let atom_id = make_entity(&registry, ns.as_str()).await;
+    let atom_id = make_atom(&registry, ns.as_str()).await;
     let ok = registry
         .dispatch(
             "knowledge.feedback",
@@ -784,11 +762,9 @@ async fn make_domain(registry: &khive_runtime::VerbRegistry, ns: &str) -> String
         .to_string()
 }
 
-/// A domain id is recorded against the namespace on tier 3, and the response
-/// says the id itself was not consulted — so nothing about which domain was
-/// rated is retained.
+/// Domain attribution is retained in namespace-local feedback too.
 #[tokio::test]
-async fn feedback_tier3_takes_a_domain_id_and_reports_it_unused() {
+async fn feedback_tier3_records_a_domain_id() {
     let rt = make_rt(None, false);
     let ns = Namespace::parse("local").expect("ns");
 
@@ -818,18 +794,14 @@ async fn feedback_tier3_takes_a_domain_id_and_reports_it_unused() {
         "tier-3 must name its tier: {r:?}"
     );
     assert_eq!(
-        r["target_id_used"], false,
-        "the domain is not credited; only the namespace prior moves: {r:?}"
+        r["target_id_used"], true,
+        "the domain is recorded while the namespace prior learns: {r:?}"
     );
 }
 
-/// The same domain id under a resolving profile is refused. `brain.feedback`
-/// resolves target_id against entities and notes; a domain lives in neither, so
-/// the rung that would credit a profile cannot accept the id the retrieval side
-/// hands out. Recorded as a test because it is the consequence that makes the
-/// tier-3 report worth reading.
+/// Profile learning accepts domain attribution without a KG resolver.
 #[tokio::test]
-async fn feedback_tier1_refuses_a_domain_id() {
+async fn feedback_tier1_accepts_a_domain_id() {
     let rt = make_rt(Some("balanced-recall-v1".into()), true);
     let ns = Namespace::parse("local").expect("ns");
 
@@ -842,7 +814,7 @@ async fn feedback_tier1_refuses_a_domain_id() {
     rt.install_edge_rules(registry.all_edge_rules());
 
     // Positive control in the same arm: an entity id is accepted here.
-    let entity_id = make_entity(&registry, ns.as_str()).await;
+    let entity_id = make_atom(&registry, ns.as_str()).await;
     let ok = registry
         .dispatch(
             "knowledge.feedback",
@@ -868,8 +840,10 @@ async fn feedback_tier1_refuses_a_domain_id() {
         )
         .await;
 
-    assert!(
-        result.is_err(),
-        "tier-1 forwards the id to a resolver that does not know domains, got: {result:?}"
-    );
+    let result = result.expect("domain feedback reaches section hook");
+    assert_eq!(result["target_kind"], "domain");
+    assert!(result["profile_event_id"].is_string());
 }
+
+#[path = "feedback_targets/mod.rs"]
+mod feedback_targets;

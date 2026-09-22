@@ -10,6 +10,7 @@ pub mod tunable;
 mod event;
 mod event_counts_grouping;
 mod pack;
+mod section_feedback;
 mod sql;
 
 pub(crate) use pack::{apply_dispatch_signal, sync_balanced_recall_record};

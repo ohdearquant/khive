@@ -3612,6 +3612,17 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         <BrainPack as khive_types::Pack>::REQUIRES
     }
 
+    async fn apply_profile_section_feedback(
+        &self,
+        token: &NamespaceToken,
+        profile_id: &str,
+        section_signals: Value,
+        target_attribution: Option<String>,
+    ) -> Result<Value, RuntimeError> {
+        self.apply_section_feedback(token, profile_id, section_signals, target_attribution)
+            .await
+    }
+
     async fn dispatch(
         &self,
         verb: &str,

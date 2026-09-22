@@ -2459,16 +2459,28 @@ request(ops="knowledge.topic(domain=\"attention\")")
 
 ### `knowledge.feedback` — Commissive
 
-Apply per-section feedback signals to update section posterior weights.
+Record judgments on live knowledge atoms/domains and optionally update section weights.
 
-| Param             | Type   | Required | Notes                                                                                                                         |
-| ----------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `section_signals` | object | yes      | `{section_type: signal}`, e.g. `{"overview": "useful", "formalism": "not_useful"}`. Signals: `useful`\|`not_useful`\|`wrong`. |
-| `target_id`       | string | no       | UUID of the rated atom/entity. When paired with a configured brain profile, also forwards to `brain.feedback`.                |
+| Param                  | Type   | Required              | Notes                                                                                                                                                       |
+| ---------------------- | ------ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signal`               | string | one judgment required | `useful`, `not_useful`, or `wrong`; requires `target_id`. Scalar-only feedback does not train sections.                                                     |
+| `section_signals`      | object | one judgment required | Non-empty `{section_type: signal}` map. Requires an attributed caller.                                                                                      |
+| `target_id`            | string | with `signal`         | Live atom/domain UUID or unique undashed hex prefix of at least 8 characters; KG entity/note IDs and slugs are refused. Optional for section-only feedback. |
+| `served_by_profile_id` | string | no                    | Serving profile, ahead of pack configuration and actor/namespace `knowledge_compose` binding. Profile feedback requires an attributed caller.               |
 
 ```
-request(ops="knowledge.feedback(target_id=\"rope\", section_signals={\"overview\": \"useful\"})")
+request(ops="knowledge.feedback(target_id=\"5b825dc5-8652-4ca8-9c68-4b2f01011673\", signal=\"wrong\", section_signals={\"overview\": \"not_useful\"})")
 ```
+
+Supplied targets are resolved and recorded in every tier. Sections update the
+selected brain profile through a trusted in-process hook, or the namespace-local
+prior when no profile resolves. No scalar signal is invented for section-only
+calls. Regular `brain.feedback` remains KG-target-only.
+
+The knowledge event commits before profile learning, which may use another
+database. A later profile failure reports the committed knowledge event ID and
+an unconfirmed profile outcome; inspect before retrying. The error does not
+roll back the already-recorded knowledge judgment.
 
 ---
 

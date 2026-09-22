@@ -6,13 +6,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_brain_core::{
-    resolve_consumer_profile, ConsumerKind, FeedbackSignal, SectionPosteriorState, SectionType,
-};
+use khive_brain_core::{resolve_consumer_profile, ConsumerKind};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry};
 use khive_storage::EdgeRelation;
 
-use crate::knowledge::section_feedback::on_section_feedback;
 use crate::KnowledgePack;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -86,19 +83,6 @@ struct TopicParams {
     query: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
-}
-
-// `feedback`'s two top-level fields (`target_id`, `section_signals`) are a fixed,
-// closed shape — not open content — so deny_unknown_fields applies here too.
-// `section_signals`'s *inner* keys stay a free-form map (section-type names are
-// validated dynamically below against `SectionType::from_str_loose`, which gives
-// a better error than a derive-time enum could).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FeedbackParams {
-    #[serde(default)]
-    target_id: Option<String>,
-    section_signals: Value,
 }
 
 // ── handler implementations ───────────────────────────────────────────────────
@@ -338,142 +322,6 @@ impl KnowledgePack {
 
             Ok(json!({ "results": results, "total": total }))
         }
-    }
-
-    /// Apply per-section feedback signals to the pack's section posterior state.
-    ///
-    /// 3-tier profile resolution (ADR-035) — exclusive flow (each tier returns early):
-    /// 1. Explicit brain profile in config (`self.brain_profile`) → route via `brain.feedback`
-    /// 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")` → route via `brain.feedback`
-    /// 3. Namespace-local section_posteriors → update in-memory state directly (tier-3 only when neither 1 nor 2 resolves)
-    ///
-    /// The response names the tier that ran (`tier`) and whether `target_id` was
-    /// consulted (`target_id_used`), so a caller does not have to infer the rung
-    /// from which other keys happen to be present. Tier 3 never consults
-    /// `target_id` — there is no resolver for it on this path, so an id naming
-    /// nothing is accepted exactly like a real one, and the response says so
-    /// rather than reporting a bare success.
-    pub(crate) async fn handle_feedback(
-        &self,
-        token: &NamespaceToken,
-        params: Value,
-        registry: &VerbRegistry,
-    ) -> Result<Value, RuntimeError> {
-        let p: FeedbackParams = deser(params)?;
-        let target_id_str = p.target_id;
-
-        let raw = p.section_signals.as_object().ok_or_else(|| {
-            RuntimeError::InvalidInput(
-                "section_signals is required and must be an object".to_string(),
-            )
-        })?;
-
-        let mut signals: Vec<(SectionType, FeedbackSignal)> = Vec::with_capacity(raw.len());
-        for (key, val) in raw {
-            let section_type = SectionType::from_str_loose(key).ok_or_else(|| {
-                RuntimeError::InvalidInput(format!(
-                    "unknown section_type: {key:?}; valid: {}",
-                    SectionType::NAMES.join(", ")
-                ))
-            })?;
-            let signal_str = val.as_str().ok_or_else(|| {
-                RuntimeError::InvalidInput(format!("section signal for {key:?} must be a string"))
-            })?;
-            let signal = match signal_str {
-                "useful" => FeedbackSignal::Useful,
-                "not_useful" => FeedbackSignal::NotUseful,
-                "wrong" => FeedbackSignal::Wrong,
-                other => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "unknown feedback signal {other:?}; expected useful | not_useful | wrong"
-                    )))
-                }
-            };
-            signals.push((section_type, signal));
-        }
-
-        let ns = token.namespace().as_str().to_string();
-        let section_signals_val = p.section_signals.clone();
-
-        // Tier 1: explicit profile from config — route exclusively to brain.feedback.
-        if let Some(ref profile_id) = self.brain_profile {
-            if let Some(ref tid) = target_id_str {
-                let brain_params = json!({
-                    "namespace": ns,
-                    "target_id": tid,
-                    "signal": "useful",
-                    "served_by_profile_id": profile_id,
-                    "section_signals": section_signals_val,
-                });
-                let result = registry
-                    .dispatch_with_identity(
-                        "brain.feedback",
-                        brain_params,
-                        Some(RequestIdentity::from_token(token)),
-                    )
-                    .await?;
-                return Ok(json!({
-                    "ok": true,
-                    "tier": "explicit_profile",
-                    "brain_profile": profile_id,
-                    "target_id_used": true,
-                    "signals_applied": signals.len(),
-                    "emitted": result.get("emitted").and_then(|v| v.as_bool()).unwrap_or(false),
-                }));
-            }
-        }
-
-        // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
-        // Use "knowledge_compose" (not "recall") — the knowledge pack's compose-ranking
-        // feedback has its own consumer_kind bucket (ADR-058 amendment, #542) so it no
-        // longer shares posteriors with the memory pack's recall bucket.
-        if let Some(ref tid) = target_id_str {
-            if let Some(profile_id) =
-                resolve_consumer_profile(registry, token, ConsumerKind::KnowledgeCompose).await
-            {
-                let brain_params = json!({
-                    "namespace": ns,
-                    "target_id": tid,
-                    "signal": "useful",
-                    "served_by_profile_id": profile_id,
-                    "section_signals": section_signals_val,
-                });
-                let result = registry
-                    .dispatch_with_identity(
-                        "brain.feedback",
-                        brain_params,
-                        Some(RequestIdentity::from_token(token)),
-                    )
-                    .await?;
-                return Ok(json!({
-                    "ok": true,
-                    "tier": "bound_profile",
-                    "brain_profile": profile_id,
-                    "target_id_used": true,
-                    "signals_applied": signals.len(),
-                    "emitted": result.get("emitted").and_then(|v| v.as_bool()).unwrap_or(false),
-                }));
-            }
-        }
-
-        // Tier 3: namespace-local tuning prior — update only this exact
-        // namespace's pack-local section posteriors.
-        let total_events = {
-            let mut states = self.section_posteriors.lock().map_err(|_| {
-                RuntimeError::Internal("section_posteriors lock poisoned".to_string())
-            })?;
-            let state = states.entry(ns).or_insert_with(SectionPosteriorState::new);
-            on_section_feedback(state, &signals);
-            state.total_events
-        };
-
-        Ok(json!({
-            "ok": true,
-            "tier": "namespace_local",
-            "target_id_used": false,
-            "total_events": total_events,
-            "signals_applied": signals.len(),
-        }))
     }
 }
 
@@ -833,7 +681,16 @@ mod tests {
     /// that has recorded no feedback of its own.
     #[tokio::test]
     async fn tier3_section_posteriors_do_not_cross_namespaces() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        // Mirror `KhiveRuntime::memory()` plus an actor: `..Default::default()`
+        // resolves `db_path` to the real store anchor, which the harness refuses.
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: Some("section-isolation-test".into()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
         let pack = KnowledgePack::new(rt.clone());
         let registry = VerbRegistryBuilder::new()
             .build()

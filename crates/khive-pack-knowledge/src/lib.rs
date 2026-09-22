@@ -1,5 +1,6 @@
 //! pack-knowledge — knowledge corpus verbs for khive.
 
+mod feedback;
 pub(crate) mod handlers;
 pub(crate) mod knowledge;
 mod pack;
