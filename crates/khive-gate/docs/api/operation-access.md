@@ -183,7 +183,11 @@ version is part of every nonempty restriction's policy fingerprint.
 | `traverse`                   | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1017) |
 | `update`                     | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L495)  |
 | `verbs`                      | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1473) |
-| `web.ingest`                 | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L6)                |
+| `web.extract`                | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L90)               |
+| `web.fetch`                  | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L8)                |
+| `web.ingest`                 | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L131)              |
+| `web.refresh`                | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L243)              |
+| `web.search`                 | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L178)              |
 | `whoami`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1387) |
 | `withdraw`                   | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1304) |
 
