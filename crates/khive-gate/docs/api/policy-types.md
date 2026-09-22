@@ -20,6 +20,12 @@ public compatibility contract. `verb` must be non-empty; `actor` and `namespace`
 invariants. `try_new` returns `GateValidationError`, `new` panics for trusted inputs, and
 `with_context` attaches session, timestamp, and transport-source metadata.
 
+`args` is the submitted value at the dispatch boundary, before handler canonicalization and
+kind hooks. A gate may inspect it, but it is not a promise of the effective value that the
+handler will execute: hooks can move, normalize, or derive fields after authorization. A
+policy requiring effective values must run in the handler after normalization. Neither the
+argument field nor dispatch order is changed by this contract.
+
 ## `GateDecision`
 
 The internally tagged JSON form uses `"decision": "allow"` or `"deny"`. Allow decisions carry an

@@ -1,14 +1,29 @@
 use std::sync::Arc;
 
-use crate::{GateDecision, GateError, GateRequest};
+use crate::{ActorRef, GateDecision, GateError, GateRequest};
 
 /// Authorization gate consulted before each verb dispatch.
 ///
 /// Implementations return policy denials as decisions and infrastructure failures as errors. See
 /// `crates/khive-gate/docs/api/gate-evaluation.md`.
+/// Request arguments are submitted, pre-handler values. Canonicalization and
+/// kind hooks may rewrite them after this decision; policies requiring the
+/// effective values must be enforced by the handler after normalization.
 pub trait Gate: Send + Sync + std::fmt::Debug {
     /// Evaluate `req`, returning an allow/deny decision or a backend [`GateError`].
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
+
+    /// Evaluate the separate capability to read another actor's mailbox.
+    ///
+    /// Ordinary request admission never grants this capability, including an
+    /// [`AllowAllGate`]. Callers must also retain the result of [`Gate::check`].
+    fn check_mailbox_read(
+        &self,
+        _req: &GateRequest,
+        _owner: &ActorRef,
+    ) -> Result<GateDecision, GateError> {
+        Ok(GateDecision::deny("mailbox_read_not_granted"))
+    }
 
     /// Return the audit backend name; defaults to `std::any::type_name::<Self>()`.
     fn impl_name(&self) -> &'static str {

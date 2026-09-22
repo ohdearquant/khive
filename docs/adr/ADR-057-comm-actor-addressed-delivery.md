@@ -1,7 +1,7 @@
 # ADR-057: Comm Actor-Addressed Delivery
 
-**Status**: Accepted (amended 2026-08-06 — named atomic mark-read)\
-**Date**: 2026-06-15 (amended 2026-08-06)\
+**Status**: Accepted (amended 2026-09-22 — anonymous-only legacy pool)\
+**Date**: 2026-06-15 (amended 2026-09-22)\
 **Authors**: khive maintainers
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and
 Schedule Packs)\
@@ -9,7 +9,7 @@ Schedule Packs)\
 gate), #75 (actor identity on every request), #1447 (sender-side dual-write confirmation),
 #1428 (process provenance), #1490 (versioned message properties), #1468 (list-read field
 projection), #1471 (sender-visible sent history), #199 (anonymous inbox isolation),
-and #1387 (named atomic mark-read)
+#1387 (named atomic mark-read), and #1739 (anonymous-only legacy pool)
 
 ## Context
 
@@ -296,15 +296,13 @@ the properties JSON for both copies.
 
 ### `comm.inbox` behavior change
 
-`comm.inbox` applies one actor predicate for every caller:
+`comm.inbox` selects exact string recipients for named actors. A configured actor sees only
+messages whose `to_actor` equals its actor label. It does not inherit the unattributed pool.
 
-`properties.to_actor == caller_actor_label OR properties.to_actor IS NULL`.
-
-- A configured actor sees messages addressed to that actor plus legacy messages without a
-  `to_actor` field.
-- The anonymous `"local"` fallback sees messages addressed to `"local"` plus the same legacy
-  rows. It does not bypass actor filtering, so messages explicitly addressed to another actor
-  remain hidden.
+Only the anonymous `"local"` fallback additionally sees rows with missing or null `to_actor`.
+An explicitly configured actor named `"local"` is still a named actor: it sees exact
+`to_actor="local"` rows but not the legacy pool. Actor kind, not label spelling, distinguishes
+these identities. Neither sees messages explicitly addressed to another actor.
 
 The `status` filter (`unread`, `read`, `all`) is unchanged.
 
@@ -326,8 +324,9 @@ routing decision instead:
 
 - If the reply caller is the original `from_actor`, route to `to_actor`.
 - If the reply caller is the original `to_actor`, route to `from_actor`.
-- If the original message lacks `from_actor` / `to_actor` (legacy message), fall back to
-  `from` and `to` as before.
+- Only the anonymous fallback may reply to a legacy message with missing/null `to_actor`,
+  retaining the existing participant check when `from_actor` is present and using `from`/`to`
+  for routing. Named actors require a valid addressed row, even if they match its sender.
 
 `from_actor` and `to_actor` are set on the reply message using the same logic as `comm.send`.
 
@@ -336,10 +335,11 @@ routing decision instead:
 Thread queries filter by `properties.thread_id`, which is namespace-scoped and independent of
 actor labels. `comm.mark_read` is the canonical bulk mutation name added by ADR-040's 2026-08-06
 amendment; `comm.read` remains its released compatibility surface. Both names reuse the same target
-validation and live mutation filter. An attributed row is markable only by its `to_actor`; a legacy
-row with no `to_actor` retains this ADR's accepted `EqOrMissing` fail-open rule. Atomic mode changes
-only the transaction boundary across already-authorized targets, not principal resolution,
-namespace behavior, or legacy visibility.
+validation and live mutation filter. An attributed row is markable only by its `to_actor`; only
+an anonymous fallback may mark a legacy row with missing/null `to_actor`. Named actors are refused
+before mutation. Atomic mode changes only the transaction boundary across already-authorized
+targets, not principal resolution, namespace behavior, or legacy visibility. Reply's fold-in read
+mark applies the same recipient rule and rechecks it at mutation time.
 
 ### Interaction with ADR-007 Rev 3 (namespace as attribution)
 
@@ -378,8 +378,8 @@ path is removed from the local-send code path.
 - `handle_send`: resolve `from_actor` from `token.namespace().as_str()`. Merge `from_actor`
   and `to_actor` into the `properties` JSON for both copies before passing to
   `dual_write_message`.
-- `handle_inbox`: resolve the caller's actor label. When the label is not `"local"`, push a
-  `PropertyFilter` on `$.to_actor` before the existing `direction` filter.
+- `handle_inbox`: resolve the caller's actor identity. Apply exact string-recipient filtering
+  for every named actor; only the anonymous fallback adds missing/null recipients.
 - `handle_reply`: read `from_actor` / `to_actor` from original message properties; use them
   for reply routing when present, falling back to `from` / `to` for legacy messages.
 
@@ -415,7 +415,8 @@ Tests assert the following:
    namespace.
 2. Assert each configured actor sees only its own attributed message.
 3. Assert an anonymous `"local"` caller sees neither attributed message.
-4. Assert every caller can still see a legacy row with no `to_actor`.
+4. Assert only the anonymous fallback sees a legacy row with missing/null `to_actor`;
+   an explicitly configured actor named `"local"` sees only exact addressed rows.
 
 **(b) Namespace isolation is preserved**
 
@@ -480,7 +481,40 @@ added via `COMM_SCHEMA_PLAN_STMTS` (run idempotently at pack startup via `CREATE
 EXISTS`). Maintainers should confirm this approach is acceptable, or specify that the index belongs
 in a numbered `VersionedMigration` (ADR-015) to keep startup behavior predictable.
 
-**Q3. Legacy message visibility (resolved).** Messages written before this ADR have no
-`to_actor` field. The implemented `EqOrMissing` predicate leaves those rows visible to every
-caller rather than assigning them to `"local"` or hiding them from configured actors. This is
-the explicit backward-compatibility boundary; newly attributed rows remain actor-scoped.
+**Q3. Legacy message visibility (revised 2026-09-22, #1739).** Only the anonymous fallback
+inherits rows with missing/null `to_actor`; named actors require exact addressed recipients.
+This replaces the former visible-to-every-caller rule without rewriting legacy records.
+
+## Amendment (2026-09-22): anonymous-only legacy recipient pool
+
+The missing/null recipient pool is a compatibility view for `ActorRef::anonymous()` (kind
+`anonymous`, id `local`), not an implicit mailbox grant to every configured actor. No new
+configuration option is introduced. Explicitly configuring the label `local` produces a named
+actor and does not grant pool access.
+
+Inbox pages, count-only responses, unread counts, and every long-poll requery use the same scope.
+Named own-mailbox views and authorized delegated mailbox views seek only exact string recipients.
+Delegated views retain their existing stricter rule excluding `local` and never gain pool access.
+The anonymous fallback continues to see its addressed rows and the missing/null pool. Empty,
+non-string, or otherwise malformed recipients are not legacy pool rows.
+
+Thread visibility filters physical rows before pair deduplication or read-state folding. Named
+own views retain sender-or-addressee participation on valid addressed rows, including explicit
+`to_actor="local"`; matching a sender alone does not expose a missing/null-recipient row. The
+anonymous fallback retains legacy thread visibility. Reply uses the same addressed-participant
+rule for named actors, while the anonymous legacy path preserves its existing sender check.
+Read and mark-read remain addressee mutations and enforce the scope again in their write filter.
+Replies do not gain permission to mark a sender's copy or another addressee's message as read.
+
+`comm.probe` retains its existing exact-recipient query and cursor contract, including for
+anonymous callers; this amendment does not expand it to the legacy pool. Both its arrival and
+stale-count predicates require a JSON string recipient, preventing object/array JSON-text aliases.
+Its stale count uses the existing typed recipient partial index introduced for mailbox reads.
+Sent-history legacy sender fallback likewise belongs only to the actual anonymous identity.
+
+Acceptance includes named and anonymous controls, explicit named `local`, pages and limit-zero
+counts, long-poll requery behavior, mixed thread twins before deduplication, exact JSON string
+recipient typing, unchanged read flags after denied read/mark/reply, and addressed positive
+controls. Removing the scope restriction must fail the corresponding pool-exclusion controls;
+using the actor label alone must fail the named-`local` control. Existing delegated mailbox grants
+remain read-only and do not broaden mutation authority.

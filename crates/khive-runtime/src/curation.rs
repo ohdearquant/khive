@@ -547,6 +547,23 @@ pub struct EdgePatch {
     pub properties: Option<Value>,
 }
 
+/// Kind-owned property semantics carried from validated hook preparation to
+/// the shared note merge. The default preserves ordinary JSON merge behavior.
+#[derive(Clone, Debug, Default)]
+pub struct NoteUpdatePolicy {
+    kind: Option<String>,
+    null_clearing_properties: &'static [&'static str],
+}
+
+impl NoteUpdatePolicy {
+    pub(crate) fn for_kind(kind: &str, null_clearing_properties: &'static [&'static str]) -> Self {
+        Self {
+            kind: Some(kind.to_owned()),
+            null_clearing_properties,
+        }
+    }
+}
+
 /// Patch for `update_note`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
 ///
 /// For `salience`/`decay_factor`:
@@ -562,6 +579,7 @@ pub struct NotePatch {
     pub properties: Option<Value>,
     pub(crate) kind_status: Option<String>,
     pub write_options: crate::note_write::NoteWriteOptions,
+    pub(crate) update_policy: NoteUpdatePolicy,
 }
 
 /// Normalize the public note tag replacement into its stored property before
@@ -612,11 +630,19 @@ impl NotePatch {
             properties,
             kind_status: None,
             write_options: Default::default(),
+            update_policy: Default::default(),
         }
     }
 
     pub fn with_write_options(mut self, options: crate::note_write::NoteWriteOptions) -> Self {
         self.write_options = options;
+        self
+    }
+
+    /// Apply the owning kind's policy returned by validated hook preparation.
+    /// This is not a caller-facing property-deletion parameter.
+    pub fn with_update_policy(mut self, policy: NoteUpdatePolicy) -> Self {
+        self.update_policy = policy;
         self
     }
 }
@@ -1751,6 +1777,16 @@ impl KhiveRuntime {
         let original_decay_factor = note.decay_factor;
         let original_properties = note.properties.clone();
         let original_status = note.status.clone();
+        if patch
+            .update_policy
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != note.kind)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "note update policy does not match the stored note kind".into(),
+            ));
+        }
         if patch.content.is_some() || patch.properties.is_some() {
             if let Some(error) = self.stream_member_error(&note).await? {
                 return Err(error);
@@ -1879,11 +1915,23 @@ impl KhiveRuntime {
                     )));
                 }
             }
-            let (merged, _) = merge_properties(
+            let incoming_properties = Some(props);
+            let (mut merged, _) = merge_properties(
                 &note.properties,
-                &Some(props),
+                &incoming_properties,
                 EntityDedupMergePolicy::PreferFrom,
             );
+            if let Some(properties) = merged.as_mut().and_then(Value::as_object_mut) {
+                for key in patch.update_policy.null_clearing_properties {
+                    if incoming_properties
+                        .as_ref()
+                        .and_then(|incoming| incoming.get(*key))
+                        .is_some_and(Value::is_null)
+                    {
+                        properties.remove(*key);
+                    }
+                }
+            }
             note.properties = merged;
         }
         if let Some(status) = patch.kind_status {
@@ -2006,7 +2054,7 @@ impl KhiveRuntime {
     }
 
     /// Claim `external_id` on an outbound `message` note through the
-    /// ADR-124-sanctioned store-level one-key atomic path, bypassing the
+    /// ADR-124-sanctioned store-level owner path, bypassing the
     /// caller-facing owner-established-property refusal in
     /// [`Self::update_note`] (and its crate-internal prepare path). This is deliberately
     /// NOT exposed through any registered verb (ADR-124's stated bound): it is
@@ -2015,7 +2063,9 @@ impl KhiveRuntime {
     ///
     /// Refuses (returns `Err`, never writes) unless the live row is a
     /// `message` note, `properties.direction == "outbound"`, and
-    /// `properties.external_id` is currently absent or empty.
+    /// `properties.external_id` is currently absent or empty. The claim is
+    /// committed against that exact snapshot and advances its timestamp so
+    /// competing claims and delivery-outcome CAS writes cannot overwrite it.
     pub async fn claim_outbound_message_external_id(
         &self,
         token: &NamespaceToken,
@@ -2044,6 +2094,16 @@ impl KhiveRuntime {
                 direction
             )));
         }
+        if note.deleted_at.is_some()
+            || Self::outbound_delivery_is_terminal(props)
+            || props
+                .and_then(|p| p.get("delivered_at"))
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} is not pending outbound delivery"
+            )));
+        }
         let existing = props
             .and_then(|p| p.get("external_id"))
             .and_then(|v| v.as_str());
@@ -2052,18 +2112,12 @@ impl KhiveRuntime {
                 "note {id} already has an external_id claimed"
             )));
         }
-        store
-            .set_note_property(
-                id,
-                "external_id",
-                Value::String(external_id),
-                note.updated_at,
-            )
-            .await?;
-        store
-            .get_note(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+        let mut properties = props
+            .cloned()
+            .expect("outbound direction requires an object");
+        properties.insert("external_id".to_string(), Value::String(external_id));
+        self.replace_outbound_message_properties_as_owner(token, note, properties)
+            .await
     }
 
     /// Non-wire outbox scan for the channel delivery loops.
@@ -2221,14 +2275,50 @@ impl KhiveRuntime {
             })?,
         );
 
-        let persisted = self
-            .notes(token)?
-            .replace_note_if_unchanged(snapshot.clone(), expected_updated_at, expected_deleted_at)
+        let store = self.notes(token)?;
+        let persisted = store
+            .replace_note_if_unchanged(snapshot, expected_updated_at, expected_deleted_at)
             .await?;
         if !persisted {
             return Err(stale_note_snapshot_error(id));
         }
-        Ok(snapshot)
+        // Storage assigns the persisted revision; the pre-write snapshot
+        // still carries the old version even when this CAS succeeds.
+        store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+    }
+
+    async fn replace_outbound_message_properties_as_owner(
+        &self,
+        token: &NamespaceToken,
+        mut snapshot: khive_storage::note::Note,
+        properties: serde_json::Map<String, Value>,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let expected_updated_at = snapshot.updated_at;
+        let expected_deleted_at = snapshot.deleted_at;
+        let id = snapshot.id;
+        snapshot.properties = Some(Value::Object(properties));
+        snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
+            expected_updated_at.checked_add(1).ok_or_else(|| {
+                RuntimeError::Internal(format!("note {id} updated_at cannot advance"))
+            })?,
+        );
+        // Owner operations preserve any transport evidence on the snapshot.
+        // Re-running the public full-row guard would reject that existing evidence.
+        let store = self.raw_notes(token)?;
+        if !store
+            .replace_note_if_unchanged(snapshot, expected_updated_at, expected_deleted_at)
+            .await?
+        {
+            return Err(stale_note_snapshot_error(id));
+        }
+        // Return the storage-assigned revision, just as the claim path does.
+        store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
     }
 
     /// True once a `delivery` outcome has been terminally recorded
@@ -2283,6 +2373,24 @@ impl KhiveRuntime {
             )));
         }
 
+        let properties = Self::outbound_retry_properties(
+            props,
+            attempted_at,
+            last_error,
+            base_delay,
+            max_delay,
+        )?;
+        self.replace_outbound_message_properties(token, snapshot, properties)
+            .await
+    }
+
+    fn outbound_retry_properties(
+        props: Option<&serde_json::Map<String, Value>>,
+        attempted_at: chrono::DateTime<chrono::Utc>,
+        last_error: String,
+        base_delay: std::time::Duration,
+        max_delay: std::time::Duration,
+    ) -> RuntimeResult<serde_json::Map<String, Value>> {
         let attempts = props
             .and_then(|properties| properties.get("delivery_attempts"))
             .and_then(Value::as_u64)
@@ -2316,7 +2424,51 @@ impl KhiveRuntime {
             Value::String(next_attempt_at.to_rfc3339()),
         );
         properties.insert("last_error".to_string(), Value::String(last_error));
-        self.replace_outbound_message_properties(token, snapshot, properties)
+        Ok(properties)
+    }
+
+    /// Schedule an external-id claim retry only for a still-unclaimed
+    /// outbound snapshot. Existing claims and terminal outcomes are unchanged.
+    pub async fn mark_outbound_message_claim_transient_failure(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        attempted_at: chrono::DateTime<chrono::Utc>,
+        last_error: String,
+        base_delay: std::time::Duration,
+        max_delay: std::time::Duration,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let snapshot = self.outbound_message(token, id).await?;
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        let has_claim = props
+            .and_then(|properties| properties.get("external_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let has_delivery = props
+            .and_then(|properties| properties.get("delivered_at"))
+            .is_some_and(|value| !value.is_null());
+        if has_claim || has_delivery || Self::outbound_delivery_is_terminal(props) {
+            return Ok(snapshot);
+        }
+        if base_delay.is_zero() || max_delay < base_delay {
+            return Err(RuntimeError::InvalidInput(
+                "outbound retry delays require a non-zero base no greater than the ceiling"
+                    .to_string(),
+            ));
+        }
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({"last_error": &last_error}),
+            "message",
+            "last_error",
+        )?;
+        let properties = Self::outbound_retry_properties(
+            props,
+            attempted_at,
+            last_error,
+            base_delay,
+            max_delay,
+        )?;
+        self.replace_outbound_message_properties_as_owner(token, snapshot, properties)
             .await
     }
 
@@ -2415,6 +2567,58 @@ impl KhiveRuntime {
         props.insert("failed_at".into(), Value::String(failed_at));
         props.insert("last_error".into(), Value::String(last_error));
         self.replace_outbound_message_properties(token, snapshot, props)
+            .await
+    }
+
+    /// Park a deterministic external-id claim refusal only while the exact
+    /// current outbound snapshot remains unclaimed. An existing claim or a
+    /// terminal delivery outcome is returned unchanged. Non-wire owner API:
+    /// a second worker must not turn another worker's successful claim into
+    /// a permanent delivery failure.
+    pub async fn mark_outbound_message_claim_failed(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        failed_at: String,
+        last_error: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let snapshot = self.outbound_message(token, id).await?;
+        self.mark_outbound_message_claim_failed_from_snapshot(
+            token, snapshot, failed_at, last_error,
+        )
+        .await
+    }
+
+    async fn mark_outbound_message_claim_failed_from_snapshot(
+        &self,
+        token: &NamespaceToken,
+        snapshot: khive_storage::note::Note,
+        failed_at: String,
+        last_error: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        let has_claim = props
+            .and_then(|properties| properties.get("external_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let has_delivery = props
+            .and_then(|properties| properties.get("delivered_at"))
+            .is_some_and(|value| !value.is_null());
+        if has_claim || has_delivery || Self::outbound_delivery_is_terminal(props) {
+            return Ok(snapshot);
+        }
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({ "failed_at": &failed_at, "last_error": &last_error }),
+            "message",
+            "failed",
+        )?;
+        let mut properties = props.cloned().unwrap_or_default();
+        properties.remove("delivery_attempts");
+        properties.remove("next_attempt_at");
+        properties.insert("delivery".into(), Value::String("failed".into()));
+        properties.insert("failed_at".into(), Value::String(failed_at));
+        properties.insert("last_error".into(), Value::String(last_error));
+        self.replace_outbound_message_properties_as_owner(token, snapshot, properties)
             .await
     }
 
@@ -5079,8 +5283,10 @@ mod tests {
 
         let delivered_note = outbound_message_note();
         let delivered_id = delivered_note.id;
+        let delivered_version = delivered_note.version;
         let failed_note = outbound_message_note();
         let failed_id = failed_note.id;
+        let failed_version = failed_note.version;
         let mut inbound = Note::new("local", "message", "inbound row");
         inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
         let inbound_id = inbound.id;
@@ -5104,6 +5310,8 @@ mod tests {
             )
             .await
             .expect("mark delivered succeeds");
+        assert_eq!(marked.version, delivered_version + 1);
+        assert_eq!(marked, store.get_note(delivered_id).await.unwrap().unwrap());
         let props = marked
             .properties
             .as_ref()
@@ -5131,6 +5339,8 @@ mod tests {
             )
             .await
             .expect("mark failed succeeds");
+        assert_eq!(failed.version, failed_version + 1);
+        assert_eq!(failed, store.get_note(failed_id).await.unwrap().unwrap());
         let props = failed
             .properties
             .as_ref()
@@ -5275,6 +5485,7 @@ mod tests {
             "unrelated": "preserved",
         }));
         let id = note.id;
+        let original_version = note.version;
         store.upsert_note(note).await.expect("seed note");
 
         let attempted_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T00:00:00Z")
@@ -5291,6 +5502,8 @@ mod tests {
             )
             .await
             .expect("transient marker succeeds");
+        assert_eq!(marked.version, original_version + 1);
+        assert_eq!(marked, store.get_note(id).await.unwrap().unwrap());
         let props = marked.properties.unwrap();
 
         assert_eq!(props["delivery_attempts"].as_u64(), Some(4));
@@ -5457,6 +5670,121 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("<claimed@example.com>")
         );
+    }
+
+    #[tokio::test]
+    async fn claim_failure_snapshot_cannot_park_a_concurrent_successful_claim() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+        let mut before = outbound_message_note();
+        // The owner must preserve existing trusted transport provenance.
+        before
+            .properties
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("channel_kind".into(), serde_json::json!("email"));
+        rt.raw_notes(&token)
+            .unwrap()
+            .upsert_note(before.clone())
+            .await
+            .unwrap();
+        let claimed = rt
+            .claim_outbound_message_external_id(&token, before.id, "<winner@example.com>".into())
+            .await
+            .unwrap();
+        assert!(claimed.updated_at > before.updated_at);
+        assert_eq!(
+            claimed.properties.as_ref().unwrap()["channel_kind"],
+            "email"
+        );
+
+        rt.mark_outbound_message_claim_failed_from_snapshot(
+            &token,
+            before,
+            "2026-09-22T12:00:00Z".into(),
+            "claim refused".into(),
+        )
+        .await
+        .expect_err("the stale pre-claim snapshot cannot overwrite the winner");
+        let returned = rt
+            .mark_outbound_message_claim_failed(
+                &token,
+                claimed.id,
+                "2026-09-22T12:00:00Z".into(),
+                "already claimed".into(),
+            )
+            .await
+            .unwrap();
+        let stored = rt
+            .notes(&token)
+            .unwrap()
+            .get_note(claimed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(&claimed).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(claimed).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_failure_parks_only_unclaimed_pending_messages() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+        for outcome in [None, Some("delivered"), Some("failed")] {
+            let mut note = outbound_message_note();
+            let props = note.properties.as_mut().unwrap().as_object_mut().unwrap();
+            props.insert("channel_kind".into(), serde_json::json!("email"));
+            if let Some(outcome) = outcome {
+                props.insert("delivery".into(), serde_json::json!(outcome));
+            }
+            rt.raw_notes(&token)
+                .unwrap()
+                .upsert_note(note.clone())
+                .await
+                .unwrap();
+            let result = rt
+                .mark_outbound_message_claim_failed(
+                    &token,
+                    note.id,
+                    "2026-09-22T12:00:00Z".into(),
+                    "claim refused".into(),
+                )
+                .await
+                .unwrap();
+            if outcome.is_some() {
+                assert_eq!(
+                    serde_json::to_value(&result).unwrap(),
+                    serde_json::to_value(note).unwrap()
+                );
+            } else {
+                assert_eq!(result.properties.as_ref().unwrap()["delivery"], "failed");
+                assert_eq!(result.properties.as_ref().unwrap()["channel_kind"], "email");
+                assert!(result.updated_at > note.updated_at);
+                assert_eq!(result.version, note.version + 1, "one parking write");
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    rt.notes(&token)
+                        .unwrap()
+                        .get_note(result.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

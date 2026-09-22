@@ -13,6 +13,17 @@ remaining unresolved policy choices by implication.
 Amended by: [ADR-128](ADR-128-custody-party-pairs-and-slot-authenticity.md), which
 extends the custody-home evaluation criterion with slot authenticity.
 
+> **Implementation status (2026-09-22, #2920):** `khive-capability` names a
+> planned substrate in this accepted design; it is not a crate in the current
+> workspace or a declared dependency. Neither its grant validator nor the
+> concrete `CapabilityGate` exists in the current source. ADR-129 Stage 1b
+> requires that implementation before Stage 2 can change the runtime default.
+> References below describe the accepted target architecture, not a shipped
+> dependency. Existing `khive-gate`, its optional Rego adapter and the static
+> enrollment compatibility gate do not implement this capability substrate.
+> The design remains accepted and unimplemented at that boundary; this note
+> neither cancels the dependency nor claims Stage 1b complete.
+
 ## Context
 
 Two problems arrived from different directions and reduce to one root cause.

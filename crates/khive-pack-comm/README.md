@@ -13,7 +13,7 @@ delivery confirmation, and channel polling observability.
 | `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
 | `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
 | `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
-| `comm.unread`    | Count the caller's unread inbound messages without payloads; exact below 1,000 with explicit cap/saturation metadata                                           |
+| `comm.unread`    | Count the caller's unread inbound messages without payloads; exact below 1,000 with explicit cap/saturation metadata                                          |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
 | `comm.health`    | Read a bounded heartbeat-first channel snapshot, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                    |
@@ -36,6 +36,42 @@ of truth. Successful `comm.send`/`comm.reply` deliveries and successful,
 non-deduplicated `comm.ingest` writes publish after commit. An unrelated wake
 only causes a filtered re-query, so it cannot leak another actor's message or
 make a filtered call return early with an empty page.
+
+## Delegated mailbox views
+
+A serving host can permit another exact actor to read its configured owner's
+inbox and threads:
+
+```toml
+[actor]
+id = "agent:owner"
+mailbox_readers = ["agent:reader"]
+```
+
+The reader uses `comm.inbox(mailbox_actor="agent:owner")` or
+`comm.thread(id="<message UUID>", mailbox_actor="agent:owner")`. These calls do
+not mark messages read or grant permission to reply. Only those two verbs accept
+the selector; delegated sent history and explicit `mailbox_actor="local"` refuse.
+Without an exact configured pair, the request returns `PermissionDenied` with
+reason `mailbox_read_not_granted`, including empty and count-only views.
+`namespace` selects storage scope and cannot grant another mailbox.
+
+Delegated inboxes and unread counts include only messages explicitly addressed
+to the owner. Delegated threads exclude missing, malformed and local recipients
+before deduplication. Omitted selectors and explicit non-local self selectors keep
+the existing own-mailbox behavior.
+
+This is a temporary policy for a trusted local host, not authenticated delegation.
+The owner must be explicit in the serving configuration; reader entries are exact,
+non-local labels, bounded to 256 entries and 255 bytes per label. Existing gate
+restrictions still apply. **Saving a changed file does not revoke access:** replace
+the server epoch, stop or drain the old server, and cancel its pending long polls
+before acknowledging replacement. The configuration fingerprint distinguishes
+changed policies, but does not stop old processes.
+
+The key will become a one-shot migration source or be removed when store-held
+grants ship. See [ADR-143 Amendment 1](../../docs/adr/ADR-143-store-held-caller-grants.md#amendment-1-2026-09-21-trusted-local-mailbox-views)
+for the assurance, revocation and sunset contract.
 
 ## `comm.probe` — polling contract
 

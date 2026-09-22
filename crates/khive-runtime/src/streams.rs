@@ -1156,11 +1156,16 @@ impl KhiveRuntime {
             if let Some(embed) = spec.embed {
                 args["embed"] = json!(embed);
             }
-            registry
-                .prepare_note_update_hook(self, token, &snapshot, &mut args)
+            let update_policy = registry
+                .prepare_note_update_policy(self, token, &snapshot, &mut args)
                 .await?;
-            let plan = crate::atomic_prepare::prepare_update_from_note_snapshot(
-                self, token, &args, None, snapshot,
+            let plan = crate::atomic_prepare::prepare_update_from_note_snapshot_with_policy(
+                self,
+                token,
+                &args,
+                None,
+                snapshot,
+                update_policy,
             )
             .await?;
             return Ok(StreamBatchPreparation::Ready(Box::new(

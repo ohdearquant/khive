@@ -405,6 +405,11 @@ async fn run_build(args: RepoBuildArgs) -> Result<()> {
     }
     require_unchanged_head(&source.repo, &initial_head, "git.digest")?;
 
+    // `code.ingest` refuses to create an explicit `db` target; the build owns
+    // the fresh dedicated store, so it creates the empty file here, after every
+    // preflight that must leave no store behind on refusal.
+    std::fs::File::create_new(&map_db)
+        .with_context(|| format!("create code-map database {}", map_db.display()))?;
     let code_value = dispatch_single(
         &server,
         "code.ingest",

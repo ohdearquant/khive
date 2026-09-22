@@ -843,6 +843,9 @@ impl ValidatedSlot {
 /// callers need stdout captured, and an explicit null would empty it.)
 fn git_at_slot(repo: &Path, slot: &ValidatedSlot) -> Command {
     let mut cmd = Command::new("git");
+    // Status-only helpers must never inherit the daemon log stream (#1854).
+    // Fetch overrides this with bounded per-operation diagnostic capture.
+    cmd.stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -1306,6 +1309,7 @@ fn clone(url: &str, dest: &Path, cap: u64) -> Result<(), CacheError> {
         .arg("-c")
         .arg("maintenance.auto=false")
         .arg("clone")
+        .arg("--no-progress")
         .arg("--filter=blob:none")
         .arg("--no-checkout")
         .arg(url)
@@ -1609,6 +1613,7 @@ fn fetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
         .arg("-c")
         .arg("maintenance.auto=false")
         .arg("fetch")
+        .arg("--no-progress")
         .arg("--prune")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::null());
@@ -1640,6 +1645,7 @@ fn fetch_refetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
         .arg("-c")
         .arg("maintenance.auto=false")
         .arg("fetch")
+        .arg("--no-progress")
         .arg("--refetch")
         .arg("origin")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -4068,3 +4074,7 @@ printf 'finished\n' > '{}'
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "cache_stderr_tests.rs"]
+mod stderr_tests;

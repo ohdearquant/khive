@@ -992,7 +992,7 @@ async fn probe_production_sql_stale_count_plan_uses_partial_index_and_cutoff() {
     assert!(
         stats_details.iter().any(|detail| {
             detail.starts_with("SEARCH ")
-                && detail.contains("idx_notes_unread_probe_recipient_direction")
+                && detail.contains("idx_notes_unread_probe_recipient_type_direction")
                 && detail.contains("created_at<?")
         }),
         "stale count must seek the partial index with its strict cutoff: {nodes:?}"

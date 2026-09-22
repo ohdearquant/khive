@@ -665,6 +665,14 @@ symbols and modules an agent's work has actually referenced, into the shared
 production database is a separate, explicit curation or import path, distinct
 from and never performed by `code.ingest`.
 
+An explicit `db` must resolve to an existing regular file before the handler constructs its target
+runtime. A pre-created empty dedicated file may initialize and migrate; omitting `db` retains
+automatic creation of `<path>/.khive/code-map.db`. A missing or non-file explicit target is refused
+as `RuntimeError::InvalidInput` naming the path, without opening or migrating that target. This
+preflight is typo protection, not an inode-identity or concurrent-unlink guarantee: filesystem
+replacement between validation and SQLite open remains outside this bounded contract. The
+production-path exclusion above still applies before this preflight.
+
 The dedicated target uses the ordinary khive graph and text-search substrates. Each entity upsert
 in L1/L1.5 is paired with `entity_fts_document` in the map's text store; a successful
 `code.ingest` response therefore means generic KG `search` and query-anchored `context` can read
