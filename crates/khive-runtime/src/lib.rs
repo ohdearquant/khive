@@ -156,7 +156,7 @@ pub use operations::{
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
     IdResolutionMode, IngestAuditStore, InterceptedDispatchResult, KindHook, NoteKindSpec,
-    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
+    NoteLifecycleSpec, NoteUpdateEffect, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
     PackMetadataRegistry, PackRegistration, PackRegistry, PackRuntime, PackSchemaCollisionError,
     PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan, VerbCategory, VerbPresentationPolicy,
     VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,

@@ -1114,20 +1114,6 @@ pub(crate) fn string_value(v: Option<Value>, field: &str) -> Result<Option<Strin
     }
 }
 
-pub(crate) fn optional_string_patch(
-    v: Option<Value>,
-    field: &str,
-) -> Result<Option<Option<String>>, RuntimeError> {
-    match v {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
-        Some(Value::String(s)) => Ok(Some(Some(s))),
-        Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{field} must be null or a string, got: {other}"
-        ))),
-    }
-}
-
 // ---- Query result rendering ----
 
 pub(crate) fn sql_value_to_json(value: SqlValue) -> Value {

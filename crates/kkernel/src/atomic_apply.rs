@@ -753,16 +753,18 @@ async fn prepare_one(
                     .prepare_note_update_policy(runtime, token, &note, &mut resolved)
                     .await
                     .map_err(anyhow::Error::new)?;
-                khive_runtime::atomic_prepare::prepare_update_from_note_snapshot_with_policy(
+                khive_runtime::atomic_prepare::prepare_update_from_note_snapshot(
                     runtime,
                     token,
                     &resolved,
                     expected_kind,
                     note,
                     update_policy,
+                    registry,
                 )
                 .await
                 .map_err(anyhow::Error::new)?
+                .1
             } else {
                 khive_runtime::atomic_prepare::prepare_update(
                     runtime,

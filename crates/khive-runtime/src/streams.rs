@@ -1159,13 +1159,14 @@ impl KhiveRuntime {
             let update_policy = registry
                 .prepare_note_update_policy(self, token, &snapshot, &mut args)
                 .await?;
-            let plan = crate::atomic_prepare::prepare_update_from_note_snapshot_with_policy(
+            let (_, plan) = crate::atomic_prepare::prepare_update_from_note_snapshot(
                 self,
                 token,
                 &args,
                 None,
                 snapshot,
                 update_policy,
+                registry,
             )
             .await?;
             return Ok(StreamBatchPreparation::Ready(Box::new(

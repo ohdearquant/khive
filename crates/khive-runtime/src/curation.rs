@@ -2016,14 +2016,48 @@ impl KhiveRuntime {
         khive_storage::note::Note,
         crate::retrieval::EmbeddingTruncationReport,
     )> {
-        let id = snapshot.id;
         let (note, plan) = self
             .prepare_versioned_note_update(token, snapshot, patch)
             .await?;
-        use crate::atomic_runner::{
-            run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome,
-        };
-        match run_atomic_unit(self.sql().as_ref(), vec![AtomicOpPlan::Update(plan)]).await {
+        self.commit_prepared_note_update(token, note, crate::AtomicOpPlan::Update(plan))
+            .await
+    }
+
+    /// Commit a normalized and validated kind-owned update, including its typed
+    /// graph companions. Callers must first run `prepare_note_update_policy`
+    /// against this exact snapshot and pass the policy it returned; the shared
+    /// atomic prepare seam checks all patch fields before asking the kind hook
+    /// to derive any graph effects.
+    pub async fn update_note_from_snapshot_with_kind_effects(
+        &self,
+        token: &NamespaceToken,
+        snapshot: khive_storage::Note,
+        args: &Value,
+        policy: crate::NoteUpdatePolicy,
+        registry: &crate::VerbRegistry,
+    ) -> RuntimeResult<(
+        khive_storage::Note,
+        crate::retrieval::EmbeddingTruncationReport,
+    )> {
+        let (note, plan) = crate::atomic_prepare::prepare_update_from_note_snapshot(
+            self, token, args, None, snapshot, policy, registry,
+        )
+        .await?;
+        self.commit_prepared_note_update(token, note, plan).await
+    }
+
+    async fn commit_prepared_note_update(
+        &self,
+        token: &NamespaceToken,
+        note: khive_storage::Note,
+        plan: crate::AtomicOpPlan,
+    ) -> RuntimeResult<(
+        khive_storage::Note,
+        crate::retrieval::EmbeddingTruncationReport,
+    )> {
+        let id = note.id;
+        use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicRunOutcome};
+        match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { post_commit }) => {
                 let outcomes = crate::atomic_prepare::apply_post_commit_effects_with_report(
                     self,

@@ -127,10 +127,9 @@ fn optional_entity_type_patch(args: &Value, key: &str) -> RuntimeResult<Option<O
     }
 }
 
-/// Nullable-string patch semantics mirroring the actually-reachable behavior
-/// of `khive-pack-kg::handlers::common::optional_string_patch`/
-/// `description_patch`, reimplemented here rather than imported (that
-/// module has no dependency edge back to `khive-runtime`). Canonical's field
+/// Nullable-string patch semantics shared by note updates and mirroring the
+/// actually-reachable entity description behavior of
+/// `khive-pack-kg::handlers::common::description_patch`. Canonical's field
 /// type is `Option<Value>` (`UpdateParams.name`/`.description`); serde_json's
 /// derived `Deserialize` for `Option<T>` intercepts a literal JSON `null` at
 /// the outer `Option` boundary and maps it straight to Rust `None`
@@ -783,7 +782,8 @@ async fn prepare_note_update_plan_from_snapshot(
     expected_kind: &Option<AtomicUpdateKind>,
     note: khive_storage::note::Note,
     policy: crate::NoteUpdatePolicy,
-) -> RuntimeResult<AtomicOpPlan> {
+    registry: Option<&crate::VerbRegistry>,
+) -> RuntimeResult<(khive_storage::Note, UpdatePlan)> {
     let id = require_uuid(args, "id")?;
     if note.id != id {
         return Err(RuntimeError::NotFound(format!("note {id}")));
@@ -826,51 +826,36 @@ async fn prepare_note_update_plan_from_snapshot(
             .transpose()?,
         key: None,
     };
-    let (_, plan) = runtime
-        .prepare_versioned_note_update(
-            token,
-            note,
-            crate::curation::NotePatch::new(name, content, salience, decay_factor, properties)
-                .with_update_policy(policy)
-                .with_write_options(options),
-        )
+    let patch = crate::curation::NotePatch::new(name, content, salience, decay_factor, properties)
+        .with_update_policy(policy)
+        .with_write_options(options);
+    let (updated, mut plan) = runtime
+        .prepare_versioned_note_update(token, note.clone(), patch.clone())
         .await?;
-    Ok(AtomicOpPlan::Update(plan))
+    if let Some(registry) = registry {
+        attach_note_update_effects(runtime, token, registry, &note, &patch, &mut plan).await?;
+    }
+    Ok((updated, plan))
 }
 
 /// Build an atomic update plan from the exact note snapshot already supplied
 /// to a pack update hook. Persistence is guarded by that snapshot's revision
-/// and deletion marker, so hook normalization cannot race a second read.
-/// This compatibility entry uses ordinary property merging; writers carrying a
-/// kind hook's policy use [`prepare_update_from_note_snapshot_with_policy`].
+/// and deletion marker, so hook normalization cannot race a second read. The
+/// caller must first run the registry normalizer/validator against this snapshot.
+/// This shared canonical/atomic seam prepares all patch fields with the owning
+/// kind's property policy (the value `VerbRegistry::prepare_note_update_policy`
+/// returned for this snapshot), then derives and attaches the owner's typed
+/// graph effects. It returns the projected note and one atomic plan, preserving
+/// the caller's operation index.
 pub async fn prepare_update_from_note_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
     expected_kind: Option<AtomicUpdateKind>,
     note: khive_storage::note::Note,
-) -> RuntimeResult<AtomicOpPlan> {
-    prepare_update_from_note_snapshot_with_policy(
-        runtime,
-        token,
-        args,
-        expected_kind,
-        note,
-        crate::NoteUpdatePolicy::default(),
-    )
-    .await
-}
-
-/// Prepare the validated note snapshot with the owning kind's property policy.
-/// Canonical and atomic writers retain the same merge and revision guards.
-pub async fn prepare_update_from_note_snapshot_with_policy(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    args: &Value,
-    expected_kind: Option<AtomicUpdateKind>,
-    note: khive_storage::note::Note,
     policy: crate::NoteUpdatePolicy,
-) -> RuntimeResult<AtomicOpPlan> {
+    registry: &crate::VerbRegistry,
+) -> RuntimeResult<(khive_storage::Note, AtomicOpPlan)> {
     if obj(args)?.get("entity_kind").is_some_and(|v| !v.is_null()) {
         return Err(RuntimeError::InvalidInput(
             "entity_kind is immutable; to change kind, delete then re-create the entity, \
@@ -878,7 +863,162 @@ pub async fn prepare_update_from_note_snapshot_with_policy(
                 .into(),
         ));
     }
-    prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note, policy).await
+    let (note, plan) = prepare_note_update_plan_from_snapshot(
+        runtime,
+        token,
+        args,
+        &expected_kind,
+        note,
+        policy,
+        Some(registry),
+    )
+    .await?;
+    Ok((note, AtomicOpPlan::Update(plan)))
+}
+
+/// The only companion attachment site. Canonical, CLI atomic, and stream note
+/// updates all enter through `prepare_update_from_note_snapshot` after running
+/// the registry's normalizer/validator on the same snapshot.
+async fn attach_note_update_effects(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &crate::VerbRegistry,
+    snapshot: &khive_storage::Note,
+    patch: &crate::curation::NotePatch,
+    plan: &mut UpdatePlan,
+) -> RuntimeResult<()> {
+    use crate::atomic_plan::NoteUpdateStatement;
+    use crate::NoteUpdateEffect;
+
+    let Some(hook) = registry.find_kind_hook(&snapshot.kind) else {
+        return Ok(());
+    };
+    // Refuse already-known stale input before asking the owner to derive effects.
+    // A change after this read remains protected by the note's first CAS statement.
+    if let Some(expected) = patch.write_options.expected_version {
+        if expected != snapshot.version {
+            return Err(crate::note_write::NoteWriteConflict::Version {
+                expected,
+                current: snapshot.version,
+            }
+            .into_error()
+            .into());
+        }
+    }
+    let current = runtime.notes(token)?.get_note(snapshot.id).await?;
+    if !current.is_some_and(|current| {
+        current.updated_at == snapshot.updated_at
+            && current.deleted_at == snapshot.deleted_at
+            && current.version == snapshot.version
+    }) {
+        return Err(crate::curation::stale_note_snapshot_error(snapshot.id));
+    }
+    let effects = hook
+        .note_update_effects(runtime, token, snapshot, patch)
+        .await?;
+    if plan.idempotent_noop && !effects.is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "an unchanged note update cannot carry graph effects".into(),
+        ));
+    }
+    let edge_token = token.with_namespace(
+        crate::Namespace::parse(&snapshot.namespace)
+            .map_err(|error| RuntimeError::Internal(format!("invalid note namespace: {error}")))?,
+    );
+    for effect in effects {
+        match effect {
+            NoteUpdateEffect::Link(spec) => {
+                if spec.source_id != snapshot.id
+                    || spec
+                        .namespace
+                        .as_deref()
+                        .is_some_and(|ns| ns != snapshot.namespace)
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "note update links must originate from the note in its namespace".into(),
+                    ));
+                }
+                let mut args = serde_json::json!({
+                    "source_id": spec.source_id, "target_id": spec.target_id,
+                    "relation": spec.relation, "weight": spec.weight,
+                    "resurrect": spec.resurrect,
+                });
+                if let Some(metadata) = spec.metadata {
+                    args["metadata"] = metadata;
+                }
+                let AtomicOpPlan::Link(link) = prepare_link(runtime, &edge_token, &args).await?
+                else {
+                    return Err(RuntimeError::Internal("expected a link plan".into()));
+                };
+                // A live annotation inserted between the owner's read and this
+                // lookup belongs to that writer. Refuse instead of replacing its
+                // weight/metadata; a fresh preparation can preserve it explicitly.
+                if link.disposition == EdgeUpsertDisposition::Updated {
+                    return Err(khive_types::KhiveError::conflict(
+                        "a live edge appeared while preparing the note update; retry with fresh state",
+                    ).into());
+                }
+                plan.graph_effects
+                    .extend(link.statements.into_iter().map(NoteUpdateStatement::Write));
+            }
+            NoteUpdateEffect::DeleteEdge(edge) => {
+                let id = Uuid::from(edge.id);
+                if edge.source_id != snapshot.id
+                    || edge.namespace != snapshot.namespace
+                    || edge.deleted_at.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "note update deletes must select an outgoing edge in the note namespace"
+                            .into(),
+                    ));
+                }
+                plan.graph_effects
+                    .push(NoteUpdateStatement::Assert(PlanStatement {
+                        statement: khive_db::stores::graph::edge_snapshot_assertion_statement(
+                            &edge, false,
+                        ),
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    }));
+                let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+                let AtomicOpPlan::Delete(delete) =
+                    prepare_delete_edge(&edge_token, id, edge, false, &actor).await?
+                else {
+                    return Err(RuntimeError::Internal(
+                        "expected an edge delete plan".into(),
+                    ));
+                };
+                if delete.post_commit != PostCommitEffect::None {
+                    return Err(RuntimeError::Internal(
+                        "edge delete has a deferred effect".into(),
+                    ));
+                }
+                plan.graph_effects.extend(
+                    delete
+                        .statements
+                        .into_iter()
+                        .map(NoteUpdateStatement::Write),
+                );
+            }
+            NoteUpdateEffect::AssertLink(edge) => {
+                if edge.source_id != snapshot.id
+                    || edge.namespace != snapshot.namespace
+                    || edge.deleted_at.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "note update assertions must select a live outgoing edge in the note namespace".into(),
+                    ));
+                }
+                plan.graph_effects
+                    .push(NoteUpdateStatement::Assert(PlanStatement {
+                        statement: khive_db::stores::graph::edge_snapshot_assertion_statement(
+                            &edge, true,
+                        ),
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    }));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `expected_kind`: `None` when the caller omitted `kind` (no check, parity
@@ -957,15 +1097,17 @@ pub async fn prepare_update(
             // `prepare_update_note_from_snapshot` — the same implementation
             // canonical guarded update calls, including salience/decay range
             // validation. The plan retains this exact snapshot's revision.
-            prepare_note_update_plan_from_snapshot(
+            let (_, plan) = prepare_note_update_plan_from_snapshot(
                 runtime,
                 token,
                 args,
                 &expected_kind,
                 note,
                 crate::NoteUpdatePolicy::default(),
+                None,
             )
-            .await
+            .await?;
+            Ok(AtomicOpPlan::Update(plan))
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
             "update target {id} must be an entity, note, or edge"
@@ -1029,6 +1171,7 @@ pub async fn prepare_update_entity_plan(
         PostCommitEffect::None
     };
     Ok(AtomicOpPlan::Update(UpdatePlan {
+        graph_effects: Vec::new(),
         note_vector_purge: None,
         note_embedding_inheritance: None,
         note_guard: None,
@@ -1238,6 +1381,7 @@ async fn prepare_update_edge(
     )?);
 
     Ok(AtomicOpPlan::Update(UpdatePlan {
+        graph_effects: Vec::new(),
         note_vector_purge: None,
         note_embedding_inheritance: None,
         note_guard: None,

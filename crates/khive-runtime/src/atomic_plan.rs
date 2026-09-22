@@ -250,6 +250,17 @@ pub struct UpdatePlan {
     pub(crate) note_guard: Option<crate::note_write::NoteWriteGuard>,
     pub(crate) note_vector_purge: Option<crate::note_write::NoteVectors>,
     pub(crate) note_embedding_inheritance: Option<crate::note_write::NoteEmbeddingInheritance>,
+    /// Typed kind-owned graph operations, applied after the note statements in
+    /// the same savepoint. Assertions never execute as writes.
+    pub(crate) graph_effects: Vec<NoteUpdateStatement>,
+}
+
+/// Only runtime preparation can append these to an update. Packs return typed
+/// graph requests, not SQL or execution flags.
+#[derive(Debug, Clone)]
+pub(crate) enum NoteUpdateStatement {
+    Write(PlanStatement),
+    Assert(PlanStatement),
 }
 
 impl UpdatePlan {
@@ -631,6 +642,7 @@ mod tests {
     fn update_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
         let id = Uuid::new_v4();
         let plan = UpdatePlan {
+            graph_effects: Vec::new(),
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,

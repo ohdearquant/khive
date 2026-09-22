@@ -62,9 +62,10 @@ impl AtomicOpPlan {
     /// [`PlanStatement`]s (ADR-099 D1 rule 1 — a rewire may legitimately
     /// touch zero or many rows and is never guarded), followed by the
     /// always-guarded lifecycle writes (`MergePlan::lifecycle`). Every other
-    /// variant already carries a flat `Vec<PlanStatement>` in apply order.
-    fn plan_statements(&self) -> Vec<PlanStatement> {
-        match self {
+    /// variant carries ordered statements. Updates additionally append typed graph
+    /// effects; the tuple flag marks a read assertion for `query_all`, never DML.
+    fn plan_statements(&self) -> Vec<(PlanStatement, bool)> {
+        let statements = match self {
             AtomicOpPlan::AddEntity(p) => p.statements.clone(),
             AtomicOpPlan::AddNote(p) => p.statements.clone(),
             AtomicOpPlan::Update(p) => p.statements.clone(),
@@ -85,7 +86,22 @@ impl AtomicOpPlan {
             AtomicOpPlan::GtdTransition(p) => p.statements.clone(),
             AtomicOpPlan::GtdComplete(p) => p.statements.clone(),
             AtomicOpPlan::Governance(p) => p.statements.clone(),
+        };
+        let mut statements: Vec<_> = statements
+            .into_iter()
+            .map(|statement| (statement, false))
+            .collect();
+        if let AtomicOpPlan::Update(plan) = self {
+            statements.extend(plan.graph_effects.iter().map(|effect| match effect {
+                crate::atomic_plan::NoteUpdateStatement::Write(statement) => {
+                    (statement.clone(), false)
+                }
+                crate::atomic_plan::NoteUpdateStatement::Assert(statement) => {
+                    (statement.clone(), true)
+                }
+            }));
         }
+        statements
     }
 
     /// The deferred post-commit effect this op's plan recorded, if any.
@@ -323,11 +339,12 @@ pub(crate) async fn apply_plan(
             }
         }
     }
-    for (index, stmt) in plan.plan_statements().into_iter().enumerate() {
+    for (index, (stmt, read_assertion)) in plan.plan_statements().into_iter().enumerate() {
         let label = stmt.statement.label.clone();
         // No-op GTD plans are typed read assertions, not equal-value writes:
         // even assigning a column to itself would fire the version trigger.
-        let result = if matches!(plan, AtomicOpPlan::GtdTransition(p) if p.idempotent_noop)
+        let result = if read_assertion
+            || matches!(plan, AtomicOpPlan::GtdTransition(p) if p.idempotent_noop)
             || matches!(plan, AtomicOpPlan::Update(p) if p.idempotent_noop)
         {
             writer
@@ -750,6 +767,7 @@ mod tests {
 
     fn rename_plan(id: Uuid, new_name: &str, label: &str) -> AtomicOpPlan {
         AtomicOpPlan::Update(UpdatePlan {
+            graph_effects: Vec::new(),
             note_vector_purge: None,
             note_embedding_inheritance: None,
             note_guard: None,

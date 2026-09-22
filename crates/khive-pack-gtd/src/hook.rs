@@ -10,16 +10,45 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, KindHook, LinkSpec, Namespace, NamespaceToken, RuntimeError};
-use khive_storage::Note;
+use khive_runtime::{
+    KhiveRuntime, KindHook, LinkSpec, Namespace, NamespaceToken, NotePatch, NoteUpdateEffect,
+    RuntimeError,
+};
+use khive_storage::{EdgeRelation, Note};
 
-use crate::handlers::parse_due;
+use crate::handlers::{parse_due, resolve_context_entity_id};
 use crate::schema::{is_valid_priority, priority_to_salience};
 use crate::task_create::{link_depends_on_edges, prepare_task_create, TaskCreateInput};
 
 #[derive(Debug, Default)]
 /// KindHook implementation for the `task` note kind; normalises GTD fields on create.
 pub struct TaskHook;
+
+/// Reuse creation's primary-namespace entity resolver for a supplied context.
+/// Absence preserves the stored reference; explicit null retains patch clearing.
+async fn normalize_context_entity_update(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &mut Value,
+) -> Result<(), RuntimeError> {
+    let Some(properties) = args.get_mut("properties").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let Some(value) = properties
+        .get("context_entity_id")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let raw = value.as_str().ok_or_else(|| {
+        RuntimeError::InvalidInput(
+            "properties.context_entity_id must be a full UUID string or null".into(),
+        )
+    })?;
+    let id = resolve_context_entity_id(raw, runtime, token).await?;
+    properties.insert("context_entity_id".into(), json!(id.to_string()));
+    Ok(())
+}
 
 fn stored_content_is_title_fallback(note: &Note) -> bool {
     let effective_title = note.name.as_deref().map(str::trim).unwrap_or_default();
@@ -363,14 +392,100 @@ impl KindHook for TaskHook {
     async fn normalize_note_update(
         &self,
         runtime: &KhiveRuntime,
-        _token: &NamespaceToken,
+        token: &NamespaceToken,
         note: &Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
         synchronize_description(note, args)?;
         normalize_due_update(runtime, note, args)?;
         normalize_priority_update(args)?;
+        normalize_context_entity_update(runtime, token, args).await?;
         Ok(())
+    }
+
+    async fn note_update_effects(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &Note,
+        patch: &NotePatch,
+    ) -> Result<Vec<NoteUpdateEffect>, RuntimeError> {
+        let Some(value) = patch
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("context_entity_id"))
+        else {
+            return Ok(Vec::new());
+        };
+        // The normalizer has already validated/canonicalized the new reference.
+        // Parse stored legacy UUID spellings too, so a spelling-only patch is a
+        // graph no-op. A malformed historical value cannot identify an old edge.
+        let previous = note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("context_entity_id"))
+            .and_then(Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        let next = if value.is_null() {
+            None
+        } else {
+            Some(
+                value
+                    .as_str()
+                    .and_then(|raw| Uuid::parse_str(raw).ok())
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "context_entity_id update was not normalized".into(),
+                        )
+                    })?,
+            )
+        };
+        if previous == next {
+            return Ok(Vec::new());
+        }
+        let mut effects = Vec::new();
+        if let Some(previous) = previous {
+            if let Some(edge) = runtime
+                .get_edge_by_natural_key_including_deleted(
+                    token,
+                    &note.namespace,
+                    note.id,
+                    previous,
+                    EdgeRelation::Annotates,
+                )
+                .await?
+                .filter(|edge| edge.deleted_at.is_none())
+            {
+                effects.push(NoteUpdateEffect::DeleteEdge(edge));
+            }
+        }
+        if let Some(next) = next {
+            let existing = runtime
+                .get_edge_by_natural_key_including_deleted(
+                    token,
+                    &note.namespace,
+                    note.id,
+                    next,
+                    EdgeRelation::Annotates,
+                )
+                .await?;
+            // A separately authored live annotation already satisfies the new
+            // context. Preserve its ID, timestamps, weight, and metadata.
+            if let Some(edge) = existing.filter(|edge| edge.deleted_at.is_none()) {
+                effects.push(NoteUpdateEffect::AssertLink(edge));
+            } else {
+                effects.push(NoteUpdateEffect::Link(LinkSpec {
+                    namespace: Some(note.namespace.clone()),
+                    source_id: note.id,
+                    target_id: next,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: true,
+                }));
+            }
+        }
+        Ok(effects)
     }
 
     async fn validate_links(
