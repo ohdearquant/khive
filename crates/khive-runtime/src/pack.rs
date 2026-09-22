@@ -2616,6 +2616,9 @@ impl VerbRegistry {
             .map(|id| id.actor_id.as_deref())
             .unwrap_or(self.actor_id.as_deref());
         let actor = crate::actor_identity::resolve_actor(actor_id);
+        // GateRequest.args deliberately captures submitted dispatch arguments.
+        // The handler's canonicalization and kind hooks have not run; a policy
+        // requiring their effective values belongs after that handler work.
         let req = GateRequest::new(actor, namespace, verb, params.clone());
         crate::mailbox_view::validate_mailbox_request(&req)?;
         Ok(req)
@@ -15499,3 +15502,7 @@ mod help_tests {
         assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "gate_argument_contract_tests.rs"]
+mod gate_argument_contract_tests;

@@ -6,6 +6,9 @@ use crate::{ActorRef, GateDecision, GateError, GateRequest};
 ///
 /// Implementations return policy denials as decisions and infrastructure failures as errors. See
 /// `crates/khive-gate/docs/api/gate-evaluation.md`.
+/// Request arguments are submitted, pre-handler values. Canonicalization and
+/// kind hooks may rewrite them after this decision; policies requiring the
+/// effective values must be enforced by the handler after normalization.
 pub trait Gate: Send + Sync + std::fmt::Debug {
     /// Evaluate `req`, returning an allow/deny decision or a backend [`GateError`].
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
