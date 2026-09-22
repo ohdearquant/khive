@@ -1,7 +1,7 @@
 //! Validate session metadata on shared creation without rewriting caller data.
 
 use async_trait::async_trait;
-use khive_runtime::{KhiveRuntime, KindHook, RuntimeError};
+use khive_runtime::{effective_create_tags, KhiveRuntime, KindHook, RuntimeError};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -30,15 +30,11 @@ impl KindHook for SessionKindHook {
             .transpose()?;
         let property = |key: &str| properties.and_then(|values| values.get(key));
 
-        // Shared create and stream preparation both apply nonempty top-level
-        // tags over properties.tags. Validate that final value without changing
-        // the original metadata or rejecting a value the caller replaces.
+        // Validate the writers' shared effective value without changing the
+        // original metadata or rejecting a value the caller replaces.
         let top_tags: Option<Vec<String>> =
             deser(args.get("tags").cloned().unwrap_or(Value::Null))?;
-        let tags = match top_tags {
-            Some(tags) if !tags.is_empty() => json!(tags),
-            _ => property("tags").cloned().unwrap_or(Value::Null),
-        };
+        let tags = effective_create_tags(top_tags.as_deref(), args.get("properties")).to_value();
         let fields: StoreParams = deser(json!({
             "content": args.get("content"),
             "title": args.get("name"),
