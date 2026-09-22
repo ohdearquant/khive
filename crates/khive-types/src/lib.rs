@@ -26,6 +26,7 @@ pub mod id;
 pub mod khive_error;
 pub mod namespace;
 pub mod note;
+pub mod operation;
 pub mod pack;
 pub mod refusal;
 pub mod substrate;
@@ -70,3 +71,5 @@ pub use refusal::RefusalReason;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
+
+pub use operation::{OperationAttribution, RefResolution};

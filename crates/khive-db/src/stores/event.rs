@@ -222,7 +222,8 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
 // Column order: id(0), namespace(1), verb(2), substrate(3), actor(4),
 //               kind(5), outcome(6), payload(7), payload_schema_version(8),
 //               profile_state_version(9), duration_us(10), target_id(11),
-//               session_id(12), aggregate_kind(13), aggregate_id(14), created_at(15)
+//               session_id(12), aggregate_kind(13), aggregate_id(14), created_at(15),
+//               op_index(16), ref_resolution(17)
 fn read_event(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
     let id_str: String = row.get(0)?;
     let namespace: String = row.get(1)?;
@@ -240,6 +241,28 @@ fn read_event(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
     let aggregate_kind: Option<String> = row.get(13)?;
     let aggregate_str: Option<String> = row.get(14)?;
     let created_at: i64 = row.get(15)?;
+    let op_index = row.get::<_, Option<u32>>(16)?;
+    let ref_resolution = row
+        .get::<_, Option<String>>(17)?
+        .map(|value| {
+            value
+                .parse::<khive_types::RefResolution>()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        17,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+        })
+        .transpose()?;
+    if op_index.is_some() != ref_resolution.is_some() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            16,
+            rusqlite::types::Type::Integer,
+            "event operation attribution must be present or absent together".into(),
+        ));
+    }
 
     let id = parse_uuid(&id_str)?;
     let substrate = substrate_from_str(&substrate_str)?;
@@ -287,6 +310,8 @@ fn read_event(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
         aggregate_kind,
         aggregate_id,
         created_at,
+        op_index,
+        ref_resolution,
     })
 }
 
@@ -298,6 +323,7 @@ fn insert_event_with_observations(
     conn: &rusqlite::Connection,
     event: &Event,
 ) -> Result<(), rusqlite::Error> {
+    validate_operation_pair(event)?;
     let id_str = event.id.to_string();
     let substrate_str = event.substrate.name().to_string();
     let kind_str = event.kind.name().to_string();
@@ -311,8 +337,8 @@ fn insert_event_with_observations(
     conn.execute(
         "INSERT INTO events \
          (id, namespace, verb, substrate, actor, kind, outcome, payload, payload_schema_version, \
-          profile_state_version, duration_us, target_id, session_id, aggregate_kind, aggregate_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+          profile_state_version, duration_us, target_id, session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         rusqlite::params![
             id_str,
             &event.namespace,
@@ -330,6 +356,8 @@ fn insert_event_with_observations(
             &event.aggregate_kind,
             aggregate_str,
             event.created_at,
+            event.op_index,
+            event.ref_resolution.map(|value| value.name()),
         ],
     )?;
 
@@ -383,7 +411,7 @@ fn fetch_event_by_id(
     let mut stmt = conn.prepare(
         "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
                 payload_schema_version, profile_state_version, duration_us, target_id, \
-                session_id, aggregate_kind, aggregate_id, created_at \
+                session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
          FROM events WHERE id = ?1",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -484,6 +512,7 @@ fn idempotent_batch_dml(
 /// function rather than each hand-writing the INSERT text — the divergence
 /// that produced the drift this cut fixes.
 pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusqlite::Error> {
+    validate_operation_pair(event)?;
     let id_str = event.id.to_string();
     let substrate_str = event.substrate.name().to_string();
     let kind_str = event.kind.name().to_string();
@@ -497,8 +526,8 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
     let mut statements = vec![SqlStatement {
         sql: "INSERT INTO events \
               (id, namespace, verb, substrate, actor, kind, outcome, payload, payload_schema_version, \
-               profile_state_version, duration_us, target_id, session_id, aggregate_kind, aggregate_id, created_at) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+               profile_state_version, duration_us, target_id, session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             .into(),
         params: vec![
             SqlValue::Text(id_str),
@@ -523,6 +552,8 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
                 .unwrap_or(SqlValue::Null),
             aggregate_str.map(SqlValue::Text).unwrap_or(SqlValue::Null),
             SqlValue::Integer(event.created_at),
+            event.op_index.map(|value| SqlValue::Integer(i64::from(value))).unwrap_or(SqlValue::Null),
+            event.ref_resolution.map(|value| SqlValue::Text(value.name().into())).unwrap_or(SqlValue::Null),
         ],
         label: Some("event_insert_on_writer".into()),
     }];
@@ -545,6 +576,15 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
     }
 
     Ok(statements)
+}
+
+fn validate_operation_pair(event: &Event) -> Result<(), rusqlite::Error> {
+    if event.op_index.is_some() != event.ref_resolution.is_some() {
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            "event operation attribution must be present or absent together".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build commit-time warning inserts for lineage-sensitive incident edges
@@ -572,13 +612,14 @@ pub fn hard_delete_lineage_warning_statements(
 
     let target_id = target_id.to_string();
     let created_at = chrono::Utc::now().timestamp_micros();
+    let operation = khive_storage::operation_context::current_operation_attribution();
     WARNINGS
         .into_iter()
         .map(|(relation, warning)| SqlStatement {
             sql: "INSERT INTO events \
                   (id, namespace, verb, substrate, actor, kind, outcome, payload, \
                    payload_schema_version, profile_state_version, duration_us, target_id, \
-                   session_id, aggregate_kind, aggregate_id, created_at) \
+                   session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution) \
                   SELECT ?1, ?2, 'delete', ?3, ?4, ?5, ?6, \
                          json_object( \
                            'severity', 'warning', \
@@ -593,7 +634,7 @@ pub fn hard_delete_lineage_warning_statements(
                              'target_id', incident.target_id, \
                              'deleted_at', incident.deleted_at)) \
                          ), \
-                         1, NULL, 0, ?8, NULL, NULL, NULL, ?10 \
+                         1, NULL, 0, ?8, NULL, NULL, NULL, ?10, ?11, ?12 \
                   FROM ( \
                     SELECT id, namespace, source_id, target_id, deleted_at \
                     FROM graph_edges \
@@ -613,6 +654,12 @@ pub fn hard_delete_lineage_warning_statements(
                 SqlValue::Text(target_id.clone()),
                 SqlValue::Text(relation.to_string()),
                 SqlValue::Integer(created_at),
+                operation
+                    .map(|value| SqlValue::Integer(i64::from(value.op_index)))
+                    .unwrap_or(SqlValue::Null),
+                operation
+                    .map(|value| SqlValue::Text(value.ref_resolution.name().into()))
+                    .unwrap_or(SqlValue::Null),
             ],
             label: Some(format!("hard-delete-{relation}-warning")),
         })
@@ -1260,7 +1307,7 @@ impl EventStore for SqlEventStore {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
                         payload_schema_version, profile_state_version, duration_us, target_id, \
-                        session_id, aggregate_kind, aggregate_id, created_at \
+                        session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
                  FROM events WHERE namespace = ?1 AND id = ?2",
             )?;
             let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
@@ -1310,7 +1357,7 @@ impl EventStore for SqlEventStore {
             let data_sql = format!(
                 "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
                         payload_schema_version, profile_state_version, duration_us, target_id, \
-                        session_id, aggregate_kind, aggregate_id, created_at \
+                        session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
                  FROM events{} ORDER BY created_at DESC, id DESC LIMIT ?{} OFFSET ?{}",
                 where_clause, limit_idx, offset_idx,
             );

@@ -17,7 +17,12 @@ CREATE TABLE IF NOT EXISTS events (
     session_id             TEXT,
     aggregate_kind         TEXT,
     aggregate_id           TEXT,
-    created_at             INTEGER NOT NULL
+    created_at             INTEGER NOT NULL,
+    op_index               INTEGER CHECK (op_index IS NULL OR op_index BETWEEN 0 AND 4294967295),
+    ref_resolution         TEXT CHECK (
+        (op_index IS NULL AND ref_resolution IS NULL) OR
+        (op_index IS NOT NULL AND ref_resolution IS NOT NULL AND ref_resolution IN ('literal', 'resolved'))
+    )
 );
 
 CREATE TABLE IF NOT EXISTS event_observations (

@@ -344,6 +344,20 @@ impl KgPack {
             aggregate_kind: sql_optional_text(&row, "aggregate_kind")?,
             aggregate_id: sql_optional_uuid(&row, "aggregate_id")?,
             created_at: sql_i64(&row, "created_at")?,
+            op_index: sql_optional_i64(&row, "op_index")?
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        RuntimeError::Internal("stored event op_index is invalid".into())
+                    })
+                })
+                .transpose()?,
+            ref_resolution: sql_optional_text(&row, "ref_resolution")?
+                .map(|value| {
+                    value.parse().map_err(|_| {
+                        RuntimeError::Internal("stored event ref_resolution is invalid".into())
+                    })
+                })
+                .transpose()?,
         }))
     }
 

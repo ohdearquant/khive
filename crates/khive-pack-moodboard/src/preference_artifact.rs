@@ -334,6 +334,20 @@ fn parse_event_row(row: &SqlRow, model_id: Uuid) -> Result<Event, RuntimeError> 
         aggregate_kind: optional_text(row, "aggregate_kind", context)?,
         aggregate_id: optional_uuid(row, "aggregate_id", context)?,
         created_at: required_i64(row, "created_at", context)?,
+        op_index: optional_nonnegative_u64(row, "op_index", context)?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    RuntimeError::Internal(format!("{context} returned invalid op_index"))
+                })
+            })
+            .transpose()?,
+        ref_resolution: optional_text(row, "ref_resolution", context)?
+            .map(|value| {
+                value.parse().map_err(|_| {
+                    RuntimeError::Internal(format!("{context} returned invalid ref_resolution"))
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -345,11 +359,9 @@ async fn load_exact_model_event(
     let mut reader = sql.reader().await?;
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
-                         payload_schema_version, profile_state_version, duration_us, target_id, \
-                         session_id, aggregate_kind, aggregate_id, created_at \
-                  FROM events WHERE namespace = ?1 AND id = ?2"
-                .to_string(),
+            // Boot cutover can run before the operation-attribution migration. Read
+            // available columns by name; absent attribution remains unknown.
+            sql: "SELECT * FROM events WHERE namespace = ?1 AND id = ?2".to_string(),
             params: vec![
                 SqlValue::Text(model.namespace.clone()),
                 SqlValue::Text(event_id.to_string()),
@@ -508,8 +520,9 @@ mod tests {
     };
 
     use super::{
-        legacy_preference_model_count, model_event_id, verify_legacy_preference_attachments,
-        verify_preference_bundle_evidence, verify_preference_network,
+        legacy_preference_model_count, model_event_id, parse_event_row,
+        verify_legacy_preference_attachments, verify_preference_bundle_evidence,
+        verify_preference_network,
     };
 
     struct ArtifactFixture {
@@ -738,6 +751,20 @@ mod tests {
                         .unwrap_or(SqlValue::Null),
                 ),
                 column("created_at", SqlValue::Integer(event.created_at)),
+                column(
+                    "op_index",
+                    event
+                        .op_index
+                        .map(|value| SqlValue::Integer(i64::from(value)))
+                        .unwrap_or(SqlValue::Null),
+                ),
+                column(
+                    "ref_resolution",
+                    event
+                        .ref_resolution
+                        .map(|value| SqlValue::Text(value.name().into()))
+                        .unwrap_or(SqlValue::Null),
+                ),
             ],
         }
     }
@@ -749,6 +776,7 @@ mod tests {
                 statement.label.as_deref(),
                 Some("moodboard_legacy_model_event")
             );
+            assert!(statement.sql.starts_with("SELECT * FROM events "));
             Ok(Some(self.0.event_row.clone()))
         }
 
@@ -817,6 +845,27 @@ mod tests {
         assert_eq!(
             model_event_id(model_id, &bundle_ref),
             Uuid::parse_str("b5b8f223-6cab-5738-9b81-6488c2e3722b").unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_event_attribution_is_optional_but_preserved_when_present() {
+        let mut fixture = artifact_fixture();
+        fixture.event.op_index = Some(7);
+        fixture.event.ref_resolution = Some(khive_types::RefResolution::Resolved);
+        let mut row = event_row(&fixture.event);
+        assert_eq!(
+            parse_event_row(&row, fixture.model_id).unwrap(),
+            fixture.event
+        );
+
+        row.columns
+            .retain(|column| !matches!(column.name.as_str(), "op_index" | "ref_resolution"));
+        fixture.event.op_index = None;
+        fixture.event.ref_resolution = None;
+        assert_eq!(
+            parse_event_row(&row, fixture.model_id).unwrap(),
+            fixture.event
         );
     }
 
@@ -921,9 +970,13 @@ mod tests {
         );
         let network_ref = store.put(fixture.network_bytes.clone()).await.unwrap();
         let hydrator = BlobHydrator::new(store, 64 * 1024 * 1024).unwrap();
+        let mut legacy_event = event_row(&fixture.event);
+        legacy_event
+            .columns
+            .retain(|column| !matches!(column.name.as_str(), "op_index" | "ref_resolution"));
         let sql = ReadOnlyLegacySql {
             model_row: legacy_model_row(&fixture, None),
-            event_row: event_row(&fixture.event),
+            event_row: legacy_event,
         };
 
         assert_eq!(legacy_preference_model_count(&sql).await.unwrap(), 1);

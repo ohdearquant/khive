@@ -28,14 +28,17 @@ use crate::NamespaceToken;
 pub struct EventAttribution {
     namespace: String,
     actor: String,
+    operation: Option<khive_types::OperationAttribution>,
 }
 
 impl EventAttribution {
-    /// Resolve the canonical namespace and actor stamp from `token`.
+    /// Resolve the canonical namespace and actor stamp from `token`, capturing
+    /// the current operation for explicitly deferred transactional event work.
     pub fn from_token(token: &NamespaceToken) -> Self {
         Self {
             namespace: token.namespace().as_str().to_owned(),
             actor: format!("{}:{}", token.actor().kind, token.actor().id),
+            operation: khive_storage::operation_context::current_operation_attribution(),
         }
     }
 
@@ -43,6 +46,12 @@ impl EventAttribution {
     pub fn stamp(&self, mut event: Event) -> Event {
         event.namespace.clone_from(&self.namespace);
         event.actor.clone_from(&self.actor);
+        // Explicit capture carries the originating operation through writer-task
+        // closures. Reusable store decorators disable this capture below.
+        if let Some(operation) = self.operation {
+            event.op_index = Some(operation.op_index);
+            event.ref_resolution = Some(operation.ref_resolution);
+        }
         event
     }
 }
@@ -54,10 +63,12 @@ pub(crate) struct AttributedEventStore {
 
 impl AttributedEventStore {
     pub(crate) fn wrap(inner: Arc<dyn EventStore>, token: &NamespaceToken) -> Arc<dyn EventStore> {
-        Arc::new(Self {
-            inner,
-            attribution: EventAttribution::from_token(token),
-        })
+        let mut attribution = EventAttribution::from_token(token);
+        // A store may outlive the operation that obtained it. Its authority
+        // remains token-bound, but each event captures its own operation when
+        // constructed; reusing the store must not reuse an earlier position.
+        attribution.operation = None;
+        Arc::new(Self { inner, attribution })
     }
 
     fn attribute(&self, event: Event) -> Event {
@@ -113,5 +124,73 @@ impl EventStore for AttributedEventStore {
 
     fn supports_idempotent_audit_batch(&self) -> bool {
         self.inner.supports_idempotent_audit_batch()
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+    use khive_storage::operation_context::scope_operation_attribution;
+    use khive_types::{EventKind, OperationAttribution, RefResolution, SubstrateKind};
+
+    fn event() -> Event {
+        Event::new(
+            "local",
+            "test.operation",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "fixture",
+        )
+    }
+
+    #[tokio::test]
+    async fn reusable_store_does_not_reuse_operation_but_explicit_capture_survives_defer() {
+        let runtime = crate::KhiveRuntime::memory().unwrap();
+        let token = runtime.authorize(crate::Namespace::local()).unwrap();
+        let operation = OperationAttribution {
+            op_index: 2,
+            ref_resolution: RefResolution::Resolved,
+        };
+        let (store, captured) = scope_operation_attribution(operation, async {
+            (
+                runtime.events(&token).unwrap(),
+                EventAttribution::from_token(&token),
+            )
+        })
+        .await;
+
+        let outside = event();
+        store.append_event(outside.clone()).await.unwrap();
+        let stored = store.get_event(outside.id).await.unwrap().unwrap();
+        assert_eq!((stored.op_index, stored.ref_resolution), (None, None));
+
+        let deferred = tokio::spawn(async move { captured.stamp(event()) })
+            .await
+            .unwrap();
+        assert_eq!(
+            (deferred.op_index, deferred.ref_resolution),
+            (Some(2), Some(RefResolution::Resolved))
+        );
+        store.append_event(deferred.clone()).await.unwrap();
+        let stored = store.get_event(deferred.id).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.op_index, stored.ref_resolution),
+            (Some(2), Some(RefResolution::Resolved))
+        );
+
+        let next = scope_operation_attribution(
+            OperationAttribution {
+                op_index: 7,
+                ref_resolution: RefResolution::Literal,
+            },
+            async { event() },
+        )
+        .await;
+        store.append_event(next.clone()).await.unwrap();
+        let stored = store.get_event(next.id).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.op_index, stored.ref_resolution),
+            (Some(7), Some(RefResolution::Literal))
+        );
     }
 }

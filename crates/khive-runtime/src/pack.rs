@@ -2619,7 +2619,10 @@ impl VerbRegistry {
         error: &khive_gate::GateError,
         request_id: Option<u64>,
     ) -> RuntimeError {
-        let audit = AuditEvent::gate_unavailable(gate_req, self.gate.impl_name());
+        let audit = AuditEvent::gate_unavailable(gate_req, self.gate.impl_name())
+            .with_operation_attribution(
+                khive_storage::operation_context::current_operation_attribution(),
+            );
         tracing::info!(
             audit_event = %serde_json::to_string(&audit)
                 .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
@@ -4512,7 +4515,10 @@ fn masked_audit_event(
     decision: &GateDecision,
     gate_impl: &str,
 ) -> AuditEvent {
-    let mut audit = AuditEvent::from_check(gate_req, decision, gate_impl);
+    let mut audit = AuditEvent::from_check(gate_req, decision, gate_impl)
+        .with_operation_attribution(
+            khive_storage::operation_context::current_operation_attribution(),
+        );
     if let Some(reason) = audit.deny_reason.take() {
         audit.deny_reason = Some(crate::secret_gate::bounded_masked_log_text(&reason));
     }
@@ -4545,6 +4551,8 @@ fn build_audit_storage_event(
     )
     .with_outcome(outcome)
     .with_payload(audit_data);
+    storage_event.op_index = audit.op_index;
+    storage_event.ref_resolution = audit.ref_resolution;
     if let Some(target_id) = target_id_from_args(&gate_req.args) {
         storage_event = storage_event.with_target(target_id);
     }
