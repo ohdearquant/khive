@@ -14213,12 +14213,18 @@ mod note_update_sequencing_tests {
             resurrect: false,
         })];
         let mut args = json!({"id": snapshot.id, "raw_marker": false});
-        registry
-            .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+        let policy = registry
+            .prepare_note_update_policy(&runtime, &token, &snapshot, &mut args)
             .await
             .unwrap();
         let error = runtime
-            .update_note_from_snapshot_with_kind_effects(&token, snapshot.clone(), &args, &registry)
+            .update_note_from_snapshot_with_kind_effects(
+                &token,
+                snapshot.clone(),
+                &args,
+                policy,
+                &registry,
+            )
             .await
             .expect_err("missing link target must not become a successful note update");
         assert!(matches!(error, RuntimeError::NotFound(_)), "{error}");
@@ -14278,12 +14284,18 @@ mod note_update_sequencing_tests {
             resurrect: true,
         })];
         let mut args = json!({"id": snapshot.id, "raw_marker": false});
-        registry
-            .prepare_note_update_hook(&runtime, &token, &snapshot, &mut args)
+        let policy = registry
+            .prepare_note_update_policy(&runtime, &token, &snapshot, &mut args)
             .await
             .unwrap();
         let error = runtime
-            .update_note_from_snapshot_with_kind_effects(&token, snapshot.clone(), &args, &registry)
+            .update_note_from_snapshot_with_kind_effects(
+                &token,
+                snapshot.clone(),
+                &args,
+                policy,
+                &registry,
+            )
             .await
             .expect_err("typed create must not replace an intervening live edge");
         assert!(error.to_string().contains("live edge appeared"), "{error}");
