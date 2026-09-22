@@ -547,6 +547,23 @@ pub struct EdgePatch {
     pub properties: Option<Value>,
 }
 
+/// Kind-owned property semantics carried from validated hook preparation to
+/// the shared note merge. The default preserves ordinary JSON merge behavior.
+#[derive(Clone, Debug, Default)]
+pub struct NoteUpdatePolicy {
+    kind: Option<String>,
+    null_clearing_properties: &'static [&'static str],
+}
+
+impl NoteUpdatePolicy {
+    pub(crate) fn for_kind(kind: &str, null_clearing_properties: &'static [&'static str]) -> Self {
+        Self {
+            kind: Some(kind.to_owned()),
+            null_clearing_properties,
+        }
+    }
+}
+
 /// Patch for `update_note`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
 ///
 /// For `salience`/`decay_factor`:
@@ -562,6 +579,7 @@ pub struct NotePatch {
     pub properties: Option<Value>,
     pub(crate) kind_status: Option<String>,
     pub write_options: crate::note_write::NoteWriteOptions,
+    pub(crate) update_policy: NoteUpdatePolicy,
 }
 
 /// Normalize the public note tag replacement into its stored property before
@@ -612,11 +630,19 @@ impl NotePatch {
             properties,
             kind_status: None,
             write_options: Default::default(),
+            update_policy: Default::default(),
         }
     }
 
     pub fn with_write_options(mut self, options: crate::note_write::NoteWriteOptions) -> Self {
         self.write_options = options;
+        self
+    }
+
+    /// Apply the owning kind's policy returned by validated hook preparation.
+    /// This is not a caller-facing property-deletion parameter.
+    pub fn with_update_policy(mut self, policy: NoteUpdatePolicy) -> Self {
+        self.update_policy = policy;
         self
     }
 }
@@ -1751,6 +1777,16 @@ impl KhiveRuntime {
         let original_decay_factor = note.decay_factor;
         let original_properties = note.properties.clone();
         let original_status = note.status.clone();
+        if patch
+            .update_policy
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != note.kind)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "note update policy does not match the stored note kind".into(),
+            ));
+        }
         if patch.content.is_some() || patch.properties.is_some() {
             if let Some(error) = self.stream_member_error(&note).await? {
                 return Err(error);
@@ -1802,26 +1838,39 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
-            // ADR-056 makes these three properties transport evidence owned
-            // exclusively by `comm.ingest`. This check lives at the runtime
-            // patch seam, not only in comm's shared-CRUD hook, because direct
-            // Rust callers and atomic update preparation both arrive here
-            // without dispatching that hook. Scope it to `message`: the same
-            // JSON names remain ordinary caller metadata on every other kind.
-            if note.kind == "message" {
-                if !props.is_object() {
-                    return Err(RuntimeError::InvalidInput(
-                        "properties on a `message` note must be patched with an object: a \
-                         non-object patch would replace the transport-owned quarantine and \
-                         channel provenance established by `comm.ingest`"
-                            .into(),
-                    ));
-                }
-                if let Some(named) = message_transport_owned_property_named_in(&props) {
+            // Kind-owned identity is protected below pack hooks, including
+            // direct runtime and atomic/proposal update preparation. The merge
+            // path restores these same keys on its surviving row.
+            let owned_keys = kind_owned_properties(&note.kind);
+            if !owned_keys.is_empty() {
+                let object = props.as_object().ok_or_else(|| {
+                    if note.kind == "message" {
+                        RuntimeError::InvalidInput(
+                            "properties on a `message` note must be patched with an object: a \
+                             non-object patch would replace the transport-owned quarantine and \
+                             channel provenance established by `comm.ingest`"
+                                .into(),
+                        )
+                    } else {
+                        RuntimeError::InvalidInput(format!(
+                            "properties on a `{}` note must be patched with an object; \
+                             a non-object patch would erase its owner-established identity",
+                            note.kind
+                        ))
+                    }
+                })?;
+                if let Some(named) = owned_keys.iter().find(|key| object.contains_key(**key)) {
+                    if note.kind == "message" {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "`{named}` is transport-owned on a `message` note and cannot be patched; \
+                             only `comm.ingest` may establish quarantine disposition and channel \
+                             provenance"
+                        )));
+                    }
                     return Err(RuntimeError::InvalidInput(format!(
-                        "`{named}` is transport-owned on a `message` note and cannot be patched; \
-                         only `comm.ingest` may establish quarantine disposition and channel \
-                         provenance"
+                        "`{named}` is not patchable on a `{}` note; \
+                         use `comm.heartbeat` to report health without changing the row's identity",
+                        note.kind
                     )));
                 }
             }
@@ -1866,11 +1915,23 @@ impl KhiveRuntime {
                     )));
                 }
             }
-            let (merged, _) = merge_properties(
+            let incoming_properties = Some(props);
+            let (mut merged, _) = merge_properties(
                 &note.properties,
-                &Some(props),
+                &incoming_properties,
                 EntityDedupMergePolicy::PreferFrom,
             );
+            if let Some(properties) = merged.as_mut().and_then(Value::as_object_mut) {
+                for key in patch.update_policy.null_clearing_properties {
+                    if incoming_properties
+                        .as_ref()
+                        .and_then(|incoming| incoming.get(*key))
+                        .is_some_and(Value::is_null)
+                    {
+                        properties.remove(*key);
+                    }
+                }
+            }
             note.properties = merged;
         }
         if let Some(status) = patch.kind_status {
@@ -1963,21 +2024,23 @@ impl KhiveRuntime {
     }
 
     /// Commit a normalized and validated kind-owned update, including its typed
-    /// graph companions. Callers must first run `prepare_note_update_hook` against
-    /// this exact snapshot; the shared atomic prepare seam checks all patch fields
-    /// before asking the kind hook to derive any graph effects.
+    /// graph companions. Callers must first run `prepare_note_update_policy`
+    /// against this exact snapshot and pass the policy it returned; the shared
+    /// atomic prepare seam checks all patch fields before asking the kind hook
+    /// to derive any graph effects.
     pub async fn update_note_from_snapshot_with_kind_effects(
         &self,
         token: &NamespaceToken,
         snapshot: khive_storage::Note,
         args: &Value,
+        policy: crate::NoteUpdatePolicy,
         registry: &crate::VerbRegistry,
     ) -> RuntimeResult<(
         khive_storage::Note,
         crate::retrieval::EmbeddingTruncationReport,
     )> {
         let (note, plan) = crate::atomic_prepare::prepare_update_from_note_snapshot(
-            self, token, args, None, snapshot, registry,
+            self, token, args, None, snapshot, policy, registry,
         )
         .await?;
         self.commit_prepared_note_update(token, note, plan).await
@@ -2025,7 +2088,7 @@ impl KhiveRuntime {
     }
 
     /// Claim `external_id` on an outbound `message` note through the
-    /// ADR-124-sanctioned store-level one-key atomic path, bypassing the
+    /// ADR-124-sanctioned store-level owner path, bypassing the
     /// caller-facing owner-established-property refusal in
     /// [`Self::update_note`] (and its crate-internal prepare path). This is deliberately
     /// NOT exposed through any registered verb (ADR-124's stated bound): it is
@@ -2034,7 +2097,9 @@ impl KhiveRuntime {
     ///
     /// Refuses (returns `Err`, never writes) unless the live row is a
     /// `message` note, `properties.direction == "outbound"`, and
-    /// `properties.external_id` is currently absent or empty.
+    /// `properties.external_id` is currently absent or empty. The claim is
+    /// committed against that exact snapshot and advances its timestamp so
+    /// competing claims and delivery-outcome CAS writes cannot overwrite it.
     pub async fn claim_outbound_message_external_id(
         &self,
         token: &NamespaceToken,
@@ -2063,6 +2128,16 @@ impl KhiveRuntime {
                 direction
             )));
         }
+        if note.deleted_at.is_some()
+            || Self::outbound_delivery_is_terminal(props)
+            || props
+                .and_then(|p| p.get("delivered_at"))
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} is not pending outbound delivery"
+            )));
+        }
         let existing = props
             .and_then(|p| p.get("external_id"))
             .and_then(|v| v.as_str());
@@ -2071,35 +2146,35 @@ impl KhiveRuntime {
                 "note {id} already has an external_id claimed"
             )));
         }
-        store
-            .set_note_property(
-                id,
-                "external_id",
-                Value::String(external_id),
-                note.updated_at,
-            )
-            .await?;
-        store
-            .get_note(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+        let mut properties = props
+            .cloned()
+            .expect("outbound direction requires an object");
+        properties.insert("external_id".to_string(), Value::String(external_id));
+        self.replace_outbound_message_properties_as_owner(token, note, properties)
+            .await
     }
 
     /// Non-wire outbox scan for the channel delivery loops.
     ///
-    /// Fetches live `message` notes matching the SQL-side pending predicate,
-    /// sorts that bounded candidate set newest-first, and returns those that
-    /// are still pending delivery, capped at `limit`.
-    /// Direction, `delivered_at`, and terminal `delivery` state are filtered
-    /// by SQLite; a valid `next_attempt_at` and the optional `to_actor`
-    /// channel prefix remain Rust checks. Pending means `delivered_at` is
-    /// absent or null, `properties.delivery` carries no terminal state
+    /// Fetches live `message` notes matching the SQL-side pending predicate
+    /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
+    /// cap, and returns those that are still due, capped at `limit`.
+    /// Direction, `delivered_at`, terminal `delivery` state and the optional
+    /// `to_actor` channel prefix are all filtered by SQLite; only a valid
+    /// `next_attempt_at` remains a Rust check. Pending means `delivered_at`
+    /// is absent or null, `properties.delivery` carries no terminal state
     /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
     /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
-    /// property cannot strand mail forever. When `to_prefix` is given,
-    /// only rows whose `properties.to_actor` starts with it are counted —
-    /// the channel predicate must run BEFORE the limit, otherwise a backlog
-    /// of another channel's pending rows starves this channel indefinitely.
+    /// property cannot strand mail forever.
+    ///
+    /// The channel prefix has to be in the statement, not applied to the
+    /// fetched page: every actor-to-actor outbound row matches the pending
+    /// predicate forever (nothing marks those delivered), so that population
+    /// outgrows any scan cap and a page-then-filter scan never reaches a
+    /// channel's rows once enough other rows sort ahead of them. The prefix
+    /// renders as an index range served by
+    /// `idx_comm_message_outbound_recipient`, and the newest-first order
+    /// means a future predicate miss still surfaces new rows first.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2117,32 +2192,39 @@ impl KhiveRuntime {
             return Ok(Vec::new());
         }
         let now_micros = chrono::Utc::now().timestamp_micros();
+        let mut property_filters = vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("outbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.delivered_at".to_string(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.delivery".to_string(),
+                op: FilterOp::NotInOrMissing(vec![
+                    SqlValue::Text("delivered".to_string()),
+                    SqlValue::Text("failed".to_string()),
+                ]),
+                value: SqlValue::Null,
+            },
+        ];
+        if let Some(prefix) = to_prefix {
+            property_filters.push(PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::TextStartsWithIndexed,
+                value: SqlValue::Text(prefix.to_string()),
+            });
+        }
         let filter = NoteFilter {
             kind: Some("message".to_string()),
-            unordered: true,
-            property_filters: vec![
-                PropertyFilter {
-                    json_path: "$.direction".to_string(),
-                    op: FilterOp::Eq,
-                    value: SqlValue::Text("outbound".to_string()),
-                },
-                PropertyFilter {
-                    json_path: "$.delivered_at".to_string(),
-                    op: FilterOp::JsonTypeMissingOrNullIndexed,
-                    value: SqlValue::Null,
-                },
-                PropertyFilter {
-                    json_path: "$.delivery".to_string(),
-                    op: FilterOp::NotInOrMissing(vec![
-                        SqlValue::Text("delivered".to_string()),
-                        SqlValue::Text("failed".to_string()),
-                    ]),
-                    value: SqlValue::Null,
-                },
-            ],
+            property_filters,
             ..Default::default()
         };
-        let mut candidates = self
+        let candidates = self
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
@@ -2154,25 +2236,10 @@ impl KhiveRuntime {
             )
             .await?
             .items;
-        candidates.sort_unstable_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
 
         let mut collected: Vec<khive_storage::note::Note> = Vec::new();
         for note in candidates {
             let props = note.properties.as_ref().and_then(|v| v.as_object());
-            if let Some(prefix) = to_prefix {
-                let to_matches = props
-                    .and_then(|p| p.get("to_actor"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|actor| actor.starts_with(prefix));
-                if !to_matches {
-                    continue;
-                }
-            }
             let retry_deferred = props
                 .and_then(|p| p.get("next_attempt_at"))
                 .and_then(|v| v.as_str())
@@ -2242,14 +2309,50 @@ impl KhiveRuntime {
             })?,
         );
 
-        let persisted = self
-            .notes(token)?
-            .replace_note_if_unchanged(snapshot.clone(), expected_updated_at, expected_deleted_at)
+        let store = self.notes(token)?;
+        let persisted = store
+            .replace_note_if_unchanged(snapshot, expected_updated_at, expected_deleted_at)
             .await?;
         if !persisted {
             return Err(stale_note_snapshot_error(id));
         }
-        Ok(snapshot)
+        // Storage assigns the persisted revision; the pre-write snapshot
+        // still carries the old version even when this CAS succeeds.
+        store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+    }
+
+    async fn replace_outbound_message_properties_as_owner(
+        &self,
+        token: &NamespaceToken,
+        mut snapshot: khive_storage::note::Note,
+        properties: serde_json::Map<String, Value>,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let expected_updated_at = snapshot.updated_at;
+        let expected_deleted_at = snapshot.deleted_at;
+        let id = snapshot.id;
+        snapshot.properties = Some(Value::Object(properties));
+        snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
+            expected_updated_at.checked_add(1).ok_or_else(|| {
+                RuntimeError::Internal(format!("note {id} updated_at cannot advance"))
+            })?,
+        );
+        // Owner operations preserve any transport evidence on the snapshot.
+        // Re-running the public full-row guard would reject that existing evidence.
+        let store = self.raw_notes(token)?;
+        if !store
+            .replace_note_if_unchanged(snapshot, expected_updated_at, expected_deleted_at)
+            .await?
+        {
+            return Err(stale_note_snapshot_error(id));
+        }
+        // Return the storage-assigned revision, just as the claim path does.
+        store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
     }
 
     /// True once a `delivery` outcome has been terminally recorded
@@ -2304,6 +2407,24 @@ impl KhiveRuntime {
             )));
         }
 
+        let properties = Self::outbound_retry_properties(
+            props,
+            attempted_at,
+            last_error,
+            base_delay,
+            max_delay,
+        )?;
+        self.replace_outbound_message_properties(token, snapshot, properties)
+            .await
+    }
+
+    fn outbound_retry_properties(
+        props: Option<&serde_json::Map<String, Value>>,
+        attempted_at: chrono::DateTime<chrono::Utc>,
+        last_error: String,
+        base_delay: std::time::Duration,
+        max_delay: std::time::Duration,
+    ) -> RuntimeResult<serde_json::Map<String, Value>> {
         let attempts = props
             .and_then(|properties| properties.get("delivery_attempts"))
             .and_then(Value::as_u64)
@@ -2337,7 +2458,51 @@ impl KhiveRuntime {
             Value::String(next_attempt_at.to_rfc3339()),
         );
         properties.insert("last_error".to_string(), Value::String(last_error));
-        self.replace_outbound_message_properties(token, snapshot, properties)
+        Ok(properties)
+    }
+
+    /// Schedule an external-id claim retry only for a still-unclaimed
+    /// outbound snapshot. Existing claims and terminal outcomes are unchanged.
+    pub async fn mark_outbound_message_claim_transient_failure(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        attempted_at: chrono::DateTime<chrono::Utc>,
+        last_error: String,
+        base_delay: std::time::Duration,
+        max_delay: std::time::Duration,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let snapshot = self.outbound_message(token, id).await?;
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        let has_claim = props
+            .and_then(|properties| properties.get("external_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let has_delivery = props
+            .and_then(|properties| properties.get("delivered_at"))
+            .is_some_and(|value| !value.is_null());
+        if has_claim || has_delivery || Self::outbound_delivery_is_terminal(props) {
+            return Ok(snapshot);
+        }
+        if base_delay.is_zero() || max_delay < base_delay {
+            return Err(RuntimeError::InvalidInput(
+                "outbound retry delays require a non-zero base no greater than the ceiling"
+                    .to_string(),
+            ));
+        }
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({"last_error": &last_error}),
+            "message",
+            "last_error",
+        )?;
+        let properties = Self::outbound_retry_properties(
+            props,
+            attempted_at,
+            last_error,
+            base_delay,
+            max_delay,
+        )?;
+        self.replace_outbound_message_properties_as_owner(token, snapshot, properties)
             .await
     }
 
@@ -2436,6 +2601,58 @@ impl KhiveRuntime {
         props.insert("failed_at".into(), Value::String(failed_at));
         props.insert("last_error".into(), Value::String(last_error));
         self.replace_outbound_message_properties(token, snapshot, props)
+            .await
+    }
+
+    /// Park a deterministic external-id claim refusal only while the exact
+    /// current outbound snapshot remains unclaimed. An existing claim or a
+    /// terminal delivery outcome is returned unchanged. Non-wire owner API:
+    /// a second worker must not turn another worker's successful claim into
+    /// a permanent delivery failure.
+    pub async fn mark_outbound_message_claim_failed(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        failed_at: String,
+        last_error: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let snapshot = self.outbound_message(token, id).await?;
+        self.mark_outbound_message_claim_failed_from_snapshot(
+            token, snapshot, failed_at, last_error,
+        )
+        .await
+    }
+
+    async fn mark_outbound_message_claim_failed_from_snapshot(
+        &self,
+        token: &NamespaceToken,
+        snapshot: khive_storage::note::Note,
+        failed_at: String,
+        last_error: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        let has_claim = props
+            .and_then(|properties| properties.get("external_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let has_delivery = props
+            .and_then(|properties| properties.get("delivered_at"))
+            .is_some_and(|value| !value.is_null());
+        if has_claim || has_delivery || Self::outbound_delivery_is_terminal(props) {
+            return Ok(snapshot);
+        }
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({ "failed_at": &failed_at, "last_error": &last_error }),
+            "message",
+            "failed",
+        )?;
+        let mut properties = props.cloned().unwrap_or_default();
+        properties.remove("delivery_attempts");
+        properties.remove("next_attempt_at");
+        properties.insert("delivery".into(), Value::String("failed".into()));
+        properties.insert("failed_at".into(), Value::String(failed_at));
+        properties.insert("last_error".into(), Value::String(last_error));
+        self.replace_outbound_message_properties_as_owner(token, snapshot, properties)
             .await
     }
 
@@ -3727,9 +3944,11 @@ fn merge_note_sql(
     if preserve_owner_established {
         preserve_owner_established_properties(&into_note.properties, &mut merged_props);
     }
-    if into_note.kind == "message" {
-        preserve_message_transport_properties(&into_note.properties, &mut merged_props);
-    }
+    preserve_property_keys(
+        kind_owned_properties(&into_note.kind),
+        &into_note.properties,
+        &mut merged_props,
+    );
 
     // Recomputed from the final retained properties rather than carried
     // forward from the fold's own count. The fold's count and post-
@@ -4143,15 +4362,22 @@ pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
     "external_id",
 ];
 
-/// Transport evidence that only `comm.ingest` may establish on a `message`.
-///
-/// This list is deliberately separate from [`OWNER_ESTABLISHED_PROPERTIES`].
-/// The latter applies to every pack-owned note kind; quarantine disposition
-/// and channel attribution are message-only, and protecting these names on a
-/// task, memory, or another pack-owned note would reserve ordinary metadata
-/// outside ADR-056's scope.
-pub(crate) const MESSAGE_TRANSPORT_OWNED_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug"];
+/// Kind-specific identity that generic updates cannot patch and merges must
+/// retain from the surviving record. Message transport evidence belongs to
+/// `comm.ingest`; health coordinates determine the UUID used by `comm.heartbeat`.
+/// Unlike OWNER_ESTABLISHED_PROPERTIES, these names remain ordinary metadata
+/// on other kinds, including tasks and memories.
+const KIND_OWNED_PROPERTIES: &[(&str, &[&str])] = &[
+    ("message", &["quarantined", "channel_kind", "channel_slug"]),
+    ("channel_health", &["channel_kind", "channel_slug"]),
+];
+
+pub(crate) fn kind_owned_properties(kind: &str) -> &'static [&'static str] {
+    KIND_OWNED_PROPERTIES
+        .iter()
+        .find_map(|(owned_kind, keys)| (*owned_kind == kind).then_some(*keys))
+        .unwrap_or(&[])
+}
 
 /// Whether a stored message note carries a live quarantine disposition.
 ///
@@ -4170,16 +4396,6 @@ fn message_is_quarantined(note: &khive_storage::note::Note) -> bool {
         Some(Value::String(value)) => value != "false",
         Some(_) => true,
     }
-}
-
-fn message_transport_owned_property_named_in(patch: &Value) -> Option<&'static str> {
-    let Value::Object(map) = patch else {
-        return None;
-    };
-    MESSAGE_TRANSPORT_OWNED_PROPERTIES
-        .iter()
-        .copied()
-        .find(|key| map.contains_key(*key))
 }
 
 /// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
@@ -4228,10 +4444,6 @@ pub(crate) fn preserve_owner_established_properties(
     merged: &mut Option<Value>,
 ) {
     preserve_property_keys(OWNER_ESTABLISHED_PROPERTIES, into, merged);
-}
-
-fn preserve_message_transport_properties(into: &Option<Value>, merged: &mut Option<Value>) {
-    preserve_property_keys(MESSAGE_TRANSPORT_OWNED_PROPERTIES, into, merged);
 }
 
 fn preserve_property_keys(keys: &[&str], into: &Option<Value>, merged: &mut Option<Value>) {
@@ -4503,6 +4715,164 @@ mod tests {
         KhiveRuntime::memory().unwrap()
     }
 
+    async fn seed_health_identity_note(runtime: &KhiveRuntime, slug: &str) -> Note {
+        let mut note = Note::new("local", "channel_health", "health state");
+        note.properties = Some(serde_json::json!({
+            "channel_kind": "email", "channel_slug": slug, "operator_note": "original"
+        }));
+        runtime
+            .notes(&NamespaceToken::local())
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        note
+    }
+
+    /// Must fail without the runtime coordinate guard: the first plain update
+    /// succeeds and changes channel_kind even though no pack hook ran.
+    #[tokio::test]
+    async fn channel_health_identity_plain_update_refuses_coordinate_changes() {
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let note = seed_health_identity_note(&runtime, "original@example.com").await;
+        let before = serde_json::to_value(&note).unwrap();
+        for properties in [
+            serde_json::json!({"channel_kind": "telegram", "operator_note": "changed"}),
+            serde_json::json!({"channel_slug": "other@example.com"}),
+            serde_json::json!({"channel_kind": null}),
+            serde_json::json!({"channel_slug": null}),
+            serde_json::json!({"channel_kind": "email"}),
+            serde_json::json!({"channel_slug": "original@example.com"}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            let error = runtime
+                .update_note(
+                    &token,
+                    note.id,
+                    NotePatch::new(None, None, None, None, Some(properties)),
+                )
+                .await
+                .expect_err("plain runtime update must preserve heartbeat coordinates");
+            assert!(error.to_string().contains("channel_health"), "{error}");
+            let stored = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(stored).unwrap(), before);
+        }
+        let changed = runtime
+            .update_note(
+                &token,
+                note.id,
+                NotePatch::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(serde_json::json!({"operator_note": "changed"})),
+                ),
+            )
+            .await
+            .unwrap();
+        let properties = changed.properties.unwrap();
+        assert_eq!(properties["channel_kind"], "email");
+        assert_eq!(properties["channel_slug"], "original@example.com");
+        assert_eq!(properties["operator_note"], "changed");
+    }
+
+    #[tokio::test]
+    async fn channel_health_identity_atomic_prepare_refuses_coordinates() {
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let note = seed_health_identity_note(&runtime, "original@example.com").await;
+        let error = crate::atomic_prepare::prepare_update(
+            &runtime,
+            &token,
+            &serde_json::json!({
+                "id": note.id.to_string(),
+                "properties": {"channel_slug": "other@example.com"}
+            }),
+            None,
+        )
+        .await
+        .expect_err("atomic/proposal preparation must use the runtime identity guard");
+        assert!(error.to_string().contains("channel_slug"), "{error}");
+        let stored = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(note).unwrap()
+        );
+    }
+
+    /// Must fail without merge restoration: PreferFrom replaces the surviving
+    /// row's coordinates with the absorbed row's values.
+    #[tokio::test]
+    async fn channel_health_identity_merge_retains_survivor_coordinates() {
+        for strategy in [
+            EntityDedupMergePolicy::PreferFrom,
+            EntityDedupMergePolicy::Union,
+            EntityDedupMergePolicy::PreferInto,
+        ] {
+            let runtime = rt();
+            let token = NamespaceToken::local();
+            let into = seed_health_identity_note(&runtime, "survivor@example.com").await;
+            let mut from = seed_health_identity_note(&runtime, "absorbed@example.com").await;
+            from.properties = Some(serde_json::json!({
+                "channel_kind": "telegram", "channel_slug": "absorbed@example.com", "new_metadata": true
+            }));
+            // Trusted fixture setup establishes a distinct source identity;
+            // the public store must refuse changing an existing health row.
+            runtime
+                .raw_notes(&token)
+                .unwrap()
+                .upsert_note(from.clone())
+                .await
+                .unwrap();
+            runtime
+                .merge_note(
+                    &token,
+                    into.id,
+                    from.id,
+                    strategy,
+                    ContentMergeStrategy::PreferInto,
+                    false,
+                )
+                .await
+                .unwrap();
+            let stored = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(into.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.id, into.id);
+            assert_eq!(stored.created_at, into.created_at);
+            let properties = stored.properties.unwrap();
+            assert_eq!(properties["channel_kind"], "email");
+            assert_eq!(properties["channel_slug"], "survivor@example.com");
+            assert_eq!(properties["new_metadata"], true);
+            assert!(runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(from.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
     async fn entity_update_events(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
@@ -4601,6 +4971,69 @@ mod tests {
             .await
             .expect("zero-limit scan succeeds");
         assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    /// Regression guard for the scan window (#1859). The pending predicate
+    /// admits every actor-to-actor outbound row forever (nothing marks them
+    /// delivered), so the pending population outgrows any scan cap. With
+    /// more such rows than the cap, an email row that sorts past the cap in
+    /// every candidate index order (older `created_at`, later rowid, a
+    /// `to_actor` that collates after the fillers') must still be returned:
+    /// the channel prefix has to bound the SQL candidate set, not trim it
+    /// afterwards. `list_undelivered_outbound_messages_matches_legacy_predicate`
+    /// is the under-cap control.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_email_row_past_the_scan_window() {
+        const FILLERS: usize = 10_050;
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut email = outbound_message_note();
+        email.created_at -= 1_000_000;
+        email.updated_at = email.created_at;
+        email.properties = Some(
+            serde_json::json!({"direction": "outbound", "to_actor": "email:ocean@example.test"}),
+        );
+        let email_id = email.id;
+
+        let mut fillers = Vec::with_capacity(FILLERS);
+        for i in 0..FILLERS {
+            let mut filler = outbound_message_note();
+            filler.created_at += i as i64;
+            filler.updated_at = filler.created_at;
+            filler.properties =
+                Some(serde_json::json!({"direction": "outbound", "to_actor": "daemon:filler"}));
+            fillers.push(filler);
+        }
+        // Fillers first so the email row also takes the later rowid.
+        let summary = store.upsert_notes(fillers).await.expect("seed fillers");
+        assert_eq!(
+            summary.affected as usize, FILLERS,
+            "every filler row seeded"
+        );
+        store.upsert_note(email).await.expect("seed email row");
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 200)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            hits.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![email_id],
+            "the email row is found behind {FILLERS} pending actor-to-actor rows"
+        );
+
+        let daemon_hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("daemon:"), 3)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            daemon_hits.len(),
+            3,
+            "the other prefix still sees its own rows"
+        );
     }
 
     fn legacy_outbox_pending(note: &Note, to_prefix: Option<&str>, now_micros: i64) -> bool {
@@ -4884,8 +5317,10 @@ mod tests {
 
         let delivered_note = outbound_message_note();
         let delivered_id = delivered_note.id;
+        let delivered_version = delivered_note.version;
         let failed_note = outbound_message_note();
         let failed_id = failed_note.id;
+        let failed_version = failed_note.version;
         let mut inbound = Note::new("local", "message", "inbound row");
         inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
         let inbound_id = inbound.id;
@@ -4909,6 +5344,8 @@ mod tests {
             )
             .await
             .expect("mark delivered succeeds");
+        assert_eq!(marked.version, delivered_version + 1);
+        assert_eq!(marked, store.get_note(delivered_id).await.unwrap().unwrap());
         let props = marked
             .properties
             .as_ref()
@@ -4936,6 +5373,8 @@ mod tests {
             )
             .await
             .expect("mark failed succeeds");
+        assert_eq!(failed.version, failed_version + 1);
+        assert_eq!(failed, store.get_note(failed_id).await.unwrap().unwrap());
         let props = failed
             .properties
             .as_ref()
@@ -5080,6 +5519,7 @@ mod tests {
             "unrelated": "preserved",
         }));
         let id = note.id;
+        let original_version = note.version;
         store.upsert_note(note).await.expect("seed note");
 
         let attempted_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T00:00:00Z")
@@ -5096,6 +5536,8 @@ mod tests {
             )
             .await
             .expect("transient marker succeeds");
+        assert_eq!(marked.version, original_version + 1);
+        assert_eq!(marked, store.get_note(id).await.unwrap().unwrap());
         let props = marked.properties.unwrap();
 
         assert_eq!(props["delivery_attempts"].as_u64(), Some(4));
@@ -5262,6 +5704,121 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("<claimed@example.com>")
         );
+    }
+
+    #[tokio::test]
+    async fn claim_failure_snapshot_cannot_park_a_concurrent_successful_claim() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+        let mut before = outbound_message_note();
+        // The owner must preserve existing trusted transport provenance.
+        before
+            .properties
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("channel_kind".into(), serde_json::json!("email"));
+        rt.raw_notes(&token)
+            .unwrap()
+            .upsert_note(before.clone())
+            .await
+            .unwrap();
+        let claimed = rt
+            .claim_outbound_message_external_id(&token, before.id, "<winner@example.com>".into())
+            .await
+            .unwrap();
+        assert!(claimed.updated_at > before.updated_at);
+        assert_eq!(
+            claimed.properties.as_ref().unwrap()["channel_kind"],
+            "email"
+        );
+
+        rt.mark_outbound_message_claim_failed_from_snapshot(
+            &token,
+            before,
+            "2026-09-22T12:00:00Z".into(),
+            "claim refused".into(),
+        )
+        .await
+        .expect_err("the stale pre-claim snapshot cannot overwrite the winner");
+        let returned = rt
+            .mark_outbound_message_claim_failed(
+                &token,
+                claimed.id,
+                "2026-09-22T12:00:00Z".into(),
+                "already claimed".into(),
+            )
+            .await
+            .unwrap();
+        let stored = rt
+            .notes(&token)
+            .unwrap()
+            .get_note(claimed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(&claimed).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(claimed).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_failure_parks_only_unclaimed_pending_messages() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+        for outcome in [None, Some("delivered"), Some("failed")] {
+            let mut note = outbound_message_note();
+            let props = note.properties.as_mut().unwrap().as_object_mut().unwrap();
+            props.insert("channel_kind".into(), serde_json::json!("email"));
+            if let Some(outcome) = outcome {
+                props.insert("delivery".into(), serde_json::json!(outcome));
+            }
+            rt.raw_notes(&token)
+                .unwrap()
+                .upsert_note(note.clone())
+                .await
+                .unwrap();
+            let result = rt
+                .mark_outbound_message_claim_failed(
+                    &token,
+                    note.id,
+                    "2026-09-22T12:00:00Z".into(),
+                    "claim refused".into(),
+                )
+                .await
+                .unwrap();
+            if outcome.is_some() {
+                assert_eq!(
+                    serde_json::to_value(&result).unwrap(),
+                    serde_json::to_value(note).unwrap()
+                );
+            } else {
+                assert_eq!(result.properties.as_ref().unwrap()["delivery"], "failed");
+                assert_eq!(result.properties.as_ref().unwrap()["channel_kind"], "email");
+                assert!(result.updated_at > note.updated_at);
+                assert_eq!(result.version, note.version + 1, "one parking write");
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    rt.notes(&token)
+                        .unwrap()
+                        .get_note(result.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

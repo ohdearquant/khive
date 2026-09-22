@@ -83,6 +83,28 @@ that stay put.
    embedded mode of point 4, whose short direct appends SQLite's per-file
    cross-process exclusion already serializes.
 
+   On Unix, daemon startup records each existing events main database, WAL and
+   SHM file's device/inode from the same pre-open descriptor used for owner-only
+   hardening. After SQLite opens and initializes the events store, it checks
+   the three path entries with `lstat` only; opening and closing another
+   descriptor could release SQLite's process-owned advisory locks. Present
+   entries must remain owner-only regular files, and an entry observed both
+   before and after open must have the same device/inode. A missing main
+   database refuses startup because the daemon could otherwise serve an
+   unlinked inode whose writes are no longer reachable through its database
+   path. A sidecar missing at either observation is permitted: SQLite may
+   create or remove it during normal opening/checkpoint activity (#2403).
+
+   This is a bounded two-observation startup check. It does not prove which
+   inode SQLite opened, detect a swap restored between observations or inode
+   reuse, or prevent changes after the final check. A sidecar removed and
+   recreated between observations is conservatively refused when both
+   observations see different identities, even if the cause was legitimate;
+   a later startup can observe the new stable files. Trusted directory
+   admission remains necessary. This post-open identity check is scoped to
+   the Unix events daemon; it does not add a Windows identity guarantee or
+   a post-open identity check to the embedded backend.
+
 2. **Split event store (writes).** In the domain process, the `EventStore`
    the runtime hands out routes by append class. The idempotent audit-batch
    surface (`append_events_idempotent`, ADR-133) goes to the events lane as a

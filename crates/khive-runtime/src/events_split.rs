@@ -389,7 +389,7 @@ fn direct_backend(
             .open(db_path);
         // Before the open, and only before it: see the precondition on
         // `harden_events_db_sidecars`.
-        harden_events_db_sidecars(db_path)
+        let _before_open = harden_events_db_sidecars(db_path)
             .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
     let backend = Arc::new(if read_only {
@@ -618,6 +618,14 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
     }
 }
 
+fn events_db_targets(db_path: &Path) -> [PathBuf; 3] {
+    ["", "-wal", "-shm"].map(|suffix| {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    })
+}
+
 /// Refuse to serve an events database whose path — or whose `-wal`/`-shm`
 /// sidecar path — is a pre-existing symlink. These paths are derived, never
 /// user-chosen (`events_db_path_beside` canonicalizes the main database
@@ -628,13 +636,7 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
 /// link planted after admission is bounded by the daemon's trusted-directory
 /// contract on the socket parent.
 fn refuse_events_db_symlinks(db_path: &Path) -> anyhow::Result<()> {
-    let mut targets = vec![db_path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_os_string();
-        name.push(suffix);
-        targets.push(PathBuf::from(name));
-    }
-    for path in targets {
+    for path in events_db_targets(db_path) {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
                 "refusing to serve events: {} is a symlink; the events database and its \
@@ -651,6 +653,29 @@ fn refuse_events_db_symlinks(db_path: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EventsFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl EventsFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// Main/WAL/SHM identities, in `events_db_targets` order. None means the
+/// target was absent when pre-open hardening tried to open it.
+#[cfg(unix)]
+type EventsDbIdentities = [Option<EventsFileIdentity>; 3];
 
 /// Require the directory holding the events database to be trusted before
 /// anything opens a path inside it. The symlink pre-checks and the fd-pinned
@@ -716,15 +741,10 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
 /// holds them. Both callers run it before their open; keep it that way. The
 /// post-open check that opens nothing is `verify_events_db_owner_only_unopened`.
 #[cfg(unix)]
-fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
+fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<EventsDbIdentities> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut targets = vec![db_path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_os_string();
-        name.push(suffix);
-        targets.push(PathBuf::from(name));
-    }
-    for path in targets {
+    let mut identities = [None; 3];
+    for (index, path) in events_db_targets(db_path).into_iter().enumerate() {
         // Pin the inode before touching it: `O_NOFOLLOW` makes the open
         // itself refuse a symlink at the final component, and the chmod is
         // then issued on the returned handle (fchmod), so no path re-lookup
@@ -748,7 +768,8 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
         };
         // The open succeeds on a directory too; fstat the handle (no path
         // re-lookup) so a directory at the path is refused, never chmod'ed.
-        if !file.metadata()?.file_type().is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
             anyhow::bail!(
                 "refusing to serve events: {} is not a regular file. The events \
                  database and its sidecars must be regular files.",
@@ -763,8 +784,11 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
                     path.display()
                 )
             })?;
+        // The same descriptor supplied validation and fchmod; record its
+        // identity before closing it, never by re-looking up the path.
+        identities[index] = Some(EventsFileIdentity::from_metadata(&metadata));
     }
-    Ok(())
+    Ok(identities)
 }
 
 /// Check, after SQLite has opened the database, that it and its sidecars are
@@ -773,23 +797,32 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
 /// hold (see the precondition on `harden_events_db_sidecars`). Sidecars
 /// SQLite creates inherit the database file's mode, so a failure here means
 /// something else changed the file set; refuse to serve rather than tighten
-/// through a path-based chmod and its lookup race. What this attests is
-/// exactly that: each present path is a regular file with no group or other
-/// permission bits. It does not compare inode identity with the files SQLite
-/// opened, and an absent path is skipped, not refused.
+/// through a path-based chmod and its lookup race. Present paths must retain
+/// their pre-open device/inode when one was observed. A missing main database
+/// is refused: serving an unlinked database would detach writes from its path.
+/// Sidecars may legitimately be absent or newly created by SQLite, so an absent
+/// pre- or post-observation does not assert identity continuity for that sidecar.
+///
+/// This is a two-observation check, not a pin of SQLite's own descriptors. It
+/// cannot detect swaps restored between observations, inode reuse, or changes
+/// after the final lstat. Even a legitimate sidecar delete/recreate is refused
+/// if both observations see different identities; a later startup can retry
+/// with a fresh snapshot. Trusted parent directories remain required. Unix only.
 #[cfg(unix)]
-fn verify_events_db_owner_only_unopened(db_path: &Path) -> anyhow::Result<()> {
+fn verify_events_db_owner_only_unopened(
+    db_path: &Path,
+    before: &EventsDbIdentities,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut targets = vec![db_path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_os_string();
-        name.push(suffix);
-        targets.push(PathBuf::from(name));
-    }
-    for path in targets {
+    for (index, path) in events_db_targets(db_path).into_iter().enumerate() {
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && index != 0 => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+                "refusing to serve events: main database {} disappeared after SQLite open; \
+                 refusing to serve an unlinked database",
+                path.display()
+            ),
             Err(e) => {
                 anyhow::bail!(
                     "refusing to serve events: cannot stat {}: {e}",
@@ -809,6 +842,15 @@ fn verify_events_db_owner_only_unopened(db_path: &Path) -> anyhow::Result<()> {
             anyhow::bail!(
                 "refusing to serve events: {} is mode {mode:03o}, not owner-only. The events \
                  database and its sidecars must be owner-only.",
+                path.display()
+            );
+        }
+        if before[index]
+            .is_some_and(|identity| identity != EventsFileIdentity::from_metadata(&metadata))
+        {
+            anyhow::bail!(
+                "refusing to serve events: {} changed identity between pre-open hardening \
+                 and post-open verification",
                 path.display()
             );
         }
@@ -969,11 +1011,11 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // sidecars underneath this daemon, which kept writing to the unlinked
     // inodes. Sidecars SQLite creates from here on inherit the database
     // file's mode; the check after the open below opens nothing.
-    harden_events_db_sidecars(db_path)?;
+    let before_open = harden_events_db_sidecars(db_path)?;
     let backend = Arc::new(StorageBackend::sqlite(db_path)?);
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
-    verify_events_db_owner_only_unopened(db_path)?;
+    verify_events_db_owner_only_unopened(db_path, &before_open)?;
 
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
@@ -2364,6 +2406,7 @@ mod tests {
         assert_eq!(mode, 0o700, "the directory keeps its mode");
     }
 
+    #[cfg(unix)]
     #[test]
     fn unopened_check_refuses_a_loosened_or_replaced_sidecar() {
         use std::os::unix::fs::PermissionsExt;
@@ -2376,11 +2419,12 @@ mod tests {
             std::fs::write(path, b"").unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        let before_open = harden_events_db_sidecars(&db).unwrap();
         // Owner-only regular files, an absent `-shm`: nothing to refuse.
-        verify_events_db_owner_only_unopened(&db).unwrap();
+        verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
 
         std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = verify_events_db_owner_only_unopened(&db)
+        let err = verify_events_db_owner_only_unopened(&db, &before_open)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2388,7 +2432,7 @@ mod tests {
             "{err}"
         );
         std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
-        verify_events_db_owner_only_unopened(&db).unwrap();
+        verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
 
         // A link planted at the `-shm` name is refused as not a regular file,
         // and the check never followed it: the target keeps its mode.
@@ -2396,7 +2440,7 @@ mod tests {
         std::fs::write(&victim, b"").unwrap();
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&victim, &shm).unwrap();
-        let err = verify_events_db_owner_only_unopened(&db)
+        let err = verify_events_db_owner_only_unopened(&db, &before_open)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2407,6 +2451,108 @@ mod tests {
             std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[cfg(unix)]
+    fn write_owner_only_test_file(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, b"").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unopened_check_refuses_same_mode_regular_file_replacement() {
+        // Must fail with the old mode-only verifier: every replacement remains
+        // a regular 0600 file. Creating it before rename guarantees a different
+        // live inode, without relying on inode reuse after unlink or on timing.
+        for target_index in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("events.db");
+            let targets = events_db_targets(&db);
+            for path in &targets {
+                write_owner_only_test_file(path);
+            }
+            let before_open = harden_events_db_sidecars(&db).unwrap();
+            let replacement = dir.path().join("replacement");
+            write_owner_only_test_file(&replacement);
+            let replacement_id = EventsFileIdentity::from_metadata(
+                &std::fs::symlink_metadata(&replacement).unwrap(),
+            );
+            assert_ne!(before_open[target_index], Some(replacement_id));
+            // Keep a real SQLite connection open across the pathname change.
+            // Do not run SQL against deliberately replaced files afterward.
+            let _connection = rusqlite::Connection::open(&db).unwrap();
+            verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
+            std::fs::rename(&replacement, &targets[target_index]).unwrap();
+            let error = verify_events_db_owner_only_unopened(&db, &before_open)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("changed identity"), "{error}");
+            assert!(
+                error.contains(&targets[target_index].display().to_string()),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unopened_check_accepts_sidecars_missing_at_check_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let targets = events_db_targets(&db);
+        for path in &targets {
+            write_owner_only_test_file(path);
+        }
+        let before_open = harden_events_db_sidecars(&db).unwrap();
+        let _connection = rusqlite::Connection::open(&db).unwrap();
+        for path in targets.iter().skip(1) {
+            std::fs::remove_file(path).unwrap();
+            verify_events_db_owner_only_unopened(&db, &before_open)
+                .expect("SQLite sidecars may disappear without losing the main database");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unopened_check_refuses_main_database_removed_after_sqlite_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        ensure_events_db_owner_only(&db).unwrap();
+        let before_open = harden_events_db_sidecars(&db).unwrap();
+        let backend = StorageBackend::sqlite(&db).unwrap();
+        backend.events().unwrap();
+        verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
+        std::fs::remove_file(&db).unwrap();
+        // Must fail with the old NotFound-for-every-target behavior. The live
+        // connection can still name an unlinked inode; it must not be served.
+        let error = verify_events_db_owner_only_unopened(&db, &before_open)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("main database") && error.contains("disappeared"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unopened_check_accepts_fresh_sqlite_sidecars_and_unchanged_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("new.events.db");
+        assert!(!db.exists());
+        ensure_events_db_owner_only(&db).unwrap();
+        let before_open = harden_events_db_sidecars(&db).unwrap();
+        assert!(before_open[0].is_some());
+        assert_eq!(&before_open[1..], &[None, None]);
+        let backend = StorageBackend::sqlite(&db).unwrap();
+        backend.events().unwrap();
+        for path in events_db_targets(&db).iter().skip(1) {
+            assert!(path.exists(), "SQLite creates {}", path.display());
+        }
+        verify_events_db_owner_only_unopened(&db, &before_open)
+            .expect("new SQLite sidecars have no pre-open identity to contradict");
     }
 
     #[test]

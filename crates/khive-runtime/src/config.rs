@@ -833,12 +833,14 @@ pub fn runtime_config_from_khive_config(
         .gate
         .as_ref()
         .map(|gate| {
-            Arc::new(khive_gate::CallerEnrollmentGate::new(
+            Arc::new(khive_gate::CallerEnrollmentGate::with_write_denials(
                 gate.granted_actors.clone(),
                 gate.grant_unattributed,
+                gate.deny_writes_for.clone(),
             )) as GateRef
         })
         .unwrap_or_else(|| base.gate.clone());
+    let gate = crate::mailbox_view::configured_mailbox_gate(&khive_cfg.actor, gate);
 
     let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();

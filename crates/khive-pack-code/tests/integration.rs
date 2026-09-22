@@ -555,20 +555,111 @@ async fn update_finding_refuses_to_clear_kind_status() {
 #[tokio::test]
 async fn update_finding_clears_an_optional_field_on_null() {
     let reg = registry(rt());
-    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
-    let updated = dispatch(
+    for (field, retained) in [("severity", "confidence"), ("confidence", "severity")] {
+        let created = create_finding(
+            &reg,
+            json!({"severity": "high", "confidence": "high", "keep": 42, "custom": "before"}),
+        )
+        .await;
+        let before = dispatch(&reg, "get", json!({"id": created["id"]}))
+            .await
+            .unwrap();
+        let before_props = before["properties"].as_object().unwrap();
+        assert!(before_props.contains_key(field));
+        assert!(before_props.contains_key(retained));
+
+        let mut properties = json!({"custom": null});
+        properties[field] = Value::Null;
+        let updated = dispatch(
+            &reg,
+            "update",
+            json!({"id": created["id"], "properties": properties}),
+        )
+        .await
+        .expect("optional finding null removes the stored key");
+        assert!(!updated["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key(field));
+        let persisted = dispatch(&reg, "get", json!({"id": created["id"]}))
+            .await
+            .unwrap();
+        let props = persisted["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key(field),
+            "{field} must be absent, not present as null: {persisted}"
+        );
+        assert_eq!(props.get(retained), Some(&json!("high")));
+        assert_eq!(props.get("kind_status"), Some(&json!("open")));
+        assert_eq!(props.get("keep"), Some(&json!(42)));
+        assert!(
+            props.contains_key("custom"),
+            "ordinary property null remains stored"
+        );
+        assert_eq!(props.get("custom"), Some(&Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn create_finding_refuses_null_optional_enums_but_accepts_absence() {
+    let reg = registry(rt());
+    for field in ["severity", "confidence"] {
+        let mut properties = json!({});
+        properties[field] = Value::Null;
+        let error = dispatch(
+            &reg,
+            "create",
+            json!({"kind": "finding", "title": "Invalid optional field", "properties": properties}),
+        )
+        .await
+        .expect_err("create still refuses a present null optional enum");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message == &format!("{field} must be a string")),
+            "{error}"
+        );
+    }
+    let refused = dispatch(&reg, "list", json!({"kind": "finding"}))
+        .await
+        .unwrap();
+    assert!(refused["items"].as_array().unwrap().is_empty());
+
+    let created = create_finding(&reg, json!({"custom": null})).await;
+    let persisted = dispatch(&reg, "get", json!({"id": created["id"]}))
+        .await
+        .unwrap();
+    let properties = persisted["properties"].as_object().unwrap();
+    assert!(!properties.contains_key("severity"));
+    assert!(!properties.contains_key("confidence"));
+    assert!(properties.contains_key("custom"));
+    assert_eq!(properties.get("custom"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn update_non_finding_keeps_explicit_null_properties() {
+    let reg = registry(rt());
+    let created = dispatch(
         &reg,
-        "update",
-        json!({"id": created["id"], "properties": {"severity": null}}),
+        "create",
+        json!({"kind": "observation", "content": "ordinary note", "properties": {"severity": "high", "confidence": "high", "keep": 42}}),
     )
     .await
-    .expect("severity is optional on create, so clearing it is a state create can also produce");
-    assert!(
-        updated["properties"]["severity"].is_null(),
-        "severity must be gone, got: {}",
-        updated["properties"]["severity"]
-    );
-    assert_eq!(updated["properties"]["confidence"], "high");
+    .unwrap();
+    dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"severity": null, "confidence": null}}),
+    )
+    .await
+    .unwrap();
+    let persisted = dispatch(&reg, "get", json!({"id": created["id"]}))
+        .await
+        .unwrap();
+    let properties = persisted["properties"].as_object().unwrap();
+    for field in ["severity", "confidence"] {
+        assert!(properties.contains_key(field));
+        assert_eq!(properties.get(field), Some(&Value::Null));
+    }
+    assert_eq!(properties.get("keep"), Some(&json!(42)));
 }
 
 #[tokio::test]

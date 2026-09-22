@@ -63,9 +63,9 @@ async fn update(
     let token = runtime.authorize(Namespace::local()).unwrap();
     let id = Uuid::parse_str(args["id"].as_str().unwrap()).unwrap();
     let snapshot = note(runtime, id).await;
-    fixture
+    let policy = fixture
         .registry
-        .prepare_note_update_hook(runtime, &token, &snapshot, &mut args)
+        .prepare_note_update_policy(runtime, &token, &snapshot, &mut args)
         .await?;
     let (_, plan) = prepare_update_from_note_snapshot(
         runtime,
@@ -73,6 +73,7 @@ async fn update(
         &args,
         None,
         snapshot,
+        policy,
         &fixture.registry,
     )
     .await?;

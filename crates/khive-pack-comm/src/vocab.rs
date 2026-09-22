@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 5] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 6] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -25,6 +25,11 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 5] = [
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.from_actor'), \
         json_extract(properties, '$.outbound_ref')) \
+        WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_recipient \
+        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+        json_extract(properties, '$.to_actor'), \
+        created_at DESC, id ASC) \
         WHERE deleted_at IS NULL",
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
 ];
@@ -125,6 +130,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "mailbox_actor",
+                param_type: "string",
+                required: false,
+                description: "Exact actor mailbox to read. Omit for the caller's own view. A different actor requires an explicit mailbox-read grant and supports only box=\"inbox\"; unattributed messages are excluded. Explicit \"local\" is refused.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
@@ -339,6 +351,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "mailbox_actor",
+                param_type: "string",
+                required: false,
+                description: "Exact actor whose conversation view to read. Omit for the caller's own view. A different actor requires an explicit mailbox-read grant; rows with missing, invalid or local recipients are excluded. Explicit \"local\" is refused.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "id",
                 param_type: "string",

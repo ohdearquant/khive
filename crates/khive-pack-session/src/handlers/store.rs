@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 
-use super::{deser, require_non_empty_if_present, to_session_record, StoreParams, StoreResult};
+use super::{deser, to_session_record, StoreParams, StoreResult};
 use crate::vocab::SESSION_KIND;
 
 const VERB: &str = "session.store";
@@ -15,24 +15,7 @@ pub(crate) async fn handle_store(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: StoreParams = deser(params)?;
-
-    if p.content.trim().is_empty() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{VERB}: content must not be empty"
-        )));
-    }
-    require_non_empty_if_present(&p.title, "title", VERB)?;
-    require_non_empty_if_present(&p.provider, "provider", VERB)?;
-    require_non_empty_if_present(&p.provider_session_id, "provider_session_id", VERB)?;
-    if let Some(tags) = &p.tags {
-        for tag in tags {
-            if tag.trim().is_empty() {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "{VERB}: tags entries must be non-empty strings"
-                )));
-            }
-        }
-    }
+    p.validate(VERB)?;
 
     let mut properties = serde_json::Map::new();
     if let Some(provider) = &p.provider {

@@ -295,8 +295,8 @@ impl KgPack {
                             .into(),
                     ));
                 }
-                registry
-                    .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
+                let update_policy = registry
+                    .prepare_note_update_policy(&self.runtime, token, &note, &mut params)
                     .await?;
                 let p: UpdateParams = deser(params.clone())?;
                 super::common::require_object_param(p.properties.as_ref(), "properties")?;
@@ -306,7 +306,13 @@ impl KgPack {
                 let original_version = note.version;
                 let (note, report) = self
                     .runtime
-                    .update_note_from_snapshot_with_kind_effects(token, note, &params, registry)
+                    .update_note_from_snapshot_with_kind_effects(
+                        token,
+                        note,
+                        &params,
+                        update_policy,
+                        registry,
+                    )
                     .await?;
                 let mut response = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
                 if note.version == original_version {

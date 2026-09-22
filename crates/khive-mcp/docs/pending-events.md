@@ -50,15 +50,19 @@ closed instead of inheriting daemon authority.
 
 ## Repeat advancement
 
-Named aliases are advanced as follows:
+Creation and the executor share one parser, `khive_pack_schedule::repeat`,
+which accepts and advances these forms:
 
 - `"daily"` → `trigger_at + 1 day`
 - `"weekly"` → `trigger_at + 7 days`
 - `"monthly"` → `trigger_at + 1 calendar month`
+- `"every:<N><s|m|h|d>"` → `trigger_at + N units` (`N >= 1`, for example `"every:15m"`)
+- a five-field cron expression → the next match after `trigger_at`, evaluated in UTC
+  (for example `"0 9 * * 1"` for 09:00 UTC on Mondays)
 
-Five-field cron is rejected by schedule creation because the executor cannot
-advance it. A legacy row carrying any unsupported repeat fails closed before
-invocation instead of silently degrading to one-shot delivery.
+Unsupported expressions are rejected at creation. A legacy row carrying any
+unsupported repeat fails closed before invocation instead of silently degrading
+to one-shot delivery.
 
 ## Missed-event policy (ADR-106 amendment)
 
@@ -67,7 +71,7 @@ An event is "missed" when it is discovered overdue by more than
 **never dispatched** — it is marked `status="missed"` with `missed_at`
 stamped (epoch µs) and `fired_at` left null. A missed _repeating_ event is
 skipped for this occurrence and re-armed at the next occurrence strictly
-after now (looping past every accumulated occurrence) — it never fires a
+after now (skipping every accumulated occurrence) — it never fires a
 catch-up burst. This means a daemon that was offline for a long stretch (or
 a first boot against a store with a large stale backlog) marks the entire
 overdue backlog missed on its first tick and dispatches zero of them. The

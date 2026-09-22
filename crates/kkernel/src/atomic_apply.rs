@@ -749,8 +749,8 @@ async fn prepare_one(
                     &expected_kind,
                 )
                 .map_err(anyhow::Error::new)?;
-                registry
-                    .prepare_note_update_hook(runtime, token, &note, &mut resolved)
+                let update_policy = registry
+                    .prepare_note_update_policy(runtime, token, &note, &mut resolved)
                     .await
                     .map_err(anyhow::Error::new)?;
                 khive_runtime::atomic_prepare::prepare_update_from_note_snapshot(
@@ -759,6 +759,7 @@ async fn prepare_one(
                     &resolved,
                     expected_kind,
                     note,
+                    update_policy,
                     registry,
                 )
                 .await

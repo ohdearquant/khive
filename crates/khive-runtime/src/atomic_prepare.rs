@@ -781,6 +781,7 @@ async fn prepare_note_update_plan_from_snapshot(
     args: &Value,
     expected_kind: &Option<AtomicUpdateKind>,
     note: khive_storage::note::Note,
+    policy: crate::NoteUpdatePolicy,
     registry: Option<&crate::VerbRegistry>,
 ) -> RuntimeResult<(khive_storage::Note, UpdatePlan)> {
     let id = require_uuid(args, "id")?;
@@ -826,6 +827,7 @@ async fn prepare_note_update_plan_from_snapshot(
         key: None,
     };
     let patch = crate::curation::NotePatch::new(name, content, salience, decay_factor, properties)
+        .with_update_policy(policy)
         .with_write_options(options);
     let (updated, mut plan) = runtime
         .prepare_versioned_note_update(token, note.clone(), patch.clone())
@@ -840,15 +842,18 @@ async fn prepare_note_update_plan_from_snapshot(
 /// to a pack update hook. Persistence is guarded by that snapshot's revision
 /// and deletion marker, so hook normalization cannot race a second read. The
 /// caller must first run the registry normalizer/validator against this snapshot.
-/// This shared canonical/atomic seam prepares all patch fields, then derives and
-/// attaches the owner's typed graph effects. It returns the projected note and
-/// one atomic plan, preserving the caller's operation index.
+/// This shared canonical/atomic seam prepares all patch fields with the owning
+/// kind's property policy (the value `VerbRegistry::prepare_note_update_policy`
+/// returned for this snapshot), then derives and attaches the owner's typed
+/// graph effects. It returns the projected note and one atomic plan, preserving
+/// the caller's operation index.
 pub async fn prepare_update_from_note_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
     expected_kind: Option<AtomicUpdateKind>,
     note: khive_storage::note::Note,
+    policy: crate::NoteUpdatePolicy,
     registry: &crate::VerbRegistry,
 ) -> RuntimeResult<(khive_storage::Note, AtomicOpPlan)> {
     if obj(args)?.get("entity_kind").is_some_and(|v| !v.is_null()) {
@@ -864,6 +869,7 @@ pub async fn prepare_update_from_note_snapshot(
         args,
         &expected_kind,
         note,
+        policy,
         Some(registry),
     )
     .await?;
@@ -1097,6 +1103,7 @@ pub async fn prepare_update(
                 args,
                 &expected_kind,
                 note,
+                crate::NoteUpdatePolicy::default(),
                 None,
             )
             .await?;

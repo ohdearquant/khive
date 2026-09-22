@@ -687,6 +687,7 @@ async fn wire_omitted_tiers_defaults_to_l1_and_l1_5() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_default");
     let db = root.path().join("default.db");
+    std::fs::File::create(&db).expect("pre-create explicit ingest target");
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
 
@@ -752,6 +753,7 @@ async fn wire_report_languages_describe_observed_sources() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_observed_language");
     let db = root.path().join("observed-language.db");
+    std::fs::File::create(&db).expect("pre-create explicit ingest target");
     let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
 
     let report = dispatch(
@@ -774,6 +776,7 @@ async fn wire_null_tiers_defaults_to_l1_and_l1_5() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_null");
     let db = root.path().join("null.db");
+    std::fs::File::create(&db).expect("pre-create explicit ingest target");
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
 
@@ -824,6 +827,7 @@ async fn wire_empty_tiers_write_no_map_rows() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_wire_empty");
     let db = root.path().join("wire-empty.db");
+    std::fs::File::create(&db).expect("pre-create explicit ingest target");
     let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
 
     let result = dispatch(
@@ -898,7 +902,9 @@ async fn wire_duplicate_tiers_canonicalize() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_dup");
     let db_dup = root.path().join("dup.db");
+    std::fs::File::create(&db_dup).expect("pre-create explicit ingest target");
     let db_single = root.path().join("single.db");
+    std::fs::File::create(&db_single).expect("pre-create explicit ingest target");
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
 
@@ -935,7 +941,9 @@ async fn wire_tier_order_is_caller_independent() {
     let reg = registry(rt);
 
     let db_a = root.path().join("order_a.db");
+    std::fs::File::create(&db_a).expect("pre-create explicit ingest target");
     let db_b = root.path().join("order_b.db");
+    std::fs::File::create(&db_b).expect("pre-create explicit ingest target");
     for (db, tiers) in [(&db_a, json!(["l2", "l1"])), (&db_b, json!(["l1", "l2"]))] {
         dispatch(
             &reg,
@@ -973,6 +981,7 @@ async fn default_and_explicit_l1_l1_5_are_report_byte_equivalent() {
     let pkg = root.path().join("pkg_bytes");
 
     let db_wire = root.path().join("bytes_wire.db");
+    std::fs::File::create(&db_wire).expect("pre-create explicit ingest target");
     let rt_wire = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt_wire);
     let value_wire = dispatch(
