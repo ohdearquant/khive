@@ -84,6 +84,8 @@ pub(crate) struct ListParams {
     /// page. An empty string starts cursor mode from the beginning.
     pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) created_by_actor: Option<String>,
     pub(crate) key_prefix: Option<String>,
     pub(crate) after_key: Option<String>,
     pub(crate) created_after: Option<String>,

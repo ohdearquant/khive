@@ -309,6 +309,10 @@ impl KgPack {
             return self.handle_list_proposals(token, params).await;
         }
 
+        // Presence matters for scope: even a null filter must not silently
+        // become accepted on an unrelated substrate or note kind.
+        let has_schedule_filters =
+            params.get("status").is_some() || params.get("created_by_actor").is_some();
         let mut p: ListParams = deser(params)?;
         if p.after.is_some() && p.offset.is_some() {
             return Err(RuntimeError::InvalidInput(
@@ -321,6 +325,11 @@ impl KgPack {
             ));
         }
         let spec = resolve_kind_spec(&p.kind, registry)?;
+        if has_schedule_filters && !matches!(&spec, KindSpec::Note { .. }) {
+            return Err(RuntimeError::InvalidInput(
+                "status and created_by_actor filters require scheduled_event notes; proposal lists retain their own status filter".into(),
+            ));
+        }
         if !matches!(&spec, KindSpec::Note { .. })
             && (p.key_prefix.is_some()
                 || p.after_key.is_some()
@@ -517,6 +526,11 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                if has_schedule_filters && kind_filter.as_deref() != Some("scheduled_event") {
+                    return Err(RuntimeError::InvalidInput(
+                        "status and created_by_actor filters require kind=scheduled_event or kind=note with note_kind=scheduled_event".into(),
+                    ));
+                }
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
                         resolve_message_thread_filter(
