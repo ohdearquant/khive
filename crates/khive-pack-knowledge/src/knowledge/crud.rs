@@ -206,6 +206,71 @@ fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
 }
 
 impl KnowledgeHandlers {
+    /// Feedback accepts IDs from knowledge retrieval only; no KG table lookup
+    /// and no slug fallback. Domain mirror atoms share the domain UUID.
+    pub(crate) async fn resolve_feedback_target(
+        runtime: &KhiveRuntime,
+        input: &str,
+    ) -> Result<(Uuid, &'static str), RuntimeError> {
+        let sql = runtime.sql();
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| sql_err("feedback target reader", e))?;
+        let id = if let Ok(id) = input.parse::<Uuid>() {
+            id
+        } else if let Some(statement) = knowledge_get_prefix_statement(input) {
+            let rows = reader
+                .query_all(statement)
+                .await
+                .map_err(|e| sql_err("feedback target prefix", e))?;
+            let ids: Vec<Uuid> = rows
+                .iter()
+                .filter_map(|r| row_str(r, "id"))
+                .map(|id| {
+                    id.parse()
+                        .map_err(|_| RuntimeError::Internal("invalid stored knowledge UUID".into()))
+                })
+                .collect::<Result<_, _>>()?;
+            match ids.as_slice() {
+                [] => {
+                    return Err(
+                        khive_types::KhiveError::not_found("knowledge target", input).into(),
+                    )
+                }
+                [id] => *id,
+                _ => {
+                    return Err(RuntimeError::AmbiguousPrefix {
+                        prefix: input.into(),
+                        matches: ids,
+                    })
+                }
+            }
+        } else {
+            return Err(khive_types::KhiveError::invalid_input(
+                "knowledge feedback target must be a full UUID or 8+ hex prefix",
+            )
+            .into());
+        };
+        // UUID reads, like knowledge.get, are namespace-agnostic (ADR-007).
+        for (table, kind) in [("knowledge_domains", "domain"), ("knowledge_atoms", "atom")] {
+            let row = reader
+                .query_row(SqlStatement {
+                    sql: format!(
+                        "SELECT id FROM {table} WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    ),
+                    params: vec![SqlValue::Text(id.to_string())],
+                    label: Some("knowledge.feedback.target".into()),
+                })
+                .await
+                .map_err(|e| sql_err("feedback target", e))?;
+            if row.is_some() {
+                return Ok((id, kind));
+            }
+        }
+        Err(khive_types::KhiveError::not_found("knowledge target", input).into())
+    }
+
     pub(crate) async fn upsert_atoms(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,

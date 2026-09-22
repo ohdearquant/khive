@@ -1158,6 +1158,16 @@ async fn load_events_since_with_window(
                 continue;
             }
         };
+        if event.verb == "brain.section_feedback" {
+            if let Err(error) = crate::section_feedback::decode_event(&event) {
+                push_quarantine(
+                    ReplaySkipCategory::Quarantine,
+                    format!("invalid section feedback: {error}"),
+                    payload_str,
+                );
+                continue;
+            }
+        }
         // Semantic validation: a brain.feedback row with an invalid section_signals
         // payload must be quarantined whole — before any posterior state mutation.
         // This is the shared contract with the live brain.feedback handler.
@@ -1250,6 +1260,12 @@ pub async fn ensure_loaded(
             let mut bs = BrainState::from_snapshot(snapshot, entity_capacity);
 
             for event in &replay_result.events {
+                if event.verb == "brain.section_feedback" {
+                    if let Err(error) = crate::section_feedback::replay(&mut bs, event) {
+                        tracing::warn!(event_id = %event.id, %error, "section feedback replay skipped");
+                    }
+                    continue;
+                }
                 let signal = interpret(event);
                 bs.balanced_recall.apply_signal(&signal);
 

@@ -196,9 +196,9 @@ brain_profile = "project-recall-v1"
 
 1. **Explicit profile in config**: if `runtime.brain_profile` / `KHIVE_BRAIN_PROFILE` /
    `--brain-profile` resolves to a non-empty string, that profile ID is used directly.
-2. **Namespace-bound profile**: if no explicit profile is set but a namespace is configured,
-   the feedback handler calls `brain.resolve(consumer_kind="recall")` for that
-   namespace and uses the resolved profile.
+2. **Actor/namespace-bound profile**: when no explicit profile is set, resolve
+   against the actual caller and namespace. Memory/recall use `consumer_kind="recall"`;
+   knowledge uses `consumer_kind="knowledge_compose"` and accepts only a matched binding.
 3. **Pack-local tuning prior**: if neither explicit nor namespace-bound profile resolves, the
    pack-local in-memory state receives the update directly. `BalancedRecallState` retains the
    original memory-pack fallback. As amended by #1505, knowledge's `SectionPosteriorState` is
@@ -541,3 +541,24 @@ as separating source files from build artifacts in a standard software project.
   fans entity/note work across registered engines unless `--model` narrows it
 - [ADR-034](ADR-034-kg-validation-pipelines.md) — validation pipelines remain separate from
   the explicit reindex maintenance path
+
+## 2026-09-22 amendment — knowledge feedback ownership (#1781)
+
+Knowledge feedback resolves live corpus atom/domain UUIDs and unique undashed
+hex prefixes of at least 8 characters itself. Supplied target IDs are always
+recorded; KG entity/note IDs and slugs are refused. The scalar `signal` and the
+non-empty `section_signals` map are independently optional, but one is required.
+A scalar signal requires a target; section-only feedback may omit it. The
+caller-provided scalar is retained, never replaced with a synthetic useful vote.
+
+`served_by_profile_id` takes precedence over pack configuration, followed by the
+actor/namespace knowledge_compose binding, then the namespace-local section
+prior. Profile/section learning requires an attributed caller. Section learning
+uses a trusted Rust hook with opaque corpus attribution, no KG target resolution
+and no wire verb. Its persisted event/log/snapshot updates only section state;
+normal brain feedback continues to accept KG targets only.
+
+Knowledge records its event before calling the profile hook. There is no
+cross-backend atomic transaction. If profile persistence subsequently fails, the
+error identifies the committed knowledge event and states that the profile
+outcome is unconfirmed. Callers must inspect before retrying.

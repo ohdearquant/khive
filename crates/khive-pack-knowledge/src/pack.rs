@@ -35,7 +35,7 @@ pub struct KnowledgePack {
     /// Explicit brain profile ID from config (ADR-035 §Brain profile configuration).
     ///
     /// Tier-1 of the 3-tier feedback resolution: when set, `knowledge.feedback` directs
-    /// feedback to this profile via `brain.feedback`. When absent, tier-2
+    /// section feedback through the trusted in-process brain hook. When absent, tier-2
     /// (namespace-bound profile) and tier-3 (namespace-local prior) are tried in order.
     pub(crate) brain_profile: Option<String>,
 }

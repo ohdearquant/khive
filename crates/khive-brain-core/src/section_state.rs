@@ -155,29 +155,34 @@ impl SectionPosteriorState {
             ..
         } = signal
         {
-            self.total_events += 1;
+            self.apply_section_signals(signals);
+        }
+    }
 
-            for (section_type, feedback_signal) in signals {
-                if let Some(posterior) = self.posteriors.get_mut(section_type) {
-                    match feedback_signal {
-                        FeedbackSignal::Useful => posterior.update_success(),
-                        FeedbackSignal::NotUseful => posterior.update_failure(),
-                        FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
-                    }
-                    if let Some(prior) = self.priors.get(section_type) {
-                        if let Err(e) = posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP) {
-                            eprintln!(
-                                "[brain-core] apply_ess_cap failed for section {:?}: {e}",
-                                section_type
-                            );
-                        }
+    /// Apply section evidence without inventing an entity-level feedback signal.
+    pub fn apply_section_signals(&mut self, signals: &HashMap<SectionType, FeedbackSignal>) {
+        self.total_events += 1;
+
+        for (section_type, feedback_signal) in signals {
+            if let Some(posterior) = self.posteriors.get_mut(section_type) {
+                match feedback_signal {
+                    FeedbackSignal::Useful => posterior.update_success(),
+                    FeedbackSignal::NotUseful => posterior.update_failure(),
+                    FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
+                }
+                if let Some(prior) = self.priors.get(section_type) {
+                    if let Err(e) = posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP) {
+                        eprintln!(
+                            "[brain-core] apply_ess_cap failed for section {:?}: {e}",
+                            section_type
+                        );
                     }
                 }
             }
+        }
 
-            if self.exploration_epoch > 0 {
-                self.exploration_epoch -= 1;
-            }
+        if self.exploration_epoch > 0 {
+            self.exploration_epoch -= 1;
         }
     }
 }
@@ -228,8 +233,18 @@ fn lower_confidence_bound(p: &BetaPosterior) -> f64 {
 
 // ── Sampling helpers ────────────────────────────────────────────────────────
 
+/// Sum in ascending value order. A `HashMap` iterates in a per-instance order
+/// and floating-point addition is not associative, so summing in map order lets
+/// two maps holding the same weights normalize to results that differ in the
+/// last bit.
+fn sum_in_value_order(values: impl Iterator<Item = f64>) -> f64 {
+    let mut values: Vec<f64> = values.collect();
+    values.sort_by(f64::total_cmp);
+    values.into_iter().sum()
+}
+
 fn apply_floor_and_renorm(weights: &mut HashMap<SectionType, f64>, floor: f64) {
-    let sum: f64 = weights.values().sum();
+    let sum = sum_in_value_order(weights.values().copied());
     if sum > 0.0 {
         for v in weights.values_mut() {
             *v /= sum;
@@ -244,7 +259,7 @@ fn apply_floor_and_renorm(weights: &mut HashMap<SectionType, f64>, floor: f64) {
             }
         });
         if n_free == 0 {
-            let total: f64 = weights.values().sum();
+            let total = sum_in_value_order(weights.values().copied());
             if total > 0.0 {
                 for v in weights.values_mut() {
                     *v /= total;
@@ -253,7 +268,7 @@ fn apply_floor_and_renorm(weights: &mut HashMap<SectionType, f64>, floor: f64) {
             break;
         }
         let free_mass = (1.0 - pinned_sum).max(0.0);
-        let free_sum: f64 = weights.values().filter(|&&w| w > floor).sum();
+        let free_sum = sum_in_value_order(weights.values().copied().filter(|&w| w > floor));
         for v in weights.values_mut() {
             if *v <= floor {
                 *v = floor;
@@ -325,6 +340,31 @@ mod tests {
                 (sum - 1.0).abs() < 1e-9,
                 "weights must sum to 1.0; got {sum}"
             );
+        }
+    }
+
+    /// The same weights must normalize to bit-identical results whatever order
+    /// the map happens to iterate in.
+    #[test]
+    fn renormalization_does_not_depend_on_map_iteration_order() {
+        let raw = [0.1, 0.2, 0.3, 0.7, 0.11, 0.13, 0.17, 0.19, 0.23, 0.29];
+        let normalize = |order: &[usize]| {
+            let mut weights: HashMap<SectionType, f64> = order
+                .iter()
+                .map(|&i| (SectionType::ALL[i], raw[i]))
+                .collect();
+            apply_floor_and_renorm(&mut weights, DEFAULT_SECTION_WEIGHT_FLOOR);
+            SectionType::ALL.map(|section| weights[&section].to_bits())
+        };
+        let forward: Vec<usize> = (0..raw.len()).collect();
+        let expected = normalize(&forward);
+        for round in 0..64 {
+            let mut order = forward.clone();
+            order.rotate_left(round % raw.len());
+            if round % 2 == 1 {
+                order.reverse();
+            }
+            assert_eq!(normalize(&order), expected, "round {round}");
         }
     }
 

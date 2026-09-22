@@ -254,6 +254,21 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
+    /// Trusted in-process section feedback after the calling pack has validated
+    /// its own target. This is not a registered handler or a wire entry point.
+    async fn apply_profile_section_feedback(
+        &self,
+        _token: &NamespaceToken,
+        _profile_id: &str,
+        _section_signals: Value,
+        _target_attribution: Option<String>,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!(
+            "pack {:?} does not support profile section feedback",
+            self.name()
+        )))
+    }
+
     /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
     fn handlers(&self) -> &'static [HandlerDef];
 
@@ -3599,6 +3614,30 @@ impl VerbRegistry {
             }
         }
         Ok(catalog)
+    }
+
+    /// Apply section evidence through the installed brain instance. Callers must
+    /// validate their domain target and authorize their own operation first;
+    /// this trusted Rust hook adds no handler to dispatch or the wire catalog.
+    pub async fn apply_profile_section_feedback(
+        &self,
+        token: &NamespaceToken,
+        profile_id: &str,
+        section_signals: Value,
+        target_attribution: Option<String>,
+    ) -> Result<Value, RuntimeError> {
+        let brain = self
+            .packs
+            .iter()
+            .find(|pack| pack.name() == "brain")
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "profile section feedback requires the brain pack".into(),
+                )
+            })?;
+        brain
+            .apply_profile_section_feedback(token, profile_id, section_signals, target_attribution)
+            .await
     }
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
