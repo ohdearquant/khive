@@ -2486,12 +2486,45 @@ mod tests {
                 )
                 .expect("insert pre-V21 legacy model");
         }
-        legacy_backend
-            .events_for_namespace("local")
-            .unwrap()
-            .append_event(published_event)
-            .await
-            .expect("insert immutable legacy model event");
+        {
+            // The fixture is a pre-V36 store, so the event row is written in that
+            // schema's column set. The current event writer also sets the V36
+            // operation-attribution columns, which this table does not have.
+            let writer = legacy_backend
+                .pool()
+                .try_writer()
+                .expect("legacy fixture writer");
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO events (\
+                         id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                         payload_schema_version, profile_state_version, duration_us, target_id, \
+                         session_id, aggregate_kind, aggregate_id, created_at\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    (
+                        published_event.id.to_string(),
+                        published_event.namespace.clone(),
+                        published_event.verb.clone(),
+                        published_event.substrate.name(),
+                        published_event.actor.clone(),
+                        published_event.kind.name(),
+                        published_event.outcome.name(),
+                        published_event.payload.to_string(),
+                        i64::from(published_event.payload_schema_version),
+                        published_event
+                            .profile_state_version
+                            .map(|version| version as i64),
+                        published_event.duration_us,
+                        published_event.target_id.map(|id| id.to_string()),
+                        published_event.session_id.map(|id| id.to_string()),
+                        published_event.aggregate_kind.clone(),
+                        published_event.aggregate_id.map(|id| id.to_string()),
+                        published_event.created_at,
+                    ),
+                )
+                .expect("insert immutable legacy model event");
+        }
 
         let legacy_sql = legacy_backend.sql();
         let owner = acquire_database_gc_owner(legacy_sql.as_ref())
@@ -2549,27 +2582,6 @@ mod tests {
                 .unwrap()
                 .with_orphan_sweep_grace(Duration::ZERO),
         );
-        let migrated = KhiveRuntime::from_prepared_backend(
-            Arc::clone(&legacy_backend),
-            persistent_runtime_config(&legacy_db_path, "alice"),
-        )
-        .expect("runtime over finalized V21 database");
-        migrated
-            .install_blob_store(sweep_store.clone())
-            .expect("install migrated blob store");
-        let migrated_token = migrated.authorize(Namespace::local()).unwrap();
-        let migrated_model = load_preference_model(&migrated, &migrated_token, model_id, &scope)
-            .await
-            .expect("load migrated model");
-        let (_, migrated_probability) = predict(
-            &migrated_model.network,
-            migrated_model.bundle.calibration.temperature,
-            &[0.9; FEATURE_COUNT],
-            &[0.1; FEATURE_COUNT],
-        )
-        .unwrap();
-        assert_eq!(migrated_probability, expected_probability);
-
         let orphan_ref = sweep_store
             .put(b"unreferenced migration regression object".to_vec())
             .await
@@ -2577,11 +2589,42 @@ mod tests {
         let sweep = sweep_store
             .transactional_orphan_sweep(legacy_sql.as_ref(), false)
             .await
-            .expect("attachment-only GC after V21 finalization");
+            .expect("attachment-only GC at the completed V21 epoch");
         assert_eq!(sweep.deleted, 1, "the control orphan proves GC executed");
         assert!(!sweep_store.exists(&orphan_ref).await.unwrap());
         assert!(sweep_store.exists(&bundle_content_ref).await.unwrap());
         assert!(sweep_store.exists(&network_content_ref).await.unwrap());
+
+        // As the boot coordinator does: ordinary schema preparation stops before
+        // V21, so the migrations after it run once the cutover is final.
+        legacy_backend
+            .prepare_core_schema()
+            .expect("apply the migrations after the V21 cutover");
+        // The sweep is admitted only for the exact completed V21 ledger, so once
+        // the later migrations have run it refuses and deletes nothing.
+        let later_orphan_ref = sweep_store
+            .put(b"unreferenced object after the later migrations".to_vec())
+            .await
+            .unwrap();
+        let refused = sweep_store
+            .transactional_orphan_sweep(legacy_sql.as_ref(), false)
+            .await
+            .expect_err("GC above the V21 epoch must refuse");
+        assert!(
+            matches!(refused, khive_storage::StorageError::Unsupported { .. }),
+            "unexpected refusal: {refused:?}"
+        );
+        assert!(sweep_store.exists(&later_orphan_ref).await.unwrap());
+
+        let migrated = KhiveRuntime::from_prepared_backend(
+            Arc::clone(&legacy_backend),
+            persistent_runtime_config(&legacy_db_path, "alice"),
+        )
+        .expect("runtime over the fully migrated database");
+        migrated
+            .install_blob_store(sweep_store.clone())
+            .expect("install migrated blob store");
+        let migrated_token = migrated.authorize(Namespace::local()).unwrap();
         let after_gc = load_preference_model(&migrated, &migrated_token, model_id, &scope)
             .await
             .expect("load migrated model after attachment-only GC");

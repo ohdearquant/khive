@@ -240,6 +240,7 @@ async fn coordinate_attachment_cutover_inner(
         return Ok(());
     }
 
+    let prepared = Arc::clone(&backend);
     let handle = khive_runtime::spawn_named_tracked_task("attachment_cutover", async move {
         let sql = backend.sql();
         #[cfg(test)]
@@ -346,6 +347,15 @@ async fn coordinate_attachment_cutover_inner(
     handle
         .await
         .context("tracked V21 attachment migrator panicked")??;
+
+    // Ordinary schema preparation stops before V21, so a backend whose cutover
+    // was just finished here (or by a sibling while this boot waited for the GC
+    // owner) is still at V21. Apply the remaining migrations before the runtime
+    // is built on it; the GC owner was released when the task above ended.
+    tokio::task::spawn_blocking(move || prepared.prepare_core_schema())
+        .await
+        .context("post-V21 schema preparation task panicked")?
+        .context("apply the migrations after the V21 cutover")?;
     Ok(())
 }
 
@@ -435,6 +445,12 @@ mod tests {
         assert_eq!(
             backend.attachment_cutover_status().unwrap(),
             AttachmentCutoverStatus::Complete
+        );
+        assert_eq!(
+            backend.schema_version().unwrap(),
+            khive_db::migrations::latest_schema_version(),
+            "the coordinated cutover must leave the schema at the latest migration, \
+             not at V21, before a runtime is built on it"
         );
 
         let attachment = backend

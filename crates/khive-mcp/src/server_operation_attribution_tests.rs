@@ -228,6 +228,7 @@ fn assert_fields(event: &Event, index: u32, resolution: RefResolution) {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn batch_operation_attribution_uses_parser_position_when_second_commits_first() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -255,6 +256,7 @@ async fn batch_operation_attribution_uses_parser_position_when_second_commits_fi
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chain_operation_attribution_marks_only_consumed_references_resolved() {
     let target = Uuid::new_v4();
     let (server, store) = fixture(None, Uuid::new_v4());
@@ -270,6 +272,7 @@ async fn chain_operation_attribution_marks_only_consumed_references_resolved() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn single_operation_and_direct_event_have_distinct_provenance_in_same_store() {
     let target = Uuid::new_v4();
     let (server, store) = fixture(None, Uuid::new_v4());
