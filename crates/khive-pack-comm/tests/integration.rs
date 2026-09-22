@@ -1114,7 +1114,8 @@ async fn reply_subject_does_not_disclose_a_foreign_threads_root_subject() {
                 "to": "lambda:mallory",
                 "content": "probe",
                 "subject": "probe",
-                "thread_id": foreign_thread
+                "thread_id": foreign_thread,
+                "self_send": true
             }),
         )
         .await
