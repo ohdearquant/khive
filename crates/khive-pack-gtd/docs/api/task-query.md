@@ -22,7 +22,10 @@ blockers are reported as `invalid` with a `broken` dependency state.
 stored string states with an explicit invalid-stored-status error. Repair needs
 reviewed source evidence, preserving `archived_at` and transition history. The
 timestamp repair sub-request is deferred: the original units/replacement dates
-are unverified, storage uses microseconds, and no `gtd.stats` verb exists.
+are unverified and storage uses microseconds. The separate read-only
+[`gtd.census`](task-timestamp-census.md) reports raw value magnitudes; it neither
+changes these status filters nor claims the historical timestamp units. There
+is no `gtd.stats` verb.
 
 ## `fetch_all_matching_tasks` — bounded single-snapshot scan (issue #772, #825)
 

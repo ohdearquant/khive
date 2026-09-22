@@ -7,6 +7,9 @@ maintenance effects. `Write` covers caller-requested domain mutations, lifecycle
 and control changes, ingestion, external effects, generated persistent artifacts,
 and explicit maintenance. Speech-act categories do not determine access.
 
+`gtd.census` performs an aggregate SQL read on the bound notes backend and does
+not acquire a writer, repair timestamps, or infer their units.
+
 Only an explicit `Read` permits an enrolled, pattern-matched caller. Unknown,
 unloaded, dynamically mounted, or third-party names without a classification are
 denied. Internal subhandlers and aliases receive no exemption. Handler additions
@@ -98,6 +101,7 @@ version is part of every nonempty restriction's policy fingerprint.
 | `git.reconcile`              | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L64)   |
 | `git.status`                 | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L72)   |
 | `gtd.assign`                 | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
+| `gtd.census`                 | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.complete`               | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)              |
 | `gtd.next`                   | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L191)              |
 | `gtd.tasks`                  | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L271)              |
