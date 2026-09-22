@@ -904,6 +904,347 @@ async fn reply_creates_threaded_message() {
 }
 
 #[tokio::test]
+async fn reply_subject_derives_from_thread_root_not_from_drifted_reply() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "original",
+                "subject": "会议纪要 (Q3 planning)"
+            }),
+        )
+        .await
+        .expect("send original succeeds");
+    let root_id = original["full_id"].as_str().expect("full_id").to_string();
+
+    // A later message in the same thread whose subject drifted: extra spaces
+    // at the CJK/ASCII boundary, a doubled reply prefix, and a client-added
+    // suffix. The first two are what whitespace collapsing alone would repair;
+    // the suffix is what only the root rule repairs.
+    let drifted = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "drifted",
+                "subject": "Re: Re: 会议纪要   (Q3 planning) (2)",
+                "thread_id": root_id
+            }),
+        )
+        .await
+        .expect("send into thread succeeds");
+    let drifted_id = drifted["full_id"].as_str().expect("full_id").to_string();
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": drifted_id, "content": "answer" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(
+        reply["subject"].as_str(),
+        Some("Re: 会议纪要 (Q3 planning)"),
+        "reply subject comes from the thread root, not the drifted message: {reply}"
+    );
+    assert_eq!(reply["thread_id"].as_str(), Some(root_id.as_str()));
+
+    // Replying to a reply keeps a single prefix.
+    let reply_id = reply["full_id"].as_str().expect("full_id").to_string();
+    let second = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": reply_id, "content": "again" }),
+        )
+        .await
+        .expect("second reply succeeds");
+    assert_eq!(
+        second["subject"].as_str(),
+        Some("Re: 会议纪要 (Q3 planning)")
+    );
+}
+
+/// A thread opened by an INBOUND mail has no note at its thread id: `comm.ingest`
+/// mints the thread id separately from the note id. The root must be found by
+/// membership, or every reply in the common case (an exchange the other side
+/// opened) echoes the drifted subject this rule exists to stop.
+#[tokio::test]
+async fn reply_subject_for_ingest_rooted_thread_is_byte_stable_over_three_round_trips() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root_props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "opening mail",
+            "subject": "会议纪要 (Q3 planning)",
+            "default_inbound_actor": "local",
+            "external_id": "imap:mail:9:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+    let thread_id = root_props["thread_id"]
+        .as_str()
+        .expect("ingest assigns a thread id")
+        .to_string();
+    let root_id = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "thread_id": thread_id, "limit": 5 }),
+        )
+        .await
+        .expect("inbox lists the ingested root")["messages"][0]["full_id"]
+        .as_str()
+        .expect("root full_id")
+        .to_string();
+    assert_ne!(
+        root_id, thread_id,
+        "the ingest root's note id is not its thread id"
+    );
+
+    let mut subjects = Vec::new();
+    let mut reply_to = root_id;
+    for (round, drifted) in [
+        "Re: 会议纪要 (Q3 planning)",
+        "Re: Re: 会议纪要   (Q3 planning)",
+        "Re:  Re: Re: 会议纪要   (Q3 planning) (2)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = registry
+            .dispatch(
+                "comm.reply",
+                serde_json::json!({ "id": reply_to, "content": format!("answer {round}") }),
+            )
+            .await
+            .expect("reply succeeds");
+        subjects.push(
+            reply["subject"]
+                .as_str()
+                .expect("reply subject")
+                .to_string(),
+        );
+        assert_eq!(reply["thread_id"].as_str(), Some(thread_id.as_str()));
+
+        // The other side answers with a drifted subject in the same thread.
+        let next = ingest_and_get_props(
+            &registry,
+            &rt,
+            serde_json::json!({
+                "from": "email:user@example.com",
+                "to": "email:mailbox@example.com",
+                "content": format!("their turn {round}"),
+                "subject": drifted,
+                "thread_id": thread_id,
+                "default_inbound_actor": "local",
+                "external_id": format!("imap:mail:9:{}", round + 2),
+                "namespace": "local",
+            }),
+        )
+        .await;
+        assert_eq!(next["thread_id"].as_str(), Some(thread_id.as_str()));
+        reply_to = registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "thread_id": thread_id, "limit": 20 }),
+            )
+            .await
+            .expect("inbox lists the thread")["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .find(|m| m["properties"]["subject"].as_str() == Some(drifted))
+            .and_then(|m| m["full_id"].as_str())
+            .expect("the drifted inbound is listed")
+            .to_string();
+    }
+    let fourth = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": reply_to, "content": "answer 3" }),
+        )
+        .await
+        .expect("fourth reply succeeds");
+    subjects.push(
+        fourth["subject"]
+            .as_str()
+            .expect("reply subject")
+            .to_string(),
+    );
+
+    assert!(
+        subjects.iter().all(|s| s == "Re: 会议纪要 (Q3 planning)"),
+        "every reply carries the root subject byte for byte: {subjects:?}"
+    );
+}
+
+/// A legacy thread member that carries no `sent_at` but has a subject of its
+/// own must not be taken for the root: SQL NULL sorts first under ascending
+/// order, so without a type guard the earliest-by-`sent_at` lookup would pick
+/// the legacy row and the reply would echo its subject instead of the root's.
+#[tokio::test]
+async fn reply_subject_ignores_a_legacy_member_without_sent_at() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root_props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "opening mail",
+            "subject": "Budget review",
+            "default_inbound_actor": "local",
+            "external_id": "imap:mail:11:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+    let thread_id = root_props["thread_id"]
+        .as_str()
+        .expect("ingest assigns a thread id")
+        .to_string();
+    let root_id = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "thread_id": thread_id, "limit": 5 }),
+        )
+        .await
+        .expect("inbox lists the ingested root")["messages"][0]["full_id"]
+        .as_str()
+        .expect("root full_id")
+        .to_string();
+
+    // Seed a pre-`sent_at` member of the same thread through the raw store,
+    // addressed so the caller counts as a party to it.
+    let legacy = Note::new("local", "message", "legacy row from before sent_at existed")
+        .with_properties(serde_json::json!({
+            "thread_id": thread_id,
+            "subject": "LEGACY DRIFT",
+            "from_actor": "local",
+            "to_actor": "email:user@example.com",
+        }));
+    rt.backend()
+        .notes()
+        .expect("raw notes store")
+        .upsert_note(legacy)
+        .await
+        .expect("legacy row seeded");
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_id, "content": "answer" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(
+        reply["subject"].as_str(),
+        Some("Re: Budget review"),
+        "the root's subject wins over a legacy member that has no sent_at"
+    );
+}
+
+/// A caller who knows another actor's thread id and self-sends into it must not
+/// learn that thread's root subject through its own reply: the root lookup
+/// applies the same thread-participant predicate as the reply itself.
+#[tokio::test]
+async fn reply_subject_does_not_disclose_a_foreign_threads_root_subject() {
+    let backend = shared_backend();
+    let (alice, _alice_rt) = build_actor_registry(backend.clone(), "lambda:alice");
+    let (mallory, _mallory_rt) = build_actor_registry(backend, "lambda:mallory");
+
+    let root = alice
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:bob",
+                "content": "for bob only",
+                "subject": "SECRET reorg plan"
+            }),
+        )
+        .await
+        .expect("alice sends to bob");
+    let foreign_thread = root["thread_id"].as_str().expect("thread id").to_string();
+
+    let own = mallory
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:mallory",
+                "content": "probe",
+                "subject": "probe",
+                "thread_id": foreign_thread,
+                "self_send": true
+            }),
+        )
+        .await
+        .expect("mallory self-sends into the foreign thread id");
+    let own_id = own["full_id"].as_str().expect("full_id").to_string();
+
+    let reply = mallory
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": own_id, "content": "reply to self" }),
+        )
+        .await
+        .expect("mallory replies to their own message");
+    let subject = reply["subject"].as_str().expect("reply subject");
+    assert_eq!(
+        subject, "Re: probe",
+        "reply falls back to the caller's own subject"
+    );
+    assert!(
+        !subject.contains("SECRET"),
+        "the foreign root subject must not leak through the reply: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn reply_subject_falls_back_to_the_message_when_the_root_has_none() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "no subject here" }),
+        )
+        .await
+        .expect("send original succeeds");
+    let root_id = original["full_id"].as_str().expect("full_id").to_string();
+
+    let titled = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "titled",
+                "subject": "Topic",
+                "thread_id": root_id
+            }),
+        )
+        .await
+        .expect("send into thread succeeds");
+    let titled_id = titled["full_id"].as_str().expect("full_id").to_string();
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": titled_id, "content": "answer" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(reply["subject"].as_str(), Some("Re: Topic"));
+}
+
+#[tokio::test]
 async fn unknown_verb_returns_error() {
     let (registry, _rt) = build_registry();
     let err = registry
