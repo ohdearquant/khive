@@ -2713,9 +2713,9 @@ async fn t87_anonymous_local_single_actor_read_still_works() {
     );
 }
 
-/// Pre-ADR-057 legacy messages may carry no `to_actor` at all.
+/// Named actors do not inherit pre-ADR-057 rows without `to_actor`.
 #[tokio::test]
-async fn t87_legacy_message_without_to_actor_reads_fail_open() {
+async fn t87_named_actor_cannot_read_legacy_message_without_to_actor() {
     let (_registry, rt) = build_registry_for_ns("lambda:legacy");
     let token = rt
         .authorize(khive_runtime::Namespace::parse("local").unwrap())
@@ -2745,17 +2745,24 @@ async fn t87_legacy_message_without_to_actor_reads_fail_open() {
     builder.with_actor_id(Some("lambda:legacy".to_string()));
     let registry = builder.build().expect("registry builds");
 
-    let result = registry
+    let error = registry
         .dispatch(
             "comm.read",
             serde_json::json!({ "id": legacy_note.id.as_hyphenated().to_string() }),
         )
         .await
-        .expect("#87: legacy message without to_actor must fail open on read");
+        .expect_err("#1739: named actors cannot mark legacy pool messages");
+    assert!(error.to_string().contains("not addressed"), "{error}");
+    let stored = rt
+        .notes(&token)
+        .unwrap()
+        .get_note(legacy_note.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        result.get("read").and_then(|v| v.as_bool()),
-        Some(true),
-        "#87: legacy to_actor-less read returns read:true — got {result}"
+        stored, legacy_note,
+        "refusal must not mutate the legacy note"
     );
 }
 
@@ -4042,6 +4049,7 @@ fn build_crossns_registry(
     allowed_outbound: Vec<Namespace>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -4987,7 +4995,15 @@ fn build_actor_registry(
     backend: Arc<khive_db::StorageBackend>,
     actor_id: &str,
 ) -> (VerbRegistry, KhiveRuntime) {
+    build_identity_registry(backend, Some(actor_id))
+}
+
+fn build_identity_registry(
+    backend: Arc<khive_db::StorageBackend>,
+    actor_id: Option<&str>,
+) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -5005,14 +5021,14 @@ fn build_actor_registry(
         brain_profile: None,
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
-        actor_id: Some(actor_id.to_string()),
+        actor_id: actor_id.map(str::to_string),
         exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     builder.register(CommPack::new(rt.clone()));
-    builder.with_actor_id(Some(actor_id.to_string()));
+    builder.with_actor_id(actor_id.map(str::to_string));
     let registry = builder.build().expect("actor registry builds");
     (registry, rt)
 }
@@ -5288,6 +5304,7 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
 
     let backend = shared_backend();
     let config = RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -5409,6 +5426,7 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
 
     // An anonymous (unconfigured) caller on the same backend must NOT see B's message.
     let config_anon = RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -9903,7 +9921,7 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
     assert_eq!(thread_from_a["count"].as_u64().unwrap_or(0), 1);
 }
 
-/// A legacy message note lacking `to_actor` (pre-ADR-057 data, or directly store-inserted content) must remain visible via `comm.thread`'s actor scoping — the same EqOrMissing rule `comm.inbox` already applies for exactly this shape (ADR-057 Q3).
+/// The anonymous fallback keeps legacy thread rows without `to_actor`.
 #[tokio::test]
 async fn t94_thread_legacy_message_without_to_actor_stays_visible() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -10644,7 +10662,7 @@ async fn i113_sender_reply_to_own_message_succeeds() {
     assert_eq!(reply["from"], "lambda:a");
 }
 
-/// A legacy message with neither `to_actor` nor `from_actor` fails open (no attributed party to restrict against), matching the #87/#94 precedent.
+/// The anonymous fallback can still reply to an entirely unattributed legacy row.
 #[tokio::test]
 async fn i113_legacy_message_without_actors_fails_open() {
     use khive_storage::note::Note;
@@ -10871,13 +10889,14 @@ async fn i2214_unread_count_saturates_with_explicit_cap_metadata() {
     assert_eq!(unread["count_saturated"], true);
 }
 
-/// Explicit JSON null has the same fail-open inbox visibility as an absent
-/// `to_actor`; the mailbox-wide unread count must include it too.
+/// Missing and null recipients are outside a named actor's mailbox; the
+/// anonymous fallback still includes this legacy pool in bodies and counts.
 #[tokio::test]
-async fn i2166_unread_count_includes_explicit_null_recipient() {
+async fn i2166_null_recipient_pool_is_anonymous_only() {
     let backend = shared_backend();
     let (_registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
     let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (anonymous, _rt_local) = build_identity_registry(backend.clone(), None);
 
     backend
         .notes()
@@ -10898,19 +10917,33 @@ async fn i2166_unread_count_includes_explicit_null_recipient() {
         .await
         .expect("unread succeeds");
     assert_eq!(
-        unread["count"], 1,
-        "explicit null must be counted: {unread}"
+        unread["count"], 0,
+        "named actor must not count explicit-null pool: {unread}"
     );
 
     let inbox = registry_b
         .dispatch("comm.inbox", serde_json::json!({ "limit": 10 }))
         .await
         .expect("inbox succeeds");
-    assert_eq!(inbox["count"], 1, "explicit null must be visible: {inbox}");
     assert_eq!(
-        inbox["unread_count"], 1,
+        inbox["count"], 0,
+        "named actor must not see null pool: {inbox}"
+    );
+    assert_eq!(
+        inbox["unread_count"], 0,
         "count must match visibility: {inbox}"
     );
+    let unread = anonymous
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .unwrap();
+    let inbox = anonymous
+        .dispatch("comm.inbox", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(unread["count"], 1);
+    assert_eq!(inbox["count"], 1);
+    assert_eq!(inbox["unread_count"], 1);
 }
 
 /// `limit=0` is the count-only inbox path: it returns no message payloads but
@@ -11483,14 +11516,15 @@ async fn i1387_mark_read_supports_best_effort_and_atomic_bulk_modes() {
 #[tokio::test]
 async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
     let backend = shared_backend();
-    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let (named_local, _named_runtime) = build_actor_registry(backend.clone(), "local");
+    let (registry, runtime) = build_identity_registry(backend, None);
     let created_at = chrono::Utc::now().timestamp_micros();
     let eligible = insert_i1422_message(
         &runtime,
         504,
         created_at,
         "lambda:sender",
-        "lambda:reader",
+        "local",
         None,
         "must roll back",
     )
@@ -11500,7 +11534,7 @@ async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
         505,
         created_at + 1,
         "lambda:sender",
-        "lambda:reader",
+        "local",
         None,
         "transaction guard",
     )
@@ -11513,6 +11547,22 @@ async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
         .update_note_properties(non_object, Some(serde_json::json!([])), created_at + 2)
         .await
         .unwrap();
+
+    // Removing the entire property object also removes its addressee. Named
+    // callers must fail scope validation; only the actual anonymous fixture
+    // can reach the storage object-shape guard that exercises rollback.
+    let denied = named_local
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({
+                "ids": [eligible.to_string(), non_object.to_string()],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect_err("named local must not inherit the second row's missing addressee");
+    assert!(denied.to_string().contains("not addressed"), "{denied}");
+    assert!(token.actor().is_anonymous());
 
     let error = registry
         .dispatch(
@@ -11553,9 +11603,9 @@ async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
 }
 
 #[tokio::test]
-async fn i1387_atomic_mark_read_preserves_adr057_legacy_fail_open() {
+async fn i1387_atomic_mark_read_preserves_anonymous_legacy_pool() {
     let backend = shared_backend();
-    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let (registry, runtime) = build_identity_registry(backend, None);
     let created_at = chrono::Utc::now().timestamp_micros();
     let legacy = insert_i1422_message(
         &runtime,
@@ -11586,7 +11636,7 @@ async fn i1387_atomic_mark_read_preserves_adr057_legacy_fail_open() {
             serde_json::json!({ "ids": [legacy.to_string()], "atomic": true }),
         )
         .await
-        .expect("ADR-057 keeps addressee-free legacy rows markable");
+        .expect("anonymous fallback keeps addressee-free legacy rows markable");
     assert_eq!(result["marked_count"], 1);
     assert_eq!(result["failed_count"], 0);
 
@@ -13149,12 +13199,13 @@ async fn i1468_fields_projects_inbox_and_thread_with_one_strict_vocabulary() {
     assert!(empty.to_string().contains("at least one field"));
 }
 
-/// The anonymous `"local"` caller is scoped by `to_actor = "local" OR to_actor IS NULL` like every other caller (ADR-057 amendment): it shares messages addressed to `"local"`, keeps legacy rows without `to_actor` visible, and must not see messages explicitly addressed to another actor.
+/// The anonymous fallback shares local-addressed and legacy messages. A
+/// configured actor whose id is `"local"` has no legacy-pool privilege.
 #[tokio::test]
 async fn i1471_anonymous_local_inbox_scoping_and_legacy_visibility() {
     let backend = shared_backend();
     let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
-    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+    let (registry_local, rt_local) = build_identity_registry(backend, None);
 
     registry_a
         .dispatch(
@@ -13263,7 +13314,8 @@ async fn i1471_cross_box_filters_are_rejected() {
 async fn i1471_local_sent_box_includes_legacy_rows_only() {
     let backend = shared_backend();
     let (registry_other, _rt_other) = build_actor_registry(backend.clone(), "lambda:other");
-    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+    let (named_local, _named_runtime) = build_actor_registry(backend.clone(), "local");
+    let (registry_local, rt_local) = build_identity_registry(backend, None);
 
     registry_local
         .dispatch(
@@ -13314,6 +13366,20 @@ async fn i1471_local_sent_box_includes_legacy_rows_only() {
         )
         .await
         .expect("foreign-attributed outbound fixture");
+
+    let named_sent = named_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("named local sent history");
+    assert_eq!(
+        named_sent["count"], 1,
+        "named local has no legacy fallback: {named_sent}"
+    );
+    assert_eq!(named_sent["messages"][0]["content"], "sent by local");
+    assert!(local_tok.actor().is_anonymous());
 
     let sent = registry_local
         .dispatch(
@@ -13574,7 +13640,8 @@ async fn sent_box_rejects_empty_to_actor_filter() {
 #[tokio::test]
 async fn sent_box_null_property_fallback_does_not_panic() {
     let backend = shared_backend();
-    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+    let (named_local, _named_runtime) = build_actor_registry(backend.clone(), "local");
+    let (registry_local, rt_local) = build_identity_registry(backend, None);
 
     let local_tok = rt_local
         .authorize(Namespace::local())
@@ -13593,6 +13660,17 @@ async fn sent_box_null_property_fallback_does_not_panic() {
         .expect("actor-property-less outbound fixture");
     let fixture_id = fixture.id.as_hyphenated().to_string();
 
+    let named_sent = named_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "fields": ["id", "to_actor", "from_actor"] }),
+        )
+        .await
+        .expect("named local projection excludes sender-less legacy rows");
+    assert_eq!(named_sent["count"], 0, "{named_sent}");
+    assert!(named_sent["messages"].as_array().unwrap().is_empty());
+    assert!(local_tok.actor().is_anonymous());
+
     let sent = registry_local
         .dispatch(
             "comm.inbox",
@@ -13602,7 +13680,7 @@ async fn sent_box_null_property_fallback_does_not_panic() {
         .expect("projected sent history over a property-less row");
     assert_eq!(
         sent["count"], 1,
-        "the local caller's EqOrMissing from_actor fallback must keep the row visible; got {sent}"
+        "the anonymous caller's EqOrMissing from_actor fallback must keep the row visible; got {sent}"
     );
     let message = &sent["messages"][0];
     assert_eq!(message["id"], fixture_id);
@@ -13882,6 +13960,148 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
     );
 }
 
+/// Coordinate patches must fail before any sibling property or note revision changes (#2990).
+#[tokio::test]
+async fn channel_health_update_refuses_coordinate_patches_and_preserves_heartbeat_identity() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let heartbeat = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "identity@example.com",
+        "poll_interval_secs": 5,
+        "outcome": "failure",
+        "error_class": "transient",
+    });
+    registry
+        .dispatch("comm.heartbeat", heartbeat.clone())
+        .await
+        .expect("seed health through its owning writer");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read seeded health row");
+    assert_eq!(rows.len(), 1);
+    let before = &rows[0];
+
+    for (key, original, replacement) in [
+        ("channel_kind", "email", "telegram"),
+        ("channel_slug", "identity@example.com", "other@example.com"),
+    ] {
+        for value in [
+            serde_json::json!(replacement),
+            serde_json::Value::Null,
+            serde_json::json!(original),
+        ] {
+            let error = registry
+                .dispatch(
+                    "update",
+                    serde_json::json!({
+                        "id": before.id.to_string(),
+                        "properties": {key: value, "operator_note": "must not commit"},
+                    }),
+                )
+                .await
+                .expect_err("naming a health coordinate must be refused");
+            let message = error.to_string();
+            assert!(message.contains(key), "refusal must name {key}: {message}");
+            assert!(message.contains("comm.heartbeat"), "{message}");
+            assert_eq!(
+                runtime
+                    .get_note_including_deleted(&token, before.id)
+                    .await
+                    .expect("read after refused update")
+                    .as_ref(),
+                Some(before),
+                "a refused patch must leave the entire stored row unchanged"
+            );
+        }
+    }
+
+    // Namespace selects dispatch attribution; it cannot relocate this by-id target.
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({
+                "id": before.id.to_string(),
+                "namespace": "other-namespace",
+                "properties": {"operator_note": "checked"},
+            }),
+        )
+        .await
+        .expect("a non-coordinate property remains editable");
+    let updated = runtime
+        .get_note_including_deleted(&token, before.id)
+        .await
+        .expect("read positive control")
+        .expect("health row remains present");
+    assert_eq!(updated.namespace, before.namespace);
+    assert_eq!(
+        updated.properties.as_ref().unwrap()["operator_note"],
+        "checked"
+    );
+    assert_eq!(
+        updated.properties.as_ref().unwrap()["channel_kind"],
+        "email"
+    );
+    assert_eq!(
+        updated.properties.as_ref().unwrap()["channel_slug"],
+        "identity@example.com"
+    );
+
+    registry
+        .dispatch("comm.heartbeat", heartbeat)
+        .await
+        .expect("the owning writer still updates the same row");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read health after another heartbeat");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, before.id);
+    assert_eq!(rows[0].created_at, before.created_at);
+    assert_eq!(
+        rows[0].properties.as_ref().unwrap()["consecutive_failures"],
+        2
+    );
+    assert_eq!(
+        rows[0].properties.as_ref().unwrap()["operator_note"],
+        "checked"
+    );
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("public health projection remains coherent");
+    let channels = health["channels"].as_array().expect("channel array");
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0]["channel_kind"], "email");
+    assert_eq!(channels[0]["channel_slug"], "identity@example.com");
+}
+
+#[tokio::test]
+async fn channel_health_update_coordinate_names_remain_editable_on_ordinary_notes() {
+    let (registry, _runtime) = build_registry_for_ns("local");
+    let note = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "coordinate name control"}),
+        )
+        .await
+        .expect("create ordinary note");
+    let updated = registry
+        .dispatch(
+            "update",
+            serde_json::json!({
+                "id": note["id"],
+                "properties": {"channel_kind": "custom", "channel_slug": "custom-slug"},
+            }),
+        )
+        .await
+        .expect("health coordinates are ordinary metadata on other note kinds");
+    assert_eq!(updated["properties"]["channel_kind"], "custom");
+    assert_eq!(updated["properties"]["channel_slug"], "custom-slug");
+}
+
 /// Issue #2974. Standalone `stream.append` is another creation route that accepts a
 /// caller-selected note kind, so it must consult the owning hook before writing. The ordinary
 /// observation control remains admitted, and two heartbeats for one channel still address one
@@ -14142,13 +14362,22 @@ mod mailbox_views {
         verb: &str,
         args: Value,
     ) -> Result<Value, RuntimeError> {
+        call_as(registry, (actor != "local").then_some(actor), verb, args).await
+    }
+
+    async fn call_as(
+        registry: &VerbRegistry,
+        actor_id: Option<&str>,
+        verb: &str,
+        args: Value,
+    ) -> Result<Value, RuntimeError> {
         registry
             .dispatch_with_identity(
                 verb,
                 args,
                 Some(RequestIdentity {
                     namespace: "local".into(),
-                    actor_id: (actor != "local").then(|| actor.into()),
+                    actor_id: actor_id.map(str::to_string),
                     ..Default::default()
                 }),
             )
@@ -14181,6 +14410,479 @@ mod mailbox_views {
             .iter()
             .map(|row| row["content"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    // MUST-FAIL: a named caller using EqOrMissing, or treating actor id "local"
+    // as anonymous, exposes the legacy rows in bodies and count-only responses.
+    #[tokio::test]
+    async fn i1739_named_own_views_do_not_inherit_the_anonymous_pool() {
+        let fixture = Fixture::new(true, "local");
+        for (n, content, recipient) in [
+            (1, "owner", Some(json!(OWNER))),
+            (2, "helper", Some(json!(HELPER))),
+            (3, "local", Some(json!("local"))),
+            (4, "pool missing", None),
+            (5, "pool null", Some(Value::Null)),
+            (6, "malformed empty", Some(json!(""))),
+            (7, "malformed control", Some(json!("bad\nactor"))),
+            (8, "malformed number", Some(json!(12))),
+            (9, "foreign", Some(json!(OTHER))),
+        ] {
+            fixture
+                .seed(
+                    Uuid::from_u128(n),
+                    content,
+                    props(recipient, None, "inbound", false),
+                )
+                .await;
+        }
+        for (actor, content) in [(OWNER, "owner"), (HELPER, "helper"), ("local", "local")] {
+            for limit in [0, 100] {
+                let inbox = call_as(
+                    &fixture.registry,
+                    Some(actor),
+                    "comm.inbox",
+                    json!({"status":"all", "limit":limit}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(inbox["unread_count"], 1, "{actor}: {inbox}");
+                assert_eq!(inbox["unread_count_saturated"], false);
+                if limit == 0 {
+                    assert_eq!(inbox["messages"], json!([]));
+                } else {
+                    assert_eq!(contents(&inbox), BTreeSet::from([content.into()]));
+                }
+            }
+            let unread = call_as(&fixture.registry, Some(actor), "comm.unread", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(unread["count"], 1, "{actor}: {unread}");
+            let empty_wait = call_as(
+                &fixture.registry,
+                Some(actor),
+                "comm.inbox",
+                json!({"content_contains":"pool", "wait_ms":1}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(empty_wait["messages"], json!([]), "{actor}: {empty_wait}");
+            assert_eq!(empty_wait["unread_count"], 1);
+        }
+        // Registry-configured actor="local" is also named; no request override
+        // is needed to demonstrate the distinction from an anonymous token.
+        let configured_local = fixture
+            .registry
+            .dispatch("comm.inbox", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&configured_local),
+            BTreeSet::from(["local".into()])
+        );
+        let anonymous = fixture
+            .call("local", "comm.inbox", json!({"status":"all"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&anonymous),
+            BTreeSet::from(["local".into(), "pool missing".into(), "pool null".into()])
+        );
+        assert_eq!(anonymous["unread_count"], 3);
+        assert_eq!(
+            fixture
+                .call("local", "comm.unread", json!({}))
+                .await
+                .unwrap()["count"],
+            3
+        );
+        let count_only = fixture
+            .call("local", "comm.inbox", json!({"limit":0}))
+            .await
+            .unwrap();
+        assert_eq!(count_only["messages"], json!([]));
+        assert_eq!(count_only["unread_count"], 3);
+        // Probe retains its established exact-address scope, even for the
+        // anonymous fallback. It does not inherit the inbox's legacy pool.
+        for actor_id in [Some(OWNER), Some("local"), None] {
+            let actor = actor_id.unwrap_or("local");
+            let probe = call_as(
+                &fixture.registry,
+                actor_id,
+                "comm.probe",
+                json!({"actor":actor}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                probe["new_messages"].as_array().unwrap().len(),
+                1,
+                "{probe}"
+            );
+            assert_eq!(probe["stale_unread_count"], 1, "{probe}");
+        }
+    }
+
+    // SQLite json_extract renders objects/arrays as JSON text. Actor labels
+    // that equal that text must still match string recipients exclusively.
+    #[tokio::test]
+    async fn i1739_named_json_like_actor_labels_require_string_recipients() {
+        for (actor, malformed) in [("{}", json!({})), ("[]", json!([]))] {
+            let fixture = Fixture::new(false, actor);
+            for (n, content, recipient) in
+                [(1, "string", json!(actor)), (2, "non-string", malformed)]
+            {
+                fixture
+                    .seed(
+                        Uuid::from_u128(n),
+                        content,
+                        props(Some(recipient), None, "inbound", false),
+                    )
+                    .await;
+            }
+            for limit in [0, 100] {
+                let inbox = fixture
+                    .registry
+                    .dispatch("comm.inbox", json!({"limit":limit}))
+                    .await
+                    .unwrap();
+                assert_eq!(inbox["unread_count"], 1, "{inbox}");
+                if limit != 0 {
+                    assert_eq!(contents(&inbox), BTreeSet::from(["string".into()]));
+                }
+            }
+            assert_eq!(
+                fixture
+                    .registry
+                    .dispatch("comm.unread", json!({}))
+                    .await
+                    .unwrap()["count"],
+                1
+            );
+            let probe = fixture
+                .registry
+                .dispatch("comm.probe", json!({"actor":actor}))
+                .await
+                .unwrap();
+            assert_eq!(
+                probe["new_messages"].as_array().unwrap().len(),
+                1,
+                "{probe}"
+            );
+            assert_eq!(probe["new_messages"][0]["id"], json!(Uuid::from_u128(1)));
+            assert_eq!(probe["stale_unread_count"], 1, "{probe}");
+        }
+    }
+
+    async fn message_snapshot(fixture: &Fixture) -> Value {
+        let token = fixture.runtime.authorize(Namespace::local()).unwrap();
+        let mut notes = fixture
+            .runtime
+            .list_notes(&token, Some("message"), 200, 0)
+            .await
+            .unwrap();
+        notes.sort_by_key(|note| note.id);
+        json!(notes)
+    }
+
+    #[tokio::test]
+    async fn i1739_named_read_mark_and_reply_refuse_pool_without_mutation() {
+        let fixture = Fixture::new(true, OWNER);
+        for (n, recipient) in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("bad\nactor")),
+            Some(json!(3)),
+            Some(json!({})),
+            Some(json!([])),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = Uuid::from_u128(200 + n as u128);
+            fixture
+                .seed(
+                    id,
+                    "pool must remain untouched",
+                    props(recipient, None, "inbound", false),
+                )
+                .await;
+            let before = message_snapshot(&fixture).await;
+            for actor in [OWNER, HELPER, "local"] {
+                for (verb, args) in [
+                    ("comm.read", json!({"id":id})),
+                    ("comm.read", json!({"ids":[id]})),
+                    ("comm.mark_read", json!({"ids":[id]})),
+                    ("comm.mark_read", json!({"ids":[id],"atomic":true})),
+                    (
+                        "comm.reply",
+                        json!({"id":id,"content":"must not create a reply"}),
+                    ),
+                ] {
+                    let error = call_as(&fixture.registry, Some(actor), verb, args)
+                        .await
+                        .expect_err("named caller must not mutate or reply through the pool");
+                    assert!(
+                        matches!(error, RuntimeError::InvalidInput(_)),
+                        "{actor}/{verb}: {error:?}"
+                    );
+                    assert_eq!(
+                        message_snapshot(&fixture).await,
+                        before,
+                        "{actor}/{verb} changed message rows"
+                    );
+                }
+                let thread = call_as(
+                    &fixture.registry,
+                    Some(actor),
+                    "comm.thread",
+                    json!({"id":id}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(thread["count"], 0, "{actor}: {thread}");
+            }
+        }
+        // An enrolled mailbox reader's delegated read grant does not enlarge
+        // its own mailbox or permit acknowledging the owner's addressed rows.
+        let owner = Uuid::from_u128(250);
+        fixture
+            .seed(
+                owner,
+                "owner addressed",
+                props(Some(json!(OWNER)), Some(SENDER), "inbound", false),
+            )
+            .await;
+        assert!(fixture
+            .call(HELPER, "comm.read", json!({"id":owner}))
+            .await
+            .is_err());
+        assert_eq!(
+            fixture.stored(owner).await.properties.unwrap()["read"],
+            false
+        );
+        for (n, verb, args) in [
+            (251, "comm.read", json!({"id":Uuid::from_u128(251)})),
+            (252, "comm.mark_read", json!({"ids":[Uuid::from_u128(252)]})),
+            (
+                253,
+                "comm.mark_read",
+                json!({"ids":[Uuid::from_u128(253)],"atomic":true}),
+            ),
+            (
+                254,
+                "comm.reply",
+                json!({"id":Uuid::from_u128(254),"content":"addressed reply"}),
+            ),
+        ] {
+            let id = Uuid::from_u128(n);
+            fixture
+                .seed(
+                    id,
+                    "helper addressed",
+                    props(Some(json!(HELPER)), Some(SENDER), "inbound", false),
+                )
+                .await;
+            fixture
+                .call(HELPER, verb, args)
+                .await
+                .expect("exact addressee retains mutation access");
+            assert_eq!(fixture.stored(id).await.properties.unwrap()["read"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn i1739_anonymous_pool_mutations_keep_legacy_participant_protection() {
+        let fixture = Fixture::new(false, OWNER);
+        for (n, recipient) in [None, Some(Value::Null), Some(json!("local"))]
+            .into_iter()
+            .enumerate()
+        {
+            let id = Uuid::from_u128(300 + n as u128);
+            fixture
+                .seed(
+                    id,
+                    "anonymous legacy",
+                    props(recipient, None, "inbound", false),
+                )
+                .await;
+            let thread = fixture
+                .call("local", "comm.thread", json!({"id":id}))
+                .await
+                .unwrap();
+            assert_eq!(thread["count"], 1, "{thread}");
+            fixture
+                .call("local", "comm.read", json!({"id":id}))
+                .await
+                .unwrap();
+            fixture
+                .call("local", "comm.mark_read", json!({"ids":[id],"atomic":true}))
+                .await
+                .unwrap();
+            fixture
+                .call(
+                    "local",
+                    "comm.reply",
+                    json!({"id":id,"content":"anonymous legacy reply"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fixture.stored(id).await.properties.unwrap()["read"], true);
+        }
+        let foreign_sender = Uuid::from_u128(310);
+        fixture
+            .seed(
+                foreign_sender,
+                "legacy attributed sender",
+                props(None, Some(SENDER), "inbound", false),
+            )
+            .await;
+        let before = message_snapshot(&fixture).await;
+        fixture
+            .call(
+                "local",
+                "comm.reply",
+                json!({"id":foreign_sender,"content":"must stay refused"}),
+            )
+            .await
+            .expect_err(
+                "anonymous legacy handling does not remove sender participation protection",
+            );
+        assert_eq!(message_snapshot(&fixture).await, before);
+        for (n, recipient) in [
+            json!(""),
+            json!("bad\nactor"),
+            json!(1),
+            json!({}),
+            json!([]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = Uuid::from_u128(320 + n as u128);
+            fixture
+                .seed(
+                    id,
+                    "malformed is not legacy",
+                    props(Some(recipient), None, "inbound", false),
+                )
+                .await;
+            let before = message_snapshot(&fixture).await;
+            for (verb, args) in [
+                ("comm.read", json!({"id":id})),
+                ("comm.mark_read", json!({"ids":[id],"atomic":true})),
+                ("comm.reply", json!({"id":id,"content":"refused"})),
+            ] {
+                fixture
+                    .call("local", verb, args)
+                    .await
+                    .expect_err("malformed recipient never enters the anonymous legacy pool");
+                assert_eq!(message_snapshot(&fixture).await, before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn i1739_named_thread_filters_pool_before_folding_read_state() {
+        let fixture = Fixture::new(true, OWNER);
+        let root = Uuid::from_u128(400);
+        fixture
+            .seed(
+                root,
+                "owner outbound",
+                props(Some(json!(SENDER)), Some(OWNER), "outbound", false),
+            )
+            .await;
+        for (n, recipient) in [None, Some(Value::Null), Some(json!({})), Some(json!(""))]
+            .into_iter()
+            .enumerate()
+        {
+            let mut p = props(recipient, Some(OWNER), "inbound", true);
+            p["thread_id"] = json!(root);
+            p["outbound_ref"] = json!(root);
+            fixture
+                .seed(Uuid::from_u128(401 + n as u128), "excluded read twin", p)
+                .await;
+        }
+        let mut p = props(Some(json!("local")), Some(OWNER), "outbound", false);
+        p["thread_id"] = json!(root);
+        let local_addressed = Uuid::from_u128(410);
+        fixture
+            .seed(local_addressed, "owner sent to local", p)
+            .await;
+        let before = message_snapshot(&fixture).await;
+        let own = fixture
+            .call(OWNER, "comm.thread", json!({"id":root}))
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&own),
+            BTreeSet::from(["owner outbound".into(), "owner sent to local".into()])
+        );
+        assert!(
+            own["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["read"] == false),
+            "excluded twins cannot change read folding: {own}"
+        );
+        let explicit = fixture
+            .call(
+                OWNER,
+                "comm.thread",
+                json!({"id":root,"mailbox_actor":OWNER}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(own, explicit);
+        let delegated = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"id":root,"mailbox_actor":OWNER}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&delegated),
+            BTreeSet::from(["owner outbound".into()]),
+            "delegated views continue to exclude local recipients"
+        );
+        assert_eq!(message_snapshot(&fixture).await, before);
+        fixture
+            .call(
+                OWNER,
+                "comm.reply",
+                json!({"id":local_addressed,"content":"sender follow-up"}),
+            )
+            .await
+            .expect("valid addressed local row preserves the named sender's participation");
+        // Matching from_actor is insufficient when to_actor is missing.
+        let missing_recipient = Uuid::from_u128(420);
+        fixture
+            .seed(
+                missing_recipient,
+                "sender-only legacy",
+                props(None, Some(OWNER), "outbound", false),
+            )
+            .await;
+        let before = message_snapshot(&fixture).await;
+        fixture
+            .call(
+                OWNER,
+                "comm.reply",
+                json!({"id":missing_recipient,"content":"refused"}),
+            )
+            .await
+            .expect_err("matching sender must not reopen the legacy pool");
+        let thread = fixture
+            .call(OWNER, "comm.thread", json!({"id":missing_recipient}))
+            .await
+            .unwrap();
+        assert_eq!(thread["count"], 0);
+        assert_eq!(message_snapshot(&fixture).await, before);
     }
 
     // MUST-FAIL control: replacing mailbox authorization with an allow/no-op
@@ -14524,8 +15226,10 @@ mod mailbox_views {
             .unwrap();
         let own_explicit = fixture.call(OWNER, "comm.inbox", args).await.unwrap();
         assert_eq!(own, own_explicit);
-        assert!(contents(&own).contains("missing recipient"));
-        assert!(contents(&own).contains("null recipient"));
+        assert!(!contents(&own).contains("missing recipient"));
+        assert!(!contents(&own).contains("null recipient"));
+        assert_eq!(contents(&own), contents(&full));
+        assert_eq!(own["unread_count"], 2);
         let anonymous = fixture
             .call("local", "comm.inbox", json!({"status":"all"}))
             .await
@@ -14694,7 +15398,7 @@ mod mailbox_views {
             .await
             .unwrap();
         assert_eq!(own, explicit);
-        assert!(contents(&own).contains("legacy root"));
+        assert!(!contents(&own).contains("legacy root"));
         assert_eq!(fixture.owner_state().await, before);
     }
 

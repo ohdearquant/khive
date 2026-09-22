@@ -651,10 +651,13 @@ impl DispatchFailure {
 
 /// One constructor for per-op failures. Moving values avoids recursively
 /// serializing a canonical result before its depth has been checked.
+/// The entry-level disposition comes from the same authoritative argument as
+/// the nested error, so callers inspecting `ok` also see the domain outcome.
 fn failure_entry(tool: impl Into<String>, error: Value, disposition: DomainDisposition) -> Value {
     let mut entry = serde_json::Map::new();
     entry.insert("ok".into(), Value::Bool(false));
     entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("domain_disposition".into(), json!(disposition.as_str()));
     entry.insert("error".into(), error_with_disposition(error, disposition));
     Value::Object(entry)
 }
@@ -3301,8 +3304,21 @@ fn ensure_bridge_request_id(params: &mut RequestParams) -> u64 {
     request_id
 }
 
+#[cfg(test)]
 async fn scope_mcp_request_read_cancellation<F>(
     cancellation: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    scope_mcp_request_read_cancellation_with_timeout(cancellation, request_read_timeout(), future)
+        .await
+}
+
+async fn scope_mcp_request_read_cancellation_with_timeout<F>(
+    cancellation: tokio_util::sync::CancellationToken,
+    timeout: std::time::Duration,
     future: F,
 ) -> F::Output
 where
@@ -3325,7 +3341,7 @@ where
     }));
     khive_storage::scope_request_read_cancellation(
         cancel_rx,
-        khive_storage::scope_request_read_deadline(request_read_timeout(), future),
+        khive_storage::scope_request_read_deadline(timeout, future),
     )
     .await
 }
@@ -3419,7 +3435,13 @@ result (e.g. create then link with the new entity's id)."#)]
         Parameters(p): Parameters<RequestParams>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<String, McpError> {
-        scope_mcp_request_read_cancellation(cancellation, self.request_with_cancellation(p)).await
+        let timeout = crate::request_policy::read_timeout(&p.ops, request_read_timeout());
+        scope_mcp_request_read_cancellation_with_timeout(
+            cancellation,
+            timeout,
+            self.request_with_cancellation(p),
+        )
+        .await
     }
 }
 
@@ -4079,6 +4101,7 @@ impl KhiveMcpServer {
             format_per_op: None,
             request_id: None,
         };
+        let timeout = crate::request_policy::parsed_read_timeout(&parsed, request_read_timeout());
         let dispatch = Box::pin(self.dispatch_parsed_request_inner_scoped(
             p,
             parsed,
@@ -4087,7 +4110,7 @@ impl KhiveMcpServer {
             DispatchOrigin::Local,
             policy,
         ));
-        khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
+        khive_storage::scope_request_read_deadline(timeout, dispatch).await
     }
 
     /// Replay one stored public-surface request under a host-verified actor.
@@ -4176,6 +4199,7 @@ impl KhiveMcpServer {
         // pipeline in every MCP, local-exec, and replay request future. LLVM
         // coverage instrumentation amplifies the resulting poll stack enough to
         // overflow Tokio's normal worker stack even for unrelated small verbs.
+        let timeout = crate::request_policy::read_timeout(&p.ops, request_read_timeout());
         let dispatch = Box::pin(self.dispatch_request_inner_scoped(
             p,
             from_wire,
@@ -4183,7 +4207,7 @@ impl KhiveMcpServer {
             origin,
             strict_refusals,
         ));
-        khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
+        khive_storage::scope_request_read_deadline(timeout, dispatch).await
     }
 
     async fn dispatch_request_inner_scoped(
@@ -5528,9 +5552,9 @@ mod tests {
                     "comm.mark_read(ids=[\"00000000-0000-0000-0000-000000000001\"], atomic=true)",
                     false,
                 ),
-                ("search(kind=\"entity\", query=\"policy-fixture\")", false),
-                ("memory.recall(query=\"policy-fixture\")", false),
-                ("get(id=\"00000000-0000-0000-0000-000000000001\")", false),
+                ("search(kind=\"entity\", query=\"policy-fixture\")", true),
+                ("memory.recall(query=\"policy-fixture\")", true),
+                ("get(id=\"00000000-0000-0000-0000-000000000001\")", true),
             ];
 
             for (ops, expected) in cases {
@@ -6661,6 +6685,36 @@ mod tests {
             compute_config_id_with_runtime_policies(&revoked, None, true, false),
             "different caller-enrollment policies must not share one warm daemon"
         );
+        let restricted = |patterns: Vec<String>| RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::with_write_denials(
+                vec!["lambda:enrolled".into()],
+                false,
+                patterns,
+            )),
+            ..enrolled.clone()
+        };
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        assert_eq!(fingerprint(&enrolled), fingerprint(&restricted(vec![])));
+        let limited = restricted(vec!["*:duty".into(), "lambda:enrolled".into()]);
+        assert_ne!(
+            fingerprint(&enrolled),
+            fingerprint(&limited),
+            "an unrestricted daemon must not serve a restricted config"
+        );
+        assert_eq!(
+            fingerprint(&limited),
+            fingerprint(&restricted(vec![
+                "lambda:enrolled".into(),
+                "*:duty".into(),
+                "*:duty".into()
+            ]))
+        );
+        assert_ne!(
+            fingerprint(&limited),
+            fingerprint(&restricted(vec!["*".into()]))
+        );
     }
 
     #[test]
@@ -7168,6 +7222,9 @@ mod tests {
              wrapper={wrapper_bytes}B pipeline={pipeline_bytes}B"
         );
     }
+
+    #[cfg(unix)]
+    include!("server/long_poll_deadline_tests.rs");
 
     fn assert_request_read_timed_out(response: &str) {
         let envelope: Value = serde_json::from_str(response).expect("JSON response envelope");
@@ -7683,6 +7740,11 @@ mod tests {
             .skip(10)
         {
             assert_eq!(entry["ok"], false);
+            assert_eq!(entry["domain_disposition"], "not_committed");
+            assert_eq!(
+                entry["domain_disposition"],
+                entry["error"]["domain_disposition"]
+            );
             let error = entry["error"]["message"]
                 .as_str()
                 .expect("budget error message");
@@ -8880,11 +8942,13 @@ mod tests {
             fitted["results"][0]["error"]["domain_disposition"],
             "committed"
         );
-        // A3 adds this one field to the historic byte snapshot; omission
+        assert_eq!(fitted["results"][0]["domain_disposition"], "committed");
+        // A3 and #2951 add matching nested and entry-level fields to the
+        // historic byte snapshot; omission
         // selection, remaining payloads, and aggregate counts stay identical.
         assert_eq!(
             serialized_response_len(&fitted),
-            2_900_530 + r#","domain_disposition":"committed""#.len()
+            2_900_530 + 2 * r#","domain_disposition":"committed""#.len()
         );
     }
 

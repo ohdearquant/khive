@@ -3211,6 +3211,7 @@ fn make_full_server() -> KhiveMcpServer {
     disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
+        actor_id: Some("brain-feedback-test".to_string()),
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -5273,6 +5274,7 @@ async fn connect_brain_only(
     let (server_transport, client_transport) = tokio::io::duplex(65536);
     let config = RuntimeConfig {
         db_path: None,
+        actor_id: Some("brain-feedback-test".to_string()),
         default_namespace: Namespace::parse("braintest2").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -7668,7 +7670,7 @@ async fn issue2757_invalid_content_missing_note_and_unknown_fields_are_distinct(
     let missing_envelope: Value = serde_json::from_str(&first_text(&response))?;
     let missing_error = &missing_envelope["results"][0]["error"];
     assert_eq!(missing_envelope["results"][0]["ok"], false);
-    assert_eq!(missing_error["kind"], "runtime_error");
+    assert_eq!(missing_error["kind"], "not_found");
     assert!(missing_error["message"]
         .as_str()
         .unwrap()

@@ -77,7 +77,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     HandlerDef {
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
-            plane; feedback_explicit events additionally split by \
+            plane. Optional group_by=[\"verb\",\"actor\"] emits a nested counts_by_verb_and_actor \
+            map over the same events; when truncated it is named counts_by_verb_and_actor_page_scoped. \
+            Only that ordered pair is supported; omission/null adds no cross. Grouping reuses the \
+            existing actor scope and event-row caps, with no distinct-cell budget. Use kind=\"audit\" \
+            for a dispatch-audit census and exhaustive=true when the complete window is needed. \
+            feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
             with signal (by_profile_and_signal, keyed by served_by_profile_id then signal, \
@@ -157,6 +162,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Filter to a single EventKind (e.g. \"recall_executed\", \"feedback_explicit\"). Omit for all kinds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "group_by",
+                param_type: "array",
+                required: false,
+                description: "Optional ordered pair [\"verb\", \"actor\"] only. Returns a nested verb→actor count map over the same authorized event window; uses the _page_scoped key when truncated. Omission or null emits no cross. Reversed, repeated, unknown, or other dimensions are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -310,7 +322,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
-                description: "Profile ID that served the result being rated. Recorded in the event payload.",
+                description: "Profile ID that served the result being rated. A known ID wins; an unknown ID falls back only to the caller's matching recall binding, otherwise not_found. The resolved ID is recorded in the event payload.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -972,6 +984,7 @@ impl BrainPack {
             actor: Option<String>,
             all_actors: Option<bool>,
             kind: Option<String>,
+            group_by: Option<crate::event_counts_grouping::EventCountGroupBy>,
             // `Option`, not a required `String`: a bare-missing `since` must go through
             // the same named-field-plus-example-format error as a malformed one, not
             // serde's generic "missing field `since`" message.
@@ -1210,6 +1223,14 @@ impl BrainPack {
             },
         });
         result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
+        if let Some(group_by) = p.group_by {
+            group_by.add_to_result(
+                &mut result,
+                &items,
+                default_scope.then_some(caller.as_str()),
+                truncated,
+            );
+        }
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
         }
@@ -1592,10 +1613,12 @@ impl BrainPack {
     }
 
     /// Resolve the effective serving profile for feedback attribution
-    /// (ADR-035 tiers 1-2, #697): explicit `served_by_profile_id` wins outright;
+    /// (ADR-035 tiers 1-2, #697, #1851): a known explicit profile wins;
     /// otherwise resolve an actor+namespace-scoped binding via the same
     /// `resolve_with_match` table `brain.resolve` uses, before falling back to
-    /// the system default. `brain.auto_feedback` forwards into `handle_feedback`
+    /// the system default only when no explicit ID was supplied. An unknown
+    /// explicit ID without a matching binding is refused, never credited to
+    /// the default. `brain.auto_feedback` forwards into `handle_feedback`
     /// unresolved so it inherits this without duplicating the logic.
     ///
     /// Consumer kind is fixed to `recall`: feedback routed directly through
@@ -1610,16 +1633,24 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         explicit: Option<&str>,
-    ) -> (String, &'static str) {
+    ) -> Result<(String, &'static str), RuntimeError> {
+        let state = self.state.lock().unwrap();
         if let Some(profile_id) = explicit {
-            return (profile_id.to_string(), "explicit");
+            if state.profiles.contains_key(profile_id) {
+                return Ok((profile_id.to_string(), "explicit"));
+            }
         }
         let actor = token.actor().binding_id();
         let namespace = token.namespace().as_str();
-        let state = self.state.lock().unwrap();
         match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
-            Some((record, _matched_kind, true)) => (record.id.clone(), "binding"),
-            _ => ("balanced-recall-v1".to_string(), "default"),
+            Some((record, _matched_kind, true)) => Ok((record.id.clone(), "binding")),
+            _ => match explicit {
+                Some(profile_id) => Err(RuntimeError::NotFound(format!(
+                    "serving profile {:?} not found in profile registry",
+                    profile_id
+                ))),
+                None => Ok(("balanced-recall-v1".to_string(), "default")),
+            },
         }
     }
 
@@ -1702,6 +1733,21 @@ impl BrainPack {
             Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
         );
 
+        // Caller identity and serve attribution are separate: omitting the
+        // profile may resolve a shared default, but cannot authorize an
+        // anonymous caller to train it with an explicit judgment (#2282).
+        // Keep implicit anonymous controls on their existing admission path.
+        // A configured actor id of "local" is the unattributed pool, not a
+        // caller, so it is refused by the same rule as the anonymous actor.
+        let unattributed =
+            token.actor().is_anonymous() || khive_runtime::actor_is_unattributed(token.actor());
+        if unattributed && !is_gated_implicit {
+            return Err(khive_types::KhiveError::invalid_input(
+                "explicit or correction feedback requires an attributed caller; configure actor.id",
+            )
+            .into());
+        }
+
         // Resolve the target by UUID with no namespace filter (ADR-007 Rule 2 /
         // PR-A1: by-ID ops are namespace-agnostic; authorization is the Gate's,
         // not a post-fetch namespace check). Rule 3b recall fans out actor-stamped
@@ -1753,8 +1799,9 @@ impl BrainPack {
             _ => {}
         }
 
-        // Compute the effective serving profile (explicit, else a matching
-        // actor+namespace binding, else the system default — #697), unless the
+        // Compute the effective serving profile (known explicit, else a matching
+        // actor+namespace binding; only an omitted ID may use the system default
+        // — #697, #1851), unless the
         // serve was explicitly unattributed, in which case there is no profile
         // to resolve at all. Then perform a warm-state fast-path check that it
         // exists and is not Archived; the persistence transaction repeats this
@@ -1765,7 +1812,7 @@ impl BrainPack {
                 (None, "serve_unattributed")
             } else {
                 let (profile_id, resolution) = self
-                    .resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
+                    .resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref())?;
                 (Some(profile_id), resolution)
             };
 

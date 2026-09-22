@@ -634,7 +634,7 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// property has invariants that generic CRUD cannot know about (for
     /// example, GTD task dependency acyclicity). This always runs after
     /// [`Self::normalize_note_update`], because
-    /// [`VerbRegistry::prepare_note_update_hook`] calls them in that order.
+    /// [`VerbRegistry::prepare_note_update_policy`] calls them in that order.
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -643,6 +643,14 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         _properties: Option<&Value>,
     ) -> Result<(), RuntimeError> {
         Ok(())
+    }
+
+    /// Optional top-level properties whose explicit null update deletes the
+    /// stored key after the shared merge. Omission still preserves the key.
+    /// The default changes no property semantics. This policy is returned only
+    /// after normalization and validation have accepted the update.
+    fn note_update_null_clearing_properties(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// Validate a shared entity-property update before storage is mutated.
@@ -1193,12 +1201,23 @@ impl VerbRegistryBuilder {
         // this question, and none does (`VerbRegistry::admission_degrade_safe`
         // is a single hash-set lookup with no per-call pack/handler scan).
         let mut degrade_safe_verbs: HashSet<&'static str> = HashSet::new();
+        let mut read_replay_safe_verbs = HashSet::new();
         for (pack, &trusted) in ordered_packs.iter().zip(ordered_trusted.iter()) {
             if !trusted {
                 continue;
             }
             let pack_name = pack.name();
             for handler in pack.handlers() {
+                let canonical_owner = handler
+                    .name
+                    .split_once('.')
+                    .map_or("kg", |(owner, _)| owner);
+                if matches!(handler.visibility, Visibility::Verb)
+                    && pack_name == canonical_owner
+                    && crate::classify_operation(handler.name) == Some(crate::OperationAccess::Read)
+                {
+                    read_replay_safe_verbs.insert(handler.name);
+                }
                 if !matches!(handler.visibility, Visibility::Verb)
                     || handler.category != VerbCategory::Assertive
                 {
@@ -1261,6 +1280,7 @@ impl VerbRegistryBuilder {
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
+            read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
             audit_batch,
         })
@@ -1516,6 +1536,8 @@ pub struct VerbRegistry {
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]. See
     /// [`VerbRegistry::admission_degrade_safe`].
     degrade_safe_verbs: Arc<HashSet<&'static str>>,
+    /// Trusted canonical public handlers classified Read by the shared effects table.
+    read_replay_safe_verbs: Arc<HashSet<&'static str>>,
     /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,
     /// actor-scoped, never persisted — see `crate::reference_ring`. Shared
     /// across every clone of this registry via the `Arc`, so admissions made
@@ -2015,6 +2037,7 @@ impl VerbRegistry {
         ("comm", "comm.health"),
         ("comm", "comm.probe"),
         // gtd
+        ("gtd", "gtd.census"),
         ("gtd", "gtd.next"),
         ("gtd", "gtd.tasks"),
         // kg
@@ -2120,16 +2143,12 @@ impl VerbRegistry {
         self.degrade_safe_verbs.contains(verb)
     }
 
-    /// Narrow transport replay opt-in. These trusted built-in handlers have no
-    /// domain mutations for any arguments. A repeated dispatch may append a new
-    /// ordinary audit row; its request id remains correlation, not deduplication.
-    /// Unknown and custom handlers cannot inherit safety from a name/category.
+    /// Transport replay eligibility from the shared operation-effects table,
+    /// restricted to trusted canonical public handlers. Read permits incidental
+    /// audit/cache effects; the request id is correlation, not deduplication.
+    /// Custom and mounted handlers cannot inherit safety from a name/category.
     pub fn is_read_replay_safe(&self, verb: &str) -> bool {
-        self.degrade_safe_verbs.contains(verb)
-            && matches!(
-                verb,
-                "stats" | "comm.thread" | "comm.inbox" | "comm.unread" | "comm.delivered"
-            )
+        self.read_replay_safe_verbs.contains(verb)
     }
 
     /// White-box accessor for [`Self::admission_degrade_safe`], needed
@@ -2608,6 +2627,9 @@ impl VerbRegistry {
             .map(|id| id.actor_id.as_deref())
             .unwrap_or(self.actor_id.as_deref());
         let actor = crate::actor_identity::resolve_actor(actor_id);
+        // GateRequest.args deliberately captures submitted dispatch arguments.
+        // The handler's canonicalization and kind hooks have not run; a policy
+        // requiring their effective values belongs after that handler work.
         let req = GateRequest::new(actor, namespace, verb, params.clone());
         crate::mailbox_view::validate_mailbox_request(&req)?;
         Ok(req)
@@ -3447,8 +3469,9 @@ impl VerbRegistry {
 
     /// Run the owning kind's shared-note-update normalizer/validator, if it declares one.
     ///
-    /// Both canonical KG dispatch and user-facing atomic preparation call this
-    /// seam so pack-specific property invariants cannot drift between them.
+    /// Compatibility wrapper for callers that only need normalization and
+    /// validation. Writers use [`Self::prepare_note_update_policy`] and attach
+    /// its returned policy so kind-specific property removals reach storage.
     ///
     /// The ordering lives here, at the single dispatch site, rather than in a
     /// [`KindHook`] method a pack could override: a pack implements the two
@@ -3461,6 +3484,22 @@ impl VerbRegistry {
         note: &khive_storage::Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
+        self.prepare_note_update_policy(runtime, token, note, args)
+            .await
+            .map(|_| ())
+    }
+
+    /// Normalize and validate a note update, then carry the owning kind's
+    /// property policy into the shared prepared write. Writers must attach the
+    /// returned policy to their `NotePatch` or snapshot update preparation;
+    /// [`Self::prepare_note_update_hook`] remains the validation-only wrapper.
+    pub async fn prepare_note_update_policy(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        args: &mut Value,
+    ) -> Result<crate::NoteUpdatePolicy, RuntimeError> {
         crate::curation::normalize_note_update_tags(args)?;
         if let Some(hook) = self.find_kind_hook(&note.kind) {
             hook.normalize_note_update(runtime, token, note, args)
@@ -3468,8 +3507,12 @@ impl VerbRegistry {
             let properties = args.get("properties").filter(|value| !value.is_null());
             hook.validate_note_update(runtime, token, note, properties)
                 .await?;
+            return Ok(crate::NoteUpdatePolicy::for_kind(
+                &note.kind,
+                hook.note_update_null_clearing_properties(),
+            ));
         }
-        Ok(())
+        Ok(crate::NoteUpdatePolicy::default())
     }
 
     /// Run the owning kind's shared-note-update property validator, if it
@@ -4440,8 +4483,58 @@ impl PackRegistry {
             .into_iter()
             .map(|r| r.0)
             .collect();
+        Self::register_packs_with_runtimes_from(&all, names, runtimes, default_runtime, builder)
+    }
+
+    /// Like [`Self::register_packs_with_runtimes`], but resolves pack names
+    /// against the link-time `inventory` registry **plus** `extra_factories` —
+    /// pack factories the composition root supplies directly rather than
+    /// discovers through `inventory::iter::<PackRegistration>` (ADR-191 D6,
+    /// ADR-192 S4: "a pack compiled outside this repository ... extends the
+    /// web ontology without any change here" — a host binary that depends on
+    /// a pinned khive revision plus an out-of-tree pack crate, or a
+    /// composition root registering a credential-provider/request-hook
+    /// consumer pack, has no `inventory` presence in *this* binary short of
+    /// its own force-link anchor). An inventory-discovered factory always
+    /// wins a name collision with an `extra_factories` entry — the linked set
+    /// is the trusted default; an extra factory only fills a name inventory
+    /// does not already answer.
+    ///
+    /// This is the seam D6 describes as "kkernel exposes its server
+    /// construction as a library entry point that accepts additional pack
+    /// factories" — the `kkernel` library entry point itself lives in
+    /// `kkernel::compose`, built on this function exactly as
+    /// `khive-mcp/src/serve.rs` builds on [`Self::register_packs_with_runtimes`].
+    pub fn register_packs_with_runtimes_with_extra_factories(
+        extra_factories: &[&'static dyn PackFactory],
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
+        let mut all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        all.extend(extra_factories.iter().copied());
+        Self::register_packs_with_runtimes_from(&all, names, runtimes, default_runtime, builder)
+    }
+
+    /// Shared body for [`Self::register_packs_with_runtimes`] and
+    /// [`Self::register_packs_with_runtimes_with_extra_factories`]: both
+    /// build a `factories` index (inventory-only, or inventory-plus-extra)
+    /// and delegate here. `factory_for` resolves by first match, so a
+    /// duplicate name earlier in `factories` wins over a later one — the two
+    /// public callers above rely on that for their stated collision rule.
+    fn register_packs_with_runtimes_from(
+        factories: &[&'static dyn PackFactory],
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
         let factory_for = |name: &str| -> Option<&'static dyn PackFactory> {
-            all.iter().copied().find(|f| f.name() == name)
+            factories.iter().copied().find(|f| f.name() == name)
         };
 
         let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -4586,11 +4679,8 @@ pub(crate) fn audit_append_failure_count() -> u64 {
 static AUDIT_OBLIGATION_APPEND_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Test-only reader: no production caller needs this counter today (unlike
-/// [`audit_append_failure_count`], which `KhiveRuntime::db_diagnostics`
-/// surfaces), but the mechanism tests need to observe it directly to prove
-/// obligation and swallowed failures land on disjoint counters.
-#[cfg(test)]
+/// Runtime diagnostics exposes this process-wide counter separately from
+/// swallowed audit errors and batch-generation failures (#2784).
 pub(crate) fn audit_obligation_append_failure_count() -> u64 {
     AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -5841,14 +5931,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn read_replay_rejects_a_trusted_opted_in_name_with_mutating_category() {
-        static HANDLERS: [HandlerDef; 1] = [HandlerDef {
-            name: "stats",
-            description: "same name with a state-changing contract",
-            visibility: Visibility::Verb,
-            category: VerbCategory::Commissive,
-            params: &[],
-        }];
+    fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
+        static HANDLERS: [HandlerDef; 3] = [
+            HandlerDef {
+                name: "stats",
+                description: "category cannot override the reviewed operation effects",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "create",
+                description: "an Assertive category cannot make a Write replayable",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "unclassified_read",
+                description: "an unknown operation remains ineligible",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
         let mut builder = VerbRegistryBuilder::new();
         builder.register_trusted(CountingHandlersPack {
             name: "kg",
@@ -5856,7 +5962,9 @@ pub(crate) mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let registry = builder.build().expect("mutating fixture registry");
-        assert!(!registry.is_read_replay_safe("stats"));
+        assert!(registry.is_read_replay_safe("stats"));
+        assert!(!registry.is_read_replay_safe("create"));
+        assert!(!registry.is_read_replay_safe("unclassified_read"));
     }
 
     /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's
@@ -9872,6 +9980,27 @@ pub(crate) mod tests {
         assert_eq!(audit_append_failure_count(), before);
         assert_eq!(
             audit_obligation_append_failure_count(),
+            before_obligation + 1
+        );
+        // #2784: the same real sink failure must be discoverable through the
+        // public diagnostics report, not only this private counter accessor.
+        let runtime = crate::KhiveRuntime::memory().expect("diagnostics runtime");
+        let report = runtime
+            .db_diagnostics()
+            .await
+            .expect("diagnostics after audit failure");
+        assert_eq!(
+            report.writer_contention.audit_obligation_append_failures,
+            Some(before_obligation + 1)
+        );
+        assert_eq!(report.writer_contention.audit_append_failures, Some(before));
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason
+            .is_none());
+        let json = serde_json::to_value(report).expect("serialized diagnostics");
+        assert_eq!(
+            json["writer_contention"]["audit_obligation_append_failures"],
             before_obligation + 1
         );
     }
@@ -15460,3 +15589,7 @@ mod help_tests {
         assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "gate_argument_contract_tests.rs"]
+mod gate_argument_contract_tests;

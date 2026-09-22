@@ -62,6 +62,9 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// database the calling `KhiveRuntime` was actually constructed against
 /// (`self.runtime.config().db_path` at the call site), so an operator running
 /// a non-default production location (`--db` / `KHIVE_DB`) is covered too.
+/// An explicit target must already be a regular file. This prevents typo-driven
+/// creation before runtime construction; it does not pin identity or protect
+/// against concurrent unlink/replacement between this check and SQLite open.
 pub(crate) fn resolve_target_db(
     db_param: Option<&str>,
     ingest_path: &Path,
@@ -102,6 +105,20 @@ pub(crate) fn resolve_target_db(
             ));
         }
     }
+    if db_param.is_some() {
+        let metadata = std::fs::metadata(&candidate).map_err(|error| {
+            format!(
+                "code.ingest explicit db {candidate:?} must be an existing regular file: {error}; \
+                 omit db to create the workspace-local default"
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "code.ingest explicit db {candidate:?} must be an existing regular file; \
+                 omit db to create the workspace-local default"
+            ));
+        }
+    }
     Ok(candidate)
 }
 
@@ -132,13 +149,16 @@ mod tests {
 
     #[test]
     fn explicit_dedicated_path_is_accepted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("code-map.db");
+        std::fs::write(&target, b"").expect("pre-create dedicated map");
         let db = resolve_target_db(
-            Some("/tmp/code-ingest-map.db"),
+            Some(target.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None,
         )
         .expect("dedicated path accepted");
-        assert_eq!(db, PathBuf::from("/tmp/code-ingest-map.db"));
+        assert_eq!(db, target);
     }
 
     #[test]
@@ -213,13 +233,16 @@ mod tests {
         unsafe {
             std::env::remove_var("KHIVE_DB");
         }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("code-map.db");
+        std::fs::write(&target, b"").expect("pre-create dedicated map");
         let db = resolve_target_db(
-            Some("/tmp/code-ingest-map-2.db"),
+            Some(target.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None,
         )
         .expect("dedicated path accepted with no env override");
-        assert_eq!(db, PathBuf::from("/tmp/code-ingest-map-2.db"));
+        assert_eq!(db, target);
     }
 
     /// RAII guard: clears `HOME` for the test body and restores the prior

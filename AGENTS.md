@@ -102,7 +102,7 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### GTD pack — 6 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
 | Verb             | What it does                                            | When to use                              |
 | ---------------- | ------------------------------------------------------- | ---------------------------------------- |

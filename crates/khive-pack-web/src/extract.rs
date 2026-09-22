@@ -1,321 +1,1182 @@
-use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+//! `web.extract` (ADR-191 D3, D2).
+//!
+//! Parses an already-fetched body (never fetches one itself — that is
+//! `web.fetch`'s job) into whichever of `text`/`links`/`sitemap`/`feed` the
+//! caller names, default all applicable to the stored content-type. No HTML
+//! or XML parser crate is a workspace dependency, so every extraction here
+//! uses regex matches and a fixed-capacity text scan rather than a DOM walk.
+//!
+//! - `links`: every `<a href="...">` in an HTML body becomes a
+//!   `page links_to page|resource` edge (D2's new base row) to a target
+//!   minted, if absent, as an unfetched `resource` (`status: null`) — never
+//!   overwritten if the target already exists and has been fetched.
+//! - `sitemap`/`feed`: every `<loc>`/`<link>` entry becomes a `resource`
+//!   under the document's own `site`, linked `site contains resource` (the
+//!   pack's second `EDGE_RULES` row) — a feed/sitemap entry is the site's
+//!   content, not the feed document's.
+//! - `text`: a new `resource` holding the tag-stripped text, linked
+//!   `document derived_from document` (source: the new text resource,
+//!   target: the original) and keyed by [`identity::derived_text_id`] so
+//!   repeated extraction over an unchanged document converges on one row.
 
-use khive_runtime::EntityCreateSpec;
+use std::borrow::Cow;
+use std::sync::{Arc, LazyLock};
+
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
-use serde::Serialize;
+use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use url::Url;
 use uuid::Uuid;
 
-use crate::manifest::{cross_check_llms, Manifest, QuarantinedDeclaration};
-use crate::persistence::{WebEdge, WebEntity};
-use crate::views::read_view;
+use crate::egress::Refusal;
+use crate::identity;
+use crate::WebPack;
 
-pub const WEB_INGEST_NAMESPACE: Uuid = Uuid::from_u128(0x71c1a6f3_8b91_5c7a_a027_9f8f868644a9);
+const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
+// Two fixed text buffers plus at most three UTF-8 bytes per raw byte (U+FFFD).
+// This pack-local aggregate budget is separate from raw blob admission. A
+// request acquires it once, after hydration, and never upgrades its reservation.
+// URL/graph allocations and regex engine scratch are not part of this budget.
+const TEXT_SCRATCH_BYTES: usize = 2 * MAX_TEXT_EXCERPT_BYTES;
+const MAX_DERIVED_BYTES: usize =
+    3 * khive_storage::MAX_BLOB_WHOLE_BYTES as usize + TEXT_SCRATCH_BYTES;
+static DERIVED_ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_DERIVED_BYTES)));
 
-#[derive(Debug, Serialize)]
-pub(crate) struct WebIngestReport {
-    pub entity_counts: BTreeMap<String, usize>,
-    pub relation_counts: BTreeMap<String, usize>,
-    pub views_missing: usize,
-    pub quarantined: Vec<QuarantinedDeclaration>,
-    pub manifest_digest: String,
-    pub source: String,
-    pub include_views: bool,
-    pub ignored_keys: usize,
+static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<a\s[^>]*?href\s*=\s*["']([^"'#][^"']*)["']"#).expect("valid regex")
+});
+static LOC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<loc>\s*([^<\s][^<]*?)\s*</loc>"#).expect("valid regex"));
+static ATOM_LINK_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<link\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*/?>"#).expect("valid regex")
+});
+static RSS_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<link>\s*([^<\s][^<]*?)\s*</link>"#).expect("valid regex"));
+/// `<script>`/`<style>` bodies are never prose: stripped whole (tag and
+/// content) before the streaming generic tag-only strip runs, so their
+/// contents never leak into extracted text. Two alternatives, not a
+/// backreference — the `regex` crate's engine is backtracking-free and
+/// does not support `\1`.
+static SCRIPT_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>").expect("valid regex")
+});
+
+fn decoded_body_bytes(raw: &[u8]) -> usize {
+    raw.utf8_chunks()
+        .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
+        .sum()
 }
 
-pub(crate) struct Extracted {
-    pub entities: Vec<WebEntity>,
-    pub edges: Vec<WebEdge>,
-    pub report: WebIngestReport,
+async fn admit_derived_buffers(
+    admission: &Arc<tokio::sync::Semaphore>,
+    decoded_bytes: usize,
+) -> Result<tokio::sync::OwnedSemaphorePermit, RuntimeError> {
+    let required = decoded_bytes
+        .checked_add(TEXT_SCRATCH_BYTES)
+        .filter(|required| *required <= MAX_DERIVED_BYTES)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput("web.extract: derived buffer bound exceeded".into())
+        })?;
+    khive_storage::await_request_read_phase(
+        "web_extract_derived_admission",
+        Arc::clone(admission).acquire_many_owned(required as u32),
+    )
+    .await?
+    .map_err(|error| {
+        RuntimeError::Internal(format!("web.extract: derived admission closed: {error}"))
+    })
 }
 
-fn identifier(parts: Value) -> Uuid {
-    Uuid::new_v5(&WEB_INGEST_NAMESPACE, parts.to_string().as_bytes())
-}
-
-fn canonical_path(path: &str) -> Result<String, &'static str> {
-    if path.trim().is_empty() || path.contains(['\\', '\0', '?', '#']) || path.contains("://") {
-        return Err("url must be a local declared path");
-    }
-    let path = path.trim_matches('/');
-    if path.split('/').any(|part| matches!(part, "." | "..")) {
-        return Err("url must not contain dot path segments");
-    }
-    Ok(format!("/{path}"))
-}
-
-impl Extracted {
-    fn quarantine(&mut self, field: impl Into<String>, reason: impl Into<String>) {
-        self.report.quarantined.push(QuarantinedDeclaration {
-            field: field.into(),
-            reason: reason.into(),
-        });
-    }
-
-    fn entity(
-        &mut self,
-        id: Uuid,
-        kind: &str,
-        entity_type: &str,
-        name: &str,
-        declaration: &Value,
-        field: &str,
-    ) -> bool {
-        if self.entities.iter().any(|entity| entity.id == id) {
-            self.quarantine(
-                field,
-                "duplicate declaration has the same canonical identity",
-            );
-            return false;
+fn decode_body(raw: &[u8], decoded_bytes: usize) -> String {
+    // A fixed-length allocation avoids String's geometric growth during lossy
+    // decoding. The admitted size includes replacement characters, not just raw
+    // bytes. No second full-size String is constructed.
+    let mut bytes = vec![0; decoded_bytes];
+    let mut offset = 0;
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid().as_bytes();
+        bytes[offset..offset + valid.len()].copy_from_slice(valid);
+        offset += valid.len();
+        if !chunk.invalid().is_empty() {
+            bytes[offset..offset + 3].copy_from_slice("\u{fffd}".as_bytes());
+            offset += 3;
         }
-        let description = match declaration.get("description") {
-            None => None,
-            Some(Value::String(description)) => Some(description.clone()),
-            Some(_) => {
-                self.quarantine(
-                    format!("{field}.description"),
-                    "description must be a string",
-                );
-                return false;
-            }
-        };
-        let tags = match declaration.get("tags") {
-            None => Vec::new(),
-            Some(Value::Array(tags)) if tags.iter().all(Value::is_string) => tags
-                .iter()
-                .map(|tag| tag.as_str().unwrap().to_string())
-                .collect(),
-            Some(_) => {
-                self.quarantine(format!("{field}.tags"), "tags must be an array of strings");
-                return false;
-            }
-        };
-        self.entities.push(WebEntity {
-            id,
-            spec: EntityCreateSpec {
-                kind: kind.to_string(),
-                entity_type: Some(entity_type.to_string()),
-                name: name.to_string(),
-                description,
-                properties: Some(declaration.clone()),
-                tags,
-            },
-        });
-        *self
-            .report
-            .entity_counts
-            .entry(entity_type.to_string())
-            .or_default() += 1;
-        true
+    }
+    String::from_utf8(bytes).expect("UTF-8 chunks and replacement characters are valid")
+}
+
+struct TextBuffer {
+    bytes: Box<[u8]>,
+    len: usize,
+    space: bool,
+    full: bool,
+}
+
+impl TextBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: vec![0; MAX_TEXT_EXCERPT_BYTES].into_boxed_slice(),
+            len: 0,
+            space: false,
+            full: false,
+        }
     }
 
-    fn edge(&mut self, source: Uuid, target: Uuid, relation: EdgeRelation) {
-        let id = identifier(json!(["edge", relation.as_str(), source, target]));
-        if self.edges.iter().any(|edge| edge.id == id) {
+    fn clear(&mut self) {
+        self.len = 0;
+        self.space = false;
+        self.full = false;
+    }
+
+    fn push(&mut self, ch: char) {
+        if self.full {
             return;
         }
-        self.edges.push(WebEdge {
-            id,
-            source,
-            target,
-            relation,
-        });
-        *self
-            .report
-            .relation_counts
-            .entry(relation.as_str().to_string())
-            .or_default() += 1;
+        if ch.is_whitespace() {
+            self.space = self.len != 0;
+            return;
+        }
+        if self.space {
+            if self.len == self.bytes.len() {
+                self.full = true;
+                return;
+            }
+            self.bytes[self.len] = b' ';
+            self.len += 1;
+            self.space = false;
+        }
+        let mut encoded = [0; 4];
+        let encoded = ch.encode_utf8(&mut encoded).as_bytes();
+        if self.len + encoded.len() > self.bytes.len() {
+            self.full = true;
+            return;
+        }
+        self.bytes[self.len..self.len + encoded.len()].copy_from_slice(encoded);
+        self.len += encoded.len();
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("only complete UTF-8 chars are stored")
+    }
+
+    fn into_string(self) -> String {
+        let mut bytes = self.bytes.into_vec();
+        bytes.truncate(self.len);
+        String::from_utf8(bytes).expect("only complete UTF-8 chars are stored")
     }
 }
 
-pub(crate) fn extract(
-    source: &Path,
-    manifest: Manifest,
-    include_views: bool,
-) -> Result<Extracted, String> {
-    let mut result = Extracted {
-        entities: Vec::new(),
-        edges: Vec::new(),
-        report: WebIngestReport {
-            entity_counts: ["site", "page", "machine_view", "agent_tool", "agent_skill"]
-                .map(|name| (name.to_string(), 0))
-                .into(),
-            relation_counts: ["contains", "derived_from", "depends_on", "implements"]
-                .map(|name| (name.to_string(), 0))
-                .into(),
-            views_missing: 0,
-            quarantined: cross_check_llms(source, &manifest.raw),
-            manifest_digest: manifest.digest,
-            source: source.display().to_string(),
-            include_views,
-            ignored_keys: manifest.ignored_keys,
-        },
-    };
-    let mut site = manifest.raw["site"].clone();
-    for field in ["version", "profile", "content_signals"] {
-        if let Some(value) = manifest.raw.get(field) {
-            site[field] = value.clone();
-        }
-    }
-    let site_id = identifier(json!(["site", manifest.origin]));
-    let name = site["name"].as_str().expect("manifest site name validated");
-    if !result.entity(site_id, "service", "site", name, &site, "site") {
-        return Err("manifest_malformed: unreadable site declaration".to_string());
-    }
-    for collection in ["content", "tools", "skills"] {
-        if manifest
-            .raw
-            .get(collection)
-            .is_some_and(|value| !value.is_array())
-        {
-            result.quarantine(collection, "declarations must be an array");
-        }
-    }
-    for (index, page) in manifest.raw["content"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let field = format!("content[{index}]");
-        let Some(url) = page.get("url").and_then(Value::as_str) else {
-            result.quarantine(format!("{field}.url"), "page url must be a string");
-            continue;
-        };
-        let path = match canonical_path(url) {
-            Ok(path) => path,
-            Err(reason) => {
-                result.quarantine(format!("{field}.url"), reason);
-                continue;
-            }
-        };
-        let id = identifier(json!(["page", manifest.origin, path]));
-        if !result.entity(id, "document", "page", url, page, &field) {
-            continue;
-        }
-        result.edge(site_id, id, EdgeRelation::Contains);
-        if !include_views {
-            continue;
-        }
-        let Some(view) = page.get("markdown_url") else {
-            continue;
-        };
-        let Some(view_url) = view.as_str() else {
-            result.quarantine(
-                format!("{field}.markdown_url"),
-                "markdown_url must be a string",
-            );
-            continue;
-        };
-        let view_path = match canonical_path(view_url) {
-            Ok(path) => path,
-            Err(reason) => {
-                result.quarantine(format!("{field}.markdown_url"), reason);
-                continue;
-            }
-        };
-        let view_id = identifier(json!(["machine_view", manifest.origin, view_path]));
-        if result.entities.iter().any(|entity| entity.id == view_id) {
-            // A declared machine view may serve more than one page. Its first
-            // accepted frontmatter is the ingest snapshot for that identity.
-            result.edge(view_id, id, EdgeRelation::DerivedFrom);
-            continue;
-        }
-        match read_view(source, &view_path) {
-            Ok(None) => result.report.views_missing += 1,
-            Err(reason) => result.quarantine(format!("{field}.markdown_url"), reason),
-            Ok(Some(frontmatter)) => {
-                if result.entity(
-                    view_id,
-                    "document",
-                    "machine_view",
-                    view_url,
-                    &frontmatter,
-                    &format!("{field}.markdown_url"),
-                ) {
-                    result.edge(view_id, id, EdgeRelation::DerivedFrom);
+fn text_excerpt(body: &str) -> String {
+    let mut output = TextBuffer::new();
+    // Keep an unclosed '<...' candidate bounded too: the old <[^>]+> strip
+    // preserves it as text if no closing '>' exists. Normalizing this candidate
+    // as it arrives avoids buffering an arbitrarily long unterminated tag.
+    let mut pending = TextBuffer::new();
+    let mut in_tag = false;
+    let mut tag_content = false;
+    let mut consume = |text: &str| {
+        for ch in text.chars() {
+            if in_tag {
+                if ch == '>' {
+                    if tag_content {
+                        output.push(' ');
+                    } else {
+                        output.push('<');
+                        output.push('>');
+                    }
+                    in_tag = false;
+                    pending.clear();
+                } else {
+                    tag_content = true;
+                    pending.push(ch);
                 }
+            } else if ch == '<' {
+                in_tag = true;
+                tag_content = false;
+                pending.push(ch);
+            } else {
+                output.push(ch);
             }
         }
+    };
+    let mut offset = 0;
+    for removed in SCRIPT_STYLE_RE.find_iter(body) {
+        consume(&body[offset..removed.start()]);
+        consume(" ");
+        offset = removed.end();
     }
-    let mut tools = BTreeMap::new();
-    for (index, tool) in manifest.raw["tools"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let field = format!("tools[{index}]");
-        let Some(name) = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-        else {
-            result.quarantine(
-                format!("{field}.name"),
-                "tool name must be a non-empty string",
-            );
-            continue;
-        };
-        let id = identifier(json!(["agent_tool", manifest.origin, name]));
-        if result.entity(id, "service", "agent_tool", name, tool, &field) {
-            result.edge(site_id, id, EdgeRelation::Contains);
-            tools.insert(name, id);
+    consume(&body[offset..]);
+    if in_tag {
+        for ch in pending.as_str().chars() {
+            output.push(ch);
         }
     }
-    for (index, skill) in manifest.raw["skills"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let field = format!("skills[{index}]");
-        let Some(name) = skill
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-        else {
-            result.quarantine(
-                format!("{field}.name"),
-                "skill name must be a non-empty string",
-            );
-            continue;
-        };
-        let id = identifier(json!(["agent_skill", manifest.origin, name]));
-        if !result.entity(id, "document", "agent_skill", name, skill, &field) {
+    output.into_string()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExtractParams {
+    #[serde(default)]
+    id: Option<Uuid>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    kinds: Option<Vec<String>>,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+const ALL_KINDS: &[&str] = &["text", "links", "sitemap", "feed"];
+
+fn applicable_kinds(entity_type: &str, content_type: Option<&str>) -> Vec<&'static str> {
+    let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    let is_feed_or_sitemap = content_type.contains("xml") || content_type.contains("rss");
+    match entity_type {
+        "page" => vec!["links", "text"],
+        _ if is_feed_or_sitemap => vec!["sitemap", "feed"],
+        _ => vec!["text"],
+    }
+}
+
+async fn resolve_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: &ExtractParams,
+) -> Result<(Uuid, khive_storage::Entity), RuntimeError> {
+    let id = match (params.id, &params.url) {
+        (Some(id), None) => id,
+        (None, Some(url_str)) => {
+            let url = Url::parse(url_str)
+                .map_err(|error| RuntimeError::InvalidInput(format!("invalid url: {error}")))?;
+            let canonical = identity::canonicalize(url);
+            let site = identity::site_id(&canonical);
+            identity::document_id(site, &identity::path_and_query(&canonical))
+        }
+        (Some(_), Some(_)) => {
+            return Err(RuntimeError::InvalidInput(
+                "web.extract: pass exactly one of id or url, not both".to_string(),
+            ))
+        }
+        (None, None) => {
+            return Err(RuntimeError::InvalidInput(
+                "web.extract: id or url is required".to_string(),
+            ))
+        }
+    };
+    let entity = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::from(Refusal::new(
+                "not_found",
+                format!("web.extract: no document at id {id}"),
+            ))
+        })?;
+    crate::entities::require_entity_namespace(token, &entity)?;
+    Ok((id, entity))
+}
+
+fn resolve_against(base: &Url, href: &str) -> Option<Url> {
+    base.join(href).ok()
+}
+
+async fn extract_links(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    document_id: Uuid,
+    base_url: &Url,
+    body: &str,
+) -> Result<u32, RuntimeError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0u32;
+    for capture in HREF_RE.captures_iter(body) {
+        let href = capture[1].trim();
+        if href.is_empty() || href.starts_with("javascript:") || href.starts_with("mailto:") {
             continue;
         }
-        result.edge(site_id, id, EdgeRelation::Contains);
-        let Some(required) = skill.get("tools_required") else {
+        let Some(target_url) = resolve_against(base_url, href) else {
             continue;
         };
-        let Some(required) = required.as_array() else {
-            result.quarantine(
-                format!("{field}.tools_required"),
-                "tools_required must be an array of names",
+        let canonical = identity::canonicalize(target_url);
+        if canonical.scheme() != "http" && canonical.scheme() != "https" {
+            continue;
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let site = identity::site_id(&canonical);
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            site,
+            "service",
+            "site",
+            &identity::site_key(&canonical),
+            json!({
+                "scheme": canonical.scheme(),
+                "host": canonical.host_str(),
+                "port": canonical.port_or_known_default(),
+            }),
+        )
+        .await?;
+        let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            target_id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string(), "status": Value::Null }),
+        )
+        .await?;
+        runtime
+            .link(token, site, target_id, EdgeRelation::Contains, 1.0, None)
+            .await?;
+        runtime
+            .link(
+                token,
+                document_id,
+                target_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn extract_entries(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    site_id: Uuid,
+    body: &str,
+    kind: &str,
+) -> Result<u32, RuntimeError> {
+    let mut urls: Vec<String> = Vec::new();
+    match kind {
+        "sitemap" => {
+            urls.extend(LOC_RE.captures_iter(body).map(|c| c[1].trim().to_string()));
+        }
+        "feed" => {
+            urls.extend(
+                ATOM_LINK_HREF_RE
+                    .captures_iter(body)
+                    .map(|c| c[1].trim().to_string()),
             );
+            urls.extend(
+                RSS_LINK_RE
+                    .captures_iter(body)
+                    .map(|c| c[1].trim().to_string()),
+            );
+        }
+        _ => {}
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0u32;
+    for raw in urls {
+        let Ok(url) = Url::parse(&raw) else { continue };
+        let canonical = identity::canonicalize(url);
+        if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
-        };
-        let mut seen = HashSet::new();
-        for (index, name) in required.iter().enumerate() {
-            let reference = format!("{field}.tools_required[{index}]");
-            let Some(name) = name.as_str() else {
-                result.quarantine(reference, "tool reference must be a string");
-                continue;
-            };
-            if !seen.insert(name) {
-                continue;
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let entry_site = identity::site_id(&canonical);
+        let target_id = identity::document_id(entry_site, &identity::path_and_query(&canonical));
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            target_id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string(), "status": Value::Null }),
+        )
+        .await?;
+        // Entries belong to the SITE that published the feed/sitemap, which
+        // is the source document's own site (D2: "site contains resource ...
+        // extract (sitemap and feed entries)") — not necessarily the
+        // entry's own site when the entry points elsewhere, so both edges
+        // are recorded: containment under the publishing site, plus the
+        // entry's own site if it differs.
+        runtime
+            .link(token, site_id, target_id, EdgeRelation::Contains, 1.0, None)
+            .await?;
+        if entry_site != site_id {
+            crate::entities::get_or_create(
+                runtime,
+                token,
+                entry_site,
+                "service",
+                "site",
+                &identity::site_key(&canonical),
+                json!({
+                    "scheme": canonical.scheme(),
+                    "host": canonical.host_str(),
+                    "port": canonical.port_or_known_default(),
+                }),
+            )
+            .await?;
+            runtime
+                .link(
+                    token,
+                    entry_site,
+                    target_id,
+                    EdgeRelation::Contains,
+                    1.0,
+                    None,
+                )
+                .await?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn extract_text(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    original_id: Uuid,
+    original_url: &str,
+    body: &str,
+    derived_admission: &Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Uuid, RuntimeError> {
+    let excerpt = text_excerpt(body);
+    let excerpt_bytes = excerpt.len();
+
+    let store = crate::blob_store(runtime)?;
+    let content_ref = put_excerpt(store, excerpt, Arc::clone(derived_admission)).await?;
+
+    let text_id = identity::derived_text_id(original_id);
+    crate::entities::get_or_create(
+        runtime,
+        token,
+        text_id,
+        "document",
+        "resource",
+        &format!("{original_url} (extracted text)"),
+        json!({ "derived_from": original_id.to_string() }),
+    )
+    .await?;
+    crate::entities::patch(
+        runtime,
+        token,
+        text_id,
+        Some("resource"),
+        json!({
+            "derived_from": original_id.to_string(),
+            "content_type": "text/plain",
+            "blob_ref": content_ref.to_string(),
+            "size": excerpt_bytes as u64,
+        }),
+    )
+    .await?;
+    runtime
+        .link(
+            token,
+            text_id,
+            original_id,
+            EdgeRelation::DerivedFrom,
+            1.0,
+            None,
+        )
+        .await?;
+    Ok(text_id)
+}
+
+async fn put_excerpt(
+    store: Arc<dyn khive_storage::BlobStore>,
+    excerpt: String,
+    admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<khive_storage::ContentRef, RuntimeError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    khive_runtime::track_named_background_task("web_extract_text", async move {
+        // Store implementations may move the output buffer into blocking I/O.
+        // Keep its reservation until that future completes, even if its request
+        // has been cancelled and no longer receives the put result.
+        let _admission = admission;
+        let result = store.put(excerpt.into_bytes()).await;
+        let _ = sender.send(result);
+    });
+    khive_storage::await_request_read_phase("web_extract_text_put", receiver)
+        .await?
+        .map_err(|_| RuntimeError::Internal("web.extract: text put supervisor ended".into()))?
+        .map_err(RuntimeError::from)
+}
+
+async fn run_extract(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: ExtractParams,
+) -> Result<Value, RuntimeError> {
+    let (target_id, entity) = resolve_target(runtime, token, &params).await?;
+    let properties = entity.properties.clone().unwrap_or(Value::Null);
+    let content_ref = properties
+        .get("blob_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RuntimeError::from(Refusal::new(
+                "not_fetched",
+                format!("web.extract: {target_id} has no stored body; fetch it first"),
+            ))
+        })?;
+    let content_ref = khive_storage::ContentRef::from_hex(content_ref)
+        .map_err(|error| RuntimeError::Internal(format!("stored blob_ref is invalid: {error}")))?;
+    let hydrator = runtime.blob_hydrator().ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
+                .to_string(),
+        )
+    })?;
+    let verified = hydrator
+        .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+        .await?;
+    // Raw admission is held first, then derived admission. No path holding a
+    // derived permit acquires raw admission again, so these two budgets cannot
+    // form a wait cycle. Queued cancellation drops the request's RAII leases
+    // before allocating derived buffers. An already-started text put retains a
+    // shared derived lease until its background I/O actually completes.
+    let valid_body = std::str::from_utf8(verified.bytes()).ok();
+    let decoded_bytes = if valid_body.is_some() {
+        0
+    } else {
+        decoded_body_bytes(verified.bytes())
+    };
+    let derived = Arc::new(admit_derived_buffers(&DERIVED_ADMISSION, decoded_bytes).await?);
+    let body = match valid_body {
+        Some(body) => Cow::Borrowed(body),
+        None => Cow::Owned(decode_body(verified.bytes(), decoded_bytes)),
+    };
+
+    let url_str = properties
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let base_url = Url::parse(&url_str)
+        .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
+    let site_id = identity::site_id(&identity::canonicalize(base_url.clone()));
+    let entity_type = entity.entity_type.as_deref().unwrap_or("resource");
+    let content_type = properties.get("content_type").and_then(Value::as_str);
+
+    let kinds: Vec<String> = match params.kinds {
+        Some(k) if !k.is_empty() => k,
+        _ => applicable_kinds(entity_type, content_type)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+    for kind in &kinds {
+        if !ALL_KINDS.contains(&kind.as_str()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "web.extract: unknown kind {kind:?}; expected one of {ALL_KINDS:?}"
+            )));
+        }
+    }
+
+    let mut result = serde_json::Map::new();
+    for kind in &kinds {
+        match kind.as_str() {
+            "links" => {
+                let count = extract_links(runtime, token, target_id, &base_url, &body).await?;
+                result.insert("links".to_string(), json!({ "edges_created": count }));
             }
-            match tools.get(name) {
-                Some(tool) => result.edge(id, *tool, EdgeRelation::DependsOn),
-                None => result.quarantine(
-                    reference,
-                    "tool reference has no readable declaration in this manifest",
-                ),
+            "sitemap" => {
+                let count = extract_entries(runtime, token, site_id, &body, "sitemap").await?;
+                result.insert("sitemap".to_string(), json!({ "entries": count }));
             }
+            "feed" => {
+                let count = extract_entries(runtime, token, site_id, &body, "feed").await?;
+                result.insert("feed".to_string(), json!({ "entries": count }));
+            }
+            "text" => {
+                let text_id =
+                    extract_text(runtime, token, target_id, &url_str, &body, &derived).await?;
+                result.insert("text".to_string(), json!({ "id": text_id.to_string() }));
+            }
+            _ => unreachable!("validated above"),
         }
     }
-    Ok(result)
+
+    Ok(json!({
+        "id": target_id.to_string(),
+        "kinds": kinds,
+        "result": Value::Object(result),
+    }))
+}
+
+impl WebPack {
+    pub(crate) async fn handle_extract(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let params: ExtractParams = serde_json::from_value(params).map_err(|error| {
+            RuntimeError::InvalidInput(format!("invalid web.extract arguments: {error}"))
+        })?;
+        let effective_token =
+            crate::fetch::resolve_effective_token(token, params.namespace.as_deref())?;
+        run_extract(&self.runtime, &effective_token, params).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::VerbRegistryBuilder;
+    use khive_types::Namespace;
+    use std::sync::Arc;
+
+    mod hydration;
+
+    #[test]
+    fn lossy_decode_reserves_replacement_bytes_without_capacity_growth() {
+        for raw in [
+            b"abc".as_slice(),
+            b"\xff\xff\xff",
+            b"a\xf0\x90\x80z\xc2",
+            b"",
+        ] {
+            let required = decoded_body_bytes(raw);
+            let decoded = decode_body(raw, required);
+            assert_eq!(decoded, String::from_utf8_lossy(raw));
+            assert_eq!(decoded.len(), required);
+            assert_eq!(decoded.capacity(), required);
+            assert!(required <= 3 * raw.len());
+        }
+        // Must fail if admission counts raw bytes instead of replacement bytes.
+        assert_eq!(decoded_body_bytes(b"\xff\xff\xff"), 9);
+    }
+
+    #[test]
+    fn bounded_text_scanner_preserves_tag_and_whitespace_behavior() {
+        let tags = Regex::new(r"(?s)<[^>]+>").unwrap();
+        let whitespace = Regex::new(r"\s+").unwrap();
+        for body in [
+            "  Hello\u{2003} world <br> next  ",
+            "before<script>secret <b>text</b></script><style>hidden</style>after",
+            "<p title='<script>secret</script>'>visible</p>",
+            "literal <> <<> end <unfinished\n  tag",
+            "<script>unterminated script",
+            "\u{0085}é\u{2028}字\u{3000}",
+        ] {
+            let no_script = SCRIPT_STYLE_RE.replace_all(body, " ");
+            let no_tags = tags.replace_all(&no_script, " ");
+            let expected = whitespace.replace_all(no_tags.trim(), " ");
+            let actual = text_excerpt(body);
+            assert_eq!(actual, expected, "{body:?}");
+            assert_eq!(actual.capacity(), MAX_TEXT_EXCERPT_BYTES);
+        }
+        // A raw candidate buffer capped before whitespace normalization would
+        // lose the terminal 'z'; it must remain visible for an unclosed tag.
+        let body = format!("<{}z", " ".repeat(2 * MAX_TEXT_EXCERPT_BYTES));
+        assert_eq!(text_excerpt(&body), "< z");
+        let body = format!("x{}", "é".repeat(MAX_TEXT_EXCERPT_BYTES));
+        let excerpt = text_excerpt(&body);
+        assert_eq!(excerpt.len(), MAX_TEXT_EXCERPT_BYTES - 1);
+        assert_eq!(excerpt.capacity(), MAX_TEXT_EXCERPT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn derived_admission_bounds_cancelled_waiters_and_releases_completed_leases() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        assert_eq!(MAX_DERIVED_BYTES, 201_726_592);
+        let admission = Arc::new(tokio::sync::Semaphore::new(MAX_DERIVED_BYTES));
+        let maximum_decode = 3 * khive_storage::MAX_BLOB_WHOLE_BYTES as usize;
+        let lease = admit_derived_buffers(&admission, maximum_decode)
+            .await
+            .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let waiting = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            admit_derived_buffers(&admission, 0),
+        );
+        tokio::pin!(waiting);
+        // Must fail if admission is bypassed or its lease is released before
+        // parsing/persistence. One explicit poll proves blocking, without timing.
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        cancel.send(true).unwrap();
+        let error = waiting.await.unwrap_err();
+        assert!(matches!(error,
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { ref operation })
+            if operation == "web_extract_derived_admission"));
+        assert_eq!(admission.available_permits(), 0);
+        drop(lease);
+        assert_eq!(admission.available_permits(), MAX_DERIVED_BYTES);
+
+        let lease = admit_derived_buffers(&admission, 0).await.unwrap();
+        assert_eq!(
+            admission.available_permits(),
+            MAX_DERIVED_BYTES - TEXT_SCRATCH_BYTES
+        );
+        drop(lease);
+        assert!(admit_derived_buffers(&admission, maximum_decode + 1)
+            .await
+            .is_err());
+        assert_eq!(admission.available_permits(), MAX_DERIVED_BYTES);
+    }
+
+    #[derive(Debug)]
+    struct PausedPut {
+        inner: Arc<dyn khive_storage::BlobStore>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::BlobStore for PausedPut {
+        async fn put(
+            &self,
+            bytes: Vec<u8>,
+        ) -> khive_storage::StorageResult<khive_storage::ContentRef> {
+            self.started.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            self.inner.put(bytes).await
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            id: &khive_storage::ContentRef,
+            max: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            self.inner.get_bounded_verified(id, max).await
+        }
+
+        async fn exists(
+            &self,
+            id: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            self.inner.exists(id).await
+        }
+
+        async fn size(
+            &self,
+            id: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            self.inner.size(id).await
+        }
+
+        async fn delete(
+            &self,
+            id: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            self.inner.delete(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_text_put_keeps_admission_until_background_io_finishes() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PausedPut {
+            inner: Arc::new(
+                khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0).unwrap(),
+            ),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let admission = Arc::new(tokio::sync::Semaphore::new(TEXT_SCRATCH_BYTES));
+        let permit = Arc::new(admit_derived_buffers(&admission, 0).await.unwrap());
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let writing = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            put_excerpt(store.clone(), "excerpt".into(), permit),
+        );
+        tokio::pin!(writing);
+        // The notification is the assertion boundary; the timeout only catches
+        // a hung test. No elapsed-time assumption decides admission correctness.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut writing => panic!("put missed the barrier: {result:?}"),
+                _ = store.started.notified() => {},
+            }
+        })
+        .await
+        .unwrap();
+        cancel.send(true).unwrap();
+        let error = writing.await.unwrap_err();
+        assert!(matches!(error,
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { ref operation })
+            if operation == "web_extract_text_put"));
+        // Must fail if put is awaited in the cancelled request without a
+        // supervisor retaining the derived lease alongside its owned bytes.
+        assert_eq!(admission.available_permits(), 0);
+        let next = admit_derived_buffers(&admission, 0);
+        tokio::pin!(next);
+        poll_fn(|cx| {
+            assert!(next.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        store.release.add_permits(1);
+        let next_lease = tokio::time::timeout(Duration::from_secs(5), &mut next)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(next_lease);
+        assert_eq!(admission.available_permits(), TEXT_SCRATCH_BYTES);
+        let content_ref =
+            khive_storage::ContentRef::from_digest_bytes(blake3::hash(b"excerpt").as_bytes());
+        assert!(store.inner.exists(&content_ref).await.unwrap());
+    }
+
+    /// See `fetch::tests::install_web_edge_rules` for why this is needed:
+    /// the in-crate test runtime carries no `VerbRegistry`, so the web
+    /// pack's own `EDGE_RULES` are never installed on it by default.
+    fn install_web_edge_rules(runtime: &KhiveRuntime) {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(runtime.clone()));
+        builder.register(crate::WebPack::new(runtime.clone()));
+        let registry = builder.build().expect("kg+web registry builds");
+        runtime.install_edge_rules(registry.all_edge_rules());
+    }
+
+    async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
+            .expect("fs blob store");
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        install_web_edge_rules(&runtime);
+        runtime
+            .install_blob_store(Arc::new(store))
+            .expect("install blob store");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        (runtime, token, dir)
+    }
+
+    async fn seed_page(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        url_str: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Uuid {
+        let url = Url::parse(url_str).unwrap();
+        let canonical = identity::canonicalize(url);
+        let site = identity::site_id(&canonical);
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            site,
+            "service",
+            "site",
+            &identity::site_key(&canonical),
+            json!({ "scheme": canonical.scheme(), "host": canonical.host_str() }),
+        )
+        .await
+        .unwrap();
+        let id = identity::document_id(site, &identity::path_and_query(&canonical));
+        let store = crate::blob_store(runtime).unwrap();
+        let content_ref = store.put(body.to_vec()).await.unwrap();
+        let entity_type = if content_type.starts_with("text/html") {
+            "page"
+        } else {
+            "resource"
+        };
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            id,
+            "document",
+            entity_type,
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string() }),
+        )
+        .await
+        .unwrap();
+        crate::entities::patch(
+            runtime,
+            token,
+            id,
+            Some(entity_type),
+            json!({
+                "url": canonical.to_string(),
+                "content_type": content_type,
+                "blob_ref": content_ref.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    // A2: extract(links) on a page with N distinct hrefs yields N links_to
+    // edges whose targets are minted as unfetched resources; a repeated
+    // href is not double-counted (dedup), and a fragment-only href is
+    // skipped as not a distinct resource.
+    #[tokio::test]
+    async fn a2_extract_links_yields_n_edges_to_unfetched_resources_dedup_and_fragment_skip() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let html = br##"<html><body>
+            <a href="/a">A</a>
+            <a href="/b">B</a>
+            <a href="/a">A again</a>
+            <a href="#top">fragment only</a>
+            <a href="https://other.example.test/c">C</a>
+        </body></html>"##;
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://origin.example.test/",
+            "text/html",
+            html,
+        )
+        .await;
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".to_string()]),
+                namespace: None,
+            },
+        )
+        .await
+        .expect("extract succeeds");
+        assert_eq!(
+            reply["result"]["links"]["edges_created"], 3,
+            "a, b, c — deduped, fragment skipped"
+        );
+
+        let neighbors = runtime
+            .neighbors(
+                &token,
+                page_id,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::LinksTo]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 3);
+        for n in &neighbors {
+            let entity = runtime
+                .entities(&token)
+                .unwrap()
+                .get_entity(n.node_id)
+                .await
+                .unwrap()
+                .expect("target minted");
+            assert_eq!(
+                entity.entity_type.as_deref(),
+                Some("resource"),
+                "unfetched target starts as resource"
+            );
+            assert_eq!(entity.properties.unwrap()["status"], Value::Null);
+        }
+    }
+
+    // extract(text) mints a derived_from resource holding tag-stripped
+    // text, and repeating the call converges on the same id.
+    #[tokio::test]
+    async fn extract_text_mints_derived_from_resource_idempotent_id() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let html = b"<html><body><p>Hello   world</p><script>ignored();</script></body></html>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://origin.example.test/page",
+            "text/html",
+            html,
+        )
+        .await;
+
+        let reply1 = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["text".to_string()]),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let text_id_1 = reply1["result"]["text"]["id"].as_str().unwrap().to_string();
+
+        let reply2 = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["text".to_string()]),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let text_id_2 = reply2["result"]["text"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            text_id_1, text_id_2,
+            "repeated extraction converges on one id"
+        );
+
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(uuid::Uuid::parse_str(&text_id_1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let store = crate::blob_store(&runtime).unwrap();
+        let content_ref = khive_storage::ContentRef::from_hex(
+            entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
+        )
+        .unwrap();
+        let bytes = store
+            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("Hello world"), "{text:?}");
+        assert!(
+            !text.contains("ignored"),
+            "script content is stripped like any other tag body"
+        );
+
+        let neighbors = runtime
+            .neighbors(
+                &token,
+                uuid::Uuid::parse_str(&text_id_1).unwrap(),
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::DerivedFrom]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, page_id);
+    }
+
+    // extract(text)'s excerpt cap is a BYTE bound, and the cut never
+    // splits a multi-byte character even when the raw byte offset lands
+    // mid-character.
+    #[tokio::test]
+    async fn extract_text_caps_excerpt_at_bytes_not_chars_and_never_splits_a_character() {
+        let (runtime, token, _dir) = test_runtime().await;
+        // Every character below is 2 bytes (`\u{00e9}`) except a single
+        // 1-byte `x` prefix, chosen so a raw cut at exactly
+        // `MAX_TEXT_EXCERPT_BYTES` (200_000, even) lands in the middle of
+        // a character: the prefix shifts every character's start to an
+        // odd byte offset, so offset 200_000 sits inside the character at
+        // byte range [199_999, 200_001) rather than on a boundary. A
+        // truncation that slices without walking back to a char boundary
+        // panics on this input; one that truncates by `.chars().take(N)`
+        // instead of bytes would let roughly twice the intended byte
+        // budget through (every char here is 2 bytes) and fail the
+        // length assertion below.
+        let content = format!("x{}", "\u{00e9}".repeat(150_000));
+        let html = format!("<html><body><p>{content}</p></body></html>");
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://origin.example.test/big-multibyte",
+            "text/html",
+            html.as_bytes(),
+        )
+        .await;
+
+        let derived = Arc::new(admit_derived_buffers(&DERIVED_ADMISSION, 0).await.unwrap());
+        let text_id = extract_text(
+            &runtime,
+            &token,
+            page_id,
+            "https://origin.example.test/big-multibyte",
+            &html,
+            &derived,
+        )
+        .await
+        .expect("extract_text does not panic on a non-boundary byte cut");
+
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(text_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let store = crate::blob_store(&runtime).unwrap();
+        let content_ref = khive_storage::ContentRef::from_hex(
+            entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
+        )
+        .unwrap();
+        let excerpt_bytes = store
+            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap();
+
+        assert!(
+            excerpt_bytes.len() <= MAX_TEXT_EXCERPT_BYTES,
+            "excerpt must respect the byte cap even for an all-multibyte document, got {}",
+            excerpt_bytes.len()
+        );
+        assert_eq!(
+            excerpt_bytes.len(),
+            199_999,
+            "cut walks back exactly one byte from the mid-character offset to the nearest char boundary"
+        );
+        assert!(
+            String::from_utf8(excerpt_bytes).is_ok(),
+            "truncation must never split a multi-byte character"
+        );
+    }
+
+    // extract on a document with no stored body refuses `not_fetched`.
+    #[tokio::test]
+    async fn extract_on_unfetched_document_refuses_not_fetched() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://origin.example.test/never-fetched").unwrap();
+        let canonical = identity::canonicalize(url);
+        let site = identity::site_id(&canonical);
+        let id = identity::document_id(site, &identity::path_and_query(&canonical));
+        crate::entities::get_or_create(
+            &runtime,
+            &token,
+            id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string(), "status": Value::Null }),
+        )
+        .await
+        .unwrap();
+
+        let err = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(id),
+                url: None,
+                kinds: None,
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not_fetched"), "{err}");
+    }
 }

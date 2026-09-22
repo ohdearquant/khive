@@ -30,8 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past either ceiling is refused by name rather than allowed to accumulate
   staging entries.
 
+- The `web` pack's verb surface (ADR-191, superseding ADR-175): `web.fetch`, `web.extract`,
+  `web.ingest`, `web.search`, and `web.refresh` fetch, parse, and search live HTTP(S) content
+  under an egress policy (address-class checks, an optional host allowlist, scoped credentials,
+  a bounded request-header set, and byte/time/result-count ceilings), replacing the prior
+  pack's local-manifest-only `web.ingest`. New `site`/`page`/`resource` entity subtypes and the
+  `links_to` edge relation support the ontology; identity is deterministic by canonicalized
+  address, so an unfetched link target and its later-fetched body are the same row.
+
 ### Changed
 
+- **Breaking**: the `web` pack no longer reads a `.well-known` application manifest or emits
+  `machine_view`/`agent_tool`/`agent_skill` entities — see the `web.*` entries above and
+  `docs/packs/web.md`.
 - Standalone `stream.append` now consults the owning pack's `KindHook::prepare_create` before
   creating a caller-selected note kind, preserving pack-owned admission and field normalization.
   When the kind has a hook, an object record's fields are read as the create arguments the hook

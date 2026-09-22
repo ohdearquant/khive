@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke + behavioral tests for the brain pack via MCP stdio.
 
-Spawns the binary with --pack kg --pack brain --namespace local, sends
+Spawns the binary with --pack kg --pack brain --actor smoke-brain-actor, sends
 JSON-RPC over stdin, and verifies every brain verb works end-to-end.
 
 The brain pack is a Bayesian belief engine (ADR-032).  Profiles hold
@@ -124,7 +124,9 @@ def spawn_brain_proc():
             "mcp", "--db", ":memory:",
             "--no-embed",
             "--log", "error",
-            "--namespace", "local",
+            # Explicit feedback requires an attributed caller; the
+            # unattributed default actor ("local") is refused.
+            "--actor", "smoke-brain-actor",
             "--pack", "kg",
             "--pack", "brain",
         ],

@@ -10,6 +10,7 @@ use crate::{
 fn config(gate: GateRef) -> RuntimeConfig {
     RuntimeConfig {
         telemetry: Default::default(),
+        web: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

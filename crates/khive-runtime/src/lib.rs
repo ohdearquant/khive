@@ -93,6 +93,7 @@ pub use curation::{
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
     EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, MergeEdgeConflictPreimage,
     MergeEdgePreimage, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NotePatch,
+    NoteUpdatePolicy,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
@@ -125,14 +126,16 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    is_valid_mailbox_actor_label, ActorRef, AllowAllGate, AuditDecision, AuditEvent,
-    CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError, GateRef, GateRequest,
-    MailboxPolicyError, MailboxReadGate, Obligation, RUNTIME_STAMPED_ACTOR_KINDS,
+    classify_operation, is_valid_mailbox_actor_label, ActorRef, AllowAllGate, AuditDecision,
+    AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError, GateRef,
+    GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
+    CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
     MemoryRecallPipeline, NoteCandidate, RerankerObjective, RetrievalCandidate, RrfFusionObjective,

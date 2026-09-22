@@ -48,7 +48,7 @@ pub use request_context::{
     RequestReadStopReason, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
 pub use sparse::SparseStore;
-pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
+pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter, TopLevelMaintenance};
 pub use telemetry::{
     ChannelBackoffArmedPayload, ChannelBackoffResetPayload, ChannelHeartbeatPersistFailedPayload,
     ChannelPollFailedPayload, ChannelPollStartedPayload, ChannelPollSucceededPayload,

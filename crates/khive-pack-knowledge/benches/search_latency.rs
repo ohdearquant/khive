@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 fn rt_with_embedder() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),

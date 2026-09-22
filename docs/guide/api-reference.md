@@ -20,7 +20,7 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `gtd`       | 6     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
@@ -174,7 +174,16 @@ its siblings (chain failures do abort the remainder of the chain):
 {
   "results": [
     { "ok": true, "tool": "search", "result": { "...": "..." } },
-    { "ok": false, "tool": "get", "error": "not found: ..." }
+    {
+      "ok": false,
+      "tool": "get",
+      "domain_disposition": "unknown",
+      "error": {
+        "kind": "runtime_error",
+        "message": "not found: ...",
+        "domain_disposition": "unknown"
+      }
+    }
   ],
   "summary": { "total": 2, "succeeded": 1, "failed": 1, "aborted": 0 }
 }
@@ -182,6 +191,22 @@ its siblings (chain failures do abort the remainder of the chain):
 
 `aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
 parallel batches, since parallel failures do not cascade.
+
+Every `ok: false` entry has a required top-level `domain_disposition`. Inspect it
+before retrying: `ok: false` alone does not mean that a write failed to commit.
+
+| `domain_disposition` | Meaning and response                                                                                                                                                                                                                           |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `committed`          | The domain operation completed before a later audit or response failure. Read `error.domain_result` for its canonical result; if the result was omitted for a size/depth limit, read the stored outcome back. Do not repeat the write blindly. |
+| `not_committed`      | This operation has a proven pre-dispatch refusal or another explicitly proven no-write outcome. Aborted chain operations always have this value.                                                                                               |
+| `unknown`            | The operation's effects are not established. Reconcile by a known operation/record identity before deciding whether to retry.                                                                                                                  |
+
+Non-aborted failures retain an `error` object, whose `domain_disposition` matches
+the entry-level field. Aborted entries have no `error` object. A required audit
+append failure after a committed write still counts as failed and keeps `ok: false`;
+the new entry-level field makes that committed outcome visible beside `ok`.
+Presentation and daemon frame-budget omission preserve this disposition. See
+[ADR-133 Amendment 3](../adr/ADR-133-incidental-writes-off-the-request-hot-path.md#a31-the-error-carries-a-machine-readable-domain-disposition).
 
 A successful entry can also carry a transport-owned `advisories` array beside `result`.
 These warnings describe execution context without changing the verb's canonical result or
@@ -1048,12 +1073,30 @@ process-wide best-effort audit appends whose storage error was logged and swallo
 pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
 unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
 it instead fails the dispatch that produced it directly, or — for a denial whose dispatch already
-fails independent of the row — is tracked by a separate internal counter. `audit_append_failures`
+fails independent of the row — is tracked by `audit_obligation_append_failures`. `audit_append_failures`
 and `audit_batch_flush_failures` are therefore disjoint for that case; summing them does not
 double-count an obligation-bearing generation failure. Zero-wait
 checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.
+
+`audit_obligation_append_failures` counts process-wide failed obligation-bearing audit
+submissions, including audit failures for already-denied calls. It is separate from swallowed
+best-effort failures. One failed batch generation can contain several such submissions, so
+do not sum it with `audit_batch_flush_failures` as if those were disjoint failures. Runtime
+diagnostics supplies the count even without an audit-batch control handle; direct `khive-db`
+collectors return `null` plus `audit_obligation_append_failures_unavailable_reason`.
+
+Audit obligations attach to gate denials, dispatch success/failure outcomes, unknown-verb
+attempts, and `git.digest` receipts. This preserves the link between a caller-visible outcome
+and its durable audit; `whoami` and `comm.heartbeat` have no exemption from outcome audit
+commit failure. A configured sink failure can therefore refuse identity and liveness calls
+too. Config-lock rows, recall telemetry, and gate-unavailable observability are best-effort.
+The existing bounded queue-admission degradation rules are separate from a sink commit
+failure and do not change these producer classes. This counter adds visibility without
+changing the fail-closed policy or making diagnostics independent of its own configured audit
+sink. Channel startup reports a failed quarantine-readiness check with the actual cause; an
+audit error on that check does not by itself prove quarantine blob storage is unavailable.
 
 `writer_task_request_failures` counts dequeued writer-task requests whose processing at the
 writer seam terminated in error, regardless of the specific terminal state; a request that never
@@ -1167,7 +1210,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 5 verbs
+## `gtd` pack — 6 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1266,6 +1309,22 @@ audit row is written, and a `note` passed with the request is not persisted, rep
 
 ```
 request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
+```
+
+### `gtd.census` — Assertive
+
+Read-only count of live task timestamps by raw numeric magnitude, for `created_at` and
+`properties.archived_at`. Every bucket (`null`, `nonnumeric`, `epoch_zero`, 10-, 13- and
+16-digit magnitudes, `other`) is returned, zeros included. No unit is inferred and nothing is
+repaired; `created_at_gt_archived_at_raw` compares raw numbers and is not temporal ordering.
+See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timestamp-census.md).
+
+| Param       | Type   | Required | Notes                                       |
+| ----------- | ------ | -------- | ------------------------------------------- |
+| `namespace` | string | no       | Count one visible namespace instead of all. |
+
+```
+request(ops="gtd.census()")
 ```
 
 ---
@@ -1406,6 +1465,8 @@ zero-filled, when no event in the window carries `cost_unit`. Events without a `
 | `actor`      | string | no       | Defaults to the authorized caller. A filter prefixed with `actor:`, `anonymous:`, or `agent:` matches a stored label exactly. Self access compares kind and id; foreign access checks the raw id for `actor:` and the full label for other reserved kinds against the caller's visible set. Other filters match bare and canonical labels. |
 | `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                                                                                                            |
 | `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                                                                                                     |
+| `group_by`   | array  | no       | Only `["verb", "actor"]`, in that order. Omission or null adds no cross; duplicates, reversed/other pairs and unknown dimensions are rejected.                                                                                                                                                                                             |
+| `exhaustive` | bool   | no       | Default false. Use the existing full-window cursor walk; windows above 2,000,000 events are refused. The live view is best-effort, not a transactional snapshot.                                                                                                                                                                           |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
@@ -1441,6 +1502,29 @@ historical-alias separation guarantee. A new runtime-stamped kind must be added
 to the shared list and covered by per-kind event-count tests. See
 [configuration](../configuration.md#brain-read-scope) and
 [ADR-103 Amendment 5](../adr/ADR-103-resource-attribution-model.md#amendment-5-2026-09-10-caller-scoped-brain-reads).
+
+Optional `group_by=["verb","actor"]` returns
+`counts_by_verb_and_actor: {<verb>: {<actor>: <count>}}`. The map contains only
+observed cells, with no delimiter joining the keys. A requested empty cross is
+`{}`. Omission or null leaves both cross keys absent. Actor keys use precisely
+the existing `counts_by_actor` rules: default caller aliases coalesce, while an
+explicit actor or `all_actors=true` preserves stored labels.
+
+The cross uses the same filtered events as the marginals. When `truncated=true`,
+only `counts_by_verb_and_actor_page_scoped` is emitted; the complete-looking
+cross key is absent. Existing marginal field names are unchanged. Limits count
+event rows, not distinct group cells, so a denser cross cannot trigger a separate
+cap. An occupied-cell count cannot exceed the number of events aggregated.
+
+For a dispatch-audit census, request `kind="audit"` with the cross. That filter
+is applied before the existing event cap; the special unfiltered audit/non-audit
+budget split is unnecessary on this single-kind path. Use `exhaustive=true`
+when a sampled answer is insufficient, retaining the existing safety bound and
+best-effort live-window caveat. `window_event_total` remains independently read.
+
+```text
+request(ops='brain.event_counts(since="2026-09-01T00:00:00Z", until="2026-09-02T00:00:00Z", kind="audit", group_by=["verb","actor"], exhaustive=true)')
+```
 
 ### `brain.profiles` — Assertive
 

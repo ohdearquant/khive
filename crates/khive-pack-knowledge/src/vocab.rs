@@ -27,7 +27,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
-        description: "Bulk insert or update knowledge atoms by slug, or replace existing atom properties by UUID",
+        description: "Atomically insert or update knowledge atoms by slug, or replace existing atom properties by UUID. All inputs are validated before writing; a validation or secret refusal commits no atom writes. Secret refusals identify the zero-based atoms[index].field; valid siblings are not partially committed.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

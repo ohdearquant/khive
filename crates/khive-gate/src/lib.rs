@@ -9,6 +9,7 @@ mod error;
 mod gate;
 mod mailbox;
 mod obligation;
+mod operation;
 mod request;
 
 pub use actor::{ActorRef, RUNTIME_STAMPED_ACTOR_KINDS};
@@ -23,6 +24,9 @@ pub use mailbox::{
     MailboxPolicyError, MailboxReadGate,
 };
 pub use obligation::Obligation;
+pub use operation::{
+    classify_operation, OperationAccess, CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION,
+};
 pub use request::GateRequest;
 
 #[cfg(test)]

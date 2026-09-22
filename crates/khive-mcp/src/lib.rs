@@ -11,6 +11,7 @@ pub mod coordinator;
 pub mod daemon;
 pub mod pack;
 pub mod pending_events;
+mod request_policy;
 pub mod save_sink;
 pub mod serve;
 pub mod server;

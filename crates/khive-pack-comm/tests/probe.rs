@@ -992,7 +992,7 @@ async fn probe_production_sql_stale_count_plan_uses_partial_index_and_cutoff() {
     assert!(
         stats_details.iter().any(|detail| {
             detail.starts_with("SEARCH ")
-                && detail.contains("idx_notes_unread_probe_recipient_direction")
+                && detail.contains("idx_notes_unread_probe_recipient_type_direction")
                 && detail.contains("created_at<?")
         }),
         "stale count must seek the partial index with its strict cutoff: {nodes:?}"
@@ -1083,7 +1083,7 @@ async fn probe_survives_vacuum_between_probes() {
     {
         let mut writer = sql.writer().await.expect("writer");
         writer
-            .execute_script_top_level("VACUUM;".to_string())
+            .execute_script_top_level(khive_storage::TopLevelMaintenance::Vacuum)
             .await
             .expect("vacuum succeeds");
     }
@@ -1428,6 +1428,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // Reopen through the normal runtime boot path -- this runs
     // `run_migrations` to latest, including V7's backfill.
     let config = RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -1618,6 +1619,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     // `run_migrations` to latest (including V8's forward repair) and the
     // fixed anti-join lazy bootstrap.
     let config = RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),

@@ -166,6 +166,7 @@ impl EmbedderProvider for FixtureEmbedProvider {
 
 fn rt_with_fixture_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),

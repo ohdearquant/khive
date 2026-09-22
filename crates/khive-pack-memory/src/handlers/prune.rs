@@ -253,7 +253,7 @@ impl MemoryPack {
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await?;
         writer
-            .execute_script_top_level("VACUUM;".to_string())
+            .execute_script_top_level(khive_storage::TopLevelMaintenance::Vacuum)
             .await?;
 
         Ok(json!({ "ok": true }))
@@ -1006,7 +1006,9 @@ mod vacuum_write_queue_tests {
             std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
 
         let mut writer = sql.writer().await.expect("writer handle");
-        let result = writer.execute_script_top_level("VACUUM;".to_string()).await;
+        let result = writer
+            .execute_script_top_level(khive_storage::TopLevelMaintenance::Vacuum)
+            .await;
 
         assert!(
             result.is_ok(),

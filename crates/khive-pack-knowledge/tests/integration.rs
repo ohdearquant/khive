@@ -2498,6 +2498,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
 
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -4260,16 +4261,17 @@ fn is_secret_detected(err: &RuntimeError) -> bool {
 #[tokio::test]
 async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
     let f = pack(rt());
+    let clean_atom = json!({
+        "slug": "clean-sibling-atom",
+        "name": "Clean Sibling",
+        "content": "This atom carries ordinary prose about retrieval augmented generation and contains nothing credential shaped anywhere in it, only plain words about ranking and recall quality.",
+    });
     let result = f
         .dispatch(
             "knowledge.upsert_atoms",
             json!({
                 "atoms": [
-                    {
-                        "slug": "clean-sibling-atom",
-                        "name": "Clean Sibling",
-                        "content": "This atom carries ordinary prose about retrieval augmented generation and contains nothing credential shaped anywhere in it, only plain words about ranking and recall quality.",
-                    },
+                    clean_atom.clone(),
                     {
                         "slug": "atom-carrying-the-credential",
                         "name": "Offending Atom",
@@ -4284,6 +4286,10 @@ async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
         is_secret_detected(&err),
         "the refusal must stay classified as a secret detection; got: {err:?}"
     );
+    let RuntimeError::SecretDetected(matched) = &err else {
+        unreachable!("typed secret refusal asserted above");
+    };
+    assert_eq!(matched.location.as_deref(), Some("atoms[1].content"));
     let rendered = err.to_string();
     assert!(
         rendered.contains("in atoms[1].content"),
@@ -4298,6 +4304,28 @@ async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
             && !rendered.contains("clean-sibling-atom"),
         "the location is positional: a slug is itself a scanned field and never echoed; got: {rendered}"
     );
+
+    let after_refusal = f
+        .dispatch("knowledge.list", json!({"type": "atom"}))
+        .await
+        .expect("list after secret preflight refusal");
+    assert!(
+        after_refusal["results"].as_array().expect("atom rows").is_empty(),
+        "the whole-batch refusal must not commit the clean sibling or the refusing atom: {after_refusal}"
+    );
+
+    let accepted = f
+        .dispatch("knowledge.upsert_atoms", json!({"atoms": [clean_atom]}))
+        .await
+        .expect("the identical clean sibling must succeed when submitted alone");
+    assert_eq!(accepted, json!({"created": 1, "updated": 0, "total": 1}));
+    let after_retry = f
+        .dispatch("knowledge.list", json!({"type": "atom"}))
+        .await
+        .expect("list separately accepted clean atom");
+    let atoms = after_retry["results"].as_array().expect("atom rows");
+    assert_eq!(atoms.len(), 1);
+    assert_eq!(atoms[0]["slug"], "clean-sibling-atom");
 }
 
 /// knowledge.upsert_domains with a credential-shaped slug must be rejected.
@@ -4968,6 +4996,7 @@ mod kg_blend {
         recorded: Option<Arc<Mutex<Vec<String>>>>,
     ) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -5333,6 +5362,7 @@ mod kg_blend {
 
         let calls = Arc::new(Mutex::new(0usize));
         let rt = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -5753,6 +5783,7 @@ mod kg_blend {
 
     fn rt_with_failing_blend_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),

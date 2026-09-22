@@ -922,6 +922,13 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         identity: Option<RequestIdentity>,
     ) -> Result<String, String>;
 
+    /// Read-deadline ceiling for one request. The default is the operator
+    /// ceiling; an implementor that understands the request may grant a
+    /// longer bounded allowance (a long poll's declared wait plus a margin).
+    fn request_read_timeout(&self, _ops: &str) -> std::time::Duration {
+        khive_storage::request_read_timeout_from_env()
+    }
+
     /// Preserve structured dispatch errors without breaking string-only implementors.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_with_error_detail(
@@ -1616,12 +1623,16 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             "daemon RequestIdentity constructed"
         );
         let (read_cancel_tx, read_cancel_rx) = tokio::sync::watch::channel(false);
+        // The connection's own ceiling nests inside the dispatcher's, and a
+        // nested scope keeps the earlier deadline, so the allowance must be
+        // granted here or a long poll times out at the operator ceiling.
+        let read_timeout = dispatcher.request_read_timeout(&frame.ops);
         let dispatch = khive_storage::scope_request_read_cancellation(
             shutdown,
             khive_storage::scope_request_read_cancellation(
                 read_cancel_rx,
                 khive_storage::scope_request_read_deadline(
-                    khive_storage::request_read_timeout_from_env(),
+                    read_timeout,
                     dispatcher.dispatch_with_error_detail(
                         frame.ops,
                         frame.presentation,

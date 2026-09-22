@@ -514,6 +514,7 @@ mod tests {
         let db_path = dir.path().join("fold-gate-concurrency.db");
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -627,6 +628,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
         let rt = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),

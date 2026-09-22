@@ -1232,3 +1232,38 @@ list and restarts or reconfigures the serving daemon; a client-side setting
 cannot grant it. The same narrowing applies to `brain.resolve` and
 `brain.bindings`: a caller sees its own profile and its own binding rows unless
 it names an actor it is allowed to see.
+
+## Amendment 6 (2026-09-22): optional verb-by-actor event counts (#2969)
+
+`brain.event_counts` accepts optional `group_by=["verb", "actor"]`. Only this
+ordered pair is supported. A reversed pair, repeated dimension, unknown name,
+other pair, wrong array length, or non-array value fails input validation.
+Omission or JSON null preserves the existing response and adds no crossed map.
+
+When requested, `counts_by_verb_and_actor` is a sparse nested map keyed first by
+stored event verb and then by the actor key used by `counts_by_actor`. No
+concatenated delimiter key is introduced. The default caller view coalesces the
+same permitted historical actor aliases as the existing marginal; explicit
+actor filters and `all_actors=true` retain raw stored labels. An empty requested
+cross is an empty object.
+
+The crossed aggregation runs over the exact event rows already admitted by the
+existing actor authorization, namespace, kind, time-window and fetch paths.
+It adds no authorization branch, source query, cross-cell budget, or cap. The
+sampled limits count events, not output groups: a sparse cross has no more
+occupied cells than aggregated events, even when it has more cells than either
+marginal has keys. Cell density alone does not change truncation.
+
+The existing `truncated` value also governs the cross. When true, the normal
+key is absent and the same sampled counts are emitted only as
+`counts_by_verb_and_actor_page_scoped`. `window_event_total`, existing marginal
+fields, scalar renames, audit/non-audit budget segregation and exhaustive
+pagination remain unchanged. Exhaustive reads retain the current safety bound
+and best-effort live-view semantics; grouping does not turn them into snapshots.
+
+A dispatch-audit census should select `kind="audit"` with the cross, avoiding
+aggregation of unrelated domain event kinds. The filter is applied before the
+existing cap; the unfiltered audit/non-audit split does not apply to a
+single-kind query. `all_actors=true` still requires the exact caller id in the
+serving runtime's fleet-reader configuration. No new grouping pair or budget is
+approved by this amendment.

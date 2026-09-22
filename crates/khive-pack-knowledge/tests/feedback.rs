@@ -29,6 +29,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
         additional_embedding_models: vec![],
         packs,
         brain_profile,
+        actor_id: Some("knowledge-feedback-test".into()),
         ..RuntimeConfig::default()
     })
     .expect("runtime")
@@ -39,6 +40,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
 /// to a real on-disk model, absent on CI runners.
 fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
@@ -93,6 +95,7 @@ async fn feedback_tier1_explicit_profile_routes_to_brain() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
@@ -124,6 +127,7 @@ async fn feedback_tier1_explicit_wins_over_bound_profile() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -204,6 +208,7 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -382,6 +387,7 @@ async fn feedback_tier3_namespace_fallback_no_explicit_binding() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -442,6 +448,7 @@ async fn feedback_tier3_no_brain_pack() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
@@ -475,6 +482,7 @@ async fn feedback_tier3_no_target_id() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
@@ -518,6 +526,7 @@ async fn feedback_tier1_response_names_its_tier() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -556,6 +565,7 @@ async fn feedback_tier2_response_names_its_tier() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -622,6 +632,7 @@ async fn feedback_tier3_response_names_its_tier_and_reports_the_id_unused() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
@@ -663,6 +674,7 @@ async fn feedback_tier3_accepts_a_target_id_naming_nothing_and_says_it_was_unuse
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
@@ -700,6 +712,7 @@ async fn feedback_tier1_rejects_a_target_id_naming_nothing() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
@@ -780,6 +793,7 @@ async fn feedback_tier3_takes_a_domain_id_and_reports_it_unused() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
@@ -820,6 +834,7 @@ async fn feedback_tier1_refuses_a_domain_id() {
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("knowledge-feedback-test".into()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));

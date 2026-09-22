@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### Edge Ontology (17 edge relations — closed set; 15 base + 2 epistemic via ADR-055) (ADR-002)
+### Edge Ontology (18 edge relations — closed set; 16 base incl. `links_to` via ADR-191 + 2 epistemic via ADR-055) (ADR-002)
 
 - The GTD pack does NOT add new edge relation variants; `depends_on` is already in the base set.
 - The pack additively extends the _endpoint contract_ to allow `depends_on` between two `task`
@@ -37,7 +37,8 @@
 
 ### GTD lifecycle contract (ADR-019)
 
-- Five verbs: `gtd.assign`, `gtd.next`, `gtd.complete`, `gtd.tasks`, `gtd.transition`.
+- Five task-management verbs: `gtd.assign`, `gtd.next`, `gtd.complete`, `gtd.tasks`, `gtd.transition`.
+- `gtd.census` is an additional read-only timestamp-magnitude census; it does not repair task data.
 - Lifecycle states: `inbox → next | waiting | someday | active | done | cancelled`.
 - `done` and `cancelled` are permanently terminal (no reopen; issue #273).
 - `complete()` validates its `done`/`cancelled` target against the same lifecycle table as
@@ -52,6 +53,7 @@
 
 ### Illocutionary verb classification (Searle 1976) (ADR-025)
 
+- `gtd.census` → Assertive (counts raw timestamp-value shapes without choosing units)
 - `gtd.assign` → Directive (directs an actor to perform work)
 - `gtd.next` → Assertive (retrieves actionable task state)
 - `gtd.tasks` → Assertive (retrieves filtered task listing)

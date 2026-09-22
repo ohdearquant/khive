@@ -10,16 +10,20 @@ fail-closed verb class; proposed [ADR-068](ADR-068-process-isolation-topology.md
 would replace the deployment-topology clause.\
 **Authors**: khive maintainers
 
-> **Implementation status (2026-08-30):** The `Gate` trait, hard `Deny`
-> enforcement, explicit programmatic `AllowAllGate`, and the optional static
-> `[gate]` caller-enrollment policy are implemented. The table's
-> `granted_actors` exact allowlist and independent `grant_unattributed` flag
-> are enforced at the authorization seam; unknown table keys fail startup.
-> The accepted ADR-129 default flip and ADR-143 store-held caller-grant model
-> are not yet implemented, and the current runtime default remains
-> `AllowAllGate` when `[gate]` is absent. The configuration policy is live on
-> every boot rather than ADR-143's one-time import. This note records
-> implementation state only and does not amend the accepted decisions.
+> **Implementation status (2026-09-22):** The `Gate` trait, hard `Deny`
+> enforcement, explicit programmatic `AllowAllGate`, and optional static
+> `[gate]` caller-enrollment policy are implemented. ADR-129 Stage 1a is also
+> shipped: gate errors return `RuntimeError::GateUnavailable` at both runtime
+> dispatch seams and do not invoke the handler. The accepted Stage 1b
+> `khive-capability`/`CapabilityGate` substrate and Stage 2 default flip remain
+> unimplemented; `khive-capability` is a planned crate, absent from the current
+> workspace and dependency manifests. The runtime default remains `AllowAllGate`
+> when `[gate]` is absent. The table's exact `granted_actors` allowlist and
+> independent `grant_unattributed` flag are enforced; unknown keys fail startup.
+> Configuration is read at every boot, rather than ADR-143's still-unimplemented
+> store-held grants and one-time import. This is implementation status, not an
+> amendment of the accepted decisions. See the staged disposition in
+> [ADR-129](ADR-129-fail-closed-gate-default.md).
 
 ## Context
 

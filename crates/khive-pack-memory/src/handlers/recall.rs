@@ -3923,6 +3923,7 @@ mod tests {
         }
     }
 
+    const ADR104_TRAINING_ACTOR: &str = "memory-recall-training";
     const ADR104_MODEL: &str = "adr104-fixed-vec-model";
     const ADR104_QUERY: &str = "profile ranking probe query";
     const ADR104_FILLER_LOW: &str = "filler low relevance content";
@@ -4024,6 +4025,7 @@ mod tests {
             .id;
 
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
@@ -4323,6 +4325,7 @@ mod tests {
             .expect("create arm note");
 
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
@@ -4685,6 +4688,7 @@ mod tests {
 
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         builder.register(brain);
@@ -4794,6 +4798,7 @@ mod tests {
 
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         builder.register(brain);
@@ -4907,6 +4912,7 @@ mod tests {
 
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         builder.register(brain);
@@ -5020,6 +5026,7 @@ mod tests {
 
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         builder.register(brain);

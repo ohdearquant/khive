@@ -956,6 +956,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("project", EdgeRelation::PartOf, "org"),
     ("*", EdgeRelation::InstanceOf, "concept"),
     ("service", EdgeRelation::InstanceOf, "project"),
+    // ADR-002 amendment (ADR-191): web hyperlink — a document points at
+    // another document it links to. No qualifier inference (unlike
+    // depends_on); the endpoint pair is intentionally narrow (document only,
+    // no service/concept targets — see ADR-191 D2/F10).
+    ("document", EdgeRelation::LinksTo, "document"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -1952,24 +1957,34 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
-        let ns_strs: Vec<String> = token
-            .visible_namespaces()
-            .iter()
-            .map(|ns| ns.as_str().to_owned())
-            .collect();
         let filter = EntityFilter {
-            kinds: match kind {
-                Some(k) => vec![k.to_string()],
-                None => vec![],
-            },
-            entity_types: match entity_type {
-                Some(t) => vec![t.to_string()],
-                None => vec![],
-            },
+            kinds: kind
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            entity_types: entity_type
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
             legacy_entity_type_fallback: true,
-            namespaces: ns_strs,
             ..Default::default()
         };
+        self.list_entities_filtered(token, filter, limit, offset)
+            .await
+    }
+
+    /// Apply a composed entity predicate before offset pagination. Namespace
+    /// visibility is supplied by the token, just as for the scalar list API.
+    pub async fn list_entities_filtered(
+        &self,
+        token: &NamespaceToken,
+        mut filter: EntityFilter,
+        limit: u32,
+        offset: u32,
+    ) -> RuntimeResult<Vec<Entity>> {
+        filter.namespaces = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
         let page = self
             .entities(token)?
             .query_entities(
@@ -1999,6 +2014,30 @@ impl KhiveRuntime {
         after: Option<Uuid>,
         limit: u32,
     ) -> RuntimeResult<(Vec<Entity>, Option<Uuid>)> {
+        let filter = EntityFilter {
+            kinds: kind
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            entity_types: entity_type
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            legacy_entity_type_fallback: true,
+            tags_any: tags_any.to_vec(),
+            ..Default::default()
+        };
+        self.list_entities_after_filtered(token, filter, after, limit)
+            .await
+    }
+
+    /// Apply a composed entity predicate before insertion-sequence pagination,
+    /// preserving the scalar API's cursor validation and token visibility.
+    pub async fn list_entities_after_filtered(
+        &self,
+        token: &NamespaceToken,
+        mut filter: EntityFilter,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> RuntimeResult<(Vec<Entity>, Option<Uuid>)> {
         let store = self.entities(token)?;
         let after = match after {
             Some(id) => {
@@ -2016,22 +2055,11 @@ impl KhiveRuntime {
             }
             None => None,
         };
-        let filter = EntityFilter {
-            kinds: kind
-                .map(|value| vec![value.to_string()])
-                .unwrap_or_default(),
-            entity_types: entity_type
-                .map(|value| vec![value.to_string()])
-                .unwrap_or_default(),
-            legacy_entity_type_fallback: true,
-            tags_any: tags_any.to_vec(),
-            namespaces: token
-                .visible_namespaces()
-                .iter()
-                .map(|namespace| namespace.as_str().to_owned())
-                .collect(),
-            ..Default::default()
-        };
+        filter.namespaces = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
         let page = store
             .query_entities_after(token.namespace().as_str(), filter, after, limit)
             .await?;
@@ -6993,6 +7021,97 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_composed_type_filters_apply_alias_and_disjoint_sets_before_pagination() {
+        let runtime = rt();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let store = runtime.entities(&token).unwrap();
+        let mut expected = Vec::new();
+        for (kind, column, property, matches) in [
+            ("document", Some("paper"), "ignored", true),
+            ("document", None, "preprint", true),
+            ("document", Some("preprint"), "ignored", true),
+            ("document", Some("report"), "preprint", false),
+            ("concept", None, "preprint", false),
+        ] {
+            let row = Entity::new("local", kind, "type predicate")
+                .with_entity_type(column)
+                .with_properties(serde_json::json!({"type": property}));
+            if matches {
+                expected.push(row.id);
+            }
+            store.upsert_entity(row).await.unwrap();
+        }
+        store
+            .upsert_entity(
+                Entity::new("foreign", "document", "foreign alias")
+                    .with_properties(serde_json::json!({"type":"preprint"})),
+            )
+            .await
+            .unwrap();
+        for (values, should_match) in [
+            (vec!["paper".to_string(), "preprint".to_string()], true),
+            (vec!["absent".to_string()], false),
+            (Vec::new(), false),
+        ] {
+            let filter = EntityFilter {
+                entity_types_by_kind: [("document".to_string(), values)].into_iter().collect(),
+                legacy_entity_type_fallback: true,
+                namespaces: vec!["foreign".to_string()], // Runtime supplies token visibility.
+                ..Default::default()
+            };
+            let mut offset_ids = Vec::new();
+            for offset in 0..=expected.len() {
+                let page = runtime
+                    .list_entities_filtered(&token, filter.clone(), 1, offset as u32)
+                    .await
+                    .unwrap();
+                offset_ids.extend(page.into_iter().map(|row| row.id));
+            }
+            let mut cursor_ids = Vec::new();
+            let mut after = None;
+            for _ in 0..=expected.len() {
+                let (page, next) = runtime
+                    .list_entities_after_filtered(&token, filter.clone(), after, 1)
+                    .await
+                    .unwrap();
+                cursor_ids.extend(page.into_iter().map(|row| row.id));
+                after = next;
+                if after.is_none() {
+                    break;
+                }
+            }
+            let mut wanted = if should_match {
+                expected.clone()
+            } else {
+                Vec::new()
+            };
+            wanted.sort_unstable();
+            offset_ids.sort_unstable();
+            cursor_ids.sort_unstable();
+            assert_eq!(offset_ids, wanted);
+            assert_eq!(cursor_ids, wanted);
+        }
+        // Existing scalar callers retain literal matching, including legacy fallback.
+        assert_eq!(
+            runtime
+                .list_entities(&token, None, Some("paper"), 20, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .list_entities_after(&token, None, Some("paper"), &[], None, 20)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -17948,6 +18067,81 @@ mod tests {
             dk,
             Some("normative"),
             "document->document depends_on must infer dependency_kind=normative"
+        );
+    }
+
+    // ── Web hyperlink endpoint pair (ADR-191) ────────────────────────────────
+    // document->document is the only links_to pair: a hyperlink's target is a
+    // URL, which resolves to a document, never to the service that hosts it.
+
+    #[tokio::test]
+    async fn link_document_links_to_document_allowed_service_and_concept_targets_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let page_a = rt
+            .create_entity(&tok, "document", None, "Page A", None, None, vec![])
+            .await
+            .unwrap();
+        let page_b = rt
+            .create_entity(&tok, "document", None, "Page B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, page_a.id, page_b.id, EdgeRelation::LinksTo, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->document links_to must be allowed by the ADR-191 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert!(
+            edge.metadata.is_none(),
+            "links_to carries no governed metadata and infers none, unlike \
+             depends_on; got {:?}",
+            edge.metadata
+        );
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Some Site", None, None, vec![])
+            .await
+            .unwrap();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Some Concept", None, None, vec![])
+            .await
+            .unwrap();
+
+        let doc_to_service = rt
+            .link(&tok, page_a.id, svc.id, EdgeRelation::LinksTo, 1.0, None)
+            .await
+            .unwrap_err();
+        assert!(
+            doc_to_service
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "document->service links_to must be refused with the \
+             endpoint-contract error; got {doc_to_service}"
+        );
+
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                concept.id,
+                page_a.id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document links_to must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
         );
     }
 

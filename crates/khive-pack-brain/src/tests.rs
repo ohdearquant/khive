@@ -54,9 +54,22 @@ impl PackRuntime for TestConsumerPack {
 }
 
 fn make_pack() -> (BrainPack, KhiveRuntime) {
+    make_pack_with_actor("brain-test")
+}
+
+fn make_anonymous_pack() -> (BrainPack, KhiveRuntime) {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let pack = BrainPack::new(rt.clone());
     (pack, rt)
+}
+
+fn assert_anonymous_feedback_refusal(error: RuntimeError) {
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected typed anonymous-feedback refusal, got {error:?}");
+    };
+    assert_eq!(error.kind(), khive_types::ErrorKind::InvalidInput);
+    assert!(error.message().contains("attributed caller"), "{error}");
+    assert!(error.message().contains("actor.id"), "{error}");
 }
 
 fn make_pack_with_read_scope(
@@ -90,7 +103,7 @@ fn make_pack_with_tz(tz: &str) -> (BrainPack, KhiveRuntime) {
         db_path: None,
         packs: vec!["kg".to_string()],
         brain_profile: None,
-        actor_id: None,
+        actor_id: Some("brain-test".to_string()),
         display_timezone: tz.parse().expect("known IANA zone"),
         ..RuntimeConfig::no_embeddings()
     })
@@ -2457,6 +2470,7 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
     // Default impl resolves embedding_model to a real on-disk model, which is
     // absent on CI runners and fails entity creation with ModelInitialization.
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         git_write: Default::default(),
@@ -2861,7 +2875,7 @@ async fn feedback_1016_event_payload_stamps_resolved_profile_all_tiers() {
 #[tokio::test]
 async fn feedback_anonymous_caller_does_not_match_explicit_actor_local_binding() {
     // No actor_id configured — `rt.authorize` mints the anonymous actor.
-    let (pack, rt) = make_pack();
+    let (pack, rt) = make_anonymous_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
     assert!(
@@ -2897,15 +2911,19 @@ async fn feedback_anonymous_caller_does_not_match_explicit_actor_local_binding()
     .await
     .unwrap();
 
-    // No served_by_profile_id supplied.
-    pack.dispatch(
-        "brain.feedback",
-        json!({"target_id": target, "signal": "useful"}),
-        &registry,
-        &token,
-    )
-    .await
-    .unwrap();
+    let default_before = pack.snapshot().balanced_recall.total_events;
+
+    // An actor-local binding cannot authorize anonymous explicit feedback.
+    let err = pack
+        .dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "useful"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("anonymous explicit feedback must refuse before profile routing");
+    assert_anonymous_feedback_refusal(err);
 
     let bound_events = pack
         .dispatch(
@@ -2935,8 +2953,8 @@ async fn feedback_anonymous_caller_does_not_match_explicit_actor_local_binding()
         .as_u64()
         .unwrap();
     assert_eq!(
-        default_events, 1,
-        "anonymous unspecified feedback must fall through to the default profile"
+        default_events, default_before,
+        "refusal must leave the default profile unchanged"
     );
 }
 
@@ -2989,7 +3007,147 @@ async fn feedback_697_unspecified_no_binding_falls_back_to_default() {
     );
 }
 
-/// #697 (d): an explicit `served_by_profile_id` always wins over a matching
+/// #1851: unknown IDs (including bare roles) use the caller's recall binding,
+/// and both feedback entry points persist the resolved attribution.
+#[tokio::test]
+async fn feedback_1851_unknown_profile_uses_recall_binding() {
+    use khive_storage::event::EventFilter;
+    use khive_storage::types::PageRequest;
+
+    for (verb, requested, selected_metadata) in [
+        ("brain.feedback", "researcher", false),
+        ("brain.auto_feedback", "unknown-profile-v1", false),
+        ("brain.auto_feedback", "researcher", true),
+    ] {
+        let (pack, rt) = make_pack_with_actor("bound-feedback-actor");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        for (setup_verb, params) in [
+            (
+                "brain.create_profile",
+                json!({"name": "actual-recall-v1", "consumer_kind": "recall"}),
+            ),
+            ("brain.activate", json!({"profile_id": "actual-recall-v1"})),
+            (
+                "brain.bind",
+                json!({"actor": "bound-feedback-actor", "profile_id": "actual-recall-v1", "consumer_kind": "recall"}),
+            ),
+        ] {
+            pack.dispatch(setup_verb, params, &registry, &token)
+                .await
+                .unwrap();
+        }
+        let before = pack.snapshot();
+        let mut params = json!({"target_id": target, "signal": "useful"});
+        if selected_metadata {
+            params["results"] = json!([{"id": target, "served_by_profile_id": requested}]);
+        } else {
+            params["served_by_profile_id"] = json!(requested);
+            params["results"] = json!([{"id": target}]);
+        }
+        if verb == "brain.feedback" {
+            params.as_object_mut().unwrap().remove("results");
+        } else {
+            params["query"] = json!("profile fallback");
+        }
+        let result = pack
+            .dispatch(verb, params, &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(result["served_by_profile_id"], "actual-recall-v1");
+        let after = pack.snapshot();
+        assert_eq!(after.balanced_recall, before.balanced_recall);
+        assert_eq!(after.profiles.len(), before.profiles.len());
+        assert!(!after.profiles.contains_key(requested));
+        assert_eq!(
+            after.profile_states["actual-recall-v1"].total_events,
+            before.profile_states["actual-recall-v1"].total_events + 1
+        );
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        let feedback: Vec<_> = events
+            .items
+            .iter()
+            .filter(|e| e.verb == "brain.feedback")
+            .collect();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(
+            feedback[0].payload["served_by_profile_id"],
+            "actual-recall-v1"
+        );
+        assert_eq!(feedback[0].payload["profile_resolution"], "binding");
+    }
+}
+
+/// An unknown explicit ID without a matching binding cannot train the default.
+#[tokio::test]
+async fn feedback_1851_unknown_unbound_profile_refuses_without_writes() {
+    use khive_storage::event::EventFilter;
+    use khive_storage::types::PageRequest;
+
+    for verb in ["brain.feedback", "brain.auto_feedback"] {
+        let (pack, rt) = make_pack_with_actor("unbound-feedback-actor");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        // Materialize the lazily loaded default before taking the no-write
+        // baseline; otherwise its construction timestamp changes on first dispatch.
+        pack.dispatch(
+            "brain.profile",
+            json!({"profile_id":"balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        let before = pack.snapshot();
+        let mut params =
+            json!({"target_id": target, "signal": "useful", "served_by_profile_id": "researcher"});
+        if verb == "brain.auto_feedback" {
+            params["results"] = json!([{"id": target}]);
+            params["query"] = json!("profile fallback");
+        }
+        let err = pack
+            .dispatch(verb, params, &registry, &token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::NotFound(message) if message.contains("researcher")),
+            "{err:?}"
+        );
+        let after = pack.snapshot();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!events.items.iter().any(|e| e.verb == "brain.feedback"));
+    }
+}
+
+/// #697 (d): a known explicit `served_by_profile_id` always wins over a matching
 /// actor binding.
 #[tokio::test]
 async fn feedback_697_explicit_profile_overrides_actor_binding() {
@@ -3735,7 +3893,7 @@ async fn brain_auto_feedback_full_id_rejects_conflicts_duplicates_and_malformed_
 
 #[tokio::test]
 async fn brain_auto_feedback_without_signal_abstains_without_writing() {
-    let (pack, rt) = make_pack();
+    let (pack, rt) = make_anonymous_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
     let target = create_test_entity(&rt, &token).await;
@@ -9000,7 +9158,8 @@ mod event_counts_tests {
             .expect("brain.event_counts must succeed");
 
         assert_eq!(result["counts_by_work_class"]["actor_turn"], json!(2));
-        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        // Default caller scope uses the canonical actor id, not the stored kind:id spelling.
+        let actor = &token.actor().id;
         assert_eq!(result["counts_by_actor"][actor.as_str()], json!(2));
         assert_eq!(result["counts_by_kind"]["phase_started"], json!(2));
     }
@@ -11063,6 +11222,283 @@ mod read_scope_tests {
     }
 }
 
+/// Anonymous explicit judgments must not train a shared default or a named
+/// profile. Implicit signals and caller abstention retain their admission rules.
+mod anonymous_feedback_admission_tests {
+    use super::*;
+
+    const EXPLICIT_SIGNALS: [&str; 6] = [
+        "useful",
+        "not_useful",
+        "wrong",
+        "explicit_positive",
+        "explicit_negative",
+        "correction",
+    ];
+
+    fn feedback_args(verb: &str, target: &str, signal: &str) -> Value {
+        let mut args = json!({"target_id": target, "signal": signal});
+        if verb == "brain.auto_feedback" {
+            args["query"] = json!("anonymous feedback admission");
+            args["results"] = json!([{"id": target}]);
+        }
+        args
+    }
+
+    /// Include live posteriors, the durable snapshot and both event stores so
+    /// refusal cannot append an audit record or silently change replay state.
+    async fn feedback_state(pack: &BrainPack, rt: &KhiveRuntime, token: &NamespaceToken) -> Value {
+        let durable = crate::persist::load_latest_snapshot(
+            rt.sql().as_ref(),
+            token.namespace().as_str(),
+            ENTITY_CACHE_CAPACITY,
+        )
+        .await
+        .expect("read durable brain snapshot");
+        let replay =
+            crate::persist::load_events_since(rt.sql().as_ref(), token.namespace().as_str(), 0)
+                .await
+                .expect("read brain replay log");
+        let public = rt
+            .events(token)
+            .expect("event store")
+            .query_events(
+                khive_storage::event::EventFilter {
+                    kinds: vec![khive_types::EventKind::FeedbackExplicit],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 1000,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("read public feedback events");
+        json!({
+            "live": pack.snapshot(),
+            "durable": durable,
+            "replay": replay.events,
+            "skipped_replay_rows": replay.quarantined.len(),
+            "public": public.items,
+        })
+    }
+
+    #[tokio::test]
+    async fn anonymous_explicit_feedback_refuses_all_signals_and_profiles_without_writes() {
+        let (pack, rt) = make_anonymous_pack();
+        let token = rt.authorize(Namespace::local()).expect("anonymous token");
+        assert!(token.actor().is_anonymous());
+        let registry = empty_registry();
+        let target = create_test_entity(&rt, &token).await;
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "admission-named", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("create custom profile");
+        pack.dispatch(
+            "brain.activate",
+            json!({"profile_id": "admission-named"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("activate custom profile");
+
+        // Seed real prior judgments so unchanged-state assertions also protect
+        // existing events and non-prior posteriors, not just an empty store.
+        let (_, attributed_rt) = make_pack();
+        let attributed_token = attributed_rt
+            .authorize(Namespace::local())
+            .expect("attributed seed token");
+        for profile in ["balanced-recall-v1", "admission-named"] {
+            pack.dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "served_by_profile_id": profile,
+                }),
+                &registry,
+                &attributed_token,
+            )
+            .await
+            .expect("attributed seed feedback");
+        }
+        let before = feedback_state(&pack, &rt, &token).await;
+        assert_eq!(before["public"].as_array().unwrap().len(), 2);
+
+        for verb in ["brain.feedback", "brain.auto_feedback"] {
+            for signal in EXPLICIT_SIGNALS {
+                for profile in [None, Some("balanced-recall-v1"), Some("admission-named")] {
+                    let mut args = feedback_args(verb, &target, signal);
+                    if let Some(profile) = profile {
+                        args["served_by_profile_id"] = json!(profile);
+                    }
+                    let error = pack
+                        .dispatch(verb, args, &registry, &token)
+                        .await
+                        .expect_err("anonymous explicit feedback must be refused");
+                    assert_anonymous_feedback_refusal(error);
+                    assert_eq!(
+                        feedback_state(&pack, &rt, &token).await,
+                        before,
+                        "refusal changed state: {verb}, {signal}, {profile:?}"
+                    );
+                }
+            }
+        }
+
+        // A full UUID avoids prefix resolution; caller admission must happen
+        // before target existence or named-profile resolution can decide it.
+        let missing_target = uuid::Uuid::new_v4().to_string();
+        for verb in ["brain.feedback", "brain.auto_feedback"] {
+            let mut args = feedback_args(verb, &missing_target, "correction");
+            args["served_by_profile_id"] = json!("missing-profile");
+            let error = pack
+                .dispatch(verb, args, &registry, &token)
+                .await
+                .expect_err("anonymous admission precedes existence checks");
+            assert_anonymous_feedback_refusal(error);
+        }
+        assert_eq!(feedback_state(&pack, &rt, &token).await, before);
+    }
+
+    #[tokio::test]
+    async fn configured_local_actor_explicit_feedback_is_refused_like_anonymous() {
+        // `actor.id = "local"` names the unattributed pool, not a caller.
+        let (pack, rt) = make_pack_with_actor("local");
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        assert!(
+            !token.actor().is_anonymous(),
+            "test setup: configured actor"
+        );
+        assert!(khive_runtime::actor_is_unattributed(token.actor()));
+        let registry = empty_registry();
+        let target = create_test_entity(&rt, &token).await;
+        // Seed one attributed judgment so the default profile is persisted;
+        // an unpersisted default is minted per snapshot with a fresh timestamp.
+        let (_, attributed_rt) = make_pack();
+        let attributed_token = attributed_rt
+            .authorize(Namespace::local())
+            .expect("attributed seed token");
+        pack.dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "served_by_profile_id": "balanced-recall-v1",
+            }),
+            &registry,
+            &attributed_token,
+        )
+        .await
+        .expect("attributed seed feedback");
+        let before = feedback_state(&pack, &rt, &token).await;
+        assert_eq!(before["public"].as_array().unwrap().len(), 1);
+        for verb in ["brain.feedback", "brain.auto_feedback"] {
+            for signal in EXPLICIT_SIGNALS {
+                let error = pack
+                    .dispatch(
+                        verb,
+                        feedback_args(verb, &target, signal),
+                        &registry,
+                        &token,
+                    )
+                    .await
+                    .expect_err("unattributed explicit feedback must be refused");
+                assert_anonymous_feedback_refusal(error);
+                assert_eq!(
+                    feedback_state(&pack, &rt, &token).await,
+                    before,
+                    "{verb} {signal}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_implicit_feedback_still_emits_and_trains_the_default_profile() {
+        for verb in ["brain.feedback", "brain.auto_feedback"] {
+            for signal in ["implicit_positive", "implicit_negative"] {
+                let (pack, rt) = make_anonymous_pack();
+                let token = rt.authorize(Namespace::local()).expect("anonymous token");
+                let registry = empty_registry();
+                let target = create_test_entity(&rt, &token).await;
+                let result = pack
+                    .dispatch(
+                        verb,
+                        feedback_args(verb, &target, signal),
+                        &registry,
+                        &token,
+                    )
+                    .await
+                    .expect("anonymous implicit feedback retains its existing admission");
+                assert_eq!(result["emitted"], json!(true));
+                assert_eq!(pack.snapshot().balanced_recall.total_events, 1);
+                let event_id = result["event_id"].as_str().unwrap().parse().unwrap();
+                let event = rt
+                    .events(&token)
+                    .expect("event store")
+                    .get_event(event_id)
+                    .await
+                    .expect("read implicit event")
+                    .expect("implicit event exists");
+                assert_eq!(event.actor, "anonymous:local");
+                assert_eq!(
+                    event.payload["served_by_profile_id"],
+                    json!("balanced-recall-v1")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attributed_explicit_feedback_without_profile_keeps_default_routing() {
+        // A configured actor id other than the unattributed pool name is
+        // attributed; the pool name "local" is refused (see the test above).
+        for actor in ["brain-test", "agent-x"] {
+            let (pack, rt) = make_pack_with_actor(actor);
+            let token = rt.authorize(Namespace::local()).expect("attributed token");
+            assert!(!token.actor().is_anonymous());
+            let registry = empty_registry();
+            let mut expected_total = 0;
+            for verb in ["brain.feedback", "brain.auto_feedback"] {
+                for signal in EXPLICIT_SIGNALS {
+                    let target = create_test_entity(&rt, &token).await;
+                    let result = pack
+                        .dispatch(
+                            verb,
+                            feedback_args(verb, &target, signal),
+                            &registry,
+                            &token,
+                        )
+                        .await
+                        .expect("attributed feedback can use the default profile");
+                    assert_eq!(result["emitted"], json!(true));
+                    expected_total += 1;
+                    assert_eq!(pack.snapshot().balanced_recall.total_events, expected_total);
+                    let event_id = result["event_id"].as_str().unwrap().parse().unwrap();
+                    let event = rt
+                        .events(&token)
+                        .expect("event store")
+                        .get_event(event_id)
+                        .await
+                        .expect("read attributed event")
+                        .expect("attributed event exists");
+                    assert_eq!(event.actor, format!("actor:{actor}"));
+                    assert_eq!(
+                        event.payload["served_by_profile_id"],
+                        json!("balanced-recall-v1")
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// #808: `brain.feedback`'s `FeedbackExplicit` event must carry the resolved
 /// caller identity (ADR-096 per-request identity), not the hardcoded literal
 /// `"brain"` it used to stamp regardless of who called it.
@@ -11152,7 +11588,7 @@ mod feedback_actor_tests {
         // silent, plausible-looking "brain" stand-in.
         let (pack, rt) = make_pack_with_actor(None);
         let token = rt.authorize(Namespace::local()).unwrap();
-        let actor = feedback_event_actor(&pack, &rt, &token, "useful").await;
+        let actor = feedback_event_actor(&pack, &rt, &token, "implicit_positive").await;
         assert_eq!(
             actor, "anonymous:local",
             "unresolved actor must fall back to an explicit label, never the literal \"brain\""
