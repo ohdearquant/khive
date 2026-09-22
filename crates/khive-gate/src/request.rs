@@ -7,6 +7,10 @@ use crate::{ActorRef, GateContext, GateValidationError};
 ///
 /// Its JSON fields are a stable policy-input contract; `verb` must be non-empty. See
 /// `crates/khive-gate/docs/api/policy-types.md`.
+/// `args` contains submitted arguments at the dispatch boundary, before handler
+/// canonicalization and kind hooks. A gate may inspect these values, but must
+/// not treat them as the effective values a handler will execute. Policy that
+/// requires effective values belongs in the handler after its normalization.
 #[derive(Clone, Debug, Serialize)]
 pub struct GateRequest {
     pub actor: ActorRef,

@@ -114,7 +114,8 @@ the canonical helper was updated but the inline copy wasn't.
 ## WAL checkpoint under the write queue
 
 `run_sync`'s WAL truncate-checkpoint must bypass the write queue's
-per-request `BEGIN IMMEDIATE` wrapping via `execute_script_top_level` — a
+per-request `BEGIN IMMEDIATE` wrapping via
+`execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)` — a
 checkpoint cannot complete while a transaction is open on the same
 connection. Ordinary `execute_script` is the old, broken call shape: under
 `KHIVE_WRITE_QUEUE=1` it wraps the statement in `BEGIN IMMEDIATE`, which

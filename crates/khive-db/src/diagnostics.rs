@@ -827,6 +827,13 @@ pub struct WriterContentionDiagnostics {
     pub audit_append_failures: Option<u64>,
     /// Why `audit_append_failures` is unavailable to this caller.
     pub audit_append_failures_unavailable_reason: Option<String>,
+    /// Process-wide obligation-bearing audit commit failures, including a
+    /// denial's audit failure even though the denial already refuses the call.
+    /// This counts failed producer submissions, not failed batch generations;
+    /// do not add it to `audit_batch_flush_failures` as a disjoint total.
+    pub audit_obligation_append_failures: Option<u64>,
+    /// Why the runtime-owned obligation counter is unavailable to this caller.
+    pub audit_obligation_append_failures_unavailable_reason: Option<String>,
     /// Accepted audit-batch generations that reached a terminal non-commit
     /// outcome after retry, including driver death; excludes preflight and
     /// admission rejection. `None` for a direct `khive-db` caller, or when no
@@ -962,6 +969,11 @@ impl WriterContentionDiagnostics {
             audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
                 "runtime audit instrumentation was not supplied to khive-db diagnostics".to_string()
             }),
+            audit_obligation_append_failures: None,
+            audit_obligation_append_failures_unavailable_reason: Some(
+                "runtime obligation audit instrumentation was not supplied to khive-db diagnostics"
+                    .to_string(),
+            ),
             audit_batch_flush_failures: runtime_audit_batch_metrics.map(|m| m.flush_failures),
             audit_batch_flush_failures_unavailable_reason: runtime_audit_batch_metrics
                 .is_none()
@@ -2568,6 +2580,15 @@ mod tests {
         );
         assert!(report.size_composition_error.is_none());
         assert!(report.writer_contention.audit_append_failures.is_none());
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures
+            .is_none());
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason
+            .is_some());
+        assert!(json["writer_contention"]["audit_obligation_append_failures"].is_null());
         assert!(
             report
                 .writer_contention

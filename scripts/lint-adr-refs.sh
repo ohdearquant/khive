@@ -782,6 +782,7 @@ FIXTURE
 
 if [ "${1:-}" = "--self-test" ]; then
     self_test
+    deno run --config "$SCRIPT_DIR/adr-anchors/deno.json" "$SCRIPT_DIR/adr-anchors/lint.mjs" --self-test
     exit $?
 fi
 
@@ -1140,3 +1141,7 @@ print(
     f"{reference_count} titled reference(s) OK"
 )
 PY
+
+# Parse rendered CommonMark headings/links and validate local ADR fragments.
+# The anchor module runs positive and deliberately broken fixtures on every call.
+deno run --config "$SCRIPT_DIR/adr-anchors/deno.json" --allow-read="$ROOT" "$SCRIPT_DIR/adr-anchors/lint.mjs" "$ROOT"

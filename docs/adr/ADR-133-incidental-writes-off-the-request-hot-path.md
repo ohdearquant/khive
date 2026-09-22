@@ -790,7 +790,11 @@ carries `domain_disposition` with exactly one of three values:
 
 Three values, not two, because a caller reads an absent or two-valued field as `not_committed`
 exactly when the runtime could not tell, which reinstates the defect with more confidence attached.
-The field is present on every error object; absence is a defect, not a fourth state. An aborted
+The field is present on every error object; absence is a defect, not a fourth state. In addition,
+every failed per-op entry carries the same required `domain_disposition` beside `ok: false`
+(#2951). Both fields come from the canonical disposition; promoting arbitrary input metadata into
+commit evidence is forbidden. This additive envelope field preserves `ok`, audit-obligation
+failure semantics and summary counts. An aborted
 chain entry carries no error object today (`ok: false`, `aborted: true`, `message`); it carries
 `domain_disposition: "not_committed"` at the entry level.
 

@@ -479,7 +479,7 @@ fn spawn_email_channel_loops(
                         {
                             tracing::error!(
                                 error = %error,
-                                "email polling disabled: quarantine blob storage is unavailable"
+                                "email polling disabled: quarantine storage readiness check failed"
                             );
                             return;
                         }
@@ -1861,7 +1861,7 @@ fn spawn_telegram_channel_loops(
                             {
                                 tracing::error!(
                                     error = %error,
-                                    "telegram polling disabled: quarantine blob storage is unavailable"
+                                    "telegram polling disabled: quarantine storage readiness check failed"
                                 );
                                 return;
                             }
