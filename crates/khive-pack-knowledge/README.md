@@ -79,6 +79,14 @@ namespace-agnostic and retains the atom's namespace. Ordinary slug rows still
 require at least 20 words of content. The two forms can share an atomic batch:
 all inputs and targets are checked before any write, and writes retain input order.
 
+Validation and secret-gate refusals reject the entire batch without writing any
+atom, including otherwise valid siblings. A secret refusal retains its typed
+`SecretDetected` error and identifies the zero-based `atoms[index].field` in the
+submitted payload. Slugs are not echoed because a slug can itself contain the
+refused text, and multiple input rows can share a slug. Correct the identified row
+and retry the batch, or submit selected rows separately; the batch verb does not
+return per-record partial commits.
+
 Programmatic embedding is exposed via a small Rust API for the `kkernel reindex`
 binary, independent of the MCP surface:
 
