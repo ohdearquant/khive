@@ -2,6 +2,7 @@
 
 use khive_storage::types::{Edge, LinkId, SqlValue};
 use khive_storage::{EdgeRelation, SqlStatement};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::atomic_message::{
@@ -10,6 +11,39 @@ use crate::atomic_message::{
 use crate::atomic_plan::{AffectedRowGuard, PlanStatement};
 use crate::atomic_runner::AtomicOpPlan;
 use crate::{KhiveRuntime, RuntimeError, RuntimeResult};
+
+/// The effective tags for note creation, retaining their source so writers can
+/// preserve the original properties when no top-level override is needed.
+pub enum EffectiveCreateTags<'a> {
+    TopLevel(&'a [String]),
+    Properties(Option<&'a Value>),
+}
+
+impl EffectiveCreateTags<'_> {
+    /// Project only the selected tags for a kind-specific validator. Property
+    /// values remain untyped here; each note kind owns their validation.
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::TopLevel(tags) => json!(tags),
+            Self::Properties(tags) => tags.cloned().unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// Resolve create-tag precedence once for writers and kind hooks.
+///
+/// Nonempty top-level tags override `properties.tags`; absent, null (already
+/// deserialized as `None`), or empty top-level tags preserve that property.
+/// This differs from update semantics, where an empty tag array clears tags.
+pub fn effective_create_tags<'a>(
+    tags: Option<&'a [String]>,
+    properties: Option<&'a Value>,
+) -> EffectiveCreateTags<'a> {
+    match tags {
+        Some(tags) if !tags.is_empty() => EffectiveCreateTags::TopLevel(tags),
+        _ => EffectiveCreateTags::Properties(properties.and_then(|value| value.get("tags"))),
+    }
+}
 
 pub(crate) enum KeyPublication {
     AtInsert,

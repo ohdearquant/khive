@@ -4737,6 +4737,227 @@ async fn candidate_created_at_id_seek_index_cannot_steal_pinned_unread_plan() {
     assert!(!plan.contains("idx_notes_kind_created_seek"), "{plan}");
 }
 
+// The delegated count predicate is assembled by comm's inbox count path. These
+// tests call the production WHERE/bind/index-pin builder; only the constant
+// COUNT/SELECT 1/LIMIT wrapper below repeats the bounded-count method's wrapper.
+fn typed_recipient_unread_filter() -> NoteFilter {
+    use khive_storage::note::PropertyFilter;
+
+    NoteFilter {
+        kind: Some("message".into()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".into()),
+            },
+            PropertyFilter {
+                json_path: "$.read".into(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".into()),
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".into(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("text".into()),
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".into(),
+                op: FilterOp::EqOrMissingIndexed,
+                value: SqlValue::Text("{}".into()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn typed_recipient_unread_pin_requires_complete_exact_shape() {
+    const TYPED: &str = " INDEXED BY idx_notes_unread_probe_recipient_type_direction WHERE ";
+    const UNTYPED: &str = " INDEXED BY idx_notes_unread_probe_recipient_direction WHERE ";
+    let filter = typed_recipient_unread_filter();
+    let (clause, params) = build_note_filter_read_clause("default", &filter).unwrap();
+    assert!(clause.starts_with(TYPED), "{clause}");
+    assert!(
+        clause.contains("json_type(properties, '$.to_actor') = ?4"),
+        "{clause}"
+    );
+    assert!(
+        clause.contains("ifnull(json_extract(properties, '$.to_actor'), '') = ?5"),
+        "{clause}"
+    );
+    assert_eq!(
+        params.len(),
+        5,
+        "the unread partial predicate stays literal"
+    );
+
+    // Removing only the typed pin arm must fail the first assertion above.
+    // Own/legacy readers and other JSON-type predicates keep their old pin.
+    let mut untyped = filter.clone();
+    untyped.property_filters.remove(2);
+    let (clause, _) = build_note_filter_read_clause("default", &untyped).unwrap();
+    assert!(clause.starts_with(UNTYPED), "{clause}");
+    let mut non_text = filter.clone();
+    non_text.property_filters[2].value = SqlValue::Text("object".into());
+    let (clause, _) = build_note_filter_read_clause("default", &non_text).unwrap();
+    assert!(clause.starts_with(UNTYPED), "{clause}");
+    let mut legacy = filter.clone();
+    legacy.property_filters[3].op = FilterOp::EqOrLegacyIndexed;
+    let (clause, _) = build_note_filter_read_clause("default", &legacy).unwrap();
+    assert!(clause.starts_with(UNTYPED), "{clause}");
+
+    let mut all_status = filter.clone();
+    all_status.property_filters.remove(1);
+    let (clause, _) = build_note_filter_read_clause("default", &all_status).unwrap();
+    assert!(
+        clause.starts_with(" INDEXED BY idx_notes_message_recipient_direction WHERE "),
+        "{clause}"
+    );
+    let mut no_direction = filter.clone();
+    no_direction.property_filters.remove(0);
+    let (clause, _) = build_note_filter_read_clause("default", &no_direction).unwrap();
+    assert!(clause.starts_with(" WHERE "), "{clause}");
+
+    // The bound type metadata alone is insufficient: an equality buried in an
+    // OR branch cannot constrain the type seek key of every qualifying row.
+    let (where_sql, _) = build_note_filter_where("default", &filter).unwrap();
+    let unsafe_where = where_sql.replace(
+        "json_type(properties, '$.to_actor') = ?4",
+        "(json_type(properties, '$.to_actor') = ?4 OR 1 = 1)",
+    );
+    assert_eq!(
+        comm_filter_index_clause(&filter, &unsafe_where),
+        " INDEXED BY idx_notes_unread_probe_recipient_direction"
+    );
+}
+
+#[tokio::test]
+async fn typed_recipient_unread_count_seeks_type_recipient_and_direction() {
+    let store = setup_memory_store();
+    let mut notes = vec![make_note_with_props(
+        "default",
+        "message",
+        "string recipient",
+        serde_json::json!({"direction":"inbound", "to_actor":"{}", "read":false}),
+    )];
+    for i in 0..128 {
+        for (label, properties) in [
+            (
+                "object alias",
+                serde_json::json!({"direction":"inbound", "to_actor":{}, "read":false}),
+            ),
+            (
+                "other recipient",
+                serde_json::json!({"direction":"inbound", "to_actor":"other", "read":false}),
+            ),
+            (
+                "outbound",
+                serde_json::json!({"direction":"outbound", "to_actor":"{}", "read":false}),
+            ),
+            (
+                "read",
+                serde_json::json!({"direction":"inbound", "to_actor":"{}", "read":true}),
+            ),
+            (
+                "legacy",
+                serde_json::json!({"direction":"inbound", "read":false}),
+            ),
+        ] {
+            notes.push(make_note_with_props(
+                "default",
+                "message",
+                &format!("{label} {i}"),
+                properties,
+            ));
+        }
+    }
+    store.upsert_notes(notes).await.unwrap();
+    {
+        let writer = store.pool.writer().unwrap();
+        writer.conn().execute_batch(
+            "CREATE INDEX idx_notes_kind_created_seek ON notes(namespace, kind, created_at DESC, id ASC) WHERE deleted_at IS NULL;"
+        ).unwrap();
+    }
+    let filter = typed_recipient_unread_filter();
+    let counts = store
+        .count_notes_filtered_bounded_in_snapshot("default", std::slice::from_ref(&filter), 1)
+        .await
+        .unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].count, 1);
+    assert_eq!(counts[0].cap, 1);
+    assert!(
+        !counts[0].saturated,
+        "malformed aliases must not saturate the real count"
+    );
+
+    let (where_sql, mut params) = build_note_filter_read_clause("default", &filter).unwrap();
+    assert!(
+        where_sql.starts_with(" INDEXED BY idx_notes_unread_probe_recipient_type_direction WHERE "),
+        "{where_sql}"
+    );
+    params.push(Box::new(1001_i64));
+    let sql = format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM notes{where_sql} LIMIT ?{})",
+        params.len()
+    );
+    {
+        let reader = store.pool.reader().unwrap();
+        let plan = plan_details(reader.conn(), &sql, &params);
+        let typed_seek = plan
+            .lines()
+            .find(|line| {
+                line.contains("SEARCH notes")
+                    && line.contains("idx_notes_unread_probe_recipient_type_direction")
+            })
+            .unwrap_or_else(|| panic!("typed index must serve a seek: {plan}"));
+        assert!(
+            typed_seek.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=? AND <expr>=?"),
+            "type, recipient and direction must all be seek keys: {plan}"
+        );
+        assert!(!plan.contains("idx_notes_kind_created_seek"), "{plan}");
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|value| value.as_ref()).collect();
+        let count: i64 = reader
+            .conn()
+            .query_row(&sql, refs.as_slice(), |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the explained statement must execute with its real binds"
+        );
+    }
+
+    // ADR-187 requires a missing pinned index to fail loudly. It must not
+    // quietly scan a competing index after the schema invariant is broken.
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch("DROP INDEX idx_notes_unread_probe_recipient_type_direction")
+            .unwrap();
+        let error = writer
+            .conn()
+            .prepare(&sql)
+            .expect_err("missing pin must refuse preparation");
+        assert!(
+            error
+                .to_string()
+                .contains("idx_notes_unread_probe_recipient_type_direction"),
+            "{error}"
+        );
+    }
+    let mut untyped = filter;
+    untyped.property_filters.remove(2);
+    let (old_sql, old_params) = listing_sql_and_params(&untyped);
+    let old_plan = plan_details(store.pool.reader().unwrap().conn(), &old_sql, &old_params);
+    assert!(
+        old_plan.contains("idx_notes_unread_probe_recipient_direction"),
+        "{old_plan}"
+    );
+}
+
 /// khive#2392: narrowing `idx_notes_task_status`/`idx_notes_task_assignee`'s
 /// partial `WHERE` to `kind = 'task' AND deleted_at IS NULL` would shrink the
 /// index, but every query that would use it binds `kind` as a parameter

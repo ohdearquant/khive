@@ -52,7 +52,56 @@ are both non-zero.
   policy engine handing back malformed JSON fails the same way a caller building the
   struct directly would.
 
-## Where this sits
+## Built-in caller restrictions
+
+The optional configuration table combines caller enrollment with a restriction
+on user-requested domain mutations:
+
+```toml
+[gate]
+granted_actors = ["service:writer", "service:duty"]
+grant_unattributed = false
+deny_writes_for = ["*:duty"]
+```
+
+Enrollment is required first. `deny_writes_for` never enrolls an actor: matched,
+enrolled callers may execute only explicitly reviewed `Read` operations from the
+[operation table](docs/api/operation-access.md). Every other operation is denied,
+including unknown or unclassified mounted/plugin names, mutation aliases, `comm.read`,
+`comm.mark_read`, and broad-token `authorize`. Both runtime authorization methods
+check `authorize`; an `authorize.visible` read check cannot grant the primary
+write-capable token. Ordinary approved dispatch still works through its concrete
+verb check.
+
+Patterns match the complete effective actor ID, case-sensitively. `*` is the only
+wildcard and matches zero or more characters, including colons. Every other
+character is literal, including Unicode, `?`, brackets, slash and backslash;
+there is no escaping, trimming, case folding, or implicit actor hierarchy.
+Each pattern must be nonblank and at most 256 UTF-8 bytes; at most 256 entries are
+accepted. An anonymous caller is enrolled only by `grant_unattributed`, and its
+fallback ID `local` is then subject to the same pattern restriction.
+
+Omitting `[gate]` preserves the programmatic base gate (normally `AllowAllGate`).
+An empty table still denies all callers. Omitting `deny_writes_for`, or setting
+it to `[]`, preserves the existing enrollment-only behavior and fingerprint.
+Nonempty restrictions fingerprint the sorted, deduplicated patterns and the
+classifier version, so a warm daemon cannot reuse a different effective policy.
+Invalid files fail validation; an invalid programmatic policy fails every gate
+check closed. `CallerEnrollmentGate::new` remains enrollment-only; the additive
+`with_write_denials` constructor installs the restriction.
+
+This is a dispatch policy, not a storage-level read-only mode. Read handlers can
+still persist normal audit, telemetry, cache, and maintenance effects. In
+particular, `memory.recall` returns results and can persist `RecallExecuted`,
+while its separately gated `brain.record_serve` call is denied for a restricted
+caller; the recall serve ledger is therefore not populated by that call. No
+internal privilege bypass is added. Already-held tokens are not revoked, and
+direct storage calls using them are not rechecked. Actor IDs are resolved labels;
+this setting does not authenticate a label or prevent a same-UID operator from
+changing configuration or identity. `help=true` retains its existing pure
+introspection path before the operation gate.
+
+## Runtime placement
 
 `khive-gate` sits below `khive-runtime`, which holds the `RuntimeConfig.gate: GateRef`
 field consulted before every verb dispatch and defaults it to `AllowAllGate`. It has no

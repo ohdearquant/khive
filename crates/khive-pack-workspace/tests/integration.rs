@@ -87,6 +87,113 @@ async fn create_workspace_rejects_missing_schema_version() {
 }
 
 #[tokio::test]
+async fn bulk_workspace_owner_validation_preserves_atomic_and_per_item_results() {
+    for atomic in [true, false] {
+        for properties in [
+            None,
+            Some(json!({})),
+            Some(json!({"schema_version": null})),
+            Some(json!({"schema_version": "1"})),
+            Some(json!({"schema_version": 1.5})),
+            Some(json!({"schema_version": true})),
+            Some(json!({"schema_version": []})),
+        ] {
+            let runtime = rt();
+            let registry = build_registry(runtime.clone());
+            let mut invalid = json!({
+                "kind": "entity", "entity_kind": "workspace", "name": "invalid workspace",
+            });
+            if let Some(properties) = properties {
+                invalid["properties"] = properties;
+            }
+            let response = registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "atomic": atomic,
+                        "verbose": true,
+                        "items": [
+                            {"kind": "workspace", "name": "valid workspace", "properties": {"schema_version": 1}},
+                            invalid,
+                        ],
+                    }),
+                )
+                .await;
+            let expected_count = if atomic {
+                let error = response.expect_err("owner refusal rejects the atomic batch");
+                assert!(error.to_string().contains("schema_version"), "{error}");
+                0
+            } else {
+                let response = response.expect("owner refusal is a per-item failure");
+                assert_eq!(response["attempted"], 2, "{response}");
+                assert_eq!(response["created"], 1, "{response}");
+                assert_eq!(response["skipped"], 0, "{response}");
+                assert_eq!(response["failed"], 1, "{response}");
+                assert_eq!(response["errors"].as_array().unwrap().len(), 1);
+                assert_eq!(response["errors"][0]["index"], 1);
+                assert!(response["errors"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("schema_version"));
+                assert_eq!(response["entities"].as_array().unwrap().len(), 1);
+                assert_eq!(response["entities"][0]["name"], "valid workspace");
+                1
+            };
+            let listed = registry
+                .dispatch("list", json!({"kind": "entity"}))
+                .await
+                .unwrap();
+            assert_eq!(listed["items"].as_array().unwrap().len(), expected_count);
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .text(&token)
+                    .unwrap()
+                    .count(khive_storage::TextFilter::default())
+                    .await
+                    .unwrap(),
+                expected_count as u64,
+                "entity and FTS writes must share the same outcome"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bulk_workspace_owner_validation_accepts_both_kind_spellings() {
+    for atomic in [true, false] {
+        let registry = build_registry(rt());
+        let response = registry
+            .dispatch(
+                "create",
+                json!({
+                    "atomic": atomic,
+                    "verbose": true,
+                    "items": [
+                        {"kind": "workspace", "name": "first", "properties": {"schema_version": 0}},
+                        {"kind": "entity", "entity_kind": "workspace", "name": "second", "properties": {"schema_version": 2}},
+                    ],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["attempted"], 2);
+        assert_eq!(response["created"], 2);
+        assert_eq!(response["failed"], 0);
+        for (index, version) in [0, 2].into_iter().enumerate() {
+            let entity = registry
+                .dispatch("get", json!({"id": response["entities"][index]["id"]}))
+                .await
+                .unwrap();
+            assert_eq!(entity["kind"], "workspace");
+            assert_eq!(entity["properties"]["schema_version"], version);
+        }
+    }
+}
+
+#[tokio::test]
 async fn create_workspace_rejects_missing_name() {
     let registry = build_registry(rt());
     let err = registry

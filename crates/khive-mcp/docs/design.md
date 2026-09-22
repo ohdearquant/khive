@@ -21,7 +21,15 @@ decisions and rationale.
 - `status` is `"partial"` when `summary.failed` or `summary.aborted` is non-zero;
   callers must not infer full success solely from the absence of an RPC-level error.
 - Per-op failures do not abort siblings in Parallel mode; they do abort remaining
-  ops in Chain mode (reported as `{"ok": false, "aborted": true}`).
+  ops in Chain mode (reported as `{"ok": false, "aborted": true, "domain_disposition": "not_committed"}`).
+- Every failed per-op entry carries `domain_disposition` beside `ok: false`, with
+  exactly `committed`, `not_committed`, or `unknown`. Non-aborted entries carry the
+  same value at `error.domain_disposition`; both are emitted by `failure_entry`
+  from the canonical dispatch/error provenance. Error strings or caller-supplied
+  metadata cannot establish a committed outcome. Frame-budget omission preserves
+  the disposition and counts the extra entry field in its serialized-byte budget.
+  A committed domain mutation whose required audit append failed remains a failed
+  op; callers must inspect its disposition before considering a retry (#2951).
 - `comm.read` and `comm.mark_read` are state-mutating acknowledgements, not
   dependencies on sibling delivery operations. In Parallel mode they may commit
   even when a sibling `comm.send` or `comm.reply` fails. Callers that need the

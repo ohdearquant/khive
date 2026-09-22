@@ -1101,7 +1101,22 @@ fn comm_filter_index_clause(filter: &NoteFilter, where_sql: &str) -> &'static st
     if terms.contains(
         &"(json_type(properties, '$.read') IS NULL OR json_type(properties, '$.read') != 'true')",
     ) {
-        " INDEXED BY idx_notes_unread_probe_recipient_direction"
+        // Delegated reads require an exact, string-typed recipient. Match both
+        // whole compiler-emitted terms and the bound type value; legacy/own
+        // shapes retain the existing ADR-187 pin.
+        let typed_exact_recipient =
+            equality("ifnull(json_extract(properties, '$.to_actor'), '') = ")
+                && equality("json_type(properties, '$.to_actor') = ")
+                && filter.property_filters.iter().any(|property| {
+                    property.json_path == "$.to_actor"
+                        && matches!(property.op, FilterOp::JsonTypeEq)
+                        && matches!(&property.value, SqlValue::Text(value) if value == "text")
+                });
+        if typed_exact_recipient {
+            " INDEXED BY idx_notes_unread_probe_recipient_type_direction"
+        } else {
+            " INDEXED BY idx_notes_unread_probe_recipient_direction"
+        }
     } else {
         " INDEXED BY idx_notes_message_recipient_direction"
     }

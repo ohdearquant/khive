@@ -38,6 +38,8 @@ pub(crate) struct DeliveredParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxParams {
     #[serde(default)]
+    pub mailbox_actor: Option<String>,
+    #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub kind: Option<String>,
@@ -123,6 +125,8 @@ pub(crate) struct ReplyParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ThreadParams {
+    #[serde(default)]
+    pub mailbox_actor: Option<String>,
     /// Thread root ID: accepts either an 8-char short prefix or a full UUID.
     /// Returns all messages whose `properties.thread_id` matches this value,
     /// plus the originating message itself, in chronological order.

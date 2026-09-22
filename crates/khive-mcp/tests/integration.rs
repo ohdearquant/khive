@@ -7670,7 +7670,7 @@ async fn issue2757_invalid_content_missing_note_and_unknown_fields_are_distinct(
     let missing_envelope: Value = serde_json::from_str(&first_text(&response))?;
     let missing_error = &missing_envelope["results"][0]["error"];
     assert_eq!(missing_envelope["results"][0]["ok"], false);
-    assert_eq!(missing_error["kind"], "runtime_error");
+    assert_eq!(missing_error["kind"], "not_found");
     assert!(missing_error["message"]
         .as_str()
         .unwrap()

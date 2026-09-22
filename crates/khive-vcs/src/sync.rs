@@ -939,7 +939,7 @@ async fn checkpoint_wal(runtime: &KhiveRuntime) -> Result<()> {
     // which would make this call silently no-op the checkpoint (the subsequent
     // rename above would then lose data — see the comment at the call site).
     writer
-        .execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
+        .execute_script_top_level(khive_storage::TopLevelMaintenance::WalCheckpointTruncate)
         .await?;
     Ok(())
 }
@@ -2830,7 +2830,7 @@ mod tests {
 // construction hardcodes `PoolConfig::default()`), so — mirroring the
 // `memory.vacuum` regression test in khive-pack-memory's `prune.rs` — this
 // drives the underlying mechanism directly at the `SqlBridge` level: the same
-// `execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);")` call that
+// `execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)` call that
 // `checkpoint_wal` makes, over a `PoolConfig { write_queue_enabled: Some(true), .. }`
 // literal (no env var mutation, no cross-test race).
 #[cfg(test)]
@@ -2859,7 +2859,7 @@ mod checkpoint_wal_write_queue_tests {
 
         let mut writer = sql.writer().await.expect("writer handle");
         let result = writer
-            .execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
+            .execute_script_top_level(khive_storage::TopLevelMaintenance::WalCheckpointTruncate)
             .await;
 
         assert!(
