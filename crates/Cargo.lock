@@ -2591,6 +2591,7 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "libc",
  "regex",
  "reqwest 0.12.28",
  "serde",

@@ -110,116 +110,6 @@ async fn ingest_disk_file(
     Ok(settled.id)
 }
 
-/// Refuse visible symlink components before resolving an absolute path.
-/// This path-based check still races with replacement before a later open;
-/// it is not descriptor-based confinement. Callers retain the checked
-/// canonical path instead of opening the original spelling again.
-fn canonical_or_refuse(path: &Path, what: &str) -> Result<std::path::PathBuf, RuntimeError> {
-    let mut prefix = std::path::PathBuf::new();
-    for component in path.components() {
-        prefix.push(component.as_os_str());
-        let metadata = std::fs::symlink_metadata(&prefix).map_err(|error| {
-            RuntimeError::from(Refusal::new(
-                "ingest_path_unresolvable",
-                format!(
-                    "web.ingest: cannot inspect {what} {}: {error}",
-                    prefix.display()
-                ),
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(RuntimeError::from(Refusal::new(
-                "ingest_symlink_refused",
-                format!(
-                    "web.ingest: {what} contains a symbolic link at {}",
-                    prefix.display()
-                ),
-            )));
-        }
-    }
-    std::fs::canonicalize(path).map_err(|error| {
-        RuntimeError::from(Refusal::new(
-            "ingest_path_unresolvable",
-            format!(
-                "web.ingest: cannot resolve {what} {}: {error}",
-                path.display()
-            ),
-        ))
-    })
-}
-
-/// Confines disk ingest to the operator's configured `[web] read_roots`.
-/// Refuses when the setting is unset (fail closed) or when the canonicalized
-/// source directory falls under none of the canonicalized configured roots.
-/// Comparison is by path COMPONENT (`Path::starts_with`), never by string
-/// prefix, so `/srv/web` does not contain `/srv/web-evil`.
-fn confine_to_read_roots(
-    cfg: &khive_runtime::engine_config::WebSectionConfig,
-    root_path: &Path,
-) -> Result<std::path::PathBuf, RuntimeError> {
-    if cfg.read_roots.is_empty() {
-        return Err(RuntimeError::from(Refusal::new(
-            "ingest_disk_no_read_roots",
-            "web.ingest: disk ingest is refused because [web] read_roots is unset; \
-             configure at least one root to allow it",
-        )));
-    }
-    let canonical_root = canonical_or_refuse(root_path, "the ingest source")?;
-    let contained = cfg.read_roots.iter().any(|configured| {
-        canonical_or_refuse(Path::new(configured), "a configured read root")
-            .map(|canonical_configured| canonical_root.starts_with(&canonical_configured))
-            .unwrap_or(false)
-    });
-    if !contained {
-        return Err(RuntimeError::from(Refusal::new(
-            "ingest_source_outside_read_roots",
-            format!(
-                "web.ingest: {} is outside every configured [web] read_roots entry",
-                root_path.display()
-            ),
-        )));
-    }
-    Ok(canonical_root)
-}
-
-fn walk_files(canonical_root: &Path) -> Result<Vec<std::path::PathBuf>, RuntimeError> {
-    let mut out = Vec::new();
-    let mut stack = vec![canonical_root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|error| {
-            RuntimeError::InvalidInput(format!(
-                "web.ingest: cannot read {}: {error}",
-                dir.display()
-            ))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| RuntimeError::Internal(error.to_string()))?;
-            let path = entry.path();
-            // Check each entry and retain only its canonical path for later
-            // traversal/read. This still has a check/open race, documented
-            // on canonical_or_refuse; no descriptor guarantee is implied.
-            let canonical_entry = canonical_or_refuse(&path, "a path under the ingest source")?;
-            if !canonical_entry.starts_with(canonical_root) {
-                return Err(RuntimeError::from(Refusal::new(
-                    "ingest_symlink_escapes_root",
-                    format!(
-                        "web.ingest: {} resolves to {}, outside the ingest root — refused",
-                        path.display(),
-                        canonical_entry.display()
-                    ),
-                )));
-            }
-            if canonical_entry.is_dir() {
-                stack.push(canonical_entry);
-            } else {
-                out.push(canonical_entry);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
 async fn ingest_disk(
     pack: &WebPack,
     token: &NamespaceToken,
@@ -228,35 +118,33 @@ async fn ingest_disk(
     origin: &str,
     limit: u32,
 ) -> Result<Value, RuntimeError> {
+    ingest_disk_before_open(pack, token, cfg, root, origin, limit, &mut |_| {}).await
+}
+
+async fn ingest_disk_before_open(
+    pack: &WebPack,
+    token: &NamespaceToken,
+    cfg: &khive_runtime::engine_config::WebSectionConfig,
+    root: &str,
+    origin: &str,
+    limit: u32,
+    before_open: &mut (dyn FnMut(&Path) + Send),
+) -> Result<Value, RuntimeError> {
     let runtime = &pack.runtime;
     let origin_url = Url::parse(origin)
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid origin: {error}")))?;
     let canonical_origin = identity::canonicalize(origin_url.clone());
-    let root_path = Path::new(root);
-    let canonical_root = confine_to_read_roots(cfg, root_path)?;
-    if !canonical_root.is_dir() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "web.ingest: {root:?} is not a directory"
-        )));
-    }
-    let files = walk_files(&canonical_root)?;
+    let files = crate::confinement::open_files(cfg, Path::new(root), limit, before_open)?;
     let site_id = crate::fetch::canonical_site(runtime, token, &canonical_origin).await?;
     let mut minted = Vec::new();
-    for path in files.into_iter().take(limit as usize) {
-        let relative = path
-            .strip_prefix(&canonical_root)
-            .map_err(|error| RuntimeError::Internal(error.to_string()))?
+    for file in files {
+        let relative = file
+            .relative
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let bytes = std::fs::read(&path).map_err(|error| {
-            RuntimeError::Internal(format!(
-                "web.ingest: cannot read {}: {error}",
-                path.display()
-            ))
-        })?;
+        let bytes = file.read()?;
         let id = ingest_disk_file(runtime, token, &canonical_origin, &relative, bytes).await?;
-        pack.handle_extract(token, json!({ "id": id, "kinds": ["links"] }))
-            .await?;
+        pack.handle_extract(token, json!({ "id": id })).await?;
         minted.push(id.to_string());
     }
     Ok(json!({ "mode": "disk", "site": site_id.to_string(), "ingested": minted }))
@@ -292,7 +180,7 @@ async fn ingest_urls(
     crawl(pack, token, urls, depth, limit, &fetch_one).await
 }
 
-/// The crawl proper: queue, visited set, per-address fetch, `links`
+/// The crawl proper: queue, visited set, per-address fetch, applicable
 /// extraction on each persisted row, and the `links_to` walk that feeds the
 /// next level. `fetch_one` is the only side of it that reaches the network,
 /// which is what lets a test drive the whole crawl against a local listener
@@ -337,9 +225,7 @@ where
         };
         ingested.push(id_str.to_string());
 
-        let extract_reply = pack
-            .handle_extract(token, json!({ "id": id_str, "kinds": ["links"] }))
-            .await;
+        let extract_reply = pack.handle_extract(token, json!({ "id": id_str })).await;
         if level < depth {
             if let Ok(extract_reply) = extract_reply {
                 let _ = extract_reply;
@@ -490,6 +376,7 @@ mod tests {
         path.canonicalize().unwrap().to_str().unwrap().to_string()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn graph_snapshot(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
@@ -552,6 +439,7 @@ mod tests {
     // directly. `a5_literal_http_served_tree_parity...` below is the fuller
     // form: the same tree served over a real HTTP listener, compared
     // against this disk ingest's own output rather than a recomputed id.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a5_disk_ingest_mints_ids_matching_the_declared_origin() {
         let tree = tempfile::tempdir().expect("tree");
@@ -643,6 +531,7 @@ mod tests {
     // Serves a small tree over HTTP/1.1 on a loopback port: each request's
     // path selects the body, unknown paths answer 404. Accepts any number of
     // connections, one request each.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn spawn_http_tree_server(files: std::collections::HashMap<String, Vec<u8>>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -686,6 +575,7 @@ mod tests {
     // The per-address fetch handed to the crawl in the test above: real bytes
     // off the loopback listener, settled under the declared address through
     // the same `settle_content` path `web.fetch` uses.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn served_fetch<'a>(
         runtime: &'a KhiveRuntime,
         token: &'a NamespaceToken,
@@ -733,8 +623,9 @@ mod tests {
 
     // A5 compares independent databases. Only the HTTP fetch is supplied:
     // it reads real local HTTP bytes, then settles under the declared origin.
-    // Both arms use the production links extraction, with receipts excluded
+    // Both arms use production applicable extraction, with receipts excluded
     // from the entity-to-entity graph comparison.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a5_literal_http_served_tree_parity_id_and_edge_set_equality_with_disk_ingest() {
         let tree = tempfile::tempdir().expect("tree");
@@ -763,10 +654,14 @@ mod tests {
         let disk_graph = graph_snapshot(&disk_runtime, &disk_token).await;
         assert_eq!(
             disk_graph.0.as_array().unwrap().len(),
-            4,
-            "site and three pages only"
+            7,
+            "site, three pages, and their three derived text resources"
         );
-        assert_eq!(disk_graph.1.len(), 5, "three contains edges and two links");
+        assert_eq!(
+            disk_graph.1.len(),
+            8,
+            "three contains edges, two links, three derivations"
+        );
         assert_eq!(
             disk_graph
                 .1
@@ -820,6 +715,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn disk_ingest_empty_or_zero_limit_creates_only_the_site() {
         for limit in [None, Some(0)] {
@@ -846,6 +742,7 @@ mod tests {
 
     // disk ingest confinement (`[web] read_roots`): a source directory that
     // IS a configured root, or falls under one, is allowed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn read_roots_disk_ingest_inside_a_configured_root_succeeds() {
         let tree = tempfile::tempdir().expect("tree");
@@ -891,6 +788,7 @@ mod tests {
     // A source directory outside every configured root is refused, even
     // though the directory itself is real and readable — read_roots is an
     // allow-list, not merely a check that the path exists.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn read_roots_source_outside_every_configured_root_refuses() {
         let allowed_root = tempfile::tempdir().expect("allowed root");
@@ -918,7 +816,7 @@ mod tests {
     // walk time — read_roots confines the whole tree the walk visits, not
     // only the entry point named in `source`.
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn read_roots_symlink_escaping_the_root_refuses() {
         let allowed_root = tempfile::tempdir().expect("allowed root");
         let outside = tempfile::tempdir().expect("outside target");
@@ -941,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn disk_ingest_refuses_visible_symlink_components_even_within_read_roots() {
         for alias_location in ["entry", "source", "ancestor", "configured_root"] {
             let tree = tempfile::tempdir().unwrap();
@@ -1015,27 +913,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn disk_walk_retains_canonical_checked_paths() {
-        let tree = tempfile::tempdir().unwrap();
-        let root = std::path::PathBuf::from(disk_path(tree.path()));
-        std::fs::create_dir(root.join("unused")).unwrap();
-        std::fs::create_dir(root.join("served")).unwrap();
-        std::fs::write(root.join("served/page.html"), b"body").unwrap();
-        let supplied = root.join("unused/../served");
-        let canonical = confine_to_read_roots(
-            &WebSectionConfig {
-                read_roots: vec![root.to_str().unwrap().to_string()],
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a5_fd_confinement_refuses_leaf_and_directory_swaps_before_open_without_writes() {
+        use khive_storage::ContentRef;
+        for (directory, symlink) in [(false, true), (true, true), (false, false), (true, false)] {
+            let tree = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let root = std::path::PathBuf::from(disk_path(tree.path()));
+            let outside = outside.path().canonicalize().unwrap();
+            std::fs::create_dir(root.join("sub")).unwrap();
+            std::fs::create_dir(outside.join("replacement")).unwrap();
+            let inside_bytes = b"<p>admitted original bytes</p>";
+            let outside_bytes = b"<p>must never enter the blob store or graph</p>";
+            std::fs::write(root.join("sub/page.html"), inside_bytes).unwrap();
+            std::fs::write(outside.join("replacement/page.html"), outside_bytes).unwrap();
+            let cfg = WebSectionConfig {
+                read_roots: vec![root.to_str().unwrap().to_owned()],
                 ..Default::default()
-            },
-            &supplied,
-        )
-        .unwrap();
-        assert_eq!(canonical, root.join("served"));
-        assert_eq!(
-            walk_files(&canonical).unwrap(),
-            vec![root.join("served/page.html")]
+            };
+            let (runtime, token, _dir) = test_runtime_with_read_roots(cfg.read_roots.clone()).await;
+            let pack = WebPack::new(runtime.clone());
+            let target = root.join(if directory { "sub" } else { "sub/page.html" });
+            let replacement = outside.join(if directory {
+                "replacement"
+            } else {
+                "replacement/page.html"
+            });
+            let mut swapped = false;
+            let mut before_open = |path: &Path| {
+                if path == target && !swapped {
+                    std::fs::rename(&target, root.join("retained-original")).unwrap();
+                    if symlink {
+                        std::os::unix::fs::symlink(&replacement, &target).unwrap();
+                    } else {
+                        std::fs::rename(&replacement, &target).unwrap();
+                    }
+                    swapped = true;
+                }
+            };
+            let error = ingest_disk_before_open(
+                &pack,
+                &token,
+                &cfg,
+                root.to_str().unwrap(),
+                "https://swap.example.test",
+                100,
+                &mut before_open,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                swapped,
+                "the swap must occur after check and immediately before open"
+            );
+            assert!(error.to_string().contains("ingest_path_changed"), "{error}");
+            assert_no_records(&runtime, &token).await;
+            for bytes in [inside_bytes.as_slice(), outside_bytes.as_slice()] {
+                let content_ref = ContentRef::from_digest_bytes(blake3::hash(bytes).as_bytes());
+                assert!(!runtime
+                    .blob_store()
+                    .unwrap()
+                    .exists(&content_ref)
+                    .await
+                    .unwrap());
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test]
+    async fn disk_ingest_refuses_without_descriptor_confinement_on_unsupported_platforms() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join("page.html"), b"<p>unread</p>").unwrap();
+        let (runtime, token, _dir) =
+            test_runtime_with_read_roots(vec![disk_path(tree.path())]).await;
+        let pack = WebPack::new(runtime.clone());
+        let error = pack
+            .handle_ingest(
+                &token,
+                json!({
+                    "source": disk_path(tree.path()), "origin": "https://unsupported.example.test"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ingest_confinement_unsupported"),
+            "{error}"
         );
+        assert_no_records(&runtime, &token).await;
     }
 
     // A URL that `web.fetch` refuses (loopback is a hard refusal

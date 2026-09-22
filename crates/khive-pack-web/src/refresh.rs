@@ -8,6 +8,8 @@
 //! (some origins ignore conditional headers), writes a receipt only — no
 //! entity patch, no new blob (the blob store's own `put` is idempotent, so
 //! "no blob change" falls out of that rather than needing separate logic).
+//! A redirected 304 also restores the validated cached representation at a
+//! terminal address that does not yet carry it, without a new blob put.
 //! A genuinely changed body puts the new blob and patches the entity in
 //! place, same as `fetch`. Every refresh receipt chains to the immediately
 //! prior one for the same entity via `note supersedes note` (D4's "receipt
@@ -18,8 +20,8 @@
 //! egress checks on every hop — [`crate::fetch::run_hop_chain`], shared
 //! rather than a second redirect loop. Every traversed hop gets the same
 //! treatment `fetch::settle` gives it ([`crate::fetch::settle_redirect_hops`]):
-//! a placeholder row per hop and, on a permanent redirect (301/308),
-//! `document supersedes document` (D2). Identity is by address: on a
+//! permanent redirect (301/308) endpoints and `document supersedes document`
+//! (D2); temporary hops remain receipt data only. Identity is by address: on a
 //! redirect the terminal address's own row receives the body (minted/patched
 //! via `settle_content`, same as `fetch::settle`'s terminal hop); the entity
 //! the caller asked to refresh (`id`) keeps its own recorded `url`
@@ -123,6 +125,7 @@ async fn run_refresh(
             format!("web.refresh: no document at id {}", params.id),
         ))
     })?;
+    crate::entities::require_entity_namespace(token, &entity)?;
     let properties = entity.properties.clone().unwrap_or(Value::Null);
     let stored_content_ref = properties
         .get("blob_ref")
@@ -204,8 +207,9 @@ async fn run_refresh(
 /// resolved IP itself, not on resolver trust).
 ///
 /// `redirect_hops` gets the exact same treatment `fetch::settle` gives it
-/// (`crate::fetch::settle_redirect_hops`, shared, not duplicated): a
-/// placeholder row per traversed hop and `new supersedes old` on 301/308.
+/// (`crate::fetch::settle_redirect_hops`, shared, not duplicated):
+/// permanent redirect endpoints and `new supersedes old` on 301/308; no graph
+/// mutation for a temporary hop itself.
 /// `id` — the entity the caller asked to refresh — is patched in place only
 /// when there was no redirect; on a redirect the terminal address's own row
 /// receives the body instead (identity is by address), `id` keeps its own
@@ -221,10 +225,6 @@ async fn settle_refresh(
 ) -> Result<Value, RuntimeError> {
     let previous_receipt = latest_receipt(runtime, token, id).await?;
 
-    let mut entities_touched: Vec<Uuid> = vec![id];
-    entities_touched
-        .extend(crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await?);
-
     let final_url_str = outcome.final_url.to_string();
 
     let final_id = if redirect_hops.is_empty() {
@@ -236,16 +236,14 @@ async fn settle_refresh(
             &crate::identity::path_and_query(&canonical),
         )
     };
-    if !entities_touched.contains(&final_id) {
-        entities_touched.push(final_id);
-    }
     let final_stored_content_ref = if redirect_hops.is_empty() {
         Some(stored_content_ref.to_owned())
     } else {
-        runtime
-            .entities(token)?
-            .get_entity(final_id)
-            .await?
+        let terminal = runtime.entities(token)?.get_entity(final_id).await?;
+        if let Some(entity) = &terminal {
+            crate::entities::require_entity_namespace(token, entity)?;
+        }
+        terminal
             .and_then(|entity| entity.properties)
             .and_then(|properties| {
                 properties
@@ -255,7 +253,106 @@ async fn settle_refresh(
             })
     };
 
+    // A redirected 304 validates the representation whose conditional
+    // headers were sent, not an unfetched placeholder at the terminal URL.
+    // Capture its metadata before permanent-hop settlement patches the old
+    // address's status. Refuse a changed cache instead of pairing a stale
+    // validated reference with newer representation metadata.
+    let validated_cache = if outcome.status == 304
+        && final_id != id
+        && final_stored_content_ref.as_deref() != Some(stored_content_ref)
+    {
+        let source = runtime
+            .entities(token)?
+            .get_entity(id)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::from(Refusal::new(
+                    "cached_body_changed",
+                    "the refreshed document disappeared; fetch it again",
+                ))
+            })?;
+        crate::entities::require_entity_namespace(token, &source)?;
+        let reference = source
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("blob_ref"))
+            .and_then(Value::as_str);
+        if reference != Some(stored_content_ref) {
+            return Err(Refusal::new(
+                "cached_body_changed",
+                "the refreshed document's cached body changed; retry the refresh",
+            )
+            .into());
+        }
+        let content_ref =
+            khive_storage::ContentRef::from_hex(stored_content_ref).map_err(|error| {
+                RuntimeError::Internal(format!("cached content reference invalid: {error}"))
+            })?;
+        let size = crate::blob_store(runtime)?
+            .size(&content_ref)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::from(Refusal::new(
+                    "not_fetched",
+                    "the validated cached body is unavailable; fetch it again",
+                ))
+            })?;
+        Some((source, content_ref, size))
+    } else {
+        None
+    };
+
+    let mut entities_touched: Vec<Uuid> = vec![id];
+    for touched in crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await? {
+        if !entities_touched.contains(&touched) {
+            entities_touched.push(touched);
+        }
+    }
+    if !entities_touched.contains(&final_id) {
+        entities_touched.push(final_id);
+    }
+
     let mut changed = false;
+    if let Some((source, content_ref, size)) = validated_cache {
+        let properties = source
+            .properties
+            .as_ref()
+            .expect("validated cached properties");
+        let canonical = crate::identity::canonicalize(outcome.final_url.clone());
+        let (_, terminal) = crate::fetch::mint_bare(runtime, token, &canonical).await?;
+        debug_assert_eq!(terminal, final_id);
+        let content_type = properties.get("content_type").and_then(Value::as_str);
+        crate::entities::patch(
+            runtime,
+            token,
+            terminal,
+            source.entity_type.as_deref(),
+            json!({
+                "url": canonical.to_string(),
+                "blob_ref": content_ref.to_string(),
+                "content_digest": content_ref.to_string(),
+                "content_type": content_type,
+                "size": size,
+                "status": properties.get("status").and_then(Value::as_u64).filter(|status| (200..300).contains(status)).unwrap_or(200),
+                "fetched_at": properties.get("fetched_at").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!(chrono::Utc::now().to_rfc3339())),
+                "etag": properties.get("etag"),
+                "last_modified": properties.get("last_modified"),
+            }),
+        ).await?;
+        crate::fetch::root_body(
+            runtime,
+            terminal,
+            khive_storage::AttachmentSubstrate::Entity,
+            &content_ref,
+            content_type,
+            size,
+        )
+        .await?;
+        // The terminal representation changed from absent/different to the
+        // validated cache. No new body bytes were received or blob-put.
+        changed = true;
+    }
     let mut new_content_ref: Option<String> = None;
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = &outcome.body {
@@ -318,9 +415,9 @@ async fn settle_refresh(
                     .await?;
                 } else {
                     // Identity is by address: the body served at the terminal
-                    // hop belongs to that address's own row, which
-                    // `settle_redirect_hops` has already minted (and, on
-                    // 301/308, linked `supersedes` over the caller's row).
+                    // hop belongs to that address's own row. Permanent hops
+                    // have already minted it; temporary hops leave that job
+                    // entirely to this terminal content settlement.
                     // The caller-named row keeps its own url.
                     let settled = crate::fetch::settle_content(
                         runtime,
@@ -1147,3 +1244,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "refresh_r2_tests.rs"]
+mod r2_tests;

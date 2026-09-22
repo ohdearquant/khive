@@ -461,13 +461,11 @@ pub(crate) async fn canonical_site(
     Ok(entity.id)
 }
 
-/// Mint a placeholder row for every traversed redirect and, for a permanent
-/// redirect (301/308), link `new supersedes old` — D2's "document supersedes
-/// document" on a permanent redirect. Shared by [`settle`] (`web.fetch`) and
-/// [`crate::refresh::run_refresh`] (`web.refresh`) so both verbs record a
-/// redirect chain identically; returns every entity id touched (the `from`
-/// side of each hop — the `to` side is either another hop's `from` or the
-/// terminal entity a caller mints separately).
+/// Persist only permanent redirect endpoints and `new supersedes old` (D2).
+/// Temporary hops remain receipt data: neither mint nor patch an entity merely
+/// because it participated in such a hop. The caller settles the terminal
+/// response separately, whether its preceding redirect was permanent or not.
+/// Returns each endpoint touched by permanent hops once.
 pub(crate) async fn settle_redirect_hops(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -475,6 +473,9 @@ pub(crate) async fn settle_redirect_hops(
 ) -> Result<Vec<Uuid>, RuntimeError> {
     let mut entities_touched: Vec<Uuid> = Vec::new();
     for hop in redirect_hops {
+        if !matches!(hop.status, 301 | 308) {
+            continue;
+        }
         let (_from_site, from_id) = mint_bare(runtime, token, &hop.from).await?;
         let (_to_site, to_id) = mint_bare(runtime, token, &hop.to).await?;
         crate::entities::patch(
@@ -485,12 +486,14 @@ pub(crate) async fn settle_redirect_hops(
             json!({ "status": hop.status, "redirect_to": hop.to.to_string() }),
         )
         .await?;
-        entities_touched.push(from_id);
-        if hop.status == 301 || hop.status == 308 {
-            runtime
-                .link(token, to_id, from_id, EdgeRelation::Supersedes, 1.0, None)
-                .await?;
+        for id in [from_id, to_id] {
+            if !entities_touched.contains(&id) {
+                entities_touched.push(id);
+            }
         }
+        runtime
+            .link(token, to_id, from_id, EdgeRelation::Supersedes, 1.0, None)
+            .await?;
     }
     Ok(entities_touched)
 }
@@ -653,9 +656,9 @@ pub(crate) async fn settle_content(
     })
 }
 
-/// Everything after the redirect loop settles on a final hop: every
-/// traversed redirect becomes a placeholder row plus (for 301/308)
-/// `new supersedes old`; the terminal hop's GET body (if any) goes to the
+/// Everything after the redirect loop settles on a final hop: permanent
+/// redirects record their endpoints and `new supersedes old`; temporary hops
+/// are receipt data only. The terminal hop's GET body (if any) goes to the
 /// blob store before the receipt is written (D4), and the receipt/reply
 /// share one allow-listed header projection.
 #[allow(clippy::too_many_arguments)]
@@ -695,7 +698,9 @@ async fn settle(
             body,
         )
         .await?;
-        entities_touched.push(settled.id);
+        if !entities_touched.contains(&settled.id) {
+            entities_touched.push(settled.id);
+        }
         (
             Some(settled.id),
             settled.content_ref,
@@ -2303,3 +2308,7 @@ mod tests {
         assert_eq!(emptied.entity_type.as_deref(), Some("resource"));
     }
 }
+
+#[cfg(test)]
+#[path = "fetch_r2_tests.rs"]
+mod r2_tests;

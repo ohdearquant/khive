@@ -28,6 +28,9 @@ regex = { workspace = true }
 url = "2"
 reqwest = { workspace = true, features = ["gzip"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full", "test-util"] }

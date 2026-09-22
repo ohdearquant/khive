@@ -3,6 +3,7 @@
 //! policy, the runtime's blob store, and its create/update/link seam.
 //! Supersedes ADR-175's local-manifest-only pack.
 
+mod confinement;
 mod egress;
 mod entities;
 mod extract;

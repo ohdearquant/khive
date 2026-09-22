@@ -27,17 +27,47 @@
 //! method.
 
 use khive_runtime::{EntityPatch, KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::Entity;
+use khive_storage::{Entity, EntityStore};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Fetch the entity at `id` if it already exists (by-id, namespace-agnostic
-/// per ADR-007 Rev 8), else insert it with `entity_kind`/`entity_type`/`name`
+/// Refuse web writes that would reuse a differently attributed entity.
+///
+/// Runtime by-ID reads remain namespace-agnostic under ADR-007 Rev 8. This
+/// is an interim web mutation safeguard while namespace-aware deterministic
+/// identity is pending; it does not change the UUID derivation or store policy.
+/// A refusal discloses only the requested ID, never the stored attribution.
+pub(crate) fn require_entity_namespace(
+    token: &NamespaceToken,
+    entity: &Entity,
+) -> Result<(), RuntimeError> {
+    if entity.namespace != token.namespace().as_str() {
+        return Err(khive_types::KhiveError::not_found("web entity", entity.id).into());
+    }
+    Ok(())
+}
+
+async fn read_insert_winner(
+    store: &dyn EntityStore,
+    token: &NamespaceToken,
+    id: Uuid,
+) -> Result<Entity, RuntimeError> {
+    let winner = store.get_entity(id).await?.ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "web entity {id}: insert_entity_if_absent lost the race but no row is readable"
+        ))
+    })?;
+    require_entity_namespace(token, &winner)?;
+    Ok(winner)
+}
+
+/// Fetch the entity at `id` if it already exists in the caller's namespace,
+/// else insert it with `entity_kind`/`entity_type`/`name`
 /// and `properties`, indexed for search exactly as an ordinary `create`
 /// would be. Returns `(entity, created)`; `created = false` both when the
 /// row already existed and when this call lost a race to a concurrent
-/// writer creating the same deterministic id (the winner is read back and
-/// returned either way — same-id writers always converge on one row).
+/// writer creating the same deterministic id in the same namespace. A foreign
+/// row from either lookup is refused before a caller can patch or link it.
 pub(crate) async fn get_or_create(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -49,6 +79,7 @@ pub(crate) async fn get_or_create(
 ) -> Result<(Entity, bool), RuntimeError> {
     let store = runtime.entities(token)?;
     if let Some(existing) = store.get_entity(id).await? {
+        require_entity_namespace(token, &existing)?;
         return Ok((existing, false));
     }
 
@@ -60,11 +91,7 @@ pub(crate) async fn get_or_create(
         .await
         .map_err(RuntimeError::from)?;
     if !inserted {
-        let winner = store.get_entity(id).await?.ok_or_else(|| {
-            RuntimeError::Internal(format!(
-                "web entity {id}: insert_entity_if_absent lost the race but no row is readable"
-            ))
-        })?;
+        let winner = read_insert_winner(store.as_ref(), token, id).await?;
         return Ok((winner, false));
     }
 
@@ -105,4 +132,71 @@ pub(crate) async fn patch(
             },
         )
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_runtime::{Namespace, RuntimeConfig};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn lost_insert_race_refuses_foreign_winner_without_mutating_it() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            actor_id: None,
+            brain_profile: None,
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let alpha = runtime
+            .authorize(Namespace::parse("alpha").unwrap())
+            .unwrap();
+        let beta = runtime
+            .authorize(Namespace::parse("beta").unwrap())
+            .unwrap();
+        let store = runtime.entities(&beta).unwrap();
+        let winner = Entity::new("alpha", "document", "private row title")
+            .with_entity_type(Some("resource"))
+            .with_properties(json!({"private": "metadata"}));
+        assert!(store.get_entity(winner.id).await.unwrap().is_none());
+
+        // Deterministically place another writer between the initial miss and
+        // conditional insert, then exercise the production lost-race readback.
+        assert!(runtime
+            .entities(&alpha)
+            .unwrap()
+            .insert_entity_if_absent(winner.clone())
+            .await
+            .unwrap());
+        let mut contender = Entity::new("beta", "document", "").with_entity_type(Some("resource"));
+        contender.id = winner.id;
+        assert!(!store.insert_entity_if_absent(contender).await.unwrap());
+        let error = read_insert_winner(store.as_ref(), &beta, winner.id)
+            .await
+            .unwrap_err();
+        let projected =
+            khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+        assert_eq!(projected["kind"], "not_found");
+        assert_eq!(
+            projected["message"],
+            format!("web entity not found: {}", winner.id)
+        );
+        assert!(projected["details"].is_null());
+        assert!(projected["code"].is_null());
+        let after = store.get_entity(winner.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&winner).unwrap()
+        );
+
+        // The identical readback remains reusable for the winning namespace.
+        let same_namespace = read_insert_winner(store.as_ref(), &alpha, winner.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(same_namespace).unwrap(),
+            serde_json::to_value(winner).unwrap()
+        );
+    }
 }

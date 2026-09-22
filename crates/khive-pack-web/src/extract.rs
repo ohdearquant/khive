@@ -4,7 +4,7 @@
 //! `web.fetch`'s job) into whichever of `text`/`links`/`sitemap`/`feed` the
 //! caller names, default all applicable to the stored content-type. No HTML
 //! or XML parser crate is a workspace dependency, so every extraction here
-//! is a bounded regex over the raw bytes rather than a DOM walk.
+//! uses regex matches and a fixed-capacity text scan rather than a DOM walk.
 //!
 //! - `links`: every `<a href="...">` in an HTML body becomes a
 //!   `page links_to page|resource` edge (D2's new base row) to a target
@@ -19,7 +19,8 @@
 //!   target: the original) and keyed by [`identity::derived_text_id`] so
 //!   repeated extraction over an unchanged document converges on one row.
 
-use std::sync::LazyLock;
+use std::borrow::Cow;
+use std::sync::{Arc, LazyLock};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
@@ -34,6 +35,15 @@ use crate::identity;
 use crate::WebPack;
 
 const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
+// Two fixed text buffers plus at most three UTF-8 bytes per raw byte (U+FFFD).
+// This pack-local aggregate budget is separate from raw blob admission. A
+// request acquires it once, after hydration, and never upgrades its reservation.
+// URL/graph allocations and regex engine scratch are not part of this budget.
+const TEXT_SCRATCH_BYTES: usize = 2 * MAX_TEXT_EXCERPT_BYTES;
+const MAX_DERIVED_BYTES: usize =
+    3 * khive_storage::MAX_BLOB_WHOLE_BYTES as usize + TEXT_SCRATCH_BYTES;
+static DERIVED_ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_DERIVED_BYTES)));
 
 static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<a\s[^>]*?href\s*=\s*["']([^"'#][^"']*)["']"#).expect("valid regex")
@@ -45,16 +55,167 @@ static ATOM_LINK_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RSS_LINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?is)<link>\s*([^<\s][^<]*?)\s*</link>"#).expect("valid regex"));
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").expect("valid regex"));
 /// `<script>`/`<style>` bodies are never prose: stripped whole (tag and
-/// content) before `TAG_RE`'s generic tag-only strip runs, so their
+/// content) before the streaming generic tag-only strip runs, so their
 /// contents never leak into extracted text. Two alternatives, not a
 /// backreference — the `regex` crate's engine is backtracking-free and
 /// does not support `\1`.
 static SCRIPT_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>").expect("valid regex")
 });
-static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
+
+fn decoded_body_bytes(raw: &[u8]) -> usize {
+    raw.utf8_chunks()
+        .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
+        .sum()
+}
+
+async fn admit_derived_buffers(
+    admission: &Arc<tokio::sync::Semaphore>,
+    decoded_bytes: usize,
+) -> Result<tokio::sync::OwnedSemaphorePermit, RuntimeError> {
+    let required = decoded_bytes
+        .checked_add(TEXT_SCRATCH_BYTES)
+        .filter(|required| *required <= MAX_DERIVED_BYTES)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput("web.extract: derived buffer bound exceeded".into())
+        })?;
+    khive_storage::await_request_read_phase(
+        "web_extract_derived_admission",
+        Arc::clone(admission).acquire_many_owned(required as u32),
+    )
+    .await?
+    .map_err(|error| {
+        RuntimeError::Internal(format!("web.extract: derived admission closed: {error}"))
+    })
+}
+
+fn decode_body(raw: &[u8], decoded_bytes: usize) -> String {
+    // A fixed-length allocation avoids String's geometric growth during lossy
+    // decoding. The admitted size includes replacement characters, not just raw
+    // bytes. No second full-size String is constructed.
+    let mut bytes = vec![0; decoded_bytes];
+    let mut offset = 0;
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid().as_bytes();
+        bytes[offset..offset + valid.len()].copy_from_slice(valid);
+        offset += valid.len();
+        if !chunk.invalid().is_empty() {
+            bytes[offset..offset + 3].copy_from_slice("\u{fffd}".as_bytes());
+            offset += 3;
+        }
+    }
+    String::from_utf8(bytes).expect("UTF-8 chunks and replacement characters are valid")
+}
+
+struct TextBuffer {
+    bytes: Box<[u8]>,
+    len: usize,
+    space: bool,
+    full: bool,
+}
+
+impl TextBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: vec![0; MAX_TEXT_EXCERPT_BYTES].into_boxed_slice(),
+            len: 0,
+            space: false,
+            full: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.space = false;
+        self.full = false;
+    }
+
+    fn push(&mut self, ch: char) {
+        if self.full {
+            return;
+        }
+        if ch.is_whitespace() {
+            self.space = self.len != 0;
+            return;
+        }
+        if self.space {
+            if self.len == self.bytes.len() {
+                self.full = true;
+                return;
+            }
+            self.bytes[self.len] = b' ';
+            self.len += 1;
+            self.space = false;
+        }
+        let mut encoded = [0; 4];
+        let encoded = ch.encode_utf8(&mut encoded).as_bytes();
+        if self.len + encoded.len() > self.bytes.len() {
+            self.full = true;
+            return;
+        }
+        self.bytes[self.len..self.len + encoded.len()].copy_from_slice(encoded);
+        self.len += encoded.len();
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("only complete UTF-8 chars are stored")
+    }
+
+    fn into_string(self) -> String {
+        let mut bytes = self.bytes.into_vec();
+        bytes.truncate(self.len);
+        String::from_utf8(bytes).expect("only complete UTF-8 chars are stored")
+    }
+}
+
+fn text_excerpt(body: &str) -> String {
+    let mut output = TextBuffer::new();
+    // Keep an unclosed '<...' candidate bounded too: the old <[^>]+> strip
+    // preserves it as text if no closing '>' exists. Normalizing this candidate
+    // as it arrives avoids buffering an arbitrarily long unterminated tag.
+    let mut pending = TextBuffer::new();
+    let mut in_tag = false;
+    let mut tag_content = false;
+    let mut consume = |text: &str| {
+        for ch in text.chars() {
+            if in_tag {
+                if ch == '>' {
+                    if tag_content {
+                        output.push(' ');
+                    } else {
+                        output.push('<');
+                        output.push('>');
+                    }
+                    in_tag = false;
+                    pending.clear();
+                } else {
+                    tag_content = true;
+                    pending.push(ch);
+                }
+            } else if ch == '<' {
+                in_tag = true;
+                tag_content = false;
+                pending.push(ch);
+            } else {
+                output.push(ch);
+            }
+        }
+    };
+    let mut offset = 0;
+    for removed in SCRIPT_STYLE_RE.find_iter(body) {
+        consume(&body[offset..removed.start()]);
+        consume(" ");
+        offset = removed.end();
+    }
+    consume(&body[offset..]);
+    if in_tag {
+        for ch in pending.as_str().chars() {
+            output.push(ch);
+        }
+    }
+    output.into_string()
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +277,7 @@ async fn resolve_target(
                 format!("web.extract: no document at id {id}"),
             ))
         })?;
+    crate::entities::require_entity_namespace(token, &entity)?;
     Ok((id, entity))
 }
 
@@ -286,30 +448,13 @@ async fn extract_text(
     original_id: Uuid,
     original_url: &str,
     body: &str,
+    derived_admission: &Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Uuid, RuntimeError> {
-    let no_script_style = SCRIPT_STYLE_RE.replace_all(body, " ");
-    let stripped = TAG_RE.replace_all(&no_script_style, " ");
-    let collapsed = WHITESPACE_RE.replace_all(stripped.trim(), " ").to_string();
-    // `MAX_TEXT_EXCERPT_BYTES` bounds BYTES, not chars — `.chars().take(N)`
-    // would cap at N chars and let a multi-byte-heavy document (CJK text is
-    // 3 bytes/char) through at up to 3-4x the intended byte budget. Truncate
-    // by byte length instead, walking back to the nearest char boundary so a
-    // multi-byte character is never split.
-    let excerpt: String = if collapsed.len() <= MAX_TEXT_EXCERPT_BYTES {
-        collapsed
-    } else {
-        let mut end = MAX_TEXT_EXCERPT_BYTES;
-        while !collapsed.is_char_boundary(end) {
-            end -= 1;
-        }
-        collapsed[..end].to_string()
-    };
+    let excerpt = text_excerpt(body);
+    let excerpt_bytes = excerpt.len();
 
     let store = crate::blob_store(runtime)?;
-    let content_ref = store
-        .put(excerpt.clone().into_bytes())
-        .await
-        .map_err(RuntimeError::from)?;
+    let content_ref = put_excerpt(store, excerpt, Arc::clone(derived_admission)).await?;
 
     let text_id = identity::derived_text_id(original_id);
     crate::entities::get_or_create(
@@ -331,7 +476,7 @@ async fn extract_text(
             "derived_from": original_id.to_string(),
             "content_type": "text/plain",
             "blob_ref": content_ref.to_string(),
-            "size": excerpt.len() as u64,
+            "size": excerpt_bytes as u64,
         }),
     )
     .await?;
@@ -346,6 +491,26 @@ async fn extract_text(
         )
         .await?;
     Ok(text_id)
+}
+
+async fn put_excerpt(
+    store: Arc<dyn khive_storage::BlobStore>,
+    excerpt: String,
+    admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<khive_storage::ContentRef, RuntimeError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    khive_runtime::track_named_background_task("web_extract_text", async move {
+        // Store implementations may move the output buffer into blocking I/O.
+        // Keep its reservation until that future completes, even if its request
+        // has been cancelled and no longer receives the put result.
+        let _admission = admission;
+        let result = store.put(excerpt.into_bytes()).await;
+        let _ = sender.send(result);
+    });
+    khive_storage::await_request_read_phase("web_extract_text_put", receiver)
+        .await?
+        .map_err(|_| RuntimeError::Internal("web.extract: text put supervisor ended".into()))?
+        .map_err(RuntimeError::from)
 }
 
 async fn run_extract(
@@ -375,9 +540,22 @@ async fn run_extract(
     let verified = hydrator
         .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
         .await?;
-    // Retain the raw-buffer admission lease through parsing and persistence,
-    // including when lossy decoding needs its own allocation.
-    let body = String::from_utf8_lossy(verified.bytes());
+    // Raw admission is held first, then derived admission. No path holding a
+    // derived permit acquires raw admission again, so these two budgets cannot
+    // form a wait cycle. Queued cancellation drops the request's RAII leases
+    // before allocating derived buffers. An already-started text put retains a
+    // shared derived lease until its background I/O actually completes.
+    let valid_body = std::str::from_utf8(verified.bytes()).ok();
+    let decoded_bytes = if valid_body.is_some() {
+        0
+    } else {
+        decoded_body_bytes(verified.bytes())
+    };
+    let derived = Arc::new(admit_derived_buffers(&DERIVED_ADMISSION, decoded_bytes).await?);
+    let body = match valid_body {
+        Some(body) => Cow::Borrowed(body),
+        None => Cow::Owned(decode_body(verified.bytes(), decoded_bytes)),
+    };
 
     let url_str = properties
         .get("url")
@@ -421,7 +599,8 @@ async fn run_extract(
                 result.insert("feed".to_string(), json!({ "entries": count }));
             }
             "text" => {
-                let text_id = extract_text(runtime, token, target_id, &url_str, &body).await?;
+                let text_id =
+                    extract_text(runtime, token, target_id, &url_str, &body, &derived).await?;
                 result.insert("text".to_string(), json!({ "id": text_id.to_string() }));
             }
             _ => unreachable!("validated above"),
@@ -459,6 +638,207 @@ mod tests {
     use std::sync::Arc;
 
     mod hydration;
+
+    #[test]
+    fn lossy_decode_reserves_replacement_bytes_without_capacity_growth() {
+        for raw in [
+            b"abc".as_slice(),
+            b"\xff\xff\xff",
+            b"a\xf0\x90\x80z\xc2",
+            b"",
+        ] {
+            let required = decoded_body_bytes(raw);
+            let decoded = decode_body(raw, required);
+            assert_eq!(decoded, String::from_utf8_lossy(raw));
+            assert_eq!(decoded.len(), required);
+            assert_eq!(decoded.capacity(), required);
+            assert!(required <= 3 * raw.len());
+        }
+        // Must fail if admission counts raw bytes instead of replacement bytes.
+        assert_eq!(decoded_body_bytes(b"\xff\xff\xff"), 9);
+    }
+
+    #[test]
+    fn bounded_text_scanner_preserves_tag_and_whitespace_behavior() {
+        let tags = Regex::new(r"(?s)<[^>]+>").unwrap();
+        let whitespace = Regex::new(r"\s+").unwrap();
+        for body in [
+            "  Hello\u{2003} world <br> next  ",
+            "before<script>secret <b>text</b></script><style>hidden</style>after",
+            "<p title='<script>secret</script>'>visible</p>",
+            "literal <> <<> end <unfinished\n  tag",
+            "<script>unterminated script",
+            "\u{0085}é\u{2028}字\u{3000}",
+        ] {
+            let no_script = SCRIPT_STYLE_RE.replace_all(body, " ");
+            let no_tags = tags.replace_all(&no_script, " ");
+            let expected = whitespace.replace_all(no_tags.trim(), " ");
+            let actual = text_excerpt(body);
+            assert_eq!(actual, expected, "{body:?}");
+            assert_eq!(actual.capacity(), MAX_TEXT_EXCERPT_BYTES);
+        }
+        // A raw candidate buffer capped before whitespace normalization would
+        // lose the terminal 'z'; it must remain visible for an unclosed tag.
+        let body = format!("<{}z", " ".repeat(2 * MAX_TEXT_EXCERPT_BYTES));
+        assert_eq!(text_excerpt(&body), "< z");
+        let body = format!("x{}", "é".repeat(MAX_TEXT_EXCERPT_BYTES));
+        let excerpt = text_excerpt(&body);
+        assert_eq!(excerpt.len(), MAX_TEXT_EXCERPT_BYTES - 1);
+        assert_eq!(excerpt.capacity(), MAX_TEXT_EXCERPT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn derived_admission_bounds_cancelled_waiters_and_releases_completed_leases() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        assert_eq!(MAX_DERIVED_BYTES, 201_726_592);
+        let admission = Arc::new(tokio::sync::Semaphore::new(MAX_DERIVED_BYTES));
+        let maximum_decode = 3 * khive_storage::MAX_BLOB_WHOLE_BYTES as usize;
+        let lease = admit_derived_buffers(&admission, maximum_decode)
+            .await
+            .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let waiting = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            admit_derived_buffers(&admission, 0),
+        );
+        tokio::pin!(waiting);
+        // Must fail if admission is bypassed or its lease is released before
+        // parsing/persistence. One explicit poll proves blocking, without timing.
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        cancel.send(true).unwrap();
+        let error = waiting.await.unwrap_err();
+        assert!(matches!(error,
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { ref operation })
+            if operation == "web_extract_derived_admission"));
+        assert_eq!(admission.available_permits(), 0);
+        drop(lease);
+        assert_eq!(admission.available_permits(), MAX_DERIVED_BYTES);
+
+        let lease = admit_derived_buffers(&admission, 0).await.unwrap();
+        assert_eq!(
+            admission.available_permits(),
+            MAX_DERIVED_BYTES - TEXT_SCRATCH_BYTES
+        );
+        drop(lease);
+        assert!(admit_derived_buffers(&admission, maximum_decode + 1)
+            .await
+            .is_err());
+        assert_eq!(admission.available_permits(), MAX_DERIVED_BYTES);
+    }
+
+    #[derive(Debug)]
+    struct PausedPut {
+        inner: Arc<dyn khive_storage::BlobStore>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::BlobStore for PausedPut {
+        async fn put(
+            &self,
+            bytes: Vec<u8>,
+        ) -> khive_storage::StorageResult<khive_storage::ContentRef> {
+            self.started.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            self.inner.put(bytes).await
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            id: &khive_storage::ContentRef,
+            max: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            self.inner.get_bounded_verified(id, max).await
+        }
+
+        async fn exists(
+            &self,
+            id: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            self.inner.exists(id).await
+        }
+
+        async fn size(
+            &self,
+            id: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            self.inner.size(id).await
+        }
+
+        async fn delete(
+            &self,
+            id: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            self.inner.delete(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_text_put_keeps_admission_until_background_io_finishes() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PausedPut {
+            inner: Arc::new(
+                khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0).unwrap(),
+            ),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let admission = Arc::new(tokio::sync::Semaphore::new(TEXT_SCRATCH_BYTES));
+        let permit = Arc::new(admit_derived_buffers(&admission, 0).await.unwrap());
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let writing = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            put_excerpt(store.clone(), "excerpt".into(), permit),
+        );
+        tokio::pin!(writing);
+        // The notification is the assertion boundary; the timeout only catches
+        // a hung test. No elapsed-time assumption decides admission correctness.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut writing => panic!("put missed the barrier: {result:?}"),
+                _ = store.started.notified() => {},
+            }
+        })
+        .await
+        .unwrap();
+        cancel.send(true).unwrap();
+        let error = writing.await.unwrap_err();
+        assert!(matches!(error,
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { ref operation })
+            if operation == "web_extract_text_put"));
+        // Must fail if put is awaited in the cancelled request without a
+        // supervisor retaining the derived lease alongside its owned bytes.
+        assert_eq!(admission.available_permits(), 0);
+        let next = admit_derived_buffers(&admission, 0);
+        tokio::pin!(next);
+        poll_fn(|cx| {
+            assert!(next.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        store.release.add_permits(1);
+        let next_lease = tokio::time::timeout(Duration::from_secs(5), &mut next)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(next_lease);
+        assert_eq!(admission.available_permits(), TEXT_SCRATCH_BYTES);
+        let content_ref =
+            khive_storage::ContentRef::from_digest_bytes(blake3::hash(b"excerpt").as_bytes());
+        assert!(store.inner.exists(&content_ref).await.unwrap());
+    }
 
     /// See `fetch::tests::install_web_edge_rules` for why this is needed:
     /// the in-crate test runtime carries no `VerbRegistry`, so the web
@@ -720,12 +1100,14 @@ mod tests {
         )
         .await;
 
+        let derived = Arc::new(admit_derived_buffers(&DERIVED_ADMISSION, 0).await.unwrap());
         let text_id = extract_text(
             &runtime,
             &token,
             page_id,
             "https://origin.example.test/big-multibyte",
             &html,
+            &derived,
         )
         .await
         .expect("extract_text does not panic on a non-boundary byte cut");
