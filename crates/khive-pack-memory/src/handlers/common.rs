@@ -910,6 +910,16 @@ pub(super) fn fuse_candidates(
             SearchHit {
                 entity_id: id,
                 score,
+                rank_score_kind: match &cfg.fuse_strategy {
+                    FusionStrategy::Rrf { .. } => khive_runtime::RankScoreKind::Rrf,
+                    FusionStrategy::VectorOnly => khive_runtime::RankScoreKind::Vector,
+                    FusionStrategy::KeywordOnly => khive_runtime::RankScoreKind::Keyword,
+                    FusionStrategy::Weighted { .. } => khive_runtime::RankScoreKind::Weighted,
+                    FusionStrategy::Union => khive_runtime::RankScoreKind::Union,
+                    // The retrieval helper resolves custom strategies to its RRF fallback.
+                    FusionStrategy::Custom { .. } => khive_runtime::RankScoreKind::Rrf,
+                },
+                signals: khive_runtime::SearchSignals::default(),
                 source,
                 title,
                 snippet,

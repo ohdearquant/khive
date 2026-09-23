@@ -1225,6 +1225,8 @@ fn rrf_merge_entity_hits_filtered(
             Some(SearchHit {
                 entity_id: id,
                 score: det_score,
+                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+                signals: khive_runtime::SearchSignals::default(),
                 source,
                 title: bucket.title,
                 snippet: bucket.snippet,
@@ -1285,6 +1287,8 @@ fn rrf_merge_note_hits_filtered(
             Some(NoteSearchHit {
                 note_id: id,
                 score: det_score,
+                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+                signals: khive_runtime::SearchSignals::default(),
                 source,
                 title: bucket.title,
                 snippet: bucket.snippet,

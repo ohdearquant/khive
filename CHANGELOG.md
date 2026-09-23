@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking**: runtime `SearchHit` and `NoteSearchHit` values now include
+  `rank_score_kind` and typed `signals`. Struct constructors must identify the
+  ordering strategy and explicitly retain available component scores; an absent
+  signal uses `None`. `FusionExecutor` implementers must add
+  `rank_score_kind()`, choosing `rrf`, `vector`, `keyword`, `weighted`, or `union`
+  according to the executor's ordering strategy. The existing `score` field
+  remains the canonical deterministic ordering value. Note search computes its
+  salience weight with fixed-point arithmetic, so rounding at the smallest score
+  increment can differ from the previous floating-point calculation.
 - **Breaking**: the `web` pack no longer reads a `.well-known` application manifest or emits
   `machine_view`/`agent_tool`/`agent_skill` entities — see the `web.*` entries above and
   `docs/packs/web.md`.
