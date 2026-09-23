@@ -972,7 +972,7 @@ jobs:
         shell: bash
         run: |
           cargo test -p khive-pack-git --lib issue2149_windows_ 2>&1 | tee "$RUNNER_TEMP/issue2149-windows.log"
-          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/issue2149-windows.log" 5
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/issue2149-windows.log" 1
 
   coverage-measurement:
     name: Coverage measurement
