@@ -637,31 +637,62 @@ impl KgPack {
                         )
                         .await
                 };
-                let (note, embedding_report) = result.map_err(|error| match error {
-                    RuntimeError::Khive(error)
+                let (note, embedding_report) = match result {
+                    Ok(pair) => pair,
+                    Err(RuntimeError::Khive(error))
                         if error.details().and_then(|details| details.get("reason"))
                             == Some("key_conflict") =>
                     {
                         let key = p.key.as_deref().unwrap_or("");
-                        if registry.allows_note_key_disclosure(token, &canonical, key) {
-                            RuntimeError::Khive(error)
-                        } else {
-                            RuntimeError::Khive(error.with_details(
-                                khive_types::Details::new_owned([
-                                    ("reason", "key_conflict".into()),
-                                    ("key", key.into()),
-                                ]),
-                            ))
+                        let existing_id = error
+                            .details()
+                            .and_then(|details| details.get("existing_id"))
+                            .unwrap_or_default()
+                            .to_string();
+                        // ADR-172 Amendment 6: `equal` is an internal signal
+                        // from the runtime's in-transaction holder
+                        // comparison; it never reaches a client. It only
+                        // selects which response this handler builds below.
+                        let equal = error.details().and_then(|details| details.get("equal"))
+                            == Some("true");
+                        let disclose = registry.allows_note_key_disclosure(token, &canonical, key);
+                        if equal && disclose {
+                            // Successful minimal replay: no domain mutation
+                            // happened, so nothing below this arm (hooks,
+                            // dedup search, requested edges) runs either.
+                            return Ok(json!({
+                                "id": existing_id,
+                                "created": false,
+                            }));
                         }
+                        let details = if disclose {
+                            khive_types::Details::new_owned([
+                                ("reason", "key_conflict".into()),
+                                ("key", key.into()),
+                                ("existing_id", existing_id),
+                            ])
+                        } else {
+                            khive_types::Details::new_owned([
+                                ("reason", "key_conflict".into()),
+                                ("key", key.into()),
+                            ])
+                        };
+                        return Err(RuntimeError::Khive(error.with_details(details)));
                     }
-                    other => other,
-                })?;
+                    Err(other) => return Err(other),
+                };
                 let id = note.id;
-                (
-                    remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
-                    id,
-                    embedding_report.any_truncated(),
-                )
+                let mut note_json = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
+                // ADR-172 Amendment 6: a fresh insert under a supplied key
+                // carries created:true so a caller can tell it apart from a
+                // replay without a second round trip. Unkeyed notes keep
+                // their existing response shape untouched.
+                if p.key.is_some() {
+                    if let Some(obj) = note_json.as_object_mut() {
+                        obj.insert("created".to_string(), json!(true));
+                    }
+                }
+                (note_json, id, embedding_report.any_truncated())
             }
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
