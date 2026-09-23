@@ -89,7 +89,11 @@ validated against its own substrate's field set -- and returns aggregate counts
 (`attempted`/`created`/`skipped`/`failed`) plus an index-aligned `results` array (one entry per
 item, id present even without `verbose`) -- an empty `items=[]` is accepted and writes nothing.
 `atomic` (default true even when omitted) commits every item in one transaction or none; a
-rollback surfaces as the call's own error, never a `results` list of partial successes.
+rollback surfaces as the call's own error, never a `results` list of partial successes. The one bounded
+exception to always writing a new record is a note `create` carrying `key`: an identical replay of a held key returns the existing id with
+`created: false` and writes nothing new, while a differing payload under that key still refuses with
+`key_conflict` rather than overwriting it (see `docs/adr/ADR-172-versioned-notes-compare-and-set.md` Amendment 6
+and `docs/adr/ADR-023-declarative-pack-format.md`).
 Entity names are mutable labels, not unique keys. When reuse is intended, call
 `resolve` and inspect its per-ref status (`resolved` / `ambiguous` / `not_found` -- lowercase wire
 values) (or `search` and inspect the ranked hits), and create only after `not_found` or an

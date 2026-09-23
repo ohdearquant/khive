@@ -2881,6 +2881,38 @@ impl KhiveRuntime {
         }
     }
 
+    /// Find the newest live annotation note with an exact kind and tag across
+    /// the token's visible edge namespaces, on this runtime's bound backend.
+    /// Each store selects one eligible candidate before returning; note bodies
+    /// and the complete annotation history are never hydrated here.
+    pub async fn latest_annotating_note(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        if !self.substrate_exists_in_ns(token, node_id).await? {
+            return Ok(None);
+        }
+        let mut latest: Option<(Uuid, i64)> = None;
+        for namespace in token.visible_namespaces() {
+            let scoped = NamespaceToken::for_namespace(namespace.clone());
+            if let Some(candidate) = self
+                .graph(&scoped)?
+                .latest_annotating_note(node_id, kind, tag)
+                .await?
+            {
+                if latest.is_none_or(|(id, created_at)| {
+                    candidate.1 > created_at || (candidate.1 == created_at && candidate.0 < id)
+                }) {
+                    latest = Some(candidate);
+                }
+            }
+        }
+        Ok(latest.map(|(id, _)| id))
+    }
+
     /// Get immediate neighbors of a node, optionally filtered by relation type.
     ///
     /// Pass `relations: Some(vec![EdgeRelation::Annotates])` to retrieve only

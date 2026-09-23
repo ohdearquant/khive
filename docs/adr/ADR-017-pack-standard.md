@@ -7,6 +7,9 @@
 `PackByIdResolver` sub-trait.\
 **Amended**: 2026-09-18, [a pack may refuse shared creation of a kind it
 owns](#amendment-2026-09-18-a-pack-may-refuse-shared-creation-of-a-kind-it-owns) (#2965).\
+**Amended**: 2026-09-22, [a kind-owned proposal-note validation hook, composed with the
+runtime-owned admission sequence](#amendment-2026-09-22-a-kind-owned-proposal-note-validation-hook-composed-with-the-runtime-owned-admission-sequence)
+(#2057, #2967).\
 **Related**: [ADR-055](ADR-055-epistemic-edge-relations.md), which amends ADR-002 by
 adding the `supports` and `refutes` relations. Occurrences of "15 edge relations" in
 this historical pack-standard text reflect the original base set.
@@ -248,7 +251,9 @@ runtime handle and must not mutate storage or normalize approved content. Worksp
 shares its pure integer `properties.schema_version` predicate with this method,
 shared create, and entity update. This does not invoke `prepare_create` or `after_create`
 on proposals, change multi-step Compound admission, or alter `AddNote`'s separate
-contract and the memory exception in ADR-021.
+contract. `AddNote`'s memory exception, referenced here at the time of writing, was withdrawn by
+[ADR-021](ADR-021-memory-pack.md)'s 2026-09-22 amendment; this document's own 2026-09-22 amendment
+describes the kind-owned proposal-note hook that replaces it.
 
 The 2026-08-01 dependency-integrity amendment adds the two default-accepting
 pre-write validators after GTD demonstrated a cross-record invariant that generic
@@ -1138,3 +1143,37 @@ This does not make refusal a default or a property of pack-owned kinds as a clas
 shared creation produces a complete record stays creatable through it, and packs that depend on
 shared `create` are unaffected: what is permitted here is a per-kind refusal justified by a named
 writer, not a class-wide denial.
+
+## Amendment (2026-09-22): a kind-owned proposal-note validation hook, composed with the runtime-owned admission sequence
+
+**Status:** Accepted.
+
+Originating issue(s): #2057, #2967
+
+The prior amendment names one approved creation route that does not call
+`KindHook::prepare_create`: `propose`/`review` with an `AddNote` changeset, "governed by its own
+contract." This amendment gives a kind owner a second, narrower hook on exactly that route, so a
+pack that refuses shared creation of a note kind is not bypassed by proposing the same creation
+instead.
+
+A pack MAY register a kind-owned, **validation-only** hook on the proposal-note route, analogous
+to the existing `validate_proposal_entity` seam. Unlike `prepare_create`, this hook never
+normalizes or mutates the changeset: it accepts or refuses. It runs twice against the same
+changeset: once when a new `AddNote` proposal targeting the pack's kind is accepted, and again
+when an approved proposal is applied. So the same judgment governs both a caller trying to
+create the kind directly through a proposal and a caller trying to apply one approved before the
+hook existed. A refusal at either point uses the canonical invalid-input error shape with a
+`details.reason`, `details.kind`, and `details.route` identifying the refused kind and route, and
+a message naming the writer the caller should use instead. [ADR-021](ADR-021-memory-pack.md)'s
+amendment registers the first instance of this hook, for the `memory` kind.
+
+This hook composes with, and does not replace, the runtime-owned admission sequence
+[ADR-115 Amendment 4](ADR-115-secret-gate-content-manifest-exemption.md#amendment-4-2026-09-22-a-runtime-owned-admission-sequence-a-route-inventory-and-the-finalizers-transaction)
+defines for every properties-bearing write. In that sequence, proposal materialization of an
+already-approved draft validates the immutable changeset against current rules without
+re-running generic create's `prepare_create` normalization on it. An approved draft is judged,
+not silently renormalized. `KindHook` remains the only mechanism a pack uses to express kind-owned
+policy (Rationale, "Why KindHook for specialization?"); the runtime, not any hook, owns that
+sequence's transaction commit and reserved-property enforcement, matching
+[ADR-023](ADR-023-declarative-pack-format.md)'s composition rules, reconciled by that document's
+own 2026-09-22 amendment.

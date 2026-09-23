@@ -2,7 +2,11 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended**: 2026-09-22, [operation attribution is the complete contract, with no argument
+capture](#amendment-1-2026-09-22-operation-attribution-is-the-complete-contract-with-no-argument-capture)
+(#2049).\
+**Amended**: 2026-09-22, [parallel units of linear chains, `[chain, chain]`](#amendment-2-2026-09-22-parallel-units-of-linear-chains-chain-chain) (#890).
 
 ## Context
 
@@ -90,6 +94,13 @@ request(ops='create(kind="concept", name="Dependent") | link(source_id=$prev.id,
 
 The two calls above are independent and may be issued in either order. `$prev`
 is scoped to the second call's chain; it never carries across request calls.
+
+> **Amendment 2 supersession:** the paragraph and example above describe the pre-amendment
+> grammar. [Amendment 2](#amendment-2-2026-09-22-parallel-units-of-linear-chains-chain-chain)
+> adds one bracketed form, `[chain, chain]`, in which each comma-separated unit may itself
+> contain `|`. The combined shape shown above as invalid is valid under that one bracketed form.
+> Every other mix of `,` and `|` remains a parse error: an unbracketed comma list containing `|`, nested
+> brackets, or a chain whose operand is itself a bracketed list.
 
 **JSON form** is canonical for programmatic input that produces structured objects
 more easily than string templating:
@@ -673,3 +684,126 @@ registry resolves them.
 - ADR-014: Curation Operations — verbs that the DSL invokes (update, merge,
   delete).
 - ADR-017: Pack Standard — how packs register verbs with the `VerbRegistry`.
+
+## Amendment 1 (2026-09-22): operation attribution is the complete contract, with no argument capture
+
+**Status**: Accepted.
+
+Originating issue(s): #2049
+
+Every audit event produced within an operation's scope carries that operation's zero-based
+lexical position in the parsed request (`op_index`) and one closed provenance value,
+`literal` or `resolved` (`ref_resolution`): `resolved` means at least one argument of that
+operation consumed a `$prev` reference; `literal` means none did. Position is assigned from
+source order at parse time, not from dispatch or completion order, so an operation that
+finishes out of order is still attributed to its written position. This pair is carried on
+every carrier the runtime produces for that operation's scope, including the gate-audit and
+domain-event carriers, and public event `list`/`get` expose the same pair unchanged. Several
+audit or domain rows may share one operation's index; the pair identifies which operation
+produced a row, not a uniqueness constraint on rows.
+
+This is the complete attribution contract. It does **not** identify which parameter carried
+a reference, the reference's path, or any argument's value, and it does **not** let a caller
+or a reader compare two operations' argument envelopes for equality. A capability that needs
+per-argument identification or cross-request argument equality is a separate product
+requirement and needs its own ADR; it is not satisfied by, and must not be retrofitted onto,
+`op_index`/`ref_resolution`.
+
+A pre-dispatch parse failure, or a chain tail aborted by an earlier failure, produces no
+operation-scoped audit event for the operation that never ran (see "Chain abort behavior"
+above). A row produced outside any request's operation scope (a legacy row written before
+this contract, or a row from a direct, non-request write path) carries both fields absent,
+never a synthesized `0`/`literal` default; absence is preserved, not backfilled.
+
+## Amendment 2 (2026-09-22): parallel units of linear chains, `[chain, chain]`
+
+**Status**: Accepted.
+
+Originating issue(s): #890
+
+### Grammar
+
+```text
+request := chain | "[" chain ("," chain)* "]"
+chain    := operation ("|" operation)*
+```
+
+A comma inside the outer brackets separates independent **units**; a pipe inside one unit
+sequences that unit's operations exactly as plain chain mode already does. Nested brackets, a
+chain whose operand is itself a bracketed list, a dangling pipe, an empty unit, and an
+unbracketed comma list that also contains a pipe remain parse errors. The existing JSON form
+is unchanged: it is always a flat list of independent operations, and a `"$prev"`-shaped
+string inside it is still rejected per `DslError::PrevRefInJsonForm`.
+
+### Parsed representation and execution
+
+The parser produces one source-ordered list of leaf operations plus a nonempty partition of
+that list into contiguous, non-overlapping ranges: `Single` has one range of length one,
+`Chain` has one range covering every leaf, and the new `Parallel`-of-`Chain`s shape has one
+range per bracketed unit. For `[a(), b() | c(), d() | e()]`, the leaves are indexed 0–4 in
+source order and the unit ranges are `[0,1)`, `[1,3)`, `[3,5)`. `op_index` (Amendment 1) is
+assigned from this same global, source-ordered leaf list; no new event schema is needed.
+
+Each unit owns its own `$prev`: the first leaf of a unit cannot reference `$prev`, and no
+unit may reference another unit's result. Units dispatch concurrently, each leaf within a
+unit sequentially, exactly as plain chain mode does today.
+
+### Failure scope
+
+A failed leaf aborts only the later leaves of its own unit, reported `aborted: true` exactly
+as in plain chain mode. Every other unit continues, subject only to the request-wide
+concurrency and budget limits below. A leaf already committed before its unit's abort is not
+rolled back. This is the same "abort but don't roll back" rule the base ADR already states
+for a plain chain.
+
+### Static write-key conflict preflight
+
+The existing static write-key extraction (used today only to detect conflicts between
+sibling leaves of a flat parallel batch) is applied per unit and then across units: a
+statically known write key may repeat any number of times **within** one unit, because a chain's own
+leaves are already ordered. But if the same statically known key appears in **different**
+units, every affected unit is refused in full, before any of its leaves dispatch, with the
+refusal on each affected unit's first entry naming the conflicting global leaf positions.
+Units that share no statically known key run normally.
+
+This preflight is deliberately incomplete and stays that way: it sees only statically
+extractable write keys, not `$prev`-resolved or otherwise dynamic targets, and it is not a
+serializability guarantee. Two units whose targets are both unresolved at parse time, or
+resolve to the same row only at dispatch time, are not caught by this preflight and race
+under their own verbs' existing transaction, compare-and-set, or uniqueness contracts; a
+caller that needs those two writes ordered puts them in one chain instead of two units.
+
+### Concurrency and response budget
+
+At most eight units are concurrently active per request, matching the existing eight-slot
+parallel-batch limit; a unit occupies one slot until it finishes and has at most one leaf in
+flight at a time. There is no per-unit multiplication of the eight-slot limit. The existing
+100-operation cap (`DslError::TooManyOps`) counts total leaf operations across every unit,
+not the count of outer units. The existing per-request inline response byte budget
+(`BATCH_RESPONSE_BUDGET_BYTES`) is one aggregate budget shared by the whole request, not a
+private budget per unit; once it is exhausted, no new leaf is admitted anywhere in the
+request, including a continuation of an already-active unit, while leaves already in
+flight are allowed to finish and their actual disposition is recorded. A never-started leaf
+past that point is reported `response_budget_exceeded`/`not_committed`, and its unit's
+remaining tail is aborted; a completed write whose response could not be retained under the
+budget is still reported committed, with its `domain_result` omitted per the existing
+bounded-response convention, and is never reported `not_committed` for that reason alone.
+
+### Response accounting
+
+Results are returned as one flat, leaf-ordered list regardless of which unit completes first.
+Each entry carries its global `op_index` (Amendment 1) plus additive `unit_index` and
+`step_index` fields locating it within its unit; no nested per-unit envelope replaces the
+flat leaf list. `summary.total` counts leaf operations; `succeeded` counts `ok: true`
+entries; `aborted` counts never-run dependent tail entries; `failed` counts the remainder;
+`total = succeeded + failed + aborted` as today. `status` remains `success` only when
+`failed` and `aborted` are both zero and is `partial` otherwise, including when no leaf in
+the request succeeded. This amendment adds no new top-level status value.
+
+### What this amendment does not change
+
+Single-operation and plain flat-batch requests keep their existing parse, dispatch, and
+response shape unchanged; every existing test asserting the pre-amendment rejection of an
+unbracketed comma-plus-pipe mix, a dangling separator, or a nested batch continues to hold.
+This amendment adds no cross-unit isolation guarantee, no recursive nesting beyond one level
+of brackets, and no change to any verb's own per-item limits.
