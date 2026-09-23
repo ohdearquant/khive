@@ -21,14 +21,12 @@
 //! (`spawn_blocking`) or a subprocess boundary; a component future must not
 //! occupy an async runtime worker with synchronous work.
 //!
-//! Startup ordering caveat: components start on the serve path after the
-//! boot guard is acquired but before the daemon finishes establishing
-//! ownership (socket bind, pid write). A process that fails establishment
-//! exits through `ComponentTeardown` — components are cancelled, but may
-//! have run briefly first. Side-effecting components (the ingest class)
-//! must therefore be idempotent under that window: work emitted by a
-//! process that never became the daemon may be performed again by the one
-//! that does.
+//! Production startup runs after the daemon has bound its socket, restricted
+//! its permissions, and written its PID file while holding the boot guard.
+//! A candidate that fails establishment starts no components. The daemon's
+//! teardown guard still cancels components on every exit, including unwinding
+//! from the startup callback; normal shutdown joins them inside drain.
+//! Components must remain idempotent across ordinary crash/restart delivery.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

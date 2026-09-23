@@ -167,15 +167,12 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     let (server, schedule_rt) = build_server(&args).await?;
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
 
-    #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(&server, &args);
-    #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(&server, &args);
-    start_daemon_components_if_daemon(&args, &server, schedule_rt);
-
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard(server, boot_guard).await?;
+        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
+            start_host_background_tasks(&args, server, schedule_rt)
+        })
+        .await?;
         return Ok(());
     }
     #[cfg(unix)]
@@ -190,7 +187,20 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
     // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
     // that stays daemon-owned).
+    start_host_background_tasks(&args, &server, schedule_rt);
     serve_with_session_sweep(server, &args, registry).await
+}
+
+fn start_host_background_tasks(
+    args: &Args,
+    server: &KhiveMcpServer,
+    schedule_rt: Option<KhiveRuntime>,
+) {
+    #[cfg(feature = "channel-email")]
+    spawn_email_channel_loops_if_daemon(server, args);
+    #[cfg(feature = "channel-telegram")]
+    spawn_telegram_channel_loops_if_daemon(server, args);
+    start_daemon_components_if_daemon(args, server, schedule_rt);
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -2289,15 +2299,12 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(&server, args);
-    #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(&server, args);
-    start_daemon_components_if_daemon(args, &server, schedule_rt);
-
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard(server, boot_guard).await?;
+        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
+            start_host_background_tasks(args, server, schedule_rt)
+        })
+        .await?;
         return Ok(());
     }
     drop(boot_guard);
@@ -2313,6 +2320,7 @@ pub async fn serve_server(
     // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
     // Without this spawn, every multi-backend session is permanently
     // invisible to cross-process WAL-pin attribution.
+    start_host_background_tasks(args, &server, schedule_rt);
     serve_with_session_sweep(server, args, registry).await
 }
 
