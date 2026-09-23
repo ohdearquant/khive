@@ -22,6 +22,10 @@ use super::util::{
 };
 use super::KnowledgeHandlers;
 
+#[path = "cursor_query.rs"]
+mod cursor_query;
+use cursor_query::cursor_query;
+
 const ATOM_LIST_FIELDS: &[&str] = &[
     "id",
     "namespace",
@@ -1013,12 +1017,7 @@ impl KnowledgeHandlers {
                     let fetch_limit = limit.saturating_add(1);
                     match cursor_key.as_ref() {
                         Some((created_at, id)) => (
-                            format!(
-                                "SELECT {select_columns} FROM knowledge_domains \
-                                 WHERE namespace = ?1 AND deleted_at IS NULL \
-                                 AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)) \
-                                 ORDER BY created_at ASC, id ASC LIMIT ?4"
-                            ),
+                            cursor_query("knowledge_domains", &select_columns, true, ""),
                             vec![
                                 SqlValue::Text(ns.clone()),
                                 SqlValue::Integer(*created_at),
@@ -1027,11 +1026,7 @@ impl KnowledgeHandlers {
                             ],
                         ),
                         None => (
-                            format!(
-                                "SELECT {select_columns} FROM knowledge_domains \
-                                 WHERE namespace = ?1 AND deleted_at IS NULL \
-                                 ORDER BY created_at ASC, id ASC LIMIT ?2"
-                            ),
+                            cursor_query("knowledge_domains", &select_columns, false, ""),
                             vec![SqlValue::Text(ns.clone()), SqlValue::Integer(fetch_limit)],
                         ),
                     }
@@ -1127,13 +1122,11 @@ impl KnowledgeHandlers {
                             ];
                             row_params.extend(data_status_params);
                             (
-                                format!(
-                                    "SELECT {select_columns} FROM knowledge_atoms \
-                                     WHERE namespace = ?1 AND deleted_at IS NULL \
-                                     AND tags NOT LIKE '%type:domain%' \
-                                     AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)){} \
-                                     ORDER BY created_at ASC, id ASC LIMIT ?4",
-                                    data_status_clause
+                                cursor_query(
+                                    "knowledge_atoms",
+                                    &select_columns,
+                                    true,
+                                    &data_status_clause,
                                 ),
                                 row_params,
                             )
@@ -1145,12 +1138,11 @@ impl KnowledgeHandlers {
                                 vec![SqlValue::Text(ns.clone()), SqlValue::Integer(fetch_limit)];
                             row_params.extend(data_status_params);
                             (
-                                format!(
-                                    "SELECT {select_columns} FROM knowledge_atoms \
-                                     WHERE namespace = ?1 AND deleted_at IS NULL \
-                                     AND tags NOT LIKE '%type:domain%'{} \
-                                     ORDER BY created_at ASC, id ASC LIMIT ?2",
-                                    data_status_clause
+                                cursor_query(
+                                    "knowledge_atoms",
+                                    &select_columns,
+                                    false,
+                                    &data_status_clause,
                                 ),
                                 row_params,
                             )
