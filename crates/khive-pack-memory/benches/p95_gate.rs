@@ -56,11 +56,14 @@
 //! The harness sleeps past that debounce interval and makes one settle recall
 //! (`EPOCH_DEBOUNCE_SETTLE`) before opening the timed window, which makes a due epoch
 //! check enqueue its rebuild before the event-count snapshot. The rebuild is detached:
-//! the settle recall does not await its completion. If it remains in flight and its
-//! `memory.ann_warm` events persist during the timed window, the event-count assertion
-//! rejects that run (a possible maintenance false positive) rather than silently
-//! accepting contaminated measurements. Rerun after the background work reaches
-//! quiescence. Emission is best-effort, per arm of `emit_ann_warm_phase_event`: a
+//! after that recall, the harness waits up to `ANN_BACKGROUND_WAIT_TIMEOUT` for the
+//! public background-task registry to contain neither `memory_ann_rebuild` nor
+//! `memory_ann_build`, then takes the snapshot. These names are process-global, so a
+//! different runtime's work can conservatively delay this sequential benchmark. Task
+//! absence means completion (including failure/cancellation), not successful warming
+//! or model freshness. Timeout refuses the row; it does not retry measurements. Work
+//! starting after the observation remains subject to the existing event-count and
+//! clean-response guards. Emission is best-effort, per arm of `emit_ann_warm_phase_event`: a
 //! missing event store returns without logging (this harness's count oracle itself
 //! requires the store, so that arm aborts the run rather than passing it), a
 //! serialization failure logs a warning and returns, and an `append_event` failure
@@ -78,6 +81,8 @@
 //! ```bash
 //! cd crates && cargo bench -p khive-pack-memory --bench p95_gate
 //! ```
+//! The same executable accepts `--regression-case=<name>` for model-free harness
+//! controls; these are explicit cases because this bench uses `harness=false`.
 //!
 //! Isolation: run on a quiet machine with no concurrent builds, benchmarks, or heavy I/O
 //! in progress. Run the suite twice and require consistent numbers across both runs
@@ -104,11 +109,11 @@ const RECALL_ITERS: usize = 200;
 /// `khive_pack_memory::ann::maybe_check_durable_epoch`'s debounce interval outside a
 /// `#[cfg(test)]` build (5s). One settle sleep of longer than this, followed by one more
 /// recall, makes any epoch-check due since seeding enqueue its detached background
-/// rebuild before the timed-window event snapshot. It does not await that rebuild; if
-/// `memory.ann_warm` events persist during timing, the event-count assertion below
-/// rejects the run as potentially contaminated (emission is best-effort; see the
-/// module docs for the evidence gap).
+/// rebuild before the subsequent tracked-task completion wait and event snapshot.
 const EPOCH_DEBOUNCE_SETTLE: Duration = Duration::from_millis(5_200);
+/// A harness watchdog, not a guarantee that a completed build succeeded.
+const ANN_BACKGROUND_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const ANN_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bounded attempts while polling for a stable warm ANN route before timing starts.
 const WARM_WAIT_MAX_ATTEMPTS: usize = 200;
@@ -233,6 +238,33 @@ async fn ann_warm_event_count(rt: &KhiveRuntime) -> u64 {
         })
         .await
         .expect("count_events")
+}
+
+async fn open_ann_measurement_window<T>(
+    label: &str,
+    wait_budget: Duration,
+    snapshot: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let deadline = tokio::time::Instant::now() + wait_budget;
+    loop {
+        // Process-global labels cannot identify a model/runtime or prove success.
+        // Chained rebuilds register their successor before the current task exits.
+        let live_tasks = khive_runtime::background_task_names();
+        let has_memory_ann_task = live_tasks
+            .iter()
+            .any(|name| matches!(name.as_str(), "memory_ann_rebuild" | "memory_ann_build"));
+        if !has_memory_ann_task {
+            return Ok(snapshot.await);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "[{label}] memory ANN background completion wait exhausted {wait_budget:?}; \
+                 live process tasks: {live_tasks:?}. Refusing to open the measurement window."
+            ));
+        }
+        tokio::time::sleep_until((now + ANN_BACKGROUND_POLL_INTERVAL).min(deadline)).await;
+    }
 }
 
 fn make_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
@@ -406,9 +438,8 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
 
     // Let any durable-epoch debounce check already due from seeding fire (see
     // EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more clean
-    // call. That call can enqueue a detached rebuild but cannot await it; the event-count
-    // assertion below rejects the run if that maintenance persists `memory.ann_warm`
-    // events inside the timed window (emission is best-effort; see the module docs).
+    // call. That call can enqueue a detached rebuild; await its tracked completion
+    // before the pre-window snapshot, without treating completion as build success.
     tokio::time::sleep(EPOCH_DEBOUNCE_SETTLE).await;
     let (_us, settle_resp) = recall_once(&registry, config.recall_model).await;
     if !is_clean_ann_route(&settle_resp) {
@@ -418,7 +449,12 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
         ));
     }
 
-    let ann_warm_events_before = ann_warm_event_count(&rt).await;
+    let ann_warm_events_before = open_ann_measurement_window(
+        config.label,
+        ANN_BACKGROUND_WAIT_TIMEOUT,
+        ann_warm_event_count(&rt),
+    )
+    .await?;
     let mut latencies = Vec::with_capacity(RECALL_ITERS);
     for i in 0..RECALL_ITERS {
         let (us, resp) = recall_once(&registry, config.recall_model).await;
@@ -452,6 +488,11 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
 
 #[tokio::main]
 async fn main() {
+    if let Some(case) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--regression-case=").map(str::to_owned))
+    {
+        std::process::exit(regression::run(&case).await);
+    }
     let configs = gate_configs();
 
     eprintln!(
@@ -500,6 +541,16 @@ async fn main() {
         }
     }
 
+    let exit_code = finish_gate(
+        &contaminated,
+        configs.iter().filter(|c| c.role == Role::Gating).count(),
+    );
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+fn finish_gate(contaminated: &[(&str, Role, String)], gating_configs: usize) -> i32 {
     println!("{}", "=".repeat(96));
     println!(
         "warm-route gate: a change must add at most 1.0ms absolute p95 and at most 5% of \
@@ -508,11 +559,11 @@ async fn main() {
     );
 
     if contaminated.is_empty() {
-        return;
+        return 0;
     }
 
     println!("{}", "-".repeat(96));
-    for (label, role, reason) in &contaminated {
+    for (label, role, reason) in contaminated {
         let scope = match role {
             Role::Gating => "gating, fails this run",
             Role::Informational => "informational, does not fail this run",
@@ -528,8 +579,210 @@ async fn main() {
         println!(
             "GATE FAILED: {failing} of {} gating configuration(s) could not be measured against \
              a clean warm route; the rows above are what was measured before that.",
-            configs.iter().filter(|c| c.role == Role::Gating).count()
+            gating_configs
         );
-        std::process::exit(2);
+        return 2;
+    }
+    0
+}
+
+// `harness=false` does not discover #[test] functions. These explicit cases exercise
+// the real registry and waiter without booting an embedder or opening a database.
+mod regression {
+    use super::*;
+    use std::future::{poll_fn, Future};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::Poll;
+
+    const CASE_WATCHDOG: Duration = Duration::from_secs(5);
+
+    fn held_task(
+        name: &'static str,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (release, held) = tokio::sync::oneshot::channel();
+        let task = khive_runtime::spawn_named_tracked_task(name, async move {
+            held.await.expect("release held task");
+        });
+        (release, task)
+    }
+
+    async fn snapshot(started: Arc<AtomicBool>) -> u64 {
+        started.store(true, Ordering::SeqCst);
+        17
+    }
+
+    async fn require_pending<F: Future>(mut window: Pin<&mut F>, started: &AtomicBool) {
+        poll_fn(|cx| {
+            assert!(
+                window.as_mut().poll(cx).is_pending(),
+                "measurement window must stay pending while a memory ANN task is held"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "pre-window snapshot must not start before tracked completion"
+        );
+    }
+
+    async fn held_completion(name: &'static str) {
+        let (release, task) = held_task(name);
+        let started = Arc::new(AtomicBool::new(false));
+        let mut window = Box::pin(open_ann_measurement_window(
+            name,
+            CASE_WATCHDOG,
+            snapshot(started.clone()),
+        ));
+        require_pending(window.as_mut(), &started).await;
+        release.send(()).expect("release task");
+        task.await.expect("tracked task finishes");
+        assert_eq!(window.await.expect("completion opens window"), 17);
+        assert!(started.load(Ordering::SeqCst));
+    }
+
+    async fn chained_handoff() {
+        let (release_first, first_held) = tokio::sync::oneshot::channel();
+        let (release_next, next_held) = tokio::sync::oneshot::channel();
+        // Return the successor handle so the predecessor can finish while the
+        // successor remains registered; awaiting it here would erase the handoff.
+        #[allow(clippy::async_yields_async)]
+        let first = khive_runtime::spawn_named_tracked_task("memory_ann_rebuild", async move {
+            first_held.await.expect("release first rebuild");
+            khive_runtime::spawn_named_tracked_task("memory_ann_rebuild", async move {
+                next_held.await.expect("release chained rebuild");
+            })
+        });
+        let started = Arc::new(AtomicBool::new(false));
+        let mut window = Box::pin(open_ann_measurement_window(
+            "chained-handoff",
+            CASE_WATCHDOG,
+            snapshot(started.clone()),
+        ));
+        require_pending(window.as_mut(), &started).await;
+        release_first.send(()).expect("release first rebuild");
+        let next = first
+            .await
+            .expect("first completed after registering successor");
+        assert!(
+            khive_runtime::background_task_names()
+                .iter()
+                .any(|name| name == "memory_ann_rebuild"),
+            "chained rebuild must remain registered after its predecessor completes"
+        );
+        // Make the waiter's first poll timer ready, then poll it while the successor
+        // is still channel-held. The channel, not elapsed time, proves it is live.
+        tokio::time::sleep(ANN_BACKGROUND_POLL_INTERVAL).await;
+        require_pending(window.as_mut(), &started).await;
+        release_next.send(()).expect("release chained rebuild");
+        next.await.expect("chained rebuild finishes");
+        assert_eq!(window.await.expect("chain completion opens window"), 17);
+    }
+
+    async fn timeout_row(role: Role) -> i32 {
+        let (release, task) = held_task("memory_ann_rebuild");
+        let started = Arc::new(AtomicBool::new(false));
+        let wait_budget = Duration::ZERO;
+        let reason =
+            open_ann_measurement_window("held-timeout-row", wait_budget, snapshot(started.clone()))
+                .await
+                .expect_err("held task at deadline must refuse the row");
+        assert!(
+            reason.contains("memory_ann_rebuild"),
+            "timeout must name the live task: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("{wait_budget:?}")),
+            "timeout must name the wait budget: {reason}"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "timed-out row must not take a snapshot"
+        );
+        release.send(()).expect("release timed-out task");
+        task.await.expect("timed-out task finishes");
+        finish_gate(&[("held-timeout-row", role, reason)], 1)
+    }
+
+    async fn unrelated_task() {
+        let (release, task) = held_task("unrelated_long_lived_task");
+        let started = Arc::new(AtomicBool::new(false));
+        let count = open_ann_measurement_window(
+            "unrelated-task",
+            Duration::ZERO,
+            snapshot(started.clone()),
+        )
+        .await
+        .expect("unrelated task must not block the measurement window");
+        assert_eq!(count, 17);
+        assert!(!task.is_finished(), "unrelated task must still be held");
+        release.send(()).expect("release unrelated task");
+        task.await.expect("unrelated task finishes");
+    }
+
+    async fn failed_task_completion() {
+        let task = khive_runtime::spawn_named_tracked_task("memory_ann_build", async {
+            Err::<(), _>("build failed")
+        });
+        assert!(task.await.expect("task returned an error").is_err());
+        open_ann_measurement_window("failed-build", Duration::ZERO, async {})
+            .await
+            .expect("completion observation must not claim build success");
+    }
+
+    pub(super) async fn run(case: &str) -> i32 {
+        let code = match case {
+            "held-rebuild" => {
+                held_completion("memory_ann_rebuild").await;
+                0
+            }
+            "held-build" => {
+                held_completion("memory_ann_build").await;
+                0
+            }
+            "chained-handoff" => {
+                chained_handoff().await;
+                0
+            }
+            "timeout-gating-row" => timeout_row(Role::Gating).await,
+            "timeout-informational-row" => timeout_row(Role::Informational).await,
+            "unrelated-task" => {
+                unrelated_task().await;
+                0
+            }
+            "failed-task-completion" => {
+                failed_task_completion().await;
+                0
+            }
+            "clean-row" => {
+                assert!(is_clean_ann_route(&json!([{"id": "clean-result"}])));
+                let count = open_ann_measurement_window("clean-row", Duration::ZERO, async { 17 })
+                    .await
+                    .expect("idle registry opens clean row");
+                assert_eq!(count, 17);
+                let stats = percentiles(vec![100, 200, 300]);
+                assert_eq!(stats.n, 3);
+                finish_gate(&[], 1)
+            }
+            "unmeasurable-gating-row" => {
+                assert!(!is_clean_ann_route(&json!([])));
+                finish_gate(
+                    &[(
+                        "unmeasurable-row",
+                        Role::Gating,
+                        "no clean measurement".into(),
+                    )],
+                    1,
+                )
+            }
+            _ => panic!("unknown p95 gate regression case: {case}"),
+        };
+        eprintln!("p95 gate regression case {case}: completed, exit {code}");
+        code
     }
 }
