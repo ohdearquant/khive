@@ -103,3 +103,10 @@ success for an unsearchable map. Point a normal `kkernel` process at the map thr
 `[[backends]]` entry in a selected config to use generic KG reads such as `search`, `resolve`,
 `neighbors`, `traverse`, and `context`. `kkernel code-audit` remains the separate policy-driven,
 read-only report surface for the same database.
+
+Before each guarded entity insert or replacement, source ingest rejects the runtime-owned
+top-level `khive:secret_gate` property using the shared reservation validator. This includes a
+property retained from an existing map row; reingestion cannot carry an unverified stamp into a
+new candidate. The refusal leaves that entity and its FTS document unchanged. This is a per-write
+boundary, not a transaction over the entire source sweep. An identically spelled key nested in
+ordinary property data remains subject to scanning and is not reserved.
