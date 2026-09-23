@@ -87,7 +87,12 @@ running. Results are one flat list in source order; each entry adds
 `op_index`, `unit_index`, and `step_index` alongside the usual `ok`/`tool`
 fields, so a caller can regroup the flat list back into its units without
 re-deriving the partition. Nesting stops at one bracket level: a `[...]`
-cannot appear inside a unit.
+cannot appear inside a unit. A batch of units is not a transaction: each op
+commits on its own, and no request-level `atomic` mode spans units. An
+`atomic=` argument belongs to the verbs that define it (bulk
+`create(items=[...])`, `stream.batch`, `comm.mark_read`) and covers only that
+op's own writes, while the cross-op atomic unit, `kkernel exec --ops-file
+--atomic`, reads one JSON op per line and accepts no inline batch or chain.
 
 ## Pass a result to the next operation
 
