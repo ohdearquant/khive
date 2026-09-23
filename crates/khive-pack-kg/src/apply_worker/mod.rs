@@ -8,6 +8,7 @@ pub use worker::ProposalApplyWorker;
 #[cfg(test)]
 pub(crate) use crate::projection_worker::ProposalsProjectionWorker;
 pub(crate) use budget::has_multi_step_compound;
+pub(crate) use budget::validate_note_proposal_admission;
 
 #[cfg(test)]
 pub(crate) use budget::{count_new_entries, WriteBudget};
