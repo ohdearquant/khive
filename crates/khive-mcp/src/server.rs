@@ -14,6 +14,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
+    ops::Range,
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
@@ -32,8 +33,8 @@ use sha2::{Digest, Sha256};
 use khive_db::ConnectionPool;
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_request::{
-    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, ParsedOp,
-    ParsedRequest, PrevFailure, TypedJsonOp,
+    parse_request, parse_typed_json_batch, unit_write_key_conflicts, ArgValue, DslError,
+    ExecutionMode, ParsedOp, ParsedRequest, PrevFailure, TypedJsonOp,
 };
 use khive_runtime::presentation::{
     prepare_format_value_with_note_content, render_format_with_note_content, NoteContentScope,
@@ -553,6 +554,69 @@ struct BatchTask<F> {
     index: usize,
     tool: String,
     future: F,
+}
+
+/// One bracketed-batch unit's future (ADR-016 Amendment 2): a linear chain
+/// dispatched under [`execute_bounded_units`]'s concurrency cap.
+struct UnitTask<F> {
+    future: F,
+}
+
+/// One unit's flattened leaf entries plus the `parse_content` recomputations
+/// its own dispatched leaves produced (mirroring plain chain mode's per-step
+/// recompute), reported back to the caller for merging into the shared
+/// request-wide `parse_content` vector.
+struct UnitOutcome {
+    unit_index: usize,
+    entries: Vec<Value>,
+    content_updates: Vec<(usize, bool)>,
+}
+
+/// The ADR-016 Amendment 2 aggregate response budget, shared by every unit of
+/// one bracketed batch of chains. Every leaf checks [`Self::is_breached`]
+/// before it dispatches and calls [`Self::record`] after it produces its
+/// final entry, so the total is spent once across the whole request
+/// regardless of how many units or leaves are concurrently in flight.
+struct UnitBudget {
+    limit: usize,
+    state: std::sync::Mutex<(usize, bool)>,
+}
+
+impl UnitBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: std::sync::Mutex::new((0, false)),
+        }
+    }
+
+    /// `true` once the aggregate budget has been exhausted. Checked before
+    /// every leaf, including a continuation of an already-active unit, so no
+    /// new leaf is admitted anywhere in the request past this point.
+    fn is_breached(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+    }
+
+    /// Records `entry`'s serialized size against the shared total. An entry
+    /// that itself exhausts the budget is still kept as-is; it already ran
+    /// and its disposition is real; only the *next* leaf anywhere in the
+    /// request is refused.
+    fn record(&self, entry: &Value) {
+        let bytes = serde_json::to_vec(entry)
+            .expect("serde_json::Value is always serializable")
+            .len();
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.0 = guard.0.saturating_add(bytes);
+        if guard.0 > self.limit {
+            guard.1 = true;
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2276,6 +2340,7 @@ impl KhiveMcpServer {
         &self,
         ops: Vec<ParsedOp>,
         mode: ExecutionMode,
+        ranges: Vec<Range<usize>>,
         presentation: PresentationMode,
         presentation_per_op: Option<Vec<Option<PresentationMode>>>,
         context: RunParsedContext<'_>,
@@ -2312,6 +2377,27 @@ impl KhiveMcpServer {
             .map(|op| parse_content_requested(op, None))
             .collect();
         let response = match mode {
+            // ADR-016 Amendment 2: a bracketed batch whose ranges partition
+            // `ops` into units longer than one leaf is a parallel batch of
+            // linear chains, not an ordinary flat batch; every ordinary
+            // batch keeps `ranges.len() == ops.len()` (one leaf per range)
+            // and falls through to the unchanged arm below.
+            ExecutionMode::Parallel if ranges.iter().any(|range| range.len() > 1) => {
+                let (resp, content_updates) = self
+                    .run_parallel_units(
+                        ops,
+                        ranges,
+                        presentation,
+                        presentation_per_op.clone(),
+                        context,
+                        now_unix,
+                    )
+                    .await;
+                for (index, requested) in content_updates {
+                    parse_content[index] = requested;
+                }
+                resp
+            }
             ExecutionMode::Single | ExecutionMode::Parallel => {
                 // Write-key conflict preflight.
                 //
@@ -2649,6 +2735,266 @@ impl KhiveMcpServer {
             })
             .collect();
         (response, content_scopes)
+    }
+
+    /// ADR-016 Amendment 2 executor for a bracketed batch of linear chains.
+    ///
+    /// Each `ranges` entry is a unit: its own leaves dispatch sequentially
+    /// with their own `$prev`, exactly like plain chain mode (only a unit's
+    /// first leaf is barred from `$prev`). Units themselves run
+    /// concurrently, bounded by `context.max_batch_concurrency`, and share
+    /// one aggregate response budget; once it is exhausted, no leaf
+    /// anywhere in the request starts; an already-admitted leaf keeps its
+    /// real disposition, and the next never-started leaf of every affected
+    /// unit is refused with `response_budget_exceeded`.
+    ///
+    /// A static write-key conflict between two different units refuses both
+    /// units before either dispatches a single leaf; a key repeated inside
+    /// one unit is left alone, since that unit's own leaves are already
+    /// ordered.
+    ///
+    /// Returns the response envelope plus the `(global leaf index,
+    /// parse_content)` pairs for every leaf this call actually dispatched,
+    /// so the caller can fold them into the request-wide `parse_content`
+    /// vector before its own trailing `content_scopes` pass.
+    async fn run_parallel_units(
+        &self,
+        ops: Vec<ParsedOp>,
+        ranges: Vec<Range<usize>>,
+        presentation: PresentationMode,
+        presentation_per_op: Option<Vec<Option<PresentationMode>>>,
+        context: RunParsedContext<'_>,
+        now_unix: i64,
+    ) -> (Value, Vec<(usize, bool)>) {
+        let RunParsedContext {
+            enforce_response_budget,
+            max_batch_concurrency,
+            from_wire,
+            identity,
+        } = context;
+        let total = ops.len();
+        let response_budget = if enforce_response_budget {
+            BATCH_RESPONSE_BUDGET_BYTES
+        } else {
+            usize::MAX
+        };
+        let budget = Arc::new(UnitBudget::new(response_budget));
+        let unit_conflicts = unit_write_key_conflicts(&ops, &ranges);
+        let presentation_per_op: Arc<Vec<Option<PresentationMode>>> =
+            Arc::new(presentation_per_op.unwrap_or_default());
+
+        let mut leaf_slots: Vec<Option<ParsedOp>> = ops.into_iter().map(Some).collect();
+        let unit_tasks: Vec<UnitTask<_>> = ranges
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(unit_index, range)| {
+                let leaves: Vec<ParsedOp> = range
+                    .clone()
+                    .map(|i| {
+                        leaf_slots[i]
+                            .take()
+                            .expect("each leaf belongs to exactly one range")
+                    })
+                    .collect();
+                let conflicts = unit_conflicts.get(&unit_index).cloned();
+                let budget = budget.clone();
+                let presentation_per_op = presentation_per_op.clone();
+                UnitTask {
+                    future: async move {
+                        let mut entries: Vec<Value> = Vec::with_capacity(leaves.len());
+                        let mut content_updates: Vec<(usize, bool)> =
+                            Vec::with_capacity(leaves.len());
+
+                        if let Some(conflicts) = conflicts {
+                            let positions: Vec<String> = conflicts
+                                .iter()
+                                .map(|c| format!("op #{} in unit #{}", c.other_leaf, c.other_unit))
+                                .collect();
+                            let message = format!(
+                                "write-key conflict: this unit shares a write key with another \
+                                 unit in the same request ({}). Both units are refused before \
+                                 dispatch; split them into separate requests.",
+                                positions.join(", ")
+                            );
+                            let mut leaves = leaves.into_iter();
+                            let first = leaves.next().expect("a unit always has at least one leaf");
+                            entries.push(failure_entry(
+                                first.tool,
+                                json!(message),
+                                DomainDisposition::NotCommitted,
+                            ));
+                            for leaf in leaves {
+                                entries.push(aborted_entry(
+                                    leaf.tool,
+                                    Some(
+                                        "not executed: this unit was refused before dispatch \
+                                         because it shares a write key with another unit in the \
+                                         same request."
+                                            .to_string(),
+                                    ),
+                                ));
+                            }
+                            return UnitOutcome {
+                                unit_index,
+                                entries,
+                                content_updates,
+                            };
+                        }
+
+                        let mut prev_result: Option<Value> = None;
+                        let mut aborted_from: Option<usize> = None;
+                        for (step_index, op) in leaves.into_iter().enumerate() {
+                            let global_index = range.start + step_index;
+                            if let Some(failed_at) = aborted_from {
+                                let failed_step = failed_at - 1;
+                                let failed_tool = entries
+                                    .get(failed_step)
+                                    .and_then(|r| r.get("tool"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("<unknown>");
+                                entries.push(aborted_entry(
+                                    op.tool,
+                                    Some(format!(
+                                        "not executed: leaf #{failed_step} of this unit \
+                                         ({failed_tool:?}) failed earlier in the same unit, so \
+                                         this unit's tail aborted before reaching this leaf."
+                                    )),
+                                ));
+                                continue;
+                            }
+                            if budget.is_breached() {
+                                entries.push(batch_budget_error(&op.tool, response_budget));
+                                aborted_from = Some(step_index + 1);
+                                continue;
+                            }
+
+                            let content_requested =
+                                parse_content_requested(&op, prev_result.as_ref());
+                            content_updates.push((global_index, content_requested));
+                            let op_mode = presentation_per_op
+                                .get(global_index)
+                                .and_then(|mode| *mode)
+                                .unwrap_or(presentation);
+                            let presentation_policy =
+                                self.registry.presentation_policy_for(&op.tool);
+                            let effective_mode =
+                                if presentation_policy == VerbPresentationPolicy::AlwaysVerbose {
+                                    PresentationMode::Verbose
+                                } else {
+                                    op_mode
+                                };
+                            let usage_ctx = khive_runtime::usage::UsageContext::new();
+                            let operation = khive_types::OperationAttribution {
+                                op_index: u32::try_from(global_index)
+                                    .expect("parser bounds operation count"),
+                                ref_resolution: if op
+                                    .args
+                                    .values()
+                                    .any(|arg| !matches!(arg, ArgValue::Value(_)))
+                                {
+                                    khive_types::RefResolution::Resolved
+                                } else {
+                                    khive_types::RefResolution::Literal
+                                },
+                            };
+                            match khive_storage::operation_context::scope_operation_attribution(
+                                operation,
+                                khive_runtime::usage::scope(
+                                    usage_ctx.clone(),
+                                    self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(mut result_obj) => {
+                                    stamp_usage(&mut result_obj, &usage_ctx);
+                                    match chain_aggregation_depth_reject(result_obj) {
+                                        Err(error_entry) => {
+                                            budget.record(&error_entry);
+                                            entries.push(error_entry);
+                                            prev_result = None;
+                                            aborted_from = Some(step_index + 1);
+                                        }
+                                        Ok(result_obj) => {
+                                            prev_result = result_obj.get("result").cloned();
+                                            let content_scope = note_content_scope(
+                                                content_requested,
+                                                result_obj["tool"].as_str().unwrap_or_default(),
+                                                &result_obj["result"],
+                                                &self.registry,
+                                            );
+                                            let presented = apply_presentation_to_result(
+                                                result_obj,
+                                                effective_mode,
+                                                now_unix,
+                                                presentation_policy,
+                                                content_scope,
+                                            );
+                                            budget.record(&presented);
+                                            entries.push(presented);
+                                        }
+                                    }
+                                }
+                                Err(failure) => {
+                                    let mut entry = failure.into_entry();
+                                    stamp_usage(&mut entry, &usage_ctx);
+                                    budget.record(&entry);
+                                    entries.push(entry);
+                                    aborted_from = Some(step_index + 1);
+                                }
+                            }
+                        }
+
+                        UnitOutcome {
+                            unit_index,
+                            entries,
+                            content_updates,
+                        }
+                    },
+                }
+            })
+            .collect();
+
+        let outcomes = execute_bounded_units(unit_tasks, max_batch_concurrency).await;
+
+        let mut results: Vec<Option<Value>> = (0..total).map(|_| None).collect();
+        let mut content_updates: Vec<(usize, bool)> = Vec::new();
+        for outcome in outcomes {
+            let range = ranges[outcome.unit_index].clone();
+            for (offset, mut entry) in outcome.entries.into_iter().enumerate() {
+                // Additive on this bracketed shape only: an ordinary single,
+                // flat batch, or top-level chain response carries none of
+                // these fields, unchanged by this amendment.
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("op_index".to_string(), json!(range.start + offset));
+                    object.insert("unit_index".to_string(), json!(outcome.unit_index));
+                    object.insert("step_index".to_string(), json!(offset));
+                }
+                results[range.start + offset] = Some(entry);
+            }
+            content_updates.extend(outcome.content_updates);
+        }
+        let results: Vec<Value> = results
+            .into_iter()
+            .map(|entry| entry.expect("every leaf in every unit produces exactly one entry"))
+            .collect();
+
+        let succeeded = results
+            .iter()
+            .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+            .count();
+        let aborted = results
+            .iter()
+            .filter(|r| r.get("aborted").and_then(Value::as_bool) == Some(true))
+            .count();
+        let failed = total - succeeded - aborted;
+        let response = json!({
+            "results": results,
+            "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": aborted },
+            "status": batch_status(failed, aborted),
+        });
+        (response, content_updates)
     }
 }
 
@@ -3884,6 +4230,40 @@ where
         .collect()
 }
 
+/// Bounded-concurrency driver for one bracketed batch of chains (ADR-016
+/// Amendment 2): at most `max_concurrency` units are admitted and polled at
+/// once, refilled only as units complete. Every admitted unit dispatches its
+/// own leaves sequentially (never more than one leaf in flight per unit), so
+/// this bounds total in-flight leaves at `max_concurrency` too. Unlike
+/// [`execute_bounded_batch`], response-budget accounting lives inside each
+/// unit's own leaf loop (via the shared [`UnitBudget`]) rather than in this
+/// driver: a unit admitted after the budget is already exhausted finds that
+/// out at the top of its own first leaf, before it dispatches anything.
+async fn execute_bounded_units<I, F>(tasks: I, max_concurrency: usize) -> Vec<UnitOutcome>
+where
+    I: IntoIterator<Item = UnitTask<F>>,
+    F: Future<Output = UnitOutcome>,
+{
+    assert!(max_concurrency > 0, "unit concurrency must be nonzero");
+    let mut queued: std::collections::VecDeque<_> = tasks.into_iter().collect();
+    let mut in_flight = FuturesUnordered::new();
+    let start = |task: UnitTask<F>| task.future;
+    for _ in 0..max_concurrency {
+        if let Some(task) = queued.pop_front() {
+            in_flight.push(start(task));
+        }
+    }
+
+    let mut outcomes = Vec::new();
+    while let Some(outcome) = in_flight.next().await {
+        outcomes.push(outcome);
+        if let Some(task) = queued.pop_front() {
+            in_flight.push(start(task));
+        }
+    }
+    outcomes
+}
+
 fn parallel_batch_envelope(results: Vec<Value>) -> Value {
     let total = results.len();
     let succeeded = results
@@ -4331,6 +4711,7 @@ impl KhiveMcpServer {
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
+                parsed.ranges,
                 presentation,
                 presentation_per_op.clone(),
                 RunParsedContext {
@@ -7192,6 +7573,489 @@ mod tests {
             bridge: khive_db::SqlBridge::new(pool, false),
         });
         KhiveMcpServer::from_registry(builder.build().expect("slow-SQL test registry"))
+    }
+
+    /// Deterministic concurrency probe for ADR-016 Amendment 2: `dispatch`
+    /// blocks every caller until exactly `threshold` calls have arrived at
+    /// once, then releases all of them together via a `watch` channel; a
+    /// late subscriber (a unit only admitted after an earlier one frees its
+    /// slot) reads the already-released value on its first `borrow()` and
+    /// never blocks, unlike `Notify::notify_waiters`, which only wakes
+    /// callers already waiting at the moment it fires. No test ever sleeps
+    /// to synchronize: a request that cannot reach `threshold` concurrent
+    /// calls hangs (caught by the caller's own `tokio::time::timeout`)
+    /// rather than racing a clock.
+    struct UnitBarrierPack {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        threshold: usize,
+        release_tx: tokio::sync::watch::Sender<bool>,
+        release_rx: tokio::sync::watch::Receiver<bool>,
+    }
+
+    fn unit_barrier_pack(threshold: usize) -> (UnitBarrierPack, Arc<AtomicUsize>) {
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let pack = UnitBarrierPack {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: max_in_flight.clone(),
+            threshold,
+            release_tx,
+            release_rx,
+        };
+        (pack, max_in_flight)
+    }
+
+    impl khive_types::Pack for UnitBarrierPack {
+        const NAME: &'static str = "unit-barrier-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "barrier_wait",
+                description: "blocks until `threshold` concurrent calls have arrived, for a \
+                               deterministic concurrency-bound test",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "noop",
+                description: "returns immediately, for chain-shape tests that need a harmless \
+                               second leaf",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "always_fails",
+                description: "always returns a per-op error, for unit-tail-abort tests",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for UnitBarrierPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            if verb == "noop" {
+                return Ok(json!({"noop": true}));
+            }
+            if verb == "always_fails" {
+                return Err(RuntimeError::RemoteFetchError {
+                    remote: "unit-barrier-test".to_string(),
+                    message: "injected failure for a unit-tail-abort test".to_string(),
+                });
+            }
+            let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(n, Ordering::SeqCst);
+            if n >= self.threshold {
+                self.release_tx.send(true).ok();
+                // Stay in flight across one yield, so a unit admitted beyond
+                // the cap and polled in the same pass is counted in the peak
+                // instead of arriving after this call has already left.
+                tokio::task::yield_now().await;
+            } else {
+                let mut rx = self.release_rx.clone();
+                while !*rx.borrow() {
+                    rx.changed().await.ok();
+                }
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(json!({"arrival": n}))
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_batch_of_chains_bounds_units_at_max_concurrency() {
+        // ADR-016 Amendment 2: ten multi-leaf units, each a two-leaf
+        // chain (`barrier_wait() | noop()`), inside one bracketed batch.
+        // `barrier_wait` only releases once MAX_BATCH_CONCURRENCY calls have
+        // arrived concurrently, so the request can only complete at all if
+        // the executor both reaches that concurrency (units 9 and 10 could
+        // never be admitted otherwise; the request hangs, it does not fail)
+        // and never exceeds it (`max_in_flight` is an exact atomic peak
+        // forced by the barrier, not a sampled snapshot that could miss a
+        // higher peak).
+        let (pack, max_in_flight) = unit_barrier_pack(MAX_BATCH_CONCURRENCY);
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        let server = KhiveMcpServer::from_registry(builder.build().expect("barrier test registry"));
+
+        let unit_count = 10usize;
+        let ops = format!(
+            "[{}]",
+            vec!["barrier_wait() | noop()"; unit_count].join(", ")
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.dispatch_request_local(RequestParams {
+                ops,
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the request must complete once MAX_BATCH_CONCURRENCY units are admitted, not hang")
+        .expect("bracketed batch of barrier chains dispatches cleanly");
+
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        assert_eq!(envelope["summary"]["total"], unit_count * 2, "{envelope}");
+        assert_eq!(
+            envelope["summary"]["succeeded"],
+            unit_count * 2,
+            "{envelope}"
+        );
+        assert_eq!(envelope["summary"]["failed"], 0, "{envelope}");
+        assert_eq!(envelope["summary"]["aborted"], 0, "{envelope}");
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            MAX_BATCH_CONCURRENCY,
+            "at most (and, since ten units were admitted, at least) MAX_BATCH_CONCURRENCY units \
+             may have a leaf in flight at once"
+        );
+
+        // op_index/unit_index/step_index stay lexical (0..N-1, grouped by
+        // static unit boundaries) regardless of which units actually
+        // completed first under real concurrency; this is the one scenario
+        // in this file where completion order is genuinely nondeterministic,
+        // which is exactly why it is the right place to prove the ordering
+        // claim rather than a synthetic single-threaded rebuild of it.
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), unit_count * 2, "{envelope}");
+        for (index, row) in results.iter().enumerate() {
+            assert_eq!(row["op_index"], index, "{envelope}");
+            assert_eq!(row["unit_index"], index / 2, "{envelope}");
+            assert_eq!(row["step_index"], index % 2, "{envelope}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_unit_prev_ref_threads_within_its_own_unit_only() {
+        // A later leaf inside a multi-leaf unit resolves `$prev` against
+        // its OWN unit's immediately preceding leaf, exactly like plain
+        // chain mode; there is no cross-unit reference, and a disjoint
+        // unit dispatches on its own literal argument.
+        let server = large_result_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: concat!(
+                    "[",
+                    "record_write(marker=\"seed\") | record_write(marker=$prev.marker), ",
+                    "record_write(marker=\"other-unit\")",
+                    "]"
+                )
+                .to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed batch dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        assert_eq!(envelope["summary"]["succeeded"], 3, "{envelope}");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 3, "{envelope}");
+        assert_eq!(results[0]["result"]["marker"], "seed", "{envelope}");
+        assert_eq!(
+            results[1]["result"]["marker"], "seed",
+            "$prev must resolve against the immediately preceding leaf of the SAME unit: {envelope}"
+        );
+        assert_eq!(results[2]["result"]["marker"], "other-unit", "{envelope}");
+        assert_eq!(results[0]["unit_index"], 0, "{envelope}");
+        assert_eq!(results[1]["unit_index"], 0, "{envelope}");
+        assert_eq!(results[2]["unit_index"], 1, "{envelope}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_dynamic_prev_resolved_write_target_is_outside_static_preflight() {
+        // `write_keys_for_op_pub` only reads LITERAL argument values; a
+        // `$prev`-resolved target is invisible to the static cross-unit
+        // preflight even when it happens to resolve to the same id another
+        // unit's literal write target names, because resolving it would
+        // require running the chain, and the preflight runs before any leaf
+        // in the request dispatches.
+        let server = large_result_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: concat!(
+                    "[",
+                    "record_write(marker=\"x\") | update(id=$prev.marker, name=\"dynamic\"), ",
+                    "update(id=\"x\", name=\"literal\")",
+                    "]"
+                )
+                .to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed batch dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 3, "{envelope}");
+        for row in results {
+            let message = row["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                !message.contains("write-key conflict"),
+                "a $prev-resolved target must not be visible to the static preflight: {envelope}"
+            );
+        }
+        // Unit 0's own first leaf still dispatches and succeeds; only the
+        // `update` verb (unimplemented on this test registry) fails, and it
+        // fails as an ordinary per-op error, never as a conflict refusal.
+        assert_eq!(results[0]["ok"], true, "{envelope}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_unit_failure_aborts_only_its_own_tail() {
+        // A failing leaf aborts the rest of its OWN unit only; a sibling
+        // unit dispatches normally.
+        let (pack, _max_in_flight) = unit_barrier_pack(usize::MAX);
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        let server = KhiveMcpServer::from_registry(builder.build().expect("barrier test registry"));
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: concat!("[", "always_fails() | noop(), ", "noop() | noop()", "]").to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed batch dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 4, "{envelope}");
+        assert_eq!(results[0]["ok"], false, "{envelope}");
+        assert_eq!(results[1]["aborted"], true, "{envelope}");
+        assert_eq!(results[2]["ok"], true, "{envelope}");
+        assert_eq!(results[3]["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["summary"],
+            json!({"total": 4, "succeeded": 2, "failed": 1, "aborted": 1}),
+            "{envelope}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_batch_write_key_conflict_refuses_only_affected_units() {
+        // A write key shared by two DIFFERENT units refuses every leaf
+        // of BOTH units before any of them dispatch; a disjoint unit with no
+        // shared key runs normally alongside the refused ones.
+        let server = large_result_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: concat!(
+                    "[",
+                    "update(id=\"same-id\", name=\"from-unit-0\") | record_write(marker=\"u0-tail\"), ",
+                    "update(id=\"same-id\", name=\"from-unit-1\"), ",
+                    "record_write(marker=\"u2-solo\") | record_write(marker=\"u2-tail\")",
+                    "]"
+                )
+                .to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed batch dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 5, "{envelope}");
+
+        assert_eq!(results[0]["ok"], false, "{envelope}");
+        assert!(
+            results[0]["error"]["message"]
+                .as_str()
+                .expect("conflict message")
+                .contains("write-key conflict"),
+            "{envelope}"
+        );
+        assert_eq!(results[1]["aborted"], true, "{envelope}");
+
+        assert_eq!(results[2]["ok"], false, "{envelope}");
+        assert!(
+            results[2]["error"]["message"]
+                .as_str()
+                .expect("conflict message")
+                .contains("write-key conflict"),
+            "{envelope}"
+        );
+
+        assert_eq!(results[3]["ok"], true, "{envelope}");
+        assert_eq!(results[3]["result"]["marker"], "u2-solo", "{envelope}");
+        assert_eq!(results[4]["ok"], true, "{envelope}");
+        assert_eq!(results[4]["result"]["marker"], "u2-tail", "{envelope}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_batch_same_key_within_one_unit_is_not_refused_as_conflict() {
+        // A chain's own repeated write key is legal; both leaves reach
+        // dispatch (and fail only because `update` is not a verb this test
+        // registry implements, never because of a conflict refusal).
+        let server = large_result_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"[update(id="x", name="1") | update(id="x", name="2")]"#.to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed batch dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2, "{envelope}");
+        for row in results {
+            let message = row["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                !message.contains("write-key conflict"),
+                "a chain's own ordered leaves must not be refused as a conflict: {envelope}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_unit_aggregate_budget_matches_serial_semantics() {
+        // The shared aggregate response budget behaves exactly like
+        // plain chain mode's own budget accounting (already proven
+        // serial-equivalent by
+        // `typed_serial_dispatch_retains_one_aggregate_response_budget`): an
+        // already-dispatched leaf keeps its real, committed disposition even
+        // if its own bytes are what exhausts the budget; only the next
+        // never-started leaf is refused with `response_budget_exceeded`, and
+        // the rest of that unit's tail aborts behind it. A single bracketed
+        // unit with twelve `|`-chained leaves keeps this fully sequential
+        // and deterministic (no concurrency ambiguity), exercising the new
+        // executor (`ranges = [0..12]`, one unit) with the SAME per-leaf
+        // byte size and count as the flat-mode precedent, so the same
+        // arithmetic applies.
+        let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
+        let leaves = vec![format!("large_result(bytes={result_bytes})"); 12].join(" | ");
+        let server = large_result_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: format!("[{leaves}]"),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed single-unit chain dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 12, "{envelope}");
+
+        let first_budget_error = results
+            .iter()
+            .position(|row| {
+                row["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("batch response budget"))
+            })
+            .expect("the unit must reach the aggregate budget before its tail leaf");
+        assert!(
+            first_budget_error >= 3 && first_budget_error < results.len(),
+            "the aggregate budget must not reset per leaf: {envelope}"
+        );
+        assert!(results[..first_budget_error]
+            .iter()
+            .all(|row| row["ok"] == json!(true)));
+        assert!(results[first_budget_error..]
+            .iter()
+            .enumerate()
+            .all(|(offset, row)| if offset == 0 {
+                row["ok"] == json!(false)
+                    && row["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(&BATCH_RESPONSE_BUDGET_BYTES.to_string()))
+                    && row["error"]["domain_disposition"] == json!("not_committed")
+            } else {
+                row["aborted"] == json!(true)
+            }));
+        for (index, row) in results.iter().enumerate() {
+            assert_eq!(row["op_index"], index, "{envelope}");
+            assert_eq!(row["unit_index"], 0, "{envelope}");
+            assert_eq!(row["step_index"], index, "{envelope}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn bracketed_units_share_one_aggregate_response_budget() {
+        // Two units of six large leaves each. Four such entries exceed the
+        // request budget, and each unit has at most one leaf in flight, so
+        // with one budget shared by the whole request at most five leaves
+        // can complete: four recorded before the breach plus the one leaf
+        // the other unit may already have in flight. A private budget per
+        // unit would let each unit complete four leaves on its own.
+        let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
+        let unit = vec![format!("large_result(bytes={result_bytes})"); 6].join(" | ");
+        let server = large_result_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: format!("[{unit}, {unit}]"),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bracketed two-unit batch dispatches");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        let results = envelope["results"].as_array().expect("results");
+        assert_eq!(results.len(), 12, "{envelope}");
+        let succeeded = results
+            .iter()
+            .filter(|row| row["ok"] == json!(true))
+            .count();
+        assert!(
+            (4..=5).contains(&succeeded),
+            "one budget shared across units admits four or five leaves, got {succeeded}"
+        );
+        assert_eq!(envelope["summary"]["succeeded"], succeeded, "{envelope}");
+        for row in results.iter().filter(|row| row["ok"] != json!(true)) {
+            let refused = row["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("batch response budget"));
+            assert!(
+                refused || row["aborted"] == json!(true),
+                "a leaf past the shared budget is refused or aborted: {row}"
+            );
+        }
     }
 
     #[test]
@@ -10252,6 +11116,7 @@ mod tests {
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
+                parsed.ranges,
                 PresentationMode::Verbose,
                 None,
                 RunParsedContext {
@@ -10326,6 +11191,7 @@ mod tests {
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
+                parsed.ranges,
                 PresentationMode::Verbose,
                 None,
                 RunParsedContext {

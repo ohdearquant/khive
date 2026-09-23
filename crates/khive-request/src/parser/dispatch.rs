@@ -63,6 +63,7 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         return Ok(ParsedRequest {
             ops: vec![first_op],
             mode: ExecutionMode::Single,
+            ranges: std::iter::once(0..1).collect(),
         });
     }
 
@@ -104,7 +105,8 @@ pub fn parse_typed_json_batch(ops: Vec<TypedJsonOp>) -> Result<ParsedRequest, Ds
         });
     }
 
-    let mut parsed_ops = Vec::with_capacity(ops.len());
+    let op_count = ops.len();
+    let mut parsed_ops = Vec::with_capacity(op_count);
     for TypedJsonOp { tool, args } in ops {
         let args_value = Value::Object(args);
         if !crate::value_nesting_within_limit(&args_value, NESTING_DEPTH_LIMIT - 2) {
@@ -135,6 +137,7 @@ pub fn parse_typed_json_batch(ops: Vec<TypedJsonOp>) -> Result<ParsedRequest, Ds
     Ok(ParsedRequest {
         ops: parsed_ops,
         mode: ExecutionMode::Parallel,
+        ranges: (0..op_count).map(|i| i..i + 1).collect(),
     })
 }
 
@@ -166,9 +169,11 @@ fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedReque
             expected: "'|' or end of input",
         });
     }
+    let op_count = ops.len();
     Ok(ParsedRequest {
         ops,
         mode: ExecutionMode::Chain,
+        ranges: std::iter::once(0..op_count).collect(),
     })
 }
 
@@ -236,28 +241,55 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
     } else {
         ExecutionMode::Parallel
     };
-    Ok(ParsedRequest { ops, mode })
+    let ranges = if is_single {
+        std::iter::once(0..1).collect()
+    } else {
+        (0..ops.len()).map(|i| i..i + 1).collect()
+    };
+    Ok(ParsedRequest { ops, mode, ranges })
 }
 
+/// Parses `"[" chain ("," chain)* "]"` (ADR-016 Amendment 2): a comma inside
+/// the outer brackets separates independent **units**, and a `|` inside one
+/// unit sequences that unit's operations exactly as plain chain mode already
+/// does. An ordinary flat batch (`[a(), b()]`) is the case where every unit
+/// has exactly one leaf; same tokens, same parse, same `ranges` shape
+/// (`i..i+1` per op) as before this amendment.
 fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
     let mut p = Parser::new(input);
     p.expect_char('[')?;
     p.skip_ws();
     let mut ops = Vec::new();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     if p.peek() == Some(']') {
         p.advance(1);
         return Err(DslError::EmptyBatch);
     }
     loop {
+        let unit_start = ops.len();
         if ops.len() >= MAX_OPS {
             return Err(DslError::TooManyOps {
                 count: ops.len() + 1,
                 max: MAX_OPS,
             });
         }
-        let op = p.parse_op()?;
-        ops.push(op);
+        let first_leaf = p.parse_op()?;
+        ops.push(first_leaf);
         p.skip_ws();
+        while p.peek() == Some('|') {
+            if ops.len() >= MAX_OPS {
+                return Err(DslError::TooManyOps {
+                    count: ops.len() + 1,
+                    max: MAX_OPS,
+                });
+            }
+            p.advance(1);
+            p.skip_ws();
+            let leaf = p.parse_op()?;
+            ops.push(leaf);
+            p.skip_ws();
+        }
+        ranges.push(unit_start..ops.len());
         match p.peek() {
             Some(',') => {
                 let comma_pos = p.pos;
@@ -271,7 +303,6 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
                 p.advance(1);
                 break;
             }
-            Some('|') => return Err(DslError::MixedSeparators),
             Some(c) => {
                 return Err(DslError::UnexpectedChar {
                     pos: p.pos,
@@ -290,15 +321,21 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
             expected: "end of input",
         });
     }
-    for op in &ops {
-        if let Some(pos) = find_prev_ref_pos(op) {
+    // Only a unit's first leaf is barred from `$prev` (matching plain chain
+    // mode's own first-op rule); a later leaf inside a multi-leaf unit may
+    // reference `$prev` against its own unit's immediately preceding leaf.
+    for range in &ranges {
+        if let Some(pos) = find_prev_ref_pos(&ops[range.start]) {
             return Err(DslError::PrevRefOutsideChain { pos });
         }
+    }
+    for op in &ops {
         reject_reserved_args(op)?;
     }
     Ok(ParsedRequest {
         ops,
         mode: ExecutionMode::Parallel,
+        ranges,
     })
 }
 

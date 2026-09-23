@@ -623,7 +623,8 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
 def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], str]:
     """Parses a request DSL string into `([(verb, args), ...], mode)`, where
     `mode` is `"single"`, `"parallel"`, or `"chain"` — a `$prev` reference is
-    accepted only in the last of these (`dispatch.rs::parse_chain_tail`).
+    accepted in a chain (`dispatch.rs::parse_chain_tail`) and in any operation
+    after the first of a batch unit (`dispatch.rs::parse_fn_batch`).
     Mirrors `dispatch.rs::parse_request`'s ordering: the raw-empty check
     (`Empty`), then the raw byte-length cap (`InputTooLarge`), both before
     any routing or parsing; the chain/batch operation-count cap
@@ -644,19 +645,22 @@ def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], st
         inner = text[1:-1].strip()
         if not inner:
             raise DslParseError("empty batch: '[]'", variant="EmptyBatch")
-        if len(_split_top_level(inner, "|")) > 1:
-            raise DslParseError(
-                "mixed separators: '|' is not allowed inside '[...]'", variant="MixedSeparators"
-            )
-        parts = _split_top_level(inner, ",")
-        if not parts[-1].strip():
+        units = _split_top_level(inner, ",")
+        if not units[-1].strip():
             # Mirrors `dispatch.rs::parse_fn_batch`: a `,` followed by `]`.
             raise DslParseError(f"trailing comma in batch: {text!r}", variant="TrailingComma")
-        if len(parts) > MAX_OPS:
-            raise DslParseError(
-                f"batch has {len(parts)} ops; max is {MAX_OPS}", variant="TooManyOps"
-            )
-        return [_parse_op(p, in_chain=False) for p in parts], "parallel"
+        # A `|` inside `[...]` sequences one unit's operations; the cap counts
+        # every operation of every unit, and only a unit's first operation is
+        # barred from `$prev`.
+        leaves = [_split_top_level(unit, "|") for unit in units]
+        count = sum(len(unit) for unit in leaves)
+        if count > MAX_OPS:
+            raise DslParseError(f"batch has {count} ops; max is {MAX_OPS}", variant="TooManyOps")
+        return [
+            _parse_op(leaf, in_chain=index > 0)
+            for unit in leaves
+            for index, leaf in enumerate(unit)
+        ], "parallel"
     chain_parts = _split_top_level(text, "|")
     if len(chain_parts) > 1:
         if len(chain_parts) > MAX_OPS:

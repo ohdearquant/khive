@@ -26,6 +26,12 @@ pub fn plan_request(ops: &str, catalog: &BTreeMap<String, String>) -> Value {
         ExecutionMode::Parallel => "parallel",
         ExecutionMode::Chain => "chain",
     };
+    let unit_index_of: Vec<usize> = request
+        .ranges
+        .iter()
+        .enumerate()
+        .flat_map(|(unit_index, range)| range.clone().map(move |_| unit_index))
+        .collect();
     let stages: Vec<Value> = request
         .ops
         .into_iter()
@@ -45,14 +51,21 @@ pub fn plan_request(ops: &str, catalog: &BTreeMap<String, String>) -> Value {
                 "known": pack.is_some(),
                 "args": args,
                 "prev_refs": prev_refs,
+                "unit_index": unit_index_of.get(index),
             })
         })
+        .collect();
+    let units: Vec<Value> = request
+        .ranges
+        .iter()
+        .map(|range| json!({"start": range.start, "end": range.end}))
         .collect();
     json!({
         "parsed": true,
         "mode": mode,
         "stage_count": stages.len(),
         "stages": stages,
+        "units": units,
         "limits": limits,
     })
 }

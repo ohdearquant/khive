@@ -3511,6 +3511,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn atomic_takes_no_inline_batch_of_chains() {
+        // The cross-op atomic unit reads an ops file, one JSON op per line, so
+        // no inline DSL reaches its admission check: a bracketed batch of
+        // chains is refused at the same argument boundary as a flat batch.
+        for ops in ["[stats() | stats(), stats()]", "[stats(), stats()]"] {
+            let error = ExecArgs::try_parse_from(["exec", ops, "--atomic"])
+                .expect_err("--atomic with inline ops must fail during CLI parsing");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{ops}: {error}"
+            );
+        }
+        let atomic =
+            ExecArgs::try_parse_from(["exec", "--ops-file", "/tmp/batch.jsonl", "--atomic"])
+                .expect("--atomic must be accepted with an ops file");
+        assert!(atomic.atomic);
+    }
+
     // ── isolated DB helpers ────────────────────────────────────────────────────
 
     /// Build an isolated in-process runtime using a temp-file SQLite database.

@@ -9,7 +9,7 @@ to permissive.
 from __future__ import annotations
 
 import pytest
-from _dsl_fake import DslParseError, PrevRef, parse_dsl
+from _dsl_fake import DslParseError, PrevRef, parse_dsl, parse_dsl_with_mode
 
 
 def test_raw_control_character_in_string_rejected():
@@ -60,9 +60,24 @@ def test_bare_top_level_chain_parses_as_chain():
     assert parse_dsl("stats() | whoami()") == [("stats", {}), ("whoami", {})]
 
 
-def test_bracketed_chain_rejected_as_mixed_separators():
-    with pytest.raises(DslParseError):
-        parse_dsl("[stats() | whoami()]")
+def test_bracketed_chain_parses_as_parallel_units():
+    ops, mode = parse_dsl_with_mode('[get(id="x") | update(id=$prev.id), stats()]')
+    assert mode == "parallel"
+    assert ops == [("get", {"id": "x"}), ("update", {"id": PrevRef("id")}), ("stats", {})]
+
+
+def test_prev_reference_rejected_in_a_batch_units_first_operation():
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl("[stats(), get(id=$prev.id) | whoami()]")
+    assert exc_info.value.variant == "PrevRefOutsideChain"
+
+
+def test_batch_unit_operations_count_toward_the_op_cap():
+    fifty = " | ".join(f"v(i={i})" for i in range(50))
+    assert len(parse_dsl(f"[{fifty}, {fifty}]")) == 100
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl(f"[{fifty}, {fifty} | v(i=50)]")
+    assert exc_info.value.variant == "TooManyOps"
 
 
 def test_prev_reference_resolved_inside_a_chain():
@@ -159,7 +174,6 @@ def test_duplicate_argument_name_rejected():
     ("text", "variant"),
     [
         ("", "Empty"),
-        ("[v() | w()]", "MixedSeparators"),
         ("[v(), ]", "TrailingComma"),
         ("v(a=1, a=2)", "DuplicateArg"),
         ("v(a={, b=1)", "UnexpectedChar"),
