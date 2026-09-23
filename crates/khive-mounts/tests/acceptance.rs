@@ -376,15 +376,14 @@ async fn mounted_call_mints_one_gate_request_and_preserves_declared_namespace_ar
     let path = dir.path().join("state");
     fs::write(&path, json!({"tools": [{"name": "A", "inputSchema": {"type": "object", "properties": {"namespace": {"type": "string"}}, "required": ["namespace"]}}]}).to_string()).unwrap();
     let runtime = runtime();
+    let mut cfg = config(&path, &["A"]);
+    // Allow scheduling slack while checking gate attribution and argument forwarding.
+    cfg.timeout_ms = 30_000;
     let spy = Arc::new(SpyGate::default());
     let mut builder = VerbRegistryBuilder::new();
     builder.with_gate(spy.clone());
     builder
-        .register_mounted(Box::new(
-            MountedPack::start(config(&path, &["A"]), runtime)
-                .await
-                .unwrap(),
-        ))
+        .register_mounted(Box::new(MountedPack::start(cfg, runtime).await.unwrap()))
         .unwrap();
     let result = builder
         .build()
