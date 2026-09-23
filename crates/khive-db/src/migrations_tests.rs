@@ -4545,3 +4545,24 @@ fn issue2673_v37_initializes_and_guards_entity_versions() {
         2
     );
 }
+
+#[test]
+fn sender_transport_migration_fresh_and_previous_tail() {
+    for previous in [0, 37] {
+        let mut conn = open_memory();
+        if previous != 0 {
+            migrate_through(&mut conn, previous);
+        }
+        run_migrations(&mut conn).unwrap();
+        assert!(table_exists(&conn, "comm_sender_transport"));
+        let foreign_keys: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list('comm_sender_transport')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(foreign_keys, 0, "transport rows must outlive note history");
+        run_migrations(&mut conn).unwrap();
+    }
+}

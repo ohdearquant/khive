@@ -2706,6 +2706,7 @@ dependencies = [
  "chrono-tz",
  "iana-time-zone",
  "inventory",
+ "khive-channel",
  "khive-db",
  "khive-fold",
  "khive-fusion",
