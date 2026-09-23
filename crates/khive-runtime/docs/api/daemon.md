@@ -52,6 +52,28 @@ metrics frame does not issue an on-demand checkpoint or stat the sidecar. `wal_p
 compatibility projection of `wal_log_frames`. The backend key is load-bearing in a multi-backend
 daemon: a secondary task's later tick cannot relabel its state as the main pool's sample.
 
+`wal_checkpoint_stores` is an additive, default-empty array for this daemon's checkpoint
+topology. Each row has `store_id` (`main` or `secondary:<index>` in dispatcher order),
+`role`, and a basename-only `database` display label. Equal basenames do not merge rows;
+canonical paths stay inside the process. IDs are stable only within the same process
+and unchanged topology. Split-daemon stores are not measured by this process.
+
+Each row contains cumulative `ticks`, `elapsed_us_sum`, `elapsed_us_max`, `busy_ticks`,
+and `error_ticks` for actual routine PASSIVE calls, including failed calls. Skipped ticks
+and the post-TRUNCATE observation are excluded. Time uses a monotonic clock around the
+checkpoint call only; microseconds retain sub-millisecond work. SQLite's nonzero busy
+result increments `busy_ticks`; pending frames alone do not. A call error increments
+`error_ticks` and has no returned busy flag. Counters saturate at `u64::MAX`.
+
+For two snapshots of the same store/process, mean call time is
+`delta(elapsed_us_sum) / delta(ticks)` and the returned-busy rate per call is
+`delta(busy_ticks) / delta(ticks)` when the tick delta is positive. Use
+`delta(error_ticks)` to distinguish calls without a SQLite result; for a rate over
+returned rows only, subtract that delta from the denominator. `elapsed_us_max` is the
+maximum since process start, not an interval maximum. Restart, topology changes,
+counter decreases or saturation require a fresh measurement interval. Metrics reads
+do not issue checkpoint calls or filesystem probes.
+
 `write_queue_depth`/`_capacity` (ADR-067 Component A) come from the same pool and are `None`
 unless a writer task exists. The `write_last_*_micros` fields expose that task's latest completed
 queue-wait, transaction-acquisition, body, commit, and total stages, plus the observation time.
