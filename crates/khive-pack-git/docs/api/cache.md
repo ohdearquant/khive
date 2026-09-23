@@ -249,6 +249,41 @@ immune to the original pathname being swapped out from under it afterward.
 `is_owned_entry_via_fd` is `is_owned_entry`'s fd-relative mirror, used by
 `delete_verified_owned_entry` right before it acts.
 
+## Windows validated command paths
+
+`revalidate_owned_slot` opens the slot itself without following a final
+reparse point. It obtains that handle's normalized path and file identity,
+then pins every directory in the resolved path from root to slot. Each pin
+opens the final component without following reparse points and omits
+`FILE_SHARE_DELETE`, so the component cannot be renamed or removed while
+Git uses its name. The last handle must have the initial slot's volume and
+128-bit file ID; an ancestor swap during acquisition refuses the operation.
+The `.git` directory and regular ownership marker are checked and pinned
+the same way. All reparse tags are refused, including junctions.
+
+Git receives the resolved, pinned `.git` path. An existing scratch-root
+alias may resolve during the initial open; commands never use that alias
+again. A final-path string or a slot handle alone is not sufficient: the
+complete path chain and `.git` child stay pinned through each synchronous
+fetch and ref-update wait. Refusal to open, identify, or pin a component
+returns the existing `UnsafeToReplace` error, without a pathname fallback.
+Filesystems that cannot supply this identity/path proof therefore refuse
+the mutation. Pins are released before owned over-cap cleanup so that the
+new protection does not prevent normal removal.
+
+This protects the slot/child pathname replacement in #2149, not arbitrary
+changes to repository contents. It does not change the separate Windows
+recursive-removal behavior above. Platforms other than Unix and Windows
+retain the documented weaker pathname fallback; no handle guarantee is
+claimed for those targets.
+
+The `check-windows` CI job executes the five `issue2149_windows_` regressions
+with a nonempty selection floor. They cover blocked slot/child and ancestor
+renames, rejected reparse ownership components, an actual scratch-alias
+swap, successful fetch/ref advancement into the pinned clone, and both
+over-cap cleanup paths. Symlink capability is required by the tests and
+must not silently skip their witnesses.
+
 ## `remove_dir_all_retrying`
 
 `std::fs::remove_dir_all` on a large git working tree can transiently fail

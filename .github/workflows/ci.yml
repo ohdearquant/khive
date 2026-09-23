@@ -966,6 +966,13 @@ jobs:
           # Floor 1 detects empty selection without pinning the suite size.
           cargo test -p khive-db --lib bounded_verified_get_accepts_exact_and_portable_maximum_limits 2>&1 | tee "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log" 1
+      # #2149: exercise real Windows sharing/reparse semantics and Git's
+      # consumption of the pinned path; a compile check cannot prove either.
+      - name: khive-pack-git Windows cache slot pins
+        shell: bash
+        run: |
+          cargo test -p khive-pack-git --lib issue2149_windows_ 2>&1 | tee "$RUNNER_TEMP/issue2149-windows.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/issue2149-windows.log" 5
 
   coverage-measurement:
     name: Coverage measurement
