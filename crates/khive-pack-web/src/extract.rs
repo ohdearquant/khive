@@ -25,13 +25,13 @@ use std::sync::{Arc, LazyLock};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
 use regex::Regex;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
 use crate::egress::Refusal;
 use crate::identity;
+use crate::vocab::ExtractParams;
 use crate::WebPack;
 
 const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
@@ -55,13 +55,16 @@ static ATOM_LINK_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RSS_LINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?is)<link>\s*([^<\s][^<]*?)\s*</link>"#).expect("valid regex"));
-/// `<script>`/`<style>` bodies are never prose: stripped whole (tag and
-/// content) before the streaming generic tag-only strip runs, so their
-/// contents never leak into extracted text. Two alternatives, not a
-/// backreference — the `regex` crate's engine is backtracking-free and
-/// does not support `\1`.
-static SCRIPT_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>").expect("valid regex")
+// Match only a fixed-size, decoded prefix at the current '<'. These retain
+// regex's Unicode case folding and word boundary without searching the whole
+// document before the first prose character can enter the excerpt.
+static SCRIPT_STYLE_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^<(?:(script)\b|(style)\b)").expect("valid regex"));
+static SCRIPT_STYLE_END_RE: LazyLock<[Regex; 2]> = LazyLock::new(|| {
+    [
+        Regex::new(r"(?i)^</script>").expect("valid regex"),
+        Regex::new(r"(?i)^</style>").expect("valid regex"),
+    ]
 });
 
 fn decoded_body_bytes(raw: &[u8]) -> usize {
@@ -162,6 +165,10 @@ impl TextBuffer {
         std::str::from_utf8(&self.bytes[..self.len]).expect("only complete UTF-8 chars are stored")
     }
 
+    fn saturated(&self) -> bool {
+        self.full || self.len == self.bytes.len()
+    }
+
     fn into_string(self) -> String {
         let mut bytes = self.bytes.into_vec();
         bytes.truncate(self.len);
@@ -169,65 +176,189 @@ impl TextBuffer {
     }
 }
 
-fn text_excerpt(body: &str) -> String {
-    let mut output = TextBuffer::new();
+struct TextScanner<'a> {
+    raw: &'a [u8],
+    output: TextBuffer,
     // Keep an unclosed '<...' candidate bounded too: the old <[^>]+> strip
     // preserves it as text if no closing '>' exists. Normalizing this candidate
     // as it arrives avoids buffering an arbitrarily long unterminated tag.
-    let mut pending = TextBuffer::new();
-    let mut in_tag = false;
-    let mut tag_content = false;
-    let mut consume = |text: &str| {
-        for ch in text.chars() {
-            if in_tag {
-                if ch == '>' {
-                    if tag_content {
-                        output.push(' ');
-                    } else {
-                        output.push('<');
-                        output.push('>');
-                    }
-                    in_tag = false;
-                    pending.clear();
-                } else {
-                    tag_content = true;
-                    pending.push(ch);
-                }
-            } else if ch == '<' {
-                in_tag = true;
-                tag_content = false;
-                pending.push(ch);
-            } else {
-                output.push(ch);
-            }
-        }
-    };
-    let mut offset = 0;
-    for removed in SCRIPT_STYLE_RE.find_iter(body) {
-        consume(&body[offset..removed.start()]);
-        consume(" ");
-        offset = removed.end();
-    }
-    consume(&body[offset..]);
-    if in_tag {
-        for ch in pending.as_str().chars() {
-            output.push(ch);
-        }
-    }
-    output.into_string()
+    pending: TextBuffer,
+    in_tag: bool,
+    tag_content: bool,
+    no_tag_end: bool,
+    no_script_style_end: [bool; 2],
+    #[cfg(test)]
+    inspected_bytes: usize,
+    #[cfg(test)]
+    furthest_byte: usize,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ExtractParams {
-    #[serde(default)]
-    id: Option<Uuid>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    kinds: Option<Vec<String>>,
-    #[serde(default)]
-    namespace: Option<String>,
+impl<'a> TextScanner<'a> {
+    fn new(raw: &'a [u8]) -> Self {
+        Self {
+            raw,
+            output: TextBuffer::new(),
+            pending: TextBuffer::new(),
+            in_tag: false,
+            tag_content: false,
+            no_tag_end: false,
+            no_script_style_end: [false; 2],
+            #[cfg(test)]
+            inspected_bytes: 0,
+            #[cfg(test)]
+            furthest_byte: 0,
+        }
+    }
+
+    // Count the ranges actually inspected by decoding/search, including
+    // lookahead and repeated work. Tests assert a work bound, not elapsed time.
+    fn observe(&mut self, _start: usize, _len: usize) {
+        #[cfg(test)]
+        {
+            self.inspected_bytes += _len;
+            self.furthest_byte = self.furthest_byte.max(_start + _len);
+        }
+    }
+
+    fn next_char(&mut self, offset: &mut usize) -> Option<char> {
+        let first = *self.raw.get(*offset)?;
+        self.observe(*offset, 1);
+        if first.is_ascii() {
+            *offset += 1;
+            return Some(char::from(first));
+        }
+        // UTF-8 needs at most four bytes to decide one character or invalid
+        // sequence. Calling utf8_chunks()/from_utf8() on the entire remaining
+        // body would first scan its entire valid prefix, defeating early exit.
+        let end = self.raw.len().min(*offset + 4);
+        self.observe(*offset + 1, end - *offset - 1);
+        let bytes = &self.raw[*offset..end];
+        let ch = match std::str::from_utf8(bytes) {
+            Ok(valid) => valid.chars().next().expect("nonempty prefix"),
+            Err(error) if error.valid_up_to() != 0 => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .expect("validated prefix")
+                    .chars()
+                    .next()
+                    .expect("nonempty valid prefix")
+            }
+            Err(error) => {
+                *offset += error.error_len().unwrap_or(bytes.len());
+                return Some('\u{fffd}');
+            }
+        };
+        *offset += ch.len_utf8();
+        Some(ch)
+    }
+
+    fn prefix(&mut self, mut offset: usize) -> ([u8; 36], usize) {
+        // Nine characters cover </script> and the word-boundary lookahead for
+        // either opening name, including Unicode case-folded spellings.
+        let mut prefix = [0; 36];
+        let mut len = 0;
+        for _ in 0..9 {
+            let Some(ch) = self.next_char(&mut offset) else {
+                break;
+            };
+            len += ch.encode_utf8(&mut prefix[len..]).len();
+        }
+        (prefix, len)
+    }
+
+    fn find_byte(&mut self, start: usize, byte: u8) -> Option<usize> {
+        let found = self.raw[start..].iter().position(|ch| *ch == byte);
+        self.observe(start, found.map_or(self.raw.len() - start, |n| n + 1));
+        found.map(|n| start + n)
+    }
+
+    fn closed_script_style_end(&mut self, start: usize) -> Option<usize> {
+        if self.no_tag_end {
+            return None;
+        }
+        let (prefix, len) = self.prefix(start);
+        let prefix = std::str::from_utf8(&prefix[..len]).expect("decoded prefix");
+        let captures = SCRIPT_STYLE_START_RE.captures(prefix)?;
+        let kind = usize::from(captures.get(1).is_none());
+        if self.no_script_style_end[kind] {
+            return None;
+        }
+        let Some(header_end) = self.find_byte(start, b'>') else {
+            self.no_tag_end = true;
+            return None;
+        };
+        let mut offset = header_end + 1;
+        while let Some(candidate) = self.find_byte(offset, b'<') {
+            let (prefix, len) = self.prefix(candidate);
+            let prefix = std::str::from_utf8(&prefix[..len]).expect("decoded prefix");
+            if let Some(end) = SCRIPT_STYLE_END_RE[kind].find(prefix) {
+                // The matched token itself is valid UTF-8, so its byte length
+                // is identical in the raw body and the decoded prefix.
+                return Some(candidate + end.end());
+            }
+            offset = candidate + 1;
+        }
+        // Preserve unterminated scripts as tag-stripped text. Remember the
+        // absent closing token so repeated openers do not rescan the same tail
+        // quadratically. Every later opener's first '>' is >= header_end.
+        self.no_script_style_end[kind] = true;
+        None
+    }
+
+    fn consume(&mut self, ch: char) {
+        if self.in_tag {
+            if ch == '>' {
+                if self.tag_content {
+                    self.output.push(' ');
+                } else {
+                    self.output.push('<');
+                    self.output.push('>');
+                }
+                self.in_tag = false;
+                self.pending.clear();
+            } else {
+                self.tag_content = true;
+                self.pending.push(ch);
+            }
+        } else if ch == '<' {
+            self.in_tag = true;
+            self.tag_content = false;
+            self.pending.push(ch);
+        } else {
+            self.output.push(ch);
+        }
+    }
+
+    fn scan(&mut self) {
+        let mut offset = 0;
+        while !self.output.saturated() {
+            let start = offset;
+            let Some(ch) = self.next_char(&mut offset) else {
+                break;
+            };
+            if ch == '<' {
+                if let Some(end) = self.closed_script_style_end(start) {
+                    offset = end;
+                    self.consume(' ');
+                    continue;
+                }
+            }
+            self.consume(ch);
+        }
+        if self.in_tag {
+            for ch in self.pending.as_str().chars() {
+                if self.output.saturated() {
+                    break;
+                }
+                self.output.push(ch);
+            }
+        }
+    }
+}
+
+fn text_excerpt(raw: &[u8]) -> String {
+    let mut scanner = TextScanner::new(raw);
+    scanner.scan();
+    scanner.output.into_string()
 }
 
 const ALL_KINDS: &[&str] = &["text", "links", "sitemap", "feed"];
@@ -447,7 +578,7 @@ async fn extract_text(
     token: &NamespaceToken,
     original_id: Uuid,
     original_url: &str,
-    body: &str,
+    body: &[u8],
     derived_admission: &Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Uuid, RuntimeError> {
     let excerpt = text_excerpt(body);
@@ -540,23 +671,6 @@ async fn run_extract(
     let verified = hydrator
         .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
         .await?;
-    // Raw admission is held first, then derived admission. No path holding a
-    // derived permit acquires raw admission again, so these two budgets cannot
-    // form a wait cycle. Queued cancellation drops the request's RAII leases
-    // before allocating derived buffers. An already-started text put retains a
-    // shared derived lease until its background I/O actually completes.
-    let valid_body = std::str::from_utf8(verified.bytes()).ok();
-    let decoded_bytes = if valid_body.is_some() {
-        0
-    } else {
-        decoded_body_bytes(verified.bytes())
-    };
-    let derived = Arc::new(admit_derived_buffers(&DERIVED_ADMISSION, decoded_bytes).await?);
-    let body = match valid_body {
-        Some(body) => Cow::Borrowed(body),
-        None => Cow::Owned(decode_body(verified.bytes(), decoded_bytes)),
-    };
-
     let url_str = properties
         .get("url")
         .and_then(Value::as_str)
@@ -583,6 +697,30 @@ async fn run_extract(
         }
     }
 
+    // Text consumes raw UTF-8 lazily, including replacement characters. Only
+    // the other extraction kinds need a fully decoded body; a text-only
+    // request must neither validate nor allocate an unused decoded tail.
+    let valid_body = if kinds.iter().any(|kind| kind != "text") {
+        std::str::from_utf8(verified.bytes()).ok()
+    } else {
+        Some("")
+    };
+    let decoded_bytes = if valid_body.is_some() {
+        0
+    } else {
+        decoded_body_bytes(verified.bytes())
+    };
+    // Raw admission is held first, then derived admission. No path holding a
+    // derived permit acquires raw admission again, so these two budgets cannot
+    // form a wait cycle. Queued cancellation drops the request's RAII leases
+    // before allocating derived buffers. An already-started text put retains a
+    // shared derived lease until its background I/O actually completes.
+    let derived = Arc::new(admit_derived_buffers(&DERIVED_ADMISSION, decoded_bytes).await?);
+    let body = match valid_body {
+        Some(body) => Cow::Borrowed(body),
+        None => Cow::Owned(decode_body(verified.bytes(), decoded_bytes)),
+    };
+
     let mut result = serde_json::Map::new();
     for kind in &kinds {
         match kind.as_str() {
@@ -599,8 +737,15 @@ async fn run_extract(
                 result.insert("feed".to_string(), json!({ "entries": count }));
             }
             "text" => {
-                let text_id =
-                    extract_text(runtime, token, target_id, &url_str, &body, &derived).await?;
+                let text_id = extract_text(
+                    runtime,
+                    token,
+                    target_id,
+                    &url_str,
+                    verified.bytes(),
+                    &derived,
+                )
+                .await?;
                 result.insert("text".to_string(), json!({ "id": text_id.to_string() }));
             }
             _ => unreachable!("validated above"),
@@ -624,7 +769,7 @@ impl WebPack {
             RuntimeError::InvalidInput(format!("invalid web.extract arguments: {error}"))
         })?;
         let effective_token =
-            crate::fetch::resolve_effective_token(token, params.namespace.as_deref())?;
+            crate::namespace::resolve_effective_token(token, params.namespace.as_deref())?;
         run_extract(&self.runtime, &effective_token, params).await
     }
 }
@@ -660,6 +805,8 @@ mod tests {
 
     #[test]
     fn bounded_text_scanner_preserves_tag_and_whitespace_behavior() {
+        let scripts =
+            Regex::new(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>").unwrap();
         let tags = Regex::new(r"(?s)<[^>]+>").unwrap();
         let whitespace = Regex::new(r"\s+").unwrap();
         for body in [
@@ -668,23 +815,112 @@ mod tests {
             "<p title='<script>secret</script>'>visible</p>",
             "literal <> <<> end <unfinished\n  tag",
             "<script>unterminated script",
+            "<sCrIpT data='>'>ignored</ScRiPt>after",
+            "<ſcript>ignored</ſcript><ſtyle>hidden</ſtyle>after",
+            "<scripté>prose</script><script\u{301}>also prose</script>",
+            "<script/>ignored</script><style!>hidden</style>after",
+            "<script><style>hidden</style>visible",
+            "<script <style>first</style>second</script>after",
             "\u{0085}é\u{2028}字\u{3000}",
         ] {
-            let no_script = SCRIPT_STYLE_RE.replace_all(body, " ");
+            let no_script = scripts.replace_all(body, " ");
             let no_tags = tags.replace_all(&no_script, " ");
             let expected = whitespace.replace_all(no_tags.trim(), " ");
-            let actual = text_excerpt(body);
+            let actual = text_excerpt(body.as_bytes());
             assert_eq!(actual, expected, "{body:?}");
             assert_eq!(actual.capacity(), MAX_TEXT_EXCERPT_BYTES);
         }
         // A raw candidate buffer capped before whitespace normalization would
         // lose the terminal 'z'; it must remain visible for an unclosed tag.
         let body = format!("<{}z", " ".repeat(2 * MAX_TEXT_EXCERPT_BYTES));
-        assert_eq!(text_excerpt(&body), "< z");
+        assert_eq!(text_excerpt(body.as_bytes()), "< z");
         let body = format!("x{}", "é".repeat(MAX_TEXT_EXCERPT_BYTES));
-        let excerpt = text_excerpt(&body);
+        let excerpt = text_excerpt(body.as_bytes());
         assert_eq!(excerpt.len(), MAX_TEXT_EXCERPT_BYTES - 1);
         assert_eq!(excerpt.capacity(), MAX_TEXT_EXCERPT_BYTES);
+    }
+
+    #[test]
+    fn bounded_text_scanner_matches_legacy_pipeline_for_malformed_utf8() {
+        let scripts =
+            Regex::new(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>").unwrap();
+        let tags = Regex::new(r"(?s)<[^>]+>").unwrap();
+        let whitespace = Regex::new(r"\s+").unwrap();
+        let compare = |raw: &[u8]| {
+            let body = String::from_utf8_lossy(raw);
+            let no_script = scripts.replace_all(&body, " ");
+            let no_tags = tags.replace_all(&no_script, " ");
+            let expected = whitespace.replace_all(no_tags.trim(), " ");
+            assert_eq!(text_excerpt(raw), expected, "{raw:?}");
+        };
+        // Exercise every leading byte, incomplete valid sequences, invalid
+        // continuation/overlong sequences and a replacement at the script-name
+        // word boundary. These use the former full-decode/full-regex pipeline
+        // as an independent semantic oracle on deliberately small inputs.
+        for byte in 0..=u8::MAX {
+            compare(&[b'<', b'p', b'>', byte, b'a', b'<', b'/', b'p', b'>']);
+        }
+        for raw in [
+            b"\xf0\x90\x80z\xc2".as_slice(),
+            b"\xf0\x90\x80\x80\xed\xa0\x80\xf4\x90\x80\x80",
+            b"<script\xff>hidden</script>after",
+            b"<style\xf0\x90>hidden</style>after",
+            b"<p title='<script>\xff</script>'>visible</p><\xff tail",
+        ] {
+            for end in 0..=raw.len() {
+                compare(&raw[..end]);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_text_scanner_stops_before_unused_tail() {
+        for (prefix, expected) in [
+            (
+                vec![b'x'; MAX_TEXT_EXCERPT_BYTES],
+                "x".repeat(MAX_TEXT_EXCERPT_BYTES),
+            ),
+            (vec![0xff; 66_667], "\u{fffd}".repeat(66_666)),
+        ] {
+            let prefix_len = prefix.len();
+            let mut raw = b"<p>".to_vec();
+            raw.extend_from_slice(&prefix);
+            raw.extend_from_slice(b"</p><script>");
+            raw.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+            raw.extend_from_slice(b"</script>\xff");
+            let mut scanner = TextScanner::new(&raw);
+            scanner.scan();
+            assert_eq!(scanner.output.as_str(), expected);
+            // Must fail if scanning continues after saturation. In particular,
+            // neither the trailing script nor the unused malformed byte can
+            // cause a full-body regex/UTF-8 pass before taking this excerpt.
+            assert!(
+                scanner.furthest_byte <= prefix_len + 16,
+                "{}",
+                scanner.furthest_byte
+            );
+            assert!(
+                scanner.inspected_bytes <= 4 * prefix_len + 64,
+                "{}",
+                scanner.inspected_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_text_scanner_does_not_rescan_unclosed_script_tails() {
+        let body = format!("{}last", "<script><style>".repeat(256));
+        let mut scanner = TextScanner::new(body.as_bytes());
+        scanner.scan();
+        assert_eq!(scanner.output.as_str(), "last");
+        // Missing end tags require looking to EOF for legacy semantics, but
+        // one remembered failed search per kind keeps repeated openers linear.
+        // Must fail if the absent-closing-token cache is removed.
+        assert!(
+            scanner.inspected_bytes <= 8 * body.len(),
+            "{}",
+            scanner.inspected_bytes
+        );
     }
 
     #[tokio::test]
@@ -1106,7 +1342,7 @@ mod tests {
             &token,
             page_id,
             "https://origin.example.test/big-multibyte",
-            &html,
+            html.as_bytes(),
             &derived,
         )
         .await

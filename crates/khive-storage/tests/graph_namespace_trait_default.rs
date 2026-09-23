@@ -40,6 +40,23 @@ impl TraitDefaultOnlyGraphStore {
     }
 }
 
+#[tokio::test]
+async fn latest_annotating_note_default_refuses_without_silent_history_scan() {
+    let store = TraitDefaultOnlyGraphStore::new(Vec::new());
+    let error = store
+        .latest_annotating_note(Uuid::new_v4(), "observation", "web.receipt")
+        .await
+        .expect_err("a backend without the indexed lookup must report Unsupported");
+    assert!(matches!(
+        error,
+        StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation,
+            ..
+        } if operation == "latest_annotating_note"
+    ));
+}
+
 #[async_trait]
 impl GraphStore for TraitDefaultOnlyGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()> {
