@@ -2,7 +2,7 @@
 //! GET body a mechanical 304 yields. No HTTP/egress coverage is claimed here.
 use super::*;
 use crate::fetch::{settle_content, RedirectHop};
-use khive_storage::ContentRef;
+use khive_storage::{ContentRef, Direction};
 use khive_types::Namespace;
 use std::sync::Arc;
 

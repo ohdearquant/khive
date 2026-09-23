@@ -844,3 +844,126 @@ each reconstruction of the main pool. Reader and writer acquisition/task counter
 to `(pid, started_at, pool_generation)`; checkpoint counters remain process-global. Consumers
 may treat readings as one continuous counter window only while that triple is unchanged;
 a changed triple starts a fresh window.
+
+## Amendment: composition reconciled with the runtime-owned admission sequence (2026-09-22)
+
+**Status: Accepted.**
+
+Originating issue(s): #2057, #2967
+
+Section 7's composition table is unchanged: `KindHook` extension remains the only way a pack
+extends another pack's substrate verb, verb override and middleware/wrap remain unsupported, and
+horizontal sharing of a verb name remains forbidden. This amendment states how that table composes
+with the runtime-owned admission sequence
+[ADR-115 Amendment 4](ADR-115-secret-gate-content-manifest-exemption.md#amendment-4-2026-09-22-a-runtime-owned-admission-sequence-a-route-inventory-and-the-finalizers-transaction)
+introduces for every properties-bearing write.
+
+`KindHook::prepare_create`/`after_create` (§6 above) supply kind-owned policy at that sequence's
+kind-owned-preparation and final-candidate stages. They do not supply, and are not a substitute
+for, the sequence's transaction-commit and truthful-reporting stages: the runtime owns those, and
+`after_create`'s post-commit, best-effort timing means it cannot be relied on for a required
+invariant such as a reserved stamp, a required synchronous index, or a required edge. A kind with
+no registered hook still passes through the sequence's ordinary runtime admission; the absence of
+a hook is not a bypass of it.
+
+Proposal materialization is a case of kind-owned preparation, not a case of generic `create`: when
+an approved proposal's changeset is applied, the sequence validates the immutable, already-reviewed
+draft against current admission rules without re-running `prepare_create`'s normalization on it.
+[ADR-017](ADR-017-pack-standard.md)'s 2026-09-22 amendment registers the corresponding
+validation-only hook on the proposal-note route itself, for a pack that refuses shared creation of
+a note kind under that document's 2026-09-18 amendment.
+
+## Amendment: keyed note create is a bounded exception to create-is-not-upsert (2026-09-22)
+
+**Status: Accepted.**
+
+Originating issue(s): #1053
+
+`create` is not an upsert (§4 above, and `AGENTS.md`): a singleton `create` writes
+exactly one new record and returns its UUID rather than reusing an existing one. This amendment
+names the one bounded exception a note `create` call carrying `key` now has, defined in full by
+[ADR-172](ADR-172-versioned-notes-compare-and-set.md) Amendment 6: within the caller's primary
+namespace and the request's canonical note kind, an identical replay of a held key (byte-exact
+content, typed-equal normalized properties) returns the existing note's id with `created: false`
+and performs no new write, no new stamp, and no new creation-effect. Every other `create` call is
+unaffected by this exception: an unkeyed `create` always writes a new row; a keyed `create` whose
+key is not currently held inserts a new row exactly as today; a keyed `create` whose payload
+**differs** from the held key's content or properties returns `key_conflict` and never overwrites
+the held row. Because only a byte/type-equal resubmission short-circuits, and a differing payload
+under the same key always refuses rather than silently applying, this exception is a receipt for a
+retried request, not an upsert: `create` still never reuses a name and still never merges a
+differing payload into an existing record. No equivalent key exists for entities; entity identity
+continues to be established by `resolve` or `search` followed by `create`, as §4 above already
+describes.
+
+## Amendment: note-aware bulk create: item union, transaction policy, and per-item results (2026-09-22)
+
+**Status: Accepted.**
+
+Originating issue(s): #890
+
+The `create` row in §4's verb table describes bulk `create(items=[...])` for entities only. This
+amendment extends the bulk item shape to notes and states the transaction and result contract for
+the combined surface.
+
+### Item union
+
+Each item in `items` is now substrate-discriminated:
+
+- an **entity item** keeps its existing shape, with a required nonempty `name`;
+- a **note item** requires `content`, and accepts either a canonical granular note kind or
+  `kind="note"` with singleton `create`'s existing note-kind defaulting rule, plus optional
+  `note_kind`, `name`, `salience`, `properties`, and `tags`.
+
+An entity-only field on a note item, a note-only field on an entity item, and any unknown field on
+either MUST fail that item's validation rather than being silently dropped. Owner-kind validation
+stays mandatory for a note item exactly as it is for a singleton `create`: a memory note item is
+refused through the memory pack's admission hook
+([ADR-021](ADR-021-memory-pack.md)'s 2026-09-22 amendment) even when the item supplies apparent
+defaults.
+
+### Transaction policy
+
+`atomic` keeps its existing default of `true`, including when omitted; the default is not flipped
+by this amendment.
+
+- **`atomic: true` (including omitted).** Every item is validated and prepared before any domain
+  write. All items' required rows, required synchronous index/FTS state, and required effects then
+  commit in one transaction; any item's failure commits none. A mixed entity/note batch that cannot
+  join one transaction-capable target, or that contains a kind whose required effects cannot join
+  it, refuses in full before any write. This mode MUST NOT be downgraded to best effort.
+- **`atomic: false`.** After whole-envelope validation (item shapes, boolean-typed flags, the
+  existing 1000-item cap, and existing request-size limits), each item is parsed, validated,
+  prepared, and committed independently in index order. A malformed item, an unknown field, a bad
+  kind, an owner-hook refusal, or a secret-gate refusal is that item's own indexed failure and does
+  not block a valid sibling item.
+
+### Per-item result contract
+
+The response keeps the existing `attempted`/`created`/`skipped`/`failed` counters and adds a
+mandatory index-aligned `results` array, one entry per submitted item:
+
+```json
+{"index": 0, "ok": true,  "result": {"id": "<uuid>", "kind": "concept", "created": true}}
+{"index": 1, "ok": false, "domain_disposition": "not_committed",
+ "error": {"kind": "invalid_input", "message": "note item requires content"}}
+```
+
+Item ids are present in `results` even with `verbose: false`. With `verbose: true`, a successful
+entity result additionally carries the full entity record (the existing `entities` projection is
+retained for mixed-batch entity items), and a successful note item's result likewise carries its
+full note record. For confirmed outcomes, `attempted = created + skipped + failed`; `skipped` stays
+zero, since this amendment adds no deduplication. A genuinely ambiguous storage outcome is reported
+as a failed entry carrying `domain_disposition: "unknown"` and is never folded into `created`. A
+confirmed atomic rollback returns no successful item receipts; the outer verb result is a failed
+result with a canonical error, not a list of apparently-successful items.
+
+### Bounds
+
+A bulk-created note is list/get/FTS-visible immediately and, like a bulk-created entity, skips
+vector embedding until a subsequent `reindex`. Requested edges, `annotates` annotations, fences,
+and per-item embedding overrides are refused on this surface, not silently ignored, and may receive
+their own later contract. [ADR-172](ADR-172-versioned-notes-compare-and-set.md) Amendment 6's keyed
+replay stays singleton-only: this amendment does not add a key to bulk create. Empty-list semantics
+are unchanged: `create(items=[])` remains accepted and writes nothing; this amendment does not
+touch any other verb's empty-input contract.
