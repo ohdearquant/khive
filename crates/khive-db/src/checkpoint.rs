@@ -2511,7 +2511,11 @@ fn log_tx_registry_oldest_warn(
 /// rate-limited — caller MUST gate on a below→above `high_water_pages`
 /// crossing (`crossing_warn`) or every tick repeats the full enumeration.
 fn log_tx_registry_snapshot_warn(wal_pages: u64) {
-    for (age, label) in khive_storage::tx_registry::snapshot() {
+    log_tx_registry_entries_warn(wal_pages, &khive_storage::tx_registry::snapshot());
+}
+
+fn log_tx_registry_entries_warn(wal_pages: u64, snapshot: &[(Duration, Option<String>)]) {
+    for (age, label) in snapshot {
         tracing::warn!(
             wal_pages,
             tx_age_secs = age.as_secs_f64(),
@@ -2519,6 +2523,37 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
             "WAL high-water: open transaction registry entry"
         );
     }
+}
+
+fn log_truncate_no_progress_warn(
+    wal_pages_before: u64,
+    wal_pages_after: u64,
+    snapshot: &[(Duration, Option<String>)],
+) {
+    let open_tx_count = snapshot.len();
+    let oldest_tx_age_secs = snapshot
+        .iter()
+        .map(|(age, _)| *age)
+        .max()
+        .map(|age| age.as_secs_f64());
+    if snapshot.is_empty() {
+        tracing::warn!(
+            wal_pages_before,
+            wal_pages_after,
+            open_tx_count,
+            oldest_tx_age_secs = ?oldest_tx_age_secs,
+            "WAL TRUNCATE attempt made no progress; no open transaction in this process's registry"
+        );
+    } else {
+        tracing::warn!(
+            wal_pages_before,
+            wal_pages_after,
+            open_tx_count,
+            oldest_tx_age_secs = ?oldest_tx_age_secs,
+            "WAL TRUNCATE attempt made no progress; open transactions observed in this process's registry"
+        );
+    }
+    log_tx_registry_entries_warn(wal_pages_after, snapshot);
 }
 
 /// Emits the high-water WARN, deciding its text from the registry entry this
@@ -2737,13 +2772,8 @@ fn maybe_truncate(
 
             let made_progress = wal_pages_after < wal_pages_before;
             if !made_progress {
-                tracing::warn!(
-                    wal_pages_before,
-                    wal_pages_after,
-                    "WAL TRUNCATE attempt made no progress; \
-                     a long-lived reader may still be pinning the WAL snapshot"
-                );
-                log_tx_registry_snapshot_warn(wal_pages_after);
+                let snapshot = khive_storage::tx_registry::snapshot();
+                log_truncate_no_progress_warn(wal_pages_before, wal_pages_after, &snapshot);
                 #[cfg(test)]
                 if let Some(path) = pool.canonical_path() {
                     truncate_report_test_sync::after_no_progress_before_report(path);
@@ -3396,6 +3426,8 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct CapturedEvent {
         message: Option<String>,
+        open_tx_count: Option<u64>,
+        oldest_tx_age_secs: Option<String>,
         oldest_tx_label: Option<String>,
         tx_label: Option<String>,
         census_only: Option<String>,
@@ -3405,6 +3437,12 @@ mod tests {
     struct CapturedEventVisitor(CapturedEvent);
 
     impl Visit for CapturedEventVisitor {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "open_tx_count" {
+                self.0.open_tx_count = Some(value);
+            }
+        }
+
         fn record_str(&mut self, field: &Field, value: &str) {
             match field.name() {
                 "message" => self.0.message = Some(value.to_string()),
@@ -3425,6 +3463,7 @@ mod tests {
                 "oldest_tx_label" => self.0.oldest_tx_label = Some(cleaned),
                 "tx_label" => self.0.tx_label = Some(cleaned),
                 "census_only" => self.0.census_only = Some(cleaned),
+                "oldest_tx_age_secs" => self.0.oldest_tx_age_secs = Some(cleaned),
                 _ => {}
             }
         }
@@ -3494,6 +3533,57 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
         let events = buffer.lock().unwrap();
         events.clone()
+    }
+
+    #[test]
+    fn truncate_no_progress_warn_reports_nonempty_registry_snapshot_facts() {
+        let snapshot = [
+            (Duration::from_secs(2), Some("younger-entry".to_string())),
+            (Duration::from_secs(7), Some("older-entry".to_string())),
+        ];
+        let events = capture(|| log_truncate_no_progress_warn(6003, 6003, &snapshot));
+        assert_eq!(events.len(), 3, "one summary and both captured entries");
+        let summary = &events[0];
+        assert_eq!(summary.open_tx_count, Some(2));
+        assert_eq!(summary.oldest_tx_age_secs.as_deref(), Some("Some(7.0)"));
+        let message = summary.message.as_deref().expect("summary message");
+        assert_eq!(
+            message,
+            "WAL TRUNCATE attempt made no progress; open transactions observed in this process's registry"
+        );
+        assert!(!message.contains("pinning"));
+        assert!(!message.contains("long-lived reader"));
+        assert_eq!(events[1].tx_label.as_deref(), Some("younger-entry"));
+        assert_eq!(events[2].tx_label.as_deref(), Some("older-entry"));
+        assert!(events[1..].iter().all(|event| {
+            event.message.as_deref() == Some("WAL high-water: open transaction registry entry")
+        }));
+    }
+
+    #[test]
+    fn truncate_no_progress_warn_reports_empty_process_registry_without_pin_claim() {
+        let events = capture(|| log_truncate_no_progress_warn(6003, 6003, &[]));
+        assert_eq!(
+            events.len(),
+            1,
+            "an empty snapshot has no entries to enumerate"
+        );
+        let summary = &events[0];
+        assert_eq!(summary.open_tx_count, Some(0));
+        assert_eq!(summary.oldest_tx_age_secs.as_deref(), Some("None"));
+        let message = summary.message.as_deref().expect("summary message");
+        assert_eq!(
+            message,
+            "WAL TRUNCATE attempt made no progress; no open transaction in this process's registry"
+        );
+        assert!(!message.contains("pinning"));
+        assert!(!message.contains("long-lived reader"));
+        let nonempty = capture(|| {
+            log_truncate_no_progress_warn(6003, 6003, &[(Duration::ZERO, None)]);
+        });
+        assert_ne!(summary.message, nonempty[0].message);
+        assert_eq!(nonempty[0].open_tx_count, Some(1));
+        assert_eq!(nonempty[0].oldest_tx_age_secs.as_deref(), Some("Some(0.0)"));
     }
 
     /// An entry at or past the threshold: the WARN names it, its age and its
@@ -4180,7 +4270,12 @@ mod tests {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let checkpoint_pool = Arc::clone(&pool);
         let dedicated_conn = checkpoint_conn(&checkpoint_pool);
+        let checkpoint_events = Arc::clone(&buffer);
         let checkpoint = std::thread::spawn(move || {
+            let subscriber = CaptureSubscriber {
+                events: checkpoint_events,
+            };
+            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
             let mut state = TruncateState::default();
             let result = checkpoint_once_core(
                 &checkpoint_pool,
@@ -4235,6 +4330,26 @@ mod tests {
         );
 
         let events = buffer.lock().expect("captured events");
+        let summaries: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.message.as_deref().is_some_and(|message| {
+                    message.starts_with("WAL TRUNCATE attempt made no progress;")
+                })
+            })
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "the real no-progress path emits one summary"
+        );
+        let summary = summaries[0];
+        assert!(summary.open_tx_count.is_some());
+        assert!(summary.oldest_tx_age_secs.is_some());
+        let message = summary.message.as_deref().expect("summary message");
+        assert!(message.contains("in this process's registry"));
+        assert!(!message.contains("pinning"));
+        assert!(!message.contains("long-lived reader"));
         assert!(
             events.iter().any(|event| {
                 event
