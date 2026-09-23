@@ -1,7 +1,7 @@
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn plan_mcp_preserves_graph_events_and_request_identity() {
-    let server = make_daemon_save_to_test_server();
+    let server = make_daemon_save_to_test_server(None);
     let store = server.event_store().unwrap();
     let ops = r#"create(kind="entity", entity_kind="concept", name="first") | create(kind="entity", entity_kind="concept", name="second")"#;
     let baseline = server
@@ -79,7 +79,7 @@ async fn plan_mcp_preserves_graph_events_and_request_identity() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn plan_mcp_uses_loaded_catalog_and_preserves_parser_errors() {
-    let server = make_daemon_save_to_test_server();
+    let server = make_daemon_save_to_test_server(None);
     for ops in [
         "stats() | missing_verb(id=$prev.id) | stats(x=$prev)",
         "stats(",
@@ -123,7 +123,7 @@ async fn plan_mcp_uses_loaded_catalog_and_preserves_parser_errors() {
 #[serial_test::serial(config_ledger)]
 async fn plan_daemon_preserves_graph_events_and_identity_until_dispatch_control() {
     use khive_runtime::daemon::{read_frame, write_frame, DaemonResponseFrame, PROTOCOL_VERSION};
-    let server = make_daemon_save_to_test_server();
+    let server = make_daemon_save_to_test_server(None);
     let store = server.event_store().unwrap();
     let ops = r#"create(kind="entity", entity_kind="concept", name="first") | create(kind="entity", entity_kind="concept", name="second")"#;
     let baseline = server

@@ -1,194 +1,300 @@
-# ADR-188: Entities get a version, and then a fence
+# ADR-188: Persisted entity revisions and the update version fence
 
-- **Status**: Proposed
-- **Date**: 2026-09-13
-- **Depends on**: [ADR-015](ADR-015-schema-migrations.md) (schema changes ship as a new versioned
-  migration over a `.sql` file)
-- **Relates to**: [ADR-014](ADR-014-curation-operations.md) (the curation verbs this fence guards)
+- **Status**: Accepted 2026-09-22 at scope: entities.version and its trigger; every canonical writer advances it exactly once, typed upsert included (INSERT ... ON CONFLICT(id) DO UPDATE, never INSERT OR REPLACE); generic update accepts expected_version with typed version_conflict; get, list and search expose it. Deferred: merge and delete caller fences (unfenced merge and delete still advance the version once, so a fenced update racing them is refused on its next write), #2718 no-op parity, SQL-level refusal of hand-written replacement outside the store API. Migration measurement recorded in Consequences.
+- **Date**: 2026-09-22
+- **Originally proposed**: 2026-09-13
+- **Issue**: #2673; entity no-op parity (#2718) remains deferred
+- **Depends on**: [ADR-015](ADR-015-schema-migrations.md) (versioned SQL migrations)
+- **Relates to**: [ADR-014](ADR-014-curation-operations.md) (curation),
+  [ADR-172](ADR-172-versioned-notes-compare-and-set.md) (the existing note contract)
 
-## Context
+## Historical context — before the entity version change
 
-Two writers holding the same observed version of an entity both update it, and the second silently
-replaces the first. For notes this is already solved: `update` accepts `expected_version`, checks it
-inside the writer transaction, and refuses a stale write with `reason=version_conflict` plus
-`expected_version` and `current_version`. For entities the parameter is refused outright, with
-"expected_version, fence and embed apply only to notes".
+The 2026-09-13 proposal inspected revision `b15c2c8d0`. At that revision,
+`crates/khive-db/sql/entities-ddl.sql` and `khive_storage::entity::Entity` had no `version`,
+and the existing entity migrations added `content_ref` but no version counter. Entity updates
+refused `expected_version` with "expected_version, fence and embed apply only to notes".
+These are observations about that pre-change revision, not the current interface.
 
-The obvious reading is that a guard exists and is switched off for one substrate. That reading is
-wrong, and it is worth stating plainly because the work depends on it.
+Notes already had a persisted counter and a writer-transaction `expected_version` check with
+`reason=version_conflict`, `expected_version` and `current_version` details. Entities first
+needed a stored counter and a read projection; there was no existing entity fence to enable.
+Their timestamp-based internal snapshot checks could not detect a writer that left the
+timestamp unchanged. A persisted revision supplies that missing comparison.
 
-### What was measured
+The original proposal also included merge/delete caller fences and entity/note no-op parity.
+The accepted implementation scope below is narrower. Those future requirements are retained
+explicitly; this revision neither implements them nor changes note semantics.
 
-At `b15c2c8d0`:
+## Decision — persisted revisions and guarded update
 
-- `crates/khive-db/sql/entities-ddl.sql` declares `entities` with `id`, `namespace`, `kind`,
-  `entity_type`, `name`, `description`, `properties`, `tags`, `created_at`, `updated_at`,
-  `deleted_at`, `merged_into`, `merge_event_id`. There is no `version` column.
-- The only `ALTER TABLE entities` in the migration set adds `content_ref`.
-- `khive_storage::entity::Entity` has no `version` field.
+### Storage invariant
 
-Notes have both: a `version` column and a `bump_note_version` trigger that increments it on any update
-that did not set it explicitly.
+Migration V37, `crates/khive-db/sql/037-entity-versions.sql`, adds
+`version INTEGER NOT NULL DEFAULT 1` to `entities`; `entities-ddl.sql` carries the same column
+and guards for fresh stores. Existing rows and first insertions start at one. The version is
+an integer independent of `updated_at`.
 
-So entities have no version at all. A fence cannot be unlocked for them, because there is nothing to
-compare against. This is a schema change and a read-surface change before it is a guard change, which
-is why it is recorded rather than fixed in place.
+Every successful subsequent typed entity-row write and every admitted direct SQL `UPDATE`
+advances the stored version by exactly one. Writers explicitly set `version = version + 1`.
+The `entities_version_insert_guard` trigger requires an inserted version of one;
+`entities_version_update_guard` requires `NEW.version = OLD.version + 1` and rejects a
+non-integer, an omitted/skipped increment, a jump or overflow. These are rejecting guards,
+not a trigger that supplies an increment for a writer that omitted it.
 
-## Decision
+The invariant covers upsert, batch upsert, guarded replacement, actual merge survivor/source
+updates, soft deletion, restoration and namespace moves. It applies per row actually
+updated. A losing conditional insertion, refused CAS, repeated soft delete of an existing
+tombstone or restoration of an already-live row does not advance a version when it performs
+no row update. Attachment-only operations mutate the attachment substrate, not the entity
+row; an upsert that also writes attachments still advances the entity revision once.
+Hard deletion removes the row; a later insertion starts a new row at one.
 
-**Give entities a version, on the same terms notes have one, and then accept the same fence.**
+Typed upserts use `INSERT ... ON CONFLICT(id) DO UPDATE`, not replacement. Input
+`Entity.version` is a read projection, not a caller-selected destination revision: inserts
+start at one and updates increment the stored counter. Import and sync preserve local
+revision history rather than importing another store's counter.
 
-1. A new versioned migration runs `ALTER TABLE entities ADD COLUMN version INTEGER NOT NULL DEFAULT 1`,
-   with the counterpart column in `entities-ddl.sql` for fresh stores. SQLite does not rewrite the
-   table for a column added with a constant default, so the upgrade cost is expected to be
-   near-constant rather than proportional to the entity count. That expectation is measured at the
-   fleet's entity count and the number written into Consequences before this merges. A measurement
-   that disagrees is a finding about the migration, not a number to round off.
-2. A trigger increments it on update, mirroring `bump_note_version`, so the version moves for every
-   writer rather than only for writers that remember to move it. A trigger rather than handler code,
-   for the same reason notes use one: a write path that forgets is the failure the fence exists to
-   catch.
-3. `Entity` carries `version`, and entity reads return it. A caller cannot use a fence it cannot
-   observe.
-4. `update`, `merge` and `delete` each accept a positive `expected_version` for entities, checked
-   **inside the writer transaction**, refusing a stale value without mutation, with the same
-   `reason`, `expected_version` and `current_version` fields notes return. Omitting it requires no
-   caller revision assertion; identical unfenced updates follow the no-op rule below. Every verb that writes an entity carries
-   the parameter, because a guarantee that depends on which verb a competing writer happened to call
-   is not a guarantee: a fenced `update` racing an unfenced `merge` loses in silence.
+### Read projection and snapshot invalidation
 
-For `merge`, `expected_version` belongs to the surviving `into_id`, the record the caller
-continues using. It does **not** assert a version for `from_id`. Both rows are reread inside the
-merge transaction, and the existing both-side snapshot and safety checks still apply. The one
-parameter cannot name two revisions. `force=true` bypasses the existing safety floor only; it never
-bypasses the version fence. `dry_run=true` checks the same survivor fence without mutation. After a
-real merge, both the survivor update and source tombstone advance their own versions once.
+`Entity` carries the persisted integer. Entity creation/update results, `get`, `list` and
+hydrated entity search results expose it; `updated_at` remains a timestamp rather than a
+version alias.
 
-For `delete`, the fence also applies to hard deletion of an existing tombstone. A soft delete advances
-the version once; hard delete removes the row after checking its current version. Atomic `update`
-and `delete` use the same transaction guard; atomic merge remains outside the existing supported
-surface.
+The existing internal timestamp/deletion CAS also compares the prepared entity's persisted
+version. A competing write invalidates an older snapshot even if the timestamp did not
+change. This snapshot guard applies independently of whether the caller supplied
+`expected_version`. Omitting a caller revision is not permission to overwrite a stale
+internally prepared snapshot.
 
-Entity and note updates share the ADR-172 Amendment 5 no-op definition (#2718): after validation,
-normalization, hooks where applicable, and property merging, an identical patch with no
-`expected_version` and no explicit embedding request is a mutation-free assertion. Canonical and
-atomic results disclose `unchanged=true`; version, `updated_at`, stored representation, indexes,
-and mutation events stay untouched. The writer transaction rechecks the prepared snapshot, so an
-earlier operation in the atomic unit can invalidate a no-op and roll back the unit. An accepted
-identical patch with `expected_version` is always a write: it advances version by exactly one and
-`updated_at` strictly, and never returns `unchanged=true`. Stale identical fenced patches refuse.
+### Caller fence on entity update
 
-The implementation uses one eligibility predicate and shared comparison helpers, tested across
-both substrates. Object key order and tag order are insignificant; duplicate tag counts and other
-array ordering remain significant. Entity tags live in the tags column; note tags live in
-`properties.tags`. An entity's custom `properties.tags` remains an ordinary ordered property.
-Entity type aliases compare after vocabulary normalization. Explicit `embed` remains note-only
-and preserves existing note write behavior, including an explicit `embed=false` on identical data.
+Generic entity `update` accepts an optional positive `expected_version`, representable as a
+signed 64-bit integer. Zero, negative values, non-integers and out-of-range values are invalid
+input. Omission or `null` supplies no caller revision assertion.
 
-The refusal shape is shared rather than parallel. Two refusal shapes that mean the same thing is how a
-client ends up special-casing a substrate, which is the state this record is removing.
+Ordinary and atomic entity updates use the shared writer-transaction guard. It reads the
+live row's current version inside the transaction before that update plan's row or audit
+statements run. A mismatch returns typed `conflict` with these string-valued details:
 
-### What this does not do
+```json
+{ "reason": "version_conflict", "expected_version": "1", "current_version": "2" }
+```
 
-- It does not rewrite stored entities. Existing rows start at version 1.
-- It does not make the fence mandatory. Unfenced changes still require no caller version.
-- It does not change note semantics or add `fence`/`embed` to entities. It extends the existing note
-  no-op rule to entities as part of this version implementation (#2718).
+The detail names and value representation match the note refusal contract. A missing or
+deleted target follows the existing missing-target/snapshot refusal path; this change does
+not turn every failure to find a live row into a version mismatch. A current caller version
+does not bypass the existing snapshot CAS or other validation.
+
+A stale update leaves its target unchanged. An atomic conflict rolls back the whole unit,
+including earlier entity and audit writes in that unit. This is a domain-write guarantee;
+it does not disable ordinary request auditing outside the unit.
+
+The `fence` and `embed` parameters remain note-only. Caller `expected_version` fences for
+entity `merge` and `delete` are not part of this implementation. Their existing row updates
+nevertheless advance revisions, so an entity snapshot predating such an update is stale.
+Public atomic merge remains inadmissible. Its retained internal planner is not a new public
+surface and increments only the rows it actually updates.
+
+### Identical entity updates retain their existing write behavior
+
+An accepted entity update remains a write even when its requested fields equal the stored
+fields, with or without `expected_version`. It advances version once and advances
+`updated_at` strictly; it does not return `unchanged=true`. Stale identical fenced updates
+refuse like any other stale update. This implementation does not extend ADR-172's note no-op
+rules to entities and does not rewrite those note rules.
+
+### Raw replacement boundary
+
+Raw `INSERT OR REPLACE` of entity rows is forbidden by the typed store contract. The
+`khive-db` integration test `issue2673_no_raw_entity_replace_outside_migrations` inventories
+in-tree Rust/SQL sources for the forbidden form, with historical migration exemptions.
+That source inventory is not runtime SQL admission.
+
+The insert/update guards do not stop a privileged raw replacement from deleting an existing
+row and reinserting it at version one. Hard deletion followed by insertion likewise starts
+a new row lifetime. The accepted update fence therefore does not claim to detect these
+identity resets across arbitrary raw SQL. Enforcing the replacement prohibition at SQL
+admission, or retaining a persistent identity ledger across deletion/replacement, remains
+separate work; no such enforcement is supplied by this migration.
 
 ## Alternatives considered
 
-- **Compare `updated_at` instead.** Entities already carry it, so no schema change. Rejected: a
-  timestamp is not a counter. Two writes inside the same clock tick are indistinguishable, the value
-  moves for reasons unrelated to the write, and a client that stores it is holding a value whose
-  comparison semantics depend on the clock rather than on the store.
-- **Keep a version inside `properties`.** No migration, and it is what a caller would build for
-  itself today. Rejected: a trigger cannot maintain it, so it moves only when a writer remembers, and
-  the writer that forgets is exactly the one the fence is for.
-- **Enforce optimistic concurrency at the Gate.** Wrong seam. The Gate answers whether a caller may
-  write; this is whether the write is still valid, and the only place that can be decided is inside
+- **Compare only `updated_at`.** Rejected: a timestamp is not a counter, and a write that
+  preserves it must still invalidate a prepared snapshot.
+- **Keep the revision inside `properties`.** Rejected: the concurrency token belongs to the
+  substrate row and must be checked independently of caller-managed properties.
+- **Check at the Gate or before writer admission.** Rejected: permission to write does not
+  establish that the observed row is still current. The authoritative check belongs inside
   the writer transaction.
-- **Document last-writer-wins for entities and close the issue.** Honest, and it leaves a caller with
-  no way to write safely to a shared record. The asymmetry with notes is not a design, it is an
-  accident of which substrate got the feature first.
+- **Automatically bump an omitted increment.** The implementation instead requires every
+  writer to supply exactly the next version and has SQLite reject violations. This makes a
+  forgotten writer change fail explicitly rather than hiding it behind an automatic bump.
+- **Leave entities without a caller version.** Rejected for `update`: callers need an
+  observable revision and a transactional way to assert it. Broader verb coverage remains
+  an explicit follow-up, not a guarantee of this initial update fence.
 
-## Consequences
+## Consequences of the accepted scope
 
-- One more column and one more trigger on `entities`, the graph's primary table. The trigger fires on
-  every entity update, which is a cost paid by every writer, including those that never fence.
-- Entity upserts use `INSERT ... ON CONFLICT(id) DO UPDATE`, because `INSERT OR REPLACE`
-  would delete/reinsert the row and reset the default revision. Input `Entity.version` is a read
-  projection: fresh inserts start at one and existing upserts advance the stored revision. Import
-  and sync therefore use local revisions rather than importing a counter from another store.
-- Entity read responses gain a field. Additive for a client that ignores unknown fields, and a change
-  for anything asserting an exact shape.
-- Canonical and atomic entity/note write results add `unchanged=true` for accepted identical
-  unfenced patches that qualify for the no-op rule above. This is additive for clients that ignore
-  unknown fields; clients asserting an exact response shape are affected.
-- An atomic no-op rechecks its prepared snapshot inside the writer transaction. An earlier operation
-  in the same unit can invalidate that assertion, causing the whole unit to roll back, including its
-  earlier mutations.
-- The migration adds a column with a constant default, which SQLite records in the schema without
-  rewriting the table. The measured cost at the fleet's entity count is written here before this
-  merges, the way the listing index's build cost was. If that cost turns out to scale with the row
-  count, the assumption above is wrong and that is the finding.
-- Three verbs grow a refusal path rather than one. `merge` and `delete` carry the parameter on the
-  same terms as `update`, which is what makes the guarantee unconditional and is the reason the cost
-  is worth paying.
+- One column and two guard triggers are added to the primary entity table. Every entity
+  `UPDATE` must include its increment; old writers that omit it fail after migration.
+- Read responses gain `version`, which affects clients asserting an exact response shape.
+  The accepted entity update result does not gain an identical-patch `unchanged` result.
+- Ordinary and atomic entity update gain a typed conflict path. A version-only competing
+  write also invalidates internal snapshot CAS, independently of timestamp movement.
+- Unfenced merge/delete behavior is retained while their actual row mutations advance
+  versions. Caller fences on those verbs remain deferred; the current interface is not the
+  proposal's eventual all-curation-verb fence.
+- The raw replacement limitation above remains. A source convention and inventory test
+  cannot substitute for admission of privileged SQL. Until SQL-level refusal is implemented,
+  `issue2673_no_raw_entity_replace_outside_migrations` in
+  `crates/khive-db/tests/entity_write_inventory.rs` guards the crate-wide source inventory,
+  including must-match controls proving that the scanner recognizes the forbidden form.
+- The constant-default column addition does not rewrite existing entity rows: the measured
+  write-ahead log after V37 is the same size at zero, 9,285 and 100,000 rows, and the
+  migration takes under a millisecond at 100,000 rows (record below). This is a synthetic
+  measurement on one host, not a conclusion about production-scale performance.
 
-## Acceptance
+### Migration measurement record
 
-- A stale entity update is refused **without mutation**: the assertion reads back every field the
-  update would have changed, and the version, and finds them unchanged. A refusal that still wrote
-  something is the failure this record exists to prevent, and asserting only the error misses it.
-- A current-version update succeeds and the version moves by exactly one. "Moves" is not enough: a
-  trigger that double-bumps breaks every caller that read a version and wants to write once.
-- Identical fenced entity and note patches advance by exactly one and never disclose `unchanged`;
-  identical unfenced patches disclose `unchanged=true` and preserve the exact stored record,
-  including version and `updated_at`. Both canonical and atomic tests use one contract table.
-- A no-op prepared before a raw version-only writer or a prior atomic update/delete refuses its
-  stale snapshot. The atomic unit rolls back earlier mutations too.
-- A note arm as the control for the shared refusal shape: the same `reason` and the same field names,
-  asserted against one definition rather than two string literals.
-- An arm proving the check happens inside the writer transaction rather than before it: two writers
-  racing on one entity, one of which must be refused. Without this the fence is a pre-flight read and
-  the race it was built for is still open.
-- An arm reading an entity and asserting `version` is present, since a fence a caller cannot observe
-  is not usable.
-- An arm for an entity update with no `expected_version`, asserting it still succeeds unconditionally.
-- A stale `merge` is refused without mutation of either side: neither the surviving entity nor the
-  one that would have been merged away has moved, and no merge event was recorded.
-- A stale `delete` is refused and the entity is still readable afterwards.
-- A `merge` and a `delete` with no `expected_version`, each asserting today's unconditional behaviour
-  is unchanged.
-- A source mutation after the caller's merge preflight still triggers the existing transactional
-  safety refusal, even when `into_id` satisfies its version fence.
-- The migration's cost at the fleet's entity count, measured on a synthetic store and written into
-  Consequences before merge, with the row count stated beside it so the shape of the cost is readable
-  and not only its magnitude.
+Run on 2026-09-23 (UTC) with the procedure below.
 
-### Migration measurement procedure
+- **Source**: the tree of commit `0d6b328b1ebfce7080c5faafb66eb86c34eb715a` (this change on base
+  `0b46c8c63f7f723c78f5e1a8cc49d2fc56d05b2c`). Recording these results changes only this document.
+- **Host**: Apple M4 (Mac16,10), 16 GiB memory, internal solid-state storage (APFS), macOS 27.0.
+  The database lived in the system temporary directory on that volume. Release profile, bundled
+  SQLite 3.53.2, WAL with synchronous NORMAL. The host was idle before each run (98.6% and 98.9%
+  CPU idle), and no other build or test ran during timing.
+- **Selection**: listing the ignored test by exact name selected one test. Each run exited 0 with
+  `1 passed; 0 failed; 0 ignored` and two `synthetic_v36_to_v37` records reporting schema 37. The
+  fixture times only `run_migrations`, then asserts that every seeded row survived with integer
+  version 1.
+- **Populations**: 9,285 rows, the caller-visible live lower bound observed 2026-09-15T16:40:27Z
+  (excluding tombstones and other namespaces, so not a complete count), and 100,000 rows as
+  synthetic stress.
 
-The implementation packet for #2673 and #2718 must deliver `khive-db`'s ignored
-`entity_version_migration_measurement` test and its `KHIVE_ENTITY_VERSION_ROWS` input. This
-ADR-only change does not publish that fixture. Run the procedure only from the implementation
-revision containing it, and record that exact revision beside the result.
+Complete records, in run order (each population run emits its zero-row control first):
 
-Before measuring, list the ignored tests under that name and require exactly one selected test;
-zero matches or multiple matches invalidate the run. Then set `KHIVE_ENTITY_VERSION_ROWS` to the
-chosen synthetic population and run with `--ignored --nocapture`. Require a successful exit,
-exactly one passed test with zero failures and zero ignored tests, and two measurement records
-labelled `synthetic_v34_to_v35`: one with zero rows and one with the requested population, both
-reporting schema version 35. A successful exit alone, missing records, or `running 0 tests` is not
-a measurement and must not be recorded as one.
+```json
+{"db_size_before":667648,"elapsed_us":630,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":0,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+{"db_size_before":5525504,"elapsed_us":723,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":9285,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+{"db_size_before":667648,"elapsed_us":610,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":0,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+{"db_size_before":54059008,"elapsed_us":851,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":100000,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+```
 
-The fixture must bound seeding to 1,000,000 rows and report both empty and populated V34 stores.
-The validation packet will run 9,285 rows (a caller-visible live lower bound observed
-2026-09-15T16:40:27Z, excluding tombstones and other namespaces) and 100,000 rows (synthetic stress).
-Neither is the complete fleet count. Record population provenance beside each result; a full-table
-count, if obtained, must explicitly include tombstones and all namespaces. Only `run_migrations`
-is timed. The fixture must use khive's bundled SQLite, WAL/NORMAL, and a warm cache after seeding,
-and check that every existing row reads version one afterward. Required output includes row count,
-elapsed microseconds, SQLite version, platform, page size, database size before migration, and WAL
-bytes after migration. Record the exact source revision, host/storage hardware, fleet-count query
-and time, build profile, and output here before merge. No measurement has been performed in the
-source-only implementation packet.
+| Rows    | Database before  | Elapsed | Same-run zero-row control | WAL after    |
+| ------- | ---------------- | ------- | ------------------------- | ------------ |
+| 9,285   | 5,525,504 bytes  | 723 µs  | 630 µs                    | 24,752 bytes |
+| 100,000 | 54,059,008 bytes | 851 µs  | 610 µs                    | 24,752 bytes |
+
+The write-ahead log after migration is 24,752 bytes at every population, so the migration writes
+no per-row pages. Elapsed time above the same-run zero-row control is 93 µs at 9,285 rows and
+241 µs at 100,000 rows: 2.6 times the residual for 10.8 times the rows, from one sample each. That
+residual is reported as measured. Telling a row-proportional component apart from run-to-run
+variation would need repeated samples.
+
+## Acceptance for the current scope
+
+These are validation requirements, not reported test outcomes:
+
+1. V37 gives existing rows version one without changing their fields. Fresh-schema and
+   migrated-schema guards agree; invalid insert versions, missing/jumped increments and
+   overflow refuse without row mutation. An admitted increment moves by exactly one.
+2. Typed upsert/batch/conditional insertion, import/sync, lifecycle and namespace-move
+   writers obey the row-write invariant. Losing conditional writes do not advance it.
+3. Public entity reads expose the persisted integer, separate from timestamp formatting.
+4. A stale update preserves the complete target record. A current version succeeds once;
+   malformed/nonpositive preconditions refuse. A note arm checks the same typed conflict
+   detail names and string values.
+5. Controlled preparation/commit interleaving proves the caller check occurs inside the
+   writer transaction. Two writers asserting one revision have one winner. A later atomic
+   conflict rolls back earlier entity and audit mutations in the unit.
+6. A competing write that preserves `updated_at` invalidates an older version-bearing
+   snapshot. Omitting the caller fence still preserves internal snapshot checks.
+7. Identical entity updates, fenced and unfenced, retain write behavior and advance once;
+   note behavior remains unchanged. Entity `fence`/`embed` remain refused.
+8. The raw-replacement source inventory rejects new non-migration replacement writers,
+   without being presented as runtime SQL enforcement.
+9. The migration measurement described below is recorded in Consequences before merge.
+
+Current source anchors include `migrations_tests::issue2673_v37_initializes_and_guards_entity_versions`,
+`issue2673_entity_versions_cover_typed_storage_writers`, the runtime `entity_write_tests`,
+and `khive-pack-kg/tests/entity_versions.rs`. The first is a correctness test for V37; it
+does not measure migration cost.
+
+## Deferred requirements — not part of the accepted implementation
+
+### Merge and delete caller fences
+
+The proposed `merge.expected_version` belongs to surviving `into_id`, not `from_id`. Both
+rows must be reread inside the merge transaction and retain the existing both-side snapshot
+and safety checks. `force=true` may bypass only the existing safety floor, never this version
+fence. `dry_run=true` must check the survivor fence without mutation. A real merge must
+advance each survivor/source row it updates once, as the current row invariant requires.
+
+The proposed `delete.expected_version` must also guard hard deletion of an existing
+tombstone. Soft deletion advances once; hard deletion removes the row only after checking
+its current revision. Atomic delete must use the same caller guard. Public atomic merge
+remains outside the supported surface unless separately admitted.
+
+Future acceptance must prove stale merge preserves both rows and emits no merge event,
+stale delete preserves its target, unfenced behavior is retained, and a source mutation
+after merge preflight still triggers the existing safety refusal even when the survivor's
+caller fence is current. These are not shipped caller-parameter guarantees of #2673.
+
+### Entity no-op parity (#2718)
+
+The retained proposal extends the ADR-172 Amendment 5 no-op definition to entities: after
+validation, normalization, applicable hooks and property merging, an identical patch with
+no `expected_version` and no explicit embedding request becomes a mutation-free assertion.
+Canonical and atomic results would disclose `unchanged=true`; version, `updated_at`, stored
+representation, indexes and mutation events would stay untouched. The writer transaction
+must recheck the prepared snapshot; a prior atomic operation can invalidate it and cause
+whole-unit rollback. A raw version-only write or update/delete must invalidate an old no-op
+snapshot too.
+
+Under that future rule an accepted identical fenced patch remains a write: version advances
+once, `updated_at` advances strictly and `unchanged=true` is never returned. Stale identical
+fenced patches refuse. One eligibility predicate and shared comparison helpers are proposed
+for both substrates, with a shared canonical/atomic contract table in validation.
+
+Object key order and tag order would be insignificant; duplicate tag counts and other array
+ordering remain significant. Entity tags are in the tags column; note tags are in
+`properties.tags`. An entity's custom `properties.tags` remains an ordinary ordered property.
+Entity type aliases compare after vocabulary normalization. Explicit `embed` remains
+note-only and preserves existing note write behavior, including `embed=false` on identical
+data. This future entity parity work neither changes the current entity write behavior nor
+redefines the independently governed note semantics.
+
+## Migration measurement procedure
+
+The earlier proposal described `synthetic_v34_to_v35` output reporting schema 35, but the
+implementation preceding this revision had no measurement fixture or output. Entity
+versions are migration V37; V34→V35 is not this migration. The existing
+`issue2673_v37_initializes_and_guards_entity_versions` test is a correctness test, not a
+replacement benchmark.
+
+The ignored `migrations::entity_version_measurement::entity_version_migration_measurement`
+test in `crates/khive-db/src/entity_version_migration_measurement.rs` accepts
+`KHIVE_ENTITY_VERSION_ROWS` and uses the actual migration set for synthetic V36→V37 stores. Record its exact source revision before invoking it. First list ignored
+tests under that name and require exactly one selected test; zero or multiple matches
+invalidate the run. Then set `KHIVE_ENTITY_VERSION_ROWS` to the chosen population and run
+with `--ignored --nocapture`. Require successful exit, exactly one passed test, zero
+failures/ignored tests, and two records labelled `synthetic_v36_to_v37` reporting schema 37:
+zero rows and the requested population. `running 0 tests`, missing records or exit status
+alone is not a measurement.
+
+Preserve the proposed bound of 1,000,000 seeded rows. The proposed populations are 9,285
+rows (a caller-visible live lower bound observed 2026-09-15T16:40:27Z, excluding tombstones
+and other namespaces) and 100,000 rows (synthetic stress). Neither is the complete fleet
+count. Record population provenance; a full-table count, if obtained, must explicitly cover
+tombstones and all namespaces and include its query and observation time.
+
+Only `run_migrations` is to be timed. Use khive's bundled SQLite, WAL/NORMAL and a warm cache
+after seeding, then assert every existing row reads version one. Required output includes
+row count, elapsed microseconds, SQLite version, platform, page size, database size before
+migration and WAL bytes after migration. Record source revision, host/storage hardware,
+build profile and complete output here before merge. A result that scales with row count
+must be reported as a finding against the expected cost, not rounded away.
+
+Results are recorded in Consequences under "Migration measurement record".

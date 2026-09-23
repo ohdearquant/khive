@@ -756,3 +756,5 @@ These are implementation requirements, not reported test results:
    back note/index/edge writes and leave the key free; uncertain writer failures remain errors.
    Propagating preparation failure before revalidation or converting insertion failure into replay must
    fail. Preserve the specialized-memory, stream-write and update-CAS controls unchanged.
+
+Entity revisions and entity update compare-and-set are specified in [ADR-188](ADR-188-entity-version-fence.md).

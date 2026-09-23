@@ -117,9 +117,14 @@ impl Fixture {
         let mut writer = sql.writer().await.expect("fixture writer");
         writer
             .execute(SqlStatement {
+                // Entity rows guard their version: every update advances it by one.
                 sql: format!(
-                    "UPDATE {} SET properties = ?1 WHERE id = ?2",
-                    record.table()
+                    "UPDATE {} SET properties = ?1{} WHERE id = ?2",
+                    record.table(),
+                    match record {
+                        Record::Entity => ", version = version + 1",
+                        Record::Note => "",
+                    }
                 ),
                 params: vec![
                     SqlValue::Text(properties.to_string()),

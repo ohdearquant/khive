@@ -112,6 +112,12 @@ fn resolution_mode_contract(mode: IdResolutionMode) -> Option<&'static str> {
              this parameter itself; any namespace scoping comes from the enclosing operation, \
              not from this identifier.",
         ),
+        IdResolutionMode::EdgeOrEventTarget => Some(
+            "ID contract (list target by kind): kind=event accepts only a full subject UUID; \
+             prefixes and names are rejected without graph resolution. Event rows remain \
+             scoped to the authorized event namespace. For kind=edge, a full UUID resolves as \
+             given; a unique 8+ hex prefix or entity name resolves in the primary namespace.",
+        ),
     }
 }
 
@@ -125,6 +131,7 @@ fn resolution_mode_key(mode: IdResolutionMode) -> &'static str {
         IdResolutionMode::FullAndPrefixScopedToPrimary => "full_and_prefix_scoped_to_primary",
         IdResolutionMode::FullUuidOnlyScopedToPrimary => "full_uuid_only_scoped_to_primary",
         IdResolutionMode::UnscopedFullUuidOnly => "unscoped_full_uuid_only",
+        IdResolutionMode::EdgeOrEventTarget => "edge_or_event_target",
     }
 }
 
@@ -135,6 +142,7 @@ fn identifier_resolution_help() -> Value {
         IdResolutionMode::FullAndPrefixScopedToPrimary,
         IdResolutionMode::FullUuidOnlyScopedToPrimary,
         IdResolutionMode::UnscopedFullUuidOnly,
+        IdResolutionMode::EdgeOrEventTarget,
     ]
     .into_iter()
     .map(|mode| {
@@ -15193,6 +15201,21 @@ mod help_tests {
         assert!(identifier_help["parameter_rule"]
             .as_str()
             .is_some_and(|text| text.contains("submitted again")));
+    }
+
+    #[test]
+    fn event_target_resolution_metadata_has_a_conditional_contract() {
+        let mode = IdResolutionMode::EdgeOrEventTarget;
+        let text = resolution_mode_contract(mode).unwrap();
+        assert!(text.contains("kind=event accepts only a full subject UUID"));
+        assert!(text.contains("prefixes and names are rejected without graph resolution"));
+        assert!(text.contains("For kind=edge"));
+        assert!(text.contains("prefix or entity name resolves in the primary namespace"));
+        assert_eq!(resolution_mode_key(mode), "edge_or_event_target");
+        assert_eq!(
+            identifier_resolution_help()["resolution_modes"]["edge_or_event_target"],
+            text
+        );
     }
 
     /// `describe_verb` appends `resolution_mode_contract(p.resolution_mode)`

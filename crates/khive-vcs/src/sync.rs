@@ -993,6 +993,7 @@ async fn upsert_entities(
                 deleted_at: None,
                 merge_event_id: None,
                 merged_into: None,
+                version: 1,
                 content_ref: None,
             };
             // Use the canonical FTS document constructor so sync, create, update,
@@ -2757,6 +2758,7 @@ mod tests {
             deleted_at: None,
             merge_event_id: None,
             merged_into: None,
+            version: 1,
             content_ref: None,
         };
 
@@ -2901,6 +2903,37 @@ mod checkpoint_wal_write_queue_tests {
              checkpoint inside an open transaction); got {result:?} — if this now passes, \
              the WriterTask no longer wraps execute_script in a transaction and this whole \
              regression class needs re-auditing"
+        );
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn issue2673_sync_upserts_advance_destination_entity_version() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
+    let id = Uuid::new_v4();
+    for version in 1..=3 {
+        let record = NdjsonEntity {
+            id,
+            kind: "concept".into(),
+            entity_type: None,
+            name: format!("sync revision {version}"),
+            description: None,
+            properties: None,
+            tags: vec![],
+            created_at: None,
+            updated_at: None,
+        };
+        assert_eq!(
+            upsert_entities(&runtime, "local", vec![record])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime.get_entity(&token, id).await.unwrap().version,
+            version
         );
     }
 }
