@@ -6449,7 +6449,19 @@ mod tests {
         // (unpaused) time, since a genuinely blocked socket write is real
         // I/O, not a timer, and would not release control for a paused
         // clock's auto-advance to fire.
-        std::env::set_var("KHIVE_REQUEST_READ_TIMEOUT_SECS", "1");
+        let request_timeout = std::time::Duration::from_secs(1);
+        std::env::set_var(
+            "KHIVE_REQUEST_READ_TIMEOUT_SECS",
+            request_timeout.as_secs().to_string(),
+        );
+        // The ordinary lane rejects an extra 1s return delay that the old 3s
+        // cap admitted. Coverage keeps its wider cap, still below the watchdog.
+        let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            request_timeout * 3
+        } else {
+            request_timeout + request_timeout / 2
+        };
+        let watchdog = request_timeout * 5;
 
         let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
 
@@ -6488,18 +6500,14 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        // (a) `try_forward_inner` must return within the ceiling plus a
-        // margin, not hang on the unbounded write. Pre-fix this outer
-        // `tokio::time::timeout` is what actually terminates the test (the
-        // real call never returns on its own), which is the red-before
-        // signal for this assertion.
-        let outcome =
-            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
-                .await
-                .expect(
-                    "try_forward_inner must return within the ceiling plus margin, not hang on an \
+        // (a) The watchdog stops an unbounded write; the tighter elapsed
+        // assertion below separately detects a delayed timeout return.
+        let outcome = tokio::time::timeout(watchdog, try_forward_inner(&frame))
+            .await
+            .expect(
+                "try_forward_inner must return within the ceiling plus margin, not hang on an \
              unbounded write to a silent peer",
-                );
+            );
         let elapsed = started.elapsed();
 
         assert!(
@@ -6509,9 +6517,9 @@ mod tests {
              {outcome:?}",
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "expected the ~1s write-timeout ceiling to fire well under the 5s test bound; \
-             elapsed {elapsed:?}"
+            elapsed < elapsed_limit,
+            "write timeout exceeded its configured caller timeout plus scheduling allowance; \
+             timeout {request_timeout:?}, limit {elapsed_limit:?}, elapsed {elapsed:?}"
         );
 
         // (b) the peer's held stream must observe end-of-stream once
@@ -6567,7 +6575,19 @@ mod tests {
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::env::set_var("KHIVE_PID", &pid_file);
         std::env::remove_var("KHIVE_NO_DAEMON");
-        std::env::set_var("KHIVE_REQUEST_READ_TIMEOUT_SECS", "1");
+        let request_timeout = std::time::Duration::from_secs(1);
+        std::env::set_var(
+            "KHIVE_REQUEST_READ_TIMEOUT_SECS",
+            request_timeout.as_secs().to_string(),
+        );
+        // LLVM_PROFILE_FILE presence selects coverage slack deliberately;
+        // the ordinary cap rejects the old bound's extra 1s-delay blind spot.
+        let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            request_timeout * 3
+        } else {
+            request_timeout + request_timeout / 2
+        };
+        let watchdog = request_timeout * 5;
 
         let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
 
@@ -6603,10 +6623,9 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let outcome =
-            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
-                .await
-                .expect("try_forward_inner must return within the ceiling plus margin");
+        let outcome = tokio::time::timeout(watchdog, try_forward_inner(&frame))
+            .await
+            .expect("try_forward_inner must return within the ceiling plus margin");
         let elapsed = started.elapsed();
 
         assert!(
@@ -6615,9 +6634,9 @@ mod tests {
              ambiguity) — got a different variant: {outcome:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "expected the ~1s read-timeout ceiling to fire well under the 5s test bound; \
-             elapsed {elapsed:?}"
+            elapsed < elapsed_limit,
+            "read timeout exceeded its configured caller timeout plus scheduling allowance; \
+             timeout {request_timeout:?}, limit {elapsed_limit:?}, elapsed {elapsed:?}"
         );
 
         fake_handle.abort();
