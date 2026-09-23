@@ -87,7 +87,9 @@ code-ingest`, not an MCP operation. Its v2 finding identity is repository/projec
 a deterministic v1 UUID witness without rewriting legacy curated rows. Unknown dispatch attempts fail
 with `RuntimeError::InvalidInput` rather than silently succeeding.
 
-An explicit `db` must name an existing regular file. Missing and non-file targets are refused with
+An explicit `db` must be an absolute, plain filesystem path to an existing regular file. `file:`
+URIs, `?` query syntax, and relative paths are refused during parameter validation, before source
+or target filesystem probes. Missing and non-file targets are refused with
 `RuntimeError::InvalidInput` naming the path before the target runtime is constructed. A deliberately
 pre-created empty dedicated file may initialize and migrate. Omitting `db` still creates the default
 `<path>/.khive/code-map.db` when needed. This preflight protects against path typos; it does not pin
