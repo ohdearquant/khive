@@ -102,7 +102,7 @@ impl Fixture {
 
     async fn properties(&self, tool: &Value, properties: Value) {
         self.write(
-            "UPDATE entities SET properties = ?1 WHERE id = ?2",
+            "UPDATE entities SET version = version + 1, properties = ?1 WHERE id = ?2",
             vec![
                 SqlValue::Json(properties),
                 SqlValue::Text(tool["full_id"].as_str().unwrap().into()),
@@ -114,7 +114,7 @@ impl Fixture {
     async fn retire(&self, tool: &Value) {
         // The owning-pack fixture bypasses the generic KG mutation refusal.
         self.write(
-            "UPDATE entities SET deleted_at = ?1 WHERE id = ?2",
+            "UPDATE entities SET version = version + 1, deleted_at = ?1 WHERE id = ?2",
             vec![
                 SqlValue::Integer(chrono::Utc::now().timestamp_micros()),
                 SqlValue::Text(tool["full_id"].as_str().unwrap().into()),
@@ -163,7 +163,7 @@ async fn description_is_outside_the_pin_but_each_policy_input_invalidates_it() {
         )
         .await;
     f.write(
-        "UPDATE entities SET description = 'owning-pack correction' WHERE id = ?1",
+        "UPDATE entities SET version = version + 1, description = 'owning-pack correction' WHERE id = ?1",
         vec![SqlValue::Text(tool["full_id"].as_str().unwrap().into())],
     )
     .await;
@@ -610,7 +610,7 @@ async fn own_registration_keeps_grants_when_a_newer_visible_registration_exists(
         assert_ne!(tool_a["full_id"], tool_b["full_id"]);
         let entity_a = f.entity(&tool_a["full_id"]).await;
         f.write(
-            "UPDATE entities SET created_at=?1 WHERE id=?2",
+            "UPDATE entities SET version = version + 1, created_at=?1 WHERE id=?2",
             vec![
                 SqlValue::Integer(entity_a.created_at + 1),
                 SqlValue::Text(tool_b["full_id"].as_str().unwrap().into()),

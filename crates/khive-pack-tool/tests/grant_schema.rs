@@ -257,7 +257,7 @@ async fn tool_schema_backfills_markers_without_approving_legacy_rows() {
     );
     write(
         &rt,
-        "UPDATE entities SET deleted_at=400 WHERE id='exact-id'",
+        "UPDATE entities SET version = version + 1, deleted_at=400 WHERE id='exact-id'",
         vec![],
     )
     .await;

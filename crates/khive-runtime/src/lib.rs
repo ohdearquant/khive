@@ -19,6 +19,7 @@ pub mod curation;
 pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
+pub mod entity_write;
 pub mod error;
 mod error_projection;
 mod event_store_guard;
