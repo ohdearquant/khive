@@ -165,6 +165,7 @@ const V33_UP: &str = include_str!("../sql/033-notes-message-recipient-direction.
 const V34_UP: &str = include_str!("../sql/034-notes-namespace-created.sql");
 const V35_UP: &str = include_str!("../sql/035-notes-unread-probe-recipient-type-direction.sql");
 const V36_UP: &str = include_str!("../sql/036-events-operation-attribution.sql");
+const V37_UP: &str = include_str!("../sql/037-entity-versions.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -400,6 +401,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 36,
         name: "events_operation_attribution",
         up: V36_UP,
+    },
+    VersionedMigration {
+        version: 37,
+        name: "entity_versions",
+        up: V37_UP,
     },
 ];
 
@@ -1615,6 +1621,10 @@ pub(crate) fn query_embedding_models_conn(
 // =============================================================================
 // Tests
 // =============================================================================
+
+#[cfg(test)]
+#[path = "entity_version_migration_measurement.rs"]
+mod entity_version_measurement;
 
 #[cfg(test)]
 #[path = "migrations_tests.rs"]

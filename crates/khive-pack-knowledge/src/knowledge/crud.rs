@@ -318,58 +318,23 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let now = now_us();
 
-        for (index, atom_in) in p.atoms.iter().enumerate() {
-            let atom_in = match atom_in {
-                AtomWrite::Upsert(atom_in) => atom_in,
-                AtomWrite::PropertiesOnly(atom_in) => {
-                    khive_runtime::secret_gate::check_json_at(
-                        &atom_in.properties,
-                        &format!("atoms[{index}]"),
-                        "properties",
-                    )?;
-                    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(
-                        &atom_in.properties,
-                    ))?;
-                    continue;
-                }
-            };
-            let slug = atom_in.slug.trim().to_string();
-            if slug.is_empty() {
-                return Err(RuntimeError::InvalidInput(
-                    "atom slug must not be empty".into(),
-                ));
-            }
-
-            let raw_content = atom_in.content.as_deref().unwrap_or("");
-            let content = if preserve_content_whitespace {
-                raw_content.to_string()
-            } else {
-                raw_content.trim().to_string()
-            };
-            validate_atom_content(&content)?;
-            // Secret gate: scan all caller-supplied text and structured fields
-            // before any reader/writer is acquired. Every refusal is located to the
-            // atom that produced it by POSITION, never by slug: this loop returns ONE
-            // error for the whole batch, the slug is itself a scanned field, and two
-            // atoms may share a slug within one payload (#2605).
-            use khive_runtime::secret_gate;
-            let record = format!("atoms[{index}]");
-            secret_gate::check_at(&slug, &record, "slug")?;
-            secret_gate::check_at(&atom_in.name, &record, "name")?;
-            secret_gate::check_at(&content, &record, "content")?;
-            if let Some(ref tags_vec) = atom_in.tags {
-                secret_gate::check_tags_at(tags_vec, &record, "tags")?;
-            }
-            if let Some(ref props) = atom_in.properties {
-                secret_gate::check_json_at(props, &record, "properties")?;
-            }
-            secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref())?;
-            if let Some(Some(uri)) = &atom_in.source_uri {
-                secret_gate::check_at(uri, &record, "source_uri")?;
-            }
-            if let Some(Some(st)) = &atom_in.source_type {
-                secret_gate::check_at(st, &record, "source_type")?;
-            }
+        let failures: Vec<_> = p
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(index, atom)| {
+                super::refusal::validate_submission(atom, index, preserve_content_whitespace).err()
+            })
+            .collect();
+        if failures.iter().any(Option::is_some) {
+            return Err(super::refusal::refuse_batch(
+                runtime,
+                token,
+                &p.atoms,
+                failures,
+                preserve_content_whitespace,
+            )
+            .await);
         }
 
         let mut reader = sql
@@ -378,7 +343,10 @@ impl KnowledgeHandlers {
             .map_err(|e| sql_err("upsert_atoms reader", e))?;
         let mut ids_by_slug: HashMap<String, String> = HashMap::new();
         let mut operations = Vec::with_capacity(p.atoms.len());
-        for atom_in in &p.atoms {
+        let mut failed_index = 0;
+        let preparation: Result<(), RuntimeError> = async {
+        for (index, atom_in) in p.atoms.iter().enumerate() {
+            failed_index = index;
             let atom_in = match atom_in {
                 AtomWrite::Upsert(atom_in) => atom_in,
                 AtomWrite::PropertiesOnly(atom_in) => {
@@ -465,7 +433,27 @@ impl KnowledgeHandlers {
             ids_by_slug.insert(slug, id.clone());
             operations.push((id, insert));
         }
+        Ok(())
+        }.await;
         drop(reader);
+        if let Err(error) = preparation {
+            if matches!(
+                error,
+                RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_)
+            ) {
+                let mut failures: Vec<_> = (0..p.atoms.len()).map(|_| None).collect();
+                failures[failed_index] = Some(error);
+                return Err(super::refusal::refuse_batch(
+                    runtime,
+                    token,
+                    &p.atoms,
+                    failures,
+                    preserve_content_whitespace,
+                )
+                .await);
+            }
+            return Err(error);
+        }
 
         let mut created = 0usize;
         let mut updated = 0usize;

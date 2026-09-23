@@ -126,6 +126,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         let mut entity_kinds: HashMap<Uuid, String> = HashMap::new();
         let mut entity_created_at: HashMap<Uuid, i64> = HashMap::new();
         let mut entity_updated_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut entity_versions: HashMap<Uuid, i64> = HashMap::new();
         for hit in &entity_hits {
             if khive_storage::request_read_is_cancelled() {
                 break;
@@ -138,6 +139,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
                         if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
                             entity_created_at.insert(hit.entity_id, entity.created_at);
                             entity_updated_at.insert(hit.entity_id, entity.updated_at);
+                            entity_versions.insert(hit.entity_id, entity.version);
                             entity_kinds.insert(hit.entity_id, entity.kind);
                         }
                     }
@@ -210,6 +212,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
             note_kinds,
             entity_created_at,
             entity_updated_at,
+            entity_versions,
             note_created_at,
             note_updated_at,
             note_versions,

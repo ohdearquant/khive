@@ -43,11 +43,14 @@ fn refuse_pack_registry_row(entity: &Entity, verb: &str) -> Result<(), RuntimeEr
 // docs/api/note-crud-fields.md#reject_inapplicable_fields-handlersupdaters. MUST be updated
 // whenever UpdateParams or a patch struct changes.
 fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), RuntimeError> {
-    if !matches!(spec, KindSpec::Note { .. })
-        && (p.expected_version.is_some() || p.fence.is_some() || p.embed.is_some())
-    {
+    if matches!(spec, KindSpec::Edge) && p.expected_version.is_some() {
         return Err(RuntimeError::InvalidInput(
-            "expected_version, fence and embed apply only to notes".into(),
+            "expected_version applies only to entities and notes".into(),
+        ));
+    }
+    if !matches!(spec, KindSpec::Note { .. }) && (p.fence.is_some() || p.embed.is_some()) {
+        return Err(RuntimeError::InvalidInput(
+            "fence and embed apply only to notes".into(),
         ));
     }
     let (bad_field, valid): (Option<&str>, &str) = match spec {
@@ -251,7 +254,12 @@ impl KgPack {
                 };
                 let (entity, report) = self
                     .runtime
-                    .update_entity_with_embedding_report(token, id, patch)
+                    .update_entity_with_expected_version_and_embedding_report(
+                        token,
+                        id,
+                        patch,
+                        p.expected_version,
+                    )
                     .await?;
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);
                 super::create::add_embedding_truncation_warning(
