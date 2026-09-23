@@ -1005,6 +1005,122 @@ fn run_migrations_twice_is_idempotent() {
 }
 
 #[test]
+fn v38_legacy_entity_type_index_preserves_rows_and_list_sequence() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    stage_attachment_cutover(&mut conn).unwrap();
+    finalize_attachment_cutover(&mut conn).unwrap();
+    assert_eq!(read_schema_version(&conn).unwrap(), 21);
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| (22..38).contains(&migration.version))
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let ledger = |conn: &Connection| -> Vec<(u32, String)> {
+        conn.prepare("SELECT version, name FROM _schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(read_schema_version(&conn).unwrap(), 37);
+    assert_eq!(
+        ledger(&conn),
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 37)
+            .map(|migration| (migration.version, migration.name.to_string()))
+            .collect::<Vec<_>>()
+    );
+    assert!(!index_exists(&conn, "idx_entities_legacy_type"));
+    for (id, entity_type, properties) in [
+        ("legacy", None, r#"{"type":"algorithm"}"#),
+        ("typed", Some("technique"), r#"{"type":"algorithm"}"#),
+        ("number", None, r#"{"type":7}"#),
+    ] {
+        conn.execute(
+            "INSERT INTO entities \
+             (id, namespace, kind, entity_type, name, properties, created_at, updated_at) \
+             VALUES (?1, 'local', 'concept', ?2, ?1, ?3, 1, 2)",
+            rusqlite::params![id, entity_type, properties],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        conn.execute(
+            "UPDATE entities SET name = 'legacy revised', updated_at = 3, version = version + 1 \
+             WHERE id = 'legacy' AND version = 1",
+            [],
+        )
+        .unwrap(),
+        1,
+        "the fixture must advance through the existing entity-version guard"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT version FROM entities WHERE id = 'legacy'",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        2
+    );
+    let snapshot = |conn: &Connection| -> Vec<String> {
+        conn.prepare(
+            "SELECT json_object('id', id, 'namespace', namespace, 'kind', kind, 'name', name, \
+             'entity_type', entity_type, 'properties', properties, 'tags', tags, \
+             'created_at', created_at, 'updated_at', updated_at, 'version', version, \
+             'seq', entities_seq.seq) \
+             FROM entities JOIN entities_seq ON entities_seq.entity_id = entities.id ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    };
+    let before = snapshot(&conn);
+    assert_eq!(before.len(), 3);
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(snapshot(&conn), before);
+    assert!(index_exists(&conn, "idx_entities_legacy_type"));
+    let expected_ledger: Vec<_> = MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version, migration.name.to_string()))
+        .collect();
+    assert!(expected_ledger.contains(&(38, "entities_legacy_type_index".to_string())));
+    assert_eq!(ledger(&conn), expected_ledger);
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(snapshot(&conn), before);
+    assert_eq!(ledger(&conn), expected_ledger);
+    validate_schema_is_current(&conn).unwrap();
+
+    let direct = open_memory();
+    direct
+        .execute_batch(include_str!("../sql/entities-ddl.sql"))
+        .unwrap();
+    let index_sql = |conn: &Connection| -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_entities_legacy_type'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert!(index_exists(&direct, "idx_entities_legacy_type"));
+    assert_eq!(index_sql(&conn), index_sql(&direct));
+}
+
+#[test]
 fn v22_upgrades_pre_index_database_for_read_only_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("pre-unread-probe-index.db");

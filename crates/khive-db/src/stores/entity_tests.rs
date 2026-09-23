@@ -891,6 +891,206 @@ async fn test_query_by_kind_and_entity_type() {
     assert_eq!(result.items[0].entity_type, Some("researcher".to_string()));
 }
 
+#[test]
+fn legacy_entity_type_fallback_seeks_both_type_indexes() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    run_migrations(&mut conn).unwrap();
+    for filter in [
+        EntityFilter {
+            kinds: vec!["concept".into()],
+            entity_types: vec!["algorithm".into()],
+            legacy_entity_type_fallback: true,
+            ..Default::default()
+        },
+        EntityFilter {
+            entity_types_by_kind: [("concept".into(), vec!["algorithm".into()])].into(),
+            legacy_entity_type_fallback: true,
+            ..Default::default()
+        },
+    ] {
+        for ordered in [false, true] {
+            let (where_sql, mut params) = build_entity_where("local", &filter);
+            let query = if ordered {
+                params.push(Box::new(2_i64));
+                params.push(Box::new(1_i64));
+                let limit_idx = params.len() - 1;
+                let offset_idx = params.len();
+                format!(
+                    "SELECT {ENTITY_SELECT_COLUMNS} FROM entities{where_sql} \
+                     ORDER BY created_at DESC, id DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                )
+            } else {
+                format!("SELECT COUNT(*) FROM entities{where_sql}")
+            };
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let details: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("SEARCH entities")
+                        && detail.contains("idx_entities_kind_entity_type")
+                        && detail.contains("namespace=? AND kind=? AND entity_type=?")
+                }),
+                "typed rows must retain the third-column seek: {query}; {details:?}"
+            );
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("SEARCH entities")
+                        && detail.contains("idx_entities_legacy_type")
+                        && detail.contains("namespace=? AND kind=? AND <expr>=?")
+                }),
+                "legacy rows must seek the partial expression index: {query}; {details:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_entity_type_union_preserves_offset_seek_and_kind_filters() {
+    let store = setup_memory_store();
+    let mut legacy = Entity::new("local", "concept", "Alpha-one")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    legacy.id = Uuid::from_u128(1);
+    legacy.created_at = 500;
+    let mut typed = Entity::new("local", "concept", "Alpha").with_entity_type(Some("algorithm"));
+    typed.id = Uuid::from_u128(2);
+    typed.created_at = 100;
+    let mut team = Entity::new("team", "concept", "Alpha-team").with_entity_type(Some("algorithm"));
+    team.id = Uuid::from_u128(5);
+    team.created_at = 600;
+    let mut legacy_tie = Entity::new("local", "concept", "Alpha-three")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    legacy_tie.id = Uuid::from_u128(3);
+    legacy_tie.created_at = 400;
+    let mut typed_tie = Entity::new("local", "concept", "Alpha-four")
+        .with_entity_type(Some("algorithm"))
+        .with_properties(serde_json::json!({"type": "technique"}));
+    typed_tie.id = Uuid::from_u128(4);
+    typed_tie.created_at = 400;
+    for entity in [&legacy, &typed, &team, &legacy_tie, &typed_tie] {
+        store.upsert_entity(entity.clone()).await.unwrap();
+    }
+    legacy.description = Some("Revised legacy description".into());
+    store.upsert_entity(legacy.clone()).await.unwrap();
+    for description in ["First typed revision", "Second typed revision"] {
+        typed.description = Some(description.into());
+        store.upsert_entity(typed.clone()).await.unwrap();
+    }
+    let mut deleted = Entity::new("local", "concept", "Alpha-deleted")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    deleted.deleted_at = Some(deleted.created_at);
+    for entity in [
+        deleted,
+        Entity::new("local", "concept", "Alpha-overridden")
+            .with_entity_type(Some("technique"))
+            .with_properties(serde_json::json!({"type": "algorithm"})),
+        Entity::new("local", "document", "Alpha-document")
+            .with_properties(serde_json::json!({"type": "algorithm"})),
+        Entity::new("foreign", "concept", "Alpha-foreign").with_entity_type(Some("algorithm")),
+    ] {
+        store.upsert_entity(entity).await.unwrap();
+    }
+    let filter = EntityFilter {
+        namespaces: vec!["local".into(), "team".into()],
+        kinds: vec!["concept".into()],
+        entity_types: vec!["algorithm".into()],
+        legacy_entity_type_fallback: true,
+        name_prefix: Some("Alpha".into()),
+        ..Default::default()
+    };
+    let mut grouped = filter.clone();
+    grouped.kinds.clear();
+    grouped.entity_types.clear();
+    grouped.entity_types_by_kind = [("concept".into(), vec!["algorithm".into()])].into();
+    for filter in [filter, grouped] {
+        assert_eq!(
+            store
+                .count_entities("unused", filter.clone())
+                .await
+                .unwrap(),
+            5
+        );
+        let mut offset_rows = Vec::new();
+        for offset in 0..5 {
+            let page = store
+                .query_entities("unused", filter.clone(), PageRequest { limit: 1, offset })
+                .await
+                .unwrap();
+            assert_eq!(page.total, Some(5));
+            assert_eq!(page.items.len(), 1);
+            offset_rows.push((page.items[0].id, page.items[0].version));
+        }
+        assert_eq!(
+            offset_rows,
+            vec![
+                (typed.id, 3),
+                (team.id, 1),
+                (legacy.id, 2),
+                (typed_tie.id, 1),
+                (legacy_tie.id, 1),
+            ]
+        );
+        let first = store
+            .query_entities_after("unused", filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|entity| (entity.id, entity.version))
+                .collect::<Vec<_>>(),
+            vec![(legacy.id, 2), (typed.id, 3)]
+        );
+        assert_eq!(
+            first.next_after,
+            Some(SeekCursor {
+                sequence: 2,
+                id: typed.id,
+            })
+        );
+        let second = store
+            .query_entities_after("unused", filter.clone(), first.next_after, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|entity| (entity.id, entity.version))
+                .collect::<Vec<_>>(),
+            vec![(team.id, 1), (legacy_tie.id, 1)]
+        );
+        assert_eq!(
+            second.next_after,
+            Some(SeekCursor {
+                sequence: 4,
+                id: legacy_tie.id,
+            })
+        );
+        let third = store
+            .query_entities_after("unused", filter, second.next_after, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            third
+                .items
+                .iter()
+                .map(|entity| (entity.id, entity.version))
+                .collect::<Vec<_>>(),
+            vec![(typed_tie.id, 1)]
+        );
+        assert!(third.next_after.is_none());
+    }
+}
+
 #[tokio::test]
 async fn test_legacy_entity_type_filter_is_opt_in_and_preserves_column_precedence() {
     let store = setup_memory_store();
