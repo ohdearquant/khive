@@ -70,6 +70,17 @@ and ADR-136 D2 still require production A/B evidence and a release gate before
 `write_routing_strict` can become the default; until that evidence is accepted,
 `KHIVE_WRITE_ROUTING=strict` remains opt-in.
 
+## `ConnectionPool::writer_task_for_runtime_write`
+
+Entity merge, note merge, and symmetric edge update use this adapter for their
+runtime-owned SQL transactions. The closed `RuntimeWriteOperation` enum supplies
+the operation name and private telemetry classification without exposing the
+sink. The adapter applies `writer_task_for_write`'s strict refusal before the
+caller can enter its direct transaction. A returned `None` permits only the
+existing compatibility fallback and records its operation-specific violation
+when the file-backed queue is enabled. Explicit queue opt-out and in-memory
+pools remain excluded from violation telemetry.
+
 ## Test coverage notes
 
 ### `writer_guard_transaction_registers_during_closure_only`

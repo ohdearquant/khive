@@ -29,7 +29,7 @@ use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::stores::text::insert_document_statements;
-use khive_db::SqliteError;
+use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use rusqlite::OptionalExtension;
 
 /// The restore unit committed the row and its text index; only the
@@ -2879,6 +2879,38 @@ impl KhiveRuntime {
             Ok(None) | Err(RuntimeError::NotFound(_)) => Ok(false),
             Err(err) => Err(err),
         }
+    }
+
+    /// Find the newest live annotation note with an exact kind and tag across
+    /// the token's visible edge namespaces, on this runtime's bound backend.
+    /// Each store selects one eligible candidate before returning; note bodies
+    /// and the complete annotation history are never hydrated here.
+    pub async fn latest_annotating_note(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        if !self.substrate_exists_in_ns(token, node_id).await? {
+            return Ok(None);
+        }
+        let mut latest: Option<(Uuid, i64)> = None;
+        for namespace in token.visible_namespaces() {
+            let scoped = NamespaceToken::for_namespace(namespace.clone());
+            if let Some(candidate) = self
+                .graph(&scoped)?
+                .latest_annotating_note(node_id, kind, tag)
+                .await?
+            {
+                if latest.is_none_or(|(id, created_at)| {
+                    candidate.1 > created_at || (candidate.1 == created_at && candidate.0 < id)
+                }) {
+                    latest = Some(candidate);
+                }
+            }
+        }
+        Ok(latest.map(|(id, _)| id))
     }
 
     /// Get immediate neighbors of a node, optionally filtered by relation type.
@@ -6433,10 +6465,9 @@ impl KhiveRuntime {
             let expected_deleted_at_micros = expected_deleted_at.map(|v| v.timestamp_micros());
 
             let pool = self.backend().pool_arc();
-            // Route through the single-writer task when the write queue is
-            // enabled; best-effort lookup degrades to the legacy pool-mutex
-            // path (mirrors merge_entity/merge_note above).
-            let writer_task = pool.writer_task_handle().ok().flatten();
+            let writer_task = pool
+                .writer_task_for_runtime_write(RuntimeWriteOperation::UpdateSymmetricEdge)
+                .map_err(RuntimeError::Storage)?;
 
             let outcome: SymmetricEdgeUpdateOutcome = if let Some(writer_task) = writer_task {
                 writer_task

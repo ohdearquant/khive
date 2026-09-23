@@ -98,10 +98,32 @@ pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
 pub(crate) static GTD_HANDLERS: [HandlerDef; 6] = [
     HandlerDef {
         name: "gtd.census",
-        description: "Count live task created_at and archived_at values by numeric magnitude in the visible namespaces. Reports null, nonnumeric, zero, 10/13/16-digit magnitude, and other buckets. Magnitude does not establish timestamp units; the raw greater-than count is NOT temporal ordering. Read-only: no repair, conversion, or record payloads.",
+        description: "Count live task created_at and archived_at values by numeric magnitude in the visible namespaces. Reports null, nonnumeric, zero, 10/13/16-digit magnitude, and other buckets. Magnitude does not establish timestamp units; the raw greater-than count is NOT temporal ordering. Optional candidates expose bounded structural anomalies as exact JSON source text evidence. Read-only: no repair or conversion; candidate output is bounded but may scan the scoped population.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "include_candidates",
+                param_type: "boolean",
+                required: false,
+                description: "Default false preserves the aggregate-only response. True adds live tasks whose created_at or updated_at is outside the magnitude_16_digits bucket used by current task writers. archived_at is evidence only and cannot qualify a candidate by itself. Evidence fields contain JSON source text, with null for an absent status or archived_at member; no timestamp units are inferred.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Candidate page size, default 100, range 1..=200. Requires include_candidates=true; null is rejected. Bounds returned candidates, not rows examined.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "cursor",
+                param_type: "object",
+                required: false,
+                description: "Resume after {namespace, id} in namespace then UUID order. Use next_cursor from the preceding page with the same scope. The namespace must be visible and id a canonical lowercase dashed full UUID. Requires include_candidates=true; null and unknown fields are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
     },
     // Directive: directs an actor to perform work
     HandlerDef {
