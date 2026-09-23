@@ -167,15 +167,12 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     let (server, schedule_rt) = build_server(&args).await?;
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
 
-    #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(&server, &args);
-    #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(&server, &args);
-    start_daemon_components_if_daemon(&args, &server, schedule_rt);
-
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard(server, boot_guard).await?;
+        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
+            start_host_background_tasks(&args, server, schedule_rt)
+        })
+        .await?;
         return Ok(());
     }
     #[cfg(unix)]
@@ -190,7 +187,20 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
     // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
     // that stays daemon-owned).
+    start_host_background_tasks(&args, &server, schedule_rt);
     serve_with_session_sweep(server, &args, registry).await
+}
+
+fn start_host_background_tasks(
+    args: &Args,
+    server: &KhiveMcpServer,
+    schedule_rt: Option<KhiveRuntime>,
+) {
+    #[cfg(feature = "channel-email")]
+    spawn_email_channel_loops_if_daemon(server, args);
+    #[cfg(feature = "channel-telegram")]
+    spawn_telegram_channel_loops_if_daemon(server, args);
+    start_daemon_components_if_daemon(args, server, schedule_rt);
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -2289,15 +2299,12 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(&server, args);
-    #[cfg(feature = "channel-telegram")]
-    spawn_telegram_channel_loops_if_daemon(&server, args);
-    start_daemon_components_if_daemon(args, &server, schedule_rt);
-
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard(server, boot_guard).await?;
+        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
+            start_host_background_tasks(args, server, schedule_rt)
+        })
+        .await?;
         return Ok(());
     }
     drop(boot_guard);
@@ -2313,6 +2320,7 @@ pub async fn serve_server(
     // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
     // Without this spawn, every multi-backend session is permanently
     // invisible to cross-process WAL-pin attribution.
+    start_host_background_tasks(args, &server, schedule_rt);
     serve_with_session_sweep(server, args, registry).await
 }
 
@@ -2902,13 +2910,12 @@ pub fn validate_reindex_db_target_with_source(
     )
 }
 
-/// Validate a database override and normalize a redundant concrete override
-/// to the same fingerprint anchor used when no override is supplied.
+/// Validate a database override and anchor declared topology at its main store.
 ///
 /// Once a concrete path is proven to name the declared `main` backend, the
 /// backend topology fully identifies storage and the override has no remaining
-/// semantic effect. Retaining it in `RuntimeConfig.db_path` would nevertheless
-/// change `compute_config_id` and prevent sharing the default warm daemon.
+/// semantic effect. Both forms must use the declared store rather than a
+/// HOME-derived fallback so clients and the daemon compute the same identity.
 pub fn normalize_redundant_db_override(
     config: &mut RuntimeConfig,
     cli_db_override: Option<&str>,
@@ -2929,13 +2936,19 @@ pub fn normalize_redundant_db_override_with_source(
         backends,
         config_source,
     )?;
-    // The anchor rewrite is only sound once the override has been proven
-    // redundant against a declared `main` backend. With no declared backends
-    // the concrete override is the ordinary single-backend case: it names the
-    // database directly and must be preserved, not collapsed to the
-    // no-override anchor.
-    if !backends.is_empty() && matches!(cli_db_override, Some(path) if path != ":memory:") {
-        config.db_path = khive_runtime::resolve_db_anchor(None);
+    if !force_memory {
+        if let Some(main) = backends
+            .iter()
+            .find(|backend| backend.name == BackendId::MAIN)
+        {
+            config.db_path = match main.kind {
+                BackendKind::Sqlite => main
+                    .path
+                    .as_ref()
+                    .map(|path| khive_runtime::expand_tilde(path)),
+                BackendKind::Memory => None,
+            };
+        }
     }
     Ok(force_memory)
 }
@@ -7988,6 +8001,123 @@ region = "us-east-1"
             config.db_path, anchor_before,
             "override-derived anchor must survive normalization when no backends are declared"
         );
+    }
+
+    #[test]
+    fn declared_topology_config_identity_ignores_unused_home_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let topology = sqlite_multi_backend_config(main_path.clone(), dir.path().join("comm.db"));
+        let mut identities = Vec::new();
+        for home in ["home-a", "home-b"] {
+            for override_value in [None, main_path.to_str()] {
+                let mut config = RuntimeConfig {
+                    db_path: Some(dir.path().join(home).join(".khive/khive.db")),
+                    actor_id: Some("config-anchor-test".to_string()),
+                    ..base_runtime_config_for_multi_backend()
+                };
+                let force_memory = normalize_redundant_db_override_with_source(
+                    &mut config,
+                    override_value,
+                    &topology.backends,
+                    None,
+                )
+                .unwrap();
+                assert!(!force_memory);
+                assert_eq!(config.db_path.as_ref(), Some(&main_path));
+                identities.push(crate::server::compute_config_id(&config, Some(&topology)));
+            }
+        }
+        assert!(identities.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(!main_path.exists(), "normalization must not open storage");
+
+        let other_main = dir.path().join("other-main.db");
+        let other_topology = sqlite_multi_backend_config(other_main, dir.path().join("comm.db"));
+        let mut other = RuntimeConfig {
+            db_path: None,
+            actor_id: Some("config-anchor-test".to_string()),
+            ..base_runtime_config_for_multi_backend()
+        };
+        normalize_redundant_db_override(&mut other, None, &other_topology.backends).unwrap();
+        assert_ne!(
+            identities[0],
+            crate::server::compute_config_id(&other, Some(&other_topology))
+        );
+    }
+
+    #[test]
+    fn declared_topology_config_identity_preserves_memory_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology =
+            sqlite_multi_backend_config(dir.path().join("main.db"), dir.path().join("comm.db"));
+        let mut memory = RuntimeConfig {
+            db_path: None,
+            actor_id: Some("config-anchor-test".to_string()),
+            ..base_runtime_config_for_multi_backend()
+        };
+        assert!(
+            normalize_redundant_db_override(&mut memory, Some(":memory:"), &topology.backends)
+                .unwrap()
+        );
+        assert_eq!(memory.db_path, None);
+        let memory_id = crate::server::compute_config_id(&memory, Some(&topology));
+        let mut persistent = memory.clone();
+        assert!(
+            !normalize_redundant_db_override(&mut persistent, None, &topology.backends).unwrap()
+        );
+        assert_ne!(
+            memory_id,
+            crate::server::compute_config_id(&persistent, Some(&topology))
+        );
+
+        let memory_topology = memory_main_backend_config();
+        let mut declared_memory = persistent;
+        normalize_redundant_db_override(&mut declared_memory, None, &memory_topology.backends)
+            .unwrap();
+        assert_eq!(declared_memory.db_path, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn declared_topology_config_identity_matches_opened_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let topology = sqlite_multi_backend_config(main_path.clone(), dir.path().join("comm.db"));
+        let host = RuntimeConfig {
+            db_path: Some(dir.path().join("daemon-home/.khive/khive.db")),
+            actor_id: Some("config-anchor-test".to_string()),
+            ..base_runtime_config_for_multi_backend()
+        };
+        // Capture the synthetic host's anchor instead of asking the legacy
+        // wrapper to resolve an unrelated anchor from the test runner's HOME.
+        let host_anchor = host.db_path.clone();
+        let opened = build_registry_for_multi_backend_with_db_anchor(
+            host,
+            &topology,
+            None,
+            host_anchor.as_deref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            opened.default_runtime.config().db_path.as_ref(),
+            Some(&main_path)
+        );
+        for override_value in [None, main_path.to_str()] {
+            let mut client = RuntimeConfig {
+                db_path: Some(dir.path().join("client-home/.khive/khive.db")),
+                actor_id: Some("config-anchor-test".to_string()),
+                ..base_runtime_config_for_multi_backend()
+            };
+            normalize_redundant_db_override(&mut client, override_value, &topology.backends)
+                .unwrap();
+            assert_eq!(
+                crate::server::compute_config_id(&client, Some(&topology)),
+                opened.config_id
+            );
+        }
+        assert!(!dir.path().join("daemon-home").exists());
+        assert!(!dir.path().join("client-home").exists());
     }
 
     /// A declared `main` backend that is a symlink whose target does not
