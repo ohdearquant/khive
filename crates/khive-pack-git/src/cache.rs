@@ -37,6 +37,10 @@ use uuid::Uuid;
 
 use crate::source::{cache_key, redact_repo_url};
 
+#[cfg(windows)]
+#[path = "cache_windows.rs"]
+mod windows_slot;
+
 pub const DEFAULT_MAX_REPOS: usize = 5;
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_CLONE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -518,6 +522,9 @@ fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cach
             // it), not a maybe-absent slot, so propagate rather than swallow.
             let size = dir_size(&repo_dir)?;
             if size > cap {
+                // Windows pins prohibit renaming/removing the validated slot.
+                // All git children have completed; release before owned cleanup.
+                drop(validated);
                 remove_owned_entry(root, &repo_dir)?;
                 return Err(CacheError::CloneTooLarge { bytes: size, cap });
             }
@@ -590,6 +597,7 @@ fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cac
     if size > cap {
         // Ownership-guarded removal, not a raw `remove_dir_all` — see
         // crates/khive-pack-git/docs/api/cache.md#refetch_clone.
+        drop(validated);
         remove_owned_entry(root, &repo_dir)?;
         return Err(CacheError::CloneTooLarge { bytes: size, cap });
     }
@@ -805,11 +813,14 @@ fn delete_verified_owned_entry(_root: &Path, repo_dir: &Path) -> Result<(), Cach
 /// validation — of the slot pathname OR of the `.git` child entry — including
 /// a symlink pointed at an ancestor repository, which a re-resolved `--git-dir
 /// .git` or an absolute `--git-dir` would happily follow, is never seen.
-/// Non-unix carries no descriptor and keeps the pathname `--git-dir` form
-/// (weaker; documented at `revalidate_owned_slot`).
+/// Windows retains no-delete-sharing handles for every component of the
+/// resolved command path, including `.git`, through the synchronous wait.
+/// Other non-Unix platforms retain the weaker pathname fallback.
 struct ValidatedSlot {
     #[cfg(unix)]
     git_dir: std::fs::File,
+    #[cfg(windows)]
+    windows: windows_slot::PinnedSlot,
 }
 
 #[cfg(unix)]
@@ -833,8 +844,9 @@ impl ValidatedSlot {
 /// `fchdir`s into the validated `.git` descriptor before exec and uses
 /// `--git-dir .`, so git operates on the descriptor-resolved `.git` object and
 /// never re-resolves the name `.git` (which a relative `--git-dir .git` would,
-/// following a `.git` symlink swapped in after validation). Non-unix: absolute
-/// `--git-dir` on the pathname. All git commands here are ref/git-dir-only
+/// following a `.git` symlink swapped in after validation). Windows: the
+/// absolute path whose complete directory chain remains pinned against swaps.
+/// Other non-Unix targets retain a pathname fallback. Commands are ref/git-dir-only
 /// (fetch, remote set-head, symbolic-ref, update-ref); none needs a work tree,
 /// so cwd being the git dir is correct.
 /// Callers that only read the exit status must null stdout themselves — git
@@ -866,14 +878,19 @@ fn git_at_slot(repo: &Path, slot: &ValidatedSlot) -> Command {
         cmd.arg("--git-dir").arg(".");
         let _ = repo;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        cmd.arg("--git-dir").arg(slot.windows.git_dir());
+        let _ = repo;
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         // Pathname-bound fallback: non-Unix targets cannot pass a directory
         // descriptor to git, so `.git` is re-resolved by name here. This
         // reopens the symlink-swap TOCTOU the Unix descriptor-pin closes — a
         // `.git` swapped for a symlink after validation redirects git to an
-        // unowned repository. Windows-safe handle-pinning needs platform APIs
-        // untestable on this CI and is tracked in #2149.
+        // unowned repository. This fallback does not provide the Unix or
+        // Windows slot-pinning guarantee.
         let _ = slot;
         cmd.arg("--git-dir").arg(repo.join(".git"));
     }
@@ -908,12 +925,18 @@ fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
     Ok(ValidatedSlot { git_dir })
 }
 
-/// Non-unix fallback: pathname re-check at the same call site. Weaker than
+#[cfg(windows)]
+fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
+    windows_slot::PinnedSlot::open(repo_dir)
+        .map(|windows| ValidatedSlot { windows })
+        .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))
+}
+
+/// Other non-Unix fallback: pathname re-check at the same call site. Weaker than
 /// the fd-bound form — the explicit `--git-dir` layer still prevents upward
 /// discovery, though not a symlink swapped in after this check. That
-/// pathname-bound TOCTOU is tracked in #2149; the Windows-safe handle-pin
-/// needs platform APIs untestable on this CI.
-#[cfg(not(unix))]
+/// pathname-bound TOCTOU remains on platforms other than Unix and Windows.
+#[cfg(not(any(unix, windows)))]
 fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
     if !is_owned_entry(repo_dir) {
         return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
@@ -2138,6 +2161,27 @@ mod tests {
         p
     }
 
+    #[cfg(windows)]
+    fn windows_fetchable_slot(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let upstream = base.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        init_origin_with_one_commit(&upstream);
+        let foreign = base.join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        git(&foreign, &["init", "-q", "-b", "main"]);
+        git(
+            &foreign,
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        );
+        let root = base.join("mutable-parent").join("cache-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let slot = root.join("aaaaaaaaaaaaaaaa");
+        clone(upstream.to_str().unwrap(), &slot, DEFAULT_CLONE_MAX_BYTES).unwrap();
+        std::fs::write(slot.join(MARKER_FILE), b"").unwrap();
+        add_commit(&upstream, "next.txt", "next", "next commit");
+        (upstream, slot, foreign)
+    }
+
     /// Build a staging wrapper directly (bypassing `install_fresh_clone`)
     /// under the private namespace, optionally with a lock file held open
     /// by the returned guard (drop the guard to simulate the owning
@@ -3231,6 +3275,192 @@ printf 'finished\n' > '{}'
             moved_git.join("FETCH_HEAD").exists(),
             "the fetch must land in the .git object that was validated"
         );
+    }
+
+    /// Windows closes this race by preventing each rename, not by allowing
+    /// a rename and following an fd as the Unix regression above does.
+    #[cfg(windows)]
+    #[test]
+    fn issue2149_windows_pins_slot_and_git_child_through_fetch() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let _guard = ENV_MUTEX.blocking_lock();
+        for child in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (upstream, slot, foreign) = windows_fetchable_slot(dir.path());
+            let validated = revalidate_owned_slot(&slot).expect("owned slot validates");
+            let target = if child {
+                slot.join(".git")
+            } else {
+                slot.clone()
+            };
+            let moved = target.with_file_name("moved-aside");
+            assert!(
+                std::fs::rename(&target, &moved).is_err(),
+                "validated component must not be movable before git completes: {}",
+                target.display()
+            );
+            assert!(target.is_dir());
+            assert!(!moved.exists());
+            // A wrong caller spelling must not override the validated path.
+            // Foreign has a fetchable origin, so a pathname regression would
+            // succeed there rather than fail for an unrelated setup reason.
+            fetch(&foreign, &validated).expect("fetch into pinned slot");
+            advance_to_fetched_tip(&foreign, &validated).expect("advance pinned refs");
+            assert_eq!(head_sha(&slot), head_sha(&upstream));
+            assert!(slot.join(".git/FETCH_HEAD").exists());
+            assert!(!foreign.join(".git/FETCH_HEAD").exists());
+            drop(validated);
+            std::fs::rename(&target, &moved).expect("same rename succeeds after pin release");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue2149_windows_pins_every_git_path_ancestor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let _guard = ENV_MUTEX.blocking_lock();
+        for parent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (upstream, slot, foreign) = windows_fetchable_slot(dir.path());
+            let root = slot.parent().unwrap();
+            let target = if parent { root.parent().unwrap() } else { root };
+            let moved = target.with_file_name("ancestor-moved");
+            let validated = revalidate_owned_slot(&slot).expect("owned slot validates");
+            assert!(
+                std::fs::rename(target, &moved).is_err(),
+                "every directory in the Git command path must remain pinned"
+            );
+            fetch(&slot, &validated).unwrap();
+            advance_to_fetched_tip(&slot, &validated).unwrap();
+            assert_eq!(head_sha(&slot), head_sha(&upstream));
+            assert!(!foreign.join(".git/FETCH_HEAD").exists());
+            drop(validated);
+            std::fs::rename(target, &moved).expect("ancestor can move after command pins drop");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue2149_windows_refuses_reparse_ownership_components() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let _guard = ENV_MUTEX.blocking_lock();
+        for component in ["slot", ".git", MARKER_FILE] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            let slot = make_owned_entry(&root, "aaaaaaaaaaaaaaaa", true);
+            let target = if component == "slot" {
+                slot.clone()
+            } else {
+                slot.join(component)
+            };
+            let moved = target.with_file_name("unowned-target");
+            std::fs::rename(&target, &moved).unwrap();
+            if component == MARKER_FILE {
+                std::fs::write(&moved, b"foreign marker must survive").unwrap();
+                std::os::windows::fs::symlink_file(&moved, &target).expect(
+                    "Windows CI needs Developer Mode or symlink privilege; do not skip this witness",
+                );
+            } else {
+                std::os::windows::fs::symlink_dir(&moved, &target).expect(
+                    "Windows CI needs Developer Mode or symlink privilege; do not skip this witness",
+                );
+            }
+            assert!(matches!(
+                revalidate_owned_slot(&slot),
+                Err(CacheError::UnsafeToReplace(_))
+            ));
+            assert!(moved.exists(), "revalidation never removes foreign data");
+            if component == MARKER_FILE {
+                assert_eq!(
+                    std::fs::read(&moved).unwrap(),
+                    b"foreign marker must survive"
+                );
+                std::fs::remove_file(&target).unwrap();
+            } else {
+                std::fs::remove_dir(&target).unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue2149_windows_resolved_path_survives_a_scratch_alias_swap() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, slot, foreign) = windows_fetchable_slot(dir.path());
+        let alias = dir.path().join("scratch-alias");
+        let foreign_root = dir.path().join("foreign-root");
+        std::fs::create_dir_all(&foreign_root).unwrap();
+        let foreign_slot = foreign_root.join(slot.file_name().unwrap());
+        std::os::windows::fs::symlink_dir(&foreign, &foreign_slot).expect(
+            "Windows CI needs Developer Mode or symlink privilege; do not skip this witness",
+        );
+        std::os::windows::fs::symlink_dir(slot.parent().unwrap(), &alias).expect(
+            "Windows CI needs Developer Mode or symlink privilege; do not skip this witness",
+        );
+        let alias_slot = alias.join(slot.file_name().unwrap());
+        let validated =
+            revalidate_owned_slot(&alias_slot).expect("resolved scratch alias validates");
+        // Pins cover the resolved Git path, not this original alias. Replacing
+        // the alias must therefore succeed and still have no effect on Git.
+        std::fs::remove_dir(&alias).unwrap();
+        // The replacement has the same slot name and a fetchable repository,
+        // so reusing the original spelling would mutate foreign FETCH_HEAD.
+        std::os::windows::fs::symlink_dir(&foreign_root, &alias).unwrap();
+        fetch(&alias_slot, &validated).unwrap();
+        advance_to_fetched_tip(&alias_slot, &validated).unwrap();
+        assert_eq!(head_sha(&slot), head_sha(&upstream));
+        assert!(!foreign.join(".git/FETCH_HEAD").exists());
+        drop(validated);
+        std::fs::remove_dir(&alias).unwrap();
+        std::fs::remove_dir(&foreign_slot).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue2149_windows_over_cap_cleanup_releases_pins() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        init_origin_with_one_commit(&upstream);
+        let root = dir.path().join("cache-root");
+        let _scratch = ScratchRootGuard::set(&root);
+        let url = upstream.to_str().unwrap();
+        for refetch in [false, true] {
+            std::env::set_var(
+                "KHIVE_GIT_DIGEST_CLONE_MAX_BYTES",
+                DEFAULT_CLONE_MAX_BYTES.to_string(),
+            );
+            let slot = ensure_clone(url).expect("create a normal owned slot");
+            std::env::set_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", "1");
+            let result = if refetch {
+                refetch_clone(url)
+            } else {
+                ensure_clone(url)
+            };
+            assert!(
+                matches!(result, Err(CacheError::CloneTooLarge { .. })),
+                "over-cap cleanup must complete, got {result:?}"
+            );
+            assert!(
+                !slot.exists(),
+                "pins must not prevent owned over-cap removal"
+            );
+        }
+        std::env::remove_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES");
     }
 
     /// no-re-read guarantee: once the slot state is decided `Absent`, a

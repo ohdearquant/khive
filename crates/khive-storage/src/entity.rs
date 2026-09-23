@@ -25,6 +25,10 @@ pub struct Entity {
     pub tags: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Persisted row revision: inserts start at one; each committed update advances once.
+    /// Input to a snapshot replacement is the revision read before normalization.
+    #[serde(default = "initial_entity_version")]
+    pub version: i64,
     pub deleted_at: Option<i64>,
     /// When this entity was tombstoned by a merge, the `into` entity's ID.
     pub merged_into: Option<Uuid>,
@@ -36,6 +40,10 @@ pub struct Entity {
     /// attachment substrate; reads populate it so existing response payloads
     /// keep their `content_ref` field during the coordinated cutover.
     pub content_ref: Option<String>,
+}
+
+fn initial_entity_version() -> i64 {
+    1
 }
 
 impl Entity {
@@ -57,6 +65,7 @@ impl Entity {
             tags: Vec::new(),
             created_at: now,
             updated_at: now,
+            version: 1,
             deleted_at: None,
             merged_into: None,
             merge_event_id: None,
@@ -138,7 +147,9 @@ pub struct EntityFilter {
 /// Entity CRUD operations over the entities substrate table.
 #[async_trait]
 pub trait EntityStore: Send + Sync + 'static {
-    /// Insert or update a single entity.
+    /// Insert at version one or update the current row and advance its version once.
+    /// Incoming version values do not override the stored counter. Raw SQL replacement
+    /// of an existing entity is forbidden: use a conflict UPDATE or the typed store.
     async fn upsert_entity(&self, entity: Entity) -> StorageResult<()>;
     /// Insert an entity only when no row with its id or another conflicting
     /// key exists. Returns `true` when this call inserted the row and `false`
@@ -171,7 +182,9 @@ pub trait EntityStore: Send + Sync + 'static {
     /// Replace an entity only when the persisted row still matches the
     /// caller's read snapshot.
     ///
-    /// `expected_updated_at` is the snapshot revision and
+    /// `entity.version` is the persisted revision read with the snapshot;
+    /// a successful replacement increments the stored version once.
+    /// `expected_updated_at` is an additional snapshot timestamp guard and
     /// `expected_deleted_at` closes the soft-delete race. The replacement
     /// entity's `updated_at` must be strictly greater than that persisted
     /// revision. Returns `false` when the row disappeared, changed, or was

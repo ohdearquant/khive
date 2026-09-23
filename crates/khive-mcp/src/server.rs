@@ -690,7 +690,7 @@ impl DispatchFailure {
 
     fn from_dispatch(tool: &str, error: DispatchError) -> Self {
         let (error, disposition) = error.into_parts();
-        let reason = match &error {
+        let reason = match error.refusal_source() {
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
             error if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
@@ -3212,6 +3212,7 @@ async fn dispatch_via_coordinator_inner(
                                         .entity_updated_at
                                         .get(&h.entity_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
+                                    let version = coord_result.entity_versions.get(&h.entity_id);
                                     json!({
                                         "id": h.entity_id.to_string(),
                                         "kind": entity_kind,
@@ -3223,6 +3224,7 @@ async fn dispatch_via_coordinator_inner(
                                         "snippet": h.snippet,
                                         "created_at": created_at,
                                         "updated_at": updated_at,
+                                        "version": version,
                                     })
                                 })
                                 .collect();
@@ -9159,6 +9161,7 @@ mod tests {
                 note_kinds: std::collections::HashMap::new(),
                 entity_created_at: std::collections::HashMap::new(),
                 entity_updated_at: std::collections::HashMap::new(),
+                entity_versions: std::collections::HashMap::new(),
                 note_created_at: std::collections::HashMap::new(),
                 note_updated_at: std::collections::HashMap::new(),
                 note_versions: std::collections::HashMap::new(),
@@ -9235,6 +9238,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             entity_updated_at: std::collections::HashMap::new(),
+            entity_versions: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
             note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
@@ -9274,6 +9278,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             entity_updated_at: std::collections::HashMap::new(),
+            entity_versions: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
             note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
@@ -9329,6 +9334,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             entity_updated_at: std::collections::HashMap::new(),
+            entity_versions: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
             note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
@@ -12012,8 +12018,7 @@ mod tests {
                 None => json!(["local"]),
             };
             assert_eq!(
-                identity["visible_namespaces"],
-                expected,
+                identity["visible_namespaces"], expected,
                 "replay inherits its own actor namespace and never the daemon's visibility: {identity}"
             );
             assert!(
@@ -13437,6 +13442,9 @@ mod request_read_cancellation_tests {
 
 #[cfg(test)]
 mod disposition_tests;
+
+#[cfg(test)]
+mod refusal_event_tests;
 
 #[cfg(test)]
 mod issue_2537_tests {

@@ -598,6 +598,7 @@ pub(crate) async fn execute_atomic_ops_file(
             let error_message = describe_failure(&failure);
             let error_value = match &failure {
                 AtomicOpFailure::NoteConflict(conflict) => json!(conflict.clone().into_error()),
+                AtomicOpFailure::EntityConflict(conflict) => json!(conflict.clone().into_error()),
                 _ => json!(error_message),
             };
             let results: Vec<Value> = ops
@@ -665,6 +666,7 @@ async fn apply_gtd_audit_post_commit_effects(
 fn describe_failure(failure: &AtomicOpFailure) -> String {
     match failure {
         AtomicOpFailure::NoteConflict(conflict) => conflict.clone().into_error().to_string(),
+        AtomicOpFailure::EntityConflict(conflict) => conflict.clone().into_error().to_string(),
         AtomicOpFailure::GuardFailed {
             statement_label,
             expected,

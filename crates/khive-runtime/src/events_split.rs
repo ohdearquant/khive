@@ -72,8 +72,10 @@ use crate::daemon::{read_frame, write_frame};
 /// than having its retryable writer states silently mapped to terminal
 /// `InvalidInput`. Version 3 replaces that state-only carrier with a failure
 /// disposition so a proven rollback can cross the socket without falsely
-/// claiming the remote writer task terminated.
-pub const EVENTS_PROTOCOL_VERSION: u32 = 3;
+/// claiming the remote writer task terminated. Version 4 adds exact event-target
+/// filtering and the refusal kind. Older readers would ignore the new filter
+/// field, silently broadening a query, so both peers must speak version 4.
+pub const EVENTS_PROTOCOL_VERSION: u32 = 4;
 
 /// Default bound on the fire-and-forget append queue, in batches. The loss
 /// window on overflow is this depth times the batch size in flight; the value
@@ -2131,6 +2133,11 @@ impl EventStore for SplitEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod target_filter_tests {
+        include!("events_split_target_tests.rs");
+    }
 
     // The full daemon/forwarding test suite for this module lands with the
     // final slice of this series; these tests cover the naming and
