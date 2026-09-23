@@ -108,9 +108,12 @@ properties compare as typed JSON values after validation, owner normalization, t
 server-derived fields have run (object member order does not matter; array order, value types and
 member presence do; an absent `properties` differs from `{}`). When everything matches and the caller
 may learn the holder (the same `list` check that already gates `existing_id`), the request returns
-`{id, created:false}` with no new record and no other write; creation-only fields such as
-`name`, `salience`, `embedding_content` and requested `edges`/`annotates` are validated but ignored on
-that exact match and never update the existing record. A payload that differs in any of those respects,
+`{id, created:false}` with no new record and no other write. Creation-only fields such as
+`name`, `salience`, `embedding_content` and requested `edges`/`annotates` never update the existing
+record on that exact match, and an exact match does not require them to be resolvable at all: an
+`annotates` target that no longer exists or an embedding model that is not registered still returns
+`{id, created:false}` for the existing note, because none of that creation-only work runs once the
+match against the live holder is confirmed. A payload that differs in any of those respects,
 or an exact match the caller may not learn about, returns `key_conflict`, which discloses the existing
 record's id only under that same policy. Unkeyed creates are unaffected by any of
 this: repeated calls without `key` always create distinct records, exactly as described above.
