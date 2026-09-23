@@ -280,6 +280,9 @@ pub(crate) enum Site {
     DirectRouteSparseGeneralWrite,
     /// `stores::agents::SqlAgentStore`'s standalone/pool-writer fallback.
     DirectRouteAgentGeneralWrite,
+    DirectRouteRuntimeMergeEntity,
+    DirectRouteRuntimeMergeNote,
+    DirectRouteRuntimeUpdateSymmetricEdge,
 }
 
 impl Site {
@@ -303,6 +306,11 @@ impl Site {
             Site::DirectRouteEventGeneralWrite => "direct_route:event_general_write",
             Site::DirectRouteSparseGeneralWrite => "direct_route:sparse_general_write",
             Site::DirectRouteAgentGeneralWrite => "direct_route:agent_general_write",
+            Site::DirectRouteRuntimeMergeEntity => "direct_route:runtime_merge_entity",
+            Site::DirectRouteRuntimeMergeNote => "direct_route:runtime_merge_note",
+            Site::DirectRouteRuntimeUpdateSymmetricEdge => {
+                "direct_route:runtime_update_symmetric_edge"
+            }
         }
     }
 }
@@ -1054,6 +1062,31 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
+#[cfg(test)]
+thread_local! {
+    static DIRECT_ROUTE_CAPTURE: std::cell::RefCell<Option<Vec<(String, Site)>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_direct_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<(String, Site)>) {
+    struct CaptureGuard;
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            DIRECT_ROUTE_CAPTURE.with(|capture| *capture.borrow_mut() = None);
+        }
+    }
+    DIRECT_ROUTE_CAPTURE.with(|capture| {
+        assert!(capture.borrow().is_none(), "nested direct-route capture");
+        *capture.borrow_mut() = Some(Vec::new());
+    });
+    let _guard = CaptureGuard;
+    let result = f();
+    let events = DIRECT_ROUTE_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+    (result, events)
+}
+
 /// Record a `direct_route_violation` event: a write path acquired a writer
 /// connection directly (standalone connection or pool mutex), bypassing the
 /// `WriterTask` queue, while `PoolConfig::write_queue_enabled` was `true`
@@ -1062,6 +1095,12 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
 /// caller-visible error instead of a degrade, so there is no bypass left to
 /// report there.
 pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
+    #[cfg(test)]
+    DIRECT_ROUTE_CAPTURE.with(|capture| {
+        if let Some(events) = capture.borrow_mut().as_mut() {
+            events.push((db.to_owned(), site));
+        }
+    });
     let Some(handle) = SINK.get() else {
         return;
     };
@@ -1155,6 +1194,18 @@ mod tests {
         assert_eq!(
             Site::DirectRouteAgentGeneralWrite.as_str(),
             "direct_route:agent_general_write"
+        );
+        assert_eq!(
+            Site::DirectRouteRuntimeMergeEntity.as_str(),
+            "direct_route:runtime_merge_entity"
+        );
+        assert_eq!(
+            Site::DirectRouteRuntimeMergeNote.as_str(),
+            "direct_route:runtime_merge_note"
+        );
+        assert_eq!(
+            Site::DirectRouteRuntimeUpdateSymmetricEdge.as_str(),
+            "direct_route:runtime_update_symmetric_edge"
         );
     }
 
