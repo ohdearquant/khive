@@ -18,6 +18,29 @@ use crate::types::{
 /// Directed edge CRUD and graph traversal over the knowledge graph.
 #[async_trait]
 pub trait GraphStore: Send + Sync + 'static {
+    /// Return the newest live note of `kind` carrying the exact string `tag`
+    /// in its properties.tags array and connected to `node_id` by a live
+    /// incoming `annotates` edge in this store's namespace. Returns its UUID
+    /// and creation timestamp; equal timestamps choose the smallest UUID.
+    ///
+    /// Apply all predicates before limiting to one result. Note lookup follows
+    /// the by-ID contract; visibility is determined by the annotation edge's
+    /// namespace, not by introducing a second namespace filter on the note.
+    /// The note and edge must belong to this backend. Unsupported backends
+    /// fail explicitly rather than scanning an arbitrary annotation window.
+    async fn latest_annotating_note(
+        &self,
+        _node_id: Uuid,
+        _kind: &str,
+        _tag: &str,
+    ) -> StorageResult<Option<(Uuid, i64)>> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "latest_annotating_note".into(),
+            message: "this backend does not implement latest matching annotation lookup".into(),
+        })
+    }
+
     /// Insert or update a single edge.
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert an edge only when neither its id nor natural key already

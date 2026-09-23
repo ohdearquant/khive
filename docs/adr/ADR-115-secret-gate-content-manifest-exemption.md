@@ -1355,3 +1355,89 @@ clean or manifest-only result; missing/inconsistent linkage; same-request eligib
 and rollback on record/stamp/event failure with the second-order failure-log control. The §4
 resolving/non-resolving, authority, span and unrelated-credential controls remain required. Source
 analysis and this Proposed addendum supply no executed acceptance or activation authorization.
+
+## Amendment 4 (2026-09-22): a runtime-owned admission sequence, a route inventory, and the finalizer's transaction
+
+**Status**: Accepted.
+
+Originating issue(s): #2057, #2967
+
+This amendment defines the general admission sequence every properties-bearing write must
+satisfy, and how [ADR-017](ADR-017-pack-standard.md)'s `KindHook` composes with it. It refines
+Decision §4 and [Amendment 1 §3](#3-initial-implementation-scope-and-follow-on-obligations)–[§4](#4-failure-observability-and-load-bearing-atomicity)
+without reopening either section's acceptance rungs: the admission-capable enumeration, the
+named follow-on obligations, and the typed-failure/atomicity requirements those sections already
+state remain in force. Manifest activation and the [Item 5 addendum](#item-5-addendum-uuid-admission-posture-and-composition-proposed-2026-09-14)'s
+stored-UUID activation stay separately gated, unchanged by this amendment.
+
+### The sequence
+
+1. **Authorize.** The existing Gate seam authorizes the submitted operation and resolves its
+   route, actual kind, caller identity, and target snapshot. A manifest match or a `KindHook`
+   alone MUST NOT grant authorization.
+2. **Validate the raw shape.** Before any diff or merge, the caller-supplied `khive:secret_gate`
+   reservation from Decision §4 is checked on the unnormalized input. Decision §4 names the
+   byte-exact echo of the persisted stamp as the sole tolerated appearance of the key; until echo
+   support lands (sequenced after full-inventory integration, below), every caller-supplied
+   stamp is rejected, an echo included.
+3. **Kind-owned preparation.** The route's owning pack runs its own preparation: generic `create`
+   MAY normalize through `KindHook::prepare_create`; a specialized writer derives its own coupled
+   fields directly, outside that hook; an `update` normalizes and then validates against the read
+   snapshot; proposal materialization of an already-reviewed draft validates the immutable
+   changeset against current rules without re-running generic create's normalization on it.
+4. **Construct the final candidate.** Runtime-owned derivation, allowed property changes, and the
+   reserved-stamp policy are checked against the actual fields about to persist, not the caller's
+   raw input. Copying a stored property forward through a write is itself a write for this
+   purpose. A kind with no registered hook still passes through this ordinary runtime admission;
+   the absence of a hook is not a bypass of it.
+5. **Commit in one transaction.** The target snapshot, fences, key holders, and every mutable
+   precondition are revalidated inside the writer transaction. The domain row, required
+   synchronous indexes and edges, any stamp change, and a required exemption success event commit
+   together. No model call and no asynchronous hook may hold the writer open.
+6. **Report truthfully, after commit.** Success is reported only once that transaction has
+   committed. Record, stamp, event, and commit failures are classified and reported truthfully.
+   No post-commit, best-effort work may retroactively turn a committed write into "not committed."
+
+### KindHook's role, and the finalizer's
+
+`KindHook::prepare_create`/`after_create` remain the mechanism a pack uses to express kind-owned
+policy, at stages 3 and 4 above. The runtime, not any hook, owns stage 5's transaction and stage
+6's success reporting. `after_create` is explicitly post-commit and best-effort
+([ADR-017](ADR-017-pack-standard.md)'s `KindHook` definition: it "fire[s] side effects after a
+successful storage write" and its "[e]rrors are logged but not propagated"); it
+cannot supply stage 5's guarantees and MUST NOT be relied on for a required invariant such as the
+reserved stamp, a required synchronous index, or a required edge. It remains available only for
+genuinely optional follow-on work.
+
+The finalizer module [Amendment 1 §3](#3-initial-implementation-scope-and-follow-on-obligations)
+introduces keeps the transactional role Decision §4 assigns it. Production code binds its record,
+stamp, and success-event writes to one real transaction; accounts for commit failure; supports the
+existing clean and reservation-only paths unchanged; and composes multiple prepared candidates
+into a caller's own atomic unit (for example, an atomic bulk create) without committing each item
+separately inside it.
+
+### Route inventory
+
+One runtime-owned inventory lists every properties-bearing write route: its final stored target,
+its kind-policy stage, its reservation path, its transaction owner, its stamp capability, and its
+acceptance entry. A new properties-bearing route MUST join that inventory before release. A route
+is admission-capable only when its real public, runtime, or direct-write dispatch path visibly
+performs the six stages above and appears in the inventory; a route missing from the inventory
+remains reservation-only exactly as [Amendment 1 §3](#3-initial-implementation-scope-and-follow-on-obligations)
+already requires, whether or not a `KindHook` exists for its kind. A generated declaration-matrix
+test alone does not satisfy this: route tests exercise the real path and observe the actual
+finalization seam. Raw database administration or migration tooling remains an explicitly
+privileged escape, never an application write route or a supported client bypass. Echo support
+(#2065) is sequenced after full-inventory integration, unchanged from Amendment 1 §3's ordering.
+
+### Reservation repairs proceed now, independently
+
+The direct `code.ingest` reservation gap and the merge property-carry gap are defects under
+[Amendment 1 §3](#3-initial-implementation-scope-and-follow-on-obligations)'s already-accepted,
+unconditional reservation rule, which requires every properties-bearing write path,
+admission-capable or excluded, to reject a caller-supplied `khive:secret_gate`. Fixing them does
+not require this amendment's transactional sequence and does not enable exemption on either
+surface: during the reservation-only period, a direct-ingest or merge candidate keeps rejecting
+the reserved key outright rather than admitting it. A proposal's property-bearing changeset paths
+take the same reservation check independently of any kind-owned proposal-note refusal a pack
+registers under [ADR-017](ADR-017-pack-standard.md).

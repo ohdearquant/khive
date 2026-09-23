@@ -55,6 +55,19 @@ fn same_path(a: &Path, b: &Path) -> bool {
     normalize(a) == normalize(b)
 }
 
+/// Reject SQLite URI spellings and relative explicit targets before filesystem
+/// access (ADR-085 E7). This is syntax admission, not an open-time identity fence.
+pub(crate) fn validate_explicit_db_path(db: &str) -> Result<(), String> {
+    if db.starts_with("file:") || db.contains('?') || !Path::new(db).is_absolute() {
+        return Err(
+            "code.ingest refuses this database target: explicit db must be an absolute, plain \
+             filesystem path (no file: URI or ? query syntax)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the `db` verb argument into a concrete target database path,
 /// defaulting to `<path>/.khive/code-map.db` when absent, and rejecting a
 /// target that resolves to the shared production database — either its
@@ -71,7 +84,10 @@ pub(crate) fn resolve_target_db(
     runtime_db_path: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let candidate = match db_param {
-        Some(p) => PathBuf::from(p),
+        Some(p) => {
+            validate_explicit_db_path(p)?;
+            PathBuf::from(p)
+        }
         None => ingest_path.join(".khive").join("code-map.db"),
     };
 
@@ -125,6 +141,28 @@ pub(crate) fn resolve_target_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // MUST-FAIL: bypassing syntax admission reaches the existing-file probe and
+    // returns its error instead. Neither URI nor relative spellings are paths
+    // this resolver may probe, even when the named file is missing.
+    #[test]
+    fn explicit_target_syntax_refuses_before_target_probe() {
+        let tmp = tempfile::tempdir().expect("isolated target fixture");
+        let missing = tmp.path().join("missing.db");
+        for db in [
+            format!("file:{}", missing.display()),
+            format!("file:{}?mode=rw", missing.display()),
+            format!("{}?mode=rw", missing.display()),
+            "relative-map.db".to_string(),
+            "".to_string(),
+        ] {
+            let error = resolve_target_db(Some(&db), tmp.path(), None)
+                .expect_err("non-plain or relative explicit target must refuse");
+            assert!(error.contains("absolute, plain filesystem path"), "{error}");
+        }
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn default_target_is_workspace_local() {
@@ -294,6 +332,9 @@ mod tests {
         }
         let prod = khive_runtime::config::resolve_db_anchor(None)
             .expect("resolve_db_anchor(None) always resolves to Some(_)");
+        // Explicit targets now require absolute spelling; retain this test's
+        // separate assertion that the HOME-less canonical default is fenced.
+        let prod = std::env::current_dir().unwrap().join(prod);
         let err = resolve_target_db(
             Some(prod.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
@@ -317,6 +358,7 @@ mod tests {
         }
         let prod = khive_runtime::config::resolve_db_anchor(None)
             .expect("resolve_db_anchor(None) always resolves to Some(_)");
+        let prod = std::env::current_dir().unwrap().join(prod);
         let result = resolve_target_db(
             Some(prod.to_str().unwrap()),
             Path::new("/tmp/some-repo"),

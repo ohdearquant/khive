@@ -1,7 +1,7 @@
 //! Settlement regressions use the production post-network seam. They do not
 //! substitute for the existing DNS, egress, or HTTP mechanics tests.
 use super::*;
-use khive_runtime::VerbRegistryBuilder;
+use khive_runtime::{Namespace, VerbRegistryBuilder};
 use khive_storage::{Direction, EdgeRelation};
 use std::sync::Arc;
 
