@@ -21,7 +21,7 @@ CREATE TABLE comm_sender_transport (
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     next_retry_at INTEGER,
     last_failure_class TEXT CHECK(last_failure_class IN ('transient','authentication','permanent')),
-    hold_reason TEXT CHECK(hold_reason IN ('insufficient_credit','recipient_key_changed')),
+    hold_reason TEXT CHECK(hold_reason IN ('insufficient_credit','recipient_key_changed','policy_denied')),
     receipt TEXT CHECK(receipt IS NULL OR json_valid(receipt)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,

@@ -103,6 +103,7 @@ pub enum FailureClass {
 pub enum HoldReason {
     InsufficientCredit,
     RecipientKeyChanged,
+    PolicyDenied,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SenderRecord {
@@ -152,6 +153,7 @@ impl StorageSpelling for HoldReason {
         match self {
             Self::InsufficientCredit => "insufficient_credit",
             Self::RecipientKeyChanged => "recipient_key_changed",
+            Self::PolicyDenied => "policy_denied",
         }
     }
 }
@@ -517,8 +519,8 @@ impl SenderTransportStore {
             })
             .await
     }
-    /// Release credit holds explicitly. Key-change holds release by creating a confirmed new
-    /// envelope.
+    /// Release credit or policy holds explicitly. Key-change holds release by creating a confirmed
+    /// new envelope.
     pub async fn hold(&self, key: EnvelopeKey, reason: Option<HoldReason>) -> StorageResult<()> {
         self.notes
             .with_writer_tx_storage("sender_transport_hold", move |conn| {

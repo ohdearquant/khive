@@ -120,6 +120,49 @@ async fn exact_slug_and_auth_hold_pending() {
 }
 
 #[tokio::test]
+async fn policy_denied_hold_preserves_retry_state_and_bytes() {
+    let (backend, envelope) = fixture();
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(envelope.clone(), false).await.unwrap();
+    store
+        .record_failure(envelope.key(), FailureClass::Transient, Some(42))
+        .await
+        .unwrap();
+    let before = store.get(envelope.key()).await.unwrap().unwrap();
+    store
+        .hold(envelope.key(), Some(HoldReason::PolicyDenied))
+        .await
+        .expect("policy_denied hold must be accepted");
+    let held = store.get(envelope.key()).await.unwrap().unwrap();
+    assert_eq!(held.hold_reason, Some(HoldReason::PolicyDenied));
+    assert!(
+        store
+            .list_pending("local", "khive", "local-device", i64::MAX, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "policy_denied hold must suppress pending delivery"
+    );
+    store.hold(envelope.key(), None).await.unwrap();
+    let released = store.get(envelope.key()).await.unwrap().unwrap();
+    assert_eq!(released.hold_reason, None);
+    let pending = store
+        .list_pending("local", "khive", "local-device", i64::MAX, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending, vec![released.clone()]);
+    for row in [held, released] {
+        assert_eq!(row.envelope, before.envelope);
+        assert_eq!(row.state, before.state);
+        assert_eq!(row.attempt_count, before.attempt_count);
+        assert_eq!(row.next_retry_at, before.next_retry_at);
+        assert_eq!(row.last_failure_class, before.last_failure_class);
+        assert_eq!(row.envelope_seq, before.envelope_seq);
+        assert_eq!(row.receipt, before.receipt);
+    }
+}
+
+#[tokio::test]
 async fn records_survive_note_deletion_and_confirmed_epoch_change() {
     let (backend, envelope) = fixture();
     let store = SenderTransportStore::new(backend.pool_arc());
