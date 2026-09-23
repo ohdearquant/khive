@@ -186,6 +186,11 @@ on an actor is not evidence of family. The deployment profile names the issuer's
 taxonomy (one value per model provider, plus `human`). Under M2 a review from the same family as any
 producer of the change refuses. This gate is hard in every deployment.
 
+Controller independence is a per-definition datum, `independence.controller`, and `pr_merge/v1`
+defaults it to `required`. A deployment in which one principal controls every actor and platform
+account may declare it `not_required` in its definition; its deployment profile then states the
+residual risk in one sentence, and independence is established by actor root and family alone.
+
 ### D10. A run pins its definition; revocation governs admission
 
 A run pins the definition bytes, schema version, gate registry and implementation digests, action
@@ -218,7 +223,7 @@ Gate groups, all hard in v1:
 | Review at head            | Authorised review attestation with an approve verdict, the exact reviewed head and scope digest, and reviewer execution identity, plus the current platform review state.                                                                                                                                | New head, dismissal, an effective rejection, or missing proof.                                                                                                                                                                                                |
 | Family independence       | Author manifest and reviewer execution attestation from the issuer's closed taxonomy. Reviewer family differs from every producing family on the change.                                                                                                                                                 | Unknown family, missing contributor provenance, contradictory manifests.                                                                                                                                                                                      |
 | ADR sign-off              | Complete path manifest of the branch diff against the target merge base (old and new paths for renames). Any path under `docs/adr/` requires an exact, head- and scope-bound approval from the named architecture authority.                                                                             | Truncated diff, missing or revoked approval, changed scope. `not_applicable` only after completeness is proven.                                                                                                                                               |
-| No self-approval          | Approver and ADR approver disjoint from the production actor roots, from the pull request author's and last pusher's platform accounts, and from their controlling principal.                                                                                                                            | Missing identity mapping, a shared controller, an alias or sub-actor.                                                                                                                                                                                         |
+| No self-approval          | Approver and ADR approver disjoint from the production actor roots, from the pull request author's and last pusher's platform accounts, and, when `independence.controller` is `required`, from their controlling principal.                                                                             | Missing identity mapping, a shared controller, an alias or sub-actor.                                                                                                                                                                                         |
 | Scope and protected paths | The exact path-and-status set and its digest equal the scope approved with the review; the rendered body digest binds the summary to it. Changes to CI definitions, charter definitions, authority maps or effect adapters need the policy authority's attestation.                                      | Changed set, edited body after review, incomplete diff. File-count equality is diagnostic only.                                                                                                                                                               |
 | Action admissibility      | Fresh open, non-draft state; supported target and method; known mergeability; current authority; the exact action descriptor naming the expected head.                                                                                                                                                   | Unknown mergeability, closed or draft, changed candidate, revoked authority, expired claim deadline.                                                                                                                                                          |
 
@@ -246,6 +251,7 @@ The definition, as data (values ending in `_CONFIGURED` are deployment parameter
     "merge_executor": "MERGE_EXECUTOR_CONFIGURED",
     "recovery_role": "merge_recovery"
   },
+  "independence": { "controller": "required" },
   "freshness": {
     "dynamic_max_age_seconds": 60,
     "max_collection_span_seconds": 30,
@@ -394,9 +400,10 @@ Paired positive and negative cases, each run against the real verbs:
    "nothing required".
 3. Head change after review, base change, A→B→A, retarget, reopen, a delayed old webhook and two
    concurrent definitions: none redeems an old admission.
-4. Review dismissal, same family, same actor root, one controller behind two accounts, missing family
-   provenance, truncated diff, ADR rename or delete, body edit, and a same-count different-file scope
-   each block.
+4. Review dismissal, same family, same actor root, one controller behind two accounts (default
+   definition), missing family provenance, truncated diff, ADR rename or delete, body edit, and a
+   same-count different-file scope each block. The same one-controller fixture under a definition with
+   `independence.controller` set to `not_required` admits, which proves the datum is read.
 5. An unregistered producer, a forged producer field and a disabled producer refuse; generic note and
    stream writes cannot create charter evidence.
 6. A tool-level allow does not bypass a failed gate; an expired or revoked grant refuses; two
