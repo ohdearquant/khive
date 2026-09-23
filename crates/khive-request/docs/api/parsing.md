@@ -32,14 +32,13 @@ Pure JSON arrays/objects become one `ArgValue::Value`; a container with any `$pr
 
 `[op(...), op(...)]` is parallel; `op(...) | op(...)` is a sequential chain and may contain `$prev` anywhere in an argument value. Inside a bracketed batch, a comma-separated element MAY itself be a `|`-chain (`[op() | op(), op()]`, ADR-016 Amendment 2): each such element is a **unit**, dispatched as its own sequential chain, running concurrently with the other units. `$prev` is legal only against a unit's own immediately preceding op; the first op of every unit still rejects it, whether that unit has one op or several. Mixing `,` and `|` OUTSIDE any bracket (`op() | op(), op()`) is still rejected as `MixedSeparators`; empty batches, trailing input, a `[...]` nested inside a unit, and more than `MAX_OPS` operations across the whole request are errors.
 
-Split independent operations and a dependent chain into two `request` calls:
+Independent operations and a dependent chain can share one request as units of a bracketed batch:
 
 ```text
-request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B")]')
-request(ops='create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")')
+request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B"), create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")]')
 ```
 
-The calls are independent and may run in either order. `$prev` is scoped to the second call and never crosses a request boundary.
+The three units run concurrently. `$prev` in `link` names the `Dependent` create in its own unit and never crosses a unit or request boundary.
 
 Chain parsing does not resolve references; it only represents them. The dispatcher resolves each operation against the immediately preceding result and aborts after a failed step.
 

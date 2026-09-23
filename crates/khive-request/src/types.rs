@@ -567,10 +567,9 @@ impl fmt::Display for DslError {
             DslError::MixedSeparators => {
                 write!(
                     f,
-                    "cannot mix ',' (parallel) and '|' (chain) separators in one request; \
-                     a parallel batch cannot contain a chain. Split the work into two `request` \
-                     calls: put independent ops in one `[...]` batch and dependent ops in a \
-                     separate `a() | b(arg=$prev.id)` chain"
+                    "cannot mix ',' (parallel) and '|' (chain) separators outside `[...]`; \
+                     to run chains in parallel, wrap every unit in one bracketed batch, \
+                     for example `[a() | b(arg=$prev.id), c()]`"
                 )
             }
             DslError::EmptyBatch => {

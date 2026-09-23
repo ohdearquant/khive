@@ -1345,10 +1345,11 @@ fn comma_only_parallel_accepted() {
 #[test]
 fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
     // `a(), b() | c()` hits the mixed-separator mistake on the very first
-    // op, before a chain `|` has ever been seen — a third code path from
-    // the other two `MixedSeparators` tests above (`[a() | b(), c()]` and
-    // `a() | b(), c()`). All three must reach the same actionable message,
-    // not fall through to a generic "expected '|' or end of input" report.
+    // op, before a chain `|` has ever been seen, a second code path from
+    // `mixed_separator_after_chain_rejected` above (`a() | b(), c()`). Both
+    // must reach the same actionable message, not fall through to a generic
+    // "expected '|' or end of input" report, and the message must point at
+    // the bracketed form that now accepts chains as batch units.
     let err = parse_request("a(), b() | c()").unwrap_err();
     assert!(
         matches!(err, DslError::MixedSeparators),
@@ -1360,10 +1361,12 @@ fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
         "message must name the mix mistake, got: {msg}"
     );
     assert!(
-        msg.contains("two `request` calls")
-            && msg.contains("one `[...]` batch")
-            && msg.contains("a() | b(arg=$prev.id)"),
-        "message must prescribe the documented two-call split, got: {msg}"
+        msg.contains("[a() | b(arg=$prev.id), c()]"),
+        "message must point at the bracketed batch of chains, got: {msg}"
+    );
+    assert!(
+        !msg.contains("two `request` calls"),
+        "a batch of chains needs no second request, got: {msg}"
     );
 }
 
