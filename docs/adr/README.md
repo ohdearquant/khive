@@ -210,6 +210,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-191](ADR-191-web-pack-ontology-and-operations.md)                  | Web Pack — Web Ontology, Relation Rules, and Operations                                                    |
 | [ADR-192](ADR-192-credential-and-producer-seams.md)                     | Credential Seam and Producer Seams for Network Packs                                                       |
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
+| [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
 
 <!-- END GENERATED ADR CATALOG -->
 
