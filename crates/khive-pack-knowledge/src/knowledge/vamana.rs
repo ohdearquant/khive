@@ -4210,6 +4210,21 @@ mod tests {
 
     // ── unavailable marker: terminal warm outcome (issue #1026) ──────────────
 
+    fn assert_terminal_wait_latency(elapsed: std::time::Duration) {
+        // Keep the existing half-deadline discriminator under coverage. The
+        // ordinary lane also rejects a one-second delay on this immediate
+        // path, using ten polling intervals rather than half the full wait.
+        let bound_ms = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            ANN_WARM_WAIT_TIMEOUT_MS / 2
+        } else {
+            ANN_WARM_WAIT_POLL_MS * 10
+        };
+        assert!(
+            elapsed < std::time::Duration::from_millis(bound_ms),
+            "terminal unavailable outcome must short-circuit within {bound_ms}ms: {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn wait_ready_returns_false_immediately_when_marked_unavailable() {
         let ann = new_shared();
@@ -4219,17 +4234,14 @@ mod tests {
         let start = std::time::Instant::now();
         // Timeout is generous (matching production ANN_WARM_WAIT_TIMEOUT_MS)
         // to prove the short-circuit fires rather than the deadline.
-        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, 50).await;
+        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, ANN_WARM_WAIT_POLL_MS).await;
         let elapsed = start.elapsed();
 
         assert!(
             !ready,
             "must return false for a key marked unavailable at the current generation"
         );
-        assert!(
-            elapsed < std::time::Duration::from_millis(ANN_WARM_WAIT_TIMEOUT_MS / 2),
-            "terminal unavailable outcome must short-circuit, not poll out the timeout: {elapsed:?}"
-        );
+        assert_terminal_wait_latency(elapsed);
     }
 
     #[tokio::test]
@@ -6433,14 +6445,11 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, 50).await;
+        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, ANN_WARM_WAIT_POLL_MS).await;
         let elapsed = start.elapsed();
 
         assert!(!ready, "empty corpus must never become ready");
-        assert!(
-            elapsed < std::time::Duration::from_millis(ANN_WARM_WAIT_TIMEOUT_MS / 2),
-            "the terminal unavailable outcome must short-circuit the warm-wait: {elapsed:?}"
-        );
+        assert_terminal_wait_latency(elapsed);
     }
 
     /// A rebuild error is operational, not proof of an unbuildable corpus:
