@@ -80,6 +80,37 @@ fn directory_listing(root: &Path) -> Vec<PathBuf> {
     entries
 }
 
+// MUST-FAIL: moving syntax admission after path.is_dir() returns the source-path
+// error; removing it admits SQLite URI/relative spellings to target resolution.
+#[tokio::test]
+async fn explicit_db_syntax_refuses_before_source_or_target_filesystem_probes() {
+    let fixture = Fixture::new();
+    let missing_source = fixture.root.path().join("missing-source");
+    let missing_target = fixture.root.path().join("missing-map.db");
+    let before = directory_listing(fixture.root.path());
+    for db in [
+        format!("file:{}", missing_target.display()),
+        format!("file:{}?mode=rw", missing_target.display()),
+        format!("{}?mode=rw", missing_target.display()),
+        "relative-map.db".to_string(),
+        "".to_string(),
+    ] {
+        for source in [&fixture.source, &missing_source] {
+            let error = fixture
+                .registry
+                .dispatch("code.ingest", json!({"path":source, "db":db, "tiers":[]}))
+                .await
+                .expect_err("explicit db syntax must refuse at parameter admission");
+            assert!(
+                matches!(&error, RuntimeError::InvalidInput(message)
+                    if message.contains("absolute, plain filesystem path")),
+                "expected syntax refusal before any filesystem error: {error:?}"
+            );
+        }
+    }
+    assert_eq!(directory_listing(fixture.root.path()), before);
+}
+
 // MUST-FAIL: deleting the explicit-target preflight lets ordinary runtime
 // construction create/migrate both the missing file and any missing parent.
 #[tokio::test]

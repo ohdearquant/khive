@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, RuntimeError};
 
-use crate::db_target::resolve_target_db;
+use crate::db_target::{resolve_target_db, validate_explicit_db_path};
 use crate::manifest::LANGUAGES;
 use crate::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
 use crate::CodePack;
@@ -38,9 +38,13 @@ pub(crate) struct TierSelection {
 }
 
 fn parse_params(params: Value) -> Result<CodeIngestParams, RuntimeError> {
-    serde_json::from_value(params).map_err(|error| {
+    let params: CodeIngestParams = serde_json::from_value(params).map_err(|error| {
         RuntimeError::InvalidInput(format!("invalid code.ingest arguments: {error}"))
-    })
+    })?;
+    if let Some(db) = params.db.as_deref() {
+        validate_explicit_db_path(db).map_err(RuntimeError::InvalidInput)?;
+    }
+    Ok(params)
 }
 
 fn parse_languages(entries: Option<&[String]>) -> Result<BTreeSet<&'static str>, RuntimeError> {
