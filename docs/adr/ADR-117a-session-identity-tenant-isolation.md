@@ -1,6 +1,6 @@
 # ADR-117a: Session Identity and Tenant Isolation
 
-**Status**: accepted
+**Status**: accepted (amended 2026-09-23)
 **Date**: 2026-07-19
 **Authors**: khive maintainers
 **Implements**: [ADR-117](ADR-117-session-continuity-search.md) D1, D2, D4 (the direction ADR names
@@ -28,6 +28,90 @@ predicate, the ADR-018 amendment, and `session.search` itself)
   connection-identity mechanism** that authenticates that scope at the hosted bar)
 
 ---
+
+## Amendment 1 (2026-09-23): the mirror identity is source-qualified
+
+**Status: Accepted (2026-09-23).** Refs #1469.
+
+### Problem
+
+D2 keys a mirrored session by `(namespace, provider_session_id)` and a mirrored event by
+`(namespace, session_id, id)`. The mirror has four sources (ADR-080's closed set: `claude_code`, `codex`,
+`chatgpt_export`, `claude_ai_export`), and every one of them takes its session identifier from the provider:
+the `sessionId` field on each Claude Code transcript line, the UUID in a Codex rollout file name, and the
+conversation id for the two exports. Event identifiers are
+likewise provider values (`uuid`, `message.id`, `chat_messages[].uuid`), except Codex, whose events carry no
+identifier and are keyed as `"{session_id}:{byte_offset}"`. The source is recorded on `sessions.source` as
+metadata only, and `session_messages` does not record it at all.
+
+Nothing in that design separates the identifier spaces of different sources. They are disjoint only as long
+as every provider keeps issuing random UUIDs, and two of the four sources are user-supplied export files.
+When two sources do produce the same session identifier in one namespace, ADR-080's insert-once rule keeps
+whichever row arrived first and silently drops the other session's rows. Once D2 ships, the same collapse
+happens under the scoped key, only within a namespace instead of globally.
+
+### Decision
+
+Source becomes part of both operative identities. D2's scoped identity is amended to:
+
+- `sessions`: `(namespace, source, provider_session_id)`;
+- `session_messages`: `(namespace, source, session_id, id)`, with a new `source TEXT NOT NULL` column.
+
+Everything else in D2 stands. The bare provider-id primary key does not survive on either table. The
+operative key is either the composite key or a rowid surrogate with the scoped `UNIQUE` as the sole
+identity. Provider id values are stored unchanged. `content_hash` remains an adjunct, never an identity.
+ADR-080's insert-once rule applies to the amended scoped key, so a re-stream of the same source's events
+stays idempotent and a different source's equal identifier becomes a separate row.
+
+An ingested row's source is one of the ADR-080 closed set, written by the ingest path that selected the
+parser. It is never inferred from the identifier's shape. One reserved value, `unknown`, sits outside that
+set. Only the migration writes it, for orphaned messages (see Migration below), and no ingest path may write it.
+Queries without a `source` filter do not return `unknown` rows, and the `source` filter accepts `unknown` only
+when a caller names it explicitly. An orphan audit can therefore select those rows, and nothing else does. The Codex synthetic event identifier is unchanged; with the source in
+the key it cannot collide with another source's identifier even when the session identifiers are equal.
+
+### Migration
+
+This amendment lands before D2's migration and rides the same table rebuild, so it adds no second rebuild.
+
+1. `sessions.source` already exists with the default `claude_code`. Existing rows keep their recorded value.
+2. `session_messages.source` is backfilled from the parent `sessions` row joined on `(namespace, session_id)`.
+   Before the migration the bare primary keys made both identifiers globally unique, so every existing
+   message has exactly one parent and the backfill is lossless. A message whose parent row is missing is
+   an orphan. The migration counts orphans and reports them. It never drops one, and it never guesses a
+   source for one. Orphans take the value `unknown`, and only migration code writes that value.
+3. Rows suppressed by an earlier collision were never stored, so the migration cannot recover them.
+   Recovery is a re-ingest. For the line-tail sources, resetting a file's `session_mirror_cursor` re-streams
+   it. For the export sources, the whole file is re-parsed. Both are idempotent under the amended key.
+   The migration does not re-ingest on its own.
+
+### Consequences for D1 (`session.search`)
+
+Search results carry `source` beside the provider identifiers. The existing `source` filter is unchanged.
+Any later verb that resolves a single session from a provider identifier must refuse with a typed ambiguity
+error that lists the matching sources when the identifier resolves to more than one source in the namespace.
+It must never pick one silently.
+
+### Acceptance (lands with the D2 implementation)
+
+1. Two sources ingest sessions with an equal provider session identifier into one namespace: two session
+   rows, each with its own messages, and neither suppresses the other.
+2. Two sources ingest events with an equal event identifier: two message rows.
+3. A re-stream of the same file from the same source inserts nothing new (idempotency is unchanged).
+4. The migration's backfill of existing rows: every message takes its parent's source; an orphan is counted
+   and marked `unknown`, and no row is dropped. A query without a `source` filter does not return the orphan;
+   `source="unknown"` does.
+5. Controls: removing `source` from either scoped key reddens test 1 or test 2 respectively.
+
+### Alternatives considered
+
+- **Declare the identifier spaces disjoint.** Rejected. khive cannot enforce a provider's identifier format,
+  two sources are user-supplied files, and "random UUIDs rarely collide" is a probability, not a property of
+  the design.
+- **Prefix the stored identifier with the source** (for example `codex:<uuid>`). Rejected. It changes the
+  stored provider value, which D2 promises to preserve, and it breaks lookups by the provider's own identifier.
+- **A per-source table.** Rejected. It multiplies every query and index by the source count for no gain over
+  a key column.
 
 ## Context
 
@@ -114,7 +198,8 @@ A pack-level migration (a versioned step in the session pack's schema evolution,
    **does not survive** on either table, and each row is keyed by its scoped identity — a composite primary
    key over the scoped tuple, or a rowid surrogate primary key with the scoped `UNIQUE` as the sole
    operative identity:
-   - `sessions`: scoped identity `(namespace, provider_session_id)`.
+   - `sessions`: scoped identity `(namespace, provider_session_id)`. Amendment 1 adds `source` to this
+     tuple and to the `session_messages` tuple below.
    - `session_messages`: scoped identity `(namespace, session_id, id)` — the `(account, provider_session_id, event)`
      contract, where `namespace` is the account, `session_id` ties the event to its transcript, and `id`
      is the provider event id.
