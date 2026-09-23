@@ -414,9 +414,11 @@ impl LettreSmtp {
                 connection
             })
             .await;
-        if let (Err(ChannelError::Auth(_)), Some((token_provider, token))) = (&result, oauth) {
+        if let (Err(ChannelError::Auth(message)), Some((token_provider, token))) = (&result, oauth)
+        {
             if !connect_failed.load(Ordering::Relaxed) {
                 token_provider.invalidate(&token).await;
+                return Err(ChannelError::RetryableAuth(message.clone()));
             }
         }
         result
@@ -846,7 +848,7 @@ mod tests {
             .expect("scripted delivery must finish")
             .unwrap_err();
             assert_eq!(
-                matches!(err, ChannelError::Auth(_)),
+                matches!(err, ChannelError::RetryableAuth(_)),
                 kept.is_none(),
                 "{reply}: {err:?}"
             );
@@ -858,6 +860,56 @@ mod tests {
             drop(connector);
             assert_eq!(server.finish().await.messages, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn smtp_oauth_auth_rejection_recovers_with_a_refreshed_token() {
+        let provider = Arc::new(TokenProvider::new("t".into(), "c".into(), "s".into()));
+        provider.cache_for_test("rejected-token").await;
+        let connector = LettreSmtp::new_oauth(
+            "unused.invalid",
+            587,
+            "sender@example.com",
+            provider.clone(),
+        );
+        let server = ScriptedSmtp::new(vec![
+            handshake(
+                Mechanism::Xoauth2,
+                "rejected-token",
+                "535 authentication refused",
+            ),
+            successful_session(Mechanism::Xoauth2, "refreshed-token", 1),
+        ]);
+        let message = || {
+            build_message(
+                "sender@example.com",
+                "recipient@example.com",
+                "subject",
+                "body",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let error = connector
+            .deliver_message_with_connect(message(), || server.connect())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ChannelError::RetryableAuth(_)));
+        assert!(provider.cached_token_for_test().await.is_none());
+        provider.cache_for_test("refreshed-token").await;
+        connector
+            .deliver_message_with_connect(message(), || server.connect())
+            .await
+            .unwrap();
+        drop(connector);
+        let counts = server.finish().await;
+        assert_eq!(
+            (counts.connections, counts.auth, counts.messages),
+            (2, 2, 1)
+        );
     }
 
     #[tokio::test]

@@ -44,17 +44,17 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, uuid::Uuid) {
 }
 
 async fn cycle(runtime: &KhiveRuntime, channel: &RecordingChannel) {
-    assert!(
-        !channel_outbox_once(
-            channel,
-            runtime,
-            &Namespace::local(),
-            "sender@example.com",
-            "example.com",
-            &["recipient@example.com".to_string()]
-        )
-        .await
-    );
+    channel_outbox_once(
+        channel,
+        runtime,
+        &Namespace::local(),
+        "sender@example.com",
+        "example.com",
+        &["recipient@example.com".to_string()],
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 }
 
 fn invalid_storage_input() -> StorageError {

@@ -16,22 +16,21 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Main pushes share one admitted run and up to 100 waiting runs. `queue: max`
-# preserves waiting commits instead of replacing them when a newer push arrives.
-# GitHub cancels arrivals beyond that limit: those landed commits have no completed
-# CI gate until rerun. A backlog also delays post-merge results; serialization
-# limits runner pressure, not the total work required to test every commit.
+# Main pushes share one group and run the newest commit only. The run in progress
+# is never cancelled; a newer push replaces any run still waiting in the group, so
+# at most one main run waits. A replaced run's commit is contained in the later
+# run's tree, and the newest main head always reaches a completed run. Commits that
+# land while a run is in progress get no result of their own: a regression between
+# two completed runs is attributed by running CI on the commits in between (#3071).
 # https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
-# PR synchronize events keep the same refs/pull/<number>/merge group and replace
-# superseded work. `queue: max` cannot be combined with cancel-in-progress=true,
-# so only main pushes opt in. Integration, nightly and manual runs stay independent.
+# PR synchronize events keep the same refs/pull/<number>/merge group and cancel
+# superseded work. Integration, nightly and manual runs stay independent.
 # REST run status=queued does not mean concurrency-pending: jobs may already be
 # running. Inspect concurrency-group membership and jobs when diagnosing a queue.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  queue: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'single' }}
 
 jobs:
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,

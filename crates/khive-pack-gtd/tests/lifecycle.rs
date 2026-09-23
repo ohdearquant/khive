@@ -820,3 +820,27 @@ async fn completing_a_missing_task_renders_not_found_once() {
         .unwrap_err();
     assert_eq!(err.to_string(), format!("not found: {missing}"));
 }
+
+#[tokio::test]
+async fn active_and_waiting_tasks_park_directly_in_someday() {
+    let pack = pack(rt());
+
+    for from in ["active", "waiting"] {
+        let resp = assign(&pack, json!({"title": format!("park from {from}")})).await;
+        let id = resp["full_id"].as_str().unwrap().to_string();
+        pack.dispatch("gtd.transition", json!({"id": id, "status": from}))
+            .await
+            .unwrap_or_else(|err| panic!("inbox -> {from} must succeed: {err}"));
+
+        let parked = pack
+            .dispatch(
+                "gtd.transition",
+                json!({"id": id, "status": "someday", "note": "deferred"}),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{from} -> someday must succeed: {err}"));
+        assert_eq!(parked["transitioned"], true);
+        assert_eq!(parked["from"], from);
+        assert_eq!(parked["to"], "someday");
+    }
+}
