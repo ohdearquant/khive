@@ -249,6 +249,60 @@ immune to the original pathname being swapped out from under it afterward.
 `is_owned_entry_via_fd` is `is_owned_entry`'s fd-relative mirror, used by
 `delete_verified_owned_entry` right before it acts.
 
+## Windows validated command paths
+
+`revalidate_owned_slot` opens the slot itself without following a final
+reparse point. It obtains that handle's normalized path and file identity,
+then pins every directory in the resolved path from root to slot. Each pin
+opens the final component without following reparse points and omits
+`FILE_SHARE_DELETE`, so the component cannot be renamed or removed while
+Git uses its name. The last handle must have the initial slot's volume and
+128-bit file ID; an ancestor swap during acquisition refuses the operation.
+The `.git` directory and regular ownership marker are checked and pinned
+the same way. All reparse tags are refused, including junctions.
+
+Git receives an ordinary DOS or UNC spelling of the resolved, pinned `.git`
+path: `\\?\C:\...` becomes `C:\...`, and `\\?\UNC\server\share\...`
+becomes `\\server\share\...`. Git for Windows rejects the extended spelling
+returned by the handle API. Conversion refuses non-Unicode paths, other
+namespaces and components requiring verbatim semantics: empty/dot segments,
+trailing dots/spaces, reserved device names (including extensions and
+superscript port digits), control characters and reserved punctuation.
+Names are never trimmed, case-folded or substituted. The converted path is
+reopened without delete sharing and its volume/file ID must equal the held
+`.git` handle's identity; both handles remain live. The lexical refusal is
+necessary even with this comparison because Rust may internally add a
+verbatim prefix when opening an ordinary path.
+
+An existing scratch-root alias may resolve during the initial open;
+commands never use that alias again. A final-path string or a slot handle
+alone is not sufficient: the complete path chain and `.git` child stay
+pinned through each synchronous fetch and ref-update wait. Refusal to
+convert, open, identify or pin a component returns the existing
+`UnsafeToReplace` error, without a pathname fallback. Filesystems that
+cannot supply this identity/path proof therefore refuse the mutation.
+Conversion does not enable Git's optional long-path support or promise
+access to a network share: normal Git/Windows path-length and access
+requirements still apply. Pins are released before owned over-cap cleanup
+so that the new protection does not prevent normal removal.
+
+This protects the slot/child pathname replacement in #2149, not arbitrary
+changes to repository contents. It does not change the separate Windows
+recursive-removal behavior above. Platforms other than Unix and Windows
+retain the documented weaker pathname fallback; no handle guarantee is
+claimed for those targets.
+
+The `check-windows` CI job executes eight `issue2149_windows_` regressions
+with a nonempty selection floor. The five original runtime witnesses cover
+blocked slot/child and ancestor renames, rejected reparse ownership
+components, an actual scratch-alias swap, successful fetch/ref advancement
+into the pinned clone, and both over-cap cleanup paths. Three additional
+tests cover lossless DOS/UNC conversion, refusal of ambiguous or
+verbatim-only names, and matching/mismatched directory identities. The
+generic floor remains one; acceptance requires the actual named passes for
+all eight tests at the PR head. Symlink capability is required by the
+runtime tests and must not silently skip their witnesses.
+
 ## `remove_dir_all_retrying`
 
 `std::fs::remove_dir_all` on a large git working tree can transiently fail

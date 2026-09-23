@@ -60,6 +60,19 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::RefusedWithEvents { context } => {
+            let crate::error::RefusalEventContext { source, recordings } = context;
+            // Project the source first so named dispositions, code/details,
+            // detector location and refusal text retain their original meaning.
+            let mut value = runtime_error_value(*source, disposition);
+            if !recordings.is_empty() {
+                value["refusal_recorded"] = json!(recordings.iter().all(|recording| {
+                    matches!(recording, crate::RefusalEventRecording::Recorded { .. })
+                }));
+                value["refusal_events"] = json!(recordings);
+            }
+            return value;
+        }
         RuntimeError::PermissionDenied {
             verb,
             reason,
@@ -379,5 +392,117 @@ mod tests {
         assert_eq!(value["timeout_ms"], 17);
         assert_eq!(value["operation"], "append checkout");
         assert_eq!(value["domain_disposition"], "unknown");
+    }
+
+    #[test]
+    fn refusal_events_project_mixed_recording_without_changing_the_original_secret_error() {
+        use crate::{RefusalEventRecording, RefusalRecordingErrorClass};
+        let source = || {
+            RuntimeError::SecretDetected(crate::secret_gate::SecretMatch {
+                detector: "fixture",
+                trigger: None,
+                masked: "PRIVATE-MASKED-EXCERPT".into(),
+                location: Some("atoms[1].properties[0].value".into()),
+            })
+        };
+        let subject_a = uuid::Uuid::from_u128(11);
+        let subject_b = uuid::Uuid::from_u128(12);
+        let event = uuid::Uuid::from_u128(13);
+        let expected = runtime_error_value(source(), DomainDisposition::Unknown);
+        let mut actual = runtime_error_value(
+            source().with_refusal_events(vec![
+                RefusalEventRecording::Recorded {
+                    item_index: 1,
+                    subject: subject_a,
+                    event_id: event,
+                },
+                RefusalEventRecording::Failed {
+                    item_index: 4,
+                    subject: subject_b,
+                    error_class: RefusalRecordingErrorClass::EventAppendFailed,
+                },
+            ]),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(actual["refusal_recorded"], false);
+        assert_eq!(
+            actual["refusal_events"],
+            json!([
+                {"item_index":1, "subject":subject_a, "event_id":event},
+                {"item_index":4, "subject":subject_b, "error_class":"event_append_failed"},
+            ])
+        );
+        assert!(!actual.to_string().contains("PRIVATE-MASKED-EXCERPT"));
+        assert!(actual.get("receipt_id").is_none());
+        let object = actual.as_object_mut().unwrap();
+        object.remove("refusal_recorded");
+        object.remove("refusal_events");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn refusal_events_keep_typed_details_and_named_disposition_with_all_recorded() {
+        use crate::RefusalEventRecording;
+        let source = || {
+            RuntimeError::Khive(
+                KhiveError::conflict("fixed reason")
+                    .with_code(ErrorCode::new(ErrorDomain::Db, 71))
+                    .with_details(Details::new([
+                        ("reason", "seq_conflict"),
+                        ("extra", "unchanged"),
+                    ])),
+            )
+        };
+        let mut expected = runtime_error_value(source(), DomainDisposition::Unknown);
+        expected["refusal_recorded"] = json!(true);
+        expected["refusal_events"] = json!([
+            {"item_index":0, "subject":uuid::Uuid::from_u128(1), "event_id":uuid::Uuid::from_u128(2)},
+            {"item_index":3, "subject":uuid::Uuid::from_u128(3), "event_id":uuid::Uuid::from_u128(4)},
+        ]);
+        let actual = runtime_error_value(
+            source().with_refusal_events(vec![
+                RefusalEventRecording::Recorded {
+                    item_index: 0,
+                    subject: uuid::Uuid::from_u128(1),
+                    event_id: uuid::Uuid::from_u128(2),
+                },
+                RefusalEventRecording::Recorded {
+                    item_index: 3,
+                    subject: uuid::Uuid::from_u128(3),
+                    event_id: uuid::Uuid::from_u128(4),
+                },
+            ]),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(actual["domain_disposition"], "not_committed");
+    }
+
+    #[test]
+    fn refusal_events_do_not_invent_receipts_for_failed_or_absent_recordings() {
+        use crate::{RefusalEventRecording, RefusalRecordingErrorClass};
+        for class in [
+            RefusalRecordingErrorClass::EventStoreUnavailable,
+            RefusalRecordingErrorClass::EventAppendFailed,
+        ] {
+            let error = RuntimeError::InvalidInput("validation refused".into())
+                .with_refusal_events(vec![RefusalEventRecording::Failed {
+                    item_index: 0,
+                    subject: uuid::Uuid::from_u128(1),
+                    error_class: class,
+                }]);
+            let actual = runtime_error_value(error, DomainDisposition::Unknown);
+            assert_eq!(actual["refusal_recorded"], false);
+            assert_eq!(actual["refusal_events"][0]["error_class"], class.as_str());
+            assert!(actual["refusal_events"][0].get("event_id").is_none());
+            assert!(actual.get("receipt_id").is_none());
+            assert_eq!(actual["message"], "invalid input: validation refused");
+        }
+        let actual = runtime_error_value(
+            RuntimeError::InvalidInput("validation refused".into()).with_refusal_events(vec![]),
+            DomainDisposition::Unknown,
+        );
+        assert!(actual.get("refusal_recorded").is_none());
+        assert!(actual.get("refusal_events").is_none());
     }
 }

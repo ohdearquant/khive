@@ -1602,6 +1602,8 @@ mod tests {
         const MODEL: &str = "recall-836-ann-timeout-model";
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "issue 836 bounded ann acquire recall fts fallback note";
+        const ANN_READY_TIMEOUT_MS: u64 = 100;
+        const CALLER_DEADLINE_MS: u64 = 1_000;
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(HashVecProvider {
@@ -1631,23 +1633,24 @@ mod tests {
         let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
 
         let start = std::time::Instant::now();
-        let result = registry
-            .dispatch(
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            registry.dispatch(
                 "memory.recall",
                 serde_json::json!({
                     "query": "836 bounded ann acquire",
                     "limit": 10,
-                    "config": { "ann_ready_timeout_ms": 100 }
+                    "config": {
+                        "ann_ready_timeout_ms": ANN_READY_TIMEOUT_MS,
+                        "recall_deadline_ms": CALLER_DEADLINE_MS
+                    }
                 }),
-            )
-            .await
-            .expect("recall must not error when the ANN leg times out");
+            ),
+        )
+        .await
+        .expect("#836 recall exceeded the held-stage hang watchdog")
+        .expect("recall must not error when the ANN leg times out");
         let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "#836 recall must return within the bounded ANN wait, took {elapsed:?}"
-        );
 
         let results = result.as_array().expect("recall result must be an array");
         assert!(
@@ -1659,6 +1662,17 @@ mod tests {
                 r.get("degraded").and_then(Value::as_str),
                 Some("ann_unavailable"),
                 "#836 degraded result must carry the ann_unavailable marker, got: {r:?}"
+            );
+        }
+
+        // Coverage retains the watchdog and result assertions without making
+        // instrumented scheduling part of the caller-latency contract.
+        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
+            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+            assert!(
+                elapsed < caller_bound,
+                "#836 recall exceeded its caller-derived completion bound \
+                 {caller_bound:?}, took {elapsed:?}"
             );
         }
     }
@@ -6469,6 +6483,7 @@ mod tests {
     #[serial_test::serial(config_ledger)]
     async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
         const MODEL: &str = "recall-889-slow-model";
+        const CALLER_DEADLINE_MS: u64 = 50;
         let hold = Arc::new(Notify::new());
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -6500,27 +6515,23 @@ mod tests {
         let registry = builder.build().expect("registry");
 
         let start = std::time::Instant::now();
-        let result = registry
-            .dispatch(
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            registry.dispatch(
                 "memory.recall",
                 serde_json::json!({
                     "query": "889 held embed stage test",
                     "limit": 10,
-                    "config": { "recall_deadline_ms": 50 }
+                    "config": { "recall_deadline_ms": CALLER_DEADLINE_MS }
                 }),
-            )
-            .await;
+            ),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         // Release the timed-out worker so it does not occupy a blocking-pool slot.
         hold.notify_one();
-
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "#889 a timed-out recall must return promptly even while its embed \
-             stage is genuinely held, not wait for the held stage to release; \
-             took {elapsed:?}"
-        );
+        let result = completed.expect("#889 recall exceeded the held-stage hang watchdog");
 
         match result {
             Err(RuntimeError::DeadlineExceeded {
@@ -6529,11 +6540,23 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(operation, "memory.recall");
-                assert_eq!(budget_ms, 50);
+                assert_eq!(
+                    budget_ms, CALLER_DEADLINE_MS,
+                    "#889 deadline error must retain the caller budget"
+                );
             }
             other => {
                 panic!("#889 expected DeadlineExceeded with the embed stage held, got: {other:?}")
             }
+        }
+
+        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
+            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+            assert!(
+                elapsed < caller_bound,
+                "#889 recall exceeded its caller-derived completion bound \
+                 {caller_bound:?}, took {elapsed:?}"
+            );
         }
     }
 

@@ -174,6 +174,8 @@ async fn wait_for_resumed_generation_log(stderr: tokio::process::ChildStderr) {
 #[tokio::test]
 async fn bridge_self_heals_across_in_place_reexec_without_losing_the_client_session() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // A file-backed store keeps both bridge generations eligible for forwarding.
+    let db = dir.path().join("main.db");
     let sock = dir.path().join("khived.sock");
     let pid_file = dir.path().join("khived.pid");
     let lock_file = dir.path().join("khived.recovery.lock");
@@ -193,7 +195,7 @@ async fn bridge_self_heals_across_in_place_reexec_without_losing_the_client_sess
     command
         .arg("mcp")
         .arg("--db")
-        .arg(":memory:")
+        .arg(&db)
         .arg("--pack")
         .arg("kg")
         // Keep both generations of the exec-preserved bridge on a hermetic

@@ -1352,3 +1352,114 @@ async fn query_events_declines_to_compute_a_total() {
     let counted = store.count_events(EventFilter::default()).await.unwrap();
     assert_eq!(counted, 3);
 }
+
+#[tokio::test]
+async fn refusal_target_filter_keeps_query_count_namespace_and_observations_separate() {
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: None,
+            write_queue_enabled: Some(false),
+            write_routing_strict: false,
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(EVENTS_DDL)
+        .unwrap();
+    let store = SqlEventStore::new_scoped(Arc::clone(&pool), false, "default");
+    let other = SqlEventStore::new_scoped(pool, false, "other");
+    let subject = Uuid::new_v4();
+    let refusal = |namespace: &str, target| {
+        Event::new(
+            namespace,
+            "knowledge.upsert_atoms",
+            EventKind::Refusal,
+            SubstrateKind::Event,
+            "actor:refusal-test",
+        )
+        .with_target(target)
+        .with_outcome(EventOutcome::Denied)
+        .with_payload(json!({"subject_kind": "knowledge_atom"}))
+    };
+    let first = refusal("default", subject);
+    let second = refusal("default", subject);
+    store
+        .append_events(vec![
+            first.clone(),
+            second.clone(),
+            refusal("default", Uuid::new_v4()),
+            Event::new(
+                "default",
+                "knowledge.upsert_atoms",
+                EventKind::Refusal,
+                SubstrateKind::Event,
+                "actor:refusal-test",
+            ),
+            Event::new(
+                "default",
+                "test",
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "actor:refusal-test",
+            )
+            .with_target(subject),
+        ])
+        .await
+        .unwrap();
+    other.append_event(refusal("other", subject)).await.unwrap();
+    let filter = EventFilter {
+        target_id: Some(subject),
+        kinds: vec![EventKind::Refusal],
+        ..EventFilter::default()
+    };
+    assert_eq!(store.count_events(filter.clone()).await.unwrap(), 2);
+    let mut found = Vec::new();
+    for offset in 0..2 {
+        let page = store
+            .query_events(filter.clone(), PageRequest { limit: 1, offset })
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].target_id, Some(subject));
+        assert_eq!(page.items[0].namespace, "default");
+        found.push(page.items[0].id);
+    }
+    found.sort();
+    let mut expected = vec![first.id, second.id];
+    expected.sort();
+    assert_eq!(found, expected);
+    assert_eq!(other.count_events(filter.clone()).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .count_events(EventFilter {
+                target_id: Some(subject),
+                ..EventFilter::default()
+            })
+            .await
+            .unwrap(),
+        3
+    );
+    let observations = EventFilter {
+        observed: vec![subject],
+        ..filter
+    };
+    assert_eq!(store.count_events(observations.clone()).await.unwrap(), 0);
+    assert!(
+        store
+            .query_events(
+                observations,
+                PageRequest {
+                    limit: 10,
+                    offset: 0
+                }
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty(),
+        "knowledge subjects must not become graph observations"
+    );
+}
