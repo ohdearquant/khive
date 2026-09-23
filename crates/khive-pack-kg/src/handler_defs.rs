@@ -358,10 +358,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "target_id",
                 param_type: "uuid",
                 required: false,
-                description: "Filter edges by target node complete UUID, unique 8+ hex prefix, \
-                              or entity name (kind=\"edge\" only). Prefix and name resolution \
-                              search the caller's primary namespace.",
-                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
+                description: "For kind=event, filter the exact event subject UUID (including \
+                              knowledge atoms); a full UUID is required and no graph lookup \
+                              occurs. For kind=edge, filter by target node complete UUID, \
+                              unique 8+ hex prefix, or entity name; prefix/name resolution \
+                              searches the caller's primary namespace.",
+                resolution_mode: IdResolutionMode::EdgeOrEventTarget,
             },
             ParamDef {
                 name: "relations",

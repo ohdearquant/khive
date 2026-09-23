@@ -7,6 +7,85 @@
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
 
+## Amendment (2026-09-23): refusal events for existing atoms
+
+**Status: Proposed for final specification and implementation gates (#2995).**
+
+A refused public `knowledge.upsert_atoms` batch leaves every atom row and its
+indexes unchanged, including valid siblings. It separately appends a `refusal`
+event for each submitted item that resolves an existing live ordinary atom.
+Slug lookup uses the caller namespace; properties-only UUID lookup retains its
+existing namespace-independent identity semantics. Deprecated rows remain eligible
+because direct reads still return them. Missing, deleted, domain and mirror targets
+have no trace; invalid or unresolvable input identities are not echoed or invented.
+Whole-request deserialization failures have no item-level trace. Import retains its
+existing refusal semantics and emits none of these events.
+
+Admission validates the entire submitted batch before any atom writer is acquired.
+On refusal, it resolves eligible targets read-only, releases the reader, then attempts
+the separate event appends. No valid prefix or sibling is committed. The original
+first refusal remains the operation result even when a trace append fails. Target
+lookup/storage failures never turn the refused mutation into a successful write.
+
+Events use the Event substrate, `kind=refusal`, `verb=knowledge.upsert_atoms`, and
+`target_id` equal to the serving atom UUID. They carry the caller token's namespace
+and actor, including when a properties-only UUID names another namespace. An atom
+is not represented as a KG entity or event observation. Authorized readers use
+`list(kind="event", event_kind="refusal", target_id=<complete atom UUID>)`; target
+identity does not widen event namespace visibility. Existing edge `target_id`
+resolution remains unchanged. Exact event-subject filtering applies to query and
+count and is preserved by the versioned split-events transport.
+
+Payload schema version 1 contains `subject_kind="knowledge_atom"`, `item_index`,
+`digest_input="masked_submitted_atom_v1"`, and `rejected_digest="blake3:<64 lowercase
+hex digits>"`. A directly refusing item records `reason="secret_detected"` with safe
+detector, trigger and positional location, or `reason="validation_refused"`. A valid
+item rejected with its batch records `reason="batch_refused"` and
+`first_refusing_item_index`. It contains no raw submitted fields, secret excerpt,
+masked preview, arbitrary validation message or backend error.
+
+The digest covers the normalized would-persist record fields: slug, name, content,
+tags, properties, source_uri, source_type and finalized. Omitted patch fields retain
+their existing values; properties-only submissions retain the other stored fields.
+Identity, timestamps and derived lifecycle status are excluded. Before hashing,
+canonical secret detection replaces every detected span with a fixed token naming
+only its detector, retaining neither characters nor span length. Any suffix not
+proven clean within the bounded scan budget becomes a fixed unscanned token. The
+canonicalization is versioned by `digest_input`; unscanned fallback still produces
+a digest and a refusal event, never a raw-content hash. The work budget is
+2,097,152 bytes divided equally (integer floor) among every object key and string
+leaf in the candidate; fixed root labels count as units but their shares remain
+unused. Each actual string charges its full byte length before tokenization and
+each remaining detector sweep, including any revisited token prefix. Quotas are
+independent of traversal order; structural traversal and serialization are separate
+work. Initial exhaustion replaces the whole string; later exhaustion replaces the
+remaining unproven suffix.
+
+The known atom root is an object sorted by key. Objects under properties are encoded
+as arrays of `[masked_key, masked_value]` pairs, recursively canonicalized and sorted
+by each pair's canonical JSON bytes. Duplicate masked pairs are retained; no property
+is overwritten by a masked-key collision and ordering never depends on the original
+secret keys. Ordinary arrays retain their element order. JSON is encoded as compact
+UTF-8, then hashed with full BLAKE3-256. The digest is a masked-attempt correlation
+identifier, not an authentication or confidentiality primitive.
+
+When eligible traces exist, the original typed error projection adds
+`refusal_recorded` and `refusal_events`. Each trace identifies `item_index`, `subject`
+and either the confirmed `event_id` or a closed `error_class`:
+`event_store_unavailable` or `event_append_failed`. The aggregate flag is true only
+when all eligible attempted appends are confirmed. An append failure also emits a
+warning naming the operation, item, UUID and class, without rejected content or raw
+storage diagnostics. False means no confirmed trace for the failed item, not proof
+that an ambiguous append wrote nothing. No automatic append retry is implied. With
+no eligible targets the original refusal is returned without a fabricated receipt.
+
+Acceptance requires unchanged complete old rows and sibling state; exact subject and
+namespace-filtered readback; stable digests when only detected span bytes change;
+different digests when clean content changes; retained masked-key collisions and
+bounded unscanned fallback; and append-failure projection that preserves the original
+refusal. The new public event enum/filter fields and split-events protocol version
+are additive source compatibility changes and must pass their consumers' full suites.
+
 ## Amendment (2026-09-14): existing atom properties-only updates
 
 **Status: Accepted (2026-09-14).** Acceptance of the text is not implementation

@@ -626,7 +626,7 @@ impl DispatchFailure {
 
     fn from_dispatch(tool: &str, error: DispatchError) -> Self {
         let (error, disposition) = error.into_parts();
-        let reason = match &error {
+        let reason = match error.refusal_source() {
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
             error if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
@@ -11125,8 +11125,7 @@ mod tests {
                 None => json!(["local"]),
             };
             assert_eq!(
-                identity["visible_namespaces"],
-                expected,
+                identity["visible_namespaces"], expected,
                 "replay inherits its own actor namespace and never the daemon's visibility: {identity}"
             );
             assert!(
@@ -12550,6 +12549,9 @@ mod request_read_cancellation_tests {
 
 #[cfg(test)]
 mod disposition_tests;
+
+#[cfg(test)]
+mod refusal_event_tests;
 
 #[cfg(test)]
 mod issue_2537_tests {
