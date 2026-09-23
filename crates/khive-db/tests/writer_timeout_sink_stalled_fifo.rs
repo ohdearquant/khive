@@ -18,9 +18,12 @@
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use khive_db::{ConnectionPool, PoolConfig};
+
+#[path = "support/caller_timing.rs"]
+mod caller_timing;
 
 /// Generous enough that a genuine hang (not just a regression that adds
 /// caller-path latency) still produces a test *failure* rather than an
@@ -69,9 +72,10 @@ fn sink_never_adds_measurable_latency_when_its_file_is_a_blocked_fifo() {
 
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("stalled_fifo_sink_test.db");
+    let checkout_timeout = Duration::from_millis(50);
     let cfg = PoolConfig {
         path: Some(db_path),
-        checkout_timeout: Duration::from_millis(50),
+        checkout_timeout,
         ..PoolConfig::default()
     };
 
@@ -80,13 +84,18 @@ fn sink_never_adds_measurable_latency_when_its_file_is_a_blocked_fifo() {
 
     let held = pool.writer().expect("first checkout should succeed");
     let pool_for_thread = Arc::clone(&pool);
-    let timed_out = bounded(move || pool_for_thread.writer().is_err());
+    let (timed_out, elapsed) = bounded(move || {
+        let started = Instant::now();
+        let timed_out = pool_for_thread.writer().is_err();
+        (timed_out, started.elapsed())
+    });
     drop(held);
 
     assert!(
         timed_out,
         "a second writer checkout while the first is held must time out"
     );
+    caller_timing::assert_caller_latency(elapsed, checkout_timeout);
 
     // Interaction with the rotate-on-open fix: a FIFO is not a regular
     // file, so opening it must never rotate it away. If a future refactor
