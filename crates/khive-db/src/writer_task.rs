@@ -17,15 +17,15 @@
 //! ## ADR-136 D1 gate 5: writer classification
 //!
 //! Every connection that issues writes against a khive-db file falls into
-//! exactly one of the rows below. `SqlAccess`-reachable is the dividing
-//! line: only requests reachable through `khive_storage::SqlAccess`
-//! (`SqlBridge::writer`/`atomic_unit`, and the `stores::*` methods built on
-//! them) are subject to `PoolConfig::write_queue_enabled` /
-//! `write_routing_strict` routing at all. Everything else here is an
+//! exactly one of the rows below. Request-path store writes, runtime
+//! merge/symmetric-edge transactions,
+//! and `khive_storage::SqlAccess` (`SqlBridge::writer`/`atomic_unit`) are subject
+//! to `PoolConfig::write_queue_enabled` / `write_routing_strict` routing.
+//! Everything else here is an
 //! explicit, intentional exemption — not an implicit gap left over from an
 //! incomplete migration.
 //!
-//! | Writer | Connection | `SqlAccess`-reachable | Routing |
+//! | Writer | Connection | Request-path write | Routing |
 //! | --- | --- | --- | --- |
 //! | Request-path writes (`create`, `update`, batch upserts, …) | `WriterTaskHandle` (queue-first) or a standalone/pool-mutex connection on degrade | Yes | Queue-first (ADR-136 D1 gate 1); strict routing fails closed on degrade |
 //! | Startup / schema migrations (`migrations::run_migrations`, `apply_schema_plan`) | The pool's own writer-mutex connection (`ConnectionPool::new`, before the `WriterTask` is ever spawned) | No | Exempt — runs once at boot, before any queue handle exists to route through |
@@ -37,12 +37,14 @@
 //! every store request-path write refreshes through
 //! `ConnectionPool::writer_task_for_write` at execution time. Strict routing
 //! refuses a missing handle, while the explicit compatibility fallback emits
-//! its store-specific violation at the actual direct-writer seam. The strict
-//! default itself remains gated by ADR-135 F2 / ADR-136 D2 evidence.
+//! its store-specific violation at the actual direct-writer seam. Runtime
+//! entity/note merges and symmetric edge updates use the same routing policy
+//! through a closed operation adapter. The strict default itself remains gated
+//! by ADR-135 F2 / ADR-136 D2 evidence.
 //!
 //! A `direct_route_violation` sink row (`timeout_sink::emit_direct_route_violation`,
 //! ADR-136 D1 gate 6c) is emitted ONLY for the first row's degrade path — a
-//! `SqlAccess`-reachable write that bypassed an enabled queue. The other four
+//! request-path write that bypassed an enabled queue. The other four
 //! rows are exempt by design and never emit that row.
 
 use rusqlite::Connection;
