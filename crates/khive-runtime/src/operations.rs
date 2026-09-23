@@ -4983,6 +4983,10 @@ impl KhiveRuntime {
                 ..
             }) => Err(conflict.into_error().into()),
             Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::EntityConflict(conflict),
+                ..
+            }) => Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::GuardFailed { .. },
                 ..
             }) => Ok(false),
@@ -5050,15 +5054,20 @@ impl KhiveRuntime {
         let mut restored = entity;
         restored.deleted_at = None;
         restored.updated_at = updated_at;
+        restored.version = restored
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
         let mut statements = vec![PlanStatement {
             statement: SqlStatement {
-                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1 \
-                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
+                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1, version=version+1 \
+                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL AND version=?4"
                     .into(),
                 params: vec![
                     SqlValue::Integer(updated_at),
                     SqlValue::Text(id.to_string()),
                     SqlValue::Text(token.namespace().as_str().to_owned()),
+                    SqlValue::Integer(restored.version - 1),
                 ],
                 label: Some("entity-restore".into()),
             },
@@ -5083,17 +5092,18 @@ impl KhiveRuntime {
                 guard: None,
             });
         }
-        let plan = AtomicOpPlan::Update(UpdatePlan {
+        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             target_id: id,
             statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,
-        });
+        }));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 // Embeddings are rebuilt after the commit; the row and its
@@ -5207,17 +5217,18 @@ impl KhiveRuntime {
                 guard: None,
             });
         }
-        let plan = AtomicOpPlan::Update(UpdatePlan {
+        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             target_id: id,
             statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,
-        });
+        }));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 #[cfg(any(test, feature = "fault-injection"))]
@@ -5275,7 +5286,7 @@ impl KhiveRuntime {
             return Ok(Some((edge, false)));
         }
         let updated_at = Utc::now();
-        let plan = AtomicOpPlan::Update(UpdatePlan {
+        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             target_id: id,
             statements: vec![PlanStatement {
@@ -5295,10 +5306,11 @@ impl KhiveRuntime {
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,
-        });
+        }));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 let mut restored = edge;

@@ -664,7 +664,7 @@ pub(crate) async fn prepare_atomic_note_requests(
             }
         }
 
-        plans.push(AtomicOpPlan::AddNote(AddNotePlan {
+        plans.push(AtomicOpPlan::AddNote(Box::new(AddNotePlan {
             note_guard: Some(crate::note_write::NoteWriteGuard {
                 namespace: requests[note_idx].spec.token.namespace().as_str().into(),
                 target_id: note.id,
@@ -678,7 +678,7 @@ pub(crate) async fn prepare_atomic_note_requests(
             note_id: note.id,
             statements,
             post_commit: PostCommitEffect::None,
-        }));
+        })));
     }
 
     Ok(PreparedAtomicNotes {

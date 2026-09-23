@@ -789,9 +789,14 @@ fn move_kinded_subject(
     rows: &mut BTreeMap<String, u64>,
 ) -> rusqlite::Result<u64> {
     let KindedTables { base, fts, rowids } = *tables;
+    let revision = if base == "entities" {
+        ", version = version + 1"
+    } else {
+        ""
+    };
     let moved = conn.execute(
         &format!(
-            "UPDATE {} SET namespace = ?2 WHERE namespace = ?1 AND kind = ?3",
+            "UPDATE {} SET namespace = ?2{revision} WHERE namespace = ?1 AND kind = ?3",
             namespace_census::quote_ident(base)
         ),
         rusqlite::params![source, target, kind],
@@ -1545,4 +1550,39 @@ mod tests {
         assert_eq!(collisions[0].constraint, "idx_knowledge_atoms_ns_slug");
         assert_eq!(collisions[0].key, "shared-slug");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn issue2673_namespace_move_advances_entity_version_without_changing_timestamp() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    crate::migrations::run_migrations(&mut conn).unwrap();
+    conn.execute("INSERT INTO entities(id,namespace,kind,name,created_at,updated_at) VALUES('versioned','source','concept','moved',7,7)", []).unwrap();
+    let tx = conn.transaction().unwrap();
+    move_namespace(
+        &tx,
+        &MoveRequest::new(
+            "source",
+            vec![MoveRoute {
+                class: SubjectClass::Entity("concept".into()),
+                target: "target".into(),
+            }],
+        ),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let stored = conn
+        .query_row(
+            "SELECT namespace,updated_at,version FROM entities WHERE id='versioned'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(stored, ("target".into(), 7, 2));
 }

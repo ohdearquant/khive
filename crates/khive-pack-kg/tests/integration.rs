@@ -16300,11 +16300,9 @@ async fn search_note_hits_carry_updated_at_and_version_across_an_update() {
     );
 }
 
-/// An entity hit carries updated_at too. Entities have no persisted revision,
-/// so `version` is present for row-shape parity and null — a caller reading the
-/// field learns that, rather than reading a number that was never stored.
+/// Entity search hydrates the persisted version independently of updated_at.
 #[tokio::test]
-async fn search_entity_hits_carry_updated_at_and_a_null_version() {
+async fn search_entity_hits_carry_updated_at_and_persisted_version() {
     let pack = pack();
     let created = pack
         .dispatch(
@@ -16339,8 +16337,8 @@ async fn search_entity_hits_carry_updated_at_and_a_null_version() {
     );
     assert_eq!(
         before[0]["version"],
-        Value::Null,
-        "entities carry no persisted revision; got {}",
+        json!(1),
+        "entity search must carry its persisted initial revision; got {}",
         before[0]
     );
 
@@ -16364,8 +16362,8 @@ async fn search_entity_hits_carry_updated_at_and_a_null_version() {
     );
     assert_eq!(
         after[0]["version"],
-        Value::Null,
-        "an updated entity still has no revision to report; got {}",
+        json!(2),
+        "entity search must carry its persisted updated revision; got {}",
         after[0]
     );
 }

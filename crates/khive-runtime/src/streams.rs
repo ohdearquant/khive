@@ -838,6 +838,7 @@ impl KhiveRuntime {
                     "stream preparation did not produce a note".into(),
                 ));
             };
+            let plan = *plan;
             let mut guard = plan.note_guard.ok_or_else(|| {
                 RuntimeError::Internal("stream preparation did not produce a note guard".into())
             })?;

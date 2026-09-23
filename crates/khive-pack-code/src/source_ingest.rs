@@ -751,6 +751,7 @@ where
 
         let outcome = if let Some(snapshot) = current.as_ref() {
             replacement.created_at = snapshot.created_at;
+            replacement.version = snapshot.version;
             replacement.updated_at =
                 advancing_entity_revision(replacement.updated_at, snapshot.updated_at)?;
             if !gate_allows_entity(&replacement, file, report)? {
@@ -4117,4 +4118,34 @@ mod tests {
         assert_eq!(report_b.edges_updated, 1);
         assert!(edge.updated_at > update_time);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn issue2673_code_entity_mutation_rebases_persisted_versions() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
+    let id = Uuid::new_v4();
+    let mut report = CodeSourceIngestReport::default();
+    for version in 1..=3 {
+        let name = format!("code revision {version}");
+        let outcome = mutate_entity(&runtime, &token, id, "version.rs", &mut report, |_| {
+            let mut entity = Entity::new("local", "concept", &name);
+            entity.id = id;
+            Some(entity)
+        })
+        .await
+        .unwrap();
+        assert!(outcome.wrote());
+        let stored = runtime.get_entity(&token, id).await.unwrap();
+        assert_eq!(stored.version, version);
+        assert_eq!(stored.name, name);
+    }
+    assert_eq!(
+        mutate_entity(&runtime, &token, id, "version.rs", &mut report, |_| None)
+            .await
+            .unwrap(),
+        RowMutationOutcome::Unchanged
+    );
+    assert_eq!(runtime.get_entity(&token, id).await.unwrap().version, 3);
 }

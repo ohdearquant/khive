@@ -2845,6 +2845,7 @@ async fn dispatch_via_coordinator_inner(
                                         .entity_updated_at
                                         .get(&h.entity_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
+                                    let version = coord_result.entity_versions.get(&h.entity_id);
                                     json!({
                                         "id": h.entity_id.to_string(),
                                         "kind": entity_kind,
@@ -2856,6 +2857,7 @@ async fn dispatch_via_coordinator_inner(
                                         "snippet": h.snippet,
                                         "created_at": created_at,
                                         "updated_at": updated_at,
+                                        "version": version,
                                     })
                                 })
                                 .collect();
@@ -8274,6 +8276,7 @@ mod tests {
                 note_kinds: std::collections::HashMap::new(),
                 entity_created_at: std::collections::HashMap::new(),
                 entity_updated_at: std::collections::HashMap::new(),
+                entity_versions: std::collections::HashMap::new(),
                 note_created_at: std::collections::HashMap::new(),
                 note_updated_at: std::collections::HashMap::new(),
                 note_versions: std::collections::HashMap::new(),
@@ -8350,6 +8353,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             entity_updated_at: std::collections::HashMap::new(),
+            entity_versions: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
             note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
@@ -8389,6 +8393,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             entity_updated_at: std::collections::HashMap::new(),
+            entity_versions: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
             note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
@@ -8444,6 +8449,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             entity_updated_at: std::collections::HashMap::new(),
+            entity_versions: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
             note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
