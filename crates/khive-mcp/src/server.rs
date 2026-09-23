@@ -3972,8 +3972,15 @@ impl KhiveMcpServer {
                 )),
             ));
         }
+        // In-memory state belongs to this runtime. Even a daemon with the same
+        // configuration would own a separate store, so keep these requests local.
         #[cfg(unix)]
-        if p.save_to.is_none() {
+        let in_memory = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.backend().is_file_backed());
+        #[cfg(unix)]
+        if p.save_to.is_none() && !in_memory {
             let frame = self.wire_daemon_frame(&p);
             let request_id = frame.request_id;
             // Forward this server's own resolved pack list so a daemon this
@@ -5785,6 +5792,91 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn forward_test_runtime(db_path: Option<std::path::PathBuf>, packs: &[&str]) -> KhiveRuntime {
+        KhiveRuntime::new(RuntimeConfig {
+            db_path,
+            actor_id: Some("local".to_string()),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            events_split: None,
+            packs: packs.iter().map(|pack| (*pack).to_string()).collect(),
+            ..RuntimeConfig::default()
+        })
+        .expect("forwarding fixture runtime")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn in_memory_request_skips_forward_and_dispatches_locally() {
+        static FORWARD_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn spy_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            FORWARD_CALLS.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(Ok("unexpected-forward".to_string())) })
+        }
+
+        FORWARD_CALLS.store(0, Ordering::SeqCst);
+        let runtime = forward_test_runtime(None, &["kg"]);
+        assert!(!runtime.backend().is_file_backed());
+        let server = KhiveMcpServer::new(runtime).expect("in-memory server");
+        let response = server
+            .request_with_forward(
+                RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                },
+                spy_forward,
+            )
+            .await
+            .expect("ordinary in-memory request dispatches locally");
+
+        assert_eq!(FORWARD_CALLS.load(Ordering::SeqCst), 0);
+        let response: Value = serde_json::from_str(&response).expect("local JSON envelope");
+        assert_eq!(response["results"][0]["tool"], "stats");
+        assert_eq!(response["results"][0]["ok"], true);
+        assert_eq!(response["results"][0]["result"]["entities"], 0);
+        assert_eq!(response["summary"]["succeeded"], 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn file_backed_request_reaches_forward_seam() {
+        static FORWARD_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn spy_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            FORWARD_CALLS.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(Ok("forwarded-file-backed-request".to_string())) })
+        }
+
+        FORWARD_CALLS.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
+        assert!(runtime.backend().is_file_backed());
+        let server = KhiveMcpServer::new(runtime).expect("file-backed server");
+        let response = server
+            .request_with_forward(
+                RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                },
+                spy_forward,
+            )
+            .await
+            .expect("ordinary file-backed request reaches forwarding");
+
+        assert_eq!(FORWARD_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(response, "forwarded-file-backed-request");
+    }
+
     /// khive-oss#1941 regression seam: `request_with_forward` must pass
     /// THIS server's own resolved registry pack list to the daemon-forwarding
     /// seam as `Some(...)`, not `None` and not some other list. The spy's
@@ -5827,14 +5919,8 @@ mod tests {
             })
         }
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "gtd".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime restricted to kg + gtd");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg", "gtd"]);
         let server =
             KhiveMcpServer::new(runtime).expect("server builds with restricted kg+gtd registry");
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
@@ -5868,11 +5954,9 @@ mod tests {
     #[cfg(unix)]
     mod read_replay_tests {
         use super::super::{ForwardFuture, KhiveMcpServer};
-        use super::{clear_daemon_env, stats_without_request_local_usage};
+        use super::{clear_daemon_env, forward_test_runtime, stats_without_request_local_usage};
         use crate::tools::request::RequestParams;
-        use khive_runtime::{
-            KhiveRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
-        };
+        use khive_runtime::{RuntimeError, VerbRegistry, VerbRegistryBuilder};
         use rmcp::handler::server::wrapper::Parameters;
         use serde_json::Value;
         use std::sync::{
@@ -5896,22 +5980,18 @@ mod tests {
             Box::pin(async { Some(Ok("forwarded-policy-fixture".to_string())) })
         }
 
-        fn live_server() -> KhiveMcpServer {
-            let runtime = KhiveRuntime::new(RuntimeConfig {
-                db_path: None,
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                packs: vec!["kg".to_string(), "comm".to_string(), "memory".to_string()],
-                ..RuntimeConfig::default()
-            })
-            .expect("in-memory replay registry");
-            KhiveMcpServer::new(runtime).expect("live kg, comm and memory handlers")
+        fn live_server() -> (tempfile::TempDir, KhiveMcpServer) {
+            let dir = tempfile::tempdir().expect("replay fixture directory");
+            let runtime =
+                forward_test_runtime(Some(dir.path().join("main.db")), &["kg", "comm", "memory"]);
+            let server = KhiveMcpServer::new(runtime).expect("live kg, comm and memory handlers");
+            (dir, server)
         }
 
         #[tokio::test]
         #[serial_test::serial(config_ledger)]
         async fn request_forward_policy_requires_every_operation_to_be_an_opted_in_read() {
-            let server = live_server();
+            let (_dir, server) = live_server();
             let cases = [
                 ("stats()", true),
                 (
@@ -5985,7 +6065,7 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial(config_ledger)]
         async fn malformed_and_atomic_wrapper_requests_never_reach_forwarding() {
-            let server = live_server();
+            let (_dir, server) = live_server();
             for ops in [
                 "",
                 "stats(",
@@ -6094,8 +6174,8 @@ mod tests {
             let socket = dir.path().join("khived.sock");
             std::env::set_var("KHIVE_SOCKET", &socket);
             std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
-            let client = live_server();
-            let daemon = live_server();
+            let (_client_dir, client) = live_server();
+            let (_daemon_dir, daemon) = live_server();
             let baseline = client
                 .dispatch_request_local(RequestParams {
                     ops: "stats()".to_string(),
@@ -6229,14 +6309,8 @@ mod tests {
         FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
         FORWARD_RELEASE.with(|c| *c.borrow_mut() = Some(release.clone()));
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let cancellation = tokio_util::sync::CancellationToken::new();
         let cancel_after_admission = cancellation.clone();
@@ -6290,14 +6364,8 @@ mod tests {
             panic!("save_to must bypass daemon forwarding regardless of cancellation");
         }
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         let (_tx, cancelled_rx) = tokio::sync::watch::channel(true);
@@ -6375,14 +6443,8 @@ mod tests {
         }
 
         for attempt in 0..50 {
-            let runtime = KhiveRuntime::new(RuntimeConfig {
-                db_path: None,
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                packs: vec!["kg".to_string()],
-                ..RuntimeConfig::default()
-            })
-            .expect("in-memory runtime");
+            let dir = tempfile::tempdir().expect("forwarding fixture directory");
+            let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
             let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -6483,14 +6545,8 @@ mod tests {
         FORWARD_RELEASE.with(|c| *c.borrow_mut() = Some(release.clone()));
         FORWARD_COMPLETED.with(|c| *c.borrow_mut() = Some(completed.clone()));
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let handler = tokio::spawn(async move {
             server
@@ -6557,14 +6613,8 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let cancellation = tokio_util::sync::CancellationToken::new();
         let cancel_after_admission = cancellation.clone();
@@ -6642,14 +6692,8 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let cancellation = tokio_util::sync::CancellationToken::new();
         let cancel_after_admission = cancellation.clone();
@@ -6739,14 +6783,8 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
 
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -6805,14 +6843,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_real_adapter_boundary() {
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "gtd".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime restricted to kg + gtd");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg", "gtd"]);
         let server =
             KhiveMcpServer::new(runtime).expect("server builds with restricted kg+gtd registry");
 
@@ -6858,14 +6890,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn request_with_cancellation_stamps_bridge_id_at_the_real_adapter_boundary() {
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::default()
-        })
-        .expect("in-memory runtime");
+        let dir = tempfile::tempdir().expect("forwarding fixture directory");
+        let runtime = forward_test_runtime(Some(dir.path().join("main.db")), &["kg"]);
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         crate::daemon::test_forward_seam::arm();
@@ -11223,16 +11249,18 @@ mod tests {
 
     // ── MCP-AUD-002 regression: save_to must bypass daemon forwarding ────────
 
-    fn make_daemon_save_to_test_server() -> KhiveMcpServer {
+    fn make_daemon_save_to_test_server(db_path: Option<std::path::PathBuf>) -> KhiveMcpServer {
         let config = RuntimeConfig {
-            db_path: None,
+            db_path,
             default_namespace: Namespace::parse("test").unwrap(),
+            actor_id: Some("test".to_string()),
             embedding_model: None,
             additional_embedding_models: vec![],
+            events_split: None,
             packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
         };
-        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let runtime = KhiveRuntime::new(config).expect("request fixture runtime");
         KhiveMcpServer::new(runtime).expect("server builds with kg")
     }
 
@@ -11265,7 +11293,7 @@ mod tests {
     #[test]
     #[serial_test::serial(config_ledger)]
     fn wire_daemon_frame_forwards_request_id() {
-        let server = make_daemon_save_to_test_server();
+        let server = make_daemon_save_to_test_server(None);
 
         let with_id = RequestParams {
             ops: "stats()".to_string(),
@@ -11318,7 +11346,8 @@ mod tests {
         clear_daemon_env();
         std::env::set_var("KHIVE_NO_DAEMON", "1");
 
-        let server = make_daemon_save_to_test_server();
+        let dir = tempfile::tempdir().expect("request fixture directory");
+        let server = make_daemon_save_to_test_server(Some(dir.path().join("main.db")));
         server
             .request(
                 Parameters(RequestParams {
@@ -11337,7 +11366,7 @@ mod tests {
 
         let store = server
             .event_store()
-            .expect("in-memory runtime must configure an EventStore");
+            .expect("request runtime must configure an EventStore");
         let matched = find_audit_event_with_request_id(&store, 9001).await;
         assert!(
             matched.is_some(),
@@ -11359,7 +11388,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
 
-        let server = make_daemon_save_to_test_server();
+        let server = make_daemon_save_to_test_server(Some(dir.path().join("main.db")));
         let sink_path = dir.path().join("out.jsonl");
         server
             .request(
@@ -11376,7 +11405,7 @@ mod tests {
 
         let store = server
             .event_store()
-            .expect("in-memory runtime must configure an EventStore");
+            .expect("request runtime must configure an EventStore");
         let matched = find_audit_event_with_request_id(&store, 9002).await;
         assert!(
             matched.is_some(),
@@ -11426,7 +11455,7 @@ mod tests {
         // (crate::save_sink); scope it to this test's tempdir.
         std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
 
-        let server = make_daemon_save_to_test_server();
+        let server = make_daemon_save_to_test_server(Some(dir.path().join("main.db")));
         let daemon_server = server.clone();
         let handle = tokio::spawn(async move {
             let _ = khive_runtime::daemon::run_daemon(daemon_server).await;
@@ -11490,7 +11519,7 @@ mod tests {
         std::env::set_var("KHIVE_PID", &pid);
         std::env::remove_var("KHIVE_NO_DAEMON");
 
-        let server = make_daemon_save_to_test_server();
+        let server = make_daemon_save_to_test_server(Some(dir.path().join("main.db")));
         let daemon_server = server.clone();
         let handle = tokio::spawn(async move {
             let _ = khive_runtime::daemon::run_daemon(daemon_server).await;
@@ -11559,14 +11588,16 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
 
         let config = RuntimeConfig {
-            db_path: None,
+            db_path: Some(dir.path().join("main.db")),
             default_namespace: Namespace::parse("test").unwrap(),
+            actor_id: Some("test".to_string()),
             embedding_model: None,
             additional_embedding_models: vec![],
+            events_split: None,
             packs: vec!["kg".to_string(), "comm".to_string()],
             ..RuntimeConfig::default()
         };
-        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let runtime = KhiveRuntime::new(config).expect("file-backed request runtime");
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
 
         // Fake "crashed daemon": accept exactly one connection, read the
@@ -11683,14 +11714,16 @@ mod tests {
         std::env::set_var("KHIVE_DAEMON_STRICT", "1");
 
         let config = RuntimeConfig {
-            db_path: None,
+            db_path: Some(dir.path().join("main.db")),
             default_namespace: Namespace::parse("test").unwrap(),
+            actor_id: Some("test".to_string()),
             embedding_model: None,
             additional_embedding_models: vec![],
+            events_split: None,
             packs: vec!["kg".to_string(), "comm".to_string()],
             ..RuntimeConfig::default()
         };
-        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let runtime = KhiveRuntime::new(config).expect("file-backed request runtime");
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
 
         let baseline = server

@@ -15,11 +15,24 @@ import json
 import subprocess
 import sys
 import os
+import tempfile
 import uuid
 
 from kkernel_binary import resolve_binary_path
 
 BINARY = resolve_binary_path()
+
+_SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-schedule-smoke-home-")
+
+
+def smoke_child_env(source=None) -> dict[str, str]:
+    """Keep inherited configuration and daemon routing out of in-memory fixtures."""
+    base = os.environ if source is None else source
+    env = {k: v for k, v in base.items() if not k.startswith("KHIVE_")}
+    env["HOME"] = _SMOKE_HOME.name
+    env["KHIVE_NO_DAEMON"] = "1"
+    return env
+
 
 request_id = 0
 
@@ -148,6 +161,7 @@ def spawn_proc():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=smoke_child_env(),
     )
 
 
