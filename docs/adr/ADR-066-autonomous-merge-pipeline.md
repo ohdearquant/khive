@@ -343,3 +343,13 @@ well-specified automation.
   explicitly not a gate in this model.
 - **No auto-merge, faster human review.** Does not address the volume problem; the bottleneck
   remains.
+
+## Amendment 1 (2026-09-22): repositories enrolled in an enforced charter follow ADR-193
+
+For a repository enrolled in an enforced `pr_merge` charter ([ADR-193](ADR-193-charter-runs.md),
+milestone M2), this record's merge authorisation model is superseded. Passing the gate wall is
+necessary and no longer sufficient: a merge also requires an independent review bound to the current
+head and, when the change touches `docs/adr/`, a head-bound approval from the named architecture
+authority, admitted through the charter. The required-context floor in the Mechanism section remains
+the check floor for such a repository. Release and publication rules here are unchanged. A repository
+that is not enrolled in an enforced charter is not affected by this amendment.

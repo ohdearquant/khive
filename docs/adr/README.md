@@ -209,6 +209,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-190](ADR-190-adr-to-code-citation-check.md)                        | One code-keyed check for ADR-to-code citations                                                             |
 | [ADR-191](ADR-191-web-pack-ontology-and-operations.md)                  | Web Pack — Web Ontology, Relation Rules, and Operations                                                    |
 | [ADR-192](ADR-192-credential-and-producer-seams.md)                     | Credential Seam and Producer Seams for Network Packs                                                       |
+| [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
 
 <!-- END GENERATED ADR CATALOG -->
 

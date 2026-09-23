@@ -1789,7 +1789,7 @@ where
 #[cfg(unix)]
 pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
     let boot_guard = Some(acquire_daemon_boot_guard()?);
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false).await
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, |_| {}).await
 }
 
 /// Run a real daemon server for an in-process multi-launch test.
@@ -1810,7 +1810,7 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 #[doc(hidden)]
 pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
     let boot_guard = Some(acquire_daemon_boot_guard()?);
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true).await
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true, |_| {}).await
 }
 
 /// Vet the socket's parent directory, re-permissioning it only when it is the
@@ -2052,24 +2052,42 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false).await
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, |_| {}).await
+}
+
+/// Run the daemon and start host-owned background work only after the socket
+/// is bound, permissions are restricted, and this process owns the PID file.
+/// The callback runs once while the startup lock and teardown guard are held;
+/// setup failures never invoke it. Work started by the callback must use the
+/// daemon shutdown token and tracked-task drain contract.
+#[cfg(unix)]
+pub async fn run_daemon_with_boot_guard_and_start<D, F>(
+    dispatcher: D,
+    boot_guard: Option<std::fs::File>,
+    start: F,
+) -> anyhow::Result<()>
+where
+    D: DaemonDispatch,
+    F: FnOnce(&D) + Send,
+{
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, start).await
 }
 
 #[cfg(unix)]
-async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
+async fn run_daemon_with_boot_guard_inner<D, F>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
     allow_same_process_incumbent: bool,
-) -> anyhow::Result<()> {
-    // ADR-119: components may have been started by the serve path before this
-    // function established (or failed to establish) daemon ownership. Cancel
-    // the process-wide shutdown token on EVERY exit — setup failures below,
-    // early return when another daemon owns the socket, bind errors, and
-    // normal shutdown alike — so supervisors never outlive this process's
-    // claim to daemon role. Constructed before any fallible startup work so
-    // no error path can precede it. The token is process-lifetime
-    // single-shot; a process that stops being (or never becomes) the daemon
-    // has no path back except exec.
+    start: F,
+) -> anyhow::Result<()>
+where
+    D: DaemonDispatch,
+    F: FnOnce(&D) + Send,
+{
+    // Cancel on every exit, including setup failure and unwinding from the
+    // post-ownership startup callback. The guard precedes all fallible work
+    // so even a process that never becomes the daemon relinquishes its
+    // process-lifetime shutdown token; restarting requires exec.
     struct ComponentTeardown;
     impl Drop for ComponentTeardown {
         fn drop(&mut self) {
@@ -2197,6 +2215,8 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
         }
         return Err(e.into());
     }
+    start(&dispatcher);
+
     // Release the startup lock now: the listener is bound and the PID file is
     // written.  Any concurrent client or daemon startup will observe a live
     // socket+pid and take the non-recovery path.
@@ -3332,7 +3352,34 @@ mod tests {
             pool: None,
             dispatch_err: None,
         };
-        let daemon = tokio::spawn(run_daemon(dispatcher));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_starts = Arc::clone(&starts);
+        let callback_stopped = Arc::clone(&stopped);
+        let boot_guard = Some(acquire_daemon_boot_guard().expect("boot guard"));
+        let daemon = tokio::spawn(run_daemon_with_boot_guard_and_start(
+            dispatcher,
+            boot_guard,
+            move |_| {
+                use std::os::unix::fs::FileTypeExt;
+                assert!(std::fs::metadata(socket_path())
+                    .unwrap()
+                    .file_type()
+                    .is_socket());
+                assert_eq!(
+                    std::fs::read_to_string(pid_path()).unwrap(),
+                    std::process::id().to_string()
+                );
+                assert_eq!(
+                    callback_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                track_named_background_task("startup-lifecycle-test", async move {
+                    daemon_shutdown_token().cancelled().await;
+                    callback_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            },
+        ));
         let sock = socket_path();
         let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -3357,6 +3404,7 @@ mod tests {
         let response: DaemonResponseFrame =
             serde_json::from_slice(&response).expect("decode readiness response");
         assert!(response.ok, "daemon readiness failed: {response:?}");
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(stream);
 
         // SAFETY: the isolated child signals only itself, after installing its handler.
@@ -3401,6 +3449,10 @@ mod tests {
         assert!(
             !pid_path().exists(),
             "owned PID must be removed after drain"
+        );
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "work started after ownership must finish inside daemon drain"
         );
         println!("STOPPED_LISTENER_DRAIN_VERIFIED");
     }
