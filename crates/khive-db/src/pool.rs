@@ -28,6 +28,34 @@ const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Runtime-owned SQL transactions that share the store write-routing policy.
+#[derive(Clone, Copy, Debug)]
+pub enum RuntimeWriteOperation {
+    MergeEntity,
+    MergeNote,
+    UpdateSymmetricEdge,
+}
+
+impl RuntimeWriteOperation {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::MergeEntity => "merge_entity",
+            Self::MergeNote => "merge_note",
+            Self::UpdateSymmetricEdge => "update_edge",
+        }
+    }
+
+    fn fallback_site(self) -> crate::timeout_sink::Site {
+        match self {
+            Self::MergeEntity => crate::timeout_sink::Site::DirectRouteRuntimeMergeEntity,
+            Self::MergeNote => crate::timeout_sink::Site::DirectRouteRuntimeMergeNote,
+            Self::UpdateSymmetricEdge => {
+                crate::timeout_sink::Site::DirectRouteRuntimeUpdateSymmetricEdge
+            }
+        }
+    }
+}
+
 /// Bounded WAL autocheckpoint applied to writer-capable connections while no
 /// dedicated checkpoint owner has claimed the pool (4,000 pages ≈ 16 MiB at
 /// SQLite's default 4 KiB page size — SQLite's historic behaviour for this
@@ -235,8 +263,7 @@ pub struct PoolConfig {
     /// The store layer resolves all of its routed write paths at write time;
     /// the classification table in `writer_task.rs` remains the authoritative
     /// inventory. This tranche does not claim the repository-wide
-    /// single-writer guarantee: direct runtime-orchestration call sites remain
-    /// #1847 follow-up work, and the strict default is still evidence-gated.
+    /// single-writer guarantee, and the strict default is still evidence-gated.
     ///
     /// `None` means the caller expressed no preference: [`ConnectionPool::new`]
     /// resolves it once `path` is known, defaulting to `true` for file-backed
@@ -1989,6 +2016,21 @@ impl ConnectionPool {
         }
     }
 
+    /// Resolve a runtime-owned transaction through the same strict/compatibility
+    /// policy as store writes. `None` permits the caller's direct transaction and
+    /// records its compatibility fallback when the file-backed queue is enabled.
+    /// A strict refusal returns before any direct-writer acquisition or telemetry.
+    pub fn writer_task_for_runtime_write(
+        &self,
+        operation: RuntimeWriteOperation,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        let handle = self.writer_task_for_write(None, operation.operation())?;
+        if handle.is_none() {
+            self.record_direct_route(operation.fallback_site());
+        }
+        Ok(handle)
+    }
+
     /// Test-only: how many times the writer-task init closure actually ran.
     /// Must be at most 1 for the pool's whole lifetime, regardless of how
     /// many times [`Self::writer_task_handle`] is called or how many stores
@@ -2935,6 +2977,10 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
     )
     .into()
 }
+
+#[cfg(test)]
+#[path = "runtime_write_routing_tests.rs"]
+mod runtime_write_routing_tests;
 
 #[cfg(test)]
 mod tests {
