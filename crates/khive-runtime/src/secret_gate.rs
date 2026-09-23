@@ -52,6 +52,10 @@
 
 use crate::error::{RuntimeError, RuntimeResult};
 
+mod submitted_atom_digest;
+
+pub use submitted_atom_digest::masked_submitted_atom_digest_v1;
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Returned when a write would store credential-looking content.

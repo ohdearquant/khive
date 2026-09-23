@@ -5015,6 +5015,10 @@ impl KhiveRuntime {
                 ..
             }) => Err(conflict.into_error().into()),
             Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::EntityConflict(conflict),
+                ..
+            }) => Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::GuardFailed { .. },
                 ..
             }) => Ok(false),
@@ -5082,15 +5086,20 @@ impl KhiveRuntime {
         let mut restored = entity;
         restored.deleted_at = None;
         restored.updated_at = updated_at;
+        restored.version = restored
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
         let mut statements = vec![PlanStatement {
             statement: SqlStatement {
-                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1 \
-                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
+                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1, version=version+1 \
+                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL AND version=?4"
                     .into(),
                 params: vec![
                     SqlValue::Integer(updated_at),
                     SqlValue::Text(id.to_string()),
                     SqlValue::Text(token.namespace().as_str().to_owned()),
+                    SqlValue::Integer(restored.version - 1),
                 ],
                 label: Some("entity-restore".into()),
             },
@@ -5115,17 +5124,18 @@ impl KhiveRuntime {
                 guard: None,
             });
         }
-        let plan = AtomicOpPlan::Update(UpdatePlan {
+        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             target_id: id,
             statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,
-        });
+        }));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 // Embeddings are rebuilt after the commit; the row and its
@@ -5239,17 +5249,18 @@ impl KhiveRuntime {
                 guard: None,
             });
         }
-        let plan = AtomicOpPlan::Update(UpdatePlan {
+        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             target_id: id,
             statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,
-        });
+        }));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 #[cfg(any(test, feature = "fault-injection"))]
@@ -5307,7 +5318,7 @@ impl KhiveRuntime {
             return Ok(Some((edge, false)));
         }
         let updated_at = Utc::now();
-        let plan = AtomicOpPlan::Update(UpdatePlan {
+        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             target_id: id,
             statements: vec![PlanStatement {
@@ -5327,10 +5338,11 @@ impl KhiveRuntime {
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,
-        });
+        }));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 let mut restored = edge;
@@ -6895,39 +6907,7 @@ impl KhiveRuntime {
         // Any validation failure here guarantees zero rows are written.
         let mut entities = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
-            let record = format!("entity[{index}]");
-            self.validate_entity_kind(&spec.kind)?;
-            // Validate entity_type at the runtime layer via pack-installed callback.
-            // When no validator is installed (bare runtime, unit tests without packs),
-            // the type passes through unchanged — same skip-when-absent pattern as
-            // validate_entity_kind. The handler layer remains the primary enforcement point.
-            let validated_type =
-                self.validate_entity_type_for_kind(&spec.kind, spec.entity_type.as_deref())?;
-            if spec.name.trim().is_empty() {
-                return Err(RuntimeError::InvalidInput("name must not be empty".into()));
-            }
-            crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
-            crate::secret_gate::check_at(&spec.name, &record, "name")?;
-            if let Some(d) = &spec.description {
-                crate::secret_gate::check_at(d, &record, "description")?;
-            }
-            if let Some(ref p) = spec.properties {
-                crate::secret_gate::check_json_at(p, &record, "properties")?;
-            }
-            crate::secret_gate::check_tags_at(&spec.tags, &record, "tags")?;
-
-            let mut entity =
-                Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
-            if let Some(d) = &spec.description {
-                entity = entity.with_description(d);
-            }
-            if let Some(p) = spec.properties.clone() {
-                entity = entity.with_properties(p);
-            }
-            if !spec.tags.is_empty() {
-                entity = entity.with_tags(spec.tags.clone());
-            }
-            entities.push(entity);
+            entities.push(self.validate_bulk_entity(ns, spec, &format!("entity[{index}]"))?);
         }
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -6998,6 +6978,141 @@ impl KhiveRuntime {
             ))),
         }
     }
+
+    /// One bulk entity spec's pre-write checks and its row, shared by
+    /// `create_many` and [`Self::prepare_bulk_entity_plan`] so the two bulk
+    /// entity paths cannot drift apart: kind, entity_type, a nonempty name,
+    /// the reserved secret-gate property and the secret gate itself.
+    fn validate_bulk_entity(
+        &self,
+        ns: &str,
+        spec: &EntityCreateSpec,
+        record: &str,
+    ) -> RuntimeResult<Entity> {
+        self.validate_entity_kind(&spec.kind)?;
+        // Validate entity_type at the runtime layer via pack-installed callback.
+        // When no validator is installed (bare runtime, unit tests without packs),
+        // the type passes through unchanged, the same skip-when-absent pattern as
+        // validate_entity_kind. The handler layer remains the primary enforcement point.
+        let validated_type =
+            self.validate_entity_type_for_kind(&spec.kind, spec.entity_type.as_deref())?;
+        if spec.name.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+        }
+        crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
+        crate::secret_gate::check_at(&spec.name, record, "name")?;
+        if let Some(d) = &spec.description {
+            crate::secret_gate::check_at(d, record, "description")?;
+        }
+        if let Some(ref p) = spec.properties {
+            crate::secret_gate::check_json_at(p, record, "properties")?;
+        }
+        crate::secret_gate::check_tags_at(&spec.tags, record, "tags")?;
+
+        let mut entity =
+            Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
+        if let Some(d) = &spec.description {
+            entity = entity.with_description(d);
+        }
+        if let Some(p) = spec.properties.clone() {
+            entity = entity.with_properties(p);
+        }
+        if !spec.tags.is_empty() {
+            entity = entity.with_tags(spec.tags.clone());
+        }
+        Ok(entity)
+    }
+
+    /// Validate and prepare one entity item for a bulk `create(items=[...])`
+    /// write: `create_many`'s per-item checks, then a row and FTS insert plan
+    /// with no scheduled reindex, so the vector is deferred to a later
+    /// `reindex` exactly as for `create_many`. The bulk create handler uses
+    /// this for every entity item so entity and note plans can join one
+    /// `run_atomic_unit` call.
+    pub async fn prepare_bulk_entity_plan(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityCreateSpec,
+    ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
+        let entity = self.validate_bulk_entity(token.namespace().as_str(), &spec, "entity")?;
+        let _ = self.entities(token)?;
+        let _ = self.text(token)?;
+
+        let mut statements = vec![PlanStatement {
+            statement: entity_upsert_statement(&entity),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }];
+        for statement in insert_document_statements("fts_entities", &entity_fts_document(&entity)) {
+            statements.push(PlanStatement {
+                statement,
+                guard: None,
+            });
+        }
+
+        let plan = AtomicOpPlan::AddEntity(AddEntityPlan {
+            entity_id: entity.id,
+            statements,
+            post_commit: PostCommitEffect::None,
+        });
+        Ok((entity, plan))
+    }
+
+    /// Validate and prepare one note item for a bulk `create(items=[...])`
+    /// write. The note goes through the preparation a singleton note create
+    /// uses (`validate_head`, then `prepare_atomic_notes`: kind validation,
+    /// owned-identity derivation, secret gate, salience range, row and FTS
+    /// statements) with embedding switched off, so the plan writes the row
+    /// and its FTS document and no vector. A later `reindex` backfills the
+    /// vector, as it does for bulk entities. The caller commits the plan,
+    /// alone or joined with its siblings in one `run_atomic_unit` call.
+    pub async fn prepare_bulk_note_plan(
+        &self,
+        token: &NamespaceToken,
+        spec: NoteCreateSpec,
+    ) -> RuntimeResult<(Note, AtomicOpPlan)> {
+        let mut candidate = Note::new(token.namespace().as_str(), &spec.kind, &spec.content);
+        candidate.name = spec.name.clone();
+        candidate.properties = spec.properties.clone();
+        crate::note_write::validate_head(&candidate)?;
+        let mut prepared = crate::atomic_message::prepare_atomic_notes(
+            self,
+            vec![crate::atomic_message::AtomicNoteSpec {
+                token,
+                id: None,
+                kind: &spec.kind,
+                name: spec.name.as_deref(),
+                content: &spec.content,
+                properties: spec.properties,
+            }],
+            crate::atomic_message::AtomicNoteOptions {
+                salience: spec.salience,
+                embed: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+        match (prepared.notes.pop(), prepared.plans.pop()) {
+            (Some(note), Some(plan)) if prepared.notes.is_empty() && prepared.plans.is_empty() => {
+                Ok((note, plan))
+            }
+            _ => Err(RuntimeError::Internal(
+                "bulk note preparation must yield exactly one note and one plan".into(),
+            )),
+        }
+    }
+}
+
+/// One note item for [`KhiveRuntime::prepare_bulk_note_plan`], the note
+/// analogue of [`EntityCreateSpec`]. The caller has already run the kind's
+/// own preparation hook, so owner-kind policy such as the memory pack's
+/// creation refusal happens before this point.
+#[derive(Clone, Debug)]
+pub struct NoteCreateSpec {
+    pub kind: String,
+    pub name: Option<String>,
+    pub content: String,
+    pub salience: Option<f64>,
+    pub properties: Option<serde_json::Value>,
 }
 
 fn guarded_link_batch_failure(

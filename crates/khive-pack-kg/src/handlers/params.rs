@@ -12,15 +12,30 @@ pub(crate) struct EdgeSpec {
     pub(crate) weight: Option<f64>,
 }
 
-/// A single entry in a bulk `create(items=[...])` request.
+/// A single entry in a bulk `create(items=[...])` request: entity fields
+/// when `kind` resolves to an entity kind, note fields when it resolves to a
+/// note kind (ADR-023's note-aware bulk create amendment). `name` and
+/// `content` are `Option` here: required-ness is substrate-dependent and is
+/// enforced after `kind` resolves, in `create.rs`, so a missing-content note
+/// item or a missing-name entity item is that item's own indexed failure
+/// rather than a whole-request deserialization error. `create.rs` also
+/// rejects a field that does not apply to the resolved substrate (an
+/// entity-only field on a note item, or vice versa) rather than ignoring it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BulkCreateEntry {
     pub(crate) kind: String,
-    pub(crate) name: String,
+    // required for an entity item, optional for a note item
+    pub(crate) name: Option<String>,
+    // entity-only
     pub(crate) entity_kind: Option<String>,
     pub(crate) entity_type: Option<String>,
     pub(crate) description: Option<String>,
+    // note-only
+    pub(crate) content: Option<String>,
+    pub(crate) note_kind: Option<String>,
+    pub(crate) salience: Option<f64>,
+    // shared
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
 }

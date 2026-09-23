@@ -75,6 +75,7 @@ struct EntityMeta {
     tags: Vec<String>,
     created_at: i64,
     updated_at: i64,
+    version: i64,
 }
 
 /// Strict, canonical search request shared by the KG handler and the
@@ -398,6 +399,7 @@ impl KgPack {
                                     tags: e.tags,
                                     created_at: e.created_at,
                                     updated_at: e.updated_at,
+                                    version: e.version,
                                 },
                             )
                         })
@@ -461,10 +463,7 @@ impl KgPack {
                             "snippet": h.snippet,
                             "created_at": created_at,
                             "updated_at": updated_at,
-                            // Entities carry no persisted revision — the column
-                            // exists on notes only — so the field is present for
-                            // row-shape parity across substrates and always null.
-                            "version": Value::Null,
+                            "version": meta.map(|m| m.version),
                         })
                     })
                     .collect();

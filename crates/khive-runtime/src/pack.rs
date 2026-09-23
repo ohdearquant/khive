@@ -112,6 +112,12 @@ fn resolution_mode_contract(mode: IdResolutionMode) -> Option<&'static str> {
              this parameter itself; any namespace scoping comes from the enclosing operation, \
              not from this identifier.",
         ),
+        IdResolutionMode::EdgeOrEventTarget => Some(
+            "ID contract (list target by kind): kind=event accepts only a full subject UUID; \
+             prefixes and names are rejected without graph resolution. Event rows remain \
+             scoped to the authorized event namespace. For kind=edge, a full UUID resolves as \
+             given; a unique 8+ hex prefix or entity name resolves in the primary namespace.",
+        ),
     }
 }
 
@@ -125,6 +131,7 @@ fn resolution_mode_key(mode: IdResolutionMode) -> &'static str {
         IdResolutionMode::FullAndPrefixScopedToPrimary => "full_and_prefix_scoped_to_primary",
         IdResolutionMode::FullUuidOnlyScopedToPrimary => "full_uuid_only_scoped_to_primary",
         IdResolutionMode::UnscopedFullUuidOnly => "unscoped_full_uuid_only",
+        IdResolutionMode::EdgeOrEventTarget => "edge_or_event_target",
     }
 }
 
@@ -135,6 +142,7 @@ fn identifier_resolution_help() -> Value {
         IdResolutionMode::FullAndPrefixScopedToPrimary,
         IdResolutionMode::FullUuidOnlyScopedToPrimary,
         IdResolutionMode::UnscopedFullUuidOnly,
+        IdResolutionMode::EdgeOrEventTarget,
     ]
     .into_iter()
     .map(|mode| {
@@ -617,11 +625,25 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// The draft kind is canonical.
     /// This must not mutate storage or normalize the approved draft. The default
     /// accepts it. This separate seam never invokes shared-create lifecycle
-    /// hooks and does not apply to AddNote.
+    /// hooks and does not apply to AddNote; see `validate_proposal_note` below
+    /// for that route.
     fn validate_proposal_entity(
         &self,
         _entity: &khive_types::EntityDraft,
     ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Validate an `AddNote` draft on the proposal-note route, analogous to
+    /// [`Self::validate_proposal_entity`] but for notes. The kg pack's
+    /// proposal route calls this against the same immutable changeset at two
+    /// points: once when a new `propose` call is accepted, and again when an
+    /// approved proposal is applied, so a kind that refuses shared creation
+    /// is not bypassed by proposing the same creation instead. The draft's
+    /// kind is the owning pack's canonical spelling. This must not mutate
+    /// storage or normalize the draft; it only accepts or refuses. The
+    /// default accepts it.
+    fn validate_proposal_note(&self, _note: &khive_types::NoteDraft) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -15179,6 +15201,21 @@ mod help_tests {
         assert!(identifier_help["parameter_rule"]
             .as_str()
             .is_some_and(|text| text.contains("submitted again")));
+    }
+
+    #[test]
+    fn event_target_resolution_metadata_has_a_conditional_contract() {
+        let mode = IdResolutionMode::EdgeOrEventTarget;
+        let text = resolution_mode_contract(mode).unwrap();
+        assert!(text.contains("kind=event accepts only a full subject UUID"));
+        assert!(text.contains("prefixes and names are rejected without graph resolution"));
+        assert!(text.contains("For kind=edge"));
+        assert!(text.contains("prefix or entity name resolves in the primary namespace"));
+        assert_eq!(resolution_mode_key(mode), "edge_or_event_target");
+        assert_eq!(
+            identifier_resolution_help()["resolution_modes"]["edge_or_event_target"],
+            text
+        );
     }
 
     /// `describe_verb` appends `resolution_mode_contract(p.resolution_mode)`

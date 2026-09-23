@@ -131,7 +131,9 @@ impl AuditObligationFailure {
         Self {
             reason: AuditObligationReason::GitDigestReceiptFailure,
             verb: "git.digest".into(),
-            message: format!("git_digest_receipt_persist_failed: {branch}; git.digest writes may have committed, but no durable success receipt was confirmed; inspect ingest state before retrying"),
+            message: format!(
+                "git_digest_receipt_persist_failed: {branch}; git.digest writes may have committed, but no durable success receipt was confirmed; inspect ingest state before retrying"
+            ),
             source: None,
         }
     }
@@ -515,6 +517,63 @@ pub struct ReceiptRefusal {
     pub detail: serde_json::Value,
 }
 
+/// Bounded failure evidence; never carries rejected input or a storage error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalRecordingErrorClass {
+    EventStoreUnavailable,
+    EventAppendFailed,
+}
+
+impl RefusalRecordingErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EventStoreUnavailable => "event_store_unavailable",
+            Self::EventAppendFailed => "event_append_failed",
+        }
+    }
+}
+
+/// Event evidence for one eligible existing target in a refused request.
+/// `Failed` means no confirmed event, not proof that an ambiguous append wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum RefusalEventRecording {
+    Recorded {
+        item_index: usize,
+        subject: Uuid,
+        event_id: Uuid,
+    },
+    Failed {
+        item_index: usize,
+        subject: Uuid,
+        error_class: RefusalRecordingErrorClass,
+    },
+}
+
+/// Original refusal and the independent evidence of recording it.
+///
+/// The runtime variant transparently forwards this context's error source, which
+/// deliberately exposes the contained `RuntimeError`, not its `Box` or its own
+/// underlying source. This keeps typed consumers at the original refusal first.
+#[derive(Debug)]
+pub struct RefusalEventContext {
+    pub source: Box<RuntimeError>,
+    pub recordings: Vec<RefusalEventRecording>,
+}
+
+impl std::fmt::Display for RefusalEventContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.source.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for RefusalEventContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
@@ -641,6 +700,12 @@ pub enum RuntimeError {
     /// runtime: the error enum is copied on each `?`, the refusal is rare.
     #[error("{}", .0.message)]
     RefusedWithReceipt(Box<ReceiptRefusal>),
+
+    /// Original typed refusal, with recording evidence independent of the refused write.
+    /// Construct through [`Self::with_refusal_events`] so no eligible targets means
+    /// an unchanged, unadorned refusal.
+    #[error(transparent)]
+    RefusedWithEvents { context: RefusalEventContext },
 
     /// Gate denied this verb invocation.
     ///
@@ -782,6 +847,36 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Attach only evidence for established, eligible targets. Missing/new targets
+    /// contribute no entry, and an empty batch leaves the error variant unchanged.
+    pub fn with_refusal_events(self, mut recordings: Vec<RefusalEventRecording>) -> Self {
+        if recordings.is_empty() {
+            return self;
+        }
+        match self {
+            Self::RefusedWithEvents { mut context } => {
+                context.recordings.append(&mut recordings);
+                Self::RefusedWithEvents { context }
+            }
+            source => Self::RefusedWithEvents {
+                context: RefusalEventContext {
+                    source: Box::new(source),
+                    recordings,
+                },
+            },
+        }
+    }
+
+    /// Inspect the original typed error without treating event-recording failure
+    /// as the failed domain operation or losing its policy/retry classification.
+    pub fn refusal_source(&self) -> &Self {
+        let mut error = self;
+        while let Self::RefusedWithEvents { context } = error {
+            error = &context.source;
+        }
+        error
+    }
+
     /// Whether the immutable stream record policy refused this write.
     ///
     /// Only the structured runtime marker establishes this class. Ordinary
@@ -789,7 +884,7 @@ impl RuntimeError {
     /// not acquire a refusal classification from their rendered messages.
     /// These membership guards refuse before applying the requested domain write.
     pub fn is_stream_policy_refusal(&self) -> bool {
-        matches!(self, Self::Khive(error)
+        matches!(self.refusal_source(), Self::Khive(error)
             if error.kind() == khive_types::ErrorKind::Conflict
                 && error.details().and_then(|details| details.get("reason"))
                     == Some("stream_member"))
@@ -812,10 +907,11 @@ impl RuntimeError {
     /// [`Self::retryable_failure_context`] is deliberately not interpreted as
     /// permanent: every other variant starts in the bounded `Unknown` bucket.
     pub fn channel_ingest_failure_class(&self) -> ChannelIngestFailureClass {
-        let reason = self.variant_name();
-        if self.retryable_failure_context().is_some() {
+        let source = self.refusal_source();
+        let reason = source.variant_name();
+        if source.retryable_failure_context().is_some() {
             ChannelIngestFailureClass::Retryable { reason }
-        } else if matches!(self, Self::SecretDetected(_)) {
+        } else if matches!(source, Self::SecretDetected(_)) {
             ChannelIngestFailureClass::Permanent { reason }
         } else {
             ChannelIngestFailureClass::Unknown { reason }
@@ -823,7 +919,7 @@ impl RuntimeError {
     }
 
     /// Stable top-level variant name used by typed policy classifiers.
-    const fn variant_name(&self) -> &'static str {
+    fn variant_name(&self) -> &'static str {
         match self {
             Self::AuditObligation { .. } => "AuditObligation",
             Self::Storage(_) => "Storage",
@@ -862,6 +958,7 @@ impl RuntimeError {
             Self::DeadlineExceeded { .. } => "DeadlineExceeded",
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
             Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
+            Self::RefusedWithEvents { context } => context.source.variant_name(),
         }
     }
 
@@ -873,7 +970,7 @@ impl RuntimeError {
     /// through the runtime wrapper for the MCP wire serializer. A direct
     /// `RuntimeError::Sqlite` follows the same classification path.
     pub fn writer_pool_checkout_timeout_context(&self) -> Option<WriterPoolCheckoutTimeoutContext> {
-        let (sqlite_error, capability, operation) = match self {
+        let (sqlite_error, capability, operation) = match self.refusal_source() {
             Self::Sqlite(error) => (error, None, None),
             Self::Storage(khive_storage::StorageError::Driver {
                 capability,
@@ -902,6 +999,7 @@ impl RuntimeError {
     /// Both are safe to classify as retryable: the request was never
     /// accepted, so no partial side effect can exist to roll back.
     pub fn admission_failure_context(&self) -> Option<AdmissionFailureContext> {
+        let source = self.refusal_source();
         if let Some(context) = self.writer_pool_checkout_timeout_context() {
             return Some(AdmissionFailureContext {
                 stage: WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
@@ -912,7 +1010,7 @@ impl RuntimeError {
                 retry_after_ms: None,
             });
         }
-        if let Self::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms }) = self {
+        if let Self::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms }) = source {
             return Some(AdmissionFailureContext {
                 stage: WRITER_QUEUE_SATURATED_STAGE,
                 timeout: Duration::from_millis(*timeout_ms),
@@ -925,7 +1023,7 @@ impl RuntimeError {
         if let Self::Storage(khive_storage::StorageError::AdmissionTimeout {
             operation,
             timeout_ms,
-        }) = self
+        }) = source
         {
             return Some(AdmissionFailureContext {
                 stage: STORAGE_ADMISSION_TIMEOUT_STAGE,
@@ -943,7 +1041,7 @@ impl RuntimeError {
     /// error. Ordinary proven rollbacks and terminal writer failures are
     /// deliberately distinct even when they carry the same request state.
     pub fn writer_task_failure_context(&self) -> Option<WriterTaskFailureContext> {
-        let Self::Storage(error) = self else {
+        let Self::Storage(error) = self.refusal_source() else {
             return None;
         };
         match error {
@@ -971,10 +1069,11 @@ impl RuntimeError {
     /// Recover every typed failure for which this process can prove that
     /// retrying the one failed operation cannot duplicate a side effect.
     pub fn retryable_failure_context(&self) -> Option<RetryableFailureContext> {
+        let source = self.refusal_source();
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());
         }
-        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self {
+        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = source {
             return Some(RetryableFailureContext {
                 stage: WRITER_TASK_BEGIN_BUSY_STAGE,
                 timeout: Duration::from_millis(*timeout_ms),
@@ -987,7 +1086,7 @@ impl RuntimeError {
         if let Self::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
             operation,
             max_age_secs,
-        }) = self
+        }) = source
         {
             return Some(RetryableFailureContext {
                 stage: READ_TX_AGE_EVICTED_STAGE,
@@ -1004,7 +1103,7 @@ impl RuntimeError {
                 max_age_secs,
                 ..
             },
-        ) = self
+        ) = source
         {
             return Some(RetryableFailureContext {
                 stage: READ_TX_AGE_EVICTED_STAGE,
@@ -1067,6 +1166,190 @@ impl From<khive_types::EntityTypeError> for RuntimeError {
 impl From<khive_types::KhiveError> for RuntimeError {
     fn from(e: khive_types::KhiveError) -> Self {
         Self::Khive(e)
+    }
+}
+
+#[cfg(test)]
+mod refusal_event_context_tests {
+    use super::*;
+
+    fn failed() -> Vec<RefusalEventRecording> {
+        vec![RefusalEventRecording::Failed {
+            item_index: 2,
+            subject: Uuid::from_u128(11),
+            error_class: RefusalRecordingErrorClass::EventAppendFailed,
+        }]
+    }
+
+    #[test]
+    fn refusal_events_preserve_the_source_type_display_and_policy_class() {
+        let original = RuntimeError::SecretDetected(crate::secret_gate::SecretMatch {
+            detector: "fixture",
+            trigger: None,
+            masked: "never-in-display".into(),
+            location: Some("atoms[2].content".into()),
+        });
+        let message = original.to_string();
+        let wrapped = original.with_refusal_events(failed());
+        assert_eq!(wrapped.to_string(), message);
+        assert!(matches!(
+            wrapped.refusal_source(),
+            RuntimeError::SecretDetected(_)
+        ));
+        assert!(std::error::Error::source(&wrapped)
+            .unwrap()
+            .downcast_ref::<RuntimeError>()
+            .is_some_and(|error| matches!(error, RuntimeError::SecretDetected(_))));
+        assert_eq!(
+            wrapped.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Permanent {
+                reason: "SecretDetected"
+            }
+        );
+        assert!(wrapped.retryable_failure_context().is_none());
+
+        let lookalike = RuntimeError::InvalidInput(message).with_refusal_events(failed());
+        assert_eq!(
+            lookalike.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Unknown {
+                reason: "InvalidInput"
+            }
+        );
+        let policy = RuntimeError::Khive(
+            khive_types::KhiveError::conflict("immutable")
+                .with_details(khive_types::Details::new([("reason", "stream_member")])),
+        )
+        .with_refusal_events(failed());
+        assert!(policy.is_stream_policy_refusal());
+    }
+
+    #[test]
+    fn refusal_events_preserve_retry_and_writer_finality_contexts() {
+        let checkout = RuntimeError::Sqlite(khive_db::SqliteError::WriterPoolCheckoutTimeout {
+            timeout: Duration::from_millis(17),
+        })
+        .with_refusal_events(failed());
+        assert_eq!(
+            checkout
+                .writer_pool_checkout_timeout_context()
+                .unwrap()
+                .timeout,
+            Duration::from_millis(17)
+        );
+        assert_eq!(
+            checkout.admission_failure_context().unwrap().stage,
+            WRITER_POOL_CHECKOUT_TIMEOUT_STAGE
+        );
+        assert_eq!(
+            checkout.retryable_failure_context().unwrap().stage,
+            WRITER_POOL_CHECKOUT_TIMEOUT_STAGE
+        );
+
+        let queued =
+            RuntimeError::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms: 23 })
+                .with_refusal_events(failed());
+        assert_eq!(
+            queued.retryable_failure_context().unwrap().stage,
+            WRITER_QUEUE_SATURATED_STAGE
+        );
+        assert_eq!(
+            queued.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+
+        let busy =
+            RuntimeError::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms: 31 })
+                .with_refusal_events(failed());
+        assert_eq!(
+            busy.retryable_failure_context().unwrap().stage,
+            WRITER_TASK_BEGIN_BUSY_STAGE
+        );
+
+        let stopped = RuntimeError::Storage(khive_storage::StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        })
+        .with_refusal_events(failed());
+        let context = stopped.writer_task_failure_context().unwrap();
+        assert_eq!(
+            context.request_state,
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown
+        );
+        assert!(context.task_terminated);
+        assert!(!context.retryable);
+        assert!(stopped.retryable_failure_context().is_none());
+    }
+
+    #[test]
+    fn refusal_events_preserve_the_original_error_and_its_underlying_source_chain() {
+        let original = RuntimeError::Storage(khive_storage::StorageError::driver(
+            khive_storage::StorageCapability::Notes,
+            "refusal-context-fixture",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture refusal"),
+        ));
+        let message = original.to_string();
+        let wrapped = original.with_refusal_events(failed());
+        assert_eq!(wrapped.to_string(), message);
+
+        let runtime = std::error::Error::source(&wrapped)
+            .unwrap()
+            .downcast_ref::<RuntimeError>()
+            .expect("the first source must retain the runtime classification");
+        assert!(matches!(runtime, RuntimeError::Storage(_)));
+        let storage = std::error::Error::source(runtime)
+            .unwrap()
+            .downcast_ref::<khive_storage::StorageError>()
+            .expect("the original runtime error must retain its storage source");
+        let driver = std::error::Error::source(storage)
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .expect("the storage source chain must remain traversable");
+        assert_eq!(driver.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn refusal_events_with_no_eligible_targets_do_not_wrap_or_grow_metadata() {
+        let error = RuntimeError::InvalidInput("unchanged".into()).with_refusal_events(vec![]);
+        assert!(matches!(error, RuntimeError::InvalidInput(ref message) if message == "unchanged"));
+        let error = error
+            .with_refusal_events(failed())
+            .with_refusal_events(vec![RefusalEventRecording::Recorded {
+                item_index: 3,
+                subject: Uuid::from_u128(12),
+                event_id: Uuid::from_u128(13),
+            }]);
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<RuntimeError>()
+            .expect("appending recordings must not add another error wrapper");
+        assert!(matches!(source, RuntimeError::InvalidInput(_)));
+        assert!(std::error::Error::source(source).is_none());
+        let RuntimeError::RefusedWithEvents { context } = error else {
+            panic!("recordings must accompany the original typed source");
+        };
+        let RefusalEventContext { source, recordings } = context;
+        assert!(matches!(*source, RuntimeError::InvalidInput(_)));
+        assert_eq!(recordings.len(), 2);
+        assert_eq!(recordings[0], failed()[0]);
+    }
+
+    #[test]
+    fn refusal_recording_classes_serialize_only_the_closed_safe_spellings() {
+        for (class, name) in [
+            (
+                RefusalRecordingErrorClass::EventStoreUnavailable,
+                "event_store_unavailable",
+            ),
+            (
+                RefusalRecordingErrorClass::EventAppendFailed,
+                "event_append_failed",
+            ),
+        ] {
+            assert_eq!(class.as_str(), name);
+            assert_eq!(
+                serde_json::to_value(class).unwrap(),
+                serde_json::json!(name)
+            );
+        }
     }
 }
 

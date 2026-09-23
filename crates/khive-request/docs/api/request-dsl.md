@@ -19,6 +19,30 @@ verb(arg=value, arg=value)
 Ops run concurrently. Results are collected in input order.
 Maximum 100 ops per request (`MAX_OPS`).
 
+### Bracketed batch of chains (parallel units)
+
+```
+[verb1(arg=value) | verb2(id=$prev.id), verb3(arg=value), verb4(arg=value) | verb5(id=$prev.id)]
+```
+
+A comma inside the outer brackets separates independent **units**; a `|`
+inside one unit sequences that unit's own ops exactly as plain chain mode
+does. An ordinary flat batch (`[verb1(...), verb2(...)]`) is the case where
+every unit has exactly one op; same syntax, same results, unchanged from
+before this form existed.
+
+Units run concurrently with each other (bounded, same as an ordinary batch).
+Each unit's own ops run sequentially, and `$prev` inside a unit resolves
+against that unit's immediately preceding op only; the first op of a unit
+can never reference `$prev`, and no op can reference another unit's result.
+A failing op aborts the rest of its own unit; sibling units are unaffected.
+Results are one flat list in source order, each carrying the op's global
+position, its unit, and its position within that unit (`op_index`,
+`unit_index`, `step_index`), additive fields present only on this form's
+results.
+
+No `[...]` may appear inside a unit; nesting stops at one bracket level.
+
 ### Chain form (sequential)
 
 ```
@@ -93,6 +117,12 @@ Write ops and their conflict keys:
 different substrates.
 
 Chain mode skips write-key preflight because sequential ordering is explicit.
+In a bracketed batch of chains, the same exemption applies per unit: a key
+repeated by two ops inside one unit is legal (that unit's own ops are already
+ordered), while a key shared by ops in two *different* units refuses every op
+of both units before either dispatches. Only literal argument values are
+inspected; a `$prev`-resolved target is never visible to this preflight,
+in a bracketed batch or in plain chain mode.
 See [`write-conflicts.md`](write-conflicts.md) for bulk links, symmetric edges,
 and the production integration boundary.
 

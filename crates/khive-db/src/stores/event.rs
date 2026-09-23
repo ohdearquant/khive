@@ -1080,6 +1080,11 @@ fn build_event_filter_sql(
         conditions.push(format!("created_at < ?{}", params.len()));
     }
 
+    if let Some(target_id) = filter.target_id {
+        params.push(Box::new(target_id.to_string()));
+        conditions.push(format!("target_id = ?{}", params.len()));
+    }
+
     if let Some(session_id) = filter.session_id {
         params.push(Box::new(session_id.to_string()));
         conditions.push(format!("session_id = ?{}", params.len()));
@@ -1155,6 +1160,9 @@ fn reject_missing_event_filter_schema(
     conn: &rusqlite::Connection,
     filter: &EventFilter,
 ) -> Result<(), rusqlite::Error> {
+    if filter.target_id.is_some() && !has_column(conn, "events", "target_id")? {
+        return Err(schema_absent("events.target_id"));
+    }
     if filter.session_id.is_some() && !has_column(conn, "events", "session_id")? {
         return Err(schema_absent("events.session_id"));
     }

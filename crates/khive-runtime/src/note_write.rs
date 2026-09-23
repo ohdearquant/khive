@@ -7,6 +7,42 @@ use uuid::Uuid;
 
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
+/// Test-only pause point between a keyed singleton create's preparation
+/// (annotation-target validation and embedding-model resolution, both
+/// outside the writer) and its writer-transaction admission, so a race
+/// between two independent callers of `create_note_with_options`, or an
+/// independent writer proceeding while one caller's preparation is parked,
+/// can be reproduced deterministically (ADR-172 Amendment 6, acceptance
+/// items 3 and 5) instead of relying on scheduler luck or sleeps. A no-op
+/// unless the calling task runs inside `AFTER_PREPARE_BARRIER.scope(...)`;
+/// production code never establishes that scope, so `pause_after_prepare`
+/// costs nothing outside these regression tests, and it does not exist at
+/// all in non-test builds. Deliberately a separate barrier from
+/// `crate::curation::race_seam`: that module's pause point is a different
+/// production entry point's read/write boundary, and sharing one
+/// `Barrier` between two unrelated pause points would make a test of one
+/// silently depend on the party count of the other.
+#[cfg(test)]
+pub(crate) mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(crate) static AFTER_PREPARE_BARRIER: Arc<Barrier>;
+    }
+
+    /// Meets the other party twice: the first meeting tells it this caller
+    /// has finished its initial holder check and its preparation, the
+    /// second is the release. Two callers sharing one barrier simply meet
+    /// twice.
+    pub(crate) async fn pause_after_prepare() {
+        if let Ok(barrier) = AFTER_PREPARE_BARRIER.try_with(Arc::clone) {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+}
+
 /// Each fence adds a keyed read while holding the writer, like a batch observation.
 pub const MAX_NOTE_FENCES: usize = 100;
 
@@ -213,13 +249,31 @@ impl NoteWriteOptions {
     }
 }
 
+/// The candidate identity and fully-validated payload a keyed singleton
+/// `create` is claiming: kind and key resolve the live holder, and content
+/// plus properties let [`NoteWriteGuard::classify_refusal`] decide, inside
+/// the writer transaction, whether a live holder is this same create
+/// replayed (ADR-172 Amendment 6) or a genuine conflict.
+#[derive(Clone, Debug)]
+pub(crate) struct CreateKeyClaim {
+    pub kind: String,
+    pub key: String,
+    pub content: String,
+    pub properties: Option<serde_json::Value>,
+    /// Set only by the singleton `create` route (`AtomicNoteOptions::replay_receipt`).
+    /// Every other keyed-write caller leaves this `false`, so
+    /// [`NoteWriteGuard::classify_refusal`] never reports a comparison
+    /// outcome for their conflicts.
+    pub replay_signal: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NoteWriteGuard {
     pub namespace: String,
     pub target_id: Uuid,
     pub expected_version: Option<i64>,
     pub fence: Option<NoteFences>,
-    pub create_key: Option<(String, String)>,
+    pub create_key: Option<CreateKeyClaim>,
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +387,17 @@ pub enum NoteWriteConflict {
     Key {
         key: String,
         existing_id: String,
+        /// Whether the live holder's validated content and properties equal
+        /// the candidate's (ADR-172 Amendment 6). `None` unless the write
+        /// that produced this conflict asked for the comparison
+        /// (`CreateKeyClaim::replay_signal`, set only by the singleton
+        /// `create` route): every other keyed route never carries this
+        /// signal, so it can never reach their callers. Internal signal
+        /// only even when present: it never reaches a client verbatim. The
+        /// create handler turns an equal, disclosed conflict into a
+        /// successful replay result, and rebuilds `Details` without this
+        /// field on every other outcome.
+        equal: Option<bool>,
     },
     /// A fence whose `live_until` path did not admit the write. Separate from
     /// `Fence` because the version matched: what failed is the deadline. Boxed
@@ -405,14 +470,21 @@ impl NoteWriteConflict {
                 }
                 ("note fence precondition failed", fields)
             }
-            Self::Key { key, existing_id } => (
-                "a live note already holds this key",
-                vec![
+            Self::Key {
+                key,
+                existing_id,
+                equal,
+            } => {
+                let mut fields = vec![
                     ("reason", "key_conflict".into()),
                     ("key", key),
                     ("existing_id", existing_id),
-                ],
-            ),
+                ];
+                if let Some(equal) = equal {
+                    fields.push(("equal", equal.to_string()));
+                }
+                ("a live note already holds this key", fields)
+            }
             Self::FenceDeadline(deadline) => {
                 let FenceDeadline {
                     key,
@@ -567,15 +639,72 @@ impl NoteWriteGuard {
         &self,
         writer: &mut dyn SqlWriter,
     ) -> Result<Option<NoteWriteConflict>, StorageError> {
-        if let Some((kind, key)) = &self.create_key {
-            let holder = writer.query_scalar(statement(
-                "SELECT id FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
-                vec![SqlValue::Text(self.namespace.clone()), SqlValue::Text(kind.clone()), SqlValue::Text(key.clone())],
-            )).await?;
-            if let Some(SqlValue::Text(existing_id)) = holder {
+        if let Some(claim) = &self.create_key {
+            // ADR-172 Amendment 6: the final holder comparison happens here,
+            // inside the writer transaction, reading the same row the failed
+            // guarded INSERT just contended on. Never a later, separate
+            // lookup after the transaction has settled.
+            let holder = writer
+                .query_row(statement(
+                    "SELECT id, content, properties FROM notes \
+                     WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
+                    vec![
+                        SqlValue::Text(self.namespace.clone()),
+                        SqlValue::Text(claim.kind.clone()),
+                        SqlValue::Text(claim.key.clone()),
+                    ],
+                ))
+                .await?;
+            if let Some(row) = holder {
+                let existing_id = match row.get("id") {
+                    Some(SqlValue::Text(id)) => id.clone(),
+                    _ => {
+                        return Err(StorageError::Internal(
+                            "invalid keyed note holder identity".into(),
+                        ))
+                    }
+                };
+                let existing_content = match row.get("content") {
+                    Some(SqlValue::Text(content)) => content.clone(),
+                    _ => {
+                        return Err(StorageError::Internal(
+                            "invalid keyed note holder content".into(),
+                        ))
+                    }
+                };
+                let existing_properties: Option<serde_json::Value> = match row.get("properties") {
+                    Some(SqlValue::Text(text)) => {
+                        Some(serde_json::from_str(text).map_err(|_| {
+                            StorageError::Internal("invalid keyed note holder properties".into())
+                        })?)
+                    }
+                    Some(SqlValue::Null) | None => None,
+                    _ => {
+                        return Err(StorageError::Internal(
+                            "invalid keyed note holder properties".into(),
+                        ))
+                    }
+                };
+                // Decoded content is byte-exact text comparison; properties
+                // use typed JSON equality (object member order irrelevant,
+                // member presence/array order/value types significant,
+                // `None` distinct from `Some(Value::Object(empty))`).
+                // `serde_json::Value`'s own `PartialEq` already has exactly
+                // this shape (an `IndexMap`/`Map` compares order-insensitively,
+                // a `Vec` compares order-sensitively, `Number` compares its
+                // typed representation without coercion), so no extra
+                // normalization runs here. Only reported back when the
+                // caller asked for it: every route besides singleton
+                // `create` leaves `replay_signal` false and gets `None`,
+                // which `into_error_at_member` renders as no `equal` key at
+                // all in the returned Details.
+                let equal = claim.replay_signal.then(|| {
+                    existing_content == claim.content && existing_properties == claim.properties
+                });
                 return Ok(Some(NoteWriteConflict::Key {
-                    key: key.clone(),
+                    key: claim.key.clone(),
                     existing_id,
+                    equal,
                 }));
             }
         }
@@ -593,6 +722,49 @@ impl NoteWriteGuard {
             }
         }
         Ok(None)
+    }
+}
+
+/// The ADR-172 Amendment 6 authoritative holder check, run with no insert
+/// statement of its own: [`NoteWriteGuard::check_fence`] then
+/// [`NoteWriteGuard::classify_refusal`], inside their own single writer
+/// checkout ([`crate::atomic_runner::run_prepared_atomic_unit`], the same
+/// "one `atomic_unit`" seam [`crate::atomic_runner::apply_plan`] uses for the
+/// real guarded insert). `create_note_with_options` calls this twice for a
+/// keyed create: once before preparation (creation-only annotation
+/// resolution and embedding work must not run ahead of this decision), and
+/// once more, only when preparation itself failed, to revalidate before
+/// falling back to that failure. `Ok(None)` means fences passed and no live
+/// holder exists yet; `Ok(Some(conflict))` is the caller's answer (already
+/// in the same shape a failed guarded insert reports): replay, key
+/// conflict, or a stale fence.
+async fn check_keyed_create_holder(
+    access: &dyn khive_storage::SqlAccess,
+    guard: NoteWriteGuard,
+) -> RuntimeResult<Option<NoteWriteConflict>> {
+    use crate::atomic_runner::{
+        run_prepared_atomic_unit, PreparedAtomicError, PreparedAtomicOp, PreparedAtomicOutcome,
+    };
+    let op: PreparedAtomicOp<(), NoteWriteConflict> = Box::new(move |writer| {
+        Box::pin(async move {
+            if let Some(conflict) = guard.check_fence(writer).await? {
+                return Err(PreparedAtomicError::Refused {
+                    failure: conflict,
+                    message: "keyed create: fence stale at holder check".into(),
+                });
+            }
+            if let Some(conflict) = guard.classify_refusal(writer).await? {
+                return Err(PreparedAtomicError::Refused {
+                    failure: conflict,
+                    message: "keyed create: live holder found at holder check".into(),
+                });
+            }
+            Ok(((), Vec::new()))
+        })
+    });
+    match run_prepared_atomic_unit(access, op).await? {
+        PreparedAtomicOutcome::Committed { .. } => Ok(None),
+        PreparedAtomicOutcome::RolledBack(conflict) => Ok(Some(conflict)),
     }
 }
 
@@ -727,6 +899,7 @@ impl KhiveRuntime {
                 post_commit: PostCommitEffect::None,
                 edge_natural_key: None,
                 idempotent_noop: true,
+                entity_guard: None,
                 note_guard: Some(NoteWriteGuard {
                     namespace: token.namespace().as_str().into(),
                     target_id: note.id,
@@ -839,6 +1012,7 @@ impl KhiveRuntime {
             post_commit,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: Some(NoteWriteGuard {
                 namespace: token.namespace().as_str().into(),
                 target_id: note.id,
@@ -903,7 +1077,100 @@ impl KhiveRuntime {
         candidate.name = name.map(str::to_owned);
         candidate.properties = properties.clone();
         validate_head(&candidate)?;
-        let (mut prepared, _) = prepare_note_create(
+
+        // Unkeyed create: unchanged. There is no key to hold, so there is
+        // nothing for an initial holder check to decide, so preparation runs
+        // the same way it always has, and the single writer transaction at
+        // the end is the only admission decision.
+        let Some(key) = options.key.as_deref() else {
+            let (mut prepared, _) = prepare_note_create(
+                self,
+                AtomicNoteSpec {
+                    token,
+                    id: None,
+                    kind,
+                    name,
+                    content,
+                    properties,
+                },
+                AtomicNoteOptions {
+                    salience,
+                    decay_factor,
+                    embedding_model,
+                    embedding_content,
+                    embed: Some(options.embed.unwrap_or(kind != "head")),
+                    key: None,
+                    replay_receipt: true,
+                    fence: options.fence.as_ref(),
+                    properties_already_derived: false,
+                },
+                &annotates,
+                KeyPublication::AtInsert,
+            )
+            .await?;
+            let note = prepared.notes.remove(0);
+            return match run_atomic_unit(self.sql().as_ref(), prepared.plans).await {
+                Ok(AtomicRunOutcome::Committed { .. }) => {
+                    self.fire_note_mutation_hook(&note.kind, note.id).await;
+                    Ok((note, prepared.embedding_truncation))
+                }
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure: AtomicOpFailure::NoteConflict(conflict),
+                    ..
+                }) => Err(conflict.into_error().into()),
+                Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
+                    format!("note creation rolled back: {failure:?}"),
+                )),
+                Err(error) => Err(RuntimeError::Storage(error.0)),
+            };
+        };
+
+        // Keyed singleton create (ADR-172 Amendment 6): staged.
+        //
+        // Properties are derived exactly once, here, before either holder
+        // check, because the installed note-write validator is not guaranteed
+        // idempotent (a kg regression test counts its calls), and equality
+        // compares the DERIVED value, so the initial check, the note this
+        // preparation would insert, and any final-check fallback must all
+        // compare/store the SAME derived value rather than three
+        // independently hook-derived ones.
+        let derived_properties =
+            self.derive_note_write_properties(kind, token, properties.clone())?;
+        let namespace: String = token.namespace().as_str().into();
+
+        // Initial writer transaction: supplied fences and the live holder
+        // for (namespace, kind, key), before any creation-only work runs.
+        // Equal + disclosable => replay, no preparation. Different => the
+        // existing key_conflict. A stale fence => fence_conflict, also
+        // before preparation. Absent (and fences pass) => continue.
+        if let Some(conflict) = check_keyed_create_holder(
+            self.sql().as_ref(),
+            NoteWriteGuard {
+                namespace: namespace.clone(),
+                target_id: candidate.id,
+                expected_version: None,
+                fence: options.fence.clone(),
+                create_key: Some(CreateKeyClaim {
+                    kind: kind.to_owned(),
+                    key: key.to_owned(),
+                    content: content.to_owned(),
+                    properties: derived_properties.clone(),
+                    replay_signal: true,
+                }),
+            },
+        )
+        .await?
+        {
+            return Err(conflict.into_error().into());
+        }
+
+        // Creation-only preparation (annotation-target resolution,
+        // embedding-model resolution, embedding computation), outside the
+        // writer, now that the key was observed absent. A failure here is
+        // captured rather than returned immediately: the final writer
+        // transaction below still gets to revalidate the holder before
+        // either this plan or this failure is consumed.
+        let prep_result = prepare_note_create(
             self,
             AtomicNoteSpec {
                 token,
@@ -911,7 +1178,7 @@ impl KhiveRuntime {
                 kind,
                 name,
                 content,
-                properties,
+                properties: derived_properties.clone(),
             },
             AtomicNoteOptions {
                 salience,
@@ -919,27 +1186,70 @@ impl KhiveRuntime {
                 embedding_model,
                 embedding_content,
                 embed: Some(options.embed.unwrap_or(kind != "head")),
-                key: options.key.as_deref(),
+                key: Some(key),
+                replay_receipt: true,
                 fence: options.fence.as_ref(),
+                properties_already_derived: true,
             },
             &annotates,
             KeyPublication::AtInsert,
         )
-        .await?;
-        let note = prepared.notes.remove(0);
-        match run_atomic_unit(self.sql().as_ref(), prepared.plans).await {
-            Ok(AtomicRunOutcome::Committed { .. }) => {
-                self.fire_note_mutation_hook(&note.kind, note.id).await;
-                Ok((note, prepared.embedding_truncation))
+        .await;
+
+        // Test-only pause, reached whether preparation succeeded or failed:
+        // both the ordinary insert path and the prep-failure fallback below
+        // re-derive the current holder fresh, so both need to be
+        // interruptible by an independent writer for the race regression
+        // tests (ADR-172 Amendment 6, acceptance items 3 and 5).
+        #[cfg(test)]
+        race_seam::pause_after_prepare().await;
+
+        match prep_result {
+            Ok((mut prepared, _)) => {
+                let note = prepared.notes.remove(0);
+                match run_atomic_unit(self.sql().as_ref(), prepared.plans).await {
+                    Ok(AtomicRunOutcome::Committed { .. }) => {
+                        self.fire_note_mutation_hook(&note.kind, note.id).await;
+                        Ok((note, prepared.embedding_truncation))
+                    }
+                    Ok(AtomicRunOutcome::RolledBack {
+                        failure: AtomicOpFailure::NoteConflict(conflict),
+                        ..
+                    }) => Err(conflict.into_error().into()),
+                    Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(
+                        RuntimeError::Internal(format!("note creation rolled back: {failure:?}")),
+                    ),
+                    Err(error) => Err(RuntimeError::Storage(error.0)),
+                }
             }
-            Ok(AtomicRunOutcome::RolledBack {
-                failure: AtomicOpFailure::NoteConflict(conflict),
-                ..
-            }) => Err(conflict.into_error().into()),
-            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
-                format!("note creation rolled back: {failure:?}"),
-            )),
-            Err(error) => Err(RuntimeError::Storage(error.0)),
+            Err(prep_error) => {
+                // Preparation failed. Revalidate fences and the current
+                // holder one more time before consuming that failure: an
+                // equal holder now yields replay; a different payload
+                // conflicts; continued absence preserves the preparation
+                // failure (ADR-172 Amendment 6, acceptance item 5).
+                match check_keyed_create_holder(
+                    self.sql().as_ref(),
+                    NoteWriteGuard {
+                        namespace,
+                        target_id: candidate.id,
+                        expected_version: None,
+                        fence: options.fence.clone(),
+                        create_key: Some(CreateKeyClaim {
+                            kind: kind.to_owned(),
+                            key: key.to_owned(),
+                            content: content.to_owned(),
+                            properties: derived_properties,
+                            replay_signal: true,
+                        }),
+                    },
+                )
+                .await?
+                {
+                    Some(conflict) => Err(conflict.into_error().into()),
+                    None => Err(prep_error),
+                }
+            }
         }
     }
 }

@@ -367,3 +367,41 @@ async fn stream_embedding_help_exposes_defaults_and_model_requirement() {
         .unwrap()
         .contains("embedding_model requires embed=true"));
 }
+
+/// Bulk-created notes skip vector embedding, as bulk-created entities do. The
+/// singleton create at the end moves the counter, so the unchanged count after
+/// the bulk call is not an idle embedder.
+#[tokio::test]
+async fn bulk_created_notes_skip_embedding() {
+    let (rt, registry, calls) = embedding_surface().await;
+    let before = calls.load(Ordering::SeqCst);
+    let response = registry
+        .dispatch(
+            "create",
+            json!({"items": [
+                {"kind": "observation", "content": "a bulk note that is not embedded"},
+                {"kind": "concept", "name": "a bulk entity that is not embedded"}
+            ]}),
+        )
+        .await
+        .expect("bulk create must commit");
+    assert_eq!(response["created"], 2, "{response}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "bulk create must not call the embedder"
+    );
+    assert_eq!(embedding_counts(&rt).await, vec![0, 0]);
+
+    registry
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "a singleton note that is embedded"}),
+        )
+        .await
+        .expect("singleton create must commit");
+    assert!(
+        calls.load(Ordering::SeqCst) > before,
+        "a singleton note create must reach the embedder, or the bulk assertion proves nothing"
+    );
+}

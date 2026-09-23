@@ -7,7 +7,7 @@ mod plan;
 mod types;
 
 pub use atomic::{check_atomic_admissible, AtomicRejection};
-pub use conflict::write_keys_for_op_pub;
+pub use conflict::{unit_write_key_conflicts, write_keys_for_op_pub, UnitKeyConflict};
 pub use parser::{parse_request, parse_typed_json_batch};
 pub use plan::plan_request;
 pub use types::{

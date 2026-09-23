@@ -252,23 +252,58 @@ def test_mixed_separators_rejected_as_rpc_error(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """Mixing ',' (parallel) and '|' (chain) at the top level raises KhiveRpcError.
+    """Mixing ',' (parallel) and '|' (chain) outside [...] raises KhiveRpcError.
 
     ADR: ADR-016
     section: Mixed separators
 
     The DSL parser must reject this input before dispatch. The error surfaces
     as a JSON-RPC invalid_params error (isError or top-level error), not as a
-    per-op result with ok=False.
+    per-op result with ok=False. The same operations wrapped in [...] are a
+    valid batch of chains (see the next test).
     """
     ns = temp_namespace
     bad_ops = (
-        f'[create(kind="entity", entity_kind="concept", name="MixedA", namespace="{ns}")'
+        f'create(kind="entity", entity_kind="concept", name="MixedA", namespace="{ns}")'
+        f' | get(id=$prev.id, namespace="{ns}")'
         f', create(kind="entity", entity_kind="concept", name="MixedB", namespace="{ns}")'
-        f' | get(id=$prev.id, namespace="{ns}")]'
     )
     with pytest.raises(KhiveRpcError):
         khive_session.request(bad_ops)
+
+
+def test_bracketed_units_run_chains_in_parallel(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """Inside [...], a comma separates units and a pipe chains one unit's operations.
+
+    ADR: ADR-016
+    section: Amendment 2 (parallel units of linear chains)
+
+    $prev in a unit's later operation resolves against that unit's own
+    preceding operation. Results stay one flat, operation-ordered list, and
+    each entry carries its unit and step position.
+    """
+    ns = temp_namespace
+    ops = (
+        f'[create(kind="entity", entity_kind="concept", name="UnitA", namespace="{ns}")'
+        f' | get(id=$prev.id, namespace="{ns}")'
+        f', create(kind="entity", entity_kind="concept", name="UnitB", namespace="{ns}")]'
+    )
+    envelope = khive_session.request(ops)
+
+    assert_envelope(envelope)
+    results = envelope["results"]
+
+    assert len(results) == 3, f"Expected 3 results, got {len(results)}: {results}"
+    assert all(r.get("ok") is True for r in results), f"every leaf must succeed: {results}"
+    assert results[1]["result"]["id"] == results[0]["result"]["id"], (
+        f"$prev in the unit's second operation must name its own first operation: {results}"
+    )
+    assert results[2]["result"]["id"] != results[0]["result"]["id"], results
+    assert [r.get("unit_index") for r in results] == [0, 0, 1], results
+    assert [r.get("step_index") for r in results] == [0, 1, 0], results
 
 
 # ---------------------------------------------------------------------------

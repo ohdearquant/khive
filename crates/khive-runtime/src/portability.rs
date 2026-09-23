@@ -292,6 +292,7 @@ impl KhiveRuntime {
                 deleted_at: None,
                 merged_into: None,
                 merge_event_id: None,
+                version: 1,
                 content_ref: None,
             };
             store.upsert_entity(entity.clone()).await?;

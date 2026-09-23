@@ -795,7 +795,9 @@ async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
     for position in [0, 2, 5, 8] {
         writer
             .execute(SqlStatement {
-                sql: "UPDATE entities SET tags = '[\"wanted\"]' WHERE id = ?1".into(),
+                sql:
+                    "UPDATE entities SET version = version + 1, tags = '[\"wanted\"]' WHERE id = ?1"
+                        .into(),
                 params: vec![SqlValue::Text(ids[position].to_string())],
                 label: None,
             })
@@ -4250,7 +4252,7 @@ async fn kpk002_domain_with_sufficient_description_is_accepted() {
 // ── Secret-gate regression tests ─────────────────────────────────────────────
 
 fn is_secret_detected(err: &RuntimeError) -> bool {
-    matches!(err, RuntimeError::SecretDetected(_))
+    matches!(err.refusal_source(), RuntimeError::SecretDetected(_))
 }
 
 /// A batch refusal names the atom it came from, by position. Without this the
@@ -4286,7 +4288,7 @@ async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
         is_secret_detected(&err),
         "the refusal must stay classified as a secret detection; got: {err:?}"
     );
-    let RuntimeError::SecretDetected(matched) = &err else {
+    let RuntimeError::SecretDetected(matched) = err.refusal_source() else {
         unreachable!("typed secret refusal asserted above");
     };
     assert_eq!(matched.location.as_deref(), Some("atoms[1].content"));
@@ -6687,7 +6689,7 @@ async fn upsert_atoms_properties_only_preserves_short_content() {
             .dispatch("knowledge.upsert_atoms", json!({"atoms": atoms}))
             .await
             .expect_err("ID properties must receive the recursive secret scan");
-        match &error {
+        match error.refusal_source() {
             RuntimeError::SecretDetected(found) => {
                 assert_eq!(found.location.as_deref(), Some(location));
             }
@@ -6837,13 +6839,16 @@ async fn upsert_atoms_properties_only_keeps_content_and_shape_validation() {
         .expect("generic get after ordinary update");
     for result in floor_results {
         assert!(
-            matches!(&result, Err(RuntimeError::InvalidInput(message)) if message.contains("20 words")),
+            matches!(result.as_ref().map_err(RuntimeError::refusal_source), Err(RuntimeError::InvalidInput(message)) if message.contains("20 words")),
             "{result:?}"
         );
     }
     for result in shape_results {
         assert!(
-            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            matches!(
+                result.as_ref().map_err(RuntimeError::refusal_source),
+                Err(RuntimeError::InvalidInput(_))
+            ),
             "{result:?}"
         );
     }
@@ -6924,7 +6929,10 @@ async fn upsert_atoms_properties_only_missing_id_is_not_found() {
         .expect("generic get protected domain");
     for result in [missing_before, singleton, batch, missing_after, deleted] {
         assert!(
-            matches!(result, Err(RuntimeError::NotFound(_))),
+            matches!(
+                result.as_ref().map_err(RuntimeError::refusal_source),
+                Err(RuntimeError::NotFound(_))
+            ),
             "{result:?}"
         );
     }
@@ -7033,12 +7041,18 @@ async fn upsert_atoms_properties_only_mixed_batches_preserve_order_and_atomicity
             .await;
         if index == 0 {
             assert!(
-                matches!(result, Err(RuntimeError::NotFound(_))),
+                matches!(
+                    result.as_ref().map_err(RuntimeError::refusal_source),
+                    Err(RuntimeError::NotFound(_))
+                ),
                 "{result:?}"
             );
         } else {
             assert!(
-                matches!(result, Err(RuntimeError::InvalidInput(_))),
+                matches!(
+                    result.as_ref().map_err(RuntimeError::refusal_source),
+                    Err(RuntimeError::InvalidInput(_))
+                ),
                 "{result:?}"
             );
         }
@@ -7067,7 +7081,7 @@ async fn upsert_atoms_properties_only_mixed_batches_preserve_order_and_atomicity
         )
         .await;
     assert!(
-        matches!(&result, Err(RuntimeError::InvalidInput(message)) if message.contains("20 words")),
+        matches!(result.as_ref().map_err(RuntimeError::refusal_source), Err(RuntimeError::InvalidInput(message)) if message.contains("20 words")),
         "{result:?}"
     );
     let after = f
@@ -7083,3 +7097,6 @@ async fn upsert_atoms_properties_only_mixed_batches_preserve_order_and_atomicity
 }
 
 include!("support/project_origin.rs");
+
+#[path = "integration/refusal_events.rs"]
+mod refusal_events;

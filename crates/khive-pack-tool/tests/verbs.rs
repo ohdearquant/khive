@@ -496,7 +496,7 @@ async fn an_untagged_entity_still_updates_and_deletes() {
     assert_eq!(deleted["deleted"], json!(true));
 }
 
-/// #2596: `tool_policy` is append-only, so a namespace's row count only grows.
+/// #2596: unrelated policy rows must not displace an older matching deny.
 /// The decision used to read the newest 1,000 rows and rank them in Rust, which
 /// made an older matching `deny` invisible once the table passed the cap --
 /// fail-open on an authorization surface. The decision is resolved in SQL now,

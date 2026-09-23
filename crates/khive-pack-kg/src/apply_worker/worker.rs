@@ -19,7 +19,9 @@ use khive_types::{
     ProposalCreatedPayload, Timestamp,
 };
 
-use super::budget::{count_new_entries, has_multi_step_compound, WriteBudget};
+use super::budget::{
+    check_note_proposal_admission, count_new_entries, has_multi_step_compound, WriteBudget,
+};
 use crate::projection_worker::ProposalsProjectionWorker;
 
 pub(super) enum PreparedApply {
@@ -458,6 +460,7 @@ impl ProposalApplyWorker {
                     let kind =
                         crate::handlers::canonical_note_kind(note.kind.as_str(), registry)?;
                     budget.consume_new_entry()?;
+                    check_note_proposal_admission(note, &kind, registry)?;
                     let args = serde_json::json!({
                         "kind": kind,
                         "name": note.name,
