@@ -1,6 +1,6 @@
 # ADR-193: Charter Runs — Procedural Actions Admitted Only on Recorded Evidence
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-22)
 - **Date**: 2026-09-22
 - **Depends on**: [ADR-127](ADR-127-authenticated-actor-and-grant-primitive.md) (authenticated actor
   and grant primitive), [ADR-143](ADR-143-store-held-caller-grants.md) (store-held caller grants),
@@ -182,7 +182,9 @@ grant patterns and precedence are not reinterpreted.
 
 Model family, controlling principal and platform account for authors and reviewers are recorded by an
 authenticated issuer at execution time and bound to the revision they touched. An editable property
-on an actor is not evidence of family.
+on an actor is not evidence of family. The deployment profile names the issuer's closed family
+taxonomy (one value per model provider, plus `human`). Under M2 a review from the same family as any
+producer of the change refuses. This gate is hard in every deployment.
 
 ### D10. A run pins its definition; revocation governs admission
 
@@ -222,7 +224,8 @@ Gate groups, all hard in v1:
 
 Proposed freshness bounds, evaluated on server time and tightenable in data: dynamic platform
 inventories at most 60 s old at claim, a collection span of at most 30 s, at most 5 s of future skew,
-and at most 15 s from claim to send. These are design values, not measured service guarantees.
+and at most 15 s from claim to send. These are design values, not measured service guarantees;
+acceptance case 11 measures them before they become hard.
 
 The definition, as data (values ending in `_CONFIGURED` are deployment parameters):
 
@@ -369,8 +372,8 @@ Run states: `open | completed | cancelled | superseded | invalidated | failed`. 
 - **ADR-066** says the CI gate wall alone authorises a merge, with no per-change approver. For a
   repository enrolled in an enforced `pr_merge` charter this record supersedes that authorisation
   model: independent review and conditional architecture approval are required. ADR-066's required
-  context floor is absorbed as policy input. ADR-066 receives a pointer amendment when this record is
-  accepted, so two normative merge policies are never active for the same repository.
+  context floor is absorbed as policy input. ADR-066 Amendment 1 lands with this record and
+  states this, so two normative merge policies are never active for the same repository.
 - **ADR-102** is unchanged. It governs knowledge-graph change sets, not platform pull requests.
 - **ADR-142** contributes its matrix discipline and replay-key idea, not its table or restart policy.
 - **ADR-182** is amended at M2: for enrolled repositories `git.pr_merge` claims a charter admission,
@@ -407,8 +410,12 @@ Paired positive and negative cases, each run against the real verbs:
    can change protection are outside this guarantee, and that is stated in the deployment profile.
 10. Revocation before and after the claim's serialisation point gives the two different recorded
     outcomes; restoring a snapshot with a formerly consumed attempt cannot act under a stale epoch.
+11. (M2, before the freshness bounds become hard) Ten real claim-to-send samples against the platform,
+    each recorded with its measured inventory age and claim-to-send latency. The bounds are enforced as
+    hard only when every sample fits inside them with margin; otherwise M2 would refuse every merge on
+    a slow platform day while appearing to work.
 
-M1 passes cases 1-8 and 10 with `charter.claim` refusing; M2 passes all ten.
+M1 passes cases 1-8 and 10 with `charter.claim` refusing; M2 passes all eleven.
 
 ## Alternatives considered
 
