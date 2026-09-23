@@ -16717,8 +16717,9 @@ fn result_message(result: &Value) -> &str {
 }
 
 /// Under `atomic: false` every item is parsed from its own JSON value, so a
-/// malformed, unknown-field, non-object, bad-kind or cross-substrate item is
-/// its own indexed failure and the valid entity and note siblings commit.
+/// malformed, unknown-field, non-object, bad-kind or cross-substrate item, and
+/// a note without `content` or an entity without `name`, is its own indexed
+/// failure and the valid entity and note siblings commit.
 #[tokio::test]
 async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
     let pack = pack();
@@ -16735,6 +16736,7 @@ async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
                     {"kind": "not_a_real_kind", "name": "Bad"},
                     {"kind": "observation", "content": "typed", "entity_type": "paper"},
                     {"kind": "concept", "name": "WithContent", "content": "body"},
+                    {"kind": "concept", "description": "no name"},
                     {"kind": "observation", "content": "BulkValidNote"}
                 ]
             }),
@@ -16742,12 +16744,12 @@ async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
         .await
         .expect("best-effort bulk create must return a response, not an error");
 
-    assert_eq!(resp["attempted"], 8);
+    assert_eq!(resp["attempted"], 9);
     assert_eq!(
         resp["created"], 2,
         "only the two valid siblings must commit; got {resp}"
     );
-    assert_eq!(resp["failed"], 6);
+    assert_eq!(resp["failed"], 7);
     assert_eq!(resp["skipped"], 0);
 
     let results = resp["results"]
@@ -16755,7 +16757,7 @@ async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
         .expect("results must be an array");
     assert_eq!(
         results.len(),
-        8,
+        9,
         "results must be index-aligned to every submitted item"
     );
     for (idx, result) in results.iter().enumerate() {
@@ -16763,7 +16765,7 @@ async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
     }
     assert_eq!(results[0]["ok"], true);
     assert_eq!(results[0]["result"]["kind"], "concept");
-    for idx in 1..=6 {
+    for idx in 1..=7 {
         assert_eq!(
             results[idx]["ok"], false,
             "item {idx} must be its own indexed failure; got {results:?}"
@@ -16782,10 +16784,14 @@ async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
         result_message(&results[6]).contains("apply only to note items"),
         "a note-only field on an entity item must fail as such: {results:?}"
     );
-    assert_eq!(results[7]["ok"], true);
-    assert_eq!(results[7]["result"]["kind"], "observation");
+    assert!(
+        result_message(&results[7]).contains("requires 'name'"),
+        "a name-less entity item must be its own indexed failure: {results:?}"
+    );
+    assert_eq!(results[8]["ok"], true);
+    assert_eq!(results[8]["result"]["kind"], "observation");
     let errors = resp["errors"].as_array().expect("errors must be an array");
-    assert_eq!(errors.len(), 6);
+    assert_eq!(errors.len(), 7);
     for entry in errors {
         assert!(
             entry["error"].is_string(),
