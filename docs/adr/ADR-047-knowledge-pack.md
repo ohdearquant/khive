@@ -9,7 +9,7 @@ on acceptance.
 
 ## Amendment (2026-09-23): refusal events for existing atoms
 
-**Status: Proposed for final specification and implementation gates (#2995).**
+**Status: Accepted (2026-09-23).**
 
 A refused public `knowledge.upsert_atoms` batch leaves every atom row and its
 indexes unchanged, including valid siblings. It separately appends a `refusal`
