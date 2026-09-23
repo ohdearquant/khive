@@ -225,14 +225,14 @@ pub fn recoverer_lock_path() -> PathBuf {
     khive_dir().join("khived.recoverer.lock")
 }
 
-/// Marker file a process supervisor (launchd, systemd, or any equivalent)
-/// writes beside the socket path before it starts a supervised `khived`, and
-/// removes on a clean stop. Its presence tells a client that this rendezvous
-/// is not the "any client may spawn on demand" case: a supervisor already
-/// owns the daemon's lifecycle for this socket, and a client racing it to
-/// bind the socket would only produce a second, unsupervised daemon that the
-/// supervisor's own instance then refuses to replace. Reading and acting on
-/// this file is entirely the client's decision (`khive-mcp`); this module
+/// Marker file the supervisor's launcher publishes before it execs `khived`.
+/// It records the job label, launcher/daemon PID, and restart interval in
+/// seconds (ADR-185 Amendment 1). The launcher or deliberate-stop procedure
+/// removes its own claim; the daemon never writes or removes it. A client
+/// waits up to three restart intervals before a logged degraded bootstrap,
+/// bounded by its caller deadline, rather than racing normal supervisor
+/// startup. Reading and acting on this file is the client's decision
+/// (`khive-mcp`); this module
 /// only resolves where it lives, matching the [`lock_path`] /
 /// [`recoverer_lock_path`] pattern.
 ///

@@ -42,7 +42,7 @@ mod test_harness;
 #[cfg(test)]
 use test_harness::{
     reset_counters, DAEMON_DISPATCH, FORCED_CONNECT_ERROR, FORCE_PID_IS_DAEMON,
-    FORCE_PID_IS_FOREIGN, KILL_COUNT, RECOVERY_RACE_BARRIER, SPAWN_COUNT,
+    FORCE_PID_IS_FOREIGN, KILL_COUNT, RECOVERY_RACE_BARRIER, SIGTERM_COUNT, SPAWN_COUNT,
 };
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
@@ -788,36 +788,58 @@ fn recorded_daemon_is_alive() -> bool {
 }
 
 /// A process supervisor's claim on the daemon rendezvous, read from
-/// [`daemon::supervisor_marker_path`]. Its presence — in any readable form —
-/// means a supervisor (launchd, systemd, or equivalent) already owns this
-/// socket's lifecycle: no client may spawn a competing daemon here, on pain
-/// of the supervised instance losing the bind race and refusing to start
-/// (the defect this type exists to prevent).
+/// [`daemon::supervisor_marker_path`]. Presence gives the supervisor a bounded
+/// opportunity to bind the socket before ordinary client bootstrap resumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SupervisorMarker {
     job: String,
     pid: u32,
+    restart_interval: std::time::Duration,
+    modified: Option<std::time::SystemTime>,
 }
+
+const DEFAULT_SUPERVISOR_RESTART_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const SUPERVISOR_RESTART_ATTEMPTS: u32 = 3;
 
 impl SupervisorMarker {
     fn pid_is_alive(&self) -> bool {
         process_is_alive(self.pid)
+    }
+
+    fn wait_deadline(&self, request_started: tokio::time::Instant) -> tokio::time::Instant {
+        self.restart_interval
+            .checked_mul(SUPERVISOR_RESTART_ATTEMPTS)
+            .and_then(|bound| request_started.checked_add(bound))
+            .unwrap_or_else(|| {
+                request_started + DEFAULT_SUPERVISOR_RESTART_INTERVAL * SUPERVISOR_RESTART_ATTEMPTS
+            })
+    }
+
+    fn age(&self) -> Option<std::time::Duration> {
+        self.modified
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
     }
 }
 
 /// Read the supervision marker, if any. A marker file that exists but cannot
 /// be parsed is not the same as no marker: it still names a claim (job
 /// `<unreadable>`, pid 0 — never alive per [`process_is_alive`]'s `pid <= 0`
-/// guard), so it still suppresses this client's spawn rather than being read
-/// as "no supervisor". Only a genuinely absent file means "no marker".
+/// guard), so it still suppresses this client's spawn for the default finite
+/// interval. Only a genuinely absent file means "no marker".
 fn read_supervisor_marker() -> Option<SupervisorMarker> {
-    let contents = match std::fs::read_to_string(daemon::supervisor_marker_path()) {
+    let path = daemon::supervisor_marker_path();
+    let modified = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => {
             return Some(SupervisorMarker {
                 job: "<unreadable>".to_owned(),
                 pid: 0,
+                restart_interval: DEFAULT_SUPERVISOR_RESTART_INTERVAL,
+                modified,
             })
         }
     };
@@ -827,6 +849,14 @@ fn read_supervisor_marker() -> Option<SupervisorMarker> {
         .next()
         .and_then(|p| p.trim().parse::<u32>().ok())
         .unwrap_or(0);
+    // Legacy two-line markers and malformed intervals retain the finite
+    // default suppression, rather than accidentally authorizing an early spawn.
+    let restart_interval = lines
+        .next()
+        .and_then(|seconds| seconds.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_SUPERVISOR_RESTART_INTERVAL);
     Some(SupervisorMarker {
         job: if job.is_empty() {
             "<unnamed>".to_owned()
@@ -834,7 +864,59 @@ fn read_supervisor_marker() -> Option<SupervisorMarker> {
             job.to_owned()
         },
         pid,
+        restart_interval,
+        modified,
     })
+}
+
+/// Wait under the first observed restart interval, anchored to request entry.
+/// Rewrites (including a fresh PID or interval) update diagnostics, not the
+/// bound. A socket response, marker removal, or caller termination wins early.
+async fn wait_for_supervisor(
+    frame: &DaemonRequestFrame,
+    replay: &mut ReadReplayBudget,
+    request_started: tokio::time::Instant,
+    initial_marker: SupervisorMarker,
+) -> Result<ForwardOutcome, McpError> {
+    let supervisor_deadline = initial_marker.wait_deadline(request_started);
+    let caller_deadline = khive_storage::capture_request_read_context()
+        .deadline()
+        .map(khive_storage::RequestReadDeadline::async_at);
+    let retry_deadline =
+        caller_deadline.map_or(supervisor_deadline, |d| d.min(supervisor_deadline));
+    loop {
+        let Some(marker) = read_supervisor_marker() else {
+            return Ok(ForwardOutcome::NoSocket);
+        };
+        let now = tokio::time::Instant::now();
+        if khive_storage::request_read_is_cancelled()
+            || caller_deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Err(supervised_daemon_error(&marker));
+        }
+        if now >= supervisor_deadline {
+            tracing::warn!(
+                reason = "supervised_daemon_bootstrap_degraded",
+                job = %marker.job,
+                pid = marker.pid,
+                pid_alive = marker.pid_is_alive(),
+                marker_age_secs = ?marker.age().map(|age| age.as_secs_f64()),
+                time_waited_secs = request_started.elapsed().as_secs_f64(),
+                "supervisor present, daemon absent; proceeding with guarded client bootstrap"
+            );
+            return Ok(ForwardOutcome::NoSocket);
+        }
+        sleep_until_retry(retry_deadline).await;
+        if tokio::time::Instant::now() >= retry_deadline
+            || khive_storage::request_read_is_cancelled()
+        {
+            continue;
+        }
+        let outcome = try_forward_with_read_replay(frame, replay, Some(retry_deadline)).await;
+        if !matches!(outcome, ForwardOutcome::NoSocket) {
+            return Ok(outcome);
+        }
+    }
 }
 
 async fn sleep_until_retry(deadline: tokio::time::Instant) {
@@ -1373,6 +1455,8 @@ async fn kill_stale_daemon_inner(
             PidIdentity::KhiveDaemon => {
                 if let Ok(signed) = i32::try_from(pid) {
                     if signed > 0 {
+                        #[cfg(test)]
+                        SIGTERM_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // SAFETY: SIGTERM is a standard termination signal with no
                         // side effects beyond asking the process to exit.
                         unsafe {
@@ -2046,48 +2130,27 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
     )
 }
 
-/// Build the caller-visible error for a socket-less rendezvous claimed by a
-/// [`SupervisorMarker`]. Returned unconditionally (regardless of
-/// `KHIVE_DAEMON_STRICT`), exactly like [`incumbent_still_alive_error`] and
-/// [`respawn_failed_error`]: a supervisor's claim on this socket is never a
-/// case for quietly completing the request via local dispatch, and it is
-/// never a case for this process spawning a competing daemon either: a
-/// client that wins the bind race here leaves the supervised instance
-/// unable to start at all, which is the failure this closes.
+/// A caller that cannot wait for the supervisor's remaining startup budget can
+/// retry. The marker does not permanently prohibit ordinary client bootstrap.
 fn supervised_daemon_error(marker: &SupervisorMarker) -> McpError {
-    let alive = marker.pid_is_alive();
-    tracing::error!(
-        reason = "supervised_daemon_socket_absent",
-        job = %marker.job,
-        pid = marker.pid,
-        pid_alive = alive,
-        "refusing to spawn a daemon: the socket rendezvous is claimed by a supervised job"
-    );
     let mut data = serde_json::json!({
-        "reason": "supervised_daemon_socket_absent",
+        "reason": "supervised_daemon_starting",
+        "retryable": true,
         "job": marker.job,
         "pid": marker.pid,
-        "pid_alive": alive,
+        "pid_alive": marker.pid_is_alive(),
     });
     if is_daemon_strict_mode() {
         data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
     }
-    let message = if alive {
+    daemon_mcp_error(
         format!(
-            "daemon spawn refused: job \"{}\" (pid {}) supervises this socket and is still \
-             starting, but did not bind it before the wait deadline; retry once it is up, or \
-             stop that job first if you intend to replace it",
+            "supervised daemon starting: job \"{}\" (pid {}) has not bound the socket; \
+             the request deadline expired or the request was cancelled before dispatch; retry",
             marker.job, marker.pid
-        )
-    } else {
-        format!(
-            "daemon spawn refused: job \"{}\" supervises this socket but its pid {} is not \
-             running (stale marker); this client will not spawn a competing daemon — restart \
-             the supervised job, or remove the stale marker if it is no longer supervised",
-            marker.job, marker.pid
-        )
-    };
-    daemon_mcp_error(message, Some(data))
+        ),
+        Some(data),
+    )
 }
 
 // ── bridge self-heal: re-exec in place on ProtocolMismatch (#714) ───────────
@@ -2719,46 +2782,32 @@ where
         return None;
     }
 
+    let request_started = tokio::time::Instant::now();
     let mut replay = ReadReplayBudget::new(
         replay_read_only && crate::request_policy::read_replay_safe(&frame.ops),
     );
     let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
-    // A live-pid supervision marker earns the same bounded reconnect wait as
-    // a recorded-alive daemon: the supervised job may simply not have bound
-    // the socket yet. A dead-pid marker does not — see the `NoSocket` arm
-    // below, which never waits on a marker whose pid is already gone.
-    let supervisor_marker = read_supervisor_marker();
-    if matches!(first, ForwardOutcome::NoSocket)
-        && (recorded_daemon_is_alive()
-            || supervisor_marker
-                .as_ref()
-                .is_some_and(SupervisorMarker::pid_is_alive))
-    {
-        let deadline = bounded_retry_deadline();
-        while matches!(first, ForwardOutcome::NoSocket)
-            && tokio::time::Instant::now() < deadline
-            && !khive_storage::request_read_is_cancelled()
-        {
-            sleep_until_retry(deadline).await;
-            if tokio::time::Instant::now() >= deadline || khive_storage::request_read_is_cancelled()
-            {
-                break;
-            }
-            first = try_forward_with_read_replay(frame, &mut replay, Some(deadline)).await;
-        }
-    }
-    // A supervisor's marker claims this socket: never spawn a competing
-    // daemon here, regardless of whether its pid is still alive (waited
-    // above, then re-checked here) or already gone (never waited — see the
-    // retry-gate condition above). This is checked ahead of the generic
-    // caller-deadline error below on purpose: whatever ends the wait (the
-    // bounded retry deadline, or the caller's own request deadline), a
-    // present marker means the diagnosable, actionable answer is which job
-    // owns the socket, not a generic timeout. Nothing was written to a
-    // socket in the `NoSocket` case, so returning directly here is safe.
     if matches!(first, ForwardOutcome::NoSocket) {
-        if let Some(marker) = &supervisor_marker {
-            return Some(Err(supervised_daemon_error(marker)));
+        if let Some(marker) = read_supervisor_marker() {
+            first = match wait_for_supervisor(frame, &mut replay, request_started, marker).await {
+                Ok(outcome) => outcome,
+                Err(error) => return Some(Err(error)),
+            };
+        } else if recorded_daemon_is_alive() {
+            // Unmanaged daemon handover retains its existing reconnect grace.
+            let deadline = bounded_retry_deadline();
+            while matches!(first, ForwardOutcome::NoSocket)
+                && tokio::time::Instant::now() < deadline
+                && !khive_storage::request_read_is_cancelled()
+            {
+                sleep_until_retry(deadline).await;
+                if tokio::time::Instant::now() >= deadline
+                    || khive_storage::request_read_is_cancelled()
+                {
+                    break;
+                }
+                first = try_forward_with_read_replay(frame, &mut replay, Some(deadline)).await;
+            }
         }
     }
     if matches!(first, ForwardOutcome::NoSocket)
@@ -2777,9 +2826,8 @@ where
             return map_response(*resp, &frame.config_id, &frame.namespace)
         }
         ForwardOutcome::NoSocket => {
-            // No marker (checked above): nothing was written; fall through
-            // to the spawn/recover-then-send path below, unchanged from
-            // before this suppression existed.
+            // No marker, or its bounded startup grace expired: nothing was
+            // written, so use the existing guarded spawn/recovery path.
         }
         ForwardOutcome::Unreachable {
             kind,
@@ -3082,151 +3130,7 @@ mod tests {
             panic!("socket handover must not spawn or invoke local fallback")
         }
 
-        // ── client spawn suppression under a supervised daemon ──────────────
-        //
-        // Three arms, matching the marker-file ruling: no marker (control —
-        // must keep spawning, the whole bootstrap on an unmanaged machine),
-        // a stale marker (dead pid — fail immediately, never wait), and a
-        // live marker (alive pid — bounded wait, then the same loud
-        // failure). All three share `isolate()`'s per-test
-        // `KHIVE_SUPERVISOR_MARKER` path, which names no file until a test
-        // writes one.
-
-        fn marker_path() -> std::path::PathBuf {
-            std::env::var("KHIVE_SUPERVISOR_MARKER")
-                .expect("isolate() must set KHIVE_SUPERVISOR_MARKER")
-                .into()
-        }
-
-        fn write_marker(path: &std::path::Path, job: &str, pid: u32) {
-            std::fs::write(path, format!("{job}\n{pid}\n")).expect("write supervision marker");
-        }
-
-        #[tokio::test]
-        #[serial]
-        async fn no_marker_reaches_the_bootstrap_spawn_attempt() {
-            let _cleanup = RecoveryTestGuard::new();
-            let dir = tempfile::tempdir().unwrap();
-            isolate(dir.path());
-            // No marker written at KHIVE_SUPERVISOR_MARKER: the unmanaged-machine
-            // case, where a client spawning the daemon on demand is the whole
-            // bootstrap. This is the control arm — it must fail if suppression
-            // is ever applied unconditionally.
-            let spawn_attempts = Arc::new(AtomicUsize::new(0));
-            let spawn_attempts_probe = spawn_attempts.clone();
-            let counting_spawn = move || -> std::io::Result<std::process::Child> {
-                spawn_attempts_probe.fetch_add(1, Ordering::SeqCst);
-                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-            };
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                forward_or_spawn_with(&request("stats()"), &counting_spawn),
-            )
-            .await
-            .unwrap();
-            assert!(
-                matches!(result, Some(Err(_))),
-                "expected the (deliberately failing) spawn attempt's own error to \
-                 surface, not a silent no-op: {result:?}"
-            );
-            assert_eq!(
-                spawn_attempts.load(Ordering::SeqCst),
-                1,
-                "control arm: with no supervision marker present, a missing socket \
-                 must still reach the client's own spawn attempt exactly once"
-            );
-        }
-
-        #[tokio::test]
-        #[serial]
-        async fn stale_marker_with_dead_pid_fails_loud_without_spawning_or_waiting() {
-            let _cleanup = RecoveryTestGuard::new();
-            let dir = tempfile::tempdir().unwrap();
-            isolate(dir.path());
-            let mut short_lived = std::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .expect("spawn short-lived child");
-            let dead_pid = short_lived.id();
-            assert!(short_lived.wait().unwrap().success());
-            assert!(
-                !process_is_alive(dead_pid),
-                "a reaped exited child must read back as dead"
-            );
-            write_marker(&marker_path(), "ai.khive.kkernel-supervised", dead_pid);
-
-            let started = tokio::time::Instant::now();
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                forward_or_spawn_with(&request("stats()"), &never_spawn),
-            )
-            .await
-            .unwrap();
-            let elapsed = started.elapsed();
-
-            assert!(
-                elapsed < Duration::from_secs(2),
-                "a stale (dead-pid) marker must fail immediately, never wait \
-                 silently; took {elapsed:?}"
-            );
-            match result {
-                Some(Err(McpError { message, .. })) => {
-                    assert!(
-                        message.contains("ai.khive.kkernel-supervised")
-                            && message.contains("stale marker"),
-                        "must name the job and call out the stale marker; got: {message}"
-                    );
-                }
-                other => panic!("expected Some(Err(..)) naming the stale marker, got {other:?}"),
-            }
-        }
-
-        #[tokio::test]
-        #[serial]
-        async fn live_marker_bounded_waits_then_fails_loud_without_spawning() {
-            let _cleanup = RecoveryTestGuard::new();
-            let dir = tempfile::tempdir().unwrap();
-            isolate(dir.path());
-            // This test process's own pid is alive for the whole test and never
-            // binds the socket — modeling a supervised job that is slow to
-            // start. A caller-scoped read deadline keeps the bounded wait short
-            // without touching the production HANDOVER_RETRY_WINDOW constant.
-            write_marker(
-                &marker_path(),
-                "ai.khive.kkernel-supervised",
-                std::process::id(),
-            );
-
-            let started = tokio::time::Instant::now();
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                khive_storage::scope_request_read_deadline(
-                    Duration::from_millis(200),
-                    forward_or_spawn_with(&request("stats()"), &never_spawn),
-                ),
-            )
-            .await
-            .unwrap();
-            let elapsed = started.elapsed();
-
-            assert!(
-                elapsed >= Duration::from_millis(150),
-                "a live-pid marker must be given a bounded wait before failing, \
-                 not fail immediately; took {elapsed:?}"
-            );
-            match result {
-                Some(Err(McpError { message, .. })) => {
-                    assert!(
-                        message.contains("ai.khive.kkernel-supervised"),
-                        "must name the supervising job after the bounded wait \
-                         expires; got: {message}"
-                    );
-                }
-                other => panic!(
-                    "expected Some(Err(..)) naming the job after the bounded wait, got {other:?}"
-                ),
-            }
-        }
+        include!("daemon/supervisor_tests.rs");
 
         #[tokio::test]
         #[serial]
@@ -3556,6 +3460,11 @@ mod tests {
                     reap_incumbent,
                 );
                 assert!(incumbent_status.success());
+                assert_eq!(
+                    SIGTERM_COUNT.load(Ordering::SeqCst),
+                    1,
+                    "the owned incumbent is the positive control for actual SIGTERM attempts"
+                );
                 match (successor_wins, result) {
                     (false, Ok(RecoveryOutcome::Spawned(mut child))) => {
                         assert!(child.wait().unwrap().success());

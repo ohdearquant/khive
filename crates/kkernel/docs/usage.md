@@ -25,6 +25,7 @@ kkernel <command> [flags]
   reindex   Re-embed entities, notes, and the knowledge corpus (multi-engine)
   exec      Run a verb DSL expression through the pack registry
   mcp       Serve the MCP `request` surface (stdio / daemon / transports)
+  supervisor Launch a supervised daemon or release its startup marker
   backend   Inspect registered backends (list, info <name>)
 ```
 
@@ -73,6 +74,38 @@ for network transports and is ignored by stdio.
 (`~/.khive/khived.sock`) and takes precedence over `--transport`. On first use, stdio
 clients auto-spawn `kkernel mcp --daemon` and forward request frames to it; set
 `KHIVE_NO_DAEMON=1` to force local dispatch (used by the smoke/contract tests).
+
+### Supervised daemon startup
+
+On Unix, configure the process supervisor to launch the binary through its
+supervision subcommand:
+
+```bash
+kkernel supervisor launch --label ai.khive.kkernel-daemon --restart-interval-secs 10 -- --config /absolute/path/config.toml --pack kg --pack comm
+```
+
+The arguments after `--` are the daemon's existing `mcp` options; omit the
+`mcp` command name and `--daemon`, which the launcher supplies. Preserve the
+deployment's complete pack list, configuration, working directory, and
+environment. Set `--restart-interval-secs` to the supervisor's restart interval
+(for example, launchd's `ThrottleInterval`). The launcher resolves the
+configuration, publishes its marker, then execs the daemon without changing
+PID. Non-Unix platforms refuse this launcher explicitly.
+
+A configuration refusal removes the launcher's own marker and exits zero.
+A marker owned by another job is a configuration conflict and is left alone.
+For a deliberate stop, stop the supervised job first, then release its claim:
+
+```bash
+kkernel supervisor release --label ai.khive.kkernel-daemon
+```
+
+Release only removes that job's marker; it does not stop a process. Clients
+resume ordinary automatic startup when the marker is absent. While a marker
+is present, they wait up to three restart intervals before a logged degraded
+bootstrap, subject to an earlier caller deadline. See the
+[daemon lifecycle contract](../../khive-mcp/docs/api/daemon-lifecycle.md#supervised-startup-adr-185-amendment-1)
+for crash, restart, and timeout behavior.
 
 ---
 

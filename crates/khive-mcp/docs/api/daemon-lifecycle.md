@@ -6,6 +6,55 @@ stale/dead one, and forwards request frames over the daemon socket. This
 document is the extended rationale for the concurrency and safety properties
 that the inline doc comments summarize.
 
+## Supervised startup (ADR-185 Amendment 1)
+
+A supervisor launches the daemon through `kkernel supervisor launch`. The
+launcher publishes `~/.khive/khived.supervisor` before replacing itself with
+the daemon. Its three lines contain the supervisor job label, the launcher's
+PID, and the restart interval in whole seconds. Unix exec preserves that PID.
+The interval must match the supervisor's restart policy. A legacy two-line
+marker has a ten-second interval. `KHIVE_SUPERVISOR_MARKER` overrides the path
+for isolated tests; it is not a second ownership declaration.
+
+With a marker and no responsive socket, a client waits for at most three
+restart intervals from the start of its request. The bound applies to both
+live and dead marker PIDs; rewriting the marker during a crash loop does not
+renew the request's wait. The client checks the socket and marker again while
+waiting. A responding daemon receives the request; removing the marker
+restores ordinary automatic startup. An earlier caller deadline returns a
+retryable starting error instead of starting another process.
+
+If the bound expires while the marker remains and the socket still does not
+answer, the client may bootstrap a daemon. It logs “supervisor present, daemon
+absent” with the job, PID and liveness, marker age, and elapsed wait. This is
+degraded supervision: the bootstrap daemon can win the rendezvous and cause a
+later supervisor start to refuse. The marker does not permit killing or
+replacing a responsive incumbent, bypassing configuration checks, or replaying
+an ambiguous mutation. No permanent “not yours to start” refusal remains on
+this path. An unreadable marker is still a claim; it is not treated as absent.
+
+Only a launcher with the marker's own label can replace or release it. A
+foreign label causes refusal without modifying the marker. Publication uses
+a temporary file in the same directory and atomic rename. The daemon itself
+never writes or removes the marker. A configuration refusal in the launcher
+releases its own claim and exits successfully so the supervisor does not
+restart it. On a deliberate stop, the deployment must first stop the job and
+then run `kkernel supervisor release --label <job-label>`. A crash retains the
+marker while the supervisor restarts the process.
+
+The restart interval must allow for startup work: measure supervised
+start-to-bind time and allow it to fit within two intervals. A marker's PID
+alone cannot prove that the supervisor is healthy: a reused PID and a crash
+loop are both bounded by the same client wait.
+
+The temporary marker written by `make local` is still a legacy two-line
+producer. Its publication is not atomic, its existence check does not use
+the launcher lock, and its cleanup does not re-check the job label. These
+limits are tracked in [#3086](https://github.com/ohdearquant/khive/issues/3086);
+the client continues to honor that marker with the ten-second default
+interval. The launcher's serialization guarantee covers cooperating
+`supervisor launch` and `supervisor release` commands, not that older producer.
+
 ## Long-poll deadlines and one read replay (#3045)
 
 For each request, MCP admission, local/daemon dispatch, and a socket exchange
