@@ -18,10 +18,36 @@ Implementations must not write storage or change the approved content.
 Workspace overrides it with the same pure integer `properties.schema_version`
 predicate used by shared create and entity update. Neither `prepare_create` nor
 `after_create` runs on this proposal path. Other kinds retain their default
-admission, and approved `AddNote` is unchanged, including ADR-021's memory
-exception. A validation error follows the existing pre-commit failed-apply audit
+admission. A validation error follows the existing pre-commit failed-apply audit
 and projection handling; an accepted review is not itself evidence of a
 successful domain apply. Multi-step Compound proposals remain refused.
+
+Approved `AddNote` proposals are validated by the sibling hook below, not by this one:
+`validate_proposal_entity` "does not apply to AddNote" (per its own doc comment) because notes
+have their own analogous seam. ADR-021's prior memory exception on the `AddNote` route is
+withdrawn as of ADR-017's 2026-09-22 amendment; see `validate_proposal_note` immediately below.
+
+## KindHook::validate_proposal_note
+
+Analogous to `validate_proposal_entity` but for the `AddNote` route (ADR-017's 2026-09-22
+amendment). The kg pack's proposal route resolves the note kind's owning hook through the
+registry and calls this validation-only method at two points against the same immutable
+changeset: once when `propose` accepts a new `AddNote` changeset, before any proposal row
+exists, and again when an approved proposal is applied, using the canonical kind resolved by
+`canonical_note_kind`. The method is synchronous,
+receives no runtime handle, and defaults to accepting the draft. Implementations must not write
+storage or normalize the draft.
+
+The memory pack registers this hook for `kind="memory"` (ADR-021's 2026-09-22 amendment),
+refusing unconditionally with the canonical invalid-input shape (`details.reason =
+"kind_admission_refused"`, `details.kind = "memory"`, `details.route = "proposal_add_note"`,
+message naming `memory.remember`), the same refusal `prepare_create` already gives shared
+`create`, `stream.batch`, and standalone `stream.append`. Running the check at both `propose`
+and apply means a proposal approved before this hook existed still fails at apply, visibly,
+through the existing failed-apply audit and projection handling, writing no note, edge, FTS
+row, or provenance record and leaving the draft and its review history unchanged. Other note
+kinds keep their default admission, and this seam never narrows what shared `create` already
+accepts, only what the proposal route accepts.
 
 ## brain_consumer_kinds
 

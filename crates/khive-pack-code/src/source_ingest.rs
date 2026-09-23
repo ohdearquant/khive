@@ -8,10 +8,13 @@
 //! continue.
 //!
 //! Every entity write in this pipeline runs through the runtime secret gate
-//! (ADR-085 D6 #4) via the guarded entity-mutation seam. A gate refusal quarantines that one
+//! (ADR-085 D6 #4) via the guarded entity-mutation seam. A credential refusal quarantines that one
 //! item — it is recorded in [`CodeSourceIngestReport::blocked`] and skipped —
 //! rather than aborting the rest of the sweep, the same
 //! per-record posture `git.digest` already uses for its own write refusals.
+//! The runtime-owned top-level secret-gate property is separately reserved:
+//! its presence in a candidate, including retained existing properties,
+//! refuses that entity mutation with the shared invalid-input error.
 //!
 //! Identity (B4): every entity this pipeline creates has a `uuid5`-derived
 //! id, so re-ingesting the same path needs no dedup lookup. Edge ids are
@@ -632,6 +635,7 @@ async fn get_entity_opt(
 /// never set `description`, so this is additive and does not change their
 /// gate coverage.
 fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
+    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     secret_gate::check_at(&entity.name, "entity", "name")?;
     if let Some(description) = &entity.description {
         secret_gate::check_at(description, "entity", "description")?;

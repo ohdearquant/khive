@@ -537,10 +537,13 @@ def _check_p46():
 _add("P46", "renders", _check_p46)
 
 
-# -- P47: no chain pipe appears inside a function batch ----------------------
+# -- P47: the client renders flat batches; the parser accepts piped units ----
 def _check_p47():
     rendered = render_dsl([op("stats"), op("whoami")])
     assert "|" not in rendered
+    ops, mode = parse_dsl_with_mode("[a() | b(x=$prev.id), c()]")
+    assert mode == "parallel"
+    assert len(ops) == 3
 
 
 _add("P47", "renders", _check_p47)
