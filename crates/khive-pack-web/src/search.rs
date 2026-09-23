@@ -11,32 +11,18 @@ use std::time::Instant;
 
 use khive_runtime::engine_config::{WebSearchProviderConfig, WebSectionConfig};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::Deserialize;
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::egress::{self, Refusal, Resolver, SystemResolver};
-use crate::fetch::{mint_bare, resolve_effective_token, run_one_hop};
+use crate::fetch::{mint_bare, run_hop_chain};
+use crate::namespace::resolve_effective_token;
 use crate::receipt::write_receipt;
+use crate::vocab::SearchParams;
 use crate::WebPack;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SearchParams {
-    query: String,
-    #[serde(default)]
-    limit: Option<u32>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    persist: Option<bool>,
-    #[serde(default)]
-    max_bytes: Option<u64>,
-    #[serde(default)]
-    timeout_s: Option<u64>,
-    #[serde(default)]
-    namespace: Option<String>,
-}
 
 /// One transcribed result. Deserialized straight off an `Http` provider's
 /// response body — intentionally *not* `deny_unknown_fields`, since a
@@ -44,9 +30,78 @@ pub(crate) struct SearchParams {
 /// police (D6: transcribe, never invent — extra fields are simply dropped).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SearchHit {
+    #[cfg_attr(test, serde(deserialize_with = "tests::count_materialized_title"))]
     title: String,
     url: String,
     snippet: String,
+}
+
+struct DiscardedString;
+
+impl<'de> Deserialize<'de> for DiscardedString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StringVisitor;
+
+        impl Visitor<'_> for StringVisitor {
+            type Value = DiscardedString;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(DiscardedString)
+            }
+        }
+
+        deserializer.deserialize_str(StringVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct DiscardedSearchHit {
+    #[serde(rename = "title")]
+    _title: DiscardedString,
+    #[serde(rename = "url")]
+    _url: DiscardedString,
+    #[serde(rename = "snippet")]
+    _snippet: DiscardedString,
+}
+
+struct LimitedSearchHits {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for LimitedSearchHits {
+    type Value = Vec<SearchHit>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for LimitedSearchHits {
+    type Value = Vec<SearchHit>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a sequence")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let mut hits = Vec::new();
+        while hits.len() < self.limit {
+            match sequence.next_element()? {
+                Some(hit) => hits.push(hit),
+                None => return Ok(hits),
+            }
+        }
+        // A discarded hit must still satisfy the provider schema; IgnoredAny would hide errors.
+        while sequence.next_element::<DiscardedSearchHit>()?.is_some() {}
+        Ok(hits)
+    }
 }
 
 /// Resolve which configured provider serves this call. `name` narrows to
@@ -108,33 +163,52 @@ fn parse_search_response(
         )
         .into());
     }
-    let raw: Vec<SearchHit> = serde_json::from_slice(body).map_err(|error| {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    LimitedSearchHits {
+        limit: limit as usize,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|hits| deserializer.end().map(|()| hits))
+    .map_err(|error| {
         RuntimeError::InvalidInput(format!(
             "search provider response is not a JSON array of {{title, url, snippet}}: {error}"
         ))
-    })?;
-    Ok(raw.into_iter().take(limit as usize).collect())
+    })
 }
 
-/// An `Http` provider's request goes through the same address-class/
-/// DNS-rebinding-safe egress checks as `web.fetch`/`web.refresh`
-/// (`egress::resolve_and_pin_before` + `egress::pinned_client`) rather than a bare
-/// `reqwest::Client` dialing whatever `url_template` names — a provider
-/// pointed at a loopback/private/link-local address by misconfiguration (or
-/// a rewritten template) is refused before any connection is attempted, the
-/// same as it would be for `web.fetch`.
-///
-/// `api_key_env`'s value is gated behind TWO checks, both evaluated BEFORE
-/// any DNS resolution or dial: the resolved URL's host must be inside
-/// `provider_hosts` (mirroring `[[web.credentials]].hosts`' scoping), and the
-/// URL must be `https`. A provider with no configured `hosts` therefore never
-/// attaches its key to any host at all — `WebSectionConfig::validate`
-/// enforces that `hosts` is non-empty whenever `api_key_env` is set, so this
-/// is a defense in depth, not the only gate.
-///
-/// DNS resolution and `run_one_hop` share the same absolute deadline. The
-/// client carries no independent timeout that could race it and surface a
-/// `transport_error` instead of the deliberate `response_too_slow` refusal.
+fn provider_headers(
+    url: &url::Url,
+    api_key_env: Option<&str>,
+    provider_hosts: &[String],
+) -> Result<Vec<(String, String)>, RuntimeError> {
+    let Some(env_var) = api_key_env else {
+        return Ok(Vec::new());
+    };
+    let host = url
+        .host_str()
+        .ok_or_else(|| RuntimeError::InvalidInput("search provider url has no host".to_string()))?;
+    if !egress::host_in_set(provider_hosts, host) {
+        return Err(Refusal::new(
+            "search_provider_key_host_mismatch",
+            format!("search provider's api_key_env is not scoped to host {host:?}"),
+        )
+        .into());
+    }
+    egress::check_credential_scheme(url)?;
+    let value = std::env::var(env_var).map_err(|_| {
+        RuntimeError::InvalidInput(format!(
+            "search provider api_key_env {env_var:?} is not set"
+        ))
+    })?;
+    Ok(vec![(
+        "Authorization".to_string(),
+        format!("Bearer {value}"),
+    )])
+}
+
+/// Provider GETs share fetch's bounded redirect and egress chain. Every hop
+/// rechecks the provider key's host scope and HTTPS before DNS or transport;
+/// the original absolute deadline includes every DNS lookup and response.
 #[allow(clippy::too_many_arguments)]
 async fn run_http_provider(
     resolver: &dyn Resolver,
@@ -154,44 +228,14 @@ async fn run_http_provider(
     let url = url::Url::parse(&url_string).map_err(|error| {
         RuntimeError::InvalidInput(format!("invalid search provider url_template: {error}"))
     })?;
-    egress::check_scheme_and_userinfo(&url)?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| RuntimeError::InvalidInput("search provider url has no host".to_string()))?
-        .to_string();
-    egress::check_allowlist(&host, cfg)?;
-
-    let mut headers: Vec<(String, String)> = Vec::new();
-    if let Some(env_var) = api_key_env {
-        if !egress::host_in_set(provider_hosts, &host) {
-            return Err(Refusal::new(
-                "search_provider_key_host_mismatch",
-                format!("search provider's api_key_env is not scoped to host {host:?}"),
-            )
-            .into());
-        }
-        egress::check_credential_scheme(&url)?;
-        let value = std::env::var(env_var).map_err(|_| {
-            RuntimeError::InvalidInput(format!(
-                "search provider api_key_env {env_var:?} is not set"
-            ))
-        })?;
-        headers.push(("Authorization".to_string(), format!("Bearer {value}")));
-    }
-
-    let port = url.port_or_known_default().ok_or_else(|| {
-        RuntimeError::InvalidInput("search provider url has no resolvable port".to_string())
-    })?;
-    let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
-    let client = egress::pinned_client(&host, addr, port)?;
-
-    let outcome = run_one_hop(
-        &client,
-        &url,
+    let (outcome, _redirects) = run_hop_chain(
+        resolver,
+        cfg,
+        url,
         reqwest::Method::GET,
-        &headers,
         max_bytes,
         deadline,
+        |current_url| provider_headers(current_url, api_key_env, provider_hosts),
     )
     .await?;
     let (body, truncated) = outcome.body.ok_or_else(|| {
@@ -337,6 +381,7 @@ impl WebPack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::run_one_hop;
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebFixtureResult;
     use khive_runtime::VerbRegistryBuilder;
@@ -347,6 +392,101 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    thread_local! {
+        static MATERIALIZED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_materialized_title<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<String, D::Error> {
+        let title = String::deserialize(deserializer)?;
+        MATERIALIZED_HITS.with(|count| count.set(count.get() + 1));
+        Ok(title)
+    }
+
+    #[test]
+    fn response_limit_materializes_only_retained_hits() {
+        let body = serde_json::to_vec(&vec![
+            json!({"title":"ordered", "url":"https://example.test/", "snippet":"x".repeat(4096)});
+            100
+        ])
+        .unwrap();
+        for limit in [0, 1, 3, 100, 101] {
+            MATERIALIZED_HITS.with(|count| count.set(0));
+            let hits = parse_search_response(&body, false, limit).unwrap();
+            let retained = (limit as usize).min(100);
+            assert_eq!(hits.len(), retained);
+            MATERIALIZED_HITS.with(|count| assert_eq!(count.get(), retained));
+            assert!(hits.iter().all(|hit| hit.snippet.len() == 4096));
+        }
+    }
+
+    #[test]
+    fn limited_response_still_validates_discarded_hits_and_trailing_input() {
+        let first = r#"{"title":"first","url":"https://example.test/","snippet":"s"}"#;
+        for tail in [
+            r#"{"title":null,"url":"u","snippet":"s"}"#,
+            r#"{"title":"t","url":42,"snippet":"s"}"#,
+            r#"{"title":"t","url":"u"}"#,
+            r#"{"title":"t","title":"duplicate","url":"u","snippet":"s"}"#,
+            r#"{"title":"t","url":"u","snippet":"\uZZZZ"}"#,
+            "true",
+            r#"["t","u"]"#,
+        ] {
+            let body = format!("[{first},{tail}]");
+            for limit in [0, 1, 2] {
+                let error = parse_search_response(body.as_bytes(), false, limit).unwrap_err();
+                assert!(error.to_string().contains("not a JSON array"), "{error}");
+            }
+        }
+        for body in [format!("[{first},"), format!("[{first}] true")] {
+            assert!(parse_search_response(body.as_bytes(), false, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn limited_response_preserves_order_extensions_and_sequence_form() {
+        let body = br#"[
+            {"title":"z","url":"u","snippet":"s","future":{"nested":[1,true]}},
+            ["a","v","escaped\ntext"],
+            {"title":"last","url":"w","snippet":"s","future":null}
+        ]"#;
+        let hits = parse_search_response(body, false, 2).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.title.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        assert_eq!(hits[1].snippet, "escaped\ntext");
+        assert_eq!(parse_search_response(body, false, 1).unwrap().len(), 1);
+        assert!(parse_search_response(body, false, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_key_scope_is_rechecked_for_redirect_targets_before_reading_the_key() {
+        let hosts = vec!["search.example.test".to_string()];
+        let env = Some("KHIVE_WEB_SEARCH_UNSET_REDIRECT_KEY");
+        for (target, reason) in [
+            (
+                "https://other.example.test/result",
+                "search_provider_key_host_mismatch",
+            ),
+            (
+                "http://search.example.test/result",
+                "credential_requires_https",
+            ),
+        ] {
+            let url = url::Url::parse(target).unwrap();
+            let error = provider_headers(&url, env, &hosts).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        let same_host = url::Url::parse("https://search.example.test/result").unwrap();
+        assert!(provider_headers(&same_host, None, &hosts)
+            .unwrap()
+            .is_empty());
+    }
 
     /// See `fetch::tests::install_web_edge_rules` for why this is needed:
     /// the in-crate test runtime carries no `VerbRegistry`, so the web

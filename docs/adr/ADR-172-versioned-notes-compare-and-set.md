@@ -646,7 +646,13 @@ Stated before implementation, checked at the PR that lands the code:
 
 ## Amendment 6 (2026-09-14): identical generic keyed-create replay
 
-**Status**: Proposed.
+**Status**: Accepted 2026-09-22.
+
+Ratifying this amendment closes the design question it answers, not the older natural-key note
+request it was written to satisfy (#1053): #1053 closes only once this amendment is implemented
+and the acceptance controls below are executed against that implementation. [ADR-023](ADR-023-declarative-pack-format.md)'s
+2026-09-22 amendment names this contract as the one bounded exception to "create is not an
+upsert."
 
 ### Scope and result
 
