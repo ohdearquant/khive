@@ -6856,3 +6856,78 @@ async fn stream_append_refuses_memory_kind_and_names_memory_remember() {
         "the refusal must name the owning writer: {refusal}"
     );
 }
+
+/// Bulk `create(items=[...])` reaches the same owner refusal as a singleton create. Under
+/// `atomic: false` each memory item is its own failure naming `memory.remember` while an ordinary
+/// sibling commits; an atomic batch holding one memory item is refused as a whole.
+#[tokio::test]
+async fn bulk_create_refuses_a_memory_note_item_in_both_modes() {
+    let registry = make_registry(make_runtime());
+
+    let resp = registry
+        .dispatch(
+            "create",
+            json!({
+                "atomic": false,
+                "items": [
+                    {"kind": "observation", "content": "an ordinary sibling in a bulk batch"},
+                    {"kind": "memory", "content": "a memory through bulk create"},
+                    {"kind": "note", "note_kind": "memory", "content": "a memory through the note spelling"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create must return per-item results");
+    assert_eq!(resp["created"], 1, "{resp}");
+    assert_eq!(resp["failed"], 2, "{resp}");
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results[0]["ok"], true, "{resp}");
+    for idx in [1, 2] {
+        assert_eq!(results[idx]["ok"], false, "{resp}");
+        assert_eq!(
+            results[idx]["domain_disposition"], "not_committed",
+            "{resp}"
+        );
+        let message = results[idx]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("memory.remember"),
+            "item {idx} must name the verb that owns the kind: {message}"
+        );
+    }
+
+    let refusal = registry
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "observation", "content": "an ordinary sibling in an atomic batch"},
+                    {"kind": "memory", "content": "a memory in an atomic batch"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("an atomic batch holding a memory item must be refused");
+    assert!(
+        refusal.to_string().contains("memory.remember"),
+        "the atomic refusal must name the verb that owns the kind: {refusal}"
+    );
+
+    let memories = registry
+        .dispatch("list", json!({"kind": "memory"}))
+        .await
+        .expect("listing memories must succeed");
+    assert_eq!(
+        memories["items"].as_array().map(Vec::len),
+        Some(0),
+        "no memory row may be written by bulk create: {memories}"
+    );
+    let observations = registry
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("listing observations must succeed");
+    assert_eq!(
+        observations["items"].as_array().map(Vec::len),
+        Some(1),
+        "only the best-effort sibling may be stored: {observations}"
+    );
+}

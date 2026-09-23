@@ -197,6 +197,8 @@ unexpired, and `tool.check` falls through to policy for a reason nothing in the 
 
 ## Amendment 3 (2026-09-11): a policy is correctable, and a correction that changes nothing is refused
 
+**Status**: Accepted (2026-09-22), including item 1a.
+
 The Decision says `tool.policy(actor, tool, decision, note)` "stores a rule" and leaves the table's
 lifecycle unstated. Implemented, it is append-only with no inverse: every call mints a fresh row,
 `tool.revoke` takes a grant id rather than a policy id, and the base `delete` verb does not resolve
@@ -223,6 +225,13 @@ than a refusal**, because a refusal is information and this is not.
    re-reads that id later must find the rule that is in force, not a tombstone beside a newer row
    carrying the same meaning.
 
+1a. **Changing a deny names the live row.** When the live decision is `deny` and an upsert
+changes it, `tool.policy` requires `replaces=<live row id>`. A missing or mismatched id refuses
+and names the live row. Supplying an id that is not the current live row also refuses for other
+corrections or an absent triple. The id remains stable across successful corrections; this is
+explicit acknowledgment of the rule being changed, not a revision counter. Changing only the
+note on a deny does not require `replaces`.
+
 2. **Superseded rows are kept, not overwritten in place.** The replaced `decision`, `note` and the
    actor that wrote them are appended to a `history` array on the row, newest last, each entry
    carrying its own timestamp and author. The table stays a record of what was decided while the
@@ -236,6 +245,9 @@ than a refusal**, because a refusal is information and this is not.
 
    This is a separate verb rather than an overload of the base `delete`, which does not resolve a
    policy id and would have to learn a pack's table to do so.
+   Retirement retains the row and its history: `tool.policies` returns `deleted_at` and
+   `deleted_by`, while decision lookup excludes retired rows. A later write to the same triple
+   creates a new live row rather than erasing the retired record.
 
 4. **Ties still break `deny` over `ask` over `allow`.** Recency is deliberately NOT the tiebreak.
    Choosing `deny` on a tie is right for an _ambiguous_ pair, and the defect this amendment fixes
@@ -259,9 +271,15 @@ than a refusal**, because a refusal is information and this is not.
    note joins `history` under item 2 like any other superseded value, carrying the decision that was
    in force beside it, so the record still reads as one sequence rather than two.
 
+Existing append-only triples are consolidated without changing their decision: the row that
+already wins by `deny` over `ask` over `allow`, then `created_at ASC, id ASC`, keeps its id and
+remains live. Other rows are retained as retired records and folded into that row's history with
+`reason: legacy_consolidation` and `consolidated_at`, distinguishing upgrade work from a user's
+correction. Reapplying the schema plan does not append the same history again.
+
 ## Acceptance for Amendment 3
 
-17. Write `deny` for a triple, then `ask` for the identical triple: `tool.policies` lists ONE row,
+17. Write `deny` for a triple, then `ask` for the identical triple with `replaces` naming the deny: `tool.policies` lists ONE row,
     `tool.check` answers `ask`, and the `policy_id` it names is the id the first write returned.
 18. That row's `history` has one entry carrying the earlier `deny`, its note and its author.
 19. Write `deny` with a note for a triple, then the identical `deny` and the identical note again:
@@ -283,6 +301,14 @@ than a refusal**, because a refusal is information and this is not.
 25. Mutation control, stated before running: making the upsert insert a second row instead of
     replacing turns arms 17 through 20 red and leaves 21 through 24 green. That separation is what
     proves the single-live-row property is what those arms test, rather than the ordering.
+
+Additional acceptance for item 1a and upgrade:
+
+- A deny followed by an allow for the same triple without `replaces` refuses and still decides deny.
+  The correct live id permits the correction and retains the deny in history; any other id refuses.
+- A populated legacy store containing a deny and a later allow, or two allows, keeps the same
+  `tool.check` decision and deciding row id after consolidation. Choosing the newest row instead
+  must fail these arms.
 
 ## Amendment 4 (2026-09-11): a policy row can name what it is about
 

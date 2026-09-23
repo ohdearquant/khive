@@ -813,6 +813,10 @@ impl KgPack {
 }
 
 #[cfg(test)]
+#[path = "event_target_tests.rs"]
+mod event_target_tests;
+
+#[cfg(test)]
 mod tests {
     use super::parse_after_cursor;
     use super::{

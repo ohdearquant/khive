@@ -108,6 +108,7 @@ mod search_ranking_tests {
                 note_kinds: [(id, "observation".into())].into_iter().collect(),
                 entity_created_at: [(id, 1_000_000)].into_iter().collect(),
                 entity_updated_at: [(id, 2_000_000)].into_iter().collect(),
+                entity_versions: [(id, 1)].into_iter().collect(),
                 note_created_at: [(id, 1_000_000)].into_iter().collect(),
                 note_updated_at: [(id, 2_000_000)].into_iter().collect(),
                 note_versions: [(id, 1)].into_iter().collect(),

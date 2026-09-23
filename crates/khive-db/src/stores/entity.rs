@@ -38,7 +38,7 @@ const ENTITY_SELECT_COLUMNS: &str =
      entities.updated_at, entities.deleted_at, entities.merged_into, entities.merge_event_id, \
      (SELECT attachment.content_ref FROM attachments AS attachment \
       WHERE attachment.record_uuid = entities.id \
-        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref";
+        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref, entities.version";
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut)
@@ -54,9 +54,18 @@ const ENTITY_SELECT_COLUMNS: &str =
 // of re-deriving it.
 // ---------------------------------------------------------------------------
 
-/// The exact `INSERT OR REPLACE` this store's `upsert_entity` issues.
+/// Insert at version one, or replace the fields and advance the existing row once.
 pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
-    entity_write_statement(entity, "INSERT OR REPLACE", "entity-upsert")
+    let mut statement = entity_write_statement(entity, "INSERT", "entity-upsert");
+    statement.sql.push_str(
+        " ON CONFLICT(id) DO UPDATE SET namespace=excluded.namespace, kind=excluded.kind, \
+         entity_type=excluded.entity_type, name=excluded.name, description=excluded.description, \
+         properties=excluded.properties, tags=excluded.tags, created_at=excluded.created_at, \
+         updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, \
+         merged_into=excluded.merged_into, merge_event_id=excluded.merge_event_id, \
+         version=entities.version+1",
+    );
+    statement
 }
 
 /// Insert a new entity without replacing an existing live or deleted row.
@@ -135,7 +144,9 @@ pub fn entity_insert_if_absent_statement(entity: &Entity) -> SqlStatement {
 /// was derived from a read snapshot. Unlike [`entity_upsert_statement`], this
 /// never inserts and cannot overwrite a row whose revision or deletion
 /// marker moved after the snapshot was read. The replacement revision must
-/// also be strictly greater than the persisted snapshot revision; equality
+/// also be strictly greater than the persisted snapshot timestamp. The
+/// replacement's `version` is the expected persisted snapshot revision; the
+/// UPDATE advances it exactly once. Timestamp equality
 /// is a refused CAS, never a successful write with an unchanged concurrency
 /// token. Mirrors `note_replace_if_unchanged_statement`
 /// (`crates/khive-db/src/stores/note.rs`).
@@ -153,9 +164,9 @@ pub fn entity_replace_if_unchanged_statement(
         sql: "UPDATE entities SET \
                 namespace = ?1, kind = ?2, entity_type = ?3, name = ?4, description = ?5, \
                 properties = ?6, tags = ?7, updated_at = ?8, deleted_at = ?9, \
-                merged_into = ?10, merge_event_id = ?11 \
+                merged_into = ?10, merge_event_id = ?11, version = version + 1 \
               WHERE id = ?12 AND updated_at = ?13 AND deleted_at IS ?14 \
-                AND ?8 > updated_at"
+                AND ?8 > updated_at AND version = ?15"
             .to_string(),
         params: vec![
             SqlValue::Text(entity.namespace.clone()),
@@ -193,6 +204,7 @@ pub fn entity_replace_if_unchanged_statement(
                 Some(value) => SqlValue::Integer(value),
                 None => SqlValue::Null,
             },
+            SqlValue::Integer(entity.version),
         ],
         label: Some("entity-replace-if-unchanged".to_string()),
     }
@@ -201,7 +213,7 @@ pub fn entity_replace_if_unchanged_statement(
 /// The exact soft-delete `UPDATE` this store's `delete_entity(Soft)` issues.
 pub fn entity_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     SqlStatement {
-        sql: "UPDATE entities SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL".to_string(),
+        sql: "UPDATE entities SET deleted_at = ?1, version = version + 1 WHERE id = ?2 AND deleted_at IS NULL".to_string(),
         params: vec![
             SqlValue::Integer(deleted_at),
             SqlValue::Text(id.to_string()),
@@ -391,6 +403,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let merged_into_str: Option<String> = row.get(11)?;
     let merge_event_id_str: Option<String> = row.get(12)?;
     let content_ref: Option<String> = row.get(13)?;
+    let version: i64 = row.get(14)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -437,6 +450,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         tags,
         created_at,
         updated_at,
+        version,
         deleted_at,
         merged_into,
         merge_event_id,
@@ -465,35 +479,13 @@ fn batch_upsert_entities(
 
     for (index, entity) in entities.iter().enumerate() {
         let id_str = entity.id.to_string();
-        let properties_str = entity
-            .properties
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-        let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
-
-        let merged_into_str = entity.merged_into.map(|u| u.to_string());
-        let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
-        match conn.execute(
-            "INSERT OR REPLACE INTO entities \
-             (id, namespace, kind, entity_type, name, description, properties, tags, \
-              created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            rusqlite::params![
-                id_str,
-                &entity.namespace,
-                entity.kind,
-                entity.entity_type,
-                entity.name,
-                entity.description,
-                properties_str,
-                tags_str,
-                entity.created_at,
-                entity.updated_at,
-                entity.deleted_at,
-                merged_into_str,
-                merge_event_id_str,
-            ],
-        ) {
+        let statement = entity_upsert_statement(entity);
+        let result = (|| {
+            let mut prepared = conn.prepare(&statement.sql)?;
+            bind_params(&mut prepared, &statement.params)?;
+            prepared.raw_execute()
+        })();
+        match result {
             Ok(_) => summary.affected = summary.affected.saturating_add(1),
             Err(e) => {
                 let (class, retryability) = super::classify_batch_sqlite_error(&e);
@@ -1082,7 +1074,7 @@ impl EntityStore for SqlEntityStore {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|param| param.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((read_entity(row)?, row.get::<_, i64>(14)?))
+                Ok((read_entity(row)?, row.get::<_, i64>(15)?))
             })?;
             let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
             let has_more = entries.len() > limit_usize;

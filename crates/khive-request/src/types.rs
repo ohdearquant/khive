@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 
 use serde_json::Value;
 
@@ -380,10 +381,22 @@ pub struct ParsedOp {
 }
 
 /// Parsed operations in input order plus their execution mode.
+///
+/// `ranges` is a nonempty partition of `ops` into contiguous, non-overlapping
+/// **units**: every leaf belongs to exactly one range, and ranges are listed
+/// in source order with no gaps. `Single` carries one range of length one.
+/// `Chain` carries one range covering every leaf. `Parallel` carries one
+/// range per independent unit; length one for every range in an ordinary
+/// flat batch (`[a(), b()]`), and possibly longer ranges for a bracketed
+/// batch of linear chains (`[a() | b(), c()]`, ADR-016 Amendment 2), where a
+/// range longer than one names a unit that is itself a chain: only its first
+/// leaf is barred from `$prev`, and a failure inside it aborts only that
+/// unit's own remaining leaves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedRequest {
     pub ops: Vec<ParsedOp>,
     pub mode: ExecutionMode,
+    pub ranges: Vec<Range<usize>>,
 }
 
 /// One already-decoded JSON operation for a bounded trusted transport.
@@ -554,10 +567,9 @@ impl fmt::Display for DslError {
             DslError::MixedSeparators => {
                 write!(
                     f,
-                    "cannot mix ',' (parallel) and '|' (chain) separators in one request; \
-                     a parallel batch cannot contain a chain. Split the work into two `request` \
-                     calls: put independent ops in one `[...]` batch and dependent ops in a \
-                     separate `a() | b(arg=$prev.id)` chain"
+                    "cannot mix ',' (parallel) and '|' (chain) separators outside `[...]`; \
+                     to run chains in parallel, wrap every unit in one bracketed batch, \
+                     for example `[a() | b(arg=$prev.id), c()]`"
                 )
             }
             DslError::EmptyBatch => {

@@ -135,6 +135,10 @@ pub enum IdResolutionMode {
     /// itself (any namespace scoping comes from the enclosing operation,
     /// not from this parameter).
     UnscopedFullUuidOnly,
+    /// `list.target_id`: edge lists resolve full UUIDs as given and prefixes
+    /// or entity names in the primary namespace; event lists accept only an
+    /// exact full subject UUID, with visibility applied to event rows.
+    EdgeOrEventTarget,
 }
 
 /// Parameter type for `help=true` schema envelopes.

@@ -148,6 +148,9 @@ pub struct CoordSearchResult {
     /// `updated_at` (micros) for each entity hit, keyed by entity UUID. Same
     /// parity purpose and resolution rule as `entity_created_at`.
     pub entity_updated_at: std::collections::HashMap<uuid::Uuid, i64>,
+    /// Persisted revision for each entity hit, keyed by entity UUID. Same
+    /// parity purpose and resolution rule as `entity_created_at`.
+    pub entity_versions: std::collections::HashMap<uuid::Uuid, i64>,
     /// `created_at` (micros) for each note hit, keyed by note UUID. Same
     /// parity purpose and resolution rule as `entity_created_at`.
     pub note_created_at: std::collections::HashMap<uuid::Uuid, i64>,
@@ -468,6 +471,7 @@ pub(crate) mod tests {
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
                 entity_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
                 entity_updated_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                entity_versions: std::collections::HashMap::from([(id, 1)]),
                 note_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
                 note_updated_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
                 note_versions: std::collections::HashMap::from([(id, 1)]),

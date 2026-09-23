@@ -857,6 +857,12 @@ pub(crate) fn event_filter_from_params(
         }
     }
 
+    let target_id = p
+        .target_id
+        .as_deref()
+        .map(|s| parse_exact_event_filter_id("target_id", s))
+        .transpose()?;
+
     let session_id = p
         .session_id
         .as_deref()
@@ -881,6 +887,7 @@ pub(crate) fn event_filter_from_params(
 
     Ok((
         EventFilter {
+            target_id,
             verbs,
             substrates,
             actors: p.actor.clone().into_iter().collect(),
