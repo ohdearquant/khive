@@ -1,6 +1,6 @@
 # ADR-185: Daemon Rendezvous Ownership — a client must not take the socket a supervisor is for
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-22)
 - **Date**: 2026-09-13
 - **Depends on**: [ADR-049](ADR-049-khived-daemon.md) (the warm-state daemon, the thin client, and
   client auto-spawn)
