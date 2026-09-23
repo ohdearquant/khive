@@ -85,7 +85,11 @@ note record and returns its UUID rather than reusing an existing one (a request 
 `edges` additionally writes those edge records, and on a note create `annotates` likewise writes
 annotation edges from the new note -- entity creates ignore `annotates`); a bulk `create(items=[...])` carries a
 `kind` per item instead of at the top level and returns aggregate counts
-(`attempted`/`created`/`skipped`/`failed`) -- an empty `items=[]` is accepted and writes nothing.
+(`attempted`/`created`/`skipped`/`failed`) -- an empty `items=[]` is accepted and writes nothing. The one bounded
+exception is a note `create` carrying `key`: an identical replay of a held key returns the existing id with
+`created: false` and writes nothing new, while a differing payload under that key still refuses with
+`key_conflict` rather than overwriting it (see `docs/adr/ADR-172-versioned-notes-compare-and-set.md` Amendment 6
+and `docs/adr/ADR-023-declarative-pack-format.md`).
 Entity names are mutable labels, not unique keys. When reuse is intended, call
 `resolve` and inspect its per-ref status (`resolved` / `ambiguous` / `not_found` -- lowercase wire
 values) (or `search` and inspect the ranked hits), and create only after `not_found` or an

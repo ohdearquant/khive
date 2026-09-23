@@ -10,6 +10,7 @@ mod extract;
 mod fetch;
 mod identity;
 mod ingest;
+mod namespace;
 mod pack;
 mod receipt;
 mod refresh;

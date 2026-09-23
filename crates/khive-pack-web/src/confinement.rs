@@ -28,6 +28,13 @@ fn refusal(code: &'static str, path: &Path, error: impl std::fmt::Display) -> Ru
     Refusal::new(code, format!("web.ingest: {}: {error}", path.display())).into()
 }
 
+/// Admit the complete tree, returning at most `limit` regular-file descriptors.
+///
+/// The limit bounds returned file descriptors and later body reads, not discovery.
+/// Every entry is still inspected so an inadmissible entry anywhere in the source
+/// causes refusal, including at limit zero. Each visited directory's names are
+/// collected and sorted; retained name storage follows the active DFS stack.
+/// Operators needing a discovery bound must choose a smaller source directory.
 pub(crate) fn open_files(
     cfg: &WebSectionConfig,
     source: &Path,

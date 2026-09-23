@@ -12,6 +12,9 @@ indexed FTS classifier rather than a post-MATCH row filter (#1907).
 **Amended**: 2026-09-18, [new-memory creation admission](#amendment-new-memory-creation-admission)
 replaces the generic-create equivalence in §4 and qualifies §10 and the neutral
 consequences (#2724 proposed it; accepted 2026-09-18).
+**Amended**: 2026-09-22, [memory admission at the proposal-note route withdraws the AddNote
+exception](#amendment-memory-admission-at-the-proposal-note-route-withdraws-the-addnote-exception-2026-09-22)
+(#2057, #2967).
 
 ## Context
 
@@ -578,6 +581,62 @@ No native execution or performance result is asserted by this proposal.
 
 No schema migration, dependency, new verb or graph relation is required. Reverting
 the hook restores prior input admission; it does not migrate existing data.
+
+## Amendment: memory admission at the proposal-note route withdraws the AddNote exception (2026-09-22)
+
+**Status**: accepted 2026-09-22. This amendment withdraws the preceding amendment's explicit
+preservation of `AddNote` for the memory kind: "Approved `propose`/`review` changesets containing
+`AddNote` retain their existing registered-kind admission because they are the one creation route
+outside the shared create hook" no longer holds for `kind="memory"`. Every other kind's `AddNote`
+admission is unaffected.
+
+Originating issue(s): #2057, #2967
+
+### Decision
+
+The memory pack registers the kind-owned, validation-only proposal-note hook
+[ADR-017](ADR-017-pack-standard.md)'s 2026-09-22 amendment defines, for `kind="memory"`. This
+pure-validation check runs at two points against the same `AddNote` changeset:
+
+- **Proposal creation.** A new `propose` call whose changeset contains an `AddNote(kind="memory",
+  ...)` entry is refused before the proposal is created.
+- **Apply.** An approved proposal whose changeset contains such an entry is refused at apply,
+  including a proposal approved before this amendment landed.
+
+Both refusals use the canonical invalid-input error shape with `details.reason =
+"kind_admission_refused"`, `details.kind = "memory"`, `details.route = "proposal_add_note"`, and a
+message directing the caller to `memory.remember`. The refusal fires even when the draft already
+supplies `memory_type`, `salience`, `decay_factor`, or an otherwise apparently complete set of
+defaults: those inputs still do not supply `memory.remember`'s typed stored columns, authenticated
+actor/namespace routing, or keyed replay contract, so the shared creation hook's rationale for
+refusing `create(kind="memory", ...)` applies identically to the proposal route.
+
+### Pre-upgrade proposals
+
+Approval of an `AddNote(kind="memory")` proposal authorized an immutable changeset subject to
+apply-time revalidation; it was never proof that the write would commit. For a proposal approved
+before this amendment, apply now fails visibly with the shape above, and:
+
+- writes no new memory note, edge, or provenance record;
+- leaves the approved draft and its full review history unchanged and intact;
+- MUST NOT silently rewrite the proposal, report it applied, redirect the write to
+  `memory.remember` on the caller's behalf, or otherwise grandfather the creation.
+
+No automatic migration or backfill of pre-upgrade proposals or their history is performed.
+
+### Unaffected
+
+`memory.remember` is unaffected: it remains the supported writer, with its existing type-specific
+defaults, explicit numeric values, embedding selection, and namespace and keyed-replay contract.
+Reads, updates, deletion, restoration, and `AddNote` proposals targeting any kind other than
+memory are unaffected by this amendment.
+
+### Acceptance
+
+A fresh `AddNote(kind="memory")` proposal is refused at creation with the shape above, and no
+proposal row is created. A proposal of the same shape approved under the pre-amendment contract is
+refused at apply with the same shape, with its draft and review history read back unchanged.
+`memory.remember` and `AddNote` proposals of every other kind are unaffected by either check.
 
 ## Implementation
 
