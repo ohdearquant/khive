@@ -7,8 +7,8 @@
 pub const TASK_LIFECYCLE_HELP: &str = concat!(
     "inbox -> next | waiting | someday | active | done | cancelled; ",
     "next -> active | waiting | someday | done | cancelled; ",
-    "active -> next | waiting | done | cancelled; ",
-    "waiting -> next | active | done | cancelled; ",
+    "active -> next | waiting | someday | done | cancelled; ",
+    "waiting -> next | active | someday | done | cancelled; ",
     "someday -> next | active | done | cancelled; ",
     "done/cancelled -> terminal"
 );
@@ -75,8 +75,8 @@ pub fn is_terminal(s: &str) -> bool {
 /// Lifecycle (mirrors khive-internal):
 /// - `inbox`     → next | waiting | someday | active | done | cancelled
 /// - `next`      → active | waiting | someday | done | cancelled
-/// - `active`    → next | waiting | done | cancelled
-/// - `waiting`   → next | active | done | cancelled
+/// - `active`    → next | waiting | someday | done | cancelled
+/// - `waiting`   → next | active | someday | done | cancelled
 /// - `someday`   → next | active | done | cancelled
 /// - `done`      → (terminal — no outgoing transitions)
 /// - `cancelled` → (terminal — no outgoing transitions)
@@ -90,8 +90,8 @@ pub fn allowed_transitions(from: &str) -> &'static [&'static str] {
     match from {
         "inbox" => &["next", "waiting", "someday", "active", "done", "cancelled"],
         "next" => &["active", "waiting", "someday", "done", "cancelled"],
-        "active" => &["next", "waiting", "done", "cancelled"],
-        "waiting" => &["next", "active", "done", "cancelled"],
+        "active" => &["next", "waiting", "someday", "done", "cancelled"],
+        "waiting" => &["next", "active", "someday", "done", "cancelled"],
         "someday" => &["next", "active", "done", "cancelled"],
         "done" => &[],
         "cancelled" => &[],
@@ -149,6 +149,8 @@ mod tests {
         assert!(can_transition("next", "active"));
         assert!(can_transition("active", "done"));
         assert!(!can_transition("active", "inbox"));
+        assert!(can_transition("active", "someday"));
+        assert!(can_transition("waiting", "someday"));
         assert!(!can_transition("done", "waiting"));
         // Terminal states have no outgoing transitions (enforced).
         assert!(!can_transition("done", "next"));

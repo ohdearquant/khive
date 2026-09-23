@@ -153,7 +153,10 @@ fn jitter(step: Duration) -> Duration {
 /// crates/khive-channel-email/docs/api/backoff.md for the incident
 /// grounding behind this classification.
 pub fn is_backoff_eligible(err: &ChannelError) -> bool {
-    matches!(err, ChannelError::Auth(_) | ChannelError::Transport(_))
+    matches!(
+        err,
+        ChannelError::Auth(_) | ChannelError::RetryableAuth(_) | ChannelError::Transport(_)
+    )
 }
 
 /// Per-credential single-flight guard: at most one concurrent IMAP

@@ -118,8 +118,9 @@ rejected because this is an explicit stored reference; Agent responses retain it
 Full `gtd.transition` allowed transitions:
 `inbox` → next | waiting | someday | active | done | cancelled;
 `next` → active | waiting | someday | done | cancelled (skipping `active` with `next -> done` is valid);
-`active` → next | waiting | done | cancelled;
-`waiting` | `someday` → next | active | done | cancelled;
+`active` → next | waiting | someday | done | cancelled;
+`waiting` → next | active | someday | done | cancelled;
+`someday` → next | active | done | cancelled;
 `done` and `cancelled` are terminal.
 
 `gtd.transition` returns one of two shapes. On a real transition: `{transitioned: true, id, full_id,

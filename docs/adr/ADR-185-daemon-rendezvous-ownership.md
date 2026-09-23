@@ -1,6 +1,6 @@
 # ADR-185: Daemon Rendezvous Ownership — a client must not take the socket a supervisor is for
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-22)
 - **Date**: 2026-09-13
 - **Depends on**: [ADR-049](ADR-049-khived-daemon.md) (the warm-state daemon, the thin client, and
   client auto-spawn)
@@ -137,3 +137,100 @@ is the one the obvious remedy already failed:
 - The refusal's kind is asserted, not just its text, since a caller has to tell "not yours to start"
   from "starting, try again" without parsing prose. The bounded wait is asserted on both sides of
   its boundary: inside the window the kind is "starting", past it the kind is "not yours to start".
+
+## Amendment 1 (2026-09-22): the declaration is a launcher-written marker, and suppression is bounded
+
+This amendment replaces Decision items 1 and 2 and bounds items 3 and 4.
+
+### What exists since the record was proposed
+
+A client-side reader has shipped. The client reads a marker file at the rendezvous (by default
+`~/.khive/khived.supervisor`; `KHIVE_SUPERVISOR_MARKER` overrides the path) that holds a job label and a
+pid. With no marker the client follows ADR-049. With a marker and no responsive socket it never
+spawns: a live pid earns the bounded wait and then a refusal naming the job, and a dead pid refuses at
+once. Nothing defines who writes the marker, so the only writer today is a temporary one in the local
+install target. Three questions were open: what activates supervision, who publishes the claim and
+when, and who owns the marker across daemon death, restart backoff and deliberate stops.
+
+### Decisions
+
+1. **Activation is the marker, written by the launcher.** The declaration of item 1 is the marker file
+   itself, not a configuration key. The process the supervisor starts (a wrapper, or the supervisor's
+   own pre-start hook) writes the marker before it execs the daemon. The configuration-file
+   declaration and the environment override of items 1 and 2 are withdrawn, and
+   `KHIVE_SUPERVISOR_MARKER` stays a path override for tests only. The writer has to be the launcher
+   because the race is lost before the daemon runs: a writer inside the daemon publishes the claim
+   after a client may already hold the socket.
+2. **Format.** Three lines: the supervisor's job label; the launcher's pid, which the daemon keeps
+   across exec; and the supervisor's restart interval in whole seconds (launchd `ThrottleInterval`,
+   systemd `RestartSec`). The launcher writes a temporary file in the same directory and renames it
+   over the marker, so a reader never sees a partial marker. A marker without the third line reads as
+   a 10-second interval, the launchd default. An unreadable marker still suppresses, as shipped.
+3. **Ownership.**
+   - The daemon never writes or removes the marker.
+   - A launcher overwrites a marker that carries its own job label, since that is a restart of itself.
+     It never touches a marker that carries another label. Two supervisors declared for one
+     rendezvous is a configuration error, and the second launcher refuses to start.
+   - The launcher, or the deployment's stop procedure, removes the marker on every deliberate stop.
+     That includes the launcher's own configuration refusal: a launcher that exits successfully so
+     that the supervisor does not restart it removes the marker first. Once it is removed, clients
+     follow ADR-049 unchanged.
+   - An operator removes a marker by hand only when decommissioning the supervisor.
+4. **Suppression is bounded by the restart interval, for a live pid and a dead pid alike.** A client
+   that finds a marker and no responsive socket waits, re-reading the socket and the marker, for at
+   most N times the marker's interval from the start of the request, with N = 3.
+   - A socket that answers ends the wait, and the client connects.
+   - A marker that disappears ends the wait, and the client follows ADR-049.
+   - A caller deadline that expires first returns the retryable "starting" kind of item 4.
+   - Past the bound, with the marker still present and no socket, the client may start the daemon
+     itself. It logs a degradation naming the job, the pid and whether that pid was alive, the
+     marker's age and the time waited ("supervisor present, daemon absent"). It never starts one
+     silently.
+
+   The 10-second wait of item 4 is too short for a dead pid. A supervisor restarts a crashed daemon
+   one restart interval after the crash, and launchd's default interval is also 10 seconds, so a
+   client bounded at 10 seconds reaches the free socket at the same moment as the restart. That is
+   the race measured above. Three intervals cover the restart and the daemon's own startup with a
+   margin. A deployment whose daemon takes longer than two intervals to bind raises the interval it
+   writes into the marker.
+
+   The bound also covers two failures that a pid check cannot see. In a crash loop every restart
+   rewrites the marker, so its age never grows. A reused pid that now belongs to an unrelated process
+   reads as alive indefinitely. Without the bound, either one suppresses every client for as long as
+   it lasts, behind a supervisor that looks healthy.
+
+   After this amendment the spawn path returns no permanent "not yours to start" refusal. A caller
+   either is served or receives the retryable "starting" kind.
+
+### Consequences of the amendment
+
+- A request that arrives while the supervised daemon is down waits up to three restart intervals (30
+  seconds under launchd's default) and is then served. Today it is refused at once when the pid is
+  dead, or after 10 seconds when the pid is alive.
+- A supervisor in a crash loop can no longer suppress every client indefinitely. The cost is that a
+  client-started daemon can then hold the socket, and the supervisor's next start is refused by that
+  incumbent, which is the original failure. It can only happen after the bound, and a log line names it.
+- No configuration key is added.
+
+### Acceptance changes
+
+The arms above stand, with "an owner is declared" read as "a marker is present" and "not yours to
+start" read as "past the bound, the client starts the daemon and logs the degradation". The arm for a
+configuration file and environment that disagree is withdrawn along with that declaration. Added:
+
+- **The launcher writes before exec.** Start from no socket, no PID file and no marker. Start the
+  launcher and a client together, the client at the instant that wins under ADR-049. The supervised
+  daemon holds the socket, the supervisor's pid equals the socket holder's pid, and exactly one daemon
+  process exists.
+- **A configuration refusal releases the rendezvous.** A launcher that refuses its configuration exits
+  successfully and leaves no marker, and a client then spawns and serves per ADR-049. Control: the same
+  refusal with the marker left in place makes the client wait out the bound.
+- **A crash loop is bounded.** A launcher whose daemon exits non-zero before binding is restarted on a
+  short interval. A client waits no longer than three intervals, then starts the daemon and emits the
+  degradation. Control: a daemon that binds within one interval is connected to, with no degradation.
+- **The respawn gap is covered.** A healthy supervised daemon is killed. A client that arrives before
+  the supervisor's restart does not start a daemon; the restarted supervised daemon binds, and the
+  client connects to it. On the real deployment, the supervised start-to-bind time is measured ten
+  times, and every sample fits inside two intervals.
+- **A foreign marker is left alone.** A launcher that finds a marker carrying another job label refuses
+  to start and leaves the marker untouched.
