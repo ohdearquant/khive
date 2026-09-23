@@ -497,16 +497,19 @@ fn spawn_email_channel_loops(
                 if admission.outbound_delivery {
                     match runtime_outbox {
                         Some(rt) => {
-                            khive_runtime::track_named_background_task(
-                                "email_channel_outbox",
-                                channel_outbox_loop(
-                                    email_ch_clone,
-                                    rt,
-                                    ingest_ns_outbox,
-                                    mailbox_clone,
-                                    allowlist_clone,
-                                    khive_runtime::daemon_shutdown_token(),
-                                ),
+                            crate::components::start_channel_component(
+                                "email-outbound",
+                                server,
+                                move |ctx| {
+                                    Box::pin(channel_outbox_loop(
+                                        email_ch_clone.clone(),
+                                        rt.clone(),
+                                        ingest_ns_outbox.clone(),
+                                        mailbox_clone.clone(),
+                                        allowlist_clone.clone(),
+                                        ctx,
+                                    ))
+                                },
                             );
                             tracing::info!("email channel outbox loop started");
                         }
@@ -1262,7 +1265,9 @@ enum HeartbeatOutcome {
 #[cfg(feature = "channel-email")]
 fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
     match err {
-        khive_channel::ChannelError::Auth(_) => "auth",
+        khive_channel::ChannelError::Auth(_) | khive_channel::ChannelError::RetryableAuth(_) => {
+            "auth"
+        }
         khive_channel::ChannelError::Transport(_)
         | khive_channel::ChannelError::PermanentTransport(_) => "transport",
         khive_channel::ChannelError::Config(_)
@@ -1554,57 +1559,39 @@ async fn record_outbound_claim_failure(
 ///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
-async fn channel_outbox_loop(
-    email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
+pub(crate) async fn channel_outbox_loop(
+    email_channel: Arc<dyn khive_channel::Channel>,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
     allowlist: Vec<String>,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
+    ctx: crate::components::HostContext,
+) -> Result<(), crate::components::ComponentError> {
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
-    let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
-        Ok(ns) => ns,
-        Err(e) => {
-            tracing::error!(
-                namespace = %ingest_namespace,
-                error = %e,
-                "outbox loop: ingest namespace does not parse; loop will not run"
-            );
-            return;
-        }
-    };
-
+    let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
+        .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     loop {
-        if !channel_cycle_wait(OUTBOUND_RETRY_BASE, &shutdown).await {
-            tracing::info!("email channel outbox loop: daemon shutdown observed, stopping");
-            return;
+        if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
+            return Ok(());
         }
-        let stop = channel_outbox_once(
+        channel_outbox_once(
             email_channel.as_ref(),
             &runtime,
             &namespace,
             &mailbox,
             &domain,
             &allowlist,
+            ctx.cancellation(),
         )
-        .await;
-        if stop {
-            tracing::error!(
-                "email outbound delivery stopped: SMTP authentication was rejected; \
-                 restart the component after fixing credentials"
-            );
-            return;
-        }
+        .await?;
+        ctx.heartbeat();
     }
 }
 
 /// Execute one email outbox scan. Kept separate from the five-second loop so
 /// routing and owner-claim behavior can be verified without sleeping or
-/// opening a network transport. Returns `true` when the caller must stop the
-/// component (ADR-122 §4: a definitive SMTP AUTH rejection applies to the
-/// whole account, not the one message being sent, so it is never recorded as
-/// a per-note failure).
+/// opening a network transport. Account-wide authentication errors propagate
+/// to the supervisor without becoming per-message terminal failures.
 #[cfg(feature = "channel-email")]
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
@@ -1614,7 +1601,8 @@ async fn channel_outbox_once(
     mailbox: &str,
     domain: &str,
     allowlist: &[String],
-) -> bool {
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<(), crate::components::ComponentError> {
     use chrono::Utc;
     use khive_channel::ChannelEnvelope;
 
@@ -1629,7 +1617,9 @@ async fn channel_outbox_once(
         Ok(token) => token,
         Err(error) => {
             tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
-            return false;
+            return Err(crate::components::ComponentError::Permanent(
+                error.to_string(),
+            ));
         }
     };
     let notes = match runtime
@@ -1639,7 +1629,9 @@ async fn channel_outbox_once(
         Ok(notes) => notes,
         Err(error) => {
             tracing::warn!(error = %error, "outbox loop: outbox scan failed");
-            return false;
+            return Err(crate::components::ComponentError::Retryable(
+                error.to_string(),
+            ));
         }
     };
     let notes: Vec<serde_json::Value> = notes
@@ -1647,6 +1639,9 @@ async fn channel_outbox_once(
         .filter_map(|note| serde_json::to_value(note).ok())
         .collect();
     for note_val in &notes {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         let props = match note_val.get("properties") {
             Some(serde_json::Value::Object(properties)) => properties.clone(),
             _ => continue,
@@ -1817,21 +1812,14 @@ async fn channel_outbox_once(
                     ),
                 }
             }
-            Err(khive_channel::ChannelError::Auth(auth_error)) => {
-                // ADR-122 §4: a definitive AUTH rejection is an account-wide
-                // condition, not a fact about this recipient. Recording it as
-                // a per-note permanent failure (via record_outbound_send_failure)
-                // would terminally fail every note queued during the outage;
-                // instead leave this note pending and stop the component so
-                // an operator notices and fixes credentials before delivery
-                // resumes.
-                tracing::error!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    error = %auth_error,
-                    "outbox loop: SMTP authentication rejected; stopping outbound delivery"
-                );
-                return true;
+            Err(
+                khive_channel::ChannelError::Auth(error)
+                | khive_channel::ChannelError::Config(error),
+            ) => {
+                return Err(crate::components::ComponentError::Permanent(error));
+            }
+            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
+                return Err(crate::components::ComponentError::Retryable(error));
             }
             Err(error) => {
                 let mark_result = match uuid::Uuid::parse_str(&note_id) {
@@ -1861,7 +1849,7 @@ async fn channel_outbox_once(
             }
         }
     }
-    false
+    Ok(())
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
@@ -1950,14 +1938,17 @@ fn spawn_telegram_channel_loops(
                 if admission.outbound_delivery {
                     match outbox_runtime {
                         Some(rt) => {
-                            khive_runtime::track_named_background_task(
-                                "telegram_channel_outbox",
-                                telegram_outbox_loop(
-                                    tg_ch_outbox,
-                                    rt,
-                                    ingest_ns_outbox,
-                                    khive_runtime::daemon_shutdown_token(),
-                                ),
+                            crate::components::start_channel_component(
+                                "telegram-outbound",
+                                server,
+                                move |ctx| {
+                                    Box::pin(telegram_outbox_loop(
+                                        tg_ch_outbox.clone(),
+                                        rt.clone(),
+                                        ingest_ns_outbox.clone(),
+                                        ctx,
+                                    ))
+                                },
                             );
                             tracing::info!("telegram channel outbox loop started");
                         }
@@ -2135,30 +2126,26 @@ async fn telegram_poll_loop(
 /// note-scan/send/mark-delivered shape without the Message-ID minting logic
 /// (Telegram has no RFC 822 Message-ID concept).
 #[cfg(feature = "channel-telegram")]
-async fn telegram_outbox_loop(
-    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
+pub(crate) async fn telegram_outbox_loop(
+    telegram_channel: Arc<dyn khive_channel::Channel>,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
-        Ok(ns) => ns,
-        Err(e) => {
-            tracing::error!(
-                namespace = %ingest_namespace,
-                error = %e,
-                "telegram outbox loop: ingest namespace does not parse; loop will not run"
-            );
-            return;
-        }
-    };
-
+    ctx: crate::components::HostContext,
+) -> Result<(), crate::components::ComponentError> {
+    let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
+        .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     loop {
-        if !channel_cycle_wait(OUTBOUND_RETRY_BASE, &shutdown).await {
-            tracing::info!("telegram channel outbox loop: daemon shutdown observed, stopping");
-            return;
+        if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
+            return Ok(());
         }
-        telegram_outbox_once(telegram_channel.as_ref(), &runtime, &namespace).await;
+        telegram_outbox_once(
+            telegram_channel.as_ref(),
+            &runtime,
+            &namespace,
+            ctx.cancellation(),
+        )
+        .await?;
+        ctx.heartbeat();
     }
 }
 
@@ -2167,14 +2154,17 @@ async fn telegram_outbox_once(
     telegram_channel: &dyn khive_channel::Channel,
     runtime: &khive_runtime::KhiveRuntime,
     namespace: &khive_runtime::Namespace,
-) {
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<(), crate::components::ComponentError> {
     use khive_channel::ChannelEnvelope;
 
     let token = match runtime.authorize(namespace.clone()) {
         Ok(token) => token,
         Err(error) => {
             tracing::warn!(error = %error, "telegram outbox loop: namespace authorization failed");
-            return;
+            return Err(crate::components::ComponentError::Permanent(
+                error.to_string(),
+            ));
         }
     };
     let notes = match runtime
@@ -2184,11 +2174,16 @@ async fn telegram_outbox_once(
         Ok(notes) => notes,
         Err(error) => {
             tracing::warn!(error = %error, "telegram outbox loop: outbox scan failed");
-            return;
+            return Err(crate::components::ComponentError::Retryable(
+                error.to_string(),
+            ));
         }
     };
 
     for note in notes {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         let Some(props) = note
             .properties
             .as_ref()
@@ -2230,6 +2225,15 @@ async fn telegram_outbox_once(
                     ),
                 }
             }
+            Err(
+                khive_channel::ChannelError::Auth(error)
+                | khive_channel::ChannelError::Config(error),
+            ) => {
+                return Err(crate::components::ComponentError::Permanent(error));
+            }
+            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
+                return Err(crate::components::ComponentError::Retryable(error));
+            }
             Err(error) => {
                 match record_outbound_send_failure(runtime, &token, note.id, &error).await {
                     Ok(_) => tracing::warn!(
@@ -2248,6 +2252,7 @@ async fn telegram_outbox_once(
             }
         }
     }
+    Ok(())
 }
 
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
@@ -11485,8 +11490,10 @@ backend = "kg-backend"
                 "sender@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
+                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .unwrap();
             channel_outbox_once(
                 &channel,
                 &runtime,
@@ -11494,8 +11501,10 @@ backend = "kg-backend"
                 "sender@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
+                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .unwrap();
 
             assert_eq!(channel.sends.load(Ordering::SeqCst), 1);
             let note = runtime
@@ -11537,10 +11546,14 @@ backend = "kg-backend"
                 "sender@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await;
 
-            assert!(stop, "an AUTH rejection must signal the loop to stop");
+            assert!(
+                matches!(stop, Err(crate::components::ComponentError::Permanent(_))),
+                "an AUTH rejection must signal the loop to stop"
+            );
             let note = runtime
                 .notes(&token)
                 .unwrap()
@@ -11570,7 +11583,14 @@ backend = "kg-backend"
             )
             .await;
             let transient = ScriptedChannel::new(SendOutcome::Transient);
-            telegram_outbox_once(&transient, &runtime, &namespace).await;
+            telegram_outbox_once(
+                &transient,
+                &runtime,
+                &namespace,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
 
             let note = runtime
                 .notes(&token)
@@ -11592,7 +11612,14 @@ backend = "kg-backend"
             )
             .await;
             let permanent = ScriptedChannel::new(SendOutcome::Permanent);
-            telegram_outbox_once(&permanent, &runtime, &namespace).await;
+            telegram_outbox_once(
+                &permanent,
+                &runtime,
+                &namespace,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
 
             let note = runtime
                 .notes(&token)
@@ -11621,7 +11648,14 @@ backend = "kg-backend"
             )
             .await;
             let channel = ScriptedChannel::new(SendOutcome::Success);
-            telegram_outbox_once(&channel, &runtime, &namespace).await;
+            telegram_outbox_once(
+                &channel,
+                &runtime,
+                &namespace,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
 
             let note = runtime
                 .notes(&token)
@@ -11764,8 +11798,10 @@ backend = "kg-backend"
                 "maintainer@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
+                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .unwrap();
             assert_eq!(channel.sent.lock().unwrap().len(), 1);
 
             let note = registry
@@ -12027,8 +12063,10 @@ backend = "kg-backend"
                 "maintainer@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
+                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .unwrap();
             assert_eq!(
                 channel.sent.lock().unwrap().len(),
                 1,

@@ -414,6 +414,9 @@ pub enum ChannelError {
     /// Authentication failure (TLS, credentials, etc.).
     #[error("authentication error: {0}")]
     Auth(String),
+    /// A minted credential was refused and can be refreshed in process.
+    #[error("refreshable authentication error: {0}")]
+    RetryableAuth(String),
     /// Message was rejected because the sender is not authorized.
     #[error("unauthorized sender: {0}")]
     UnauthorizedSender(String),
@@ -434,7 +437,7 @@ impl ChannelError {
     /// Classify this error for durable outbound-note delivery state.
     pub fn delivery_failure_class(&self) -> DeliveryFailureClass {
         match self {
-            Self::Transport(_) => DeliveryFailureClass::Transient,
+            Self::Transport(_) | Self::RetryableAuth(_) => DeliveryFailureClass::Transient,
             Self::Config(_)
             | Self::PermanentTransport(_)
             | Self::Auth(_)
@@ -1041,6 +1044,10 @@ mod tests {
     fn outbound_delivery_failure_classification_separates_pressure_from_rejection() {
         assert_eq!(
             ChannelError::Transport("connection reset".into()).delivery_failure_class(),
+            DeliveryFailureClass::Transient
+        );
+        assert_eq!(
+            ChannelError::RetryableAuth("minted token rejected".into()).delivery_failure_class(),
             DeliveryFailureClass::Transient
         );
         assert_eq!(

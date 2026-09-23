@@ -7,9 +7,9 @@
 //! shutdown. External components register at link time through `inventory`
 //! (ADR-119 Amendment 1), so a distribution binary's components participate
 //! without this crate naming any of them. The host additionally contributes
-//! dynamic `schedule-tick` and `blob-upload-sweep` registrations when their
-//! resolved packs supply writable state; a plain core build still has an
-//! empty external inventory.
+//! dynamic `schedule-tick`, `blob-upload-sweep`, and configured channel outbox
+//! registrations when their resolved packs supply writable state; a plain
+//! core build still has an empty external inventory.
 //!
 //! Supervision joins the daemon's existing shutdown path: every supervisor
 //! task is registered through `track_background_task`, and cancellation
@@ -191,6 +191,36 @@ async fn blob_upload_sweep_loop(
             }
         }
     }
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn channel_component_registration(
+    name: &'static str,
+    start: ComponentFactory,
+) -> ComponentRegistration {
+    ComponentRegistration {
+        name,
+        restart: RestartClass::OnFailure,
+        max_restarts: 5,
+        backoff_initial_ms: 1_000,
+        backoff_max_ms: 60_000,
+        shutdown_timeout_ms: 5_000,
+        start,
+    }
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+pub(crate) fn start_channel_component(
+    name: &'static str,
+    server: &KhiveMcpServer,
+    start: impl Fn(HostContext) -> ComponentFuture + Send + Sync + 'static,
+) {
+    start_component_registrations(
+        vec![channel_component_registration(name, Arc::new(start))],
+        server,
+        khive_runtime::daemon_shutdown_token(),
+        component_health().clone(),
+    );
 }
 
 /// Supervisor-observed component state.
@@ -657,6 +687,10 @@ async fn supervise(
         backoff_ms = backoff_ms.saturating_mul(2).min(reg.backoff_max_ms.max(1));
     }
 }
+
+#[cfg(all(test, any(feature = "channel-email", feature = "channel-telegram")))]
+#[path = "components_outbox_tests.rs"]
+mod outbox_tests;
 
 #[cfg(test)]
 mod tests {
