@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_db::SqliteError;
+use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{EdgeFilter, PageRequest, SqlValue, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
@@ -1417,10 +1417,9 @@ impl KhiveRuntime {
         }
 
         let pool = self.backend().pool_arc();
-        // When the write queue is enabled, route this multi-statement merge through
-        // the single-writer task instead of the pool's writer mutex. A lookup
-        // failure degrades to the legacy mutex path rather than failing the merge.
-        let writer_task = pool.writer_task_handle().ok().flatten();
+        let writer_task = pool
+            .writer_task_for_runtime_write(RuntimeWriteOperation::MergeEntity)
+            .map_err(RuntimeError::Storage)?;
         // Minted before the transaction so the tombstone and the EntityMerged
         // event appended after commit carry the same id.
         let merge_event_id = Uuid::new_v4();
@@ -2751,7 +2750,9 @@ impl KhiveRuntime {
         let preserve_owner_established = self.is_pack_owned_note_kind(&into_note.kind);
 
         let pool = self.backend().pool_arc();
-        let writer_task = pool.writer_task_handle().ok().flatten();
+        let writer_task = pool
+            .writer_task_for_runtime_write(RuntimeWriteOperation::MergeNote)
+            .map_err(RuntimeError::Storage)?;
 
         let (mut summary, updated_note) = if let Some(writer_task) = writer_task {
             writer_task
