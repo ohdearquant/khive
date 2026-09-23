@@ -2275,9 +2275,10 @@ async fn run_exec_inline_with_forward(
             &khive_cfg.backends,
             config_source.as_deref(),
         )?;
-        if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
-            db_context.anchor = cfg.db_path.clone();
-        }
+        // Declared storage replaces the construction anchor even when --db
+        // was omitted. Keep the captured anchor in step with that deliberate
+        // normalization before the local fallback checks for path drift.
+        db_context.anchor = cfg.db_path.clone();
         force_memory
     };
 
@@ -2340,10 +2341,8 @@ async fn run_exec_inline_with_forward(
         //   and its `config_id` would never match this override-anchored frame.
         // - A concrete override here in the MULTI-backend case is, by
         //   construction, the redundant-main one proven and normalized above —
-        //   withhold it, because the frame's fingerprint is already normalized
-        //   to the no-override anchor and the spawned daemon's config-declared
-        //   `main` path IS the override's target; forwarding it would desync
-        //   the child's `config_id` from the normalized frame.
+        //   withhold it: both sides use the config-declared main path and the
+        //   override adds no storage selection information.
         let spawn_db = match db_context.raw.as_deref() {
             Some(":memory:") => Some(":memory:"),
             Some(concrete) if khive_cfg.backends.is_empty() => Some(concrete),
@@ -7268,7 +7267,9 @@ path = "{}"
         let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
             .expect("load explicit config")
             .expect("explicit config must exist");
-        let expected = compute_config_id(&cfg, Some(&khive_cfg));
+        let mut expected_config = cfg;
+        expected_config.db_path = Some(main_backend_path);
+        let expected = compute_config_id(&expected_config, Some(&khive_cfg));
         restore_home(prev_home);
 
         assert_eq!(
@@ -7388,7 +7389,9 @@ backend = "sessions"
             "sanity: the written config.toml must actually resolve with a non-empty \
              backends list, or this test proves nothing"
         );
-        let daemon_config_id = compute_config_id(&serve_cfg, Some(&khive_cfg));
+        let mut declared_main_config = serve_cfg;
+        declared_main_config.db_path = Some(main_backend_path);
+        let daemon_config_id = compute_config_id(&declared_main_config, Some(&khive_cfg));
         restore_home(prev_home);
 
         assert_eq!(
@@ -7397,6 +7400,65 @@ backend = "sessions"
              daemon must be byte-identical to what the daemon computes for the same \
              multi-backend config.toml (D1 acceptance gate, exercised end-to-end through \
              the real call site rather than a standalone compute_config_id comparison)"
+        );
+    }
+
+    /// With no --db override, a declared memory main replaces the unused
+    /// HOME-shaped anchor before forwarding. If no daemon answers, local
+    /// construction must receive that normalized anchor too.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn declared_topology_exec_fallback_updates_omitted_db_anchor() {
+        let fixture = tempfile::tempdir().expect("config fixture");
+        let unused_home = fixture.path().join("unused-home");
+        let anchor = unused_home.join(".khive/khive.db");
+        let config_path = fixture.path().join("memory-topology.toml");
+        std::fs::write(
+            &config_path,
+            "[[backends]]\nname = \"main\"\nkind = \"memory\"\n",
+        )
+        .expect("write explicit memory topology");
+        let cfg = RuntimeConfig {
+            db_path: Some(anchor.clone()),
+            actor_id: Some("config-anchor-fallback-test".to_string()),
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .unwrap()
+            .expect("explicit topology exists");
+        let mut expected_cfg = cfg.clone();
+        expected_cfg.db_path = None;
+        let expected_id = compute_config_id(&expected_cfg, Some(&topology));
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            Some("json".to_string()),
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: Some(anchor),
+                config: Some(config_path),
+            },
+            true,
+            spy_capture_config_id,
+        )
+        .await;
+
+        assert!(result.is_ok(), "local fallback must dispatch: {result:?}");
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow_mut().take()),
+            Some(expected_id),
+            "the forward attempt must use declared memory before falling back"
+        );
+        assert!(
+            !unused_home.exists(),
+            "the superseded HOME-shaped database anchor must never be opened"
         );
     }
 
