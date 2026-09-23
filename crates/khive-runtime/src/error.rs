@@ -230,6 +230,8 @@ pub struct AdmissionFailureContext {
     pub capability: Option<khive_storage::StorageCapability>,
     /// Storage operation name, when known.
     pub operation: Option<String>,
+    /// Database identity supplied by the pool that refused admission, when known.
+    pub pool_identity: Option<String>,
     /// ADR-131:251 `scope` discriminator. `Some(`[`WRITER_ADMISSION_SCOPE`]`)`
     /// for [`WRITER_QUEUE_SATURATED_STAGE`]; `None` for
     /// [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`], which ADR-131 does not define a
@@ -259,6 +261,8 @@ pub struct RetryableFailureContext {
     pub capability: Option<khive_storage::StorageCapability>,
     /// Storage operation when known.
     pub operation: Option<String>,
+    /// Database identity supplied by the pool that refused admission, when known.
+    pub pool_identity: Option<String>,
     /// Admission scope only when the queue never accepted the operation.
     pub scope: Option<&'static str>,
     /// Server backoff hint when a governing contract defines one.
@@ -290,6 +294,7 @@ impl From<AdmissionFailureContext> for RetryableFailureContext {
             timeout: context.timeout,
             capability: context.capability,
             operation: context.operation,
+            pool_identity: context.pool_identity,
             scope: context.scope,
             retry_after_ms: context.retry_after_ms,
         }
@@ -1006,6 +1011,7 @@ impl RuntimeError {
                 timeout: context.timeout,
                 capability: context.capability,
                 operation: context.operation,
+                pool_identity: None,
                 scope: None,
                 retry_after_ms: None,
             });
@@ -1016,6 +1022,7 @@ impl RuntimeError {
                 timeout: Duration::from_millis(*timeout_ms),
                 capability: None,
                 operation: None,
+                pool_identity: None,
                 scope: Some(WRITER_ADMISSION_SCOPE),
                 retry_after_ms: Some(*timeout_ms),
             });
@@ -1023,6 +1030,7 @@ impl RuntimeError {
         if let Self::Storage(khive_storage::StorageError::AdmissionTimeout {
             operation,
             timeout_ms,
+            pool_identity,
         }) = source
         {
             return Some(AdmissionFailureContext {
@@ -1030,6 +1038,7 @@ impl RuntimeError {
                 timeout: Duration::from_millis(*timeout_ms),
                 capability: None,
                 operation: Some(operation.to_string()),
+                pool_identity: pool_identity.clone(),
                 scope: None,
                 retry_after_ms: None,
             });
@@ -1079,6 +1088,7 @@ impl RuntimeError {
                 timeout: Duration::from_millis(*timeout_ms),
                 capability: None,
                 operation: Some("writer_task_begin".to_string()),
+                pool_identity: None,
                 scope: None,
                 retry_after_ms: None,
             });
@@ -1093,6 +1103,7 @@ impl RuntimeError {
                 timeout: Duration::from_secs(*max_age_secs),
                 capability: Some(khive_storage::StorageCapability::Sql),
                 operation: Some(operation.to_string()),
+                pool_identity: None,
                 scope: None,
                 retry_after_ms: None,
             });
@@ -1110,6 +1121,7 @@ impl RuntimeError {
                 timeout: Duration::from_secs(*max_age_secs),
                 capability: Some(khive_storage::StorageCapability::Sql),
                 operation: Some(operation.to_string()),
+                pool_identity: None,
                 scope: None,
                 retry_after_ms: None,
             });
@@ -1527,6 +1539,7 @@ mod channel_ingest_failure_class_tests {
         let admission = RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
             operation: "sql_bridge.writer_handle".into(),
             timeout_ms: 30_000,
+            pool_identity: None,
         });
         let context = admission
             .admission_failure_context()
