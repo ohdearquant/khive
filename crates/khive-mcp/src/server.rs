@@ -1927,6 +1927,27 @@ impl KhiveMcpServer {
         self.registry.event_store()
     }
 
+    /// Quiesce the ADR-133 audit-batch supervisor before a short-lived
+    /// process drops this server.
+    ///
+    /// Stops admission and waits for every already-accepted audit row to
+    /// reach a terminal state, then joins the supervisor's own task so its
+    /// separate clone of the runtime's connection pool is released before
+    /// this call returns (a no-op returning `Ok(())` when no audit
+    /// `EventStore` is configured, see [`VerbRegistry::shutdown_audit_batch`]).
+    ///
+    /// Exists so a caller that owns this server for the lifetime of one
+    /// process invocation, not a long-running daemon, can make the pool's
+    /// own `Drop` run deterministically on return instead of racing a
+    /// detached supervisor task that may still hold a pool reference. Every
+    /// serving path (the daemon, `serve_stdio`) keeps the registry and its
+    /// audit batch alive for the process lifetime and must not call this.
+    pub async fn shutdown_audit_batch(
+        &self,
+    ) -> Result<(), khive_runtime::audit_batch::AuditTerminalReason> {
+        self.registry.shutdown_audit_batch().await
+    }
+
     /// The server-level default output format (ADR-078), as resolved at
     /// construction by [`crate::serve::apply_env_output_format`].
     pub fn default_output_format(&self) -> OutputFormat {
