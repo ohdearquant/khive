@@ -861,17 +861,39 @@ pub(crate) async fn set_policy(
     one_of(&decision, DECISIONS, "decision")?;
     let note = opt_str(&params, "note")?;
     let ns = token.namespace().as_str().to_string();
-    let row = policy::insert_policy(
+    let replaces = opt_str(&params, "replaces")?;
+    let row = policy::upsert_policy(
         rt,
         &ns,
-        &actor,
-        &tool,
-        &decision,
-        note.as_deref(),
-        &actor_label(token),
+        policy::PolicyWrite {
+            actor: &actor,
+            tool: &tool,
+            decision: &decision,
+            note: note.as_deref(),
+            replaces: replaces.as_deref(),
+            author: &actor_label(token),
+        },
     )
     .await?;
     Ok(json!({ "ok": true, "policy": row.to_json() }))
+}
+
+pub(crate) async fn delete_policy(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let actor = req_str(&params, "actor")?;
+    let tool = req_str(&params, "tool")?;
+    let row = policy::delete_policy(
+        rt,
+        token.namespace().as_str(),
+        &actor,
+        &tool,
+        &actor_label(token),
+    )
+    .await?;
+    Ok(json!({"ok": true, "policy": row.to_json()}))
 }
 
 pub(crate) async fn policies(

@@ -6,5 +6,10 @@ CREATE TABLE IF NOT EXISTS tool_policy (
     decision TEXT NOT NULL,
     note TEXT,
     created_at INTEGER NOT NULL,
-    created_by TEXT
+    created_by TEXT,
+    updated_at INTEGER,
+    updated_by TEXT,
+    history TEXT,
+    deleted_at INTEGER,
+    deleted_by TEXT
 );
