@@ -23,3 +23,13 @@ condition = "AND"
 regexTarget = "secret"
 regexes = ['''^(a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4|Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh)$''']
 paths = ['''^crates/khive-runtime/src/secret_gate\.rs$''']
+
+# The node wire protocol appendix publishes an HPKE test vector, and its shared secret is an
+# intermediate derived from test seeds the appendix also publishes. It is a specification value,
+# not a credential. Exempted by value and by path, as above.
+[[rules.allowlists]]
+description = "The HPKE shared secret in the node wire protocol appendix's published test vector"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^04dc45cdbcefd4a719ecf0c58b31ec795288097ed994e1a8b106405f6e502a48$''']
+paths = ['''^docs/adr/ADR-105-cross-node-comm-transport\.md$''']
