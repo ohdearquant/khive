@@ -2164,6 +2164,13 @@ where
         Incumbent::Stale => {}
     }
 
+    // Install signal streams before publishing either rendezvous file. A
+    // supervisor may stop us as soon as connect/pid checks succeed, before
+    // the accept loop or shutdown future has been polled. Keep these streams
+    // alive so a signal during the rest of startup reaches normal cleanup.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     let listener = UnixListener::bind(&sock)?;
     // Fail closed, same reason as the directory above. If this chmod fails the
     // socket is world-reachable in a way the accepted design never covered, so
@@ -2280,13 +2287,6 @@ where
     let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
-        // REASON: signal handler registration can only fail if the global Tokio runtime
-        // is not running or the OS rejects the signal number — both are unrecoverable
-        // at this point in startup, so panic is the correct response.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("install SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),

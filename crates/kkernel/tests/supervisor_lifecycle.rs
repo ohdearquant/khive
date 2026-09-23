@@ -204,6 +204,14 @@ async fn supervisor_launcher_marker_pid_is_the_actual_socket_owner() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        !fixture.socket.exists(),
+        "clean stop must remove its socket"
+    );
+    assert!(
+        !fixture.pid_file.exists(),
+        "clean stop must remove its pid file"
+    );
     assert_eq!(std::fs::read_to_string(&fixture.marker).unwrap(), marker);
     let (status, log) = fixture.release(LABEL);
     assert!(status.success(), "release failed: {log}");
