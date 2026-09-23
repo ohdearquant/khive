@@ -711,44 +711,114 @@ impl EntityMergeRefusal {
 }
 
 #[derive(Debug)]
-enum MergeEntitySqlError {
+enum MergeSqlError {
     Sqlite(SqliteError),
-    Refusal(EntityMergeRefusal),
+    Refusal(RuntimeError),
 }
 
-impl std::fmt::Display for MergeEntitySqlError {
+impl std::fmt::Display for MergeSqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Sqlite(error) => std::fmt::Display::fmt(error, f),
-            Self::Refusal(_) => f.write_str("entity merge refused by transactional policy"),
+            Self::Refusal(_) => f.write_str("merge refused by transactional policy"),
         }
     }
 }
 
-impl std::error::Error for MergeEntitySqlError {}
+impl std::error::Error for MergeSqlError {}
 
-impl From<SqliteError> for MergeEntitySqlError {
+impl From<SqliteError> for MergeSqlError {
     fn from(error: SqliteError) -> Self {
         Self::Sqlite(error)
     }
 }
 
-impl From<rusqlite::Error> for MergeEntitySqlError {
+impl From<rusqlite::Error> for MergeSqlError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(SqliteError::Rusqlite(error))
     }
 }
 
+/// Recover only our semantic refusal after the writer has confirmed rollback.
+/// Other sources retain the request-state envelope and every driver field.
+fn recover_rolled_back_merge_refusal(
+    error: khive_storage::StorageError,
+) -> Result<RuntimeError, khive_storage::StorageError> {
+    use khive_storage::{StorageError, WriterTaskRequestState};
+
+    let source = match error {
+        StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source,
+        } => source,
+        error => return Err(error),
+    };
+    let source = match *source {
+        StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } => match source.downcast::<MergeSqlError>() {
+            Ok(error) => match *error {
+                MergeSqlError::Refusal(error) => return Ok(error),
+                error => StorageError::driver(capability, operation, error),
+            },
+            Err(source) => StorageError::Driver {
+                capability,
+                operation,
+                source,
+            },
+        },
+        error => error,
+    };
+    Err(StorageError::WriterTaskRequestFailed {
+        request_state: WriterTaskRequestState::TransactionRolledBack,
+        source: Box::new(source),
+    })
+}
+
 fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    let error = match recover_rolled_back_merge_refusal(error) {
+        Ok(refusal) => return refusal,
+        Err(error) => error,
+    };
     match error {
         khive_storage::StorageError::Driver {
             capability,
             operation,
             source,
-        } => match source.downcast::<MergeEntitySqlError>() {
+        } => match source.downcast::<MergeSqlError>() {
             Ok(error) => match *error {
-                MergeEntitySqlError::Sqlite(error) => RuntimeError::Sqlite(error),
-                MergeEntitySqlError::Refusal(error) => error.into_runtime_error(),
+                MergeSqlError::Sqlite(error) => RuntimeError::Sqlite(error),
+                MergeSqlError::Refusal(error) => error,
+            },
+            Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
+                capability,
+                operation,
+                source,
+            }),
+        },
+        error => RuntimeError::Storage(error),
+    }
+}
+
+fn map_merge_note_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    let error = match recover_rolled_back_merge_refusal(error) {
+        Ok(refusal) => return refusal,
+        Err(error) => error,
+    };
+    match error {
+        khive_storage::StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } => match source.downcast::<MergeSqlError>() {
+            Ok(error) => match *error {
+                MergeSqlError::Refusal(error) => error,
+                // Preserve the existing note route's storage error envelope.
+                MergeSqlError::Sqlite(error) => RuntimeError::Storage(
+                    khive_storage::StorageError::driver(capability, operation, error),
+                ),
             },
             Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
                 capability,
@@ -1474,8 +1544,8 @@ impl KhiveRuntime {
                         merge_event_id,
                     )
                     .map_err(|error| match error {
-                        MergeEntitySqlError::Sqlite(error) => error,
-                        MergeEntitySqlError::Refusal(error) => {
+                        MergeSqlError::Sqlite(error) => error,
+                        MergeSqlError::Refusal(error) => {
                             refusal = Some(error);
                             SqliteError::InvalidData(
                                 "entity merge refused by transactional policy".to_string(),
@@ -1484,7 +1554,7 @@ impl KhiveRuntime {
                     })
                 });
                 match refusal {
-                    Some(error) => Err(error.into_runtime_error()),
+                    Some(error) => Err(error),
                     None => result.map_err(RuntimeError::from),
                 }
             })
@@ -2779,11 +2849,12 @@ impl KhiveRuntime {
                     })
                 })
                 .await
-                .map_err(RuntimeError::Storage)?
+                .map_err(map_merge_note_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
                 let guard = pool.writer()?;
-                guard.transaction(|conn| {
+                let mut refusal = None;
+                let result = guard.transaction(|conn| {
                     merge_note_sql(
                         conn,
                         ns,
@@ -2798,7 +2869,20 @@ impl KhiveRuntime {
                         preserve_owner_established,
                         MergeTxLimits::default(),
                     )
-                })
+                    .map_err(|error| match error {
+                        MergeSqlError::Sqlite(error) => error,
+                        MergeSqlError::Refusal(error) => {
+                            refusal = Some(error);
+                            SqliteError::InvalidData(
+                                "note merge refused by transactional policy".to_string(),
+                            )
+                        }
+                    })
+                });
+                match refusal {
+                    Some(error) => Err(error),
+                    None => result.map_err(RuntimeError::from),
+                }
             })
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
@@ -3159,7 +3243,7 @@ fn merge_entity_sql(
     validation: EntityMergeValidation,
     limits: MergeTxLimits,
     merge_event_id: Uuid,
-) -> Result<(MergeSummary, Entity), MergeEntitySqlError> {
+) -> Result<(MergeSummary, Entity), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Config-scaled fanout (one FTS/vector delete per table, one contract rule
     // set per pack) is charged in bytes only: it is bounded by configuration,
@@ -3184,20 +3268,28 @@ fn merge_entity_sql(
     )?;
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
+    // ADR-115 A1: no production stamp is admitted yet. Check both guarded
+    // preimages, even when the chosen fold would discard or replace a key.
+    for properties in [&into_entity.properties, &from_entity.properties] {
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())
+            .map_err(MergeSqlError::Refusal)?;
+    }
+
     match validation {
         EntityMergeValidation::LegacyKind if into_entity.kind != from_entity.kind => {
-            return Err(MergeEntitySqlError::Refusal(
+            return Err(MergeSqlError::Refusal(
                 EntityMergeRefusal::LegacyKind {
                     into_id,
                     into_kind: into_entity.kind,
                     from_id,
                     from_kind: from_entity.kind,
-                },
+                }
+                .into_runtime_error(),
             ));
         }
         EntityMergeValidation::SafetyFloor => {
             validate_entity_merge_floor(&into_entity, &from_entity).map_err(|guard| {
-                MergeEntitySqlError::Refusal(EntityMergeRefusal::SafetyFloor(guard))
+                MergeSqlError::Refusal(EntityMergeRefusal::SafetyFloor(guard).into_runtime_error())
             })?;
         }
         EntityMergeValidation::LegacyKind | EntityMergeValidation::Forced => {}
@@ -3285,6 +3377,8 @@ fn merge_entity_sql(
     // --- Merge entity fields ---
     let (merged_props, properties_merged) =
         merge_properties(&into_entity.properties, &from_entity.properties, strategy);
+    crate::secret_gate::reject_reserved_secret_gate_property(merged_props.as_ref())
+        .map_err(MergeSqlError::Refusal)?;
     let merged_name = merge_string_field(&into_entity.name, &from_entity.name, strategy);
     let (merged_description, content_appended) = match content_strategy {
         ContentMergeStrategy::Append => {
@@ -3797,7 +3891,7 @@ fn merge_note_sql(
     pack_rules: Vec<EdgeEndpointRule>,
     preserve_owner_established: bool,
     limits: MergeTxLimits,
-) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
+) -> Result<(MergeSummary, khive_storage::note::Note), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Same accounting as `merge_entity_sql`: config-scaled fanout in bytes only.
     budget.charge(
@@ -3820,11 +3914,19 @@ fn merge_note_sql(
     )?;
     let from_note = read_merge_note(conn, from_id, &namespace)?;
 
+    // Preimages are read in the same guarded unit as the eventual mutation.
+    // Checking only the fold would allow a stamp to be discarded by a merge.
+    for properties in [&into_note.properties, &from_note.properties] {
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())
+            .map_err(MergeSqlError::Refusal)?;
+    }
+
     if into_note.kind != from_note.kind {
         return Err(SqliteError::InvalidData(format!(
             "cannot merge notes of different kinds: {} vs {}",
             into_note.kind, from_note.kind
-        )));
+        ))
+        .into());
     }
 
     // A quarantined message participates in no merges, in either role. Folding
@@ -3838,7 +3940,7 @@ fn merge_note_sql(
         return Err(SqliteError::InvalidData(
             "cannot merge a quarantined message: quarantine disposition is              transport-owned and must be released by the channel-ingest path              before the content can be folded into another record"
                 .to_string(),
-        ));
+        ).into());
     }
 
     let now = chrono::Utc::now().timestamp_micros();
@@ -3972,6 +4074,8 @@ fn merge_note_sql(
         "content_strategy": format!("{:?}", content_strategy),
     });
     let merged_props = append_merge_history(merged_props, merge_history_entry)?;
+    crate::secret_gate::reject_reserved_secret_gate_property(merged_props.as_ref())
+        .map_err(MergeSqlError::Refusal)?;
 
     let merged_salience = max_option_f64(into_note.salience, from_note.salience);
     let merged_expires_at = match (into_note.expires_at, from_note.expires_at) {
@@ -4701,6 +4805,9 @@ pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usiz
 // an internal invariant not suitable for the public API surface. Broad
 // behavioral curation tests live in tests/integration.rs.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod merge_reservation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -12520,8 +12627,8 @@ mod tests {
                     Uuid::new_v4(),
                 )
                 .map_err(|error| match error {
-                    MergeEntitySqlError::Sqlite(error) => error,
-                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                    MergeSqlError::Sqlite(error) => error,
+                    MergeSqlError::Refusal(_) => SqliteError::InvalidData(
                         "unexpected transactional policy refusal".to_string(),
                     ),
                 })
@@ -12562,8 +12669,8 @@ mod tests {
                     Uuid::new_v4(),
                 )
                 .map_err(|error| match error {
-                    MergeEntitySqlError::Sqlite(error) => error,
-                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                    MergeSqlError::Sqlite(error) => error,
+                    MergeSqlError::Refusal(_) => SqliteError::InvalidData(
                         "unexpected transactional policy refusal".to_string(),
                     ),
                 })
@@ -12692,6 +12799,12 @@ mod tests {
                     false,
                     limits,
                 )
+                .map_err(|error| match error {
+                    MergeSqlError::Sqlite(error) => error,
+                    MergeSqlError::Refusal(_) => SqliteError::InvalidData(
+                        "unexpected transactional policy refusal".to_string(),
+                    ),
+                })
             })
         })
         .await
