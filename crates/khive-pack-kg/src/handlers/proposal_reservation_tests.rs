@@ -122,7 +122,8 @@ async fn propose_refuses_reserved_properties_without_domain_or_history_mutation(
         assert_eq!(
             writer
                 .execute(SqlStatement {
-                    sql: "UPDATE entities SET properties = ?1 WHERE id = ?2".into(),
+                    sql: "UPDATE entities SET properties = ?1, version = version + 1 WHERE id = ?2"
+                        .into(),
                     params: vec![
                         SqlValue::Text(
                             json!({"ordinary": "original", "khive:secret_gate": "copied-stamp"})
