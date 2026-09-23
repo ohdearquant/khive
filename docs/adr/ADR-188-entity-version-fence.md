@@ -150,19 +150,48 @@ separate work; no such enforcement is supplied by this migration.
   `issue2673_no_raw_entity_replace_outside_migrations` in
   `crates/khive-db/tests/entity_write_inventory.rs` guards the crate-wide source inventory,
   including must-match controls proving that the scanner recognizes the forbidden form.
-- A constant-default column addition is expected to avoid rewriting existing entity rows,
-  but the required migration-cost measurement is outstanding. There is no measured timing
-  or fleet-scale performance conclusion in this record. The pre-merge measurement obligation
-  below is not satisfied by correctness tests or by accepting the implementation scope.
+- The constant-default column addition does not rewrite existing entity rows: the measured
+  write-ahead log after V37 is the same size at zero, 9,285 and 100,000 rows, and the
+  migration takes under a millisecond at 100,000 rows (record below). This is a synthetic
+  measurement on one host, not a conclusion about production-scale performance.
 
-### Migration measurement record — pending
+### Migration measurement record
 
-No measured results have been recorded yet. Before merge, this section must contain the
-measurement owner's exact source revision, environment metadata and complete output for
-the 9,285-row and 100,000-row synthetic runs, each with its zero-row control. The populations
-and required output below are a validation plan, not benchmark results. The measurement
-fixture is supplied in `crates/khive-db/src/entity_version_migration_measurement.rs`; its
-presence alone does not satisfy the pre-merge measurement obligation.
+Run on 2026-09-23 (UTC) with the procedure below.
+
+- **Source**: the tree of commit `0d6b328b1ebfce7080c5faafb66eb86c34eb715a` (this change on base
+  `0b46c8c63f7f723c78f5e1a8cc49d2fc56d05b2c`). Recording these results changes only this document.
+- **Host**: Apple M4 (Mac16,10), 16 GiB memory, internal solid-state storage (APFS), macOS 27.0.
+  The database lived in the system temporary directory on that volume. Release profile, bundled
+  SQLite 3.53.2, WAL with synchronous NORMAL. The host was idle before each run (98.6% and 98.9%
+  CPU idle), and no other build or test ran during timing.
+- **Selection**: listing the ignored test by exact name selected one test. Each run exited 0 with
+  `1 passed; 0 failed; 0 ignored` and two `synthetic_v36_to_v37` records reporting schema 37. The
+  fixture times only `run_migrations`, then asserts that every seeded row survived with integer
+  version 1.
+- **Populations**: 9,285 rows, the caller-visible live lower bound observed 2026-09-15T16:40:27Z
+  (excluding tombstones and other namespaces, so not a complete count), and 100,000 rows as
+  synthetic stress.
+
+Complete records, in run order (each population run emits its zero-row control first):
+
+```json
+{"db_size_before":667648,"elapsed_us":630,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":0,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+{"db_size_before":5525504,"elapsed_us":723,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":9285,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+{"db_size_before":667648,"elapsed_us":610,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":0,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+{"db_size_before":54059008,"elapsed_us":851,"label":"synthetic_v36_to_v37","page_size":4096,"platform":"macos-aarch64","rows":100000,"schema_version":37,"sqlite_version":"3.53.2","wal_bytes_after":24752}
+```
+
+| Rows    | Database before  | Elapsed | Same-run zero-row control | WAL after    |
+| ------- | ---------------- | ------- | ------------------------- | ------------ |
+| 9,285   | 5,525,504 bytes  | 723 µs  | 630 µs                    | 24,752 bytes |
+| 100,000 | 54,059,008 bytes | 851 µs  | 610 µs                    | 24,752 bytes |
+
+The write-ahead log after migration is 24,752 bytes at every population, so the migration writes
+no per-row pages. Elapsed time above the same-run zero-row control is 93 µs at 9,285 rows and
+241 µs at 100,000 rows: 2.6 times the residual for 10.8 times the rows, from one sample each. That
+residual is reported as measured. Telling a row-proportional component apart from run-to-run
+variation would need repeated samples.
 
 ## Acceptance for the current scope
 
@@ -186,8 +215,7 @@ These are validation requirements, not reported test outcomes:
    note behavior remains unchanged. Entity `fence`/`embed` remain refused.
 8. The raw-replacement source inventory rejects new non-migration replacement writers,
    without being presented as runtime SQL enforcement.
-9. The migration measurement described below is recorded before merge. Executing the
-   supplied fixture and recording its output remain open requirements, not an implicit waiver.
+9. The migration measurement described below is recorded in Consequences before merge.
 
 Current source anchors include `migrations_tests::issue2673_v37_initializes_and_guards_entity_versions`,
 `issue2673_entity_versions_cover_typed_storage_writers`, the runtime `entity_write_tests`,
@@ -238,7 +266,7 @@ note-only and preserves existing note write behavior, including `embed=false` on
 data. This future entity parity work neither changes the current entity write behavior nor
 redefines the independently governed note semantics.
 
-## Outstanding migration measurement — required before merge
+## Migration measurement procedure
 
 The earlier proposal described `synthetic_v34_to_v35` output reporting schema 35, but the
 implementation preceding this revision had no measurement fixture or output. Entity
@@ -269,5 +297,4 @@ migration and WAL bytes after migration. Record source revision, host/storage ha
 build profile and complete output here before merge. A result that scales with row count
 must be reported as a finding against the expected cost, not rounded away.
 
-Measured results remain pending until recorded in Consequences. Supplying the fixture and
-correcting the scope do not mark the original pre-merge measurement obligation satisfied.
+Results are recorded in Consequences under "Migration measurement record".
