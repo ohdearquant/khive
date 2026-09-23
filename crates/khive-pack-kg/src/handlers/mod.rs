@@ -37,7 +37,7 @@ pub use common::{
     normalize_entity_timestamps, resolve_kind_spec, resolve_uuid_unfiltered,
     resolve_uuid_unfiltered_including_deleted, KindSpec,
 };
-pub use search::{SearchOrder, SearchSubstrate, ValidatedSearchRequest};
+pub use search::{search_rank_fields, SearchOrder, SearchSubstrate, ValidatedSearchRequest};
 
 #[cfg(test)]
 pub(crate) use common::{
