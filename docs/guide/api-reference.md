@@ -250,8 +250,19 @@ Singleton writes preserve the complete source in storage and FTS. If a configure
 receives a UTF-8-safe bounded prefix, the successful response includes a `warnings` array; the
 warning is derived from the embedding outcome, not from a separate registry prediction.
 
+A singleton note create may carry `key`, an immutable namespace/kind identity. An occupied key
+refuses with the conflict error `key_conflict`; `existing_id` is disclosed under the same rule as
+`restore_key_conflict` below, only when a `list` check for that namespace/kind/key is allowed.
+When the new create's `content` and `properties` are exactly equal to the live holder's and
+disclosure is allowed, the call instead returns `{id, created: false}` for the existing note, with
+no mutation and no version change: a caller can safely repeat a keyed create without checking
+first. A fresh insert under a supplied key returns the full note object with `created: true` added,
+so the two outcomes are distinguishable without a second round trip. A create without `key` keeps
+its existing response shape and carries no `created` field.
+
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                      |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `key`               | string          | no          | Singleton notes only. At most 512 UTF-8 bytes, no U+0000. See the exact-replay behavior described above.                                                                                                                                                                                   |
 | `kind`              | string          | conditional | Substrate (`entity`\|`note`) or granular kind (`concept`, `document`, `observation`, …). Required for the singleton path; not required when `items` is present.                                                                                                                            |
 | `name`              | string          | no          | Entity name (singleton).                                                                                                                                                                                                                                                                   |
 | `entity_kind`       | string          | no          | concept\|document\|dataset\|project\|person\|org\|artifact\|service\|resource (when `kind="entity"`).                                                                                                                                                                                      |
