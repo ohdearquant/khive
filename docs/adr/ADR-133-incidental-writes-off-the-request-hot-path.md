@@ -989,3 +989,19 @@ as wedged later drained — the count drops back below the cap and the next gene
 real append again. This bounds the retained-buffer growth a wedged store can cause to
 `max_abandoned_appends * max_rows_per_generation` rows, in place of the fully unbounded growth this
 amendment originally left.
+
+## Amendment 7 (2026-09-22): operation attribution is an orthogonal pair, not a new obligation class
+
+**Status**: Accepted.
+
+Originating issue(s): #2049
+
+[ADR-016](ADR-016-request-dsl.md) Amendment 1 adds `op_index`/`ref_resolution` to every audit
+event produced within a request operation's scope. That pair identifies which operation in a
+parsed request produced a row; it carries no argument values and supports no cross-request
+argument-equality check. It changes nothing decided here: the obligation-bearing/pure-observability
+classification at D2 above, the domain-disposition vocabulary this ADR's amendments already define,
+and the caller-retry identity rule (a retry is a new execution and a new audit obligation, even when
+it reuses `request_id`) are unaffected. `op_index`/`ref_resolution` is an attribution pair riding an
+otherwise-unchanged row; it is not itself an obligation class, a domain disposition, or a basis for
+collapsing two attempts' obligations into one.

@@ -4,9 +4,8 @@
 //! whether a hop is allowed to happen at all (address class, allowlist,
 //! credential scope, headers, ceilings) with zero networking; this module's
 //! [`run_one_hop`] is the mechanical HTTP execution against an
-//! already-decided target, with zero policy judgment. `handle_fetch` is the
-//! only place that wires the two together for a real request, so the
-//! address-safety guarantee is never bypassable from outside this file.
+//! already-decided target, with zero policy judgment. [`run_hop_chain`] wires
+//! the two together for fetch, refresh, and HTTP search provider requests.
 //!
 //! Entity minting (D1/D3) lives in [`settle`], run once the redirect loop
 //! reaches its terminal hop: every hop in the chain — including redirect
@@ -23,16 +22,17 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use khive_runtime::engine_config::WebSectionConfig;
-use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
 use crate::egress::{self, Refusal, Resolver, SystemResolver};
 use crate::identity;
+use crate::namespace::resolve_effective_token;
 use crate::receipt::write_receipt;
+use crate::vocab::FetchParams;
 use crate::WebPack;
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
@@ -67,7 +67,7 @@ fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option
 /// starts with `text/html` or `application/xhtml+xml`, ignoring any `;
 /// charset=...` parameter and case. Everything else — including no header at
 /// all — is a `resource`.
-fn classify_entity_type(content_type: Option<&str>) -> &'static str {
+pub(crate) fn classify_entity_type(content_type: Option<&str>) -> &'static str {
     let base = content_type
         .and_then(|v| v.split(';').next())
         .map(str::trim)
@@ -78,28 +78,6 @@ fn classify_entity_type(content_type: Option<&str>) -> &'static str {
     } else {
         "resource"
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FetchParams {
-    url: String,
-    #[serde(default)]
-    accept: Option<String>,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-    #[serde(default)]
-    credential: Option<String>,
-    #[serde(default)]
-    persist: Option<bool>,
-    #[serde(default)]
-    max_bytes: Option<u64>,
-    #[serde(default)]
-    timeout_s: Option<u64>,
-    #[serde(default)]
-    namespace: Option<String>,
 }
 
 /// Outcome of one mechanical HTTP hop — no policy content at all.
@@ -244,6 +222,7 @@ async fn run_fetch(
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
     params: FetchParams,
+    clients: &egress::PinnedClients,
 ) -> Result<Value, RuntimeError> {
     let method_name = params
         .method
@@ -301,7 +280,8 @@ async fn run_fetch(
 
     let deadline = egress::request_deadline(timeout_s)?;
 
-    let (outcome, redirect_hops) = run_hop_chain(
+    let (outcome, redirect_hops) = run_hop_chain_with_clients(
+        clients,
         resolver,
         cfg,
         url.clone(),
@@ -343,9 +323,8 @@ async fn run_fetch(
 
 /// Bounded multi-hop redirect chain, address-safety-checked at every hop
 /// (scheme/userinfo, host allowlist, DNS resolve-and-pin — the same egress
-/// rules on hop 1 and hop N): shared by [`run_fetch`] and
-/// [`crate::refresh::run_refresh`] so a redirect is followed identically by
-/// both verbs, per ADR-191 D2's "same egress rules" requirement.
+/// rules on hop 1 and hop N): shared by fetch, refresh, and HTTP search providers
+/// so each network verb applies ADR-191 D3's same egress rules.
 ///
 /// `headers_for_hop` is called once per hop with that hop's (possibly
 /// redirected) URL; it returns the request headers for that hop and is also
@@ -355,6 +334,33 @@ async fn run_fetch(
 /// Returns the terminal hop's outcome plus every traversed redirect, in
 /// order — never the terminal hop itself, matching [`RedirectHop`]'s doc.
 pub(crate) async fn run_hop_chain<F>(
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
+    url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    headers_for_hop: F,
+) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+{
+    run_hop_chain_with_clients(
+        &egress::PinnedClients::default(),
+        resolver,
+        cfg,
+        url,
+        method,
+        max_bytes,
+        deadline,
+        headers_for_hop,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_hop_chain_with_clients<F>(
+    clients: &egress::PinnedClients,
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
     mut url: Url,
@@ -377,11 +383,8 @@ where
             .host_str()
             .ok_or_else(|| RuntimeError::InvalidInput("url has no host".to_string()))?
             .to_string();
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| RuntimeError::InvalidInput("url has no resolvable port".to_string()))?;
         let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
-        let client = egress::pinned_client(&host, addr, port)?;
+        let client = clients.for_checked_address(&url, addr)?;
 
         let outcome = run_one_hop(
             &client,
@@ -558,6 +561,37 @@ pub(crate) struct SettledContent {
     pub truncated: bool,
 }
 
+pub(crate) enum ContentBody {
+    Received(Vec<u8>, bool),
+    Stored {
+        content_ref: ContentRef,
+        bytes: u64,
+        truncated: bool,
+    },
+}
+
+pub(crate) fn representation_patch(
+    url: &str,
+    content_type: Option<&str>,
+    status: u16,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    content_ref: Option<&str>,
+    bytes: u64,
+) -> Value {
+    json!({
+        "url": url,
+        "content_type": content_type,
+        "blob_ref": content_ref,
+        "content_digest": content_ref,
+        "size": bytes,
+        "status": status,
+        "fetched_at": chrono::Utc::now().to_rfc3339(),
+        "etag": etag,
+        "last_modified": last_modified,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn settle_content(
     runtime: &KhiveRuntime,
@@ -568,6 +602,30 @@ pub(crate) async fn settle_content(
     etag: Option<&str>,
     last_modified: Option<&str>,
     body: Option<(Vec<u8>, bool)>,
+) -> Result<SettledContent, RuntimeError> {
+    settle_content_body(
+        runtime,
+        token,
+        url,
+        content_type,
+        status,
+        etag,
+        last_modified,
+        body.map(|(bytes, truncated)| ContentBody::Received(bytes, truncated)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn settle_content_body(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    url: &Url,
+    content_type: Option<&str>,
+    status: u16,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    body: Option<ContentBody>,
 ) -> Result<SettledContent, RuntimeError> {
     let canonical = identity::canonicalize(url.clone());
     let site = canonical_site(runtime, token, &canonical).await?;
@@ -609,12 +667,17 @@ pub(crate) async fn settle_content(
 
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
-        Some((buffer, truncated)) => {
+        Some(ContentBody::Received(buffer, truncated)) => {
             let store = crate::blob_store(runtime)?;
             let len = buffer.len() as u64;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             (Some(content_ref), len, truncated)
         }
+        Some(ContentBody::Stored {
+            content_ref,
+            bytes,
+            truncated,
+        }) => (Some(content_ref), bytes, truncated),
     };
     let content_ref = typed_ref.as_ref().map(ToString::to_string);
 
@@ -623,17 +686,15 @@ pub(crate) async fn settle_content(
         token,
         id,
         Some(entity_type),
-        json!({
-            "url": canonical.to_string(),
-            "content_type": content_type,
-            "blob_ref": content_ref,
-            "content_digest": content_ref,
-            "size": bytes,
-            "status": status,
-            "fetched_at": chrono::Utc::now().to_rfc3339(),
-            "etag": etag,
-            "last_modified": last_modified,
-        }),
+        representation_patch(
+            canonical.as_ref(),
+            content_type,
+            status,
+            etag,
+            last_modified,
+            content_ref.as_deref(),
+            bytes,
+        ),
     )
     .await?;
     if let Some(typed_ref) = &typed_ref {
@@ -781,6 +842,16 @@ impl WebPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        self.handle_fetch_with_clients(token, params, &egress::PinnedClients::default())
+            .await
+    }
+
+    pub(crate) async fn handle_fetch_with_clients(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        clients: &egress::PinnedClients,
+    ) -> Result<Value, RuntimeError> {
         let params: FetchParams = serde_json::from_value(params).map_err(|error| {
             RuntimeError::InvalidInput(format!("invalid web.fetch arguments: {error}"))
         })?;
@@ -791,31 +862,9 @@ impl WebPack {
             &SystemResolver,
             &self.runtime.config().web,
             params,
+            clients,
         )
         .await
-    }
-}
-
-/// A `namespace` argument narrows capability, never elevates it: it must
-/// equal the token's own namespace (mirrors `khive-pack-knowledge`'s
-/// `knowledge.compose` handling of the same shape of argument).
-pub(crate) fn resolve_effective_token(
-    token: &NamespaceToken,
-    namespace: Option<&str>,
-) -> Result<NamespaceToken, RuntimeError> {
-    match namespace {
-        None => Ok(token.clone()),
-        Some(ns_str) => {
-            let ns = Namespace::parse(ns_str).map_err(|error| {
-                RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {error}"))
-            })?;
-            if &ns != token.namespace() {
-                return Err(RuntimeError::InvalidInput(
-                    "web.fetch namespace does not match the authorized token namespace".to_string(),
-                ));
-            }
-            Ok(token.with_namespace(ns))
-        }
     }
 }
 
@@ -836,7 +885,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebCredentialConfig;
-    use khive_runtime::VerbRegistryBuilder;
+    use khive_runtime::{Namespace, VerbRegistryBuilder};
     use khive_storage::{
         BlobStore, ContentRef, Direction, EntityFilter, PageRequest, StorageError, StorageResult,
     };
@@ -893,6 +942,7 @@ mod tests {
                     &resolver,
                     &WebSectionConfig::default(),
                     params,
+                    &egress::PinnedClients::default(),
                 ),
             )
             .await
@@ -915,6 +965,7 @@ mod tests {
             &resolver,
             &WebSectionConfig::default(),
             params,
+            &egress::PinnedClients::default(),
         )
         .await
         .unwrap_err();
@@ -945,9 +996,16 @@ mod tests {
             },
         ] {
             let params = serde_json::from_value(json!({"url":"https://example.test/"})).unwrap();
-            let error = run_fetch(&runtime, &token, &resolver, &config, params)
-                .await
-                .unwrap_err();
+            let error = run_fetch(
+                &runtime,
+                &token,
+                &resolver,
+                &config,
+                params,
+                &egress::PinnedClients::default(),
+            )
+            .await
+            .unwrap_err();
             assert!(error.to_string().contains("invalid_web_config"), "{error}");
             assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
         }
@@ -2312,3 +2370,110 @@ mod tests {
 #[cfg(test)]
 #[path = "fetch_r2_tests.rs"]
 mod r2_tests;
+
+#[cfg(test)]
+mod connection_reuse_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn same_origin_hops_reuse_one_tcp_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Exactly one accept: a second client would fail to complete the
+        // second request before its deadline, instead of passing a cache-size assertion.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                paths.push(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+            paths
+        });
+        let clients = egress::PinnedClients::default();
+        // Mechanical transport test, as in run_one_hop tests: production's
+        // resolver rejects loopback before consulting this cache.
+        for path in ["/first", "/second"] {
+            let url = Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap();
+            let client = clients
+                .for_checked_address(&url, "127.0.0.1".parse().unwrap())
+                .unwrap();
+            let outcome = run_one_hop(
+                &client,
+                &url,
+                reqwest::Method::GET,
+                &[],
+                1024,
+                Instant::now() + std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.body.unwrap().0, b"ok");
+        }
+        let paths = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths, ["GET /first HTTP/1.1", "GET /second HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn cached_client_does_not_skip_new_address_policy_or_header_checks() {
+        use crate::egress::resolver_fixture::ScriptedResolver;
+        let clients = egress::PinnedClients::default();
+        let url = Url::parse("https://example.test/resource").unwrap();
+        clients
+            .for_checked_address(&url, "93.184.216.34".parse().unwrap())
+            .unwrap();
+        let mut resolver = ScriptedResolver::new(None);
+        resolver.address = "127.0.0.1".parse().unwrap();
+        let error = run_hop_chain_with_clients(
+            &clients,
+            &resolver,
+            &WebSectionConfig::default(),
+            url.clone(),
+            reqwest::Method::GET,
+            1024,
+            Instant::now() + std::time::Duration::from_secs(1),
+            |_| Ok(vec![]),
+        )
+        .await
+        .err()
+        .expect("cached client must not bypass policy refusal");
+        assert!(error.to_string().contains("address_loopback"), "{error}");
+        let error = run_hop_chain_with_clients(
+            &clients,
+            &resolver,
+            &WebSectionConfig::default(),
+            url,
+            reqwest::Method::GET,
+            1024,
+            Instant::now() + std::time::Duration::from_secs(1),
+            |_| Err(Refusal::new("credential_host_mismatch", "changed credential scope").into()),
+        )
+        .await
+        .err()
+        .expect("cached client must not bypass policy refusal");
+        assert!(
+            error.to_string().contains("credential_host_mismatch"),
+            "{error}"
+        );
+    }
+}

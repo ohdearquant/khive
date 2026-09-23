@@ -50,6 +50,22 @@ fn resurrection_required_error(operation: &'static str, edge: &Edge) -> StorageE
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
+// Walk newest notes first and stop at the first eligible annotation. Starting
+// from all target edges would sort the complete annotation history before LIMIT
+// could take effect. The existing note-time and edge natural-key indexes support
+// this shape without fetching note bodies or materializing the history.
+const LATEST_ANNOTATING_NOTE_SQL: &str = "SELECT n.id, n.created_at \
+    FROM notes AS n INDEXED BY idx_notes_created \
+    WHERE n.deleted_at IS NULL AND n.kind = ?3 \
+      AND EXISTS (SELECT 1 FROM json_each(CASE \
+          WHEN json_type(n.properties, '$.tags') = 'array' \
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag \
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY) \
+      AND EXISTS (SELECT 1 FROM graph_edges AS e INDEXED BY idx_graph_edges_unique_triple \
+          WHERE e.namespace = ?1 AND e.source_id = n.id AND e.target_id = ?2 \
+            AND e.relation = 'annotates' AND e.deleted_at IS NULL) \
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1";
+
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
 // sibling block for the full rationale. `upsert_edge`/`delete_edge` below and
@@ -1939,6 +1955,30 @@ impl SqlGraphStore {
 
 #[async_trait]
 impl GraphStore for SqlGraphStore {
+    async fn latest_annotating_note(
+        &self,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+    ) -> Result<Option<(Uuid, i64)>, StorageError> {
+        let namespace = self.namespace.clone();
+        let node_id = node_id.to_string();
+        let kind = kind.to_owned();
+        let tag = tag.to_owned();
+        self.with_reader("latest_annotating_note", move |conn| {
+            conn.query_row(
+                LATEST_ANNOTATING_NOTE_SQL,
+                rusqlite::params![namespace, node_id, kind, tag],
+                |row| {
+                    let id: String = row.get(0)?;
+                    Ok((parse_uuid(&id)?, row.get(1)?))
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
         self.upsert_edge_observed(EdgeUpsertRequest {
             edge,
@@ -3164,6 +3204,10 @@ const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(GRAPH_DDL)
 }
+
+#[cfg(test)]
+#[path = "graph_annotation_tests.rs"]
+mod annotation_tests;
 
 #[cfg(test)]
 #[path = "graph_tests.rs"]
