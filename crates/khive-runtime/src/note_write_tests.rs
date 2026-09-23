@@ -1456,3 +1456,6 @@ mod fence_live_until;
 
 #[path = "fence_identity_tests.rs"]
 mod fence_identity;
+
+#[path = "keyed_create_race_tests.rs"]
+mod keyed_create_races;

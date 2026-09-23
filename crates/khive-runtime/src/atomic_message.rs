@@ -81,6 +81,11 @@ pub(crate) struct AtomicNoteOptions<'a> {
     pub embedding_content: Option<&'a str>,
     pub embed: Option<bool>,
     pub key: Option<&'a str>,
+    /// Ask the writer transaction to compare a live key holder against this
+    /// candidate and report the result (ADR-172 Amendment 6). Every other
+    /// keyed route defaults this to `false` and gets today's Details shape
+    /// on a key conflict, with no comparison outcome in it at all.
+    pub replay_receipt: bool,
     pub fence: Option<&'a crate::note_write::NoteFences>,
 }
 
@@ -673,7 +678,13 @@ pub(crate) async fn prepare_atomic_note_requests(
                 create_key: note
                     .key
                     .as_ref()
-                    .map(|key| (note.kind.clone(), key.clone())),
+                    .map(|key| crate::note_write::CreateKeyClaim {
+                        kind: note.kind.clone(),
+                        key: key.clone(),
+                        content: note.content.clone(),
+                        properties: note.properties.clone(),
+                        replay_signal: requests[note_idx].options.replay_receipt,
+                    }),
             }),
             note_id: note.id,
             statements,
