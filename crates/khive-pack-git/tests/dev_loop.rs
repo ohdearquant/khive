@@ -31,6 +31,14 @@ use khive_storage::{ContentRef, MAX_BLOB_WHOLE_BYTES};
 use serde_json::{json, Value};
 
 const ACTOR: &str = "actor:dev-loop";
+/// Verbs the fixture allows at construction when the tool pack is present.
+const FIXTURE_ALLOWED_VERBS: [&str; 5] = [
+    "git.receipts",
+    "git.gates",
+    "git.checkout",
+    "git.diff",
+    "git.reconcile",
+];
 const TOKEN: &str = "synthetic-credential-not-a-live-secret";
 const ZERO: &str = "0000000000000000000000000000000000000000";
 
@@ -299,13 +307,7 @@ impl Fixture {
             dir,
         };
         if include_tool {
-            for verb in [
-                "git.receipts",
-                "git.gates",
-                "git.checkout",
-                "git.diff",
-                "git.reconcile",
-            ] {
+            for verb in FIXTURE_ALLOWED_VERBS {
                 fixture.policy(verb, "allow").await;
             }
         }
@@ -565,7 +567,11 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
             }
             _ => panic!("repository-taking Git verb needs an arm 5 payload: {verb}"),
         };
-        f.policy(verb, "allow").await;
+        // The fixture already allows some of these verbs, and rewriting an identical policy is
+        // refused as `policy_unchanged`.
+        if !FIXTURE_ALLOWED_VERBS.contains(&verb) {
+            f.policy(verb, "allow").await;
+        }
         let help = f.registry.describe_verb(verb).expect("Git verb schema");
         let schema = &help["input_schema"];
         assert_eq!(schema["additionalProperties"], false, "{verb}");
