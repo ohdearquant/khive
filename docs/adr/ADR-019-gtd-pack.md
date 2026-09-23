@@ -913,11 +913,11 @@ replacement date, selects or infers no unit, maps no status, and changes no data
 `gtd.census` accepts three optional parameters. The Amendment 4 sentence "The
 verb takes no business parameters" now describes a call that passes none of them.
 
-| Parameter            | Type and default          | Meaning                                          |
-| -------------------- | ------------------------- | ------------------------------------------------ |
-| `include_candidates` | boolean, `false`          | `true` adds a `candidates` object to the response |
-| `limit`              | integer `1..=200`, `100`  | Candidate page size                              |
-| `cursor`             | object `{namespace, id}`  | Resume after this key                            |
+| Parameter            | Type and default         | Meaning                                           |
+| -------------------- | ------------------------ | ------------------------------------------------- |
+| `include_candidates` | boolean, `false`         | `true` adds a `candidates` object to the response |
+| `limit`              | integer `1..=200`, `100` | Candidate page size                               |
+| `cursor`             | object `{namespace, id}` | Resume after this key                             |
 
 `limit` and `cursor` require `include_candidates=true`. Explicit nulls, unknown
 fields, a malformed cursor, a UUID prefix or noncanonical UUID spelling, and a
