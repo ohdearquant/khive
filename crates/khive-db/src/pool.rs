@@ -578,6 +578,21 @@ pub struct ConnectionPool {
     writer_task_spawn_count: std::sync::atomic::AtomicUsize,
 }
 
+impl Drop for ConnectionPool {
+    /// Close every read-only reader before the fields below it drop in
+    /// declaration order (`writer` first, `readers` well before
+    /// `writer_task`). A read-only connection cannot take the EXCLUSIVE lock
+    /// SQLite needs to checkpoint on close, so if a reader were left to close
+    /// last, WAL mode would leave `-wal`/`-shm` behind. Draining `readers`
+    /// here, before that field-order drop runs, makes the writable `writer`
+    /// connection close after every reader instead of before it.
+    fn drop(&mut self) {
+        while let Some(conn) = self.readers.pop() {
+            drop(conn);
+        }
+    }
+}
+
 enum ReaderLease<'pool> {
     Pooled(Connection),
     Shared(parking_lot::MutexGuard<'pool, Connection>),
@@ -4100,6 +4115,55 @@ mod tests {
         assert_eq!(std::fs::read(&shm).unwrap(), shm_before);
 
         drop(writer);
+    }
+
+    /// A pool's own reader connections must never be the last of its
+    /// connections to close. Readers are opened eagerly at construction
+    /// (before this test's write), so with `max_readers: 1` and no writer
+    /// task the pool holds exactly two connections on this database: the
+    /// writable `writer` and one read-only reader. Struct field order alone
+    /// then decides which one closes last, deterministically, with no
+    /// scheduling involved: `writer` was declared before `readers`, so
+    /// without draining `readers` first a plain pool drop leaves the
+    /// read-only reader as the last closer, which cannot take the EXCLUSIVE
+    /// lock SQLite needs to checkpoint (#3089).
+    #[test]
+    fn pool_drop_never_leaves_a_reader_as_the_last_connection_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("close-order.db");
+        let wal = sqlite_sidecar(&path, "-wal");
+        let shm = sqlite_sidecar(&path, "-shm");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        pool.writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE close_order_row(id INTEGER PRIMARY KEY);\
+                 INSERT INTO close_order_row DEFAULT VALUES;",
+            )
+            .unwrap();
+        assert!(
+            wal.exists(),
+            "a WAL-mode write must leave a -wal sidecar before the pool drops"
+        );
+
+        drop(pool);
+
+        assert!(
+            !wal.exists(),
+            "the pool's last connection to close must be writable enough to checkpoint -wal away"
+        );
+        assert!(
+            !shm.exists(),
+            "the pool's last connection to close must be writable enough to checkpoint -shm away"
+        );
     }
 
     /// A symlink cannot hide a writable target `-shm`. Admission inspects the

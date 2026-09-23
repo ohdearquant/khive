@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -380,6 +380,7 @@ struct Service {
     started: Notify,
     proceed: Notify,
     fail: AtomicBool,
+    calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -389,6 +390,7 @@ impl EmbeddingService for Service {
         texts: &[String],
         _: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if texts.iter().any(|text| text.contains("inflight")) {
             self.started.notify_one();
             self.proceed.notified().await;
@@ -1456,3 +1458,6 @@ mod fence_live_until;
 
 #[path = "fence_identity_tests.rs"]
 mod fence_identity;
+
+#[path = "keyed_create_race_tests.rs"]
+mod keyed_create_races;

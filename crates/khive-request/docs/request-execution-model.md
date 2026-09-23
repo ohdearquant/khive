@@ -9,13 +9,19 @@ This crate is the primary implementation of the request DSL.
 - The `request` tool accepts a verb-dispatch DSL string and routes each parsed
   op through the loaded packs.
 - Single ops, parallel batches `[...]`, sequential chains `op1 | op2($prev)`,
-  and raw JSON form are all supported.
+  bracketed batches of chains `[op1 | op2, op3]` (ADR-016 Amendment 2), and raw
+  JSON form are all supported.
 - Hard cap of 100 ops per request (`MAX_OPS`) prevents unbounded memory growth
-  and keeps latency predictable.
+  and keeps latency predictable, counted across every op in a request
+  regardless of how many units a bracketed batch partitions them into.
 - `ExecutionMode` (`Single`, `Parallel`, `Chain`) encodes how the dispatcher
-  must execute the returned `ParsedRequest`.
+  must execute the returned `ParsedRequest`. `ParsedRequest.ranges` carries the
+  finer-grained partition into units: length-one ranges for an ordinary flat
+  batch, longer ranges where a unit is itself a chain.
 - Chain mode uses `$prev` / `$prev.dotted.path` references that are substituted
-  at dispatch time — the parser validates their form but not their values.
+  at dispatch time; the parser validates their form but not their values. A
+  unit inside a bracketed batch resolves `$prev` the same way, scoped to that
+  unit's own ops only.
 
 ### Write-Key Conflict Detection (ADR-038)
 

@@ -214,7 +214,7 @@ impl PackRuntime for KgPack {
             "traverse" => self.handle_traverse(graph_token, params).await,
             "context" => self.handle_context(graph_token, params).await,
             "query" => self.handle_query(graph_token, params).await,
-            "propose" => self.handle_propose(graph_token, params).await,
+            "propose" => self.handle_propose(graph_token, params, registry).await,
             "review" => self.handle_review(graph_token, params, registry).await,
             "withdraw" => self.handle_withdraw(graph_token, params).await,
             "stats" => self.handle_stats(graph_token, params).await,
