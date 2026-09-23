@@ -16709,3 +16709,591 @@ async fn list_entity_at_the_cap_reports_the_population_it_did_not_return() {
     assert_eq!(over_cap["limit_clamped"], true);
     assert_eq!(over_cap["has_more"], true);
 }
+
+// ── ADR-023 amendment: note-aware bulk create (issue #890) ─────────────────
+
+fn result_message(result: &Value) -> &str {
+    result["error"]["message"].as_str().unwrap_or("")
+}
+
+/// Under `atomic: false` every item is parsed from its own JSON value, so a
+/// malformed, unknown-field, non-object, bad-kind or cross-substrate item, and
+/// a note without `content` or an entity without `name`, is its own indexed
+/// failure and the valid entity and note siblings commit.
+#[tokio::test]
+async fn create_bulk_best_effort_mixed_failures_admit_valid_siblings() {
+    let pack = pack();
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "atomic": false,
+                "items": [
+                    {"kind": "concept", "name": "BulkValidEntity"},
+                    {"kind": "observation", "name": "NoContent"},
+                    {"kind": "observation", "content": "ok", "extra_unknown": 1},
+                    "not an object",
+                    {"kind": "not_a_real_kind", "name": "Bad"},
+                    {"kind": "observation", "content": "typed", "entity_type": "paper"},
+                    {"kind": "concept", "name": "WithContent", "content": "body"},
+                    {"kind": "concept", "description": "no name"},
+                    {"kind": "observation", "content": "BulkValidNote"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create must return a response, not an error");
+
+    assert_eq!(resp["attempted"], 9);
+    assert_eq!(
+        resp["created"], 2,
+        "only the two valid siblings must commit; got {resp}"
+    );
+    assert_eq!(resp["failed"], 7);
+    assert_eq!(resp["skipped"], 0);
+
+    let results = resp["results"]
+        .as_array()
+        .expect("results must be an array");
+    assert_eq!(
+        results.len(),
+        9,
+        "results must be index-aligned to every submitted item"
+    );
+    for (idx, result) in results.iter().enumerate() {
+        assert_eq!(result["index"], idx, "entry {idx} must carry its own index");
+    }
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["result"]["kind"], "concept");
+    for idx in 1..=7 {
+        assert_eq!(
+            results[idx]["ok"], false,
+            "item {idx} must be its own indexed failure; got {results:?}"
+        );
+        assert_eq!(results[idx]["domain_disposition"], "not_committed");
+    }
+    assert!(
+        result_message(&results[1]).contains("requires content"),
+        "{results:?}"
+    );
+    assert!(
+        result_message(&results[5]).contains("apply only to entity items"),
+        "an entity-only field on a note item must fail as such: {results:?}"
+    );
+    assert!(
+        result_message(&results[6]).contains("apply only to note items"),
+        "a note-only field on an entity item must fail as such: {results:?}"
+    );
+    assert!(
+        result_message(&results[7]).contains("requires 'name'"),
+        "a name-less entity item must be its own indexed failure: {results:?}"
+    );
+    assert_eq!(results[8]["ok"], true);
+    assert_eq!(results[8]["result"]["kind"], "observation");
+    let errors = resp["errors"].as_array().expect("errors must be an array");
+    assert_eq!(errors.len(), 7);
+    for entry in errors {
+        assert!(
+            entry["error"].is_string(),
+            "the existing errors[] entries keep their string error: {errors:?}"
+        );
+    }
+
+    let entities = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        list_items(&entities).len(),
+        1,
+        "only the valid entity item must be stored"
+    );
+    let notes = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        list_items(&notes).len(),
+        1,
+        "only the valid note item must be stored"
+    );
+}
+
+/// Omitting `atomic` and setting it to `true` both reject a mixed batch that
+/// holds one invalid note item, and neither substrate gains a row.
+#[tokio::test]
+async fn create_bulk_mixed_atomic_default_and_true_reject_writes_nothing() {
+    for atomic_arg in [None, Some(true)] {
+        let pack = pack();
+        let mut body = json!({
+            "items": [
+                {"kind": "concept", "name": "AtomicShouldNotLand"},
+                {"kind": "observation", "name": "MissingContent"}
+            ]
+        });
+        if let Some(a) = atomic_arg {
+            body["atomic"] = json!(a);
+        }
+        let err = pack
+            .dispatch("create", body)
+            .await
+            .expect_err("an invalid note item must reject the whole atomic batch");
+        assert!(is_invalid_input(&err), "expected InvalidInput, got {err:?}");
+
+        let entities = pack
+            .dispatch("list", json!({"kind": "concept"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            list_items(&entities).len(),
+            0,
+            "atomic:{atomic_arg:?} must write no entity row"
+        );
+        let notes = pack
+            .dispatch("list", json!({"kind": "observation"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            list_items(&notes).len(),
+            0,
+            "atomic:{atomic_arg:?} must write no note row"
+        );
+    }
+}
+
+/// An all-valid mixed entity and note batch commits every item.
+#[tokio::test]
+async fn create_bulk_mixed_atomic_true_all_valid_commits_all() {
+    let pack = pack();
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "atomic": true,
+                "items": [
+                    {"kind": "concept", "name": "AtomicEntity"},
+                    {"kind": "observation", "content": "atomic note body"}
+                ]
+            }),
+        )
+        .await
+        .expect("all-valid mixed atomic batch must commit");
+    assert_eq!(resp["attempted"], 2);
+    assert_eq!(resp["created"], 2);
+    assert_eq!(resp["failed"], 0);
+    let results = resp["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[1]["ok"], true);
+
+    let entities = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .unwrap();
+    assert_eq!(list_items(&entities).len(), 1);
+    let notes = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .unwrap();
+    assert_eq!(list_items(&notes).len(), 1);
+}
+
+/// A note item may say `kind: "note"` and default its note kind the way a
+/// singleton create does, or name it through `note_kind`; it may also carry
+/// a `name`.
+#[tokio::test]
+async fn create_bulk_note_item_kind_defaults_like_singleton_create() {
+    let pack = pack();
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "verbose": true,
+                "items": [
+                    {"kind": "note", "content": "defaulted kind"},
+                    {"kind": "note", "note_kind": "insight", "content": "named kind", "name": "Named"}
+                ]
+            }),
+        )
+        .await
+        .expect("both note spellings must commit");
+    let results = resp["results"].as_array().unwrap();
+    assert_eq!(results[0]["result"]["kind"], "observation");
+    assert_eq!(results[1]["result"]["kind"], "insight");
+    assert_eq!(results[1]["result"]["name"], "Named");
+}
+
+/// A bulk note item that forges the runtime-owned `khive:secret_gate`
+/// property key is refused: under `atomic: false` it is its own indexed
+/// failure and a valid sibling still commits; under `atomic: true` the whole
+/// batch writes nothing.
+#[tokio::test]
+async fn create_bulk_items_reserved_property_key_rejected_both_atomic_modes() {
+    let pack1 = pack();
+    let best_effort = pack1
+        .dispatch(
+            "create",
+            json!({
+                "atomic": false,
+                "items": [
+                    {"kind": "observation", "content": "reserved-key sibling"},
+                    {"kind": "observation", "content": "forged", "properties": {"khive:secret_gate": "x"}}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create must return a response");
+    assert_eq!(best_effort["created"], 1);
+    assert_eq!(best_effort["failed"], 1);
+    let results = best_effort["results"].as_array().unwrap();
+    assert_eq!(results[1]["ok"], false);
+    assert!(
+        result_message(&results[1]).contains("khive:secret_gate"),
+        "error must name the reserved key; got {results:?}"
+    );
+
+    let pack2 = pack();
+    let err = pack2
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "observation", "content": "atomic reserved-key sibling"},
+                    {"kind": "observation", "content": "forged", "properties": {"khive:secret_gate": "x"}}
+                ]
+            }),
+        )
+        .await
+        .expect_err("atomic:true must reject a batch containing a forged reserved property");
+    assert!(is_invalid_input(&err));
+    let notes = pack2
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        list_items(&notes).len(),
+        0,
+        "atomic rejection must write nothing"
+    );
+}
+
+/// A `head` note item follows the same rules as a singleton `head` create:
+/// JSON text content and no name.
+#[tokio::test]
+async fn create_bulk_head_note_item_follows_head_rules() {
+    let pack = pack();
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "atomic": false,
+                "items": [
+                    {"kind": "head", "content": "not JSON"},
+                    {"kind": "head", "content": "{}", "name": "forbidden"},
+                    {"kind": "head", "content": "{\"ok\":true}"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create must return a response");
+    let results = resp["results"].as_array().unwrap();
+    assert_eq!(results[0]["ok"], false, "{results:?}");
+    assert!(result_message(&results[0]).contains("JSON"), "{results:?}");
+    assert_eq!(results[1]["ok"], false, "{results:?}");
+    assert!(
+        result_message(&results[1]).contains("no name"),
+        "{results:?}"
+    );
+    assert_eq!(results[2]["ok"], true, "{results:?}");
+    assert_eq!(resp["created"], 1);
+}
+
+/// `results` carries one entry per submitted item, with ids even without
+/// `verbose` and the full committed record only with `verbose: true`, and
+/// `attempted = created + failed` with `skipped` at 0.
+#[tokio::test]
+async fn create_bulk_items_results_ids_without_verbose_full_record_with_verbose() {
+    let pack = pack();
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "ResultsEntity"},
+                    {"kind": "observation", "content": "results note"}
+                ]
+            }),
+        )
+        .await
+        .expect("valid mixed batch must commit");
+    assert_eq!(
+        resp["attempted"],
+        resp["created"].as_u64().unwrap() + resp["failed"].as_u64().unwrap()
+    );
+    assert_eq!(resp["skipped"], 0);
+    let results = resp["results"].as_array().unwrap();
+    for r in results {
+        assert!(
+            r["result"]["id"].is_string(),
+            "id must be present without verbose; got {r}"
+        );
+        assert!(
+            r["result"].get("name").is_none() && r["result"].get("content").is_none(),
+            "non-verbose result must not carry the full record; got {r}"
+        );
+    }
+
+    let verbose = pack
+        .dispatch(
+            "create",
+            json!({
+                "verbose": true,
+                "items": [{"kind": "observation", "content": "verbose note"}]
+            }),
+        )
+        .await
+        .expect("verbose bulk create must commit");
+    let vresults = verbose["results"].as_array().unwrap();
+    assert_eq!(
+        vresults[0]["result"]["content"], "verbose note",
+        "verbose result must carry the full note record; got {vresults:?}"
+    );
+    assert_eq!(vresults[0]["result"]["created"], true);
+}
+
+/// An over-cap batch and a non-boolean `atomic` or `verbose` refuse the whole
+/// call before any write.
+#[tokio::test]
+async fn create_bulk_items_over_cap_and_non_boolean_flags_refuse_before_writes() {
+    let pack = pack();
+    let items: Vec<Value> = (0..1001)
+        .map(|i| json!({"kind": "concept", "name": format!("Cap{i}")}))
+        .collect();
+    let err = pack
+        .dispatch("create", json!({"items": items}))
+        .await
+        .expect_err("1001 items must be refused");
+    assert!(is_invalid_input(&err));
+    let entities = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        list_items(&entities).len(),
+        0,
+        "an over-cap call must write nothing"
+    );
+
+    for flag in ["atomic", "verbose"] {
+        let mut body = json!({"items": [{"kind": "concept", "name": "X"}]});
+        body[flag] = json!("yes");
+        let err = pack
+            .dispatch("create", body)
+            .await
+            .expect_err("a non-boolean flag must be refused");
+        assert!(is_invalid_input(&err), "{flag}: {err:?}");
+    }
+    let entities = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        list_items(&entities).len(),
+        0,
+        "a refused flag must write nothing"
+    );
+}
+
+/// An empty batch is accepted and writes nothing, with zero counts and an
+/// empty `results` array.
+#[tokio::test]
+async fn create_bulk_items_empty_returns_zero_counts_and_empty_results() {
+    let pack = pack();
+    let resp = pack
+        .dispatch("create", json!({"items": []}))
+        .await
+        .expect("empty items must be accepted");
+    assert_eq!(resp["attempted"], 0);
+    assert_eq!(resp["created"], 0);
+    assert_eq!(resp["skipped"], 0);
+    assert_eq!(resp["failed"], 0);
+    assert_eq!(resp["results"].as_array().unwrap().len(), 0);
+}
+
+/// A bulk-created note is visible through `get`, `list` and FTS `search`
+/// right away. Its vector waits for a later `reindex`, as for bulk entities.
+#[tokio::test]
+async fn create_bulk_notes_visible_via_get_list_and_search() {
+    let pack = pack();
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({"items": [{"kind": "observation", "content": "bulk findable note body"}]}),
+        )
+        .await
+        .expect("bulk note create must commit");
+    let id = resp["results"][0]["result"]["id"]
+        .as_str()
+        .expect("id must be present without verbose")
+        .to_string();
+
+    let fetched = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get must find the bulk-created note");
+    assert_eq!(fetched["content"], "bulk findable note body");
+
+    let listed = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .unwrap();
+    assert_eq!(list_items(&listed).len(), 1);
+
+    let found = pack
+        .dispatch("search", json!({"kind": "note", "query": "findable"}))
+        .await
+        .expect("search must succeed");
+    let hits = found.as_array().expect("search returns an array");
+    assert!(
+        hits.iter().any(|h| h["id"] == id),
+        "FTS search must find the bulk-created note; got {found}"
+    );
+}
+
+/// Edges, annotations, keys, fences and per-item embedding options on a bulk
+/// item are refused, not silently dropped.
+#[tokio::test]
+async fn create_bulk_items_refuse_singleton_only_options() {
+    let pack = pack();
+    for (field, value) in [
+        ("edges", json!([])),
+        ("annotates", json!([])),
+        ("embedding_content", json!("x")),
+        ("embedding_model", json!("any-model")),
+        ("embed", json!(false)),
+        ("key", json!("bulk/key")),
+        ("fence", json!({"key": "bulk/fence", "kind": "head"})),
+    ] {
+        let mut item = json!({"kind": "observation", "content": "x"});
+        item[field] = value;
+        let err = pack
+            .dispatch("create", json!({"items": [item]}))
+            .await
+            .expect_err("a singleton-only option on a bulk item must be refused");
+        assert!(
+            is_invalid_input(&err),
+            "expected InvalidInput for `{field}`, got {err:?}"
+        );
+    }
+    let notes = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .unwrap();
+    assert_eq!(list_items(&notes).len(), 0);
+}
+
+/// A registry whose namespace no other test writes, so a namespace-scoped
+/// fault injection cannot reach a concurrently running test.
+fn pack_in_namespace(namespace: &Namespace) -> Fixture {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(vec![namespace.clone()]);
+    builder.register(KgPack::new(rt));
+    Fixture {
+        registry: builder.build().expect("registry builds"),
+    }
+}
+
+async fn count_in(pack: &Fixture, namespace: &Namespace, kind: &str) -> usize {
+    let listed = pack
+        .dispatch(
+            "list",
+            json!({"namespace": namespace.as_str(), "kind": kind}),
+        )
+        .await
+        .expect("list must succeed");
+    list_items(&listed).len()
+}
+
+/// A write that fails inside the transaction rolls back every item of an
+/// atomic batch, including an entity item whose own statements succeeded,
+/// and the call fails with no item receipts.
+#[tokio::test]
+async fn create_bulk_atomic_commit_fault_rolls_back_every_item() {
+    let namespace = Namespace::parse("bulk-atomic-commit-fault").unwrap();
+    let pack = pack_in_namespace(&namespace);
+    let arm = khive_runtime::arm_fts_fail_scoped(namespace.as_str());
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "namespace": namespace.as_str(),
+                "items": [
+                    {"kind": "concept", "name": "RolledBackEntity"},
+                    {"kind": "observation", "content": "the note whose FTS write fails"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("a failed write inside the batch must fail the atomic call");
+    drop(arm);
+    assert!(
+        err.to_string().contains("rolled back"),
+        "the call must report the rollback: {err:?}"
+    );
+    assert_eq!(count_in(&pack, &namespace, "concept").await, 0);
+    assert_eq!(count_in(&pack, &namespace, "observation").await, 0);
+
+    // Control: the same batch without the fault commits both items, so the
+    // zero counts above are the rollback and not an unreadable namespace.
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "namespace": namespace.as_str(),
+                "items": [
+                    {"kind": "concept", "name": "CommittedEntity"},
+                    {"kind": "observation", "content": "the note whose FTS write succeeds"}
+                ]
+            }),
+        )
+        .await
+        .expect("the unfaulted batch must commit");
+    assert_eq!(resp["created"], 2);
+    assert_eq!(count_in(&pack, &namespace, "concept").await, 1);
+    assert_eq!(count_in(&pack, &namespace, "observation").await, 1);
+}
+
+/// Under `atomic: false` a write that fails inside one item's transaction is
+/// that item's own `not_committed` failure; its siblings commit.
+#[tokio::test]
+async fn create_bulk_best_effort_commit_fault_fails_only_its_item() {
+    let namespace = Namespace::parse("bulk-best-effort-commit-fault").unwrap();
+    let pack = pack_in_namespace(&namespace);
+    let arm = khive_runtime::arm_fts_fail_scoped(namespace.as_str());
+    let resp = pack
+        .dispatch(
+            "create",
+            json!({
+                "namespace": namespace.as_str(),
+                "atomic": false,
+                "items": [
+                    {"kind": "concept", "name": "BeforeTheFault"},
+                    {"kind": "observation", "content": "the note whose FTS write fails"},
+                    {"kind": "concept", "name": "AfterTheFault"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create must return per-item results");
+    drop(arm);
+    assert_eq!(resp["created"], 2, "{resp}");
+    assert_eq!(resp["failed"], 1, "{resp}");
+    let results = resp["results"].as_array().unwrap();
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[1]["ok"], false);
+    assert_eq!(results[1]["domain_disposition"], "not_committed");
+    assert_eq!(results[2]["ok"], true);
+    assert_eq!(count_in(&pack, &namespace, "concept").await, 2);
+    assert_eq!(count_in(&pack, &namespace, "observation").await, 0);
+}
