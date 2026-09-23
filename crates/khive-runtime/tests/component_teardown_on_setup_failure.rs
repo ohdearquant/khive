@@ -2,10 +2,9 @@
 //! cancel the process-wide component shutdown token (ADR-119).
 //!
 //! `run_daemon_with_boot_guard` performs fallible setup (socket-directory
-//! creation and trust validation) before it binds. Components may already be
-//! running by then — the serve path starts them first — so the teardown guard
-//! has to be constructed before ANY fallible startup work, or an early error
-//! return leaves supervisors holding a live token in an embedded process.
+//! creation and trust validation) before it binds. Host components now start
+//! only after ownership succeeds, but a failed candidate must still cancel
+//! its process-wide token. The guard therefore precedes all fallible setup.
 //!
 //! Isolation: this test lives in its own integration-test binary on purpose.
 //! It mutates `KHIVE_SOCKET` and `KHIVE_PID` (process-global env) and fires
@@ -15,7 +14,7 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
-use khive_runtime::daemon::run_daemon_with_boot_guard;
+use khive_runtime::daemon::run_daemon_with_boot_guard_and_start;
 use khive_runtime::{DaemonDispatch, RequestIdentity};
 
 #[derive(Clone)]
@@ -66,7 +65,15 @@ async fn setup_failure_before_bind_cancels_component_token() {
     std::env::set_var("KHIVE_SOCKET", blocker.join("khived.sock"));
     std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
 
-    let result = run_daemon_with_boot_guard(NeverDispatch, None).await;
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let result = run_daemon_with_boot_guard_and_start(NeverDispatch, None, |_| {
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "a setup failure must not start host components"
+    );
 
     assert!(
         result.is_err(),
