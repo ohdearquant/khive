@@ -4461,3 +4461,87 @@ fn event_operation_attribution_upgrade_keeps_legacy_rows_unknown() {
     .unwrap();
     assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
 }
+
+#[test]
+fn issue2673_v37_initializes_and_guards_entity_versions() {
+    let upgraded = rusqlite::Connection::open_in_memory().unwrap();
+    upgraded.execute_batch("CREATE TABLE entities(id TEXT PRIMARY KEY, name TEXT NOT NULL); INSERT INTO entities(id,name) VALUES('old','kept');").unwrap();
+    let migration = MIGRATIONS.iter().find(|m| m.version == 37).unwrap();
+    upgraded.execute_batch(migration.up).unwrap();
+    assert_eq!(
+        upgraded
+            .query_row("SELECT version FROM entities WHERE id='old'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        upgraded
+            .query_row("SELECT name FROM entities WHERE id='old'", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        "kept"
+    );
+
+    let fresh = rusqlite::Connection::open_in_memory().unwrap();
+    fresh
+        .execute_batch(include_str!("../sql/entities-ddl.sql"))
+        .unwrap();
+    let mut migrated = rusqlite::Connection::open_in_memory().unwrap();
+    assert_eq!(
+        run_migrations(&mut migrated).unwrap(),
+        latest_schema_version()
+    );
+    let column = migrated.query_row("SELECT type,\"notnull\",dflt_value FROM pragma_table_info('entities') WHERE name='version'", [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, i64>(1)?,row.get::<_, String>(2)?))).unwrap();
+    assert_eq!(column, ("INTEGER".into(), 1, "1".into()));
+
+    for trigger in [
+        "entities_version_insert_guard",
+        "entities_version_update_guard",
+    ] {
+        let read = |conn: &rusqlite::Connection| {
+            conn.query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [trigger],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(read(&upgraded), read(&fresh));
+    }
+    for sql in [
+        "INSERT INTO entities(id,name,version) VALUES('bad','bad',2)",
+        "UPDATE entities SET name='missing increment' WHERE id='old'",
+        "UPDATE entities SET name='jump',version=version+2 WHERE id='old'",
+    ] {
+        assert!(
+            upgraded.execute(sql, []).is_err(),
+            "unguarded write accepted: {sql}"
+        );
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT name,version FROM entities WHERE id='old'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            ("kept".into(), 1)
+        );
+    }
+    upgraded
+        .execute(
+            "UPDATE entities SET name='accepted',version=version+1 WHERE id='old'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        upgraded
+            .query_row("SELECT version FROM entities WHERE id='old'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}

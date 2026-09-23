@@ -622,7 +622,7 @@ pub async fn prepare_add_note(
         });
     }
 
-    Ok(AtomicOpPlan::AddNote(AddNotePlan {
+    Ok(AtomicOpPlan::AddNote(Box::new(AddNotePlan {
         note_guard: None,
         note_id: note.id,
         statements,
@@ -630,7 +630,7 @@ pub async fn prepare_add_note(
             note_id: note.id,
             version: note.version,
         },
-    }))
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -649,13 +649,18 @@ pub async fn prepare_add_note(
 /// semantics.
 fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeResult<()> {
     let o = obj(args)?;
+    if substrate == "edge" && o.get("expected_version").is_some_and(|v| !v.is_null()) {
+        return Err(RuntimeError::InvalidInput(
+            "expected_version applies only to entities and notes".into(),
+        ));
+    }
     if substrate != "note"
-        && ["expected_version", "embed", "fence"]
+        && ["embed", "fence"]
             .iter()
             .any(|field| o.contains_key(*field))
     {
         return Err(RuntimeError::InvalidInput(
-            "expected_version, embed and fence apply only to notes".into(),
+            "embed and fence apply only to notes".into(),
         ));
     }
     let present = |k: &str| o.get(k).is_some_and(|v| !v.is_null());
@@ -873,7 +878,7 @@ pub async fn prepare_update_from_note_snapshot(
         Some(registry),
     )
     .await?;
-    Ok((note, AtomicOpPlan::Update(plan)))
+    Ok((note, AtomicOpPlan::Update(Box::new(plan))))
 }
 
 /// The only companion attachment site. Canonical, CLI atomic, and stream note
@@ -1078,7 +1083,16 @@ pub async fn prepare_update(
             let tags = optional_tags(args)?;
             let entity_type = optional_entity_type_patch(args, "entity_type")?;
 
-            prepare_update_entity_plan(
+            let expected_version = obj(args)?
+                .get("expected_version")
+                .filter(|v| !v.is_null())
+                .map(|value| {
+                    value.as_i64().ok_or_else(|| {
+                        RuntimeError::InvalidInput("expected_version must be an integer".into())
+                    })
+                })
+                .transpose()?;
+            prepare_update_entity_plan_with_version(
                 runtime,
                 token,
                 id,
@@ -1089,6 +1103,7 @@ pub async fn prepare_update(
                     tags,
                     entity_type,
                 },
+                expected_version,
             )
             .await
         }
@@ -1107,7 +1122,7 @@ pub async fn prepare_update(
                 None,
             )
             .await?;
-            Ok(AtomicOpPlan::Update(plan))
+            Ok(AtomicOpPlan::Update(Box::new(plan)))
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
             "update target {id} must be an entity, note, or edge"
@@ -1142,6 +1157,17 @@ pub async fn prepare_update_entity_plan(
     id: Uuid,
     patch: crate::curation::EntityPatch,
 ) -> RuntimeResult<AtomicOpPlan> {
+    prepare_update_entity_plan_with_version(runtime, token, id, patch, None).await
+}
+
+pub(crate) async fn prepare_update_entity_plan_with_version(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+    expected_version: Option<i64>,
+) -> RuntimeResult<AtomicOpPlan> {
+    crate::entity_write::validate_expected_version(expected_version)?;
     let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
         runtime.prepare_update_entity(token, id, patch).await?;
     let mut statements = vec![PlanStatement {
@@ -1170,17 +1196,23 @@ pub async fn prepare_update_entity_plan(
     } else {
         PostCommitEffect::None
     };
-    Ok(AtomicOpPlan::Update(UpdatePlan {
+    Ok(AtomicOpPlan::Update(Box::new(UpdatePlan {
         graph_effects: Vec::new(),
         note_vector_purge: None,
         note_embedding_inheritance: None,
+        entity_guard: expected_version.map(|expected_version| {
+            crate::entity_write::EntityWriteGuard {
+                id,
+                expected_version,
+            }
+        }),
         note_guard: None,
         target_id: id,
         statements,
         post_commit,
         edge_natural_key: None,
         idempotent_noop: false,
-    }))
+    })))
 }
 
 /// Edge branch of `prepare_update`. Mirrors `KhiveRuntime::update_edge`'s
@@ -1380,17 +1412,18 @@ async fn prepare_update_edge(
         serde_json::json!({"id": id, "namespace": namespace, "changed_fields": changed_fields}),
     )?);
 
-    Ok(AtomicOpPlan::Update(UpdatePlan {
+    Ok(AtomicOpPlan::Update(Box::new(UpdatePlan {
         graph_effects: Vec::new(),
         note_vector_purge: None,
         note_embedding_inheritance: None,
+        entity_guard: None,
         note_guard: None,
         target_id: id,
         statements,
         post_commit: PostCommitEffect::None,
         edge_natural_key,
         idempotent_noop: false,
-    }))
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,7 +1998,7 @@ async fn prepare_merge(
     ];
     let lifecycle = vec![PlanStatement {
         statement: SqlStatement {
-            sql: "UPDATE entities SET deleted_at = ?1, merged_into = ?2 \
+            sql: "UPDATE entities SET deleted_at = ?1, merged_into = ?2, version = version + 1 \
                   WHERE id = ?3 AND deleted_at IS NULL"
                 .to_string(),
             params: vec![
@@ -4119,7 +4152,7 @@ mod tests {
 
         // PREPARE time: build the plan from the current (soon-to-be-stale)
         // revision.
-        let plan = prepare_update(
+        let mut plan = prepare_update(
             &runtime,
             &token,
             &json!({"id": id.to_string(), "description": "from the stale plan"}),
@@ -4210,7 +4243,8 @@ mod tests {
             let mut writer = runtime.sql().writer().await.expect("writer");
             let affected = writer
                 .execute(SqlStatement {
-                    sql: "UPDATE entities SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    sql: "UPDATE entities SET version = version + 1, updated_at = ?1 WHERE id = ?2"
+                        .to_string(),
                     params: vec![
                         SqlValue::Integer(stored_pinned),
                         SqlValue::Text(id.to_string()),
@@ -4249,6 +4283,19 @@ mod tests {
                  otherwise `deleted_at IS ?14` refuses too and this stops being a test of \
                  the expected-revision guard alone"
             );
+            // Keep this legacy timestamp-conjunct oracle independent of the
+            // newly added persisted-version predicate. The production plan
+            // would also refuse on its old version; this fixture pins only
+            // that additional predicate to the observed current value.
+            let AtomicOpPlan::Update(update) = &mut plan else {
+                unreachable!()
+            };
+            let cas = update
+                .statements
+                .iter_mut()
+                .find(|s| s.statement.label.as_deref() == Some("entity-replace-if-unchanged"))
+                .unwrap();
+            cas.statement.params[14] = SqlValue::Integer(stored.version);
         }
 
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])

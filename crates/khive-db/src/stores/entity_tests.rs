@@ -59,6 +59,7 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        version: 1,
         content_ref: None,
     }
 }
@@ -1036,6 +1037,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        version: 1,
         content_ref: None,
     };
     store.upsert_entity(entity_a).await.unwrap();
@@ -1060,6 +1062,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        version: 1,
         content_ref: None,
     };
     store.upsert_entity(entity_b).await.unwrap();
@@ -1797,7 +1800,8 @@ async fn cursor_kind_filter_returns_records() {
 
     let mut walked_ids: Vec<Uuid> = Vec::new();
     let mut after = None;
-    loop {
+    // A cursor that stops advancing must fail here rather than loop forever.
+    for _ in 0..=concept_ids.len() {
         let page = store
             .query_entities_after("ns1", filter.clone(), after, 2)
             .await
@@ -1810,6 +1814,7 @@ async fn cursor_kind_filter_returns_records() {
             break;
         }
     }
+    assert!(after.is_none(), "cursor did not reach the last page");
 
     assert_eq!(
         walked_ids.len(),
@@ -1976,5 +1981,93 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
     assert_eq!(
         reader.standalone_opens, 0,
         "neither saturation nor cancellation may fall back to a standalone reader"
+    );
+}
+
+#[tokio::test]
+async fn issue2673_entity_versions_cover_typed_storage_writers() {
+    let store = setup_memory_store();
+    let entity = Entity::new("local", "concept", "Versioned");
+    let id = entity.id;
+    store.upsert_entity(entity.clone()).await.unwrap();
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 1);
+
+    // Upsert must increment the stored counter even when passed an old clone.
+    store.upsert_entity(entity.clone()).await.unwrap();
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 2);
+    let batch = store
+        .upsert_entities(vec![entity.clone(), entity.clone()])
+        .await
+        .unwrap();
+    assert_eq!((batch.affected, batch.failed), (2, 0));
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 4);
+
+    assert!(!store.insert_entity_if_absent(entity).await.unwrap());
+    let before = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(
+        before.version, 4,
+        "losing conditional insert is not a write"
+    );
+    let mut changed = before.clone();
+    changed.name = "CAS winner".into();
+    changed.updated_at += 1;
+    assert!(store
+        .replace_entity_if_unchanged(changed.clone(), before.updated_at, before.deleted_at)
+        .await
+        .unwrap());
+    let winner = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(winner.version, 5);
+    assert!(!store
+        .replace_entity_if_unchanged(changed, before.updated_at, before.deleted_at)
+        .await
+        .unwrap());
+    assert_eq!(
+        serde_json::to_value(store.get_entity(id).await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
+
+    // A same-timestamp upsert still invalidates the persisted revision.
+    let mut stale = winner.clone();
+    stale.updated_at += 1;
+    stale.name = "must not land".into();
+    store.upsert_entity(winner.clone()).await.unwrap();
+    assert!(!store
+        .replace_entity_if_unchanged(stale, winner.updated_at, winner.deleted_at)
+        .await
+        .unwrap());
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 6);
+
+    let current = store.get_entity(id).await.unwrap().unwrap();
+    store
+        .upsert_entity_with_attachments(current, vec![content_attachment(id, &"a".repeat(64))])
+        .await
+        .unwrap();
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 7);
+    assert!(store.delete_entity(id, DeleteMode::Soft).await.unwrap());
+    assert_eq!(
+        store
+            .get_entity_including_deleted(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        8
+    );
+    assert!(!store.delete_entity(id, DeleteMode::Soft).await.unwrap());
+    assert_eq!(
+        store
+            .get_entity_including_deleted(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        8
+    );
+
+    let fresh = Entity::new("local", "concept", "Conditional");
+    assert!(store.insert_entity_if_absent(fresh.clone()).await.unwrap());
+    assert_eq!(
+        store.get_entity(fresh.id).await.unwrap().unwrap().version,
+        1
     );
 }

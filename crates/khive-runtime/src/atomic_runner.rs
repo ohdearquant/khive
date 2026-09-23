@@ -44,8 +44,8 @@ use crate::atomic_plan::{
 #[derive(Debug, Clone)]
 pub enum AtomicOpPlan {
     AddEntity(AddEntityPlan),
-    AddNote(AddNotePlan),
-    Update(UpdatePlan),
+    AddNote(Box<AddNotePlan>),
+    Update(Box<UpdatePlan>),
     Delete(DeletePlan),
     Link(LinkPlan),
     Merge(MergePlan),
@@ -147,6 +147,7 @@ impl AtomicOpPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtomicOpFailure {
     NoteConflict(crate::note_write::NoteWriteConflict),
+    EntityConflict(crate::entity_write::EntityVersionConflict),
     /// The statement executed without a SQL error, but its affected-row
     /// count did not satisfy the guard prepare attached to it (ADR-099 D1
     /// rule 2 — "a prepare-time validation is a plan hypothesis, re-verified
@@ -302,6 +303,21 @@ pub(crate) async fn apply_plan(
     plan: &AtomicOpPlan,
     capture_note_versions: bool,
 ) -> Result<AppliedPlan, AtomicOpFailure> {
+    if let AtomicOpPlan::Update(plan) = plan {
+        if let Some(guard) = &plan.entity_guard {
+            if let Some(conflict) =
+                guard
+                    .check(writer)
+                    .await
+                    .map_err(|error| AtomicOpFailure::SqlError {
+                        statement_label: Some("entity-version-precondition".into()),
+                        message: error.to_string(),
+                    })?
+            {
+                return Err(AtomicOpFailure::EntityConflict(conflict));
+            }
+        }
+    }
     let note_guard = match plan {
         AtomicOpPlan::Update(plan) => plan.note_guard.as_ref(),
         AtomicOpPlan::AddNote(plan) => plan.note_guard.as_ref(),
@@ -671,6 +687,7 @@ mod tests {
                     tags           TEXT NOT NULL DEFAULT '[]',
                     created_at     INTEGER NOT NULL,
                     updated_at     INTEGER NOT NULL,
+                    version        INTEGER NOT NULL DEFAULT 1,
                     deleted_at     INTEGER,
                     merged_into    TEXT,
                     merge_event_id TEXT
@@ -766,15 +783,16 @@ mod tests {
     }
 
     fn rename_plan(id: Uuid, new_name: &str, label: &str) -> AtomicOpPlan {
-        AtomicOpPlan::Update(UpdatePlan {
+        AtomicOpPlan::Update(Box::new(UpdatePlan {
             graph_effects: Vec::new(),
             note_vector_purge: None,
             note_embedding_inheritance: None,
+            entity_guard: None,
             note_guard: None,
             target_id: id,
             statements: vec![PlanStatement {
                 statement: SqlStatement {
-                    sql: "UPDATE entities SET name = ?1, updated_at = 1 \
+                    sql: "UPDATE entities SET version = version + 1, name = ?1, updated_at = 1 \
                           WHERE id = ?2 AND deleted_at IS NULL"
                         .to_string(),
                     params: vec![
@@ -788,7 +806,7 @@ mod tests {
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
-        })
+        }))
     }
 
     /// The guarded `INSERT ... SELECT ... WHERE EXISTS` shape `LinkPlan`
@@ -839,7 +857,7 @@ mod tests {
             }],
             lifecycle: vec![PlanStatement {
                 statement: SqlStatement {
-                    sql: "UPDATE entities SET deleted_at = 1, merged_into = ?1 \
+                    sql: "UPDATE entities SET version = version + 1, deleted_at = 1, merged_into = ?1 \
                           WHERE id = ?2 AND deleted_at IS NULL"
                         .to_string(),
                     params: vec![
