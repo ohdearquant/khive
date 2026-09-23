@@ -28,8 +28,9 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             name: "db",
             param_type: "string",
             required: false,
-            description: "Existing regular-file target map database path; a pre-created empty \
-                           file may initialize. Explicit db never creates a missing file. \
+            description: "Absolute, plain filesystem path to an existing regular target map \
+                           database file; file: URIs and ? query syntax are rejected. A pre-created \
+                           empty file may initialize. Explicit db never creates a missing file. \
                            Omit to create/use <path>/.khive/code-map.db. \
                            The shared production database is always rejected, with no override.",
             resolution_mode: IdResolutionMode::NotApplicable,
