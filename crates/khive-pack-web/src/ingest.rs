@@ -21,7 +21,6 @@ use std::path::Path;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
@@ -29,21 +28,8 @@ use uuid::Uuid;
 use crate::egress::Refusal;
 use crate::identity;
 use crate::receipt::write_receipt;
+use crate::vocab::IngestParams;
 use crate::WebPack;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IngestParams {
-    source: Value,
-    #[serde(default)]
-    origin: Option<String>,
-    #[serde(default)]
-    depth: Option<u32>,
-    #[serde(default)]
-    limit: Option<u32>,
-    #[serde(default)]
-    namespace: Option<String>,
-}
 
 const DEFAULT_INGEST_LIMIT: u32 = 100;
 
@@ -161,9 +147,11 @@ fn fetch_through_web_fetch<'a>(
     pack: &'a WebPack,
     token: &'a NamespaceToken,
 ) -> impl Fn(String) -> FetchReply<'a> + Sync + 'a {
+    let clients = std::sync::Arc::new(crate::egress::PinnedClients::default());
     move |url: String| -> FetchReply<'a> {
+        let clients = clients.clone();
         Box::pin(async move {
-            pack.handle_fetch(token, json!({ "url": url, "persist": true }))
+            pack.handle_fetch_with_clients(token, json!({ "url": url, "persist": true }), &clients)
                 .await
         })
     }
@@ -313,7 +301,7 @@ impl WebPack {
             RuntimeError::InvalidInput(format!("invalid web.ingest arguments: {error}"))
         })?;
         let effective_token =
-            crate::fetch::resolve_effective_token(token, params.namespace.as_deref())?;
+            crate::namespace::resolve_effective_token(token, params.namespace.as_deref())?;
         run_ingest(self, &effective_token, params).await
     }
 }
