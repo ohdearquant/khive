@@ -55,8 +55,11 @@ impl PinnedSlot {
             ));
         }
 
-        let git_dir = resolved.join(".git");
-        pins.push(open_pin(&git_dir, true)?);
+        let resolved_git_dir = resolved.join(".git");
+        let git_pin = open_pin(&resolved_git_dir, true)?;
+        let (git_dir, command_pin) = pin_git_command_path(&resolved_git_dir, &git_pin)?;
+        pins.push(git_pin);
+        pins.push(command_pin);
         pins.push(open_pin(&resolved.join(super::MARKER_FILE), false)?);
         Ok(Self {
             git_dir,
@@ -71,6 +74,94 @@ impl PinnedSlot {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn pin_git_command_path(resolved: &Path, pinned: &File) -> io::Result<(PathBuf, File)> {
+    let command_path = git_command_path(resolved)?;
+    // The original ancestor chain is still pinned. Check the spelling Git
+    // will receive against the held .git object and retain this handle too.
+    // The lexical checks below matter even though this open succeeds: Rust
+    // may internally add a verbatim prefix, whereas Git parses the ordinary
+    // path. Names requiring verbatim semantics must never reach either path.
+    let command_pin = open_pin(&command_path, true)?;
+    if identity(&command_pin)? != identity(pinned)? {
+        return Err(invalid(
+            "Git command path does not name the pinned directory",
+        ));
+    }
+    Ok((command_path, command_pin))
+}
+
+/// Convert only the handle-derived DOS/UNC spelling, never the caller's
+/// original pathname. Git for Windows does not accept the `\\?\` spelling
+/// returned by GetFinalPathNameByHandleW as --git-dir (#2149).
+fn git_command_path(resolved: &Path) -> io::Result<PathBuf> {
+    let verbatim = resolved
+        .to_str()
+        .and_then(|path| path.strip_prefix(r"\\?\"))
+        .ok_or_else(|| invalid("Git command path needs a Unicode DOS or UNC handle path"))?;
+    let (command, components) = if let Some(unc) = verbatim.strip_prefix(r"UNC\") {
+        // Require a server, share and directory; neither a device namespace
+        // nor a share-relative path can substitute for this absolute path.
+        if unc.split('\\').count() < 3 {
+            return Err(invalid("Git command path needs an absolute UNC directory"));
+        }
+        (format!(r"\\{unc}"), unc)
+    } else {
+        let bytes = verbatim.as_bytes();
+        if bytes.len() < 4
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return Err(invalid("Git command path needs an absolute DOS directory"));
+        }
+        (verbatim.to_owned(), &verbatim[3..])
+    };
+    // Removing a verbatim prefix enables ordinary Windows path parsing.
+    // Refuse anything whose meaning could change instead of trimming,
+    // normalizing, replacing characters, or finding an alternate spelling.
+    for component in components.split('\\') {
+        if !ordinary_component(component) {
+            return Err(invalid("Git command path requires verbatim name semantics"));
+        }
+    }
+    Ok(PathBuf::from(command))
+}
+
+fn ordinary_component(component: &str) -> bool {
+    if component.is_empty()
+        || component.ends_with([' ', '.'])
+        || component.chars().any(|ch| {
+            ch <= '\u{1f}' || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+    {
+        return false;
+    }
+    // Device names remain reserved with an extension and regardless of
+    // ASCII case. Include spaces before the extension and superscript port
+    // digits; never turn a verbatim file component into a device reference.
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return false;
+    }
+    !stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
 }
 
 fn open_pin(path: &Path, directory: bool) -> io::Result<File> {
@@ -134,5 +225,118 @@ fn final_path(file: &File) -> io::Result<PathBuf> {
             return Ok(PathBuf::from(OsString::from_wide(&buffer)));
         }
         buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue2149_windows_command_path_converts_drive_and_unc_without_loss() {
+        for (resolved, command) in [
+            (r"\\?\C:\cache\slot\.git", r"C:\cache\slot\.git"),
+            (
+                r"\\?\d:\cache with spaces\资料😀\.git",
+                r"d:\cache with spaces\资料😀\.git",
+            ),
+            (
+                r"\\?\UNC\server\share\cache\slot\.git",
+                r"\\server\share\cache\slot\.git",
+            ),
+            (
+                r"\\?\UNC\server.example\share name\资料\.git",
+                r"\\server.example\share name\资料\.git",
+            ),
+            (
+                r"\\?\C:\COM10\ordinary..name\.git",
+                r"C:\COM10\ordinary..name\.git",
+            ),
+        ] {
+            assert_eq!(
+                git_command_path(Path::new(resolved)).unwrap(),
+                Path::new(command)
+            );
+        }
+    }
+
+    #[test]
+    fn issue2149_windows_command_path_refuses_verbatim_only_and_ambiguous_names() {
+        for resolved in [
+            r"C:\cache\slot\.git",
+            r"\\.\C:\cache\slot\.git",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\slot\.git",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\slot\.git",
+            r"\\?\C:relative\.git",
+            r"\\?\UNC\server\share",
+            r"\\?\UNC\\share\slot\.git",
+            r"\\?\C:\cache\.\slot\.git",
+            r"\\?\C:\cache\..\slot\.git",
+            r"\\?\C:\cache\slot.\.git",
+            r"\\?\C:\cache\slot \.git",
+            r"\\?\C:\cache\\slot\.git",
+            r"\\?\C:\cache\slot\.git\",
+            r"\\?\C:\cache\slot:stream\.git",
+            r"\\?\C:\cache\slot/child\.git",
+            r"\\?\C:\cache\slot?\.git",
+            r"\\?\C:\cache\slot*\.git",
+            r"\\?\C:\cache\slot|\.git",
+            r"\\?\C:\cache\slot<\.git",
+            r"\\?\C:\cache\slot>\.git",
+            "\\\\?\\C:\\cache\\slot\"\\.git",
+            "\\\\?\\C:\\cache\\slot\0\\.git",
+            "\\\\?\\C:\\cache\\slot\u{1f}\\.git",
+        ] {
+            assert!(
+                git_command_path(Path::new(resolved)).is_err(),
+                "{resolved:?}"
+            );
+        }
+        for name in [
+            "con",
+            "NUL.txt",
+            "NUL .txt",
+            "COM1",
+            "lpt9.log",
+            "COM¹",
+            "LPT².txt",
+            "COM³",
+            "CONIN$",
+            "CONOUT$",
+        ] {
+            for prefix in [r"\\?\C:\cache", r"\\?\UNC\server\share"] {
+                let resolved = format!(r"{prefix}\{name}\.git");
+                assert!(
+                    git_command_path(Path::new(&resolved)).is_err(),
+                    "{resolved:?}"
+                );
+            }
+        }
+        let mut ill_formed: Vec<u16> = r"\\?\C:\cache\".encode_utf16().collect();
+        ill_formed.push(0xd800);
+        ill_formed.extend(r"\.git".encode_utf16());
+        assert!(git_command_path(Path::new(&OsString::from_wide(&ill_formed))).is_err());
+    }
+
+    #[test]
+    fn issue2149_windows_command_path_requires_the_pinned_directory_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = dir.path().join("owned.git");
+        let foreign = dir.path().join("foreign.git");
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        let owned_pin = open_pin(&owned, true).unwrap();
+        let foreign_pin = open_pin(&foreign, true).unwrap();
+        let (command, command_pin) =
+            pin_git_command_path(&final_path(&owned_pin).unwrap(), &owned_pin).unwrap();
+        assert!(!command.to_str().unwrap().starts_with(r"\\?\"));
+        assert_eq!(
+            identity(&command_pin).unwrap(),
+            identity(&owned_pin).unwrap()
+        );
+        assert!(
+            pin_git_command_path(&final_path(&foreign_pin).unwrap(), &owned_pin).is_err(),
+            "an existing ordinary directory is insufficient without the pinned identity"
+        );
     }
 }
