@@ -899,3 +899,64 @@ is updated in place. `someday` keeps its existing outgoing transitions, and the
 terminal rule is unchanged. `NoteKindSpec` declares the two new pairs, and the
 consistency test that checks every declared pair against `can_transition`
 covers them.
+
+## Amendment 6 (2026-09-23): opt-in candidate rows for the timestamp census (#2394)
+
+The aggregate census of Amendment 4 stands and remains the default response.
+Amendment 4 excluded row IDs and payloads so that the census could not be read
+as a repair plan. Investigating the rows it counts still requires finding them,
+and the aggregate offers no way to do that short of reading every task. This
+amendment adds an explicit opt-in that returns those rows as evidence. Every
+other Amendment 4 exclusion is kept: the response carries no candidate
+replacement date, selects or infers no unit, maps no status, and changes no data.
+
+`gtd.census` accepts three optional parameters. The Amendment 4 sentence "The
+verb takes no business parameters" now describes a call that passes none of them.
+
+| Parameter            | Type and default          | Meaning                                          |
+| -------------------- | ------------------------- | ------------------------------------------------ |
+| `include_candidates` | boolean, `false`          | `true` adds a `candidates` object to the response |
+| `limit`              | integer `1..=200`, `100`  | Candidate page size                              |
+| `cursor`             | object `{namespace, id}`  | Resume after this key                            |
+
+`limit` and `cursor` require `include_candidates=true`. Explicit nulls, unknown
+fields, a malformed cursor, a UUID prefix or noncanonical UUID spelling, and a
+cursor namespace outside the request scope are rejected as invalid input. There
+is no offset pagination. With `include_candidates` absent or `false` the response
+is the Amendment 4 response, unchanged, at `schema_version: 1`.
+
+**Qualification.** A live task in scope is a candidate when its stored
+`created_at` or `updated_at` falls outside the `magnitude_16_digits` bucket. That
+bucket is the expectation set by the current note writer, which stores
+microseconds, and the response names it in `expected_buckets`. It describes
+present writers only: a candidate is a row that does not match them, not a row
+whose unit or correct instant is known. `archived_at` has no current writer and
+therefore no expectation. Its value is reported as evidence and cannot make a row
+a candidate by itself.
+
+**Row shape.** Each candidate carries its full canonical `id`, its `namespace`,
+`stored_status`, `raw` values for `created_at`, `updated_at` and `archived_at`,
+and the Amendment 4 bucket of each of the three. `stored_status` and the `raw`
+values are stored JSON source text returned as strings, so large integers and
+long decimals keep their lexeme instead of being rounded. An absent JSON property
+is reported as null and an explicitly stored JSON null as the string `"null"`.
+Unknown or legacy status values are reported as stored and are never mapped to a
+lifecycle state. A stored value with no faithful JSON representation (a BLOB or a
+nonfinite real) fails the call instead of being approximated.
+
+**Paging.** Candidates are ordered by `(namespace, id)` in binary order.
+`next_cursor` names the last row returned, or is null when no qualifying row
+follows. A cursor narrows the scope and never widens it. Each page is a separate
+read. The aggregate counts and the candidate page are separate queries, and no
+snapshot spanning them is promised. The candidate query materializes at most
+`limit + 1` rows; like the aggregate, it may scan the whole scoped population.
+
+**Exposure.** Candidate rows come only from the request scope defined in
+Amendment 4, where the same task records are already readable through the
+generic record read path. The opt-in adds a way to find rows, not access to rows
+the caller could not already read. The handler still acquires only a SQL reader,
+mutates nothing, and keeps its Read gate classification.
+
+Timestamp conversion and repair remain deferred, as in Amendment 4. A correction
+needs row provenance and an independently established source timestamp, and a
+candidate row supplies neither.
