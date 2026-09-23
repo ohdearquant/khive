@@ -23,7 +23,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type ON entities(namespace, kind, entity_type);
 CREATE INDEX IF NOT EXISTS idx_entities_legacy_type
     ON entities(namespace, kind, json_extract(properties, '$.type'))
-    WHERE entity_type IS NULL;
+    WHERE entity_type IS NULL AND json_valid(properties);
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(namespace, name);
 CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merged_into);

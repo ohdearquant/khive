@@ -1092,6 +1092,120 @@ async fn legacy_entity_type_union_preserves_offset_seek_and_kind_filters() {
 }
 
 #[tokio::test]
+async fn legacy_entity_type_filters_skip_invalid_json_and_json5() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let invalid_properties = [
+        "not-json",
+        r#"{"type":"algorithm""#,
+        r#"{type:'algorithm'}"#,
+        r#"{"type":"algorithm",}"#,
+    ];
+    for (index, properties) in invalid_properties.iter().enumerate() {
+        let mut entity = Entity::new("local", "concept", "Invalid legacy properties");
+        entity.id = Uuid::from_u128(index as u128 + 1);
+        store.upsert_entity(entity.clone()).await.unwrap();
+        // Typed writes cannot represent malformed JSON or JSON5-only text.
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE entities SET properties = ?1, version = version + 1 WHERE id = ?2",
+                rusqlite::params![properties, entity.id.to_string()],
+            )
+            .unwrap();
+    }
+    let mut legacy = Entity::new("local", "concept", "Legacy")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    legacy.id = Uuid::from_u128(10);
+    legacy.created_at = 10;
+    let mut typed = Entity::new("local", "concept", "Typed")
+        .with_entity_type(Some("algorithm"))
+        .with_properties(serde_json::json!({"type": "technique"}));
+    typed.id = Uuid::from_u128(11);
+    typed.created_at = 20;
+    let overridden = Entity::new("local", "concept", "Overridden")
+        .with_entity_type(Some("technique"))
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    for entity in [&legacy, &typed, &overridden] {
+        store.upsert_entity(entity.clone()).await.unwrap();
+    }
+
+    for indexed in [true, false] {
+        if !indexed {
+            pool.writer()
+                .unwrap()
+                .conn()
+                .execute_batch("DROP INDEX idx_entities_legacy_type")
+                .unwrap();
+        }
+        for filter in [
+            EntityFilter {
+                kinds: vec!["concept".into()],
+                entity_types: vec!["algorithm".into()],
+                legacy_entity_type_fallback: true,
+                ..Default::default()
+            },
+            EntityFilter {
+                entity_types_by_kind: [("concept".into(), vec!["algorithm".into()])].into(),
+                legacy_entity_type_fallback: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                store.count_entities("local", filter.clone()).await.unwrap(),
+                2,
+                "indexed={indexed}"
+            );
+            for (offset, expected_id) in (0_u64..).zip([typed.id, legacy.id]) {
+                let page = store
+                    .query_entities("local", filter.clone(), PageRequest { offset, limit: 1 })
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, Some(2), "indexed={indexed}");
+                assert_eq!(page.items.len(), 1, "indexed={indexed}");
+                assert_eq!(page.items[0].id, expected_id, "indexed={indexed}");
+            }
+            let first = store
+                .query_entities_after("local", filter.clone(), None, 1)
+                .await
+                .unwrap();
+            assert_eq!(first.items.len(), 1, "indexed={indexed}");
+            assert_eq!(first.items[0].id, legacy.id, "indexed={indexed}");
+            assert_eq!(
+                first.next_after,
+                Some(SeekCursor {
+                    sequence: 5,
+                    id: legacy.id,
+                }),
+                "indexed={indexed}"
+            );
+            let second = store
+                .query_entities_after("local", filter, first.next_after, 1)
+                .await
+                .unwrap();
+            assert_eq!(second.items.len(), 1, "indexed={indexed}");
+            assert_eq!(second.items[0].id, typed.id, "indexed={indexed}");
+            assert!(second.next_after.is_none(), "indexed={indexed}");
+        }
+    }
+
+    for (index, properties) in invalid_properties.iter().enumerate() {
+        let stored: (String, i64) = pool
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT properties, version FROM entities WHERE id = ?1",
+                [Uuid::from_u128(index as u128 + 1).to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (properties.to_string(), 2));
+    }
+}
+
+#[tokio::test]
 async fn test_legacy_entity_type_filter_is_opt_in_and_preserves_column_precedence() {
     let store = setup_memory_store();
     let legacy = Entity::new("local", "concept", "Legacy")

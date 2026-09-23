@@ -577,11 +577,16 @@ fn build_entity_where(
     let type_scope = conditions.join(" AND ");
     let type_predicate = |scope: &str, placeholders: &str| {
         if filter.legacy_entity_type_fallback {
+            // Legacy properties can contain invalid JSON. Exclude those rows
+            // from type fallback without rewriting them. Keep json_valid as
+            // an explicit term matching the partial legacy-type index;
+            // json_type alone does not imply its validity predicate to SQLite.
             format!(
                 "id IN (SELECT id FROM entities WHERE {scope} \
                  AND entity_type IN ({placeholders}) \
                  UNION ALL SELECT id FROM entities WHERE {scope} \
-                 AND entity_type IS NULL AND json_type(properties, '$.type') = 'text' \
+                 AND entity_type IS NULL AND json_valid(properties) \
+                 AND json_type(properties, '$.type') = 'text' \
                  AND json_extract(properties, '$.type') IN ({placeholders}))"
             )
         } else {

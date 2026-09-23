@@ -1121,6 +1121,154 @@ fn v38_legacy_entity_type_index_preserves_rows_and_list_sequence() {
 }
 
 #[test]
+fn v38_malformed_legacy_properties_survive_boot_and_index_transitions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v38-malformed-properties.db");
+    let malformed = "{\"type\":\"algorithm\" \n";
+    let snapshot = |conn: &Connection| -> (Option<String>, Vec<u8>, String, i64, i64, i64) {
+        conn.query_row(
+            "SELECT entity_type, CAST(properties AS BLOB), name, updated_at, version, entities_seq.seq \
+             FROM entities JOIN entities_seq ON entities_seq.entity_id = entities.id \
+             WHERE id = 'malformed-legacy'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("read raw legacy properties and row metadata")
+    };
+    let before = {
+        let mut conn = Connection::open(&path).expect("create V37 fixture");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| (22..38).contains(&migration.version))
+        {
+            let tx = conn.transaction().expect("begin historical migration");
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .expect("record historical migration");
+            tx.commit().expect("commit historical migration");
+        }
+        assert_eq!(read_schema_version(&conn).unwrap(), 37);
+        assert!(!index_exists(&conn, "idx_entities_legacy_type"));
+        conn.execute(
+            "INSERT INTO entities \
+             (id, namespace, kind, entity_type, name, properties, created_at, updated_at) \
+             VALUES ('malformed-legacy', 'local', 'concept', NULL, 'legacy', ?1, 1, 2)",
+            rusqlite::params![malformed],
+        )
+        .expect("V37 accepts legacy malformed properties");
+        snapshot(&conn)
+    };
+    assert_eq!(before.0, None);
+    assert_eq!(before.1, malformed.as_bytes());
+    assert_eq!(before.4, 1);
+
+    let backend = crate::StorageBackend::sqlite(&path).expect("open legacy backend");
+    assert_eq!(
+        backend
+            .prepare_core_schema()
+            .expect("boot must migrate malformed legacy properties without evaluating their JSON"),
+        latest_schema_version()
+    );
+    let after = {
+        let writer = backend.pool().try_writer().expect("fixture writer");
+        let conn = writer.conn();
+        assert!(index_exists(conn, "idx_entities_legacy_type"));
+        assert_eq!(
+            snapshot(conn),
+            before,
+            "migration must preserve stored bytes"
+        );
+        let indexed_ids = || -> Vec<String> {
+            conn.prepare(
+                "SELECT id FROM entities INDEXED BY idx_entities_legacy_type \
+                 WHERE entity_type IS NULL AND json_valid(properties) ORDER BY id",
+            )
+            .expect("prepare exact partial-index scan")
+            .query_map([], |row| row.get(0))
+            .expect("read partial-index members")
+            .collect::<Result<_, _>>()
+            .expect("collect partial-index members")
+        };
+        assert!(indexed_ids().is_empty());
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET name = 'legacy revised', updated_at = 3, version = version + 1 \
+                 WHERE id = 'malformed-legacy' AND version = 1",
+                [],
+            )
+            .expect("malformed legacy row must remain writable"),
+            1
+        );
+        let revised = snapshot(conn);
+        assert_eq!(revised.1, malformed.as_bytes());
+        assert_eq!(revised.2, "legacy revised");
+        assert_eq!(revised.4, 2);
+        for (properties, version, indexed) in [
+            (r#"{"type":"algorithm"}"#, 3_i64, true),
+            ("not-json\t", 4, false),
+            (r#"{"type":"technique"}"#, 5, true),
+        ] {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE entities SET properties = ?1, updated_at = ?2, version = version + 1 \
+                     WHERE id = 'malformed-legacy' AND version = ?3",
+                    rusqlite::params![properties, version + 1, version - 1],
+                )
+                .expect(
+                    "validity transitions must maintain the partial index without refusing writes"
+                ),
+                1
+            );
+            let row = snapshot(conn);
+            assert_eq!(row.0, None);
+            assert_eq!(row.1, properties.as_bytes());
+            assert_eq!(row.2, "legacy revised");
+            assert_eq!(row.3, version + 1);
+            assert_eq!(row.4, version);
+            assert_eq!(row.5, before.5, "updates preserve insertion sequence");
+            assert_eq!(
+                indexed_ids(),
+                if indexed {
+                    vec!["malformed-legacy".to_string()]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        snapshot(conn)
+    };
+    drop(backend);
+    let reopened = crate::StorageBackend::sqlite(&path).expect("reopen migrated backend");
+    assert_eq!(
+        reopened
+            .prepare_core_schema()
+            .expect("idempotent schema boot"),
+        latest_schema_version()
+    );
+    let writer = reopened
+        .pool()
+        .try_writer()
+        .expect("reopened fixture writer");
+    assert_eq!(snapshot(writer.conn()), after);
+}
+
+#[test]
 fn v22_upgrades_pre_index_database_for_read_only_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("pre-unread-probe-index.db");
