@@ -974,6 +974,13 @@ jobs:
           cargo test -p khive-pack-git --lib issue2149_windows_ 2>&1 | tee "$RUNNER_TEMP/issue2149-windows.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/issue2149-windows.log" 1
 
+      # #3126: execute the native delete-pending fixture, including its test target.
+      - name: khive-pack-git Windows delete-pending size walk
+        shell: bash
+        run: |
+          cargo test -p khive-pack-git --lib dir_size_tests::windows_ 2>&1 | tee "$RUNNER_TEMP/issue3126-windows.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/issue3126-windows.log" 1
+
   coverage-measurement:
     name: Coverage measurement
     runs-on: ubuntu-latest
