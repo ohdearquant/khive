@@ -460,3 +460,97 @@ generic action strings and internal action adapters; watch-and-compare triggers 
 consumer refreshes observations and reconciles attempts); cross-charter cascades; thresholds and SLA
 logic; hash chaining and external anchoring; merge-queue and stacked pull request modes; in-place
 migration of runs.
+
+## Amendment 1 (2026-09-22): the merge method is a per-repository datum
+
+**Status**: Accepted (2026-09-22).
+
+The `pr_merge/v1` definition fixes the merge phase's action to `"method": "squash"`. Some repositories
+must merge by merge commit, for example where a deployment platform refuses a head whose commit was
+re-authored by a squash, so a template-wide constant cannot enrol them. Each enrolled repository now
+carries its method: `repositories` is a list of `{ "id": <immutable repository id>, "merge_method":
+"squash" | "merge" | "rebase" }`, and the merge phase's action takes its method from the subject's
+enrolment row instead of a literal. The "supported target and method" predicate of the action
+admissibility gate reads that row. `charter.claim` refuses a descriptor whose method differs from the
+enrolment row, and refuses when the platform's allowed methods for that repository, as observed, do not
+include it.
+
+Acceptance (case 12, M2; its refusal arms also run in M1 through `charter.evaluate`): a repository
+enrolled with `merge` admits a merge-commit descriptor and refuses a squash descriptor for the same
+candidate; a repository enrolled with `squash` gives the mirror result; a method that the platform
+disallows refuses even when the enrolment row names it.
+
+## Amendment 2 (2026-09-22): the merge verb produces the claim-time bundle
+
+**Status**: Accepted (2026-09-22).
+
+The freshness bounds require dynamic inventories at most 60 s old at claim, and D3 keeps gates free of
+external reads, but the record did not name who observes inside that window. An instrument that observes
+on a schedule longer than the bound serves the waiting view and pre-claim evaluation, never the claim.
+The producer of the claim-time bundle is the merge path itself: immediately before `charter.claim`,
+`git.pr_merge` reads the pull request snapshot and the check inventory at the expected head and submits
+them through `charter.observe` under the merge executor's producer registration, then claims. The charter
+still performs no I/O. The facts come from the platform, not from the executor: the `check_inventory`
+and `pr_snapshot` observations (Amendment 3) that the merge path submits carry the platform response
+identity (the platform's request id or entity tag, and the response time) in the D3 envelope's source
+event field, so the executor's registration attests the relay and the platform attests the facts. A
+claim-time bundle whose source identity is the executor itself, with no platform response identity,
+refuses. Rejected alternative: the initiator's instruments observing just before the
+initiator calls the verb, which puts two processes and an unbounded gap between the read and the claim.
+
+Acceptance (case 13, M2): a claim whose only check inventory is older than the bound refuses with
+`StaleEvidence`; the same claim made through `git.pr_merge`, which observes first, admits; an observation
+submitted under a registration that is not the executor's cannot stand in for the claim-time bundle; a
+bundle submitted under the executor's registration without a platform response identity refuses.
+
+## Amendment 3 (2026-09-22): observation kinds publish their schemas
+
+**Status**: Accepted (2026-09-22).
+
+`charter.observe(help=true)` returns the JSON schema of every observation kind, and each kind lists its
+required fields:
+
+- `check_inventory`: repository id, head, the required contexts by name with the rule source each came
+  from (ruleset or classic protection) and its base scope, and per context the producing application and
+  workflow ids, event, run id, conclusion and completion time.
+- `pr_snapshot`: repository and pull request ids, state, draft flag, head, base ref and sha, mergeable
+  state, the repository's allowed merge methods, author and last-pusher account ids, and per reviewer
+  the review state and the commit it names.
+- `diff_manifest`: merge base, head, the path-and-status set (old and new paths for renames) and its
+  digest under the canonical encoding.
+- `review_attestation`: reviewer identity, reviewed head, scope digest, verdict, execution identity and
+  payload digest.
+
+Every kind also carries the D3 envelope: source identity, source event or attempt identity, observation
+interval, completeness and payload digest.
+
+Until the identity issuer exists (M1), a registered review producer may attest from its own verdict
+record: payload digest = the record's digest, reviewed head = the head the record states it evaluated,
+execution identity = the executor the record names. Such an attestation carries assurance
+`self_reported`. It is recorded and evaluated in M1 and never satisfies `review_at_head` or family
+independence under M2. The M1 evaluation summary, and the `charter.waiting` row of Amendment 4, name the
+assurance of every attestation a passing gate consumed, so an M1 pass that rests on a `self_reported`
+attestation reads as such and never as verified.
+
+Acceptance (case 14, M1 and M2): an observation missing a required field of its kind refuses and names
+the field; a `self_reported` attestation passes `review_at_head` in an M1 evaluation, and the evaluation
+output names `self_reported` beside the passed gate; the same attestation fails the gate under an M2
+definition.
+
+## Amendment 4 (2026-09-22): the waiting view carries a cursor and the last evaluation
+
+**Status**: Accepted (2026-09-22).
+
+A consumer that ticks on a timer compares against its last reading. `charter.waiting` rows now carry the
+run's revision (its evidence sequence head) and the last evaluation summary `{phase, status,
+failing_gate_ids, reason}`, and the verb takes `changed_since=<cursor>`, where the cursor is opaque and
+server-issued over the store's commit order; every response returns the next cursor. The caller holds the
+cursor, and the server keeps no per-consumer state, so D5's "no read or acknowledge state" still holds. A
+row whose run changed after the cursor is returned even if it changed back.
+
+Acceptance (case 15, M1 and M2): after a tick, a second call with the returned cursor and no intervening
+change returns no rows; a run that advanced and a run that was invalidated both appear with their new
+revisions; a run that moved A to B and back to A appears.
+
+With Amendments 1-4, M1 also passes cases 14 and 15 and the refusal arms of case 12; M2 passes all
+fifteen.
