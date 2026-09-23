@@ -617,11 +617,25 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// The draft kind is canonical.
     /// This must not mutate storage or normalize the approved draft. The default
     /// accepts it. This separate seam never invokes shared-create lifecycle
-    /// hooks and does not apply to AddNote.
+    /// hooks and does not apply to AddNote; see `validate_proposal_note` below
+    /// for that route.
     fn validate_proposal_entity(
         &self,
         _entity: &khive_types::EntityDraft,
     ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Validate an `AddNote` draft on the proposal-note route, analogous to
+    /// [`Self::validate_proposal_entity`] but for notes. The kg pack's
+    /// proposal route calls this against the same immutable changeset at two
+    /// points: once when a new `propose` call is accepted, and again when an
+    /// approved proposal is applied, so a kind that refuses shared creation
+    /// is not bypassed by proposing the same creation instead. The draft's
+    /// kind is the owning pack's canonical spelling. This must not mutate
+    /// storage or normalize the draft; it only accepts or refuses. The
+    /// default accepts it.
+    fn validate_proposal_note(&self, _note: &khive_types::NoteDraft) -> Result<(), RuntimeError> {
         Ok(())
     }
 
