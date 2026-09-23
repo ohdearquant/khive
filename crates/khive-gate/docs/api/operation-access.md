@@ -19,6 +19,10 @@ when that feature is not built. Workspace and formal declare no handlers.
 
 The implementation is [operation.rs](../../src/operation.rs). Its classifier
 version is part of every nonempty restriction's policy fingerprint.
+Revision `domain-effects-v3` explicitly classifies `tool.policy_delete` as
+`Write`. Adding this classification changes that identity even though unknown
+operations were already denied. Empty restrictions retain their enrollment-only
+fingerprint.
 
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
@@ -179,6 +183,7 @@ version is part of every nonempty restriction's policy fingerprint.
 | `tool.list`                  | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L174)            |
 | `tool.policies`              | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L267)            |
 | `tool.policy`                | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L254)            |
+| `tool.policy_delete`         | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L298)            |
 | `tool.register`              | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L123)            |
 | `tool.request`               | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L193)            |
 | `tool.requests`              | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L241)            |
@@ -208,6 +213,8 @@ See [runtime token minting](../../../khive-runtime/src/runtime.rs#L1086).
 
 - `comm.read` and `comm.mark_read` change read flags. Both are Write.
   `brain.emit` is the deprecated Write alias of `brain.feedback`.
+- `tool.policy_delete` persists retirement metadata on the exact live policy
+  row and changes future policy decisions. It is Write, like `tool.policy`.
 - `git.diff` and `git.checkout` publish artifacts/receipts; `git.reconcile` changes
   receipt state. `exec.tree` persists a manifest. They are Write despite possible
   read-oriented names. `exec.tree_diff` only returns a comparison and is Read.
