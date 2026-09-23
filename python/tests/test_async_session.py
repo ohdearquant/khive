@@ -21,6 +21,8 @@ import asyncio
 import json
 import struct
 from copy import deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -146,6 +148,13 @@ def test_async_context_manager_closes_without_error():
 # -- the new transport, against a real socket -------------------------------
 
 
+@pytest.fixture
+def socket_path():
+    # The default pytest root can exceed macOS's Unix socket path limit.
+    with TemporaryDirectory(prefix="khs-", dir="/tmp") as directory:
+        yield Path(directory) / "khived.sock"
+
+
 class FakeDaemon:
     """One length-prefixed request per connection, exactly like khived."""
 
@@ -174,8 +183,8 @@ class FakeDaemon:
         writer.close()
 
 
-def test_transport_round_trips_over_a_real_unix_socket(tmp_path):
-    sock = tmp_path / "khived.sock"
+def test_transport_round_trips_over_a_real_unix_socket(socket_path):
+    sock = socket_path
 
     def responder(frame):
         return {"ok": True, "served_config_id": "socket-config", "echoed": frame["ops"]}
@@ -193,8 +202,8 @@ def test_transport_round_trips_over_a_real_unix_socket(tmp_path):
     assert requests[0]["ops"] == "stats()"
 
 
-def test_session_drives_the_real_socket_end_to_end(tmp_path):
-    sock = tmp_path / "khived.sock"
+def test_session_drives_the_real_socket_end_to_end(socket_path):
+    sock = socket_path
 
     def responder(frame):
         if frame.get("metrics_only"):
