@@ -30,7 +30,7 @@ Pure JSON arrays/objects become one `ArgValue::Value`; a container with any `$pr
 
 ## Function-call batches and chains
 
-`[op(...), op(...)]` is parallel and rejects `$prev`. `op(...) | op(...)` is a sequential chain and may contain `$prev` anywhere in an argument value. Empty batches, mixed `,` and `|` separators in one request, trailing input, and more than `MAX_OPS` operations are errors. A chain is not a valid element of a parallel batch.
+`[op(...), op(...)]` is parallel; `op(...) | op(...)` is a sequential chain and may contain `$prev` anywhere in an argument value. Inside a bracketed batch, a comma-separated element MAY itself be a `|`-chain (`[op() | op(), op()]`, ADR-016 Amendment 2): each such element is a **unit**, dispatched as its own sequential chain, running concurrently with the other units. `$prev` is legal only against a unit's own immediately preceding op; the first op of every unit still rejects it, whether that unit has one op or several. Mixing `,` and `|` OUTSIDE any bracket (`op() | op(), op()`) is still rejected as `MixedSeparators`; empty batches, trailing input, a `[...]` nested inside a unit, and more than `MAX_OPS` operations across the whole request are errors.
 
 Split independent operations and a dependent chain into two `request` calls:
 

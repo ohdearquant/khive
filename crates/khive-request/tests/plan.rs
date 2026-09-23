@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use khive_request::{plan_request, MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT};
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn catalog() -> BTreeMap<String, String> {
     [
@@ -32,7 +32,7 @@ fn chain_accounts_for_stages_and_preserves_nested_references() {
                 {
                     "index": 0, "verb": "create", "pack": "kg", "known": true,
                     "args": {"content": "line\n\"quoted\"", "flags": [true, null, 3.5]},
-                    "prev_refs": []
+                    "prev_refs": [], "unit_index": 0
                 },
                 {
                     "index": 1, "verb": "memory.remember", "pack": "memory", "known": true,
@@ -41,13 +41,14 @@ fn chain_accounts_for_stages_and_preserves_nested_references() {
                         "literal": "$prev.id",
                         "z": "$prev[0].id"
                     },
-                    "prev_refs": ["", "id", "items.[2].name", "id", "[0].id"]
+                    "prev_refs": ["", "id", "items.[2].name", "id", "[0].id"], "unit_index": 0
                 },
                 {
                     "index": 2, "verb": "get", "pack": "kg", "known": true,
-                    "args": {"id": "$prev.id"}, "prev_refs": ["id"]
+                    "args": {"id": "$prev.id"}, "prev_refs": ["id"], "unit_index": 0
                 }
             ],
+            "units": [{"start": 0, "end": 3}],
             "limits": {
                 "max_ops": MAX_OPS,
                 "max_depth": NESTING_DEPTH_LIMIT,
@@ -88,10 +89,34 @@ fn unknown_verb_retains_requested_name_without_parse_error() {
             "pack": null,
             "known": false,
             "args": {"value": 4},
-            "prev_refs": []
+            "prev_refs": [],
+            "unit_index": 0
         }])
     );
+    assert_eq!(plan["units"], json!([{"start": 0, "end": 1}]));
     assert!(plan.get("error").is_none());
+}
+
+#[test]
+fn bracketed_batch_of_chains_reports_unit_boundaries() {
+    let plan = plan_request("[a() | b(), c() | d() | e()]", &BTreeMap::new());
+    assert_eq!(plan["parsed"], true);
+    assert_eq!(plan["mode"], "parallel");
+    assert_eq!(plan["stage_count"], 5);
+    assert_eq!(
+        plan["units"],
+        json!([{"start": 0, "end": 2}, {"start": 2, "end": 5}])
+    );
+    let unit_indices: Vec<Value> = plan["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stage| stage["unit_index"].clone())
+        .collect();
+    assert_eq!(
+        unit_indices,
+        vec![json!(0), json!(0), json!(1), json!(1), json!(1)]
+    );
 }
 
 #[test]

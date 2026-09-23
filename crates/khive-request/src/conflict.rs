@@ -1,9 +1,91 @@
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+
 use serde_json::Value;
 
 use crate::types::{ArgValue, ParsedOp};
 
 #[cfg(test)]
 use crate::types::{DslError, ExecutionMode, ParsedRequest};
+
+/// One cross-unit static write-key conflict: `leaf` (inside the unit this
+/// entry is filed under) claims the same statically knowable write key as
+/// `other_leaf`, which belongs to a *different* unit, `other_unit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitKeyConflict {
+    pub key: String,
+    pub leaf: usize,
+    pub other_unit: usize,
+    pub other_leaf: usize,
+}
+
+/// Finds every statically knowable write-key collision between *different*
+/// units of a bracketed batch of chains (ADR-016 Amendment 2).
+///
+/// A key repeated by two leaves of the *same* unit is legal, because a chain's own
+/// leaves are already ordered, and is never reported. A key claimed by leaves
+/// in two different units is reported once per affected unit (symmetric:
+/// both units get an entry), each naming the other unit's conflicting global
+/// leaf position, so a caller can refuse both units before any of their
+/// leaves dispatch. Units absent from the returned map share no cross-unit
+/// key with any other unit.
+pub fn unit_write_key_conflicts(
+    ops: &[ParsedOp],
+    ranges: &[Range<usize>],
+) -> BTreeMap<usize, Vec<UnitKeyConflict>> {
+    // Per unit, collapse repeated in-unit keys to their first-occurring leaf
+    // (deterministic: ranges are walked in leaf order regardless of the
+    // arbitrary hash order `write_keys_for_op_pub` or a later `HashMap`
+    // iteration might otherwise introduce).
+    let mut per_unit_keys: Vec<HashMap<String, usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let mut keys: HashMap<String, usize> = HashMap::new();
+        for leaf in range.clone() {
+            for key in write_keys_for_op_pub(&ops[leaf]) {
+                keys.entry(key).or_insert(leaf);
+            }
+        }
+        per_unit_keys.push(keys);
+    }
+
+    let mut first_claim: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut conflicts: BTreeMap<usize, Vec<UnitKeyConflict>> = BTreeMap::new();
+    for (unit_index, keys) in per_unit_keys.iter().enumerate() {
+        for (key, &leaf) in keys {
+            match first_claim.get(key) {
+                Some(&(other_unit, other_leaf)) if other_unit != unit_index => {
+                    conflicts
+                        .entry(unit_index)
+                        .or_default()
+                        .push(UnitKeyConflict {
+                            key: key.clone(),
+                            leaf,
+                            other_unit,
+                            other_leaf,
+                        });
+                    conflicts
+                        .entry(other_unit)
+                        .or_default()
+                        .push(UnitKeyConflict {
+                            key: key.clone(),
+                            leaf: other_leaf,
+                            other_unit: unit_index,
+                            other_leaf: leaf,
+                        });
+                }
+                Some(_) => {}
+                None => {
+                    first_claim.insert(key.clone(), (unit_index, leaf));
+                }
+            }
+        }
+    }
+    for entries in conflicts.values_mut() {
+        entries.sort_by_key(|c| (c.leaf, c.other_leaf));
+        entries.dedup();
+    }
+    conflicts
+}
 
 /// Extracts statically knowable, substrate-prefixed write-conflict keys for `op`.
 ///
@@ -330,5 +412,67 @@ mod tests {
                 "edge-natural:c:d:extends".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn unit_conflict_refuses_both_units_sharing_a_key() {
+        let r = parse_request(
+            r#"[update(id="x", name="1") | update(id="y", name="2"), update(id="x", name="3")]"#,
+        )
+        .unwrap();
+        assert_eq!(r.ranges, vec![0..2, 2..3]);
+        let conflicts = unit_write_key_conflicts(&r.ops, &r.ranges);
+        assert_eq!(
+            conflicts.len(),
+            2,
+            "both units must be named: {conflicts:?}"
+        );
+        assert_eq!(
+            conflicts[&0],
+            vec![UnitKeyConflict {
+                key: "entity:x".to_string(),
+                leaf: 0,
+                other_unit: 1,
+                other_leaf: 2,
+            }]
+        );
+        assert_eq!(
+            conflicts[&1],
+            vec![UnitKeyConflict {
+                key: "entity:x".to_string(),
+                leaf: 2,
+                other_unit: 0,
+                other_leaf: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn same_key_repeated_within_one_unit_is_not_reported() {
+        let r = parse_request(r#"[update(id="x", name="1") | update(id="x", name="2")]"#).unwrap();
+        assert_eq!(r.ranges.len(), 1);
+        assert_eq!(r.ranges[0], 0..2);
+        let conflicts = unit_write_key_conflicts(&r.ops, &r.ranges);
+        assert!(
+            conflicts.is_empty(),
+            "a chain's own ordered leaves must not conflict with each other: {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn disjoint_units_share_no_conflict() {
+        let r = parse_request(r#"[update(id="x", name="1"), update(id="y", name="2")]"#).unwrap();
+        assert_eq!(r.ranges, vec![0..1, 1..2]);
+        assert!(unit_write_key_conflicts(&r.ops, &r.ranges).is_empty());
+    }
+
+    #[test]
+    fn three_way_unit_conflict_names_every_affected_unit() {
+        let r = parse_request(
+            r#"[update(id="x", name="1"), update(id="x", name="2"), update(id="x", name="3")]"#,
+        )
+        .unwrap();
+        let conflicts = unit_write_key_conflicts(&r.ops, &r.ranges);
+        assert_eq!(conflicts.len(), 3, "{conflicts:?}");
     }
 }

@@ -1276,12 +1276,48 @@ fn prev_ref_in_fn_batch_is_rejected() {
 // ── MixedSeparators emitted at parse time ─────────────────────────────────────
 
 #[test]
-fn mixed_separators_in_fn_batch_rejected() {
-    // `[a() | b(), c()]` mixes `|` and `,` at top level.
-    let err = parse_request("[a() | b(), c()]").unwrap_err();
+fn bracketed_batch_of_chains_is_parallel_with_unit_ranges() {
+    // `[a() | b(), c()]` is a parallel batch of two units (ADR-016
+    // Amendment 2): unit 0 is the chain `a() | b()`, unit 1 is the single
+    // leaf `c()`. Only inside the outer `[...]` does `,` separate units
+    // whose own leaves may themselves be `|`-chained; bare top-level mixing
+    // without brackets is still rejected (see the two tests below).
+    let r = parse_request("[a() | b(), c()]").unwrap();
+    assert_eq!(r.mode, ExecutionMode::Parallel);
+    assert_eq!(r.ops.len(), 3);
+    assert_eq!(r.ranges, vec![0..2, 2..3]);
+}
+
+#[test]
+fn unit_dangling_pipe_before_comma_rejected() {
+    // A `|` inside one unit still requires a leaf on both sides; dangling
+    // it before the unit separator is a parse error, not an empty step.
+    let err = parse_request("[a() | , c()]").unwrap_err();
     assert!(
-        matches!(err, DslError::MixedSeparators),
-        "expected MixedSeparators, got {err:?}"
+        matches!(err, DslError::InvalidIdentifier { .. }),
+        "expected InvalidIdentifier, got {err:?}"
+    );
+}
+
+#[test]
+fn unit_trailing_pipe_before_close_bracket_rejected() {
+    // Same dangling-pipe mistake, at the end of the last unit instead of
+    // the middle of the batch.
+    let err = parse_request("[a(), b() |]").unwrap_err();
+    assert!(
+        matches!(err, DslError::InvalidIdentifier { .. }),
+        "expected InvalidIdentifier, got {err:?}"
+    );
+}
+
+#[test]
+fn nested_batch_inside_bracketed_units_rejected() {
+    // No recursion beyond one bracket level: a unit's own leaf can never be
+    // another `[...]` batch.
+    let err = parse_request("[a(), [b(), c()]]").unwrap_err();
+    assert!(
+        matches!(err, DslError::InvalidIdentifier { .. }),
+        "expected InvalidIdentifier, got {err:?}"
     );
 }
 
@@ -1297,10 +1333,13 @@ fn mixed_separator_after_chain_rejected() {
 
 #[test]
 fn comma_only_parallel_accepted() {
-    // `[a(), b(), c()]` is valid comma-only parallel batch.
+    // `[a(), b(), c()]` is valid comma-only parallel batch. An ordinary flat
+    // batch is the case where every unit has exactly one leaf: `ranges` is
+    // unchanged from before this amendment, one `i..i+1` range per op.
     let r = parse_request("[a(), b(), c()]").unwrap();
     assert_eq!(r.mode, ExecutionMode::Parallel);
     assert_eq!(r.ops.len(), 3);
+    assert_eq!(r.ranges, vec![0..1, 1..2, 2..3]);
 }
 
 #[test]
