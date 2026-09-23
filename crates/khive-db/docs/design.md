@@ -130,9 +130,10 @@ direct writer.
 Strict routing remains opt-in. Flipping its default is separately gated by
 ADR-135 F2 and ADR-136 D2 production A/B evidence plus the release gate; this
 write-time routing hardening does not claim that evidence. The unified helper
-covers the SQLite store layer; remaining runtime-orchestration direct-writer
-call sites stay in #1847's follow-up inventory rather than being silently
-classified as complete.
+covers the SQLite store layer. Entity merge, note merge, and symmetric edge
+update use a closed runtime-operation adapter to the same policy, including
+operation-specific telemetry when compatibility mode degrades around an enabled
+queue. This does not claim that all repository writers have been inventoried.
 
 See `crates/khive-db/docs/api/pool.md` and `crates/khive-db/docs/api/vectors.md`
 for the per-function routing rules and the tests that pin them down.

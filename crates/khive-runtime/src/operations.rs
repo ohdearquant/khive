@@ -29,7 +29,7 @@ use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::stores::text::insert_document_statements;
-use khive_db::SqliteError;
+use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use rusqlite::OptionalExtension;
 
 /// The restore unit committed the row and its text index; only the
@@ -6465,10 +6465,9 @@ impl KhiveRuntime {
             let expected_deleted_at_micros = expected_deleted_at.map(|v| v.timestamp_micros());
 
             let pool = self.backend().pool_arc();
-            // Route through the single-writer task when the write queue is
-            // enabled; best-effort lookup degrades to the legacy pool-mutex
-            // path (mirrors merge_entity/merge_note above).
-            let writer_task = pool.writer_task_handle().ok().flatten();
+            let writer_task = pool
+                .writer_task_for_runtime_write(RuntimeWriteOperation::UpdateSymmetricEdge)
+                .map_err(RuntimeError::Storage)?;
 
             let outcome: SymmetricEdgeUpdateOutcome = if let Some(writer_task) = writer_task {
                 writer_task
