@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use khive_db::{ConnectionPool, PoolConfig};
 
+#[path = "support/caller_timing.rs"]
+mod caller_timing;
+
 const STARTUP_BARRIER_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_STARTUP_BARRIER_DIR";
 const HANG_GUARD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -87,9 +90,10 @@ fn sink_never_adds_measurable_latency_when_its_directory_is_unwritable() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stalled_sink_test.db");
+    let checkout_timeout = Duration::from_millis(50);
     let cfg = PoolConfig {
         path: Some(db_path),
-        checkout_timeout: Duration::from_millis(50),
+        checkout_timeout,
         ..PoolConfig::default()
     };
 
@@ -118,9 +122,11 @@ fn sink_never_adds_measurable_latency_when_its_directory_is_unwritable() {
     let pool_for_thread = Arc::clone(&pool);
     let (timed_out_tx, timed_out_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let _ = timed_out_tx.send(pool_for_thread.writer().is_err());
+        let started = Instant::now();
+        let timed_out = pool_for_thread.writer().is_err();
+        let _ = timed_out_tx.send((timed_out, started.elapsed()));
     });
-    let timed_out = timed_out_rx
+    let (timed_out, elapsed) = timed_out_rx
         .recv_timeout(HANG_GUARD_TIMEOUT)
         .expect("writer admission blocked on the unwritable sink directory");
     drop(held);
@@ -129,4 +135,5 @@ fn sink_never_adds_measurable_latency_when_its_directory_is_unwritable() {
         timed_out,
         "a second writer checkout while the first is held must time out"
     );
+    caller_timing::assert_caller_latency(elapsed, checkout_timeout);
 }
