@@ -44,7 +44,7 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
 | Verb             | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                          | When to use                                                                 |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `create`         | Add a new entity or note; never reuses by name (`create` is not an upsert)                                                                                                                                                                                                                                                                                                                                                                                            | New record creation after caller-side entity resolution                     |
+| `create`         | Add a new entity or note; never reuses by name (`create` is not an upsert); a note `key` gives an exact-payload retry a safe minimal receipt instead of a duplicate                                                                                                                                                                                                                                                                                                   | New record creation after caller-side entity resolution                     |
 | `get`            | Fetch any record by UUID (auto-detects type)                                                                                                                                                                                                                                                                                                                                                                                                                          | When you have a UUID and need the full record                               |
 | `search`         | Text + semantic search over entities or notes                                                                                                                                                                                                                                                                                                                                                                                                                         | Finding things by content similarity                                        |
 | `list`           | Structured filtering (by kind, tags, etc.)                                                                                                                                                                                                                                                                                                                                                                                                                            | Browsing a category or namespace                                            |
@@ -102,6 +102,25 @@ intentional decision to represent a distinct entity. Use `merge` only after esta
 change write semantics. Pass it when you have already resolved the reference, so the create does not
 repeat that retrieval. Notes are duplicate-tolerant and
 are not resolved by name.
+
+**One exception: a singleton note create that supplies `key`.** `key` is a caller-chosen opaque
+identity, scoped to the write namespace and the note's canonical kind, at most 512 UTF-8 bytes with
+no U+0000. If no live note currently holds that key, the write proceeds as an ordinary create and the
+response carries `created:true`. If a live note already holds it, the server compares that note's
+stored content and properties against the incoming request exactly: content is byte-exact, and
+properties compare as typed JSON values after validation, owner normalization, tag merging and any
+server-derived fields have run (object member order does not matter; array order, value types and
+member presence do; an absent `properties` differs from `{}`). When everything matches and the caller
+may learn the holder (the same `list` check that already gates `existing_id`), the request returns
+`{id, created:false}` with no new record and no other write. Creation-only fields such as
+`name`, `salience`, `embedding_content` and requested `edges`/`annotates` never update the existing
+record on that exact match, and an exact match does not require them to be resolvable at all: an
+`annotates` target that no longer exists or an embedding model that is not registered still returns
+`{id, created:false}` for the existing note, because none of that creation-only work runs once the
+match against the live holder is confirmed. A payload that differs in any of those respects,
+or an exact match the caller may not learn about, returns `key_conflict`, which discloses the existing
+record's id only under that same policy. Unkeyed creates are unaffected by any of
+this: repeated calls without `key` always create distinct records, exactly as described above.
 
 ```text
 request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')

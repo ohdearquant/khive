@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
 use khive_storage::Note;
+use khive_types::{Details, KhiveError, NoteDraft};
 
 use crate::handlers::{
     validate_memory_type, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
@@ -166,5 +167,94 @@ impl KindHook for MemoryHook {
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
         normalize_memory_type_update(note, args)
+    }
+
+    fn validate_proposal_note(&self, _note: &NoteDraft) -> Result<(), RuntimeError> {
+        // ADR-017's 2026-09-22 amendment withdraws ADR-021's prior exception for this one
+        // route, so an approved `propose`/`review` changeset no longer admits
+        // `AddNote(kind="memory")`. Everything `prepare_create` says above about the
+        // shared-create refusal applies here unchanged, and the refusal is unconditional for
+        // the same reason: a draft that already carries `memory_type`, `salience`, or
+        // `decay_factor` still bypasses the derivation, actor routing, and keyed-replay
+        // contract `memory.remember` owns.
+        //
+        // This runs against the same immutable changeset twice, once when a fresh proposal is
+        // created and again when an approved one is applied, including one approved before this
+        // hook existed. Neither call site is optional. Dropping the apply-time call would let a
+        // pre-upgrade approval slip a memory row past this refusal, and dropping the
+        // creation-time call would let a caller wait out a proposal's review cycle only to have
+        // it refused for a reason knowable at propose time.
+        Err(RuntimeError::Khive(
+            KhiveError::invalid_input(
+                "kind=memory is not creatable through a proposal AddNote; memory.remember \
+                 derives memory_type, salience and decay_factor together and owns episodic \
+                 actor routing, so a row admitted here would be stored without the fields \
+                 memory.recall supplies at read time; use memory.remember instead",
+            )
+            .with_details(Details::new([
+                ("reason", "kind_admission_refused"),
+                ("kind", "memory"),
+                ("route", "proposal_add_note"),
+            ])),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod validate_proposal_note_tests {
+    use super::MemoryHook;
+    use khive_runtime::{KindHook, RuntimeError};
+    use khive_types::NoteDraft;
+    use serde_json::json;
+
+    fn refuse(note: NoteDraft) -> RuntimeError {
+        MemoryHook
+            .validate_proposal_note(&note)
+            .expect_err("a memory-kind proposal-note draft must be refused")
+    }
+
+    fn assert_refusal_shape(error: &RuntimeError) {
+        let RuntimeError::Khive(khive_error) = error else {
+            panic!("expected RuntimeError::Khive, got {error:?}");
+        };
+        let details = khive_error
+            .details()
+            .expect("refusal must carry structured details");
+        assert_eq!(details.get("reason"), Some("kind_admission_refused"));
+        assert_eq!(details.get("kind"), Some("memory"));
+        assert_eq!(details.get("route"), Some("proposal_add_note"));
+        assert!(
+            khive_error.to_string().contains("memory.remember"),
+            "refusal message must name the writer to use instead: {khive_error}"
+        );
+    }
+
+    #[test]
+    fn bare_draft_is_refused_with_the_canonical_shape() {
+        let error = refuse(NoteDraft {
+            kind: "memory".to_string(),
+            content: "a memory written through a proposal".to_string(),
+            name: None,
+            properties: None,
+        });
+        assert_refusal_shape(&error);
+    }
+
+    /// A draft carrying values that look like a complete `memory.remember` call is refused
+    /// exactly the same way: these fields do not supply the derivation, actor routing, or
+    /// keyed-replay contract only `memory.remember` provides.
+    #[test]
+    fn draft_with_complete_looking_defaults_is_refused_with_the_canonical_shape() {
+        let error = refuse(NoteDraft {
+            kind: "memory".to_string(),
+            content: "a memory written through a proposal with explicit defaults".to_string(),
+            name: None,
+            properties: Some(json!({
+                "memory_type": "episodic",
+                "salience": 0.3,
+                "decay_factor": 0.02,
+            })),
+        });
+        assert_refusal_shape(&error);
     }
 }
