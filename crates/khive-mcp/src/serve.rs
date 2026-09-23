@@ -1578,19 +1578,28 @@ pub(crate) async fn channel_outbox_loop(
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    outbox::validate_loop_channel(email_channel.as_ref(), "email")?;
+    let slug = email_channel.slug();
+    let mut channels = khive_channel::ChannelRegistry::new();
+    channels.register(email_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
         }
-        channel_outbox_once(
-            email_channel.as_ref(),
+        outbox::outbox_once(
+            outbox::OutboxChannels::Registered {
+                registry: &channels,
+                slug: &slug,
+            },
+            outbox::OutboxPolicy::Email {
+                mailbox: &mailbox,
+                domain: &domain,
+                allowlist: &allowlist,
+            },
             &runtime,
             &namespace,
-            &mailbox,
-            &domain,
-            &allowlist,
             ctx.cancellation(),
         )
         .await?;
@@ -1602,7 +1611,7 @@ pub(crate) async fn channel_outbox_loop(
 /// routing and owner-claim behavior can be verified without sleeping or
 /// opening a network transport. Account-wide authentication errors propagate
 /// to the supervisor without becoming per-message terminal failures.
-#[cfg(feature = "channel-email")]
+#[cfg(all(test, feature = "channel-email"))]
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
     email_channel: &dyn khive_channel::Channel,
@@ -1613,253 +1622,18 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
-    use chrono::Utc;
-    use khive_channel::ChannelEnvelope;
-
-    // Query outbound messages through the runtime's non-wire outbox scan.
-    // The generic wire `list` verb runs on the kg pack's runtime, which under
-    // a `[packs.comm]` backend assignment is not the backend holding comm's
-    // notes — the scan must use the comm-routed handle this loop was given.
-    // The `email:` prefix is applied INSIDE the scan (before its limit), so a
-    // backlog of another channel's pending rows cannot starve this one; the
-    // per-note checks below are defensive re-checks only.
-    let token = match runtime.authorize(namespace.clone()) {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
-            return Err(crate::components::ComponentError::Permanent(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes = match runtime
-        .list_undelivered_outbound_messages(&token, Some("email:"), 200)
-        .await
-    {
-        Ok(notes) => notes,
-        Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: outbox scan failed");
-            return Err(crate::components::ComponentError::Retryable(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes: Vec<serde_json::Value> = notes
-        .iter()
-        .filter_map(|note| serde_json::to_value(note).ok())
-        .collect();
-    for note_val in &notes {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let props = match note_val.get("properties") {
-            Some(serde_json::Value::Object(properties)) => properties.clone(),
-            _ => continue,
-        };
-
-        if props.get("direction").and_then(|value| value.as_str()) != Some("outbound") {
-            continue;
-        }
-        let to_actor = match props.get("to_actor").and_then(|value| value.as_str()) {
-            Some(actor) if actor.starts_with("email:") => actor.to_string(),
-            _ => continue,
-        };
-        if note_already_delivered(&props) {
-            continue;
-        }
-        let note_id = match note_val.get("id").and_then(|value| value.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-        let recipient = to_actor
-            .strip_prefix("email:")
-            .unwrap_or(to_actor.as_str())
-            .to_string();
-        if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-            // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
-            // must be recorded — skipping with only a log line leaves the row
-            // pending forever while the sender saw `ok: true`.
-            let failed_at = Utc::now().to_rfc3339();
-            let last_error = format!("recipient {recipient} not in outbound allowlist");
-            let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                Ok(uuid) => runtime
-                    .mark_outbound_message_failed(&token, uuid, failed_at, last_error.clone())
-                    .await
-                    .map(|_| ()),
-                Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                    "note id {note_id} is not a valid UUID: {error}"
-                ))),
-            };
-            match mark_result {
-                Ok(_) => tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    "outbox loop: recipient not in allowlist; recorded permanent failure"
-                ),
-                Err(error) => tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    error = %error,
-                    "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
-                ),
-            }
-            continue;
-        }
-
-        let subject = props
-            .get("subject")
-            .and_then(|value| value.as_str())
-            .unwrap_or("(no subject)")
-            .to_string();
-        let content = match note_val.get("content").and_then(|value| value.as_str()) {
-            Some(content) => content.to_string(),
-            None => continue,
-        };
-        let thread_id = props
-            .get("thread_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let in_reply_to = props
-            .get("in_reply_to_message_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let references = props
-            .get("references_chain")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-
-        // Mint-before-send through the comm-routed runtime's owner-only path.
-        // Generic `update` correctly refuses caller patches to `external_id`.
-        let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
-            Some(external_id) if !external_id.is_empty() => external_id.to_string(),
-            _ => {
-                let message_id = format!("<{note_id}@{domain}>");
-                let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => {
-                        runtime
-                            .claim_outbound_message_external_id(&token, uuid, message_id.clone())
-                            .await
-                    }
-                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {error}"
-                    ))),
-                };
-                if let Err(error) = claim_result {
-                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                        Ok(uuid) => {
-                            record_outbound_claim_failure(runtime, &token, uuid, &error).await
-                        }
-                        Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(
-                            format!("note id {note_id} is not a valid UUID: {parse_error}"),
-                        )),
-                    };
-                    match mark_result {
-                        Ok(note) => tracing::warn!(
-                            note_id = %note_id,
-                            error = %error,
-                            permanent = outbound_claim_failure_is_permanent(&error),
-                            delivery = ?note.properties.as_ref().and_then(|p| p.get("delivery")).and_then(|v| v.as_str()),
-                            "outbox loop: claim failure handled; existing claim or terminal state preserved"
-                        ),
-                        Err(mark_error) => tracing::warn!(
-                            note_id = %note_id,
-                            error = %error,
-                            mark_error = %mark_error,
-                            "outbox loop: claim failed and failure state could not be recorded"
-                        ),
-                    }
-                    continue;
-                }
-                message_id
-            }
-        };
-
-        let mut envelope = ChannelEnvelope::new(
-            format!("email:{mailbox}"),
-            format!("email:{recipient}"),
-            content,
-        )
-        .with_subject(subject)
-        .with_message_id(message_id.clone());
-        if let Some(thread_id) = thread_id {
-            envelope = envelope.with_correlation(thread_id);
-        }
-        if let Some(in_reply_to) = in_reply_to {
-            envelope = envelope.with_in_reply_to(in_reply_to);
-        }
-        if let Some(references) = references {
-            envelope = envelope.with_references(references);
-        }
-
-        match email_channel.send(envelope).await {
-            Ok(()) => {
-                let delivered_at = Utc::now().to_rfc3339();
-                let delivered_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => runtime
-                        .mark_outbound_message_delivered(
-                            &token,
-                            uuid,
-                            delivered_at,
-                            Some(message_id.clone()),
-                        )
-                        .await
-                        .map(|_| ()),
-                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {error}"
-                    ))),
-                };
-                match delivered_result {
-                    Ok(_) => tracing::info!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        message_id = %message_id,
-                        "outbox loop: delivered"
-                    ),
-                    Err(error) => tracing::warn!(
-                        note_id = %note_id,
-                        error = %error,
-                        "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                    ),
-                }
-            }
-            Err(
-                khive_channel::ChannelError::Auth(error)
-                | khive_channel::ChannelError::Config(error),
-            ) => {
-                return Err(crate::components::ComponentError::Permanent(error));
-            }
-            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
-                return Err(crate::components::ComponentError::Retryable(error));
-            }
-            Err(error) => {
-                let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => record_outbound_send_failure(runtime, &token, uuid, &error)
-                        .await
-                        .map(|_| ()),
-                    Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {parse_error}"
-                    ))),
-                };
-                match mark_result {
-                    Ok(()) => tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %error,
-                        classification = ?error.delivery_failure_class(),
-                        "outbox loop: send failure recorded"
-                    ),
-                    Err(mark_error) => tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %error,
-                        mark_error = %mark_error,
-                        "outbox loop: send failed and retry state could not be recorded"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(())
+    outbox::outbox_once(
+        outbox::OutboxChannels::Single(email_channel),
+        outbox::OutboxPolicy::Email {
+            mailbox,
+            domain,
+            allowlist,
+        },
+        runtime,
+        namespace,
+        cancellation,
+    )
+    .await
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
@@ -2142,14 +1916,22 @@ pub(crate) async fn telegram_outbox_loop(
     ingest_namespace: String,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
+    outbox::validate_loop_channel(telegram_channel.as_ref(), "telegram")?;
+    let slug = telegram_channel.slug();
+    let mut channels = khive_channel::ChannelRegistry::new();
+    channels.register(telegram_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
         }
-        telegram_outbox_once(
-            telegram_channel.as_ref(),
+        outbox::outbox_once(
+            outbox::OutboxChannels::Registered {
+                registry: &channels,
+                slug: &slug,
+            },
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
             &runtime,
             &namespace,
             ctx.cancellation(),
@@ -2159,110 +1941,21 @@ pub(crate) async fn telegram_outbox_loop(
     }
 }
 
-#[cfg(feature = "channel-telegram")]
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
 async fn telegram_outbox_once(
     telegram_channel: &dyn khive_channel::Channel,
     runtime: &khive_runtime::KhiveRuntime,
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
-    use khive_channel::ChannelEnvelope;
-
-    let token = match runtime.authorize(namespace.clone()) {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(error = %error, "telegram outbox loop: namespace authorization failed");
-            return Err(crate::components::ComponentError::Permanent(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes = match runtime
-        .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
-        .await
-    {
-        Ok(notes) => notes,
-        Err(error) => {
-            tracing::warn!(error = %error, "telegram outbox loop: outbox scan failed");
-            return Err(crate::components::ComponentError::Retryable(
-                error.to_string(),
-            ));
-        }
-    };
-
-    for note in notes {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let Some(props) = note
-            .properties
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-        else {
-            continue;
-        };
-        if props.get("direction").and_then(serde_json::Value::as_str) != Some("outbound") {
-            continue;
-        }
-        let Some(to_actor) = props
-            .get("to_actor")
-            .and_then(serde_json::Value::as_str)
-            .filter(|actor| actor.starts_with("telegram:"))
-        else {
-            continue;
-        };
-        if note_already_delivered(props) {
-            continue;
-        }
-
-        let envelope = ChannelEnvelope::new("telegram:bot", to_actor, note.content.clone());
-        match telegram_channel.send(envelope).await {
-            Ok(()) => {
-                match runtime
-                    .mark_outbound_message_delivered(
-                        &token,
-                        note.id,
-                        chrono::Utc::now().to_rfc3339(),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(_) => tracing::info!(note_id = %note.id, "telegram outbox loop: delivered"),
-                    Err(error) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                    ),
-                }
-            }
-            Err(
-                khive_channel::ChannelError::Auth(error)
-                | khive_channel::ChannelError::Config(error),
-            ) => {
-                return Err(crate::components::ComponentError::Permanent(error));
-            }
-            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
-                return Err(crate::components::ComponentError::Retryable(error));
-            }
-            Err(error) => {
-                match record_outbound_send_failure(runtime, &token, note.id, &error).await {
-                    Ok(_) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        classification = ?error.delivery_failure_class(),
-                        "telegram outbox loop: send failure recorded"
-                    ),
-                    Err(mark_error) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        mark_error = %mark_error,
-                        "telegram outbox loop: send failed and retry state could not be recorded"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(())
+    outbox::outbox_once(
+        outbox::OutboxChannels::Single(telegram_channel),
+        outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+        runtime,
+        namespace,
+        cancellation,
+    )
+    .await
 }
 
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
@@ -14423,3 +14116,13 @@ mod poll_timing_tests;
 #[cfg(all(test, feature = "channel-email"))]
 #[path = "serve_outbox_claim_tests.rs"]
 mod outbox_claim_tests;
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox.rs"]
+mod outbox;
+
+include!("serve_outbox_parity_tests.rs");
+
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox_slug_tests.rs"]
+mod outbox_slug_tests;
