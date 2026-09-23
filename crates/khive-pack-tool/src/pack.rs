@@ -122,6 +122,7 @@ impl PackRuntime for ToolPack {
             "tool.revoke" => handlers::decide_request(rt, token, params, "revoked").await,
             "tool.requests" => handlers::requests(rt, token, params).await,
             "tool.policy" => handlers::set_policy(rt, token, params).await,
+            "tool.policy_delete" => handlers::delete_policy(rt, token, params).await,
             "tool.policies" => handlers::policies(rt, token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "{PACK_NAME} pack does not handle verb {verb:?}"

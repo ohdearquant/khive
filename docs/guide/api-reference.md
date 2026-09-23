@@ -31,7 +31,7 @@ An always-machine-readable copy of this page is at
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
-| `tool`      | 13    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
@@ -2990,7 +2990,7 @@ request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
 
-## `tool` pack — 13 verbs
+## `tool` pack — 14 verbs
 
 Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
 `tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges
@@ -3058,3 +3058,16 @@ reconstructed.
 `tool.requests(status, actor, tool, limit=50)` lists grant rows; `tool.policy(actor, tool, decision, note)`
 stores a rule where `actor` and `tool` are exact labels, trailing-`*` prefixes or `*`;
 `tool.policies(actor, limit=100)` lists rules.
+
+### `tool.policy_delete` — Commissive
+
+`tool.policy_delete(actor, tool, namespace)` retires the live policy whose stored `actor` and `tool`
+labels exactly match the supplied strings, in the request's namespace. `actor` and `tool` are required
+nonempty strings; `namespace` is the optional shared request override. A stored pattern such as
+`actor="svc:*"` is matched literally when retiring it, so this call retires only that named rule.
+
+Returns `{ "ok": true, "policy": {...} }` with the retained policy row, its correction `history`, and
+the retirement fields `deleted_at` and `deleted_by`. `tool.policies` continues to expose the retired
+row; `tool.check` excludes it while retaining its normal grant, live-policy, then default precedence. If no live
+rule has those exact labels, including on a repeated deletion, the call refuses with a not-found
+error. See [ADR-180 Amendment 3](../adr/ADR-180-tool-pack.md#amendment-3-2026-09-11-a-policy-is-correctable-and-a-correction-that-changes-nothing-is-refused).

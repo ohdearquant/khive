@@ -63,16 +63,20 @@ pub static ENTITY_TYPES: [EntityTypeDef; 4] = [
 ];
 
 /// Pack-owned tables, applied idempotently at boot.
-pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 5] = [
+pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 9] = [
     include_str!("../sql/000-policy.sql"),
     include_str!("../sql/001-policy-index.sql"),
     include_str!("../sql/002-grants.sql"),
     include_str!("../sql/003-grants-index.sql"),
     include_str!("../sql/grant-invalidation.sql"),
+    include_str!("../sql/004-policy-history-init.sql"),
+    include_str!("../sql/005-policy-history-consolidate.sql"),
+    include_str!("../sql/006-policy-retire-duplicates.sql"),
+    include_str!("../sql/007-policy-live-index.sql"),
 ];
 
-/// Legacy grant rows have no evidence of an approved registry definition.
-pub static TOOL_SCHEMA_COLUMN_ADDITIONS: [PackColumnAddition; 4] = [
+/// Nullable additions preserve existing policy and grant records during upgrade.
+pub static TOOL_SCHEMA_COLUMN_ADDITIONS: [PackColumnAddition; 9] = [
     PackColumnAddition {
         table: "tool_grants",
         column: "registry_id",
@@ -92,6 +96,31 @@ pub static TOOL_SCHEMA_COLUMN_ADDITIONS: [PackColumnAddition; 4] = [
         table: "tool_grants",
         column: "invalidated_at",
         affinity: PackColumnAffinity::Integer,
+    },
+    PackColumnAddition {
+        table: "tool_policy",
+        column: "updated_at",
+        affinity: PackColumnAffinity::Integer,
+    },
+    PackColumnAddition {
+        table: "tool_policy",
+        column: "updated_by",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "tool_policy",
+        column: "history",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "tool_policy",
+        column: "deleted_at",
+        affinity: PackColumnAffinity::Integer,
+    },
+    PackColumnAddition {
+        table: "tool_policy",
+        column: "deleted_by",
+        affinity: PackColumnAffinity::Text,
     },
 ];
 
@@ -119,7 +148,7 @@ const P_TOOL: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
-pub static TOOL_HANDLERS: [HandlerDef; 13] = [
+pub static TOOL_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "tool.register",
         description: "Register one tool, skill, plugin or verb in the registry, with its capabilities, side-effect class and trust origin. Idempotent by name.",
@@ -253,7 +282,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 13] = [
     },
     HandlerDef {
         name: "tool.policy",
-        description: "Set a policy row: actor pattern, tool pattern (exact, prefix with a trailing *, or *), decision allow, deny or ask. The most specific matching row wins; on ties deny beats ask beats allow.",
+        description: "Correct one live policy for the exact actor/tool labels; changing a deny requires replaces to name its row. A no-op refuses. Patterns: actor pattern, tool pattern (exact, prefix with a trailing *, or *), decision allow, deny or ask. The most specific matching row wins; on ties deny beats ask beats allow.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -261,12 +290,24 @@ pub static TOOL_HANDLERS: [HandlerDef; 13] = [
             ParamDef { name: "tool", param_type: "string", required: true, description: "Tool name or pattern.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "decision", param_type: "string", required: true, description: "allow, deny or ask.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note", param_type: "string", required: false, description: "Why.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "replaces", param_type: "string", required: false, description: "Exact live policy row ID, required to change a deny decision.", resolution_mode: IdResolutionMode::NotApplicable },
+            P_NAMESPACE,
+        ],
+    },
+    HandlerDef {
+        name: "tool.policy_delete",
+        description: "Retire the live rule matching the exact stored actor and tool labels; patterns are not expanded. Refuses when no live rule exists.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "actor", param_type: "string", required: true, description: "Exact stored actor label or pattern.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tool", param_type: "string", required: true, description: "Exact stored tool label or pattern.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },
     HandlerDef {
         name: "tool.policies",
-        description: "List policy rows.",
+        description: "List policy rows with correction history and retirement metadata; retired rows never decide a check.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
