@@ -256,7 +256,9 @@ refuses with the conflict error `key_conflict`; `existing_id` is disclosed under
 When the new create's `content` and `properties` are exactly equal to the live holder's and
 disclosure is allowed, the call instead returns `{id, created: false}` for the existing note, with
 no mutation and no version change: a caller can safely repeat a keyed create without checking
-first. A fresh insert under a supplied key returns the full note object with `created: true` added,
+first. An exact replay runs none of the create's own preparation, so it succeeds even when an
+`annotates` target named by the request no longer exists or its embedding model is not registered. A
+fresh insert under a supplied key returns the full note object with `created: true` added,
 so the two outcomes are distinguishable without a second round trip. A create without `key` keeps
 its existing response shape and carries no `created` field.
 

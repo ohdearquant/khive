@@ -87,6 +87,16 @@ pub(crate) struct AtomicNoteOptions<'a> {
     /// on a key conflict, with no comparison outcome in it at all.
     pub replay_receipt: bool,
     pub fence: Option<&'a crate::note_write::NoteFences>,
+    /// `spec.properties` is already the fully validator-derived value, so
+    /// skip calling the note-write validator again below (ADR-172 Amendment
+    /// 6's keyed singleton-create staging derives properties once, before
+    /// its initial holder check, and reuses that same value through
+    /// preparation and any final-check fallback; the installed validator is
+    /// not guaranteed idempotent, and a kg regression test counts its calls,
+    /// so deriving twice for one request is an observably different
+    /// candidate, not a redundant no-op). Every other caller leaves this
+    /// `false` and keeps deriving from raw caller-supplied properties here.
+    pub properties_already_derived: bool,
 }
 
 pub(crate) struct AtomicNoteRequest<'a> {
@@ -406,9 +416,15 @@ pub(crate) async fn prepare_atomic_note_requests(
         // (`operations.rs`'s create funnel, `atomic_prepare::prepare_add_note`):
         // derive from the token BEFORE the secret scan and note construction,
         // so a caller-supplied `from_actor`/`thread_id`/etc. in `spec.properties`
-        // never reaches storage verbatim on this writer either.
-        let properties =
-            runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?;
+        // never reaches storage verbatim on this writer either. Skipped when
+        // the caller already derived (`properties_already_derived`): the
+        // validator is not guaranteed idempotent, so a second call for the
+        // same request is a different candidate, not a no-op.
+        let properties = if options.properties_already_derived {
+            spec.properties.clone()
+        } else {
+            runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?
+        };
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         crate::secret_gate::check_at(spec.content, &record, "content")?;
         if let Some(n) = spec.name {
