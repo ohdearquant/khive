@@ -84,6 +84,7 @@ fn fixture() -> (
     let runtime = KhiveRuntime::memory().unwrap();
     runtime.install_blob_store(store.clone()).unwrap();
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("web-extract-test".into()));
     builder.register(KgPack::new(runtime.clone()));
     builder.register(WebPack::new(runtime.clone()));
     let registry = builder.build().unwrap();
@@ -238,21 +239,49 @@ async fn extract_text_never_allocates_an_intermediate_full_body_copy() {
         .dispatch("web.extract", json!({"id": warm, "kinds": ["text"]}))
         .await
         .unwrap();
-    let body = format!("<p>{}</p>", "x".repeat(4 * 1024 * 1024)).into_bytes();
-    let id = seed_page(&runtime, store.as_ref(), body).await;
-
-    let observation = AllocationObservation::start();
-    let response = registry
-        .dispatch("web.extract", json!({"id": id, "kinds": ["text"]}))
-        .await;
-    let largest = observation.finish();
-    response.unwrap();
-    // Must fail with the old tag replace_all/full collapsed String restored:
-    // each requests >=4 MiB on this thread before truncating to 200,000 bytes.
-    // The raw source allocation is separately admitted and performed by the FS
-    // blocking worker; this control measures derived work on the handler thread.
-    assert!(
-        largest <= 1024 * 1024,
-        "derived handler allocation was {largest} bytes"
-    );
+    for (label, mut body, expected) in [
+        ("valid", vec![b'x'; 4 * 1024 * 1024], "x".repeat(200_000)),
+        (
+            "invalid",
+            vec![0xff; 4 * 1024 * 1024],
+            "\u{fffd}".repeat(66_666),
+        ),
+        (
+            "invalid tail",
+            vec![b'x'; 4 * 1024 * 1024],
+            "x".repeat(200_000),
+        ),
+    ] {
+        if label == "invalid tail" {
+            body.push(0xff);
+        }
+        let body = [b"<p>".as_slice(), body.as_slice(), b"</p>"].concat();
+        let id = seed_page(&runtime, store.as_ref(), body).await;
+        let observation = AllocationObservation::start();
+        let response = registry
+            .dispatch("web.extract", json!({"id": id, "kinds": ["text"]}))
+            .await;
+        let largest = observation.finish();
+        let response = response.unwrap();
+        // Must fail with full tag/collapse Strings or eager lossy decoding
+        // restored: each requests >=4 MiB before truncating to 200,000 bytes.
+        // Raw hydration is separately admitted on the FS blocking worker; this
+        // control measures derived work on the handler thread, even for a body
+        // whose only malformed byte follows an already complete excerpt.
+        assert!(
+            largest <= 1024 * 1024,
+            "{label}: derived handler allocation was {largest} bytes"
+        );
+        let entity = registry
+            .dispatch("get", json!({"id": response["result"]["text"]["id"]}))
+            .await
+            .unwrap();
+        let content_ref =
+            ContentRef::from_hex(entity["properties"]["blob_ref"].as_str().unwrap()).unwrap();
+        let bytes = store
+            .get_bounded_verified(&content_ref, 200_000)
+            .await
+            .unwrap();
+        assert_eq!(bytes, expected.as_bytes(), "{label}");
+    }
 }
