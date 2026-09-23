@@ -81,6 +81,7 @@ impl KgPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: ProposeParams = deser(params)?;
         if p.title.is_empty() {
@@ -131,6 +132,7 @@ impl KgPack {
                     .into(),
             ));
         }
+        crate::apply_worker::validate_note_proposal_admission(&changeset, registry)?;
 
         let proposal_id = Uuid::new_v4();
         let actor = token.actor().id.clone();
