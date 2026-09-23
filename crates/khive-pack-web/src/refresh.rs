@@ -30,45 +30,17 @@
 //! otherwise.
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::{Direction, EdgeRelation};
-use serde::Deserialize;
+use khive_storage::EdgeRelation;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
 use crate::egress::{self, Refusal, Resolver, SystemResolver};
-use crate::fetch::{resolve_effective_token, HopOutcome};
+use crate::fetch::HopOutcome;
+use crate::namespace::resolve_effective_token;
 use crate::receipt::write_receipt;
+use crate::vocab::RefreshParams;
 use crate::WebPack;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RefreshParams {
-    id: Uuid,
-    #[serde(default)]
-    max_bytes: Option<u64>,
-    #[serde(default)]
-    timeout_s: Option<u64>,
-    #[serde(default)]
-    namespace: Option<String>,
-}
-
-/// A note carries [`crate::receipt::RECEIPT_TAG`] in its
-/// `properties["tags"]` array — the only mark distinguishing a receipt from
-/// any other `observation` a caller (or a future feature) might annotate the
-/// same entity with.
-fn is_receipt_note(note: &khive_storage::Note) -> bool {
-    note.kind == "observation"
-        && note
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.get("tags"))
-            .and_then(Value::as_array)
-            .is_some_and(|tags| {
-                tags.iter()
-                    .any(|tag| tag.as_str() == Some(crate::receipt::RECEIPT_TAG))
-            })
-}
 
 /// The newest `web.receipt`-tagged `observation` annotating `entity_id` —
 /// never a decoy `annotates` note a caller wrote by hand, since only the
@@ -79,36 +51,9 @@ async fn latest_receipt(
     token: &NamespaceToken,
     entity_id: Uuid,
 ) -> Result<Option<Uuid>, RuntimeError> {
-    let annotators = runtime
-        .neighbors(
-            token,
-            entity_id,
-            Direction::In,
-            None,
-            Some(vec![EdgeRelation::Annotates]),
-        )
-        .await?;
-    if annotators.is_empty() {
-        return Ok(None);
-    }
-    let notes = runtime.notes(token)?;
-    let mut latest: Option<(i64, Uuid)> = None;
-    for hit in annotators {
-        let Some(note) = notes.get_note(hit.node_id).await? else {
-            continue;
-        };
-        if !is_receipt_note(&note) {
-            continue;
-        }
-        if latest
-            .as_ref()
-            .map(|(t, _)| note.created_at > *t)
-            .unwrap_or(true)
-        {
-            latest = Some((note.created_at, note.id));
-        }
-    }
-    Ok(latest.map(|(_, id)| id))
+    runtime
+        .latest_annotating_note(token, entity_id, "observation", crate::receipt::RECEIPT_TAG)
+        .await
 }
 
 async fn run_refresh(
@@ -220,7 +165,7 @@ async fn settle_refresh(
     id: Uuid,
     url_str: &str,
     stored_content_ref: &str,
-    outcome: HopOutcome,
+    mut outcome: HopOutcome,
     redirect_hops: &[crate::fetch::RedirectHop],
 ) -> Result<Value, RuntimeError> {
     let previous_receipt = latest_receipt(runtime, token, id).await?;
@@ -353,14 +298,15 @@ async fn settle_refresh(
         // validated cache. No new body bytes were received or blob-put.
         changed = true;
     }
+    let body_bytes = outcome
+        .body
+        .as_ref()
+        .map_or(0, |(bytes, _)| bytes.len() as u64);
     let mut new_content_ref: Option<String> = None;
     if outcome.status != 304 {
-        if let Some((buffer, truncated)) = &outcome.body {
+        if let Some((buffer, truncated)) = outcome.body.take() {
             let store = crate::blob_store(runtime)?;
-            let content_ref = store
-                .put(buffer.clone())
-                .await
-                .map_err(RuntimeError::from)?;
+            let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
             if Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref() {
                 changed = true;
@@ -370,38 +316,24 @@ async fn settle_refresh(
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if redirect_hops.is_empty() {
-                    let entity_type = match content_type.as_deref() {
-                        Some(ct) => {
-                            let base = ct
-                                .split(';')
-                                .next()
-                                .unwrap_or_default()
-                                .trim()
-                                .to_ascii_lowercase();
-                            if base == "text/html" || base == "application/xhtml+xml" {
-                                "page"
-                            } else {
-                                "resource"
-                            }
-                        }
-                        None => "resource",
-                    };
+                    let entity_type = crate::fetch::classify_entity_type(content_type.as_deref());
                     crate::entities::patch(
                         runtime,
                         token,
                         id,
                         Some(entity_type),
-                        json!({
-                            "url": url_str,
-                            "content_type": content_type,
-                            "blob_ref": content_ref_str,
-                            "content_digest": content_ref_str,
-                            "size": buffer.len() as u64,
-                            "status": outcome.status,
-                            "fetched_at": chrono::Utc::now().to_rfc3339(),
-                            "etag": outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
-                            "last_modified": outcome.headers.get("last-modified").and_then(|v| v.to_str().ok()),
-                        }),
+                        crate::fetch::representation_patch(
+                            url_str,
+                            content_type.as_deref(),
+                            outcome.status,
+                            outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
+                            outcome
+                                .headers
+                                .get("last-modified")
+                                .and_then(|v| v.to_str().ok()),
+                            Some(&content_ref_str),
+                            body_bytes,
+                        ),
                     )
                     .await?;
                     crate::fetch::root_body(
@@ -410,7 +342,7 @@ async fn settle_refresh(
                         khive_storage::AttachmentSubstrate::Entity,
                         &content_ref,
                         content_type.as_deref(),
-                        buffer.len() as u64,
+                        body_bytes,
                     )
                     .await?;
                 } else {
@@ -419,7 +351,7 @@ async fn settle_refresh(
                     // have already minted it; temporary hops leave that job
                     // entirely to this terminal content settlement.
                     // The caller-named row keeps its own url.
-                    let settled = crate::fetch::settle_content(
+                    let settled = crate::fetch::settle_content_body(
                         runtime,
                         token,
                         &outcome.final_url,
@@ -430,7 +362,11 @@ async fn settle_refresh(
                             .headers
                             .get("last-modified")
                             .and_then(|v| v.to_str().ok()),
-                        Some((buffer.clone(), *truncated)),
+                        Some(crate::fetch::ContentBody::Stored {
+                            content_ref,
+                            bytes: body_bytes,
+                            truncated,
+                        }),
                     )
                     .await?;
                     debug_assert_eq!(settled.id, final_id);
@@ -480,11 +416,7 @@ async fn settle_refresh(
                 .headers
                 .get("content-type")
                 .and_then(|v| v.to_str().ok()),
-            outcome
-                .body
-                .as_ref()
-                .map(|(b, _)| b.len() as u64)
-                .unwrap_or(0),
+            body_bytes,
         )
         .await?;
     }
@@ -538,6 +470,7 @@ mod tests {
     use super::*;
     use crate::fetch::run_one_hop;
     use crate::identity;
+    use khive_storage::Direction;
     use khive_types::Namespace;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -616,7 +549,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
             .expect("fs blob store");
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            events_split: None,
+            actor_id: Some("test:web-refresh".to_string()),
+            packs: vec!["kg".to_string(), "web".to_string()],
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
         install_web_edge_rules(&runtime);
         runtime
             .install_blob_store(Arc::new(store))
@@ -1248,3 +1188,11 @@ mod tests {
 #[cfg(test)]
 #[path = "refresh_r2_tests.rs"]
 mod r2_tests;
+
+#[cfg(test)]
+#[path = "refresh_reuse_tests.rs"]
+mod reuse_tests;
+
+#[cfg(test)]
+#[path = "refresh_receipt_tests.rs"]
+mod receipt_tests;

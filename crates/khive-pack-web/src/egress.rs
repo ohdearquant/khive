@@ -472,6 +472,54 @@ pub fn check_redirect_cap(redirects: u32, max_redirects: u32) -> Result<(), Refu
     }
 }
 
+/// Invocation-local connection reuse. Policy checks and fresh DNS validation
+/// happen before every lookup; a client is reused only for the same origin and
+/// checked address. No credentials or request headers are cached.
+#[derive(Default)]
+pub(crate) struct PinnedClients {
+    clients: std::sync::Mutex<std::collections::VecDeque<(String, IpAddr, reqwest::Client)>>,
+}
+
+impl PinnedClients {
+    pub(crate) fn for_checked_address(
+        &self,
+        url: &Url,
+        addr: IpAddr,
+    ) -> Result<reqwest::Client, Refusal> {
+        // Bound retained pools when one ingest visits many origins or a host
+        // rotates among many public addresses. Eviction only affects reuse.
+        const CAPACITY: usize = 16;
+        let origin = url.origin().ascii_serialization();
+        let mut clients = self.clients.lock().map_err(|_| {
+            Refusal::new(
+                "internal_client_build_failed",
+                "HTTP client cache lock poisoned",
+            )
+        })?;
+        if let Some(index) = clients
+            .iter()
+            .position(|(key, pin, _)| key == &origin && *pin == addr)
+        {
+            let cached = clients.remove(index).expect("located client");
+            let client = cached.2.clone();
+            clients.push_back(cached);
+            return Ok(client);
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| Refusal::new("invalid_url", "url has no host"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| Refusal::new("invalid_url", "url has no port"))?;
+        let client = pinned_client(host, addr, port)?;
+        if clients.len() == CAPACITY {
+            clients.pop_front();
+        }
+        clients.push_back((origin, addr, client.clone()));
+        Ok(client)
+    }
+}
+
 /// Pin a socket address for `host` on a per-request reqwest client, so the
 /// physical connection lands on exactly the address [`resolve_and_pin`]
 /// validated — never a fresh resolution of the name (A1.2.2).
