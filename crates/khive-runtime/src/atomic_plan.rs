@@ -247,6 +247,7 @@ pub struct UpdatePlan {
     /// snapshot. Such plans carry a guarded SELECT assertion and must not
     /// execute DML that would advance the note revision.
     pub(crate) idempotent_noop: bool,
+    pub(crate) entity_guard: Option<crate::entity_write::EntityWriteGuard>,
     pub(crate) note_guard: Option<crate::note_write::NoteWriteGuard>,
     pub(crate) note_vector_purge: Option<crate::note_write::NoteVectors>,
     pub(crate) note_embedding_inheritance: Option<crate::note_write::NoteEmbeddingInheritance>,
@@ -643,6 +644,7 @@ mod tests {
         let id = Uuid::new_v4();
         let plan = UpdatePlan {
             graph_effects: Vec::new(),
+            entity_guard: None,
             note_guard: None,
             note_vector_purge: None,
             note_embedding_inheritance: None,

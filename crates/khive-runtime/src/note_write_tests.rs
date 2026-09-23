@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -325,7 +325,9 @@ async fn absence_fence_observes_prior_create_in_same_transaction_and_rolls_back(
             .await
             .unwrap();
         let target_op_index = prepared.plans.len();
-        prepared.plans.push(AtomicOpPlan::Update(target_plan));
+        prepared
+            .plans
+            .push(AtomicOpPlan::Update(Box::new(target_plan)));
         let outcome = run_atomic_unit(runtime.sql().as_ref(), prepared.plans)
             .await
             .unwrap();
@@ -380,6 +382,7 @@ struct Service {
     started: Notify,
     proceed: Notify,
     fail: AtomicBool,
+    calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -389,6 +392,7 @@ impl EmbeddingService for Service {
         texts: &[String],
         _: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if texts.iter().any(|text| text.contains("inflight")) {
             self.started.notify_one();
             self.proceed.notified().await;
@@ -781,8 +785,8 @@ async fn version_fence_and_prior_operation_roll_back_together() {
     let outcome = run_atomic_unit(
         runtime.sql().as_ref(),
         vec![
-            AtomicOpPlan::Update(fence_plan),
-            AtomicOpPlan::Update(target_plan),
+            AtomicOpPlan::Update(Box::new(fence_plan)),
+            AtomicOpPlan::Update(Box::new(target_plan)),
         ],
     )
     .await
@@ -937,11 +941,12 @@ async fn version_delayed_reindex_cannot_reverse_embed_off() {
         .prepare_versioned_note_update(&token, note.clone(), patch("{\"old\":true}", 1, Some(true)))
         .await
         .unwrap();
-    let AtomicRunOutcome::Committed { post_commit } =
-        run_atomic_unit(runtime.sql().as_ref(), vec![AtomicOpPlan::Update(plan)])
-            .await
-            .unwrap()
-    else {
+    let AtomicRunOutcome::Committed { post_commit } = run_atomic_unit(
+        runtime.sql().as_ref(),
+        vec![AtomicOpPlan::Update(Box::new(plan))],
+    )
+    .await
+    .unwrap() else {
         panic!("commit");
     };
     runtime
@@ -1017,11 +1022,12 @@ async fn assert_writer_time_embedding_inheritance(retired: bool) {
             .version,
         1
     );
-    let AtomicRunOutcome::Committed { post_commit } =
-        run_atomic_unit(runtime.sql().as_ref(), vec![AtomicOpPlan::Update(plan)])
-            .await
-            .unwrap()
-    else {
+    let AtomicRunOutcome::Committed { post_commit } = run_atomic_unit(
+        runtime.sql().as_ref(),
+        vec![AtomicOpPlan::Update(Box::new(plan))],
+    )
+    .await
+    .unwrap() else {
         panic!("commit")
     };
     assert_eq!(
@@ -1062,8 +1068,8 @@ async fn version_embedding_inheritance_rollback_has_no_effect_token() {
     let outcome = run_atomic_unit(
         runtime.sql().as_ref(),
         vec![
-            AtomicOpPlan::Update(plan.clone()),
-            AtomicOpPlan::Update(plan),
+            AtomicOpPlan::Update(Box::new(plan.clone())),
+            AtomicOpPlan::Update(Box::new(plan)),
         ],
     )
     .await
@@ -1164,7 +1170,10 @@ async fn version_embedding_purge_rolls_back_with_a_later_conflict() {
     assert!(matches!(
         run_atomic_unit(
             runtime.sql().as_ref(),
-            vec![AtomicOpPlan::Update(off), AtomicOpPlan::Update(stale)]
+            vec![
+                AtomicOpPlan::Update(Box::new(off)),
+                AtomicOpPlan::Update(Box::new(stale))
+            ]
         )
         .await
         .unwrap(),
@@ -1220,9 +1229,12 @@ async fn version_guard_observes_a_write_after_prepare_without_timestamp_change()
         .unwrap();
     assert_eq!(current.updated_at, note.updated_at);
     assert_eq!(current.version, 2);
-    let outcome = run_atomic_unit(runtime.sql().as_ref(), vec![AtomicOpPlan::Update(plan)])
-        .await
-        .unwrap();
+    let outcome = run_atomic_unit(
+        runtime.sql().as_ref(),
+        vec![AtomicOpPlan::Update(Box::new(plan))],
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         outcome,
         AtomicRunOutcome::RolledBack {
@@ -1305,9 +1317,12 @@ async fn version_off_removes_unregistered_vectors_created_after_prepare() {
     assert!(!runtime
         .registered_embedding_model_names()
         .contains(&"retired-note-model".into()));
-    let outcome = run_atomic_unit(runtime.sql().as_ref(), vec![AtomicOpPlan::Update(plan)])
-        .await
-        .unwrap();
+    let outcome = run_atomic_unit(
+        runtime.sql().as_ref(),
+        vec![AtomicOpPlan::Update(Box::new(plan))],
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
     assert_eq!(vectors(&runtime, &token).await, 0);
     assert_eq!(
@@ -1456,3 +1471,6 @@ mod fence_live_until;
 
 #[path = "fence_identity_tests.rs"]
 mod fence_identity;
+
+#[path = "keyed_create_race_tests.rs"]
+mod keyed_create_races;

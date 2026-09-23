@@ -66,6 +66,34 @@ no ordering guarantee; results are returned in input order. Use it for work
 that has no dependency between operations. JSON form is always single or
 parallel, so it is also limited to independent operations.
 
+## Run parallel units, each its own chain
+
+A comma-separated element inside `[...]` may itself be a `|`-chain. Each such
+element is a unit: its own ops run in order, sharing a `$prev` scope that
+never crosses into another unit, while the units themselves run concurrently
+with each other, the same way an ordinary batch does:
+
+```text
+request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"A\") | link(source_id=$prev.id, target_id=\"<doc-id>\", relation=\"introduced_by\"), stats(), create(kind=\"entity\", entity_kind=\"concept\", name=\"B\") | link(source_id=$prev.id, target_id=\"<doc-id>\", relation=\"introduced_by\")]")
+```
+
+Here the two create-then-link pairs run as independent units while `stats()`
+runs alongside them as a one-op unit; an ordinary flat batch is the case
+where every unit happens to have exactly one op. `$prev` inside a unit
+resolves only against that unit's own immediately preceding op, so a unit's
+first op can never reference `$prev`, and no op can reference another unit's
+result. A failing op aborts the rest of its own unit only; sibling units keep
+running. Results are one flat list in source order; each entry adds
+`op_index`, `unit_index`, and `step_index` alongside the usual `ok`/`tool`
+fields, so a caller can regroup the flat list back into its units without
+re-deriving the partition. Nesting stops at one bracket level: a `[...]`
+cannot appear inside a unit. A batch of units is not a transaction: each op
+commits on its own, and no request-level `atomic` mode spans units. An
+`atomic=` argument belongs to the verbs that define it (bulk
+`create(items=[...])`, `stream.batch`, `comm.mark_read`) and covers only that
+op's own writes, while the cross-op atomic unit, `kkernel exec --ops-file
+--atomic`, reads one JSON op per line and accepts no inline batch or chain.
+
 ## Pass a result to the next operation
 
 Use `|` when a later operation needs an earlier result. A chain runs in order,
@@ -93,13 +121,17 @@ the loaded verb catalog without dispatching any operation:
 request(ops="create(kind=\"note\", content=\"draft\") | get(id=$prev.id)", plan=true)
 ```
 
-A successful parse returns `parsed: true`, `mode`, `stage_count`, and `stages`.
-Each stage reports its `index`, `verb`, `pack`, `known`, normalized `args`, and
-unresolved `prev_refs`. An unknown verb still parses, with `known: false` and
-`pack: null`. References stay as literal strings; paths in `prev_refs` retain
-the parser's representation. Both outcomes include `limits` with `max_ops`,
-`max_depth`, and `max_input_len` in bytes. A syntax error returns `parsed: false`
-and the ordinary parser error text, with no `stages`.
+A successful parse returns `parsed: true`, `mode`, `stage_count`, `stages`,
+and `units`. Each stage reports its `index`, `verb`, `pack`, `known`,
+normalized `args`, unresolved `prev_refs`, and `unit_index`. An unknown verb
+still parses, with `known: false` and `pack: null`. References stay as
+literal strings; paths in `prev_refs` retain the parser's representation.
+`units` lists each unit's `start`/`end` index range over `stages`; an
+ordinary flat batch reports one length-one unit per stage, while a bracketed
+batch of chains (see "Run parallel units, each its own chain" above) reports
+one longer range per multi-op unit. Both outcomes include `limits` with
+`max_ops`, `max_depth`, and `max_input_len` in bytes. A syntax error returns
+`parsed: false` and the ordinary parser error text, with no `stages`.
 
 Planning accepts `ops` alone. Supplying `presentation`, `presentation_per_op`,
 `format`, `format_per_op`, `save_to`, or `request_id` beside `plan=true`, even
@@ -201,9 +233,12 @@ operation has its own outcome.
 ## Gotchas
 
 - **Bareword values are not strings.** Write `query="LoRA"`, not `query=LoRA`.
-- **Do not mix top-level separators.** Commas inside `[...]` mean parallel
-  work; `|` means a sequential chain. A request that mixes them at the top
-  level is invalid. Nested JSON arrays and objects may still contain commas.
+- **Do not mix top-level separators outside any bracket.** `verb() | verb(),
+  verb()` with no enclosing `[...]` is invalid. Inside `[...]`, a comma
+  separates units and a `|` sequences ops within one unit
+  (`[verb() | verb(), verb()]` is a two-unit batch, not an error); see
+  "Run parallel units, each its own chain" above. Nested JSON arrays and
+  objects may still contain commas.
 - **A request boundary has a cost.** Each `request` call adds a transport and
   dispatch round trip. The server keeps long-lived state warm between calls,
   but `$prev` exists only inside one chain and is not a cross-call cache. Batch

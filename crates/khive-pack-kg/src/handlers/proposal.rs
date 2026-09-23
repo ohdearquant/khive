@@ -24,6 +24,32 @@ use khive_runtime::micros_to_iso;
 
 const PROPOSAL_LIST_CAP: u32 = 500;
 
+/// Refuse caller-owned stamps before a draft becomes immutable proposal history.
+fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result<(), RuntimeError> {
+    use khive_runtime::secret_gate::reject_reserved_secret_gate_property;
+
+    match changeset {
+        ProposalChangeset::AddEntity { entity } => {
+            reject_reserved_secret_gate_property(entity.properties.as_ref())
+        }
+        ProposalChangeset::UpdateEntity { patch, .. } => {
+            reject_reserved_secret_gate_property(patch.properties.as_ref())
+        }
+        ProposalChangeset::AddNote { note } => {
+            reject_reserved_secret_gate_property(note.properties.as_ref())
+        }
+        ProposalChangeset::Compound { steps } => {
+            for step in steps {
+                reject_reserved_changeset_properties(step)?;
+            }
+            Ok(())
+        }
+        ProposalChangeset::AddEdge { .. }
+        | ProposalChangeset::MergeEntities { .. }
+        | ProposalChangeset::SupersedeEntity { .. } => Ok(()),
+    }
+}
+
 impl KgPack {
     pub(crate) async fn resolve_proposal_uuid(
         &self,
@@ -81,6 +107,7 @@ impl KgPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: ProposeParams = deser(params)?;
         if p.title.is_empty() {
@@ -125,12 +152,14 @@ impl KgPack {
                     RuntimeError::InvalidInput(format!("invalid changeset: {serde_message}"))
                 }
             })?;
+        reject_reserved_changeset_properties(&changeset)?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
                     .into(),
             ));
         }
+        crate::apply_worker::validate_note_proposal_admission(&changeset, registry)?;
 
         let proposal_id = Uuid::new_v4();
         let actor = token.actor().id.clone();
@@ -585,3 +614,7 @@ impl KgPack {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+#[path = "proposal_reservation_tests.rs"]
+mod reservation_tests;

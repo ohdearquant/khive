@@ -795,7 +795,9 @@ async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
     for position in [0, 2, 5, 8] {
         writer
             .execute(SqlStatement {
-                sql: "UPDATE entities SET tags = '[\"wanted\"]' WHERE id = ?1".into(),
+                sql:
+                    "UPDATE entities SET version = version + 1, tags = '[\"wanted\"]' WHERE id = ?1"
+                        .into(),
                 params: vec![SqlValue::Text(ids[position].to_string())],
                 label: None,
             })

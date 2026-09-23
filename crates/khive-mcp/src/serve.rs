@@ -14140,35 +14140,55 @@ backend = "kg-backend"
         requested_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
         expires_at INTEGER, decision_note TEXT)";
 
+    const ISSUE2768_LEGACY_POLICY: &str = "CREATE TABLE tool_policy (
+        id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL,
+        tool TEXT NOT NULL, decision TEXT NOT NULL, note TEXT,
+        created_at INTEGER NOT NULL, created_by TEXT)";
+
+    type Issue2768TableShape = Vec<(String, String, i64, Option<String>, i64, i64)>;
+
     fn issue2768_runtime_config() -> RuntimeConfig {
         RuntimeConfig {
             db_path: None,
             embedding_model: None,
             additional_embedding_models: vec![],
             packs: vec!["kg".into(), "tool".into()],
+            actor_id: Some("issue2768-test".into()),
             ..RuntimeConfig::default()
         }
     }
 
     fn issue2768_tool_shape(
         backend: &StorageBackend,
-    ) -> Vec<(String, String, i64, Option<String>, i64, i64)> {
+    ) -> std::collections::BTreeMap<String, Issue2768TableShape> {
         let reader = backend.pool().reader().unwrap();
-        let rows: String = reader
-            .query_row(
-                "SELECT json_group_array(json_array(name, type, \"notnull\", dflt_value, pk, hidden)) FROM (SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo('tool_grants', 'main') ORDER BY cid)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        serde_json::from_str(&rows).unwrap()
+        let tables: std::collections::BTreeSet<_> =
+            khive_pack_tool::vocab::TOOL_SCHEMA_COLUMN_ADDITIONS
+                .iter()
+                .map(|column| column.table)
+                .collect();
+        let mut shape = std::collections::BTreeMap::new();
+        for table in tables {
+            let rows: String = reader
+                .query_row(
+                    "SELECT json_group_array(json_array(name, type, \"notnull\", dflt_value, pk, hidden)) FROM (SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo(?1, 'main') ORDER BY cid)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let columns: Issue2768TableShape = serde_json::from_str(&rows).unwrap();
+            if !columns.is_empty() {
+                shape.insert(table.to_string(), columns);
+            }
+        }
+        shape
     }
 
     fn issue2768_seed_tool_database(path: &std::path::Path, upgraded: bool) {
         let backend = StorageBackend::sqlite(path).unwrap();
         backend.prepare_core_schema().unwrap();
         backend
-            .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS])
+            .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS, ISSUE2768_LEGACY_POLICY])
             .unwrap();
         if upgraded {
             backend
@@ -14267,12 +14287,41 @@ backend = "kg-backend"
         let single = KhiveRuntime::new(issue2768_runtime_config()).unwrap();
         single
             .backend()
-            .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS])
+            .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS, ISSUE2768_LEGACY_POLICY])
             .unwrap();
         let single_observer = single.clone();
         let before = issue2768_tool_shape(single_observer.backend());
-        assert_eq!(expected.len(), before.len() + 4);
-        assert_eq!(&expected[..before.len()], before.as_slice());
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>()
+        );
+        for (table, legacy_columns) in &before {
+            let current_columns = &expected[table];
+            let additions: Vec<_> = khive_pack_tool::vocab::TOOL_SCHEMA_COLUMN_ADDITIONS
+                .iter()
+                .filter(|column| column.table == table.as_str())
+                .collect();
+            assert_eq!(
+                current_columns.len(),
+                legacy_columns.len() + additions.len(),
+                "{table}"
+            );
+            assert_eq!(
+                &current_columns[..legacy_columns.len()],
+                legacy_columns.as_slice(),
+                "{table}"
+            );
+            for addition in additions {
+                assert!(
+                    current_columns
+                        .iter()
+                        .any(|column| column.0 == addition.column),
+                    "missing {}.{}",
+                    addition.table,
+                    addition.column
+                );
+            }
+        }
         let _single_server = KhiveMcpServer::new(single).unwrap();
         assert_eq!(issue2768_tool_shape(single_observer.backend()), expected);
 
@@ -14351,7 +14400,7 @@ backend = "kg-backend"
                     );
                     for column in khive_pack_tool::vocab::TOOL_SCHEMA_COLUMN_ADDITIONS {
                         assert!(
-                            message.contains(&format!("tool_grants.{}", column.column)),
+                            message.contains(&format!("{}.{}", column.table, column.column)),
                             "{message}"
                         );
                     }

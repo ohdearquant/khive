@@ -8,10 +8,13 @@
 //! continue.
 //!
 //! Every entity write in this pipeline runs through the runtime secret gate
-//! (ADR-085 D6 #4) via the guarded entity-mutation seam. A gate refusal quarantines that one
+//! (ADR-085 D6 #4) via the guarded entity-mutation seam. A credential refusal quarantines that one
 //! item — it is recorded in [`CodeSourceIngestReport::blocked`] and skipped —
 //! rather than aborting the rest of the sweep, the same
 //! per-record posture `git.digest` already uses for its own write refusals.
+//! The runtime-owned top-level secret-gate property is separately reserved:
+//! its presence in a candidate, including retained existing properties,
+//! refuses that entity mutation with the shared invalid-input error.
 //!
 //! Identity (B4): every entity this pipeline creates has a `uuid5`-derived
 //! id, so re-ingesting the same path needs no dedup lookup. Edge ids are
@@ -632,6 +635,7 @@ async fn get_entity_opt(
 /// never set `description`, so this is additive and does not change their
 /// gate coverage.
 fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
+    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     secret_gate::check_at(&entity.name, "entity", "name")?;
     if let Some(description) = &entity.description {
         secret_gate::check_at(description, "entity", "description")?;
@@ -751,6 +755,7 @@ where
 
         let outcome = if let Some(snapshot) = current.as_ref() {
             replacement.created_at = snapshot.created_at;
+            replacement.version = snapshot.version;
             replacement.updated_at =
                 advancing_entity_revision(replacement.updated_at, snapshot.updated_at)?;
             if !gate_allows_entity(&replacement, file, report)? {
@@ -4117,4 +4122,34 @@ mod tests {
         assert_eq!(report_b.edges_updated, 1);
         assert!(edge.updated_at > update_time);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn issue2673_code_entity_mutation_rebases_persisted_versions() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
+    let id = Uuid::new_v4();
+    let mut report = CodeSourceIngestReport::default();
+    for version in 1..=3 {
+        let name = format!("code revision {version}");
+        let outcome = mutate_entity(&runtime, &token, id, "version.rs", &mut report, |_| {
+            let mut entity = Entity::new("local", "concept", &name);
+            entity.id = id;
+            Some(entity)
+        })
+        .await
+        .unwrap();
+        assert!(outcome.wrote());
+        let stored = runtime.get_entity(&token, id).await.unwrap();
+        assert_eq!(stored.version, version);
+        assert_eq!(stored.name, name);
+    }
+    assert_eq!(
+        mutate_entity(&runtime, &token, id, "version.rs", &mut report, |_| None)
+            .await
+            .unwrap(),
+        RowMutationOutcome::Unchanged
+    );
+    assert_eq!(runtime.get_entity(&token, id).await.unwrap().version, 3);
 }

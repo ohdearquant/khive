@@ -6201,71 +6201,634 @@ async fn generic_create_of_a_kind_with_its_own_hook_is_unaffected_by_the_memory_
     assert!(refusal.to_string().contains("memory.remember"));
 }
 
-/// The approved `AddNote` changeset remains a creation route that does not invoke the shared
-/// create hook (`prepare_add_note` builds its own args), so it leaves `salience` and
-/// `decay_factor` unset. `memory.recall` still renders the row at the type-appropriate effective
-/// defaults, because recall resolves missing values at read time regardless of how the row was
-/// written. Issue #2967 remains the separate AddNote contract question.
+// ── ADR-017 / ADR-021 2026-09-22 amendment: the AddNote memory exception is withdrawn ──
+//
+// The test this section replaced proved the opposite of what the amendment now requires: an
+// approved `AddNote(kind="memory")` changeset used to admit the memory kind, leaving
+// `salience` and `decay_factor` unset because `prepare_add_note` never ran the shared create
+// hook. The memory pack now registers `KindHook::validate_proposal_note` (ADR-017), and the
+// same refusal that already covers shared `create`, `stream.batch`, and `stream.append` now
+// covers this route too, at both `propose` and apply.
+
+/// Assert a `registry.dispatch` error carries the canonical proposal-note admission-refusal
+/// shape: `details.reason = "kind_admission_refused"`, `details.kind = "memory"`,
+/// `details.route = "proposal_add_note"`, and a message naming `memory.remember`.
+fn assert_memory_proposal_admission_refused(error: &RuntimeError) {
+    let RuntimeError::Khive(khive_error) = error else {
+        panic!("expected RuntimeError::Khive carrying structured details, got {error:?}");
+    };
+    let details = khive_error
+        .details()
+        .expect("refusal must carry structured details");
+    assert_eq!(details.get("reason"), Some("kind_admission_refused"));
+    assert_eq!(details.get("kind"), Some("memory"));
+    assert_eq!(details.get("route"), Some("proposal_add_note"));
+    assert!(
+        khive_error.to_string().contains("memory.remember"),
+        "refusal must name the writer to use instead: {khive_error}"
+    );
+}
+
+/// Read one `SELECT COUNT(*) ...`-shaped statement back as an integer, mirroring the
+/// `count` helper `khive-runtime`'s own `keyed_memory_tests.rs` uses for the same purpose.
+async fn scalar_count(rt: &KhiveRuntime, sql: &str, params: Vec<SqlValue>) -> i64 {
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    match reader
+        .query_scalar(SqlStatement {
+            sql: sql.to_string(),
+            params,
+            label: Some("test.scalar_count".into()),
+        })
+        .await
+        .expect("count rows")
+    {
+        Some(SqlValue::Integer(value)) => value,
+        other => panic!("unexpected count result: {other:?}"),
+    }
+}
+
+/// A namespace-scoped `notes` row count for one kind, including soft-deleted rows (no
+/// `deleted_at` filter): the shape the apply-refusal test needs to prove nothing was written
+/// even transiently.
+async fn notes_kind_count_including_deleted(rt: &KhiveRuntime, ns: &str, kind: &str) -> i64 {
+    scalar_count(
+        rt,
+        "SELECT COUNT(*) FROM notes WHERE namespace = ?1 AND kind = ?2",
+        vec![
+            SqlValue::Text(ns.to_string()),
+            SqlValue::Text(kind.to_string()),
+        ],
+    )
+    .await
+}
+
+fn row_text(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
+    match row.get(col) {
+        Some(SqlValue::Text(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn row_i64(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
+    match row.get(col) {
+        Some(SqlValue::Integer(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The full `proposals_open` row for one proposal, every column the schema declares.
+async fn proposals_open_row(
+    rt: &KhiveRuntime,
+    ns: &str,
+    proposal_id: Uuid,
+) -> khive_storage::types::SqlRow {
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    reader
+        .query_row(SqlStatement {
+            sql: "SELECT proposal_id, namespace, proposer, title, status, created_at, \
+                  updated_at, expiry, last_decision, review_count, approve_count, reject_count \
+                  FROM proposals_open WHERE proposal_id = ?1 AND namespace = ?2"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(proposal_id.to_string()),
+                SqlValue::Text(ns.to_string()),
+            ],
+            label: Some("test.proposals_open_row_snapshot".into()),
+        })
+        .await
+        .expect("read proposals_open row")
+        .expect("seeded proposals_open row must exist")
+}
+
+/// Every column `revert_applying_to_approved` (`sql/proposals_revert_to_approved.sql`, read at
+/// source) is documented to touch: `SET status = 'approved', updated_at = ?1 WHERE ... AND
+/// status = 'applying'`. The CAS this test drives through is `approved -> applying ->
+/// approved` (`pre_apply_cas` then the revert on failure, `sql/proposals_mark_applying.sql`
+/// touches the same two columns), so `status` nets out unchanged and `updated_at` is the only
+/// column expected to differ.
+const PROPOSALS_OPEN_COLUMNS_UNTOUCHED_BY_THE_FAILURE_LIFECYCLE: &[&str] = &[
+    "proposal_id",
+    "namespace",
+    "proposer",
+    "title",
+    "created_at",
+    "expiry",
+    "last_decision",
+    "review_count",
+    "approve_count",
+    "reject_count",
+];
+
+/// The full `payload_proposal_id`-filtered event history for one proposal, in the store's own
+/// order (`created_at DESC, id DESC`, per `query_events_orders_by_created_at_then_id_desc`):
+/// newest first.
+async fn proposal_events_newest_first(
+    rt: &KhiveRuntime,
+    tok: &NamespaceToken,
+    proposal_id: Uuid,
+) -> Vec<khive_storage::event::Event> {
+    rt.events(tok)
+        .expect("event store")
+        .query_events(
+            khive_storage::EventFilter {
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await
+        .expect("query events for the seeded proposal")
+        .items
+}
+
+/// A whole-store `ProposalCreated` event count. Every creation-refusal test below runs against
+/// its own fresh in-memory runtime, so this is a safe unscoped count: nothing else in that
+/// store can emit this event kind.
+async fn proposal_created_event_count(rt: &KhiveRuntime, tok: &NamespaceToken) -> usize {
+    rt.events(tok)
+        .expect("event store")
+        .query_events(
+            khive_storage::EventFilter {
+                kinds: vec![khive_types::EventKind::ProposalCreated],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await
+        .expect("query ProposalCreated events")
+        .items
+        .len()
+}
+
+/// A bare `AddNote(kind="memory")` proposal is refused at `propose`, before any proposal row
+/// exists.
 #[tokio::test]
-#[serial_test::serial(config_ledger)]
-async fn approved_add_note_changeset_admits_memory_leaving_defaults_unset() {
+async fn propose_add_note_changeset_refuses_memory_kind_before_any_proposal_row() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
     let tok = rt.authorize(Namespace::local()).unwrap();
+    let ns = tok.namespace().as_str().to_owned();
 
-    // `propose`/`review` apply the note directly (via `prepare_add_note`), never through the
-    // shared create hook.
+    let before = registry
+        .dispatch("list", json!({"kind": "proposal"}))
+        .await
+        .expect("list(kind=proposal) must succeed");
+    let before_count = before["items"].as_array().map(Vec::len).unwrap_or(0);
+    let before_created_events = proposal_created_event_count(&rt, &tok).await;
+    let before_notes = notes_kind_count_including_deleted(&rt, &ns, "memory").await;
+
+    let refusal = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title": "a fresh memory add_note proposal",
+                "description": "must be refused before a proposal row is created",
+                "changeset": {"kind": "add_note", "note": {"kind": "memory", "content": "a bare memory draft written through a fresh proposal"}}
+            }),
+        )
+        .await
+        .expect_err("propose must refuse a bare AddNote(kind=memory) changeset");
+    assert_memory_proposal_admission_refused(&refusal);
+
+    let after = registry
+        .dispatch("list", json!({"kind": "proposal"}))
+        .await
+        .expect("list(kind=proposal) must succeed");
+    let after_count = after["items"].as_array().map(Vec::len).unwrap_or(0);
+    assert_eq!(
+        before_count, after_count,
+        "a refused propose must not create a proposal row"
+    );
+    assert_eq!(
+        before_created_events,
+        proposal_created_event_count(&rt, &tok).await,
+        "a refused propose must not append a ProposalCreated event"
+    );
+    assert_eq!(
+        before_notes,
+        notes_kind_count_including_deleted(&rt, &ns, "memory").await,
+        "a refused propose must not write a memory note"
+    );
+}
+
+/// A draft carrying values that look like a complete `memory.remember` call is refused with the
+/// same shape: these fields do not supply the derivation, actor routing, or keyed-replay
+/// contract only `memory.remember` provides.
+#[tokio::test]
+async fn propose_add_note_changeset_refuses_memory_kind_with_complete_looking_defaults() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let ns = tok.namespace().as_str().to_owned();
+    let before_created_events = proposal_created_event_count(&rt, &tok).await;
+    let before_notes = notes_kind_count_including_deleted(&rt, &ns, "memory").await;
+
+    let refusal = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title": "a memory add_note proposal with explicit defaults",
+                "description": "complete-looking defaults must not bypass the refusal",
+                "changeset": {
+                    "kind": "add_note",
+                    "note": {
+                        "kind": "memory",
+                        "content": "a memory draft with explicit defaults written through a proposal",
+                        "properties": {
+                            "memory_type": "episodic",
+                            "salience": 0.3,
+                            "decay_factor": 0.02
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect_err("propose must refuse AddNote(kind=memory) even with complete-looking defaults");
+    assert_memory_proposal_admission_refused(&refusal);
+    assert_eq!(
+        before_created_events,
+        proposal_created_event_count(&rt, &tok).await,
+        "a refused propose must not append a ProposalCreated event"
+    );
+    assert_eq!(
+        before_notes,
+        notes_kind_count_including_deleted(&rt, &ns, "memory").await,
+        "a refused propose must not write a memory note"
+    );
+}
+
+/// The refusal reaches an `AddNote(kind="memory")` nested inside a single-step `Compound`
+/// changeset, not just a top-level `AddNote`.
+#[tokio::test]
+async fn propose_add_note_changeset_refuses_memory_kind_nested_in_compound() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let ns = tok.namespace().as_str().to_owned();
+    let before_created_events = proposal_created_event_count(&rt, &tok).await;
+    let before_notes = notes_kind_count_including_deleted(&rt, &ns, "memory").await;
+
+    let refusal = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title": "a memory add_note nested in a compound changeset",
+                "description": "the walk must reach AddNote nested inside Compound",
+                "changeset": {
+                    "kind": "compound",
+                    "steps": [
+                        {"kind": "add_note", "note": {"kind": "memory", "content": "a memory draft nested inside a compound changeset"}}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect_err("propose must refuse a memory AddNote nested inside a Compound changeset");
+    assert_memory_proposal_admission_refused(&refusal);
+    assert_eq!(
+        before_created_events,
+        proposal_created_event_count(&rt, &tok).await,
+        "a refused propose must not append a ProposalCreated event"
+    );
+    assert_eq!(
+        before_notes,
+        notes_kind_count_including_deleted(&rt, &ns, "memory").await,
+        "a refused propose must not write a memory note"
+    );
+}
+
+/// An `AddNote(kind="observation")` proposal is unaffected: it creates, and an approve review
+/// applies it end to end. This is a different invariant from the trait's default body: `kg`,
+/// which owns `observation`, registers no `KindHook` at all, so `find_kind_hook` returns `None`
+/// and `check_note_proposal_admission` returns early, before any `KindHook::validate_proposal_note`
+/// method, default or overridden, ever runs for this kind. The genuine default-body witness is
+/// `propose_add_note_changeset_admits_task_kind_via_the_proposal_note_hooks_default_body` below:
+/// `task`'s owning pack does register a hook, and that hook does not override this method, so the
+/// trait's default `Ok(())` is the one that runs.
+#[tokio::test]
+async fn propose_add_note_changeset_admits_observation_kind_unaffected_by_the_memory_refusal() {
+    let registry = make_registry(make_runtime());
+
     let propose = registry
         .dispatch(
             "propose",
             json!({
-                "title": "acceptance amendment: AddNote admits the memory kind",
-                "description": "an approved changeset writes the memory kind without the create hook",
-                "changeset": {"kind": "add_note", "note": {"kind": "memory", "content": "residual defaults check via an approved add note changeset route"}}
+                "title": "an observation add_note proposal",
+                "description": "a kind with no proposal-note hook must be unaffected",
+                "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "an observation written through a proposal"}}
             }),
         )
         .await
-        .expect("propose must succeed");
+        .expect("propose must succeed for an AddNote(kind=observation) changeset");
     let proposal_id = propose["id"]
         .as_str()
         .expect("propose returns id")
         .to_string();
+
     registry
         .dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
         .await
-        .expect("approving an add_note memory changeset must succeed");
+        .expect("approving an observation add_note changeset must succeed");
 
-    let recalled_addnote = registry
+    let found = registry
         .dispatch(
-            "memory.recall",
-            json!({"query": "residual defaults check via an approved add note changeset route"}),
+            "list",
+            json!({"kind": "note", "note_kind": "observation", "limit": 50}),
         )
         .await
-        .expect("recall must find the note created by the approved add_note changeset");
-    let recalled_addnote = recalled_addnote.as_array().unwrap();
+        .expect("list must succeed");
+    let items = found["items"].as_array().expect("items array");
     assert!(
-        !recalled_addnote.is_empty(),
-        "recall must find the note created by the approved add_note changeset"
+        items
+            .iter()
+            .any(|item| item["content"] == "an observation written through a proposal"),
+        "the approved observation note must exist after apply: {items:?}"
     );
-    let addnote_hit = &recalled_addnote[0];
-    assert_eq!(addnote_hit["salience"].as_f64(), Some(0.3));
-    assert_eq!(addnote_hit["decay_factor"].as_f64(), Some(0.02));
+}
 
-    let addnote_id: Uuid = addnote_hit["id"].as_str().unwrap().parse().unwrap();
-    let stored_via_addnote = rt
-        .notes(&tok)
-        .unwrap()
-        .get_note(addnote_id)
+/// The seam's genuine default-body witness: `task` (gtd's `TaskHook`) is a note kind whose
+/// owning pack does register a `KindHook`, unlike `observation` above, but that hook's
+/// `impl KindHook` for `TaskHook` (`crates/khive-pack-gtd/src/hook.rs`) does not override
+/// `validate_proposal_note`. `find_kind_hook("task")` therefore returns `Some(TaskHook)`, and
+/// `check_note_proposal_admission` calls `validate_proposal_note` on it, reaching the trait's
+/// own default `Ok(())` body rather than short-circuiting before any hook exists. `prepare_add_note`
+/// dispatches no pack hook and only requires a registered note kind, so a raw `AddNote(kind="task")`
+/// changeset materializes without gtd's task-specific create defaulting; this test only needs the
+/// note to exist after apply, not the full task lifecycle.
+#[tokio::test]
+async fn propose_add_note_changeset_admits_task_kind_via_the_proposal_note_hooks_default_body() {
+    let rt = make_runtime();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(GtdPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt));
+    let registry = builder.build().expect("registry builds");
+
+    let propose = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title": "a task add_note proposal",
+                "description": "a kind whose hook keeps the proposal-note default must be admitted",
+                "changeset": {"kind": "add_note", "note": {"kind": "task", "content": "a task written through a proposal, admitted by the hook's default validate_proposal_note"}}
+            }),
+        )
         .await
-        .unwrap()
-        .expect("note exists");
+        .expect("propose must succeed for an AddNote(kind=task) changeset");
+    let proposal_id = propose["id"]
+        .as_str()
+        .expect("propose returns id")
+        .to_string();
+
+    registry
+        .dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect(
+            "approving a task add_note changeset must succeed through TaskHook's inherited default validate_proposal_note",
+        );
+
+    let found = registry
+        .dispatch("list", json!({"kind": "task", "limit": 50}))
+        .await
+        .expect("list must succeed");
+    let items = found["items"].as_array().expect("items array");
     assert!(
-        stored_via_addnote.salience.is_none(),
-        "an approved add_note changeset must not derive salience"
+        items.iter().any(|item| {
+            item["content"] == "a task written through a proposal, admitted by the hook's default validate_proposal_note"
+        }),
+        "the approved task note must exist after apply: {items:?}"
+    );
+}
+
+/// A proposal approved before this hook existed fails visibly at apply. The pre-upgrade state
+/// is seeded through the same runtime code `propose` and `review(decision="approve")` call
+/// (`ProposalsProjectionWorker::on_proposal_created` / `reviewed_and_emit`, read at source in
+/// `crates/khive-pack-kg/src/projection_worker/mod.rs`), bypassing only the verb-level checks
+/// in `handlers/proposal.rs` (including this amendment's own new admission check, which did not
+/// exist yet). `propose` itself can no longer produce this state going forward; this is exactly
+/// the pre-upgrade scenario ADR-021's amendment names.
+///
+/// The AddNote apply path (`prepare_add_note`, read at source in
+/// `crates/khive-runtime/src/atomic_prepare.rs`) writes exactly two things for a successful
+/// note: a `notes` row and an `fts_notes` row. It creates no `graph_edges` row, and there is no
+/// separate provenance table for a note: a provenance/annotation edge is written only when a
+/// draft carries a `source_id`, a field `NoteDraft` (and therefore `AddNote`) does not have. All
+/// four are asserted unchanged below; `graph_edges` is the direct confirmation of that source
+/// read, not a claim this seam narrows it.
+#[tokio::test]
+async fn apply_of_pre_upgrade_approved_add_note_memory_changeset_fails_visibly_and_writes_nothing()
+{
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let ns = tok.namespace().as_str().to_owned();
+
+    let proposal_id = Uuid::new_v4();
+    let seeded_content = "a pre-upgrade approved memory draft that must never reach storage";
+    let changeset = khive_types::ProposalChangeset::AddNote {
+        note: khive_types::NoteDraft {
+            kind: "memory".to_string(),
+            content: seeded_content.to_string(),
+            name: None,
+            properties: None,
+        },
+    };
+
+    // Seed the ProposalCreated event and the proposals_open insert exactly as `handle_propose`
+    // does: append the event first, then call the same `on_proposal_created` it calls.
+    let created_payload = khive_types::ProposalCreatedPayload {
+        proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+        proposer: "alice".to_string(),
+        title: "pre-upgrade approved memory add_note".to_string(),
+        description: "seeded directly to simulate approval before this hook existed".to_string(),
+        changeset,
+        reviewers: vec![],
+        expiry: None,
+        parent_id: None,
+    };
+    let created_payload_json =
+        serde_json::to_value(&created_payload).expect("serialize seeded created payload");
+    let mut created_event = khive_storage::event::Event::new(
+        ns.as_str(),
+        "propose",
+        khive_types::EventKind::ProposalCreated,
+        khive_storage::SubstrateKind::Entity,
+        "alice",
+    );
+    created_event.payload = created_payload_json.clone();
+    created_event.aggregate_kind = Some("proposal".to_string());
+    created_event.aggregate_id = Some(proposal_id);
+    rt.events(&tok)
+        .expect("event store")
+        .append_event(created_event)
+        .await
+        .expect("append seeded ProposalCreated event");
+    khive_pack_kg::projection_worker::ProposalsProjectionWorker::new(rt.clone())
+        .on_proposal_created(
+            &tok,
+            proposal_id,
+            "alice",
+            "pre-upgrade approved memory add_note",
+            None,
+        )
+        .await
+        .expect("seed the real proposals_open insert (status open)");
+
+    // Seed the ProposalReviewed event and the approving CAS exactly as `handle_review` does for
+    // `decision="approve"`: build the same payload shape and call the same `reviewed_and_emit`
+    // it calls. Reviewer "bob" is distinct from proposer "alice", matching the ordinary shape a
+    // real approval takes; the self-approval guard lives in `handle_review`, not in
+    // `reviewed_and_emit`, so it is not in play here either way.
+    let reviewed_payload = khive_types::ProposalReviewedPayload {
+        proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+        reviewer: "bob".to_string(),
+        decision: khive_types::ProposalDecision::Approve,
+        comment: None,
+    };
+    let review_payload_json =
+        serde_json::to_value(&reviewed_payload).expect("serialize seeded review payload");
+    let mut review_event = khive_storage::event::Event::new(
+        ns.as_str(),
+        "review",
+        khive_types::EventKind::ProposalReviewed,
+        khive_storage::SubstrateKind::Entity,
+        "bob",
+    );
+    review_event.payload = review_payload_json;
+    review_event.aggregate_kind = Some("proposal".to_string());
+    review_event.aggregate_id = Some(proposal_id);
+    let (cas_hit, _review_event_id) =
+        khive_pack_kg::projection_worker::ProposalsProjectionWorker::new(rt.clone())
+            .reviewed_and_emit(&tok, &reviewed_payload, review_event, true)
+            .await
+            .expect("seed the real review CAS update plus ProposalReviewed event");
+    assert!(cas_hit, "seeded review CAS must hit (open -> approved)");
+
+    // Snapshot every table the AddNote apply path can write to, plus the full ordered event
+    // history and the proposals_open row, before the apply attempt.
+    let before_notes = notes_kind_count_including_deleted(&rt, &ns, "memory").await;
+    let before_fts_notes = scalar_count(
+        &rt,
+        "SELECT COUNT(*) FROM fts_notes WHERE namespace = ?1 AND kind = ?2",
+        vec![
+            SqlValue::Text(ns.clone()),
+            SqlValue::Text("memory".to_string()),
+        ],
+    )
+    .await;
+    let before_edges = scalar_count(
+        &rt,
+        "SELECT COUNT(*) FROM graph_edges WHERE namespace = ?1",
+        vec![SqlValue::Text(ns.clone())],
+    )
+    .await;
+    let before_events = proposal_events_newest_first(&rt, &tok, proposal_id).await;
+    assert_eq!(
+        before_events.len(),
+        2,
+        "the seed must leave exactly the ProposalCreated and ProposalReviewed rows: {before_events:?}"
+    );
+    let before_row = proposals_open_row(&rt, &ns, proposal_id).await;
+    assert_eq!(
+        row_text(&before_row, "status").as_deref(),
+        Some("approved"),
+        "the seeded row must read back approved before the apply attempt"
+    );
+
+    let apply_result = khive_pack_kg::apply_worker::ProposalApplyWorker::new(rt.clone())
+        .maybe_apply_with_report(&tok, proposal_id, &registry, None)
+        .await;
+    assert!(
+        apply_result.is_ok(),
+        "apply-time refusal surfaces through the existing failed-apply lifecycle, not as an \
+         Err from maybe_apply_with_report: {apply_result:?}"
+    );
+
+    // Storage-level counts, not a retrieval result: `memory.recall` is a ranked hybrid search,
+    // and an empty result does not by itself prove nothing was written. These read every table
+    // the apply path can write to, directly.
+    assert_eq!(
+        before_notes,
+        notes_kind_count_including_deleted(&rt, &ns, "memory").await,
+        "a refused apply must write no memory note (notes, including deleted)"
+    );
+    assert_eq!(
+        before_fts_notes,
+        scalar_count(
+            &rt,
+            "SELECT COUNT(*) FROM fts_notes WHERE namespace = ?1 AND kind = ?2",
+            vec![
+                SqlValue::Text(ns.clone()),
+                SqlValue::Text("memory".to_string()),
+            ],
+        )
+        .await,
+        "a refused apply must write no fts_notes row"
+    );
+    assert_eq!(
+        before_edges,
+        scalar_count(
+            &rt,
+            "SELECT COUNT(*) FROM graph_edges WHERE namespace = ?1",
+            vec![SqlValue::Text(ns.clone())],
+        )
+        .await,
+        "a refused apply must write no graph_edges row (AddNote's apply path never writes one)"
+    );
+
+    let after_events = proposal_events_newest_first(&rt, &tok, proposal_id).await;
+    assert_eq!(
+        after_events.len(),
+        3,
+        "a failed apply must append exactly one event to the two seeded rows: {after_events:?}"
+    );
+    assert_eq!(
+        after_events[0].kind,
+        khive_types::EventKind::ProposalApplied,
+        "the newest row (created_at DESC) must be the appended ProposalApplied event: {after_events:?}"
     );
     assert!(
-        stored_via_addnote.decay_factor.is_none(),
-        "an approved add_note changeset must not derive decay_factor"
+        after_events[0].payload["result"]["failed"]["error"].is_string(),
+        "the appended ProposalApplied event must carry the Failed variant (externally tagged \
+         as \"failed\"): {:?}",
+        after_events[0].payload
+    );
+    assert_eq!(
+        &after_events[1..],
+        before_events.as_slice(),
+        "the two seeded rows must read back byte-identical, in the same order, behind the \
+         appended row: before={before_events:?} after={after_events:?}"
+    );
+
+    let after_row = proposals_open_row(&rt, &ns, proposal_id).await;
+    for column in PROPOSALS_OPEN_COLUMNS_UNTOUCHED_BY_THE_FAILURE_LIFECYCLE
+        .iter()
+        .copied()
+    {
+        assert_eq!(
+            format!("{:?}", before_row.get(column)),
+            format!("{:?}", after_row.get(column)),
+            "column {column:?} must be unchanged by the failure lifecycle"
+        );
+    }
+    assert_eq!(
+        row_text(&after_row, "status").as_deref(),
+        Some("approved"),
+        "status must read back approved: approved -> applying -> approved nets to the value it \
+         started at"
+    );
+    assert!(
+        row_i64(&after_row, "updated_at") > row_i64(&before_row, "updated_at"),
+        "updated_at is the one column the approved -> applying -> approved lifecycle is \
+         documented to move (proposals_mark_applying.sql, proposals_revert_to_approved.sql): \
+         before={before_row:?} after={after_row:?}"
     );
 }
 
@@ -6291,5 +6854,80 @@ async fn stream_append_refuses_memory_kind_and_names_memory_remember() {
     assert!(
         refusal.to_string().contains("memory.remember"),
         "the refusal must name the owning writer: {refusal}"
+    );
+}
+
+/// Bulk `create(items=[...])` reaches the same owner refusal as a singleton create. Under
+/// `atomic: false` each memory item is its own failure naming `memory.remember` while an ordinary
+/// sibling commits; an atomic batch holding one memory item is refused as a whole.
+#[tokio::test]
+async fn bulk_create_refuses_a_memory_note_item_in_both_modes() {
+    let registry = make_registry(make_runtime());
+
+    let resp = registry
+        .dispatch(
+            "create",
+            json!({
+                "atomic": false,
+                "items": [
+                    {"kind": "observation", "content": "an ordinary sibling in a bulk batch"},
+                    {"kind": "memory", "content": "a memory through bulk create"},
+                    {"kind": "note", "note_kind": "memory", "content": "a memory through the note spelling"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create must return per-item results");
+    assert_eq!(resp["created"], 1, "{resp}");
+    assert_eq!(resp["failed"], 2, "{resp}");
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results[0]["ok"], true, "{resp}");
+    for idx in [1, 2] {
+        assert_eq!(results[idx]["ok"], false, "{resp}");
+        assert_eq!(
+            results[idx]["domain_disposition"], "not_committed",
+            "{resp}"
+        );
+        let message = results[idx]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("memory.remember"),
+            "item {idx} must name the verb that owns the kind: {message}"
+        );
+    }
+
+    let refusal = registry
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "observation", "content": "an ordinary sibling in an atomic batch"},
+                    {"kind": "memory", "content": "a memory in an atomic batch"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("an atomic batch holding a memory item must be refused");
+    assert!(
+        refusal.to_string().contains("memory.remember"),
+        "the atomic refusal must name the verb that owns the kind: {refusal}"
+    );
+
+    let memories = registry
+        .dispatch("list", json!({"kind": "memory"}))
+        .await
+        .expect("listing memories must succeed");
+    assert_eq!(
+        memories["items"].as_array().map(Vec::len),
+        Some(0),
+        "no memory row may be written by bulk create: {memories}"
+    );
+    let observations = registry
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("listing observations must succeed");
+    assert_eq!(
+        observations["items"].as_array().map(Vec::len),
+        Some(1),
+        "only the best-effort sibling may be stored: {observations}"
     );
 }

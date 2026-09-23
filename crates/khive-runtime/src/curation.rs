@@ -711,44 +711,114 @@ impl EntityMergeRefusal {
 }
 
 #[derive(Debug)]
-enum MergeEntitySqlError {
+enum MergeSqlError {
     Sqlite(SqliteError),
-    Refusal(EntityMergeRefusal),
+    Refusal(RuntimeError),
 }
 
-impl std::fmt::Display for MergeEntitySqlError {
+impl std::fmt::Display for MergeSqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Sqlite(error) => std::fmt::Display::fmt(error, f),
-            Self::Refusal(_) => f.write_str("entity merge refused by transactional policy"),
+            Self::Refusal(_) => f.write_str("merge refused by transactional policy"),
         }
     }
 }
 
-impl std::error::Error for MergeEntitySqlError {}
+impl std::error::Error for MergeSqlError {}
 
-impl From<SqliteError> for MergeEntitySqlError {
+impl From<SqliteError> for MergeSqlError {
     fn from(error: SqliteError) -> Self {
         Self::Sqlite(error)
     }
 }
 
-impl From<rusqlite::Error> for MergeEntitySqlError {
+impl From<rusqlite::Error> for MergeSqlError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(SqliteError::Rusqlite(error))
     }
 }
 
+/// Recover only our semantic refusal after the writer has confirmed rollback.
+/// Other sources retain the request-state envelope and every driver field.
+fn recover_rolled_back_merge_refusal(
+    error: khive_storage::StorageError,
+) -> Result<RuntimeError, khive_storage::StorageError> {
+    use khive_storage::{StorageError, WriterTaskRequestState};
+
+    let source = match error {
+        StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source,
+        } => source,
+        error => return Err(error),
+    };
+    let source = match *source {
+        StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } => match source.downcast::<MergeSqlError>() {
+            Ok(error) => match *error {
+                MergeSqlError::Refusal(error) => return Ok(error),
+                error => StorageError::driver(capability, operation, error),
+            },
+            Err(source) => StorageError::Driver {
+                capability,
+                operation,
+                source,
+            },
+        },
+        error => error,
+    };
+    Err(StorageError::WriterTaskRequestFailed {
+        request_state: WriterTaskRequestState::TransactionRolledBack,
+        source: Box::new(source),
+    })
+}
+
 fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    let error = match recover_rolled_back_merge_refusal(error) {
+        Ok(refusal) => return refusal,
+        Err(error) => error,
+    };
     match error {
         khive_storage::StorageError::Driver {
             capability,
             operation,
             source,
-        } => match source.downcast::<MergeEntitySqlError>() {
+        } => match source.downcast::<MergeSqlError>() {
             Ok(error) => match *error {
-                MergeEntitySqlError::Sqlite(error) => RuntimeError::Sqlite(error),
-                MergeEntitySqlError::Refusal(error) => error.into_runtime_error(),
+                MergeSqlError::Sqlite(error) => RuntimeError::Sqlite(error),
+                MergeSqlError::Refusal(error) => error,
+            },
+            Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
+                capability,
+                operation,
+                source,
+            }),
+        },
+        error => RuntimeError::Storage(error),
+    }
+}
+
+fn map_merge_note_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    let error = match recover_rolled_back_merge_refusal(error) {
+        Ok(refusal) => return refusal,
+        Err(error) => error,
+    };
+    match error {
+        khive_storage::StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } => match source.downcast::<MergeSqlError>() {
+            Ok(error) => match *error {
+                MergeSqlError::Refusal(error) => error,
+                // Preserve the existing note route's storage error envelope.
+                MergeSqlError::Sqlite(error) => RuntimeError::Storage(
+                    khive_storage::StorageError::driver(capability, operation, error),
+                ),
             },
             Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
                 capability,
@@ -1178,6 +1248,19 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        self.update_entity_with_expected_version_and_embedding_report(token, id, patch, None)
+            .await
+    }
+
+    /// Entity update with an optional caller revision, checked inside the writer transaction.
+    pub async fn update_entity_with_expected_version_and_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        expected_version: Option<i64>,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        crate::entity_write::validate_expected_version(expected_version)?;
         let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_update_entity(token, id, patch).await?;
 
@@ -1188,6 +1271,7 @@ impl KhiveRuntime {
             changed_fields,
             expected_updated_at,
             expected_deleted_at,
+            expected_version,
         )
         .await
     }
@@ -1223,27 +1307,78 @@ impl KhiveRuntime {
                 changed_fields,
                 expected_updated_at,
                 expected_deleted_at,
+                None,
             )
             .await?
             .0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn persist_prepared_entity_update(
         &self,
         token: &NamespaceToken,
-        entity: Entity,
+        mut entity: Entity,
         reindex_required: bool,
         changed_fields: Vec<&'static str>,
         expected_updated_at: i64,
         expected_deleted_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         let id = entity.id;
-        let store = self.entities(token)?;
-        let persisted = store
-            .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
-            .await?;
-        if !persisted {
-            return Err(stale_entity_snapshot_error(id));
+        let _ = self.entities(token)?;
+        let next_version = entity
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
+        use crate::atomic_plan::{AffectedRowGuard, PlanStatement, PostCommitEffect, UpdatePlan};
+        use crate::atomic_runner::{
+            run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome,
+        };
+        let plan = UpdatePlan {
+            target_id: id,
+            statements: vec![PlanStatement {
+                statement: khive_db::stores::entity::entity_replace_if_unchanged_statement(
+                    &entity,
+                    expected_updated_at,
+                    expected_deleted_at,
+                ),
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
+            idempotent_noop: false,
+            entity_guard: expected_version.map(|expected_version| {
+                crate::entity_write::EntityWriteGuard {
+                    id,
+                    expected_version,
+                }
+            }),
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
+            graph_effects: Vec::new(),
+        };
+        match run_atomic_unit(
+            self.sql().as_ref(),
+            vec![AtomicOpPlan::Update(Box::new(plan))],
+        )
+        .await
+        {
+            Ok(AtomicRunOutcome::Committed { .. }) => entity.version = next_version,
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::EntityConflict(conflict),
+                ..
+            }) => return Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::GuardFailed { .. },
+                ..
+            }) => return Err(stale_entity_snapshot_error(id)),
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                return Err(RuntimeError::Internal(format!(
+                    "entity update rolled back: {failure:?}"
+                )))
+            }
+            Err(error) => return Err(RuntimeError::Storage(error.0)),
         }
 
         let embedding_report = if reindex_required {
@@ -1473,8 +1608,8 @@ impl KhiveRuntime {
                         merge_event_id,
                     )
                     .map_err(|error| match error {
-                        MergeEntitySqlError::Sqlite(error) => error,
-                        MergeEntitySqlError::Refusal(error) => {
+                        MergeSqlError::Sqlite(error) => error,
+                        MergeSqlError::Refusal(error) => {
                             refusal = Some(error);
                             SqliteError::InvalidData(
                                 "entity merge refused by transactional policy".to_string(),
@@ -1483,7 +1618,7 @@ impl KhiveRuntime {
                     })
                 });
                 match refusal {
-                    Some(error) => Err(error.into_runtime_error()),
+                    Some(error) => Err(error),
                     None => result.map_err(RuntimeError::from),
                 }
             })
@@ -2018,7 +2153,7 @@ impl KhiveRuntime {
         let (note, plan) = self
             .prepare_versioned_note_update(token, snapshot, patch)
             .await?;
-        self.commit_prepared_note_update(token, note, crate::AtomicOpPlan::Update(plan))
+        self.commit_prepared_note_update(token, note, crate::AtomicOpPlan::Update(Box::new(plan)))
             .await
     }
 
@@ -2780,11 +2915,12 @@ impl KhiveRuntime {
                     })
                 })
                 .await
-                .map_err(RuntimeError::Storage)?
+                .map_err(map_merge_note_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
                 let guard = pool.writer()?;
-                guard.transaction(|conn| {
+                let mut refusal = None;
+                let result = guard.transaction(|conn| {
                     merge_note_sql(
                         conn,
                         ns,
@@ -2799,7 +2935,20 @@ impl KhiveRuntime {
                         preserve_owner_established,
                         MergeTxLimits::default(),
                     )
-                })
+                    .map_err(|error| match error {
+                        MergeSqlError::Sqlite(error) => error,
+                        MergeSqlError::Refusal(error) => {
+                            refusal = Some(error);
+                            SqliteError::InvalidData(
+                                "note merge refused by transactional policy".to_string(),
+                            )
+                        }
+                    })
+                });
+                match refusal {
+                    Some(error) => Err(error),
+                    None => result.map_err(RuntimeError::from),
+                }
             })
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
@@ -3069,7 +3218,7 @@ fn read_merge_entity(
          created_at, updated_at, deleted_at, merged_into, merge_event_id, \
          (SELECT a.content_ref FROM attachments AS a \
           WHERE a.record_uuid = entities.id AND a.substrate = 'entity' \
-            AND a.role = 'content') AS content_ref \
+            AND a.role = 'content') AS content_ref, entities.version \
          FROM entities WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -3091,6 +3240,7 @@ fn read_merge_entity(
     let merged_into_str: Option<String> = row.get(11)?;
     let merge_event_id_str: Option<String> = row.get(12)?;
     let content_ref: Option<String> = row.get(13)?;
+    let version: i64 = row.get(14)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -3128,6 +3278,7 @@ fn read_merge_entity(
         tags,
         created_at,
         updated_at,
+        version,
         deleted_at,
         merged_into,
         merge_event_id,
@@ -3160,7 +3311,7 @@ fn merge_entity_sql(
     validation: EntityMergeValidation,
     limits: MergeTxLimits,
     merge_event_id: Uuid,
-) -> Result<(MergeSummary, Entity), MergeEntitySqlError> {
+) -> Result<(MergeSummary, Entity), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Config-scaled fanout (one FTS/vector delete per table, one contract rule
     // set per pack) is charged in bytes only: it is bounded by configuration,
@@ -3185,20 +3336,28 @@ fn merge_entity_sql(
     )?;
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
+    // ADR-115 A1: no production stamp is admitted yet. Check both guarded
+    // preimages, even when the chosen fold would discard or replace a key.
+    for properties in [&into_entity.properties, &from_entity.properties] {
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())
+            .map_err(MergeSqlError::Refusal)?;
+    }
+
     match validation {
         EntityMergeValidation::LegacyKind if into_entity.kind != from_entity.kind => {
-            return Err(MergeEntitySqlError::Refusal(
+            return Err(MergeSqlError::Refusal(
                 EntityMergeRefusal::LegacyKind {
                     into_id,
                     into_kind: into_entity.kind,
                     from_id,
                     from_kind: from_entity.kind,
-                },
+                }
+                .into_runtime_error(),
             ));
         }
         EntityMergeValidation::SafetyFloor => {
             validate_entity_merge_floor(&into_entity, &from_entity).map_err(|guard| {
-                MergeEntitySqlError::Refusal(EntityMergeRefusal::SafetyFloor(guard))
+                MergeSqlError::Refusal(EntityMergeRefusal::SafetyFloor(guard).into_runtime_error())
             })?;
         }
         EntityMergeValidation::LegacyKind | EntityMergeValidation::Forced => {}
@@ -3286,6 +3445,8 @@ fn merge_entity_sql(
     // --- Merge entity fields ---
     let (merged_props, properties_merged) =
         merge_properties(&into_entity.properties, &from_entity.properties, strategy);
+    crate::secret_gate::reject_reserved_secret_gate_property(merged_props.as_ref())
+        .map_err(MergeSqlError::Refusal)?;
     let merged_name = merge_string_field(&into_entity.name, &from_entity.name, strategy);
     let (merged_description, content_appended) = match content_strategy {
         ContentMergeStrategy::Append => {
@@ -3519,7 +3680,7 @@ fn merge_entity_sql(
         // entity-owned content_ref were lost this way; khive#1214). Attachments
         // now live in their own table and this targeted UPDATE leaves them alone.
         conn.execute(
-            "UPDATE entities SET \
+            "UPDATE entities SET version = version + 1, \
                  name = ?1, description = ?2, properties = ?3, tags = ?4, \
                  updated_at = ?5, merged_into = NULL, merge_event_id = NULL \
              WHERE namespace = ?6 AND id = ?7",
@@ -3609,7 +3770,7 @@ fn merge_entity_sql(
 
         conn.execute(
             "UPDATE entities \
-             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1 \
+             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1, version = version + 1 \
              WHERE namespace = ?4 AND id = ?5 AND deleted_at IS NULL",
             rusqlite::params![
                 now,
@@ -3635,6 +3796,14 @@ fn merge_entity_sql(
         deleted_at: into_entity.deleted_at,
         merged_into: None,
         merge_event_id: None,
+        version: if dry_run {
+            into_entity.version
+        } else {
+            into_entity
+                .version
+                .checked_add(1)
+                .ok_or_else(|| SqliteError::InvalidData("entity version overflow".into()))?
+        },
         content_ref: into_entity.content_ref,
     };
 
@@ -3798,7 +3967,7 @@ fn merge_note_sql(
     pack_rules: Vec<EdgeEndpointRule>,
     preserve_owner_established: bool,
     limits: MergeTxLimits,
-) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
+) -> Result<(MergeSummary, khive_storage::note::Note), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Same accounting as `merge_entity_sql`: config-scaled fanout in bytes only.
     budget.charge(
@@ -3821,11 +3990,19 @@ fn merge_note_sql(
     )?;
     let from_note = read_merge_note(conn, from_id, &namespace)?;
 
+    // Preimages are read in the same guarded unit as the eventual mutation.
+    // Checking only the fold would allow a stamp to be discarded by a merge.
+    for properties in [&into_note.properties, &from_note.properties] {
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())
+            .map_err(MergeSqlError::Refusal)?;
+    }
+
     if into_note.kind != from_note.kind {
         return Err(SqliteError::InvalidData(format!(
             "cannot merge notes of different kinds: {} vs {}",
             into_note.kind, from_note.kind
-        )));
+        ))
+        .into());
     }
 
     // A quarantined message participates in no merges, in either role. Folding
@@ -3839,7 +4016,7 @@ fn merge_note_sql(
         return Err(SqliteError::InvalidData(
             "cannot merge a quarantined message: quarantine disposition is              transport-owned and must be released by the channel-ingest path              before the content can be folded into another record"
                 .to_string(),
-        ));
+        ).into());
     }
 
     let now = chrono::Utc::now().timestamp_micros();
@@ -3973,6 +4150,8 @@ fn merge_note_sql(
         "content_strategy": format!("{:?}", content_strategy),
     });
     let merged_props = append_merge_history(merged_props, merge_history_entry)?;
+    crate::secret_gate::reject_reserved_secret_gate_property(merged_props.as_ref())
+        .map_err(MergeSqlError::Refusal)?;
 
     let merged_salience = max_option_f64(into_note.salience, from_note.salience);
     let merged_expires_at = match (into_note.expires_at, from_note.expires_at) {
@@ -4702,6 +4881,9 @@ pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usiz
 // an internal invariant not suitable for the public API surface. Broad
 // behavioral curation tests live in tests/integration.rs.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod merge_reservation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6128,6 +6310,7 @@ mod tests {
         }));
         assert!(updated.updated_at > entity.updated_at);
         expected.updated_at = updated.updated_at;
+        expected.version = entity.version + 1;
         assert_eq!(serde_json::json!(updated), serde_json::json!(expected));
         assert_eq!(
             serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
@@ -6802,23 +6985,11 @@ mod tests {
         );
     }
 
-    /// Isolating fixture for the `AND deleted_at IS ?14` conjunct of
-    /// `entity_replace_if_unchanged_statement`.
-    ///
-    /// The revision-based race fixtures cannot reach it, because a soft delete
-    /// does not move the revision: `entity_soft_delete_statement` is
-    /// `SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL` and never
-    /// touches `updated_at`. So a writer holding a pre-delete snapshot still has
-    /// the CORRECT expected revision after the row is tombstoned, and its
-    /// replacement revision still advances. Every conjunct except `?14` is
-    /// satisfied, and dropping `?14` would let that writer's `deleted_at = NULL`
-    /// land — resurrecting a tombstone, with no revision conflict anywhere to
-    /// signal it.
-    ///
-    /// This fixture does not merely claim that isolation, it asserts it: both
-    /// other conjuncts are checked against the post-delete row before the CAS
-    /// runs, so a future change that makes one of them refuse instead turns this
-    /// test red rather than silently converting it into a whole-guard test.
+    /// Isolate the deletion-marker guard from both timestamp and persisted
+    /// version guards. Soft deletion leaves updated_at unchanged but advances
+    /// version; this fixture deliberately supplies the current version with
+    /// its stale pre-delete marker so dropping that marker alone permits an
+    /// unintended resurrection.
     #[tokio::test]
     async fn entity_cas_refuses_a_stale_replacement_that_would_resurrect_a_tombstone() {
         let rt = rt();
@@ -6838,7 +7009,7 @@ mod tests {
         let id = entity.id;
 
         // Snapshot BEFORE the delete: this is the stale writer's view.
-        let (replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+        let (mut replacement, _, _, expected_updated_at, expected_deleted_at) = rt
             .prepare_update_entity(
                 &tok,
                 id,
@@ -6864,6 +7035,12 @@ mod tests {
             .await
             .expect("read tombstone")
             .expect("row still present after soft delete");
+
+        // Isolate the deletion marker from the independent persisted-version
+        // guard added in #2673: this test intentionally supplies the current
+        // version while retaining the stale pre-delete marker.
+        assert_eq!(tombstoned.version, replacement.version + 1);
+        replacement.version = tombstoned.version;
 
         // Prove the isolation rather than asserting it in prose. `?13` matches
         // because the soft delete left the revision alone, and `?8 > updated_at`
@@ -6957,7 +7134,7 @@ mod tests {
             let guard = pool.writer().expect("writer connection");
             guard
                 .execute(
-                    "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
+                    "UPDATE entities SET version = version + 1, updated_at = ?1 WHERE id = ?2",
                     rusqlite::params![future_micros, id_str],
                 )
                 .expect("force future revision")
@@ -9370,7 +9547,7 @@ mod tests {
         let mut writer = rt.sql().writer().await.expect("sql writer");
         let cleared = writer
             .execute(khive_storage::SqlStatement {
-                sql: "UPDATE entities SET deleted_at = NULL \
+                sql: "UPDATE entities SET version = version + 1, deleted_at = NULL \
                       WHERE id = ?1 AND merged_into IS NOT NULL"
                     .to_string(),
                 params: vec![SqlValue::Text(from.id.to_string())],
@@ -12521,8 +12698,8 @@ mod tests {
                     Uuid::new_v4(),
                 )
                 .map_err(|error| match error {
-                    MergeEntitySqlError::Sqlite(error) => error,
-                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                    MergeSqlError::Sqlite(error) => error,
+                    MergeSqlError::Refusal(_) => SqliteError::InvalidData(
                         "unexpected transactional policy refusal".to_string(),
                     ),
                 })
@@ -12563,8 +12740,8 @@ mod tests {
                     Uuid::new_v4(),
                 )
                 .map_err(|error| match error {
-                    MergeEntitySqlError::Sqlite(error) => error,
-                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                    MergeSqlError::Sqlite(error) => error,
+                    MergeSqlError::Refusal(_) => SqliteError::InvalidData(
                         "unexpected transactional policy refusal".to_string(),
                     ),
                 })
@@ -12693,6 +12870,12 @@ mod tests {
                     false,
                     limits,
                 )
+                .map_err(|error| match error {
+                    MergeSqlError::Sqlite(error) => error,
+                    MergeSqlError::Refusal(_) => SqliteError::InvalidData(
+                        "unexpected transactional policy refusal".to_string(),
+                    ),
+                })
             })
         })
         .await
@@ -12953,7 +13136,7 @@ mod tests {
             let guard = pool.writer().unwrap();
             guard.transaction(|conn| {
                 conn.execute(
-                    "UPDATE entities SET properties = ?1 WHERE id = ?2",
+                    "UPDATE entities SET version = version + 1, properties = ?1 WHERE id = ?2",
                     rusqlite::params![huge_malformed_properties, from_id.to_string()],
                 )?;
                 Ok(())

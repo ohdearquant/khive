@@ -2192,6 +2192,97 @@ async fn run_exec_inline(
     .await;
 }
 
+/// Bound on how long [`settle_exec_storage_before_return`] waits for one
+/// writer-task join. Matches the bound the settle-contract test at
+/// `khive-mcp/src/serve.rs` asserts on the identical join.
+const EXEC_STORAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Settle a short-lived exec invocation's storage before its
+/// [`KhiveMcpServer`] is dropped, so the last connection SQLite closes on
+/// this database is always writable and can checkpoint the WAL away
+/// (#3089). Every failure here is logged and swallowed: this never changes
+/// the caller's returned result. `code_ingest.rs`'s own writer-task-join
+/// drain (`settle_writer_drain`) instead fails the whole call when its
+/// ingest succeeded and the drain then timed out, because that command
+/// documents "return implies settled". These exec dispatch paths make no
+/// such durability promise today, so this settle stays advisory: bail on a
+/// stuck writer task here would be a new exec failure mode with no
+/// existing contract requiring it.
+///
+/// Order matters, and mirrors the settle-contract test at
+/// `khive-mcp/src/serve.rs` (take joins, drop the owner, await
+/// the joins) plus `code_ingest.rs`'s reason for awaiting a
+/// writer-task join at all before returning:
+///
+/// 1. Drain the ADR-133 audit-batch supervisor first
+///    (`KhiveMcpServer::shutdown_audit_batch`), following the shutdown
+///    order `VerbRegistry::shutdown_audit_batch` documents. The supervisor
+///    is a detached task that holds a clone of the audit `EventStore`
+///    while it commits already-accepted rows and exits once its queue
+///    drains. Draining it here means no such clone outlives this call, so
+///    dropping the server in step 3 releases every storage reference the
+///    server's registry held.
+/// 2. Take every pool's writer-task join BEFORE dropping the server: once
+///    the server and every local clone taken here are gone, there is no
+///    live reference left to reach the field through.
+/// 3. Drop the server. With the supervisor's clone released in step 1 and
+///    no local clones outstanding from step 2, this drops the server's own
+///    `Arc<ConnectionPool>` clones. If those were a pool's last
+///    references, `ConnectionPool::drop` (`crates/khive-db/src/pool.rs`)
+///    runs here: it closes every read-only reader before its own writer
+///    connection, so a reader is never that pool's own last closer, and
+///    the writer-task's channel sender (the pool's last field to drop) is
+///    what actually signals the writer task to exit.
+/// 4. Await each taken join, bounded. Dropping the sender in step 3 only
+///    signals the writer task, a separate `tokio::spawn`ed task owning its
+///    own standalone writable connection, to exit; it still has to run and
+///    close that connection on its own schedule. Awaiting it here,
+///    inside this still-running executor, is what makes that close happen
+///    in this sequence instead of racing Tokio runtime shutdown, which
+///    drops idle tasks in random per-worker order.
+///
+/// Together, steps 3 and 4 mean the only two connections capable of
+/// closing last on this database (a pool's own writer connection and its
+/// writer task's standalone connection) are both writable; neither is ever
+/// a read-only reader, so the last real closer can always take the
+/// EXCLUSIVE lock SQLite needs to checkpoint.
+async fn settle_exec_storage_before_return(server: KhiveMcpServer) {
+    if let Err(reason) = server.shutdown_audit_batch().await {
+        tracing::warn!(
+            reason = ?reason,
+            "exec: audit-batch drain did not complete cleanly before storage settle"
+        );
+    }
+
+    let mut writer_task_joins = Vec::new();
+    if let Some(pool) = server.pool() {
+        if let Some(join) = pool.take_writer_task_join() {
+            writer_task_joins.push(join);
+        }
+    }
+    for pool in server.secondary_pools() {
+        if let Some(join) = pool.take_writer_task_join() {
+            writer_task_joins.push(join);
+        }
+    }
+
+    drop(server);
+
+    for join in writer_task_joins {
+        match tokio::time::timeout(EXEC_STORAGE_SETTLE_TIMEOUT, join).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
+                %error,
+                "exec: a writer task panicked while settling storage before return"
+            ),
+            Err(_) => tracing::warn!(
+                timeout = ?EXEC_STORAGE_SETTLE_TIMEOUT,
+                "exec: a writer task did not settle before returning"
+            ),
+        }
+    }
+}
+
 /// Inner implementation of `run_exec_inline`, parameterised over the daemon
 /// forwarding function.  On Unix the real caller passes `forward_or_spawn_boxed`;
 /// tests pass a spy to assert that the strict-actor gate fires BEFORE any
@@ -2415,14 +2506,24 @@ async fn run_exec_inline_with_forward(
         request_id: None,
     };
 
-    let output = server
+    let dispatch_result = server
         .dispatch_request_local_for_exec(params, strict)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let output = prepare_exec_output(&output, strict);
-    println!("{output}");
-    enforce_strict_batch_result(&output, strict)?;
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("{e}"));
+
+    // Every branch below reaches the same tail: settle storage before this
+    // function (and, for a daemonless invocation, the process) returns,
+    // regardless of whether dispatch or the strict-batch check failed.
+    let final_result = match dispatch_result {
+        Ok(raw_output) => {
+            let output = prepare_exec_output(&raw_output, strict);
+            println!("{output}");
+            enforce_strict_batch_result(&output, strict)
+        }
+        Err(error) => Err(error),
+    };
+    settle_exec_storage_before_return(server).await;
+    final_result
 }
 
 /// Build the server used whenever `kkernel exec` dispatches a request locally
@@ -2643,7 +2744,7 @@ async fn run_exec_ops_file(
         .snapshot
         .rewind()
         .context("rewind validated ops-file snapshot for dispatch")?;
-    apply_ops_file_reader_with_dispatch_mode(
+    let dispatch_result = apply_ops_file_reader_with_dispatch_mode(
         &server,
         std::io::BufReader::new(validated.snapshot),
         validated.total,
@@ -2658,7 +2759,12 @@ async fn run_exec_ops_file(
         },
     )
     .await
-    .map(|_| ())
+    .map(|_| ());
+
+    // Settle storage before this function (and, for a daemonless
+    // invocation, the process) returns, regardless of dispatch outcome.
+    settle_exec_storage_before_return(server).await;
+    dispatch_result
 }
 
 #[cfg(test)]
@@ -3403,6 +3509,26 @@ mod tests {
             .is_err(),
             "--serial and --atomic are distinct execution contracts and must conflict"
         );
+    }
+
+    #[test]
+    fn atomic_takes_no_inline_batch_of_chains() {
+        // The cross-op atomic unit reads an ops file, one JSON op per line, so
+        // no inline DSL reaches its admission check: a bracketed batch of
+        // chains is refused at the same argument boundary as a flat batch.
+        for ops in ["[stats() | stats(), stats()]", "[stats(), stats()]"] {
+            let error = ExecArgs::try_parse_from(["exec", ops, "--atomic"])
+                .expect_err("--atomic with inline ops must fail during CLI parsing");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{ops}: {error}"
+            );
+        }
+        let atomic =
+            ExecArgs::try_parse_from(["exec", "--ops-file", "/tmp/batch.jsonl", "--atomic"])
+                .expect("--atomic must be accepted with an ops file");
+        assert!(atomic.atomic);
     }
 
     // ── isolated DB helpers ────────────────────────────────────────────────────
@@ -5117,6 +5243,87 @@ id = "lambda:fallback"
             serial_response["results"][0]["result"]["items"],
             serde_json::json!([]),
             "serial whole-snapshot preflight must reject before its first write"
+        );
+    }
+
+    /// #3089 end-to-end witness: a daemonless write dispatched through
+    /// `run_exec_ops_file` must leave no `-wal`/`-shm` sidecar once it
+    /// returns. `run_exec_ops_file` never attempts daemon forwarding (see
+    /// its own doc comment), so this drives the real in-process dispatch
+    /// path deterministically without a spy or `KHIVE_NO_DAEMON`, and it
+    /// exercises the same `settle_exec_storage_before_return` helper that
+    /// `run_exec_inline_with_forward` calls at its own tail, including the
+    /// ADR-133 audit-batch drain (`with_mounted_packs`,
+    /// `khive-mcp/src/server.rs`, wires an `EventStore` for every
+    /// non-read-only runtime this test's writable config builds) and the
+    /// writer-task join. `pool_drop_never_leaves_a_reader_as_the_last_connection_closed`
+    /// (`khive-db/src/pool.rs`) already covers `ConnectionPool::drop` in
+    /// isolation; this test covers the caller that owns the process exit
+    /// path around it.
+    #[tokio::test]
+    async fn ops_file_write_leaves_no_wal_sidecar_after_return() {
+        use std::io::Write as _;
+
+        let db_dir = tempfile::tempdir().expect("db dir");
+        let db_path = db_dir.path().join("close-order.db");
+        let db_path_str = db_path.to_str().expect("utf8").to_string();
+        let wal = {
+            let mut name = db_path.file_name().unwrap().to_os_string();
+            name.push("-wal");
+            db_path.parent().unwrap().join(name)
+        };
+        let shm = {
+            let mut name = db_path.file_name().unwrap().to_os_string();
+            name.push("-shm");
+            db_path.parent().unwrap().join(name)
+        };
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        source
+            .write_all(
+                b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"wal-sidecar-witness\"}}\n",
+            )
+            .expect("write create op");
+
+        let cfg = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+
+        run_exec_ops_file(
+            source.path().to_path_buf(),
+            cfg,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(db_path_str),
+                anchor: Some(db_path),
+                config: Some(config_path),
+            },
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect("ops-file write must succeed");
+
+        assert!(
+            !wal.exists(),
+            "a daemonless write through run_exec_ops_file must not leave a -wal sidecar behind after return"
+        );
+        assert!(
+            !shm.exists(),
+            "a daemonless write through run_exec_ops_file must not leave a -shm sidecar behind after return"
         );
     }
 

@@ -88,18 +88,42 @@ pub(crate) struct PolicyRow {
     pub note: Option<String>,
     pub created_at: i64,
     pub created_by: Option<String>,
+    pub updated_at: i64,
+    pub updated_by: Option<String>,
+    pub history: Vec<Value>,
+    pub deleted_at: Option<i64>,
+    pub deleted_by: Option<String>,
 }
 
 impl PolicyRow {
-    fn from_row(row: &SqlRow) -> Option<Self> {
-        Some(Self {
-            id: text(row, "id")?,
-            actor: text(row, "actor")?,
-            tool: text(row, "tool")?,
-            decision: text(row, "decision")?,
+    fn from_row(row: &SqlRow) -> Result<Self, RuntimeError> {
+        let required = |column: &str| {
+            text(row, column)
+                .ok_or_else(|| RuntimeError::Internal(format!("tool policy row has no {column}")))
+        };
+        let id = required("id")?;
+        let created_at = int(row, "created_at")
+            .ok_or_else(|| RuntimeError::Internal(format!("tool policy {id} has no created_at")))?;
+        let history = text(row, "history")
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| {
+                RuntimeError::Internal(format!("tool policy {id} has invalid history: {error}"))
+            })?
+            .unwrap_or_default();
+        Ok(Self {
+            id,
+            actor: required("actor")?,
+            tool: required("tool")?,
+            decision: required("decision")?,
             note: text(row, "note"),
-            created_at: int(row, "created_at")?,
+            created_at,
             created_by: text(row, "created_by"),
+            updated_at: int(row, "updated_at").unwrap_or(created_at),
+            updated_by: text(row, "updated_by").or_else(|| text(row, "created_by")),
+            history,
+            deleted_at: int(row, "deleted_at"),
+            deleted_by: text(row, "deleted_by"),
         })
     }
 
@@ -112,6 +136,11 @@ impl PolicyRow {
             "note": self.note,
             "created_at": micros_to_iso(self.created_at),
             "created_by": self.created_by,
+            "updated_at": micros_to_iso(self.updated_at),
+            "updated_by": self.updated_by,
+            "history": self.history,
+            "deleted_at": iso(self.deleted_at),
+            "deleted_by": self.deleted_by,
         })
     }
 }
@@ -178,7 +207,7 @@ impl GrantRow {
 }
 
 const GRANT_COLUMNS: &str = "id, actor, tool, scope, reason, status, requested_at, decided_at, decided_by, expires_at, decision_note, registry_id, definition_digest, invalidated_by_registry_id, invalidated_at";
-const POLICY_COLUMNS: &str = "id, actor, tool, decision, note, created_at, created_by";
+const POLICY_COLUMNS: &str = "id, actor, tool, decision, note, created_at, created_by, updated_at, updated_by, history, deleted_at, deleted_by";
 
 pub(crate) async fn list_policies(
     rt: &KhiveRuntime,
@@ -202,7 +231,9 @@ pub(crate) async fn list_policies(
         .await?;
     Ok(rows
         .iter()
-        .filter_map(PolicyRow::from_row)
+        .map(PolicyRow::from_row)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|p| actor.is_none_or(|a| pattern_matches(&p.actor, a) || p.actor == a))
         .collect())
 }
@@ -232,8 +263,7 @@ fn pattern_match_sql(col: &str, param: usize) -> String {
 ///
 /// The match predicate and the ranking both live in the statement, so the
 /// query returns one row and needs no row cap. The previous form fetched the
-/// newest 1,000 rows and ranked them in Rust: `tool_policy` is append-only,
-/// correcting a policy means appending another row, and once the table passed
+/// newest 1,000 rows and ranked them in Rust. Once the table passed
 /// the cap an older `deny` stopped being consulted with no error and no
 /// marker. On an authorization surface that direction is fail-open (#2596).
 ///
@@ -270,8 +300,8 @@ pub(crate) async fn select_deciding_policy(
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT {POLICY_COLUMNS} FROM tool_policy \
-                 WHERE namespace = ?1 AND {actor_match} AND {tool_match} \
+                "SELECT id, actor, tool, decision, created_at FROM tool_policy \
+                 WHERE namespace = ?1 AND deleted_at IS NULL AND {actor_match} AND {tool_match} \
                  ORDER BY ({} + {}) DESC, \
                  CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC, \
                  created_at ASC, id ASC \
@@ -287,7 +317,7 @@ pub(crate) async fn select_deciding_policy(
             label: Some("tool_policy_decide".into()),
         })
         .await?;
-    Ok(rows.first().and_then(PolicyRow::from_row))
+    rows.first().map(PolicyRow::from_row).transpose()
 }
 
 /// Resolve the grant that allows `(actor, tool)`, if any, in SQL.
@@ -353,45 +383,122 @@ pub(crate) async fn select_active_grant(
     Ok(rows.first().and_then(GrantRow::from_row))
 }
 
-pub(crate) async fn insert_policy(
+pub(crate) struct PolicyWrite<'a> {
+    pub actor: &'a str,
+    pub tool: &'a str,
+    pub decision: &'a str,
+    pub note: Option<&'a str>,
+    pub replaces: Option<&'a str>,
+    pub author: &'a str,
+}
+
+pub(crate) async fn upsert_policy(
+    rt: &KhiveRuntime,
+    ns: &str,
+    write: PolicyWrite<'_>,
+) -> Result<PolicyRow, RuntimeError> {
+    let ns = ns.to_string();
+    let actor = write.actor.to_string();
+    let tool = write.tool.to_string();
+    let decision = write.decision.to_string();
+    let note = write.note.map(str::to_string);
+    let replaces = write.replaces.map(str::to_string);
+    let author = write.author.to_string();
+    let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
+        let outcome: Result<PolicyRow, RuntimeError> = async {
+            let stored = writer.query_row(SqlStatement {
+                sql: format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND deleted_at IS NULL"),
+                params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(actor.clone()), SqlValue::Text(tool.clone())],
+                label: Some("tool_policy_current".into()),
+            }).await?;
+            let current = stored.as_ref().map(PolicyRow::from_row).transpose()?;
+            if let Some(mut row) = current {
+                if let Some(replaces) = replaces.as_deref() {
+                    if replaces != row.id {
+                        return Err(RuntimeError::InvalidInput(format!("policy_replacement_mismatch: {replaces} does not name live policy {}", row.id)));
+                    }
+                } else if row.decision == "deny" && decision != "deny" {
+                    return Err(RuntimeError::InvalidInput(format!("policy_replacement_required: live policy {} is deny; supply replaces={} to change its decision", row.id, row.id)));
+                }
+                if row.decision == decision && row.note == note {
+                    return Err(RuntimeError::InvalidInput(format!("policy_unchanged: policy {} already has decision {} and the same note", row.id, row.decision)));
+                }
+                let now = now_micros().max(row.updated_at.checked_add(1).ok_or_else(|| RuntimeError::InvalidInput(format!("tool policy {} timestamp is exhausted", row.id)))?);
+                row.history.push(json!({
+                    "decision": row.decision,
+                    "note": row.note,
+                    "timestamp": row.updated_at,
+                    "author": row.updated_by,
+                }));
+                row.decision = decision;
+                row.note = note;
+                row.updated_at = now;
+                row.updated_by = Some(author);
+                writer.execute(SqlStatement {
+                    sql: "UPDATE tool_policy SET decision = ?1, note = ?2, updated_at = ?3, updated_by = ?4, history = ?5 WHERE namespace = ?6 AND id = ?7 AND deleted_at IS NULL".into(),
+                    params: vec![SqlValue::Text(row.decision.clone()), opt_text(row.note.as_deref()), SqlValue::Integer(row.updated_at), opt_text(row.updated_by.as_deref()), SqlValue::Text(serde_json::to_string(&row.history).map_err(|error| RuntimeError::Internal(error.to_string()))?), SqlValue::Text(ns), SqlValue::Text(row.id.clone())],
+                    label: Some("tool_policy_correct".into()),
+                }).await?;
+                Ok(row)
+            } else {
+                if let Some(replaces) = replaces {
+                    return Err(RuntimeError::InvalidInput(format!("policy_replacement_missing: {replaces} is not the live policy for actor {actor:?}, tool {tool:?} in namespace {ns:?}")));
+                }
+                let now = now_micros();
+                let row = PolicyRow {
+                    id: Uuid::new_v4().to_string(), actor, tool, decision, note,
+                    created_at: now, created_by: Some(author.clone()), updated_at: now,
+                    updated_by: Some(author), history: Vec::new(), deleted_at: None, deleted_by: None,
+                };
+                writer.execute(SqlStatement {
+                    sql: format!("INSERT INTO tool_policy ({POLICY_COLUMNS}, namespace) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?7, '[]', NULL, NULL, ?8)"),
+                    params: vec![SqlValue::Text(row.id.clone()), SqlValue::Text(row.actor.clone()), SqlValue::Text(row.tool.clone()), SqlValue::Text(row.decision.clone()), opt_text(row.note.as_deref()), SqlValue::Integer(now), opt_text(row.created_by.as_deref()), SqlValue::Text(ns)],
+                    label: Some("tool_policy_insert".into()),
+                }).await?;
+                Ok(row)
+            }
+        }.await;
+        Ok(Box::new(outcome) as Box<dyn Any + Send>)
+    }))).await?;
+    *result
+        .downcast::<Result<PolicyRow, RuntimeError>>()
+        .map_err(|_| RuntimeError::Internal("unexpected tool policy transaction result".into()))?
+}
+
+pub(crate) async fn delete_policy(
     rt: &KhiveRuntime,
     ns: &str,
     actor: &str,
     tool: &str,
-    decision: &str,
-    note: Option<&str>,
-    created_by: &str,
+    author: &str,
 ) -> Result<PolicyRow, RuntimeError> {
-    let row = PolicyRow {
-        id: Uuid::new_v4().to_string(),
-        actor: actor.to_string(),
-        tool: tool.to_string(),
-        decision: decision.to_string(),
-        note: note.map(str::to_string),
-        created_at: now_micros(),
-        created_by: Some(created_by.to_string()),
-    };
-    let mut writer = rt.sql().writer().await?;
-    writer
-        .execute(SqlStatement {
-            sql: format!(
-                "INSERT INTO tool_policy ({POLICY_COLUMNS}, namespace) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-            ),
-            params: vec![
-                SqlValue::Text(row.id.clone()),
-                SqlValue::Text(row.actor.clone()),
-                SqlValue::Text(row.tool.clone()),
-                SqlValue::Text(row.decision.clone()),
-                opt_text(row.note.as_deref()),
-                SqlValue::Integer(row.created_at),
-                opt_text(row.created_by.as_deref()),
-                SqlValue::Text(ns.to_string()),
-            ],
-            label: Some("tool_policy_insert".into()),
-        })
-        .await?;
-    Ok(row)
+    let ns = ns.to_string();
+    let actor = actor.to_string();
+    let tool = tool.to_string();
+    let author = author.to_string();
+    let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
+        let outcome: Result<PolicyRow, RuntimeError> = async {
+            let stored = writer.query_row(SqlStatement {
+                sql: format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 AND actor = ?2 AND tool = ?3 AND deleted_at IS NULL"),
+                params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(actor.clone()), SqlValue::Text(tool.clone())],
+                label: Some("tool_policy_delete_current".into()),
+            }).await?;
+            let mut row = stored.as_ref().map(PolicyRow::from_row).transpose()?
+                .ok_or_else(|| RuntimeError::NotFound(format!("no live tool policy for actor {actor:?}, tool {tool:?} in namespace {ns:?}")))?;
+            row.deleted_at = Some(now_micros());
+            row.deleted_by = Some(author);
+            writer.execute(SqlStatement {
+                sql: "UPDATE tool_policy SET deleted_at = ?1, deleted_by = ?2 WHERE namespace = ?3 AND id = ?4 AND deleted_at IS NULL".into(),
+                params: vec![opt_int(row.deleted_at), opt_text(row.deleted_by.as_deref()), SqlValue::Text(ns), SqlValue::Text(row.id.clone())],
+                label: Some("tool_policy_delete".into()),
+            }).await?;
+            Ok(row)
+        }.await;
+        Ok(Box::new(outcome) as Box<dyn Any + Send>)
+    }))).await?;
+    *result
+        .downcast::<Result<PolicyRow, RuntimeError>>()
+        .map_err(|_| RuntimeError::Internal("unexpected tool policy deletion result".into()))?
 }
 
 pub(crate) async fn list_grants(

@@ -1363,9 +1363,15 @@ mod tests {
         ];
 
         for (table, id, label) in rows {
+            // Every entity update must advance the entity's version by one.
+            let version = if table == "entities" {
+                ", version = version + 1"
+            } else {
+                ""
+            };
             let changed = writer
                 .execute(SqlStatement {
-                    sql: format!("UPDATE {table} SET deleted_at = ?1 WHERE id = ?2"),
+                    sql: format!("UPDATE {table} SET deleted_at = ?1{version} WHERE id = ?2"),
                     params: vec![SqlValue::Integer(TOMBSTONE_WITNESS), id],
                     label: Some(label.to_string()),
                 })

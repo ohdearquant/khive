@@ -4,8 +4,12 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use khive_runtime::{
-    EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, RuntimeError, VerbRegistry,
+    run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
+    EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, NoteCreateSpec, RuntimeError,
+    VerbRegistry,
 };
+use khive_storage::note::Note;
+use khive_storage::Entity;
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
@@ -59,18 +63,92 @@ struct PreparedBulkEntity {
     hook: Option<Arc<dyn KindHook>>,
 }
 
-impl PreparedBulkEntity {
-    async fn after_create(&self, runtime: &KhiveRuntime, id: uuid::Uuid) {
-        if let Some(hook) = &self.hook {
-            if let Err(error) = hook.after_create(runtime, id, &self.args).await {
+struct PreparedBulkNote {
+    spec: NoteCreateSpec,
+    args: Value,
+    hook: Option<Arc<dyn KindHook>>,
+}
+
+/// A bulk `create(items=[...])` item after kind resolution, hook
+/// normalization and shared-field validation, still awaiting the
+/// runtime-owned admission checks (kind, secret gate, owned-identity
+/// derivation) each substrate's own prepare-plan call applies.
+enum PreparedBulkItem {
+    Entity {
+        prepared: PreparedBulkEntity,
+        /// `entity_type` alias substitution, echoed in the response even
+        /// without `verbose` (see `describe_entity_type_normalization`).
+        normalized: Option<Value>,
+    },
+    Note(PreparedBulkNote),
+}
+
+/// One entity or note item, already committed, paired with what its own
+/// substrate's response entry and post-commit hook call need.
+enum BulkWrite {
+    Entity {
+        hook: Option<Arc<dyn KindHook>>,
+        args: Value,
+        entity: Entity,
+        /// `entity_type` alias substitution, echoed in the response even
+        /// without `verbose` (see `describe_entity_type_normalization`).
+        normalized: Option<Value>,
+    },
+    Note {
+        hook: Option<Arc<dyn KindHook>>,
+        args: Value,
+        note: Note,
+    },
+}
+
+impl BulkWrite {
+    async fn after_create(&self, runtime: &KhiveRuntime) {
+        let (hook, args, id, kind) = match self {
+            BulkWrite::Entity {
+                hook, args, entity, ..
+            } => (hook, args, entity.id, entity.kind.as_str()),
+            BulkWrite::Note { hook, args, note } => (hook, args, note.id, note.kind.as_str()),
+        };
+        if let Some(hook) = hook {
+            if let Err(error) = hook.after_create(runtime, id, args).await {
                 tracing::warn!(
-                    kind = %self.spec.kind,
+                    %kind,
                     %id,
                     %error,
                     "kind hook after_create failed (storage write already committed)"
                 );
             }
         }
+    }
+
+    /// This item's `results[idx].result` value: an id/kind/created summary
+    /// always, replaced by the full committed record when `verbose`.
+    fn ok_result(&self, verbose: bool) -> Result<Value, RuntimeError> {
+        let (id, kind, full) = match self {
+            BulkWrite::Entity { entity, .. } => (
+                entity.id,
+                entity.kind.as_str(),
+                verbose
+                    .then(|| serde_json::to_value(entity))
+                    .transpose()
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+            ),
+            BulkWrite::Note { note, .. } => (
+                note.id,
+                note.kind.as_str(),
+                verbose
+                    .then(|| serde_json::to_value(note))
+                    .transpose()
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+            ),
+        };
+        Ok(match full {
+            Some(Value::Object(mut record)) => {
+                record.insert("created".to_string(), json!(true));
+                Value::Object(record)
+            }
+            _ => json!({"id": id, "kind": kind, "created": true}),
+        })
     }
 }
 
@@ -138,9 +216,11 @@ impl KgPack {
             let mut args = json!({
                 "kind": "entity",
                 "entity_kind": kind,
-                "name": entry.name,
                 "namespace": token.namespace().as_str(),
             });
+            if let Some(value) = &entry.name {
+                args["name"] = json!(value);
+            }
             if let Some(value) = &entry.entity_type {
                 args["entity_type"] = json!(value);
             }
@@ -160,7 +240,7 @@ impl KgPack {
         let fields = CreateParams {
             kind: "entity".into(),
             entity_type: entry.entity_type,
-            name: Some(entry.name),
+            name: entry.name,
             description: entry.description,
             properties: entry.properties,
             tags: entry.tags,
@@ -200,6 +280,442 @@ impl KgPack {
             },
             normalized,
         ))
+    }
+
+    async fn prepare_bulk_note(
+        &self,
+        kind: String,
+        entry: super::params::BulkCreateEntry,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+    ) -> Result<PreparedBulkNote, RuntimeError> {
+        let hook = registry.find_kind_hook(&kind);
+        // Bulk entries already crossed their typed deserialization boundary.
+        // Only hooks need a JSON argument object; the no-hook path stays typed.
+        let mut args = if hook.is_some() {
+            let mut args = json!({
+                "kind": "note",
+                "note_kind": kind,
+                "namespace": token.namespace().as_str(),
+            });
+            if let Some(value) = &entry.content {
+                args["content"] = json!(value);
+            }
+            if let Some(value) = &entry.name {
+                args["name"] = json!(value);
+            }
+            if let Some(value) = entry.salience {
+                args["salience"] = json!(value);
+            }
+            if let Some(value) = &entry.properties {
+                args["properties"] = value.clone();
+            }
+            if let Some(value) = &entry.tags {
+                args["tags"] = json!(value);
+            }
+            args
+        } else {
+            Value::Null
+        };
+        let fields = CreateParams {
+            kind: "note".into(),
+            entity_type: None,
+            name: entry.name,
+            description: None,
+            properties: entry.properties,
+            tags: entry.tags,
+            content: entry.content,
+            salience: entry.salience,
+            annotates: None,
+            skip_dedup_check: None,
+            edges: None,
+            embedding_content: None,
+            key: None,
+            embed: None,
+            fence: None,
+        };
+        let (fields, _normalized) = self
+            .prepare_create_fields(&kind, fields, &mut args, hook.as_ref(), registry)
+            .await?;
+        if fields.kind != "note" {
+            return Err(RuntimeError::InvalidInput(
+                "bulk create requires note fields after kind-hook preparation".into(),
+            ));
+        }
+        let content = fields
+            .content
+            .ok_or_else(|| RuntimeError::InvalidInput("note item requires content".into()))?;
+        let properties = super::common::merge_note_tags(fields.properties, fields.tags)?;
+        Ok(PreparedBulkNote {
+            spec: NoteCreateSpec {
+                kind,
+                name: fields.name,
+                content,
+                salience: fields.salience,
+                properties,
+            },
+            args,
+            hook,
+        })
+    }
+
+    /// Resolve one bulk `items[idx]` entry from its raw JSON value: parse it
+    /// against the substrate-discriminated [`super::params::BulkCreateEntry`]
+    /// shape, resolve which substrate its `kind` names, reject a field that
+    /// does not apply to that substrate, and run the same kind-owned
+    /// preparation (owner hooks included) a singleton `create` applies.
+    /// Parsing per item, rather than deserializing the whole `items` vector
+    /// up front, is what lets a malformed item become its own indexed
+    /// failure under `atomic:false` instead of failing the entire call.
+    async fn prepare_bulk_item(
+        &self,
+        idx: usize,
+        raw: Value,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+    ) -> Result<PreparedBulkItem, RuntimeError> {
+        let entry: super::params::BulkCreateEntry = serde_json::from_value(raw)
+            .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
+        let item_kind_spec = resolve_kind_spec(&entry.kind, registry)
+            .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}")))?;
+        match item_kind_spec {
+            KindSpec::Entity { specific } => {
+                if entry.content.is_some() || entry.note_kind.is_some() || entry.salience.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: content, note_kind and salience apply only to note items"
+                    )));
+                }
+                let canonical = reconcile_specific(
+                    specific,
+                    entry.entity_kind.as_deref(),
+                    |s| canonical_entity_kind(s, registry),
+                    "entity_kind",
+                )
+                .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?
+                .ok_or_else(|| RuntimeError::InvalidInput(format!(
+                    "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
+                )))?;
+                let (prepared, normalized) = self
+                    .prepare_bulk_entity(canonical, entry, token, registry)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
+                    })?;
+                Ok(PreparedBulkItem::Entity {
+                    prepared,
+                    normalized,
+                })
+            }
+            KindSpec::Note { specific } => {
+                if entry.entity_kind.is_some()
+                    || entry.entity_type.is_some()
+                    || entry.description.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: entity_kind, entity_type and description apply only to entity items"
+                    )));
+                }
+                let canonical = reconcile_specific(
+                    specific,
+                    entry.note_kind.as_deref(),
+                    |s| canonical_note_kind(s, registry),
+                    "note_kind",
+                )
+                .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?
+                .unwrap_or_else(|| "observation".to_string());
+                if canonical == "scheduled_event" {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: kind=scheduled_event is not creatable via bulk create; \
+                         use `schedule.remind` or `schedule.schedule` instead"
+                    )));
+                }
+                let prepared = self
+                    .prepare_bulk_note(canonical, entry, token, registry)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
+                    })?;
+                Ok(PreparedBulkItem::Note(prepared))
+            }
+            _ => Err(RuntimeError::InvalidInput(format!(
+                "items[{idx}]: bulk create only supports entity or note kinds; got {:?}",
+                entry.kind
+            ))),
+        }
+    }
+
+    /// `atomic: true` (including omitted): every item is validated and
+    /// admitted, runtime-owned checks included (kind existence, secret
+    /// gate, owned-identity derivation), before any domain write, then
+    /// every item's plan joins ONE `run_atomic_unit` call so the batch
+    /// commits together or not at all (ADR-115 Amendment 4: the finalizer
+    /// composes multiple prepared candidates into the caller's own atomic
+    /// unit without committing each item separately inside it). A failure
+    /// at any stage returns before `run_atomic_unit` is ever called, so no
+    /// item's row, FTS document, or edge is written; a confirmed rollback
+    /// likewise leaves no successful item receipt: the whole call becomes
+    /// this method's single `Err`, never a partial `results` array.
+    async fn commit_bulk_atomic(
+        &self,
+        token: &NamespaceToken,
+        attempted: usize,
+        verbose: bool,
+        prepared: Vec<Result<PreparedBulkItem, RuntimeError>>,
+    ) -> Result<Value, RuntimeError> {
+        let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(attempted);
+        let mut writes: Vec<BulkWrite> = Vec::with_capacity(attempted);
+        for item in prepared {
+            match item? {
+                PreparedBulkItem::Entity {
+                    prepared,
+                    normalized,
+                } => {
+                    let PreparedBulkEntity { spec, args, hook } = prepared;
+                    let idx = writes.len();
+                    let (entity, plan) = self
+                        .runtime
+                        .prepare_bulk_entity_plan(token, spec)
+                        .await
+                        .map_err(|error| {
+                        RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
+                    })?;
+                    plans.push(plan);
+                    writes.push(BulkWrite::Entity {
+                        hook,
+                        args,
+                        entity,
+                        normalized,
+                    });
+                }
+                PreparedBulkItem::Note(prepared) => {
+                    let PreparedBulkNote { spec, args, hook } = prepared;
+                    let idx = writes.len();
+                    let (note, plan) = self
+                        .runtime
+                        .prepare_bulk_note_plan(token, spec)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
+                        })?;
+                    plans.push(plan);
+                    writes.push(BulkWrite::Note { hook, args, note });
+                }
+            }
+        }
+
+        if plans.is_empty() {
+            return to_json(&json!({
+                "attempted": 0,
+                "created": 0,
+                "skipped": 0,
+                "failed": 0,
+                "results": Value::Array(vec![]),
+            }));
+        }
+
+        match run_atomic_unit(self.runtime.sql().as_ref(), plans).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => {
+                for write in &writes {
+                    write.after_create(&self.runtime).await;
+                }
+                let mut results = Vec::with_capacity(writes.len());
+                let mut entity_type_normalized: Vec<Value> = Vec::new();
+                let mut entities: Vec<Value> = Vec::new();
+                for (idx, write) in writes.into_iter().enumerate() {
+                    results.push(json!({
+                        "index": idx,
+                        "ok": true,
+                        "result": write.ok_result(verbose)?,
+                    }));
+                    if let BulkWrite::Entity {
+                        entity, normalized, ..
+                    } = write
+                    {
+                        if let Some(mut applied) = normalized {
+                            if let Some(obj) = applied.as_object_mut() {
+                                obj.insert("index".to_string(), json!(idx));
+                            }
+                            entity_type_normalized.push(applied);
+                        }
+                        if verbose {
+                            entities.push(
+                                serde_json::to_value(&entity)
+                                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+                            );
+                        }
+                    }
+                }
+                let created = results.len();
+                let mut resp = json!({
+                    "attempted": attempted,
+                    "created": created,
+                    "skipped": 0,
+                    "failed": 0,
+                    "results": results,
+                });
+                if !entity_type_normalized.is_empty() {
+                    resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
+                }
+                if verbose && !entities.is_empty() {
+                    resp["entities"] = Value::Array(entities);
+                }
+                to_json(&resp)
+            }
+            Ok(AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            }) => Err(RuntimeError::Internal(format!(
+                "create: atomic bulk batch rolled back at item index {failed_op_index}: {failure:?}"
+            ))),
+            Err(e) => Err(RuntimeError::Internal(format!(
+                "create: atomic bulk batch failed: {}",
+                e.0
+            ))),
+        }
+    }
+
+    /// One `atomic: false` item's own commit: admission (kind, secret gate,
+    /// owned-identity derivation) followed by a single-plan `run_atomic_unit`
+    /// call scoped to this item alone, so a sibling item's failure can never
+    /// roll this one back. The returned [`DomainDisposition`] distinguishes
+    /// a confirmed no-write (validation, admission, or a clean transaction
+    /// rollback) from a genuinely ambiguous seam failure, matching
+    /// [`runtime_error_value`]'s own disposition contract.
+    async fn commit_bulk_item(
+        &self,
+        token: &NamespaceToken,
+        item: Result<PreparedBulkItem, RuntimeError>,
+    ) -> Result<BulkWrite, (RuntimeError, DomainDisposition)> {
+        let item = item.map_err(|error| (error, DomainDisposition::NotCommitted))?;
+        let (plan, write) = match item {
+            PreparedBulkItem::Entity {
+                prepared,
+                normalized,
+            } => {
+                let PreparedBulkEntity { spec, args, hook } = prepared;
+                let (entity, plan) = self
+                    .runtime
+                    .prepare_bulk_entity_plan(token, spec)
+                    .await
+                    .map_err(|error| (error, DomainDisposition::NotCommitted))?;
+                (
+                    plan,
+                    BulkWrite::Entity {
+                        hook,
+                        args,
+                        entity,
+                        normalized,
+                    },
+                )
+            }
+            PreparedBulkItem::Note(prepared) => {
+                let PreparedBulkNote { spec, args, hook } = prepared;
+                let (note, plan) = self
+                    .runtime
+                    .prepare_bulk_note_plan(token, spec)
+                    .await
+                    .map_err(|error| (error, DomainDisposition::NotCommitted))?;
+                (plan, BulkWrite::Note { hook, args, note })
+            }
+        };
+        match run_atomic_unit(self.runtime.sql().as_ref(), vec![plan]).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => {
+                write.after_create(&self.runtime).await;
+                Ok(write)
+            }
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err((
+                RuntimeError::Internal(format!("create: item write rolled back: {failure:?}")),
+                DomainDisposition::NotCommitted,
+            )),
+            // The transaction seam itself failed rather than any op's guard
+            // or statement. Whether the write landed is unestablished here,
+            // not merely unwritten, so this is the "unknown" arm, not
+            // "not_committed" (ADR's "genuinely ambiguous storage outcome").
+            Err(e) => Err((
+                RuntimeError::Internal(format!("create: item write seam failure: {}", e.0)),
+                DomainDisposition::Unknown,
+            )),
+        }
+    }
+
+    /// `atomic: false`: each item that passed `prepare_bulk_item` is
+    /// admitted and committed independently, in index order. A failure at
+    /// any stage is that item's own indexed `results` entry and never
+    /// blocks a valid sibling item.
+    async fn commit_bulk_best_effort(
+        &self,
+        token: &NamespaceToken,
+        attempted: usize,
+        verbose: bool,
+        prepared: Vec<Result<PreparedBulkItem, RuntimeError>>,
+    ) -> Result<Value, RuntimeError> {
+        let mut results: Vec<Value> = Vec::with_capacity(attempted);
+        let mut error_list: Vec<Value> = Vec::new();
+        let mut entity_type_normalized: Vec<Value> = Vec::new();
+        let mut entities: Vec<Value> = Vec::new();
+        let mut created = 0usize;
+
+        for (idx, item) in prepared.into_iter().enumerate() {
+            match self.commit_bulk_item(token, item).await {
+                Ok(write) => {
+                    created += 1;
+                    results.push(json!({
+                        "index": idx,
+                        "ok": true,
+                        "result": write.ok_result(verbose)?,
+                    }));
+                    if let BulkWrite::Entity {
+                        entity, normalized, ..
+                    } = &write
+                    {
+                        if let Some(applied) = normalized {
+                            let mut applied = applied.clone();
+                            if let Some(obj) = applied.as_object_mut() {
+                                obj.insert("index".to_string(), json!(idx));
+                            }
+                            entity_type_normalized.push(applied);
+                        }
+                        if verbose {
+                            entities.push(
+                                serde_json::to_value(entity)
+                                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+                            );
+                        }
+                    }
+                }
+                Err((error, disposition)) => {
+                    // `errors[].error` keeps its existing string form; the
+                    // structured projection is carried by `results` only.
+                    let message = error.to_string();
+                    let projected = runtime_error_value(error, disposition);
+                    let domain_disposition = projected["domain_disposition"].clone();
+                    error_list.push(json!({"index": idx, "error": message}));
+                    results.push(json!({
+                        "index": idx,
+                        "ok": false,
+                        "domain_disposition": domain_disposition,
+                        "error": projected,
+                    }));
+                }
+            }
+        }
+
+        let mut resp = json!({
+            "attempted": attempted,
+            "created": created,
+            "skipped": 0,
+            "failed": error_list.len(),
+            "errors": error_list,
+            "results": results,
+        });
+        if !entity_type_normalized.is_empty() {
+            resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
+        }
+        if verbose && !entities.is_empty() {
+            resp["entities"] = Value::Array(entities);
+        }
+        to_json(&resp)
     }
 
     pub(crate) async fn handle_create(
@@ -251,196 +767,72 @@ impl KgPack {
         }
 
         // ── Bulk path ──────────────────────────────────────────────────────────
-        // Early exit: if `items` is present, handle bulk entity creation and
-        // return before the single-record path executes.
-        //
-        // Med-1: if `items` is present but malformed, return an error immediately.
-        // The previous `.ok()` silently dropped parse failures and fell through to
-        // the singleton path, creating a surprising "TopLevelCreated" entity when
-        // a bulk item contained an unknown field.
-        {
-            let maybe_items = if params.get("items").is_some() {
-                if ["key", "embed", "fence"]
-                    .iter()
-                    .any(|field| params.get(*field).is_some())
-                {
-                    return Err(RuntimeError::InvalidInput(
-                        "key, embed and fence apply only to singleton notes".into(),
-                    ));
-                }
-                let raw = params["items"].clone();
-                match serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(raw) {
-                    Ok(entries) => Some(entries),
-                    Err(e) => {
-                        return Err(RuntimeError::InvalidInput(format!(
-                            "create: malformed `items` — could not parse bulk entries: {e}"
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(entries) = maybe_items {
-                if params.get("embedding_content").is_some() {
-                    return Err(RuntimeError::InvalidInput(
-                        "embedding_content is only valid for a singleton kind=note create, not bulk `items`".into(),
-                    ));
-                }
-                let attempted = entries.len();
-                if attempted > 1000 {
-                    return Err(RuntimeError::InvalidInput(
-                        "bulk create limited to 1000 entries per request".into(),
-                    ));
-                }
-                let atomic = params
-                    .get("atomic")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let verbose = params
-                    .get("verbose")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                // Preserve the bulk shape/kind preflight. Owner preparation uses
-                // this dispatch's registry, not the optional runtime update-hook map.
-                let mut inputs = Vec::with_capacity(attempted);
-                let mut entity_type_normalized: Vec<Value> = Vec::new();
-                for (idx, entry) in entries.into_iter().enumerate() {
-                    // Resolve the item's own kind.
-                    let item_kind_spec = resolve_kind_spec(&entry.kind, registry).map_err(|e| {
-                        RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}"))
-                    })?;
-                    let canonical = match &item_kind_spec {
-                        KindSpec::Entity { specific } => {
-                            let legacy = entry.entity_kind.as_deref();
-                            super::common::reconcile_specific(
-                                specific.clone(),
-                                legacy,
-                                |s| super::common::canonical_entity_kind(s, registry),
-                                "entity_kind",
-                            )
-                            .map_err(|e| {
-                                RuntimeError::InvalidInput(format!("items[{idx}]: {e}"))
-                            })?
-                            .ok_or_else(|| RuntimeError::InvalidInput(format!(
-                                "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
-                            )))?
-                        }
-                        _ => {
-                            return Err(RuntimeError::InvalidInput(format!(
-                                "items[{idx}]: bulk create only supports entity kinds; got {:?}",
-                                entry.kind
-                            )));
-                        }
-                    };
-                    inputs.push((canonical, entry));
-                }
-
-                let mut prepared = Vec::with_capacity(attempted);
-                for (idx, (kind, entry)) in inputs.into_iter().enumerate() {
-                    let result = self
-                        .prepare_bulk_entity(kind, entry, token, registry)
-                        .await
-                        .map_err(|error| {
-                            RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
-                        });
-                    if let Ok((_, Some(applied))) = &result {
-                        let mut applied = applied.clone();
-                        if let Some(obj) = applied.as_object_mut() {
-                            obj.insert("index".to_string(), serde_json::json!(idx));
-                        }
-                        entity_type_normalized.push(applied);
-                    }
-                    prepared.push(result.map(|(entity, _)| entity));
-                }
-
-                if atomic {
-                    let prepared = prepared.into_iter().collect::<Result<Vec<_>, _>>()?;
-                    let specs = prepared.iter().map(|entry| entry.spec.clone()).collect();
-                    let entities = self.runtime.create_many(token, specs).await?;
-                    for (entry, entity) in prepared.iter().zip(&entities) {
-                        entry.after_create(&self.runtime, entity.id).await;
-                    }
-                    let created = entities.len();
-                    let mut resp = serde_json::json!({
-                        "attempted": attempted,
-                        "created": created,
-                        "skipped": 0,
-                        "failed": 0,
-                    });
-                    if verbose {
-                        resp["entities"] = serde_json::to_value(&entities)
-                            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                    }
-                    if !entity_type_normalized.is_empty() {
-                        resp["entity_type_normalized"] =
-                            serde_json::Value::Array(entity_type_normalized);
-                    }
-                    return super::common::to_json(&resp);
-                } else {
-                    // Non-atomic: best-effort, per-item errors collected.
-                    let mut results: Vec<serde_json::Value> = Vec::new();
-                    let mut error_list: Vec<serde_json::Value> = Vec::new();
-                    let mut failed_indices: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    for (idx, entry) in prepared.into_iter().enumerate() {
-                        let result: Result<_, RuntimeError> = async {
-                            let entry = entry?;
-                            let entities = self
-                                .runtime
-                                .create_many(token, vec![entry.spec.clone()])
-                                .await?;
-                            for entity in &entities {
-                                entry.after_create(&self.runtime, entity.id).await;
-                            }
-                            Ok(entities)
-                        }
-                        .await;
-                        match result {
-                            Ok(mut v) => {
-                                if verbose {
-                                    if let Some(e) = v.pop() {
-                                        if let Ok(jv) = serde_json::to_value(&e) {
-                                            results.push(jv);
-                                        }
-                                    }
-                                } else {
-                                    results.push(serde_json::Value::Null);
-                                }
-                            }
-                            Err(e) => {
-                                failed_indices.insert(idx);
-                                error_list.push(
-                                    serde_json::json!({"index": idx, "error": format!("{e}")}),
-                                );
-                            }
-                        }
-                    }
-                    entity_type_normalized.retain(|entry| {
-                        entry
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .is_none_or(|idx| !failed_indices.contains(&(idx as usize)))
-                    });
-                    let mut resp = serde_json::json!({
-                        "attempted": attempted,
-                        "created": results.len(),
-                        "skipped": 0,
-                        "failed": error_list.len(),
-                        "errors": error_list,
-                    });
-                    if !entity_type_normalized.is_empty() {
-                        resp["entity_type_normalized"] =
-                            serde_json::Value::Array(entity_type_normalized);
-                    }
-                    if verbose {
-                        resp["entities"] = serde_json::Value::Array(
-                            results.into_iter().filter(|v| !v.is_null()).collect(),
-                        );
-                    }
-                    return super::common::to_json(&resp);
-                }
+        // Early exit: if `items` is present, handle bulk entity/note creation
+        // and return before the single-record path executes. Every item is
+        // parsed from its own raw JSON value (never as part of one
+        // whole-vector deserialization) so a malformed item under
+        // `atomic: false` is that item's own indexed failure rather than a
+        // failure of the entire call; see `prepare_bulk_item`.
+        if params.get("items").is_some() {
+            if ["key", "embed", "fence"]
+                .iter()
+                .any(|field| params.get(*field).is_some())
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "key, embed and fence apply only to singleton notes".into(),
+                ));
             }
+            if params.get("embedding_content").is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "embedding_content is only valid for a singleton kind=note create, not bulk `items`".into(),
+                ));
+            }
+            let raw_items = match &params["items"] {
+                Value::Array(items) => items.clone(),
+                other => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "create: `items` must be an array; got {other}"
+                    )));
+                }
+            };
+            let attempted = raw_items.len();
+            if attempted > 1000 {
+                return Err(RuntimeError::InvalidInput(
+                    "bulk create limited to 1000 entries per request".into(),
+                ));
+            }
+            let atomic = match params.get("atomic") {
+                None => true,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "create: `atomic` must be a boolean; got {other}"
+                    )));
+                }
+            };
+            let verbose = match params.get("verbose") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "create: `verbose` must be a boolean; got {other}"
+                    )));
+                }
+            };
+
+            let mut prepared: Vec<Result<PreparedBulkItem, RuntimeError>> =
+                Vec::with_capacity(attempted);
+            for (idx, raw) in raw_items.into_iter().enumerate() {
+                prepared.push(self.prepare_bulk_item(idx, raw, token, registry).await);
+            }
+
+            return if atomic {
+                self.commit_bulk_atomic(token, attempted, verbose, prepared)
+                    .await
+            } else {
+                self.commit_bulk_best_effort(token, attempted, verbose, prepared)
+                    .await
+            };
         }
         // ── End bulk path ──────────────────────────────────────────────────────
 
@@ -637,31 +1029,62 @@ impl KgPack {
                         )
                         .await
                 };
-                let (note, embedding_report) = result.map_err(|error| match error {
-                    RuntimeError::Khive(error)
+                let (note, embedding_report) = match result {
+                    Ok(pair) => pair,
+                    Err(RuntimeError::Khive(error))
                         if error.details().and_then(|details| details.get("reason"))
                             == Some("key_conflict") =>
                     {
                         let key = p.key.as_deref().unwrap_or("");
-                        if registry.allows_note_key_disclosure(token, &canonical, key) {
-                            RuntimeError::Khive(error)
-                        } else {
-                            RuntimeError::Khive(error.with_details(
-                                khive_types::Details::new_owned([
-                                    ("reason", "key_conflict".into()),
-                                    ("key", key.into()),
-                                ]),
-                            ))
+                        let existing_id = error
+                            .details()
+                            .and_then(|details| details.get("existing_id"))
+                            .unwrap_or_default()
+                            .to_string();
+                        // ADR-172 Amendment 6: `equal` is an internal signal
+                        // from the runtime's in-transaction holder
+                        // comparison; it never reaches a client. It only
+                        // selects which response this handler builds below.
+                        let equal = error.details().and_then(|details| details.get("equal"))
+                            == Some("true");
+                        let disclose = registry.allows_note_key_disclosure(token, &canonical, key);
+                        if equal && disclose {
+                            // Successful minimal replay: no domain mutation
+                            // happened, so nothing below this arm (hooks,
+                            // dedup search, requested edges) runs either.
+                            return Ok(json!({
+                                "id": existing_id,
+                                "created": false,
+                            }));
                         }
+                        let details = if disclose {
+                            khive_types::Details::new_owned([
+                                ("reason", "key_conflict".into()),
+                                ("key", key.into()),
+                                ("existing_id", existing_id),
+                            ])
+                        } else {
+                            khive_types::Details::new_owned([
+                                ("reason", "key_conflict".into()),
+                                ("key", key.into()),
+                            ])
+                        };
+                        return Err(RuntimeError::Khive(error.with_details(details)));
                     }
-                    other => other,
-                })?;
+                    Err(other) => return Err(other),
+                };
                 let id = note.id;
-                (
-                    remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
-                    id,
-                    embedding_report.any_truncated(),
-                )
+                let mut note_json = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
+                // ADR-172 Amendment 6: a fresh insert under a supplied key
+                // carries created:true so a caller can tell it apart from a
+                // replay without a second round trip. Unkeyed notes keep
+                // their existing response shape untouched.
+                if p.key.is_some() {
+                    if let Some(obj) = note_json.as_object_mut() {
+                        obj.insert("created".to_string(), json!(true));
+                    }
+                }
+                (note_json, id, embedding_report.any_truncated())
             }
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
