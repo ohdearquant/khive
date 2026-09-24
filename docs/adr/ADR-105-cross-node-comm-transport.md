@@ -500,11 +500,23 @@ it on every send (A.6.2), and binding it into the ciphertext would force a re-en
 two agents re-accept each other.
 
 The plaintext is a UTF-8 JSON object: `v` (1), `subject` (string or null), `body` (string),
-`sent_at` (RFC 3339, UTC), `thread_id` (a UUID or null) and `in_reply_to` (a logical message
-identifier or null). A recipient ignores members it does not know, except that a plaintext with a duplicated member,
+`sent_at` (RFC 3339, UTC), `thread_id` (a UUID or null), `in_reply_to` (a logical message
+identifier or null) and, optionally, `kind` (`announce`, `report` or `ask`: the sender's declared
+purpose under runtime ADR-195 D4). A sender writes `kind` only with one of those three values and
+otherwise omits it; absent means unspecified. A recipient ignores members it does not know, except that a plaintext with a duplicated member,
 or with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
 `namespace`, `actor`, `project`, `device` or `delegation`, is invalid and is quarantined (A.8): identity comes from the
-authenticated envelope, never from the plaintext. It need not be canonical JSON,
+authenticated envelope, never from the plaintext. A `kind` with any other value, `null`,
+`unspecified` and `reply` included, is likewise invalid and quarantined: a reply is never declared.
+A message is a reply when its `in_reply_to` names a verified parent: a message this recipient agent
+(the delivery's `recipient_agent_id`) sent to this sender agent (`sender_agent_id`), committed in the
+recipient's store as its own outbound message. The recipient evaluates a reply as a reply, whatever
+kind it declares. The recipient keeps each outbound message's logical identifier and recipient agent
+for as long as it keeps that message's note; a reply whose parent is no longer kept is evaluated by
+its declared kind. A follow-up to a message the sender itself sent,
+stored or quarantined, is not a reply for policy: it is evaluated by its declared kind, or as
+unspecified when it declares none. The `kind` values are fixed for protocol version 1: a recipient
+quarantines any other value, so a new value needs a new protocol version. The plaintext need not be canonical JSON,
 because nothing is computed over it except the AEAD. There are no attachments in version 1: the
 transport carries message notes only (ADR-105, "What stands"). The ciphertext is at most 65,536
 bytes, so the plaintext is at most 65,520.
@@ -814,6 +826,37 @@ record whose outcome the service cannot confirm.
   The service holds no live admission for a refused submit (its transport-log row records only the
   refusal; a step 9 record it could not confirm, A.6.2, may have committed but holds nothing in
   memory), so A.6.5 answers `unknown` for a message with no live admission and no recorded receipt.
+- **Policy holds.** The runtime's pair policy (ADR-195 D6) is evaluated before every submission, a
+  resubmission after admission included. Under `enforce` a refusal makes no submission and holds the
+  message with the hold reason `policy_denied`; under `shadow` a refusal is audited and the submission
+  goes ahead; under `off` nothing is evaluated (ADR-195 D7). Unlike the holds above, a policy hold is
+  entered by the client, not answered by the service, so it can follow an admission. The hold charges
+  nothing further and recalls nothing: an earlier admission of the message may still be delivered, a
+  verified receipt from a poll or a status read ends the hold as it ends any `pending`, and a message
+  answered `202`, or answered in a way that may have charged (Retries, below), is still shown as
+  charged or possibly charged. An earlier admission can also be stored with no receipt ever
+  recorded (its receipt post answered `not_found` after the release); that message stays `pending`
+  under the hold until an evaluation admits it, because only a resubmission obtains its receipt. A
+  `policy_denied` hold after a `202`, or after a `200` that shows the message `pending`, therefore never
+  means undelivered, and the client says so to the
+  owner before a cancel. The hold suspends automatic retry, the status-read resubmission included.
+  A hold is written only to a message still `pending`: a receipt verified between the refusing
+  evaluation and the hold write stands, and no hold is written. The hold records the policy state
+  its own evaluation read: the mode and the revision. The revision advances on every change ADR-195
+  D9 lets an administrator make, a removal included (an actor record, a class, an address binding, a
+  rule or the mode), and an evaluation reads it in the same snapshot as the rules and records it
+  uses, or before them. A legacy route's expiry changes decisions without an administrator; it only
+  removes an allow, so it never frees a held message. A transport attempt evaluates the sender's
+  assurance recorded when the message was sent. The message is evaluated again once whenever the current state
+  differs from the recorded one, whether the change came before or after the hold was written, and
+  nothing else retries it; an evaluation that admits it submits it, and one that refuses it records
+  the state that evaluation read. A change of mode is a change of state, so a move to `off` or
+  `shadow` releases every policy hold to submission. The policy store cannot be read only when it
+  answers with an error, as defined in Receiving, step 4. When it cannot be read before a
+  submission, no submission is made and the message stays `pending` on the backoff used after a
+  5xx; no submission was made, so this adds no charge. It is neither held nor submitted
+  unevaluated, and a held message whose re-evaluation cannot read the store leaves the hold for that
+  backoff.
 - **Retries** after `recipient_offline`, `capacity_exhausted`, `rate_limited`, a 5xx or a network
   failure use exponential backoff from 30 seconds to at most one hour, with jitter, so an offline pair
   does not turn one message into a stream of refusals. Every retry is a new request under A.4: a
@@ -851,13 +894,31 @@ record whose outcome the service cannot confirm.
      identity: the relay can hand the recipient any bytes, and only an authenticated envelope may
      settle what happened to a sender's message. The client may keep it locally under
      (`delivery_attempt_id`, `SHA-256(enc || ciphertext)`) for diagnosis, within the local quarantine
-     bound. The client sets that bound; past it the oldest held or quarantined item is dropped and
-     reported;
-  4. the plaintext is parsed. A valid one is committed as the message note together with the
-     transport receipt record in one transaction, and the client then signs a `stored` receipt. An
-     invalid one (not the A.5 object, a duplicated member, or a reserved identity member) is kept as
-     received (the delivery item verbatim, as one JSON object) in local quarantine storage with a
-     closed reason, that record is committed, and the client signs a `quarantined` receipt.
+     bound. The client sets that bound; past it the oldest held or quarantined item, other than a
+     policy-refused one (step 4), is dropped and reported;
+  4. a delivery whose replay identity is already claimed is answered from it (below), and is neither
+     parsed again nor evaluated against the pair policy. Otherwise the plaintext is parsed, and a
+     valid one is evaluated against the recipient's pair policy (ADR-195 D8); under `off` nothing is
+     evaluated. A valid one the policy admits, or refuses under `shadow` (the refusal is audited), or
+     any valid one under `off`, is committed as the message note together with the transport
+     receipt record in one transaction, and the client then signs a `stored` receipt. The note
+     records the kind the message carries for policy: the declared value, `unspecified` when none
+     is declared, or `reply` when it is derived. An invalid one (not the A.5 object, a duplicated
+     member, a reserved identity member, or a `kind` outside `announce`, `report` and `ask`), or a
+     valid one the policy refuses under `enforce`, is kept as received (the delivery item verbatim,
+     as one JSON object) in local quarantine storage with a closed reason, that record is committed,
+     and the client signs a `quarantined` receipt. A policy-refused item is also kept with its parsed
+     plaintext, and not under the bound of step 3: the client keeps a bound per sender, past which
+     the oldest of that sender's policy-refused items is dropped and reported, so one sender's
+     refusals never evict another's. The replay identity is claimed inside the commit's transaction,
+     on one identity shared by the message note and the quarantine record: a commit that finds it
+     already claimed lands nothing and is answered from the claim. When
+     the policy store cannot be read, nothing is committed and no receipt is sent, as for a failed
+     write, and the runtime reports it where it reports a failed write. The message is processed
+     again from step 1 when it next arrives: as the relay's next hand-out while its admission is
+     live, or as the sender's resubmission after the release (A.10). The store cannot be read only
+     when it answers with an error: an actor with no record is `unclassified` (ADR-195 D3), which
+     is a decision, and a store holding no policy state is in mode `off`.
   `quarantined` therefore always means: authenticated as the pinned sender, and not acceptable as a
   message.
 - **Replay identity** is (`sender_agent_id`, `logical_message_id`), and only a commit in step 4 claims
@@ -909,6 +970,10 @@ construct no `Pending`, so they stay byte-identical. Service answers map onto th
   the row stays pending under the A.8 backoff;
 - a held outcome is `SendOutcome::Pending` with its hold reason, and the row suspends retry until the
   owner acts (A.8);
+- a submission the runtime's pair policy refuses (ADR-195 D6) never reaches the adapter: the row
+  stays `pending` with the hold reason `policy_denied` until a verified receipt arrives or a later
+  evaluation admits it (A.8, policy holds). A submission for which the policy store cannot be read
+  never reaches the adapter either, and the row stays pending under the A.8 backoff;
 - `401` is `ChannelError::Auth`, handled as the amendment's item 8 requires: the channel pauses for
   credential repair and its pending rows are kept, never classified `failed`;
 - a refusal whose outcome is `failed` is `ChannelError::PermanentTransport`, which classifies the row
@@ -1078,6 +1143,26 @@ implementation.
 | a submit repeated after its answer was lost, the recipient having since revoked the grant | `200` with the recorded receipt |
 | a submit of a logical message already admitted to another recipient | `envelope_conflict` |
 | a plaintext carrying a `from` member, or a duplicated member | `quarantined` receipt, no message note |
+| a plaintext whose `kind` is `null`, `reply` or any value other than `announce`, `report` and `ask` | `quarantined` receipt, no message note |
+| a plaintext with `kind` `announce` that the recipient's pair policy admits | `stored` receipt, and the message note records the kind |
+| a valid plaintext the recipient's pair policy refuses under `enforce` | `quarantined` receipt, the item in local quarantine with its parsed plaintext, no message note |
+| a delivery arriving while the recipient's policy store cannot be read | no commit, no receipt; once the store reads again, the next arrival of the message is stored and receipted exactly once |
+| a logical message stored, its receipt dropped after `not_found`, delivered again under a new attempt after the recipient's policy changed to refuse it | no quarantine item; the journal entry for the new attempt carries `stored` |
+| a pending message the sender's pair policy refuses under `enforce` before a submission | no submission; `pending` with the hold reason `policy_denied`; while held, no retry and no status-read resubmission; a later evaluation that admits it submits it |
+| a message answered `202`, then refused by the sender's pair policy at its resubmission, whose earlier admission the recipient stores | no resubmission; the verified receipt from the next poll moves it to `recipient_stored`; shown as charged throughout |
+| a policy revision that admits the pair, published after the refusing evaluation and before its hold is written (a runtime test with a seam at that point) | the message is evaluated under the new revision and submitted |
+| messages held for `policy_denied` under `enforce` when the mode moves to `off` or `shadow` | submitted, with no revision change |
+| a pending message whose next submission finds the sender's policy store unreadable | no submission, no hold; once the store reads again, the next backoff step evaluates it and, if admitted, submits it, with no revision change |
+| a message held because its recipient's class was changed, the class then restored with no rule edited | evaluated again and submitted |
+| a verified receipt recorded between a refusing evaluation and its hold write (a runtime test with a seam at that point) | `recipient_stored`, no hold |
+| a held message refused again at a re-evaluation | no further evaluation until the state differs again |
+| a held message whose re-evaluation cannot read the sender's policy store | leaves the hold; no submission until the store reads, then retried on the backoff |
+| a plaintext declaring `ask` whose `in_reply_to` names the sender's own earlier message, which the recipient stored, under a recipient policy that allows `reply` and denies `ask` | evaluated as `ask`: `quarantined` receipt |
+| a plaintext declaring `ask` whose `in_reply_to` names a message the recipient sent to this sender, under the same policy | evaluated as a reply: `stored` receipt, the note records `reply` |
+| a plaintext declaring `ask` whose `in_reply_to` names a message another agent of the recipient's deployment sent to this sender, under the same policy | not a reply: evaluated as `ask`, `quarantined` receipt |
+| a valid plaintext the recipient's pair policy refuses under `shadow` | `stored` receipt, the would-be refusal audited, no quarantine item |
+| a valid plaintext under `off` whose pair the recipient's rules would refuse | `stored` receipt, nothing evaluated |
+| two arrivals of one logical message in step 4 at once, the recipient's policy changing between their evaluations | one commit, one disposition, and both journal entries carry it |
 | a request body with an unknown member | `400 invalid_request` |
 | a delivery whose recipient key epoch was replaced after admission | released, never handed out |
 | a correctly signed request, arriving inside the step 4 window, whose timestamp is before the nonce-memory floor: signed before a relay restart and held in transit or re-sent unchanged, or signed after it by a clock running behind | `503 capacity_exhausted` with `retry_after_seconds` 60, no effect; the client re-signs, retries, and does not pause the channel |
