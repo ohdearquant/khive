@@ -61,6 +61,10 @@ mod atomic_project_origin_witnesses {
 
     #[tokio::test]
     async fn atomic_ops_file_commits_project_origin_with_exact_receipt() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         for kind in ["service", "project"] {
             let (_directory, config, source, document) = fixture(kind).await;
             println!("ORIGIN2579 atomic executor commit testing {kind}");
@@ -105,6 +109,10 @@ mod atomic_project_origin_witnesses {
 
     #[tokio::test]
     async fn atomic_ops_file_target_deletion_rolls_back_before_project_link() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         for kind in ["service", "project"] {
             let (_directory, config, source, document) = fixture(kind).await;
             let operations = vec![

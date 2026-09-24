@@ -94,6 +94,7 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
     let stderr = std::fs::File::create(&stderr_path).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_kkernel"))
+        .env("HOME", dir.path())
         .arg("events-daemon")
         .arg("--db")
         .arg(&db)

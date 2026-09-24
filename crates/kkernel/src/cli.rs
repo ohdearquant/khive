@@ -2164,6 +2164,10 @@ no_embed = true
     #[tokio::test]
     #[serial]
     async fn multi_backend_boot_paths_share_identical_non_default_output_format() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         // RAII guard: snapshots KHIVE_OUTPUT_FORMAT, clears it, and restores the
         // original value (or leaves it removed) on drop — including on panic, so
         // a failing assertion or an unexpected constructor error never leaks the
@@ -2279,6 +2283,10 @@ no_embed = true
     #[tokio::test]
     #[serial]
     async fn coordinator_boot_uses_anchor_captured_by_runtime_config() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         struct HomeGuard(Option<std::ffi::OsString>);
 
         impl Drop for HomeGuard {

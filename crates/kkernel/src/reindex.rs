@@ -553,6 +553,14 @@ async fn filter_unembedded(
 /// MCP server serves recall from. Fails closed on any partial failure unless
 /// `--best-effort` is set.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
+    run_reindex_with_setup(args, |cfg| cfg, |_| Ok(())).await
+}
+
+async fn run_reindex_with_setup(
+    args: ReindexArgs,
+    config_setup: impl FnOnce(khive_runtime::RuntimeConfig) -> khive_runtime::RuntimeConfig,
+    runtime_setup: impl FnOnce(&KhiveRuntime) -> Result<()>,
+) -> Result<()> {
     let validated_target =
         validate_declared_reindex_target(args.db.as_deref(), args.config.as_deref())?;
 
@@ -574,11 +582,14 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         brain_profile: None,
     })?;
 
+    let cfg = config_setup(cfg);
+
     // Capture the resolved namespace BEFORE `new` consumes cfg — when
     // `!explicit`, `resolve_runtime_config` may have applied `[actor] id` from
     // the config file, making `cfg.default_namespace` differ from the CLI value.
     let resolved_ns = cfg.default_namespace.clone();
     let rt = open_validated_reindex_backend(cfg, validated_target.as_ref())?;
+    runtime_setup(&rt)?;
     let token = rt
         .authorize(resolved_ns)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -1415,6 +1426,88 @@ mod tests {
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
     use serial_test::serial;
+
+    // Empty TOML retains the normal default engine. FTS-only fixtures must
+    // explicitly remove every configured engine before the validated open.
+    async fn run_reindex_without_embeddings(args: ReindexArgs) -> Result<()> {
+        run_reindex_with_setup(
+            args,
+            |mut cfg| {
+                cfg.embedding_model = None;
+                cfg.additional_embedding_models.clear();
+                cfg
+            },
+            |runtime| {
+                assert!(
+                    runtime.registered_embedding_model_names().is_empty(),
+                    "FTS-only reindex fixture must have zero configured models"
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    struct FixedReindexEmbedder {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for FixedReindexEmbedder {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+        {
+            Ok(std::sync::Arc::new(FixedReindexEmbeddingService(
+                self.dimensions,
+            )))
+        }
+    }
+
+    struct FixedReindexEmbeddingService(usize);
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for FixedReindexEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.0]).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "reindex-test"
+        }
+    }
+
+    async fn run_reindex_offline(args: ReindexArgs) -> Result<()> {
+        run_reindex_with_setup(
+            args,
+            |cfg| cfg,
+            |runtime| {
+                for name in runtime.registered_embedding_model_names() {
+                    let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
+                    runtime.register_embedder(FixedReindexEmbedder { name, dimensions });
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
 
     fn write_empty_test_config(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("empty-khive-config.toml");
@@ -2438,6 +2531,10 @@ read_only = true
     #[test]
     #[serial]
     fn khive_db_env_binds_to_db_arg() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::set_var("KHIVE_DB", "/tmp/kkernel-reindex-env.db");
         let args = ReindexArgs::parse_from(["reindex"]);
         std::env::remove_var("KHIVE_DB");
@@ -2447,6 +2544,10 @@ read_only = true
     #[test]
     #[serial]
     fn khive_config_env_binds_to_config_arg() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-reindex.toml");
         let args = ReindexArgs::parse_from(["reindex"]);
         std::env::remove_var("KHIVE_CONFIG");
@@ -2465,6 +2566,10 @@ read_only = true
     #[test]
     #[serial]
     fn namespace_absent_defers_to_local_not_config_actor_id() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use std::io::Write;
         std::env::remove_var("KHIVE_NAMESPACE");
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
@@ -2518,6 +2623,10 @@ read_only = true
     #[test]
     #[serial]
     fn namespace_env_var_sets_explicit_flag() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::set_var("KHIVE_NAMESPACE", "env-ns");
         let args = ReindexArgs::parse_from(["reindex"]);
         std::env::remove_var("KHIVE_NAMESPACE");
@@ -2535,6 +2644,10 @@ read_only = true
     #[test]
     #[serial]
     fn namespace_absent_defaults_to_none() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_NAMESPACE");
         let args = ReindexArgs::parse_from(["reindex"]);
         assert!(
@@ -2888,6 +3001,10 @@ read_only = true
     // skipped the FTS pass when model_names was empty.
     #[tokio::test]
     async fn run_reindex_populates_fts_without_embedding_model() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use khive_storage::types::TextFilter;
         use khive_types::SubstrateKind;
 
@@ -2944,7 +3061,9 @@ read_only = true
             rebuild_fts: false,
             human: false,
         };
-        run_reindex(args).await.expect("run_reindex must succeed");
+        run_reindex_without_embeddings(args)
+            .await
+            .expect("run_reindex must succeed");
 
         // Verify FTS was populated by re-opening the db.
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
@@ -3169,6 +3288,10 @@ read_only = true
     // entities. Guards the entity FTS path running independently of embedding.
     #[tokio::test]
     async fn run_reindex_populates_entity_fts_without_embedding_model() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use khive_storage::entity::Entity;
         use khive_storage::types::TextFilter;
 
@@ -3222,7 +3345,9 @@ read_only = true
             rebuild_fts: false,
             human: false,
         };
-        run_reindex(args).await.expect("run_reindex must succeed");
+        run_reindex_without_embeddings(args)
+            .await
+            .expect("run_reindex must succeed");
 
         // Verify entity FTS was populated.
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
@@ -3337,6 +3462,10 @@ read_only = true
     // and this desync would have been repaired regardless of scope.
     #[tokio::test]
     async fn run_reindex_scoped_run_does_not_rebuild_fts() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
         let db_path = db_file.path().to_str().expect("utf8 path").to_string();
         let config_dir = tempfile::tempdir().expect("config temp dir");
@@ -3359,7 +3488,9 @@ read_only = true
             rebuild_fts: false,
             human: false,
         };
-        run_reindex(args).await.expect("run_reindex must succeed");
+        run_reindex_offline(args)
+            .await
+            .expect("run_reindex must succeed");
 
         assert!(
             !knowledge_fts_repaired(&db_path, &config).await,
@@ -3372,6 +3503,10 @@ read_only = true
     // does not imply the global rebuild either. Only the flag does.
     #[tokio::test]
     async fn run_reindex_without_the_flag_does_not_rebuild_fts() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
         let db_path = db_file.path().to_str().expect("utf8 path").to_string();
         let config_dir = tempfile::tempdir().expect("config temp dir");
@@ -3394,7 +3529,9 @@ read_only = true
             rebuild_fts: false,
             human: false,
         };
-        run_reindex(args).await.expect("run_reindex must succeed");
+        run_reindex_offline(args)
+            .await
+            .expect("run_reindex must succeed");
 
         assert!(
             !knowledge_fts_repaired(&db_path, &config).await,
@@ -3406,6 +3543,10 @@ read_only = true
     // the desync end to end.
     #[tokio::test]
     async fn run_reindex_with_the_flag_rebuilds_fts() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
         let db_path = db_file.path().to_str().expect("utf8 path").to_string();
         let config_dir = tempfile::tempdir().expect("config temp dir");
@@ -3428,7 +3569,9 @@ read_only = true
             rebuild_fts: true,
             human: false,
         };
-        run_reindex(args).await.expect("run_reindex must succeed");
+        run_reindex_offline(args)
+            .await
+            .expect("run_reindex must succeed");
 
         assert!(
             knowledge_fts_repaired(&db_path, &config).await,
@@ -3569,6 +3712,46 @@ read_only = true
         KhiveRuntime::new(cfg).expect("owned test runtime")
     }
 
+    #[tokio::test]
+    async fn reindex_fts_fixture_clears_primary_and_additional_models() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("reindex fixture");
+        let args = snapshot_reindex_args(dir.path(), false);
+        std::fs::write(
+            args.config.as_ref().unwrap(),
+            r#"
+[[engines]]
+name = "primary"
+model = "bge-small-en-v1.5"
+default = true
+
+[[engines]]
+name = "additional"
+model = "paraphrase"
+default = false
+"#,
+        )
+        .expect("write two-engine fixture");
+        let configured = resolve_runtime_config(RuntimeConfigInputs {
+            db: args.db.as_deref(),
+            config: args.config.as_deref(),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve fixture engine precondition");
+        assert!(configured.embedding_model.is_some());
+        assert_eq!(configured.additional_embedding_models.len(), 1);
+        run_reindex_without_embeddings(args)
+            .await
+            .expect("FTS-only fixture must clear both configured engines");
+    }
+
     async fn snapshot_test_count(rt: &KhiveRuntime, query: &str) -> i64 {
         let mut reader = rt.sql().reader().await.expect("reader");
         let row = reader
@@ -3588,8 +3771,8 @@ read_only = true
 
     async fn seed_snapshot_test_note(rt: &KhiveRuntime) {
         let token = rt.authorize(Namespace::local()).expect("authorize");
-        // Empty embedding text keeps the real command fixture independent of
-        // model downloads while still requiring an FTS backfill write.
+        // Empty embedding text still requires an FTS backfill write. The command
+        // fixture installs offline providers independently of its seed text.
         rt.notes(&token)
             .expect("notes")
             .upsert_note(Note::new("local", "observation", ""))
@@ -3603,6 +3786,10 @@ read_only = true
 
     #[tokio::test]
     async fn run_reindex_snapshot_failure_fails_closed_and_preserves_committed_work() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("owned database directory");
         let args = snapshot_reindex_args(dir.path(), false);
         let rt = snapshot_test_runtime(&args);
@@ -3636,7 +3823,7 @@ read_only = true
         assert!(injected
             .to_string()
             .contains("injected namespace snapshot failure"));
-        let error = run_reindex(args)
+        let error = run_reindex_offline(args)
             .await
             .expect_err("snapshot failure must fail the command");
         assert!(error
@@ -3658,7 +3845,7 @@ read_only = true
             "only the independent active-memory snapshot was removed"
         );
 
-        run_reindex(snapshot_reindex_args(dir.path(), true))
+        run_reindex_offline(snapshot_reindex_args(dir.path(), true))
             .await
             .expect("explicit best effort allows partial completion");
         assert_eq!(
@@ -3673,7 +3860,7 @@ read_only = true
                 .await
                 .expect("remove injected failure");
         }
-        run_reindex(snapshot_reindex_args(dir.path(), false))
+        run_reindex_offline(snapshot_reindex_args(dir.path(), false))
             .await
             .expect("same fixture succeeds once invalidation can commit");
         assert_eq!(
@@ -3693,13 +3880,17 @@ read_only = true
 
     #[tokio::test]
     async fn run_reindex_snapshot_missing_table_remains_successful() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("owned database directory");
         let args = snapshot_reindex_args(dir.path(), false);
         let rt = snapshot_test_runtime(&args);
         seed_snapshot_test_note(&rt).await;
         let table_count = "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'retrieval_snapshots'";
         assert_eq!(snapshot_test_count(&rt, table_count).await, 0);
-        run_reindex(args)
+        run_reindex_offline(args)
             .await
             .expect("missing snapshots are a successful no-op");
         assert_eq!(snapshot_test_count(&rt, table_count).await, 0);
