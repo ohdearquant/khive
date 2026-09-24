@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 const CURRENT: i64 = 1_790_208_000_000_000;
 
-async fn fixture() -> (KhiveRuntime, VerbRegistry) {
+fn fresh_fixture() -> (KhiveRuntime, VerbRegistry) {
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         packs: vec!["kg".into(), "gtd".into()],
@@ -21,6 +21,11 @@ async fn fixture() -> (KhiveRuntime, VerbRegistry) {
     builder.register(KgPack::new(runtime.clone()));
     builder.register(GtdPack::new(runtime.clone()));
     let registry = builder.build().unwrap();
+    (runtime, registry)
+}
+
+async fn fixture() -> (KhiveRuntime, VerbRegistry) {
+    let (runtime, registry) = fresh_fixture();
     khive_pack_gtd::handlers::ensure_audit_schema(&runtime).await;
     (runtime, registry)
 }
@@ -133,6 +138,28 @@ fn item(id: &str, field: &str, observed: Value, value: Value) -> Value {
     let mut changes = serde_json::Map::new();
     changes.insert(field.into(), json!({"observed": observed, "value": value}));
     json!({"id": id, "changes": changes})
+}
+
+#[tokio::test]
+async fn repair_apply_initializes_audit_schema_on_fresh_runtime() {
+    let (runtime, registry) = fresh_fixture();
+    let id = seed(&runtime, Seed::default()).await;
+    let reply = registry
+        .dispatch(
+            "gtd.repair",
+            json!({"apply": true, "items": [
+                item(&id, "created_at", json!("0"), json!(CURRENT))
+            ]}),
+        )
+        .await
+        .expect("REPAIR_FRESH_RUNTIME_SCHEMA_INITIALIZED");
+    assert_eq!(reply["applied"], 1, "REPAIR_FRESH_RUNTIME_APPLIES");
+    assert_eq!(integer(&row(&runtime, &id).await, "created_at"), CURRENT);
+    assert_eq!(
+        audit(&runtime, &id).await.len(),
+        1,
+        "REPAIR_FRESH_RUNTIME_ONE_AUDIT"
+    );
 }
 
 #[tokio::test]

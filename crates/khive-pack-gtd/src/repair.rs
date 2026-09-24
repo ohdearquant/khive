@@ -444,10 +444,15 @@ impl GtdPack {
     ) -> Result<Value, RuntimeError> {
         let params = parse_params(params)?;
         let mut results = Vec::with_capacity(params.items.len());
+        let mut audit_schema_ready = false;
         for item in params.items {
             let mut plan = prepare_row(self.runtime(), &token.actor().id, &item).await?;
             if params.apply {
                 if let Some((update, audit)) = plan.statements {
+                    if !audit_schema_ready {
+                        crate::handlers::ensure_audit_schema(self.runtime()).await;
+                        audit_schema_ready = true;
+                    }
                     if commit_prepared(self.runtime(), update, audit).await? {
                         plan.result["applied"] = json!(true);
                     } else {

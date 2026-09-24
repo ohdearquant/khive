@@ -67,9 +67,9 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// Pack-auxiliary schema for GTD lifecycle audit.
 ///
 /// `gtd_lifecycle_audit` receives best-effort rows for successful real
-/// `transition`/`complete` changes. Same-status assertions are not lifecycle
-/// events and therefore do not create audit rows. The
-/// table is idempotent (`CREATE TABLE IF NOT EXISTS`) and is NOT part of the
+/// `transition`/`complete` changes and mandatory entries for applied repairs.
+/// Same-status assertions are not lifecycle events and do not create audit
+/// rows. The table is idempotent (`CREATE TABLE IF NOT EXISTS`) and is NOT part of the
 /// core versioned migration chain.
 ///
 /// Every statement must be idempotent so the generic boot applier can call them
