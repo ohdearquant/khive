@@ -11,7 +11,25 @@ use crate::schema::TASK_STATUSES;
 use crate::GtdPack;
 
 const SNAPSHOT_SQL: &str = include_str!("../sql/task-repair-snapshot.sql");
-const UPDATE_SQL: &str = include_str!("../sql/task-repair-update.sql");
+const UPDATE_SQL: &str = r#"UPDATE notes SET created_at = CASE WHEN ?8 = 1 THEN ?9 ELSE created_at END,
+    updated_at = CASE WHEN ?10 = 1 THEN ?11 ELSE updated_at END,
+    properties = json_set(
+        CASE WHEN ?12 = 1
+             THEN json_set(COALESCE(properties, '{}'), '$.status', ?13)
+             ELSE COALESCE(properties, '{}')
+        END,
+        '$.gtd_repair', json(?14)
+    )
+WHERE id = ?1
+  AND kind = 'task'
+  AND deleted_at IS NULL
+  AND properties IS ?2
+  AND version = ?3
+  AND created_at IS ?4
+  AND updated_at IS ?5
+  AND typeof(created_at) = ?6
+  AND typeof(updated_at) = ?7
+"#;
 const AUDIT_SQL: &str = concat!(
     "INSERT INTO gtd_lifecycle_audit (note_id, from_state, to_state, note, at, namespace)\n",
     "VALUES (?1, ?2, ?3, ?4, ?5, ?6)\n",
