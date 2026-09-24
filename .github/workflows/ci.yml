@@ -833,15 +833,16 @@ jobs:
   minio-blob-compat:
     name: MinIO BlobStore compatibility (ADR-111 Amendment 2)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
-      # Gate on storage-layer changes only: the MinIO leg (container start,
-      # image pull) is the slowest part of this job, and most PRs never touch
-      # the blob store. `git diff` against the PR base (or the pushed range
+      # Gate on storage-layer changes only: the MinIO leg (server build and
+      # start) is the slowest part of this job, and most PRs never touch the
+      # blob store. A change to this workflow file also runs it, so an edit to
+      # the leg itself is exercised by its own pull request. `git diff` against the PR base (or the pushed range
       # on a direct push) decides whether the rest of the job runs at all.
       - name: Determine whether storage crates changed
         id: changed
@@ -892,49 +893,78 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
-      # `docker run` rather than a `services:` container: MinIO's image needs
-      # `server /data` as its command, and GitHub Actions service containers
-      # cannot override the image's default command/entrypoint.
-      #
-      # Pinned to an immutable digest (H3 fix round 2), matching the repo's
-      # own supply-chain-pin convention (see the `supply-chain` job above).
-      # Resolved 2026-07-16 from the `minio/minio:latest` manifest list via
-      # `registry-1.docker.io`'s `Docker-Content-Digest` response header. Both
-      # the server container below and the `mc` client image in the next step
-      # pin the same digest.
-      #
-      # The registry moved to quay.io on 2026-09-11: Docker Hub now answers
-      # `minio/minio` with 401 insufficient_scope for anonymous pulls, by tag
-      # and by this digest alike, while the same request against
-      # `library/alpine` still succeeds. quay.io serves this exact digest, so
-      # the image content is unchanged and the pin still identifies one
-      # immutable manifest. Symptom before the move: `pull access denied for
-      # minio/minio`, exit 125, which fails this job and therefore the
-      # aggregate CI gate on every pull request that touches the blob store.
-      - name: Start pinned MinIO
+      # MinIO no longer publishes prebuilt server images or binaries that an
+      # anonymous CI job can fetch. quay.io answers 401 for minio/minio (its
+      # tags and the digest this job used to pin), dl.min.io answers 410 Gone
+      # for the server and client downloads, and Docker Hub has refused
+      # anonymous pulls since 2026-09-11. The server is therefore built from
+      # source at its last release. The tag is checked against its commit, so
+      # a moved tag fails the job instead of changing the server under test.
+      # The compiler is pinned the same way: the installer action by commit
+      # SHA, the Go version to the release's own toolchain line, and the build
+      # refuses to switch toolchains or edit module metadata. Go module
+      # checksums pin every dependency, and a restored module cache is
+      # verified against them before the build reads it.
+      - name: Fetch pinned MinIO source
         if: steps.changed.outputs.run == 'true'
+        working-directory: .
         run: |
-          docker run -d --name khive-minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=khive-ci \
-            -e MINIO_ROOT_PASSWORD=khive-ci-secret \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
-            server /data
+          git clone --quiet --depth 1 --branch RELEASE.2025-10-15T17-29-55Z \
+            https://github.com/minio/minio.git .minio-src
+          test "$(git -C .minio-src rev-parse HEAD)" = 9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+          grep -qx 'toolchain go1.24.8' .minio-src/go.mod
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.changed.outputs.run == 'true'
+        with:
+          go-version: '1.24.8'
+          check-latest: false
+          cache-dependency-path: .minio-src/go.sum
+      - name: Build and start MinIO
+        if: steps.changed.outputs.run == 'true'
+        working-directory: .minio-src
+        env:
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
+          MINIO_ROOT_USER: khive-ci
+          MINIO_ROOT_PASSWORD: khive-ci-secret
+        run: |
+          test "$(go env GOVERSION)" = go1.24.8
+          go mod verify
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/minio" .
+          # The health probe below must reach the server started here, so the
+          # port has to be free before it starts, and once the probe answers the
+          # process has to be alive and has to own the listening socket.
+          if curl -s --connect-timeout 5 --max-time 10 -o /dev/null http://127.0.0.1:9000/; then
+            echo "127.0.0.1:9000 already answers before MinIO starts" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/minio-data"
+          nohup "$RUNNER_TEMP/minio" server "$RUNNER_TEMP/minio-data" \
+            --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/minio.pid"
           for _ in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+            if curl -sf --connect-timeout 5 --max-time 10 http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              pid="$(cat "$RUNNER_TEMP/minio.pid")"
+              kill -0 "$pid"
+              ss -Hltnp 'sport = :9000' | grep -F "pid=$pid,"
               exit 0
             fi
             sleep 1
           done
           echo "MinIO did not become healthy in time" >&2
-          docker logs khive-minio || true
+          cat "$RUNNER_TEMP/minio.log" || true
           exit 1
+      # The bucket is created with a SigV4-signed PUT, so the job needs no
+      # MinIO client binary.
       - name: Create the conformance bucket
         if: steps.changed.outputs.run == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: khive-ci
+          AWS_SECRET_ACCESS_KEY: khive-ci-secret
         run: |
-          docker run --rm --network host --entrypoint /bin/sh \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e -c \
-            "mc alias set ci http://127.0.0.1:9000 khive-ci khive-ci-secret && \
-             mc mb --ignore-existing ci/khive-blob-conformance"
+          curl -sSf -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" \
+            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+            http://127.0.0.1:9000/khive-blob-conformance
       - name: Shared BlobStore conformance suite against MinIO
         if: steps.changed.outputs.run == 'true'
         env:
@@ -944,9 +974,21 @@ jobs:
           AWS_ACCESS_KEY_ID: khive-ci
           AWS_SECRET_ACCESS_KEY: khive-ci-secret
         run: cargo test -p khive-db --test blob_conformance
+      # The suite counts only if the server started above served all of it:
+      # the same process must still be alive and still own the port.
+      - name: Confirm the suite ran against the started server
+        if: steps.changed.outputs.run == 'true'
+        working-directory: .
+        run: |
+          pid="$(cat "$RUNNER_TEMP/minio.pid")"
+          kill -0 "$pid"
+          ss -Hltnp 'sport = :9000' | grep -F "pid=$pid,"
       - name: Stop MinIO
         if: always() && steps.changed.outputs.run == 'true'
-        run: docker rm -f khive-minio || true
+        run: |
+          if [ -f "$RUNNER_TEMP/minio.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/minio.pid")" || true
+          fi
 
   check-windows:
     name: Windows compile check
