@@ -99,7 +99,10 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
 
         self.assertIn("needs: [resolve-revision, coverage-measurement]", ratchet)
         self.assertIn(
-            "if: needs.coverage-measurement.outputs.available == 'true'", ratchet
+            "if: needs.resolve-revision.result == 'success' && "
+            "needs.coverage-measurement.result == 'success' && "
+            "needs.coverage-measurement.outputs.available == 'true'",
+            step_block(ratchet, "Check coverage does not regress"),
         )
         self.assertNotIn("cargo llvm-cov", ratchet)
         self.assertIn("Check coverage does not regress", ratchet)
@@ -152,15 +155,10 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
-    # Jobs carrying a job-level `if:`, so they are the only ones that CAN skip.
-    CONDITIONAL_JOBS = {
-        "automerge-push-guard", "dependency-review", "coverage-ratchet",
-    }
-    # Jobs whose skip the gate FORGIVES, which is a smaller set and not the same
-    # question. The push guard and dependency review skip on run shape: they do
-    # not apply to this event. The coverage ratchet skips on a missing input, so
-    # forgiving it reports a coverage judgment that was never made.
-    FORGIVEN_SKIPS = {"automerge-push-guard", "dependency-review"}
+    # The push guard is the only remaining job with an eligibility predicate.
+    # always() admits a job after failed dependencies; it is not such a predicate.
+    CONDITIONAL_JOBS = {"automerge-push-guard"}
+    FORGIVEN_SKIPS = {"automerge-push-guard"}
 
     def setUp(self):
         self.workflow = workflow_text("ci.yml")
@@ -185,12 +183,11 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         conditional = {
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
+            and "    if: always()" not in indented_block(self.workflow, job, 2)
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
-        # Forgiving a job that cannot skip would be dead configuration, so the
-        # allow list stays inside the conditional set without being equal to it.
-        self.assertTrue(self.FORGIVEN_SKIPS < conditional)
+        self.assertEqual(self.FORGIVEN_SKIPS, conditional)
         for job in sorted(self.needs):
             for outcome in ("success", "skipped", "failure", "cancelled"):
                 with self.subTest(job=job, outcome=outcome):
@@ -200,8 +197,11 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                     accepted = outcome == "success" or (
                         outcome == "skipped" and job in self.FORGIVEN_SKIPS
                     )
-                    self.assertEqual(result.returncode, 0 if accepted else 1,
-                                     result.stdout + result.stderr)
+                    self.assertEqual(
+                        result.returncode, 0 if accepted else 1,
+                        f"AGGREGATE_SKIP_POLICY: {job}={outcome}\n"
+                        + result.stdout + result.stderr,
+                    )
                     if not accepted:
                         self.assertIn(f"Gate failure — jobs not green: {job}", result.stdout)
 
@@ -215,18 +215,18 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                                  result.stdout + result.stderr)
 
     def test_gate_mixed_results_report_only_rejected_jobs(self):
-        # The gate reports in NEEDS order, so the conditional jobs are inserted
-        # sorted rather than in set-iteration order: one of them is rejected now,
-        # which makes its position in the output an asserted value.
+        # Only the push guard's skip is expected; the newly admitted jobs must
+        # finish their no-work/failure path instead of silently skipping.
         results = {
             "ci": "skipped", "docs": "failure", "secret-scan": "cancelled",
-            **{job: "skipped" for job in sorted(self.CONDITIONAL_JOBS)},
+            "automerge-push-guard": "skipped", "dependency-review": "skipped",
+            "coverage-ratchet": "skipped",
         }
         result = self.run_gate(results)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(
             result.stdout.split("Gate failure — jobs not green: ", 1)[1].splitlines(),
-            ["ci", "docs", "secret-scan", "coverage-ratchet"],
+            ["ci", "docs", "secret-scan", "dependency-review", "coverage-ratchet"],
         )
 
 
@@ -1533,6 +1533,110 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.assertIn("main_sha:", dispatch)
         self.assertIn("required: false", dispatch)
         self.assertIn('default: ""', dispatch)
+
+    def test_conditional_check_names_are_admitted_before_work_eligibility(self):
+        # Hosted R2 evidence showed literal name expressions when job-level
+        # eligibility skipped a job. This prevents that source pattern; only a
+        # hosted run can establish how GitHub renders the resulting check names.
+        for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
+            with self.subTest(job=name):
+                job = indented_block(self.workflow, name, 2)
+                conditions = re.findall(r"(?m)^    if: (.+)$", job)
+                self.assertNotRegex(job, r"(?m)^    if: [>|]",
+                                    "CHECK_NAME_ADMISSION: no folded eligibility predicate")
+                self.assertIn(conditions, [[], ["always()"]],
+                              "CHECK_NAME_ADMISSION: eligibility belongs on steps")
+                if name in {"dependency-review", "coverage-ratchet"}:
+                    self.assertEqual(
+                        conditions, ["always()"],
+                        "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
+                    )
+
+    def test_dependency_review_work_is_pr_only_after_revision_validation(self):
+        job = indented_block(self.workflow, "dependency-review", 2)
+        expected = "needs.resolve-revision.result == 'success' && github.event_name == 'pull_request'"
+        for name in ["Checkout dependency review revision", "Dependency review"]:
+            with self.subTest(step=name):
+                step = step_block(job, name)
+                self.assertEqual(
+                    re.findall(r"(?m)^        if: (.+)$", step), [expected],
+                    "DEPENDENCY_REVIEW_ELIGIBILITY: checkout and action remain validated PR-only work",
+                )
+        self.assertEqual(
+            mapping_entries(indented_block(job, "permissions", 4)), {"contents: read"},
+            "DEPENDENCY_REVIEW_PERMISSIONS: review stays read-only",
+        )
+        review = step_block(job, "Dependency review")
+        self.assertIn("uses: actions/dependency-review-action@v4", review)
+        self.assertIn("fail-on-severity: high", review)
+        self.assertIn("allow-licenses:", review)
+        self.assertIn("allow-dependencies-licenses: pkg:pypi/typing-extensions, pkg:cargo/sqlite-vec", review)
+        self.assertNotIn("continue-on-error", job,
+                         "DEPENDENCY_REVIEW_FAILURES: real review failures must fail the job")
+
+    def test_non_pr_dependency_review_explicitly_reports_successful_no_work(self):
+        job = indented_block(self.workflow, "dependency-review", 2)
+        step = step_block(job, "Report dependency review not applicable")
+        self.assertEqual(
+            re.findall(r"(?m)^        if: (.+)$", step),
+            ["needs.resolve-revision.result == 'success' && github.event_name != 'pull_request'"],
+            "DEPENDENCY_REVIEW_NO_WORK: only validated non-PR runs take this path",
+        )
+        script = self.script("dependency-review", "Report dependency review not applicable")
+        self.assertNotIn("${{", script)
+        result, _ = self.run_script(script)
+        self.assertEqual(result.returncode, 0,
+                         "DEPENDENCY_REVIEW_NO_WORK: ineligible work completes successfully")
+        self.assertIn("no dependency comparison was run", result.stdout,
+                      "DEPENDENCY_REVIEW_NO_WORK: no-work must be explicit")
+
+    def test_failed_revision_is_a_named_dependency_review_failure(self):
+        job = indented_block(self.workflow, "dependency-review", 2)
+        step = step_block(job, "Refuse unvalidated dependency review revision")
+        self.assertEqual(
+            re.findall(r"(?m)^        if: (.+)$", step),
+            ["needs.resolve-revision.result != 'success'"],
+            "UNVALIDATED_REVISION_REJECTED: all non-success validation outcomes fail closed",
+        )
+        self.assertLess(job.index("- name: Refuse unvalidated dependency review revision"),
+                        job.index("uses: actions/checkout@v7"))
+        result, _ = self.run_script(self.script("dependency-review", "Refuse unvalidated dependency review revision"))
+        self.assertNotEqual(result.returncode, 0,
+                            "UNVALIDATED_REVISION_REJECTED: failed selection must not pass a check")
+        self.assertIn("dependency review did not run", result.stderr)
+
+    def test_coverage_work_requires_a_validated_available_measurement(self):
+        job = indented_block(self.workflow, "coverage-ratchet", 2)
+        expected = (
+            "needs.resolve-revision.result == 'success' && "
+            "needs.coverage-measurement.result == 'success' && "
+            "needs.coverage-measurement.outputs.available == 'true'"
+        )
+        for name in ["Checkout coverage baseline revision", "Check coverage does not regress"]:
+            with self.subTest(step=name):
+                self.assertEqual(
+                    re.findall(r"(?m)^        if: (.+)$", step_block(job, name)), [expected],
+                    "COVERAGE_WORK_ELIGIBILITY: validation and measurement must both succeed",
+                )
+        self.assertNotIn("continue-on-error", job,
+                         "COVERAGE_FAILURES: a regression must fail the job")
+
+    def test_unavailable_coverage_is_a_named_failure_without_a_judgment(self):
+        job = indented_block(self.workflow, "coverage-ratchet", 2)
+        step = step_block(job, "Refuse unavailable coverage input")
+        self.assertEqual(
+            re.findall(r"(?m)^        if: (.+)$", step),
+            ["needs.resolve-revision.result != 'success' || "
+             "needs.coverage-measurement.result != 'success' || "
+             "needs.coverage-measurement.outputs.available != 'true'"],
+            "UNAVAILABLE_COVERAGE_REJECTED: failure, cancellation, skip and missing output remain closed",
+        )
+        self.assertLess(job.index("- name: Refuse unavailable coverage input"),
+                        job.index("uses: actions/checkout@v7"))
+        result, _ = self.run_script(self.script("coverage-ratchet", "Refuse unavailable coverage input"))
+        self.assertNotEqual(result.returncode, 0,
+                            "UNAVAILABLE_COVERAGE_REJECTED: absent inputs cannot produce success")
+        self.assertIn("no coverage-regression judgment was made", result.stderr)
 
     def test_replay_secret_scan_excludes_future_and_other_branch_commits(self):
         work, commits = self.repository()

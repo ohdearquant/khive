@@ -776,6 +776,8 @@ jobs:
   dependency-review:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
     needs: resolve-revision
+    # Admit the job so GitHub evaluates its check name even when no PR work applies.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -783,14 +785,23 @@ jobs:
     # No pull-requests:write — comment-summary-in-pr is not enabled.
     permissions:
       contents: read
-    # This action only works on pull_request events — it diffs the dependency
-    # graph between the base and head commits.  Skip on push to main/integration.
-    if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v7
+      - name: Refuse unvalidated dependency review revision
+        if: needs.resolve-revision.result != 'success'
+        run: |
+          echo "CI revision validation did not succeed; dependency review did not run." >&2
+          exit 1
+      - name: Report dependency review not applicable
+        if: needs.resolve-revision.result == 'success' && github.event_name != 'pull_request'
+        run: |
+          echo "Dependency review applies only to pull requests; no dependency comparison was run."
+      - name: Checkout dependency review revision
+        if: needs.resolve-revision.result == 'success' && github.event_name == 'pull_request'
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - name: Dependency review
+        if: needs.resolve-revision.result == 'success' && github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
         with:
           # Fail on high or critical vulnerabilities only; low/moderate are
@@ -1235,7 +1246,8 @@ jobs:
   coverage-ratchet:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
     needs: [resolve-revision, coverage-measurement]
-    if: needs.coverage-measurement.outputs.available == 'true'
+    # Missing inputs must produce a named failure, not an unevaluated skipped name.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1243,10 +1255,18 @@ jobs:
     # baseline is raised only by an explicit PR that edits coverage-baseline.txt,
     # so every change to main (the floor included) goes through the gate wall.
     steps:
-      - uses: actions/checkout@v7
+      - name: Refuse unavailable coverage input
+        if: needs.resolve-revision.result != 'success' || needs.coverage-measurement.result != 'success' || needs.coverage-measurement.outputs.available != 'true'
+        run: |
+          echo "CI revision validation or coverage measurement is unavailable; no coverage-regression judgment was made." >&2
+          exit 1
+      - name: Checkout coverage baseline revision
+        if: needs.resolve-revision.result == 'success' && needs.coverage-measurement.result == 'success' && needs.coverage-measurement.outputs.available == 'true'
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - name: Check coverage does not regress
+        if: needs.resolve-revision.result == 'success' && needs.coverage-measurement.result == 'success' && needs.coverage-measurement.outputs.available == 'true'
         env:
           CURRENT_COVERAGE: ${{ needs.coverage-measurement.outputs.current }}
         run: |
@@ -1299,14 +1319,11 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          # These jobs have job-level conditions: the push guard only applies
-          # to qualifying PR synchronizations, and dependency review only to
-          # PRs. The coverage ratchet is NOT on that list: it skips exactly when
-          # the measurement it needs did not arrive, which is the state this
-          # gate exists to report, and forgiving the skip is what let five
-          # consecutive main pushes report a coverage gate that never ran.
+          # Only the push guard may skip on run shape. Dependency review now
+          # completes an explicit no-work step outside PRs; missing coverage
+          # inputs fail the ratchet. An unexpected skip must not pass the gate.
           bad=$(echo "$NEEDS" | jq -r '
-            ["automerge-push-guard", "dependency-review"] as $allowed_skips
+            ["automerge-push-guard"] as $allowed_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
                 (.value.result != "skipped" or ($allowed_skips | index($job) | not)))
