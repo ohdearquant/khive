@@ -12,7 +12,10 @@ use crate::GtdPack;
 
 const SNAPSHOT_SQL: &str = include_str!("../sql/task-repair-snapshot.sql");
 const UPDATE_SQL: &str = include_str!("../sql/task-repair-update.sql");
-const AUDIT_SQL: &str = include_str!("../sql/task-repair-audit.sql");
+const AUDIT_SQL: &str = concat!(
+    "INSERT INTO gtd_lifecycle_audit (note_id, from_state, to_state, note, at, namespace)\n",
+    "VALUES (?1, ?2, ?3, ?4, ?5, ?6)\n",
+);
 const FIELDS: [&str; 3] = ["created_at", "updated_at", "status"];
 
 #[derive(Deserialize)]
