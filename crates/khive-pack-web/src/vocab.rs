@@ -63,15 +63,22 @@ const fn ordered_params<const N: usize>(fields: [(usize, ParamDef); N]) -> [Para
 
 macro_rules! web_verbs {
     ($(
-        $params:ident($verb:literal, $description:literal) {
-            $(
-                $(#[serde($default:ident)])?
-                $field:ident: $ty:ty => ($position:literal, $help:literal, $resolution:ident);
-            )+
+        $params:ident => $handler:ident {
+            name: $verb:literal,
+            description: $description:literal,
+            visibility: $visibility:path,
+            category: $category:path,
+            params: {
+                $(
+                    $(#[serde($default:ident)])?
+                    $field:ident: $ty:ty => ($position:literal, $help:literal, $resolution:ident);
+                )+
+            }
         }
     )+) => {
         $(
             #[derive(serde::Deserialize)]
+            #[cfg_attr(test, derive(serde::Serialize))]
             #[serde(deny_unknown_fields)]
             pub(crate) struct $params {
                 $(
@@ -81,7 +88,6 @@ macro_rules! web_verbs {
             }
 
             impl $params {
-                const DESCRIPTION: &'static str = $description;
                 const PARAMS: &'static [ParamDef] = &ordered_params([$(($position, ParamDef {
                     name: stringify!($field),
                     param_type: <$ty as WebParamType>::NAME,
@@ -92,6 +98,16 @@ macro_rules! web_verbs {
             }
         )+
 
+        pub(crate) static WEB_HANDLERS: [HandlerDef; [$(stringify!($params)),+].len()] = [
+            $($handler {
+                name: $verb,
+                description: $description,
+                visibility: $visibility,
+                category: $category,
+                params: $params::PARAMS,
+            }),+
+        ];
+
         #[cfg(test)]
         const WEB_PARAM_DECODERS: [(&str, ParamDecoder); [$(stringify!($params)),+].len()] = [
             $(($verb, decode_params::<$params>)),+
@@ -100,155 +116,149 @@ macro_rules! web_verbs {
 }
 
 #[cfg(test)]
-type ParamDecoder = fn(Value) -> Result<(), serde_json::Error>;
+type ParamDecoder = fn(Value) -> Result<Value, serde_json::Error>;
 
 #[cfg(test)]
-fn decode_params<T: serde::de::DeserializeOwned>(value: Value) -> Result<(), serde_json::Error> {
-    serde_json::from_value::<T>(value).map(|_| ())
+fn decode_params<T: serde::de::DeserializeOwned + serde::Serialize>(
+    value: Value,
+) -> Result<Value, serde_json::Error> {
+    serde_json::from_value::<T>(value).and_then(serde_json::to_value)
 }
 
+// Concrete handler fields stay visible to the admission source census. The
+// table, typed parameter structs and decoder inventory share this declaration.
 web_verbs! {
-    FetchParams("web.fetch", "Fetch one URL over HTTP(S) under egress policy (address-class, \
+    FetchParams => HandlerDef {
+        name: "web.fetch",
+        description: "Fetch one URL over HTTP(S) under egress policy (address-class, \
                       allowlist, credential and header controls). Mints/updates the site \
                       and page/resource entities, stores the body as a blob, and writes an \
-                      observation receipt.") {
-        url: String => (0, "The URL to fetch. http and https only.", NotApplicable);
-        #[serde(default)]
-        accept: Option<String> => (1, "Value for the Accept request header.", NotApplicable);
-        #[serde(default)]
-        method: Option<String> => (5, "Defaults to GET. GET and HEAD are the only permitted methods.", NotApplicable);
-        #[serde(default)]
-        headers: BTreeMap<String, String> => (6, "Request headers to send, restricted to the allowed request \
-                              header set (accept, accept-language, if-none-match, \
-                              if-modified-since, user-agent).", NotApplicable);
-        #[serde(default)]
-        credential: Option<String> => (7, "Named [[web.credentials]] entry to send as an \
-                              Authorization: Bearer header. Requires https at every hop, \
-                              and only on a host in the credential's own configured set.", NotApplicable);
-        #[serde(default)]
-        persist: Option<bool> => (2, "Defaults to true. False stores no body or entities, returns the body \
-                              as a standard padded base64 string, and writes a receipt with final URL, content \
-                              digest, size and fetch time. HEAD returns no body. Transient GET requires effective max_bytes \
-                              at most 6288384 before network access; oversized body or header metadata is refused before a receipt.", NotApplicable);
-        #[serde(default)]
-        max_bytes: Option<u64> => (3, "Caller-supplied byte ceiling; may only lower the operator's \
-                              configured maximum, never raise it. With persist=false, GET accepts at most 6288384 raw bytes; \
-                              lower this value or use persist=true for larger bodies. HEAD is exempt from this inline limit.", NotApplicable);
-        #[serde(default)]
-        timeout_s: Option<u64> => (4, "Caller-supplied time ceiling in seconds; may only lower the \
-                              operator's configured maximum, never raise it.", NotApplicable);
-        #[serde(default)]
-        namespace: Option<String> => (8, "Narrows the write to a namespace; must equal the caller's own \
-                              authorized token namespace, never elevates capability.", NotApplicable);
+                      observation receipt.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: {
+            url: String => (0, "The URL to fetch. http and https only.", NotApplicable);
+            #[serde(default)]
+            accept: Option<String> => (1, "Value for the Accept request header.", NotApplicable);
+            #[serde(default)]
+            method: Option<String> => (5, "Defaults to GET. GET and HEAD are the only permitted methods.", NotApplicable);
+            #[serde(default)]
+            headers: BTreeMap<String, String> => (6, "Request headers to send, restricted to the allowed request \
+                                  header set (accept, accept-language, if-none-match, \
+                                  if-modified-since, user-agent).", NotApplicable);
+            #[serde(default)]
+            credential: Option<String> => (7, "Named [[web.credentials]] entry to send as an \
+                                  Authorization: Bearer header. Requires https at every hop, \
+                                  and only on a host in the credential's own configured set.", NotApplicable);
+            #[serde(default)]
+            persist: Option<bool> => (2, "Defaults to true. False stores no body or entities, returns the body \
+                                  as a standard padded base64 string, and writes a receipt with final URL, content \
+                                  digest, size and fetch time. HEAD returns no body. Transient GET requires effective max_bytes \
+                                  at most 6288384 before network access; oversized body or header metadata is refused before a receipt.", NotApplicable);
+            #[serde(default)]
+            max_bytes: Option<u64> => (3, "Caller-supplied byte ceiling; may only lower the operator's \
+                                  configured maximum, never raise it. With persist=false, GET accepts at most 6288384 raw bytes; \
+                                  lower this value or use persist=true for larger bodies. HEAD is exempt from this inline limit.", NotApplicable);
+            #[serde(default)]
+            timeout_s: Option<u64> => (4, "Caller-supplied time ceiling in seconds; may only lower the \
+                                  operator's configured maximum, never raise it.", NotApplicable);
+            #[serde(default)]
+            namespace: Option<String> => (8, "Narrows the write to a namespace; must equal the caller's own \
+                                  authorized token namespace, never elevates capability.", NotApplicable);
+        }
     }
-    ExtractParams("web.extract", "Parse an already-fetched body into links, sitemap/feed entries, and/or \
+    ExtractParams => HandlerDef {
+        name: "web.extract",
+        description: "Parse an already-fetched body into links, sitemap/feed entries, and/or \
                       plain text. Never fetches — refuses `not_fetched` on a document with no \
-                      stored body.") {
-        #[serde(default)]
-        id: Option<Uuid> => (0, "The document entity to extract from. Exactly one of id/url.", UnscopedById);
-        #[serde(default)]
-        url: Option<String> => (1, "The document's URL, resolved to its entity id. Exactly one of id/url.", NotApplicable);
-        #[serde(default)]
-        kinds: Option<Vec<String>> => (2, "Subset of [\"text\", \"links\", \"sitemap\", \"feed\"]; default \
-                              all applicable to the stored content-type.", NotApplicable);
-        #[serde(default)]
-        namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
-                              authorized token namespace, never elevates capability.", NotApplicable);
+                      stored body.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: {
+            #[serde(default)]
+            id: Option<Uuid> => (0, "The document entity to extract from. Exactly one of id/url.", UnscopedById);
+            #[serde(default)]
+            url: Option<String> => (1, "The document's URL, resolved to its entity id. Exactly one of id/url.", NotApplicable);
+            #[serde(default)]
+            kinds: Option<Vec<String>> => (2, "Subset of [\"text\", \"links\", \"sitemap\", \"feed\"]; default \
+                                  all applicable to the stored content-type.", NotApplicable);
+            #[serde(default)]
+            namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
+                                  authorized token namespace, never elevates capability.", NotApplicable);
+        }
     }
-    IngestParams("web.ingest", "Fetch and extract over a URL, a list of URLs, or (with origin) a served \
-                      tree on disk. depth bounds link-following beyond the seed URLs.") {
-        source: Value => (0, "A URL, an array of URLs, or (with origin) a directory path.", NotApplicable);
-        #[serde(default)]
-        origin: Option<String> => (1, "Required when source is a directory path: the URL this tree is \
-                              served as, supplying the site identity for every file in it.", NotApplicable);
-        #[serde(default)]
-        depth: Option<u32> => (2, "How many hops of discovered links to follow beyond the seed \
-                              URLs. Defaults to 0 (seeds only).", NotApplicable);
-        #[serde(default)]
-        limit: Option<u32> => (3, "Maximum number of documents to ingest in one call. For a disk source, this bounds file reads and ingestion, not discovery: the entire tree is inspected and each visited directory is sorted, even at zero. Discovery cost scales with tree size; use a smaller source directory to bound it.", NotApplicable);
-        #[serde(default)]
-        namespace: Option<String> => (4, "Narrows the write to a namespace; must equal the caller's own \
-                              authorized token namespace, never elevates capability.", NotApplicable);
+    IngestParams => HandlerDef {
+        name: "web.ingest",
+        description: "Fetch and extract over a URL, a list of URLs, or (with origin) a served \
+                      tree on disk. depth bounds link-following beyond the seed URLs.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: {
+            source: Value => (0, "A URL, an array of URLs, or (with origin) a directory path.", NotApplicable);
+            #[serde(default)]
+            origin: Option<String> => (1, "Required when source is a directory path: the URL this tree is \
+                                  served as, supplying the site identity for every file in it.", NotApplicable);
+            #[serde(default)]
+            depth: Option<u32> => (2, "How many hops of discovered links to follow beyond the seed \
+                                  URLs. Defaults to 0 (seeds only).", NotApplicable);
+            #[serde(default)]
+            limit: Option<u32> => (3, "Maximum number of documents to ingest in one call. For a disk source, this bounds file reads and ingestion, not discovery: the entire tree is inspected and each visited directory is sorted, even at zero. Discovery cost scales with tree size; use a smaller source directory to bound it.", NotApplicable);
+            #[serde(default)]
+            namespace: Option<String> => (4, "Narrows the write to a namespace; must equal the caller's own \
+                                  authorized token namespace, never elevates capability.", NotApplicable);
+        }
     }
-    SearchParams("web.search", "Query a configured search provider (a fixture or an HTTP provider) and \
+    SearchParams => HandlerDef {
+        name: "web.search",
+        description: "Query a configured search provider (a fixture or an HTTP provider) and \
                       write a receipt recording the query, provider, and exact ordered result \
-                      set.") {
-        query: String => (0, "The search query text.", NotApplicable);
-        #[serde(default)]
-        limit: Option<u32> => (2, "Caller-supplied result-count ceiling; may only lower the \
-                              operator's configured maximum.", NotApplicable);
-        #[serde(default)]
-        provider: Option<String> => (1, "Named [[web.search_providers]] entry; defaults to the \
-                              operator's default provider, or the sole configured one.", NotApplicable);
-        #[serde(default)]
-        persist: Option<bool> => (3, "Defaults to false. True mints each hit's URL as an unfetched \
-                              resource under its site.", NotApplicable);
-        #[serde(default)]
-        max_bytes: Option<u64> => (4, "Caller-supplied byte ceiling on the provider response; may \
-                              only lower the operator's configured maximum, never raise it.", NotApplicable);
-        #[serde(default)]
-        timeout_s: Option<u64> => (5, "Caller-supplied time ceiling in seconds; may only lower the \
-                              operator's configured maximum, never raise it.", NotApplicable);
-        #[serde(default)]
-        namespace: Option<String> => (6, "Narrows the write to a namespace; must equal the caller's own \
-                              authorized token namespace, never elevates capability.", NotApplicable);
+                      set.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: {
+            query: String => (0, "The search query text.", NotApplicable);
+            #[serde(default)]
+            limit: Option<u32> => (2, "Caller-supplied result-count ceiling; may only lower the \
+                                  operator's configured maximum.", NotApplicable);
+            #[serde(default)]
+            provider: Option<String> => (1, "Named [[web.search_providers]] entry; defaults to the \
+                                  operator's default provider, or the sole configured one.", NotApplicable);
+            #[serde(default)]
+            persist: Option<bool> => (3, "Defaults to false. True mints each hit's URL as an unfetched \
+                                  resource under its site.", NotApplicable);
+            #[serde(default)]
+            max_bytes: Option<u64> => (4, "Caller-supplied byte ceiling on the provider response; may \
+                                  only lower the operator's configured maximum, never raise it.", NotApplicable);
+            #[serde(default)]
+            timeout_s: Option<u64> => (5, "Caller-supplied time ceiling in seconds; may only lower the \
+                                  operator's configured maximum, never raise it.", NotApplicable);
+            #[serde(default)]
+            namespace: Option<String> => (6, "Narrows the write to a namespace; must equal the caller's own \
+                                  authorized token namespace, never elevates capability.", NotApplicable);
+        }
     }
-    RefreshParams("web.refresh", "Conditionally re-fetch a previously fetched document using its stored \
+    RefreshParams => HandlerDef {
+        name: "web.refresh",
+        description: "Conditionally re-fetch a previously fetched document using its stored \
                       etag/last_modified. An unchanged body writes a receipt only; a changed \
                       body updates the stored blob and properties. Every refresh's receipt \
-                      supersedes the previous one for the same document.") {
-        id: Uuid => (0, "The document entity to refresh.", UnscopedById);
-        #[serde(default)]
-        max_bytes: Option<u64> => (1, "Caller-supplied byte ceiling; may only lower the operator's \
-                              configured maximum, never raise it.", NotApplicable);
-        #[serde(default)]
-        timeout_s: Option<u64> => (2, "Caller-supplied time ceiling in seconds; may only lower the \
-                              operator's configured maximum, never raise it.", NotApplicable);
-        #[serde(default)]
-        namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
-                              authorized token namespace, never elevates capability.", NotApplicable);
+                      supersedes the previous one for the same document.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: {
+            id: Uuid => (0, "The document entity to refresh.", UnscopedById);
+            #[serde(default)]
+            max_bytes: Option<u64> => (1, "Caller-supplied byte ceiling; may only lower the operator's \
+                                  configured maximum, never raise it.", NotApplicable);
+            #[serde(default)]
+            timeout_s: Option<u64> => (2, "Caller-supplied time ceiling in seconds; may only lower the \
+                                  operator's configured maximum, never raise it.", NotApplicable);
+            #[serde(default)]
+            namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
+                                  authorized token namespace, never elevates capability.", NotApplicable);
+        }
     }
 }
-
-// Keep verb identities and admission categories explicit for the source census;
-// each parameter list is still generated from its typed field definition above.
-pub(crate) static WEB_HANDLERS: [HandlerDef; 5] = [
-    HandlerDef {
-        name: "web.fetch",
-        description: FetchParams::DESCRIPTION,
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: FetchParams::PARAMS,
-    },
-    HandlerDef {
-        name: "web.extract",
-        description: ExtractParams::DESCRIPTION,
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: ExtractParams::PARAMS,
-    },
-    HandlerDef {
-        name: "web.ingest",
-        description: IngestParams::DESCRIPTION,
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: IngestParams::PARAMS,
-    },
-    HandlerDef {
-        name: "web.search",
-        description: SearchParams::DESCRIPTION,
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: SearchParams::PARAMS,
-    },
-    HandlerDef {
-        name: "web.refresh",
-        description: RefreshParams::DESCRIPTION,
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: RefreshParams::PARAMS,
-    },
-];
 
 /// Exactly two rows (ADR-191 D2): everything else the pack's operations
 /// produce — `page links_to page|resource`, `document derived_from
@@ -301,8 +311,66 @@ mod tests {
         }
     }
 
-    // Explicitly guard the manual handler order against the generated decoders
-    // before pairing them, so missing or reordered rows cannot escape coverage.
+    // The source census reads literal names and admission metadata. Compare
+    // that independent population with the generated table, including a
+    // nonempty check so dropping all generated handlers cannot pass vacuously.
+    #[test]
+    fn generated_handlers_match_source_declarations() {
+        let source = include_str!("vocab.rs");
+        let handlers = <crate::WebPack as khive_types::Pack>::HANDLERS;
+        let names: Vec<_> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("name: \"")?.strip_suffix("\","))
+            .collect();
+        let visibility: Vec<_> = source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("visibility: Visibility::")?
+                    .strip_suffix(',')
+            })
+            .collect();
+        let categories: Vec<_> = source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("category: VerbCategory::")?
+                    .strip_suffix(',')
+            })
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "web source declarations must be nonempty"
+        );
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|handler| handler.name)
+                .collect::<Vec<_>>(),
+            names,
+            "generated handler names must match source declarations"
+        );
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|handler| format!("{:?}", handler.visibility))
+                .collect::<Vec<_>>(),
+            visibility,
+            "generated handler visibility must match source declarations"
+        );
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|handler| format!("{:?}", handler.category))
+                .collect::<Vec<_>>(),
+            categories,
+            "generated handler categories must match source declarations"
+        );
+    }
+
+    // Serialization exposes every typed field, including optional fields
+    // missing from ParamDefs; decoding only a full advertised payload would
+    // otherwise miss exactly that drift.
     #[test]
     fn every_declared_param_name_round_trips_an_undeclared_name_refuses() {
         assert_eq!(WEB_HANDLERS.len(), WEB_PARAM_DECODERS.len());
@@ -313,11 +381,41 @@ mod tests {
                 object.insert(param.name.to_string(), fixture_for(param.param_type));
             }
             let value = Value::Object(object.clone());
-            assert!(
-                decode(value).is_ok(),
-                "{}: every declared param name must deserialize through the params struct",
+            let round_trip = decode(value).unwrap_or_else(|error| {
+                panic!(
+                    "{}: declared parameter payload must decode: {error}",
+                    handler.name
+                )
+            });
+            assert_eq!(
+                round_trip,
+                Value::Object(object.clone()),
+                "{}: advertised parameter fields must cover every typed serde field",
                 handler.name
             );
+
+            let required: serde_json::Map<_, _> = handler
+                .params
+                .iter()
+                .filter(|param| param.required)
+                .map(|param| (param.name.to_string(), fixture_for(param.param_type)))
+                .collect();
+            assert!(
+                decode(Value::Object(required)).is_ok(),
+                "{}: required-only payload must decode",
+                handler.name
+            );
+            for param in handler.params {
+                let mut omitted = object.clone();
+                omitted.remove(param.name);
+                assert_eq!(
+                    decode(Value::Object(omitted)).is_err(),
+                    param.required,
+                    "{}: requiredness must match serde for {}",
+                    handler.name,
+                    param.name
+                );
+            }
 
             let mut with_unknown = object;
             with_unknown.insert("definitely_not_a_declared_param".to_string(), json!(true));
