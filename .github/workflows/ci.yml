@@ -908,8 +908,8 @@ jobs:
           go mod verify
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/minio" .
           # The health probe below must reach the server started here, so the
-          # port has to be free before it starts and the process has to be
-          # alive once the probe answers.
+          # port has to be free before it starts, and once the probe answers the
+          # process has to be alive and has to own the listening socket.
           if curl -s -o /dev/null http://127.0.0.1:9000/; then
             echo "127.0.0.1:9000 already answers before MinIO starts" >&2
             exit 1
@@ -920,7 +920,9 @@ jobs:
           echo $! > "$RUNNER_TEMP/minio.pid"
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              kill -0 "$(cat "$RUNNER_TEMP/minio.pid")"
+              pid="$(cat "$RUNNER_TEMP/minio.pid")"
+              kill -0 "$pid"
+              ss -Hltnp 'sport = :9000' | grep -F "pid=$pid,"
               exit 0
             fi
             sleep 1
@@ -948,6 +950,15 @@ jobs:
           AWS_ACCESS_KEY_ID: khive-ci
           AWS_SECRET_ACCESS_KEY: khive-ci-secret
         run: cargo test -p khive-db --test blob_conformance
+      # The suite counts only if the server started above served all of it:
+      # the same process must still be alive and still own the port.
+      - name: Confirm the suite ran against the started server
+        if: steps.changed.outputs.run == 'true'
+        working-directory: .
+        run: |
+          pid="$(cat "$RUNNER_TEMP/minio.pid")"
+          kill -0 "$pid"
+          ss -Hltnp 'sport = :9000' | grep -F "pid=$pid,"
       - name: Stop MinIO
         if: always() && steps.changed.outputs.run == 'true'
         run: |
