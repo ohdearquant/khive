@@ -706,8 +706,20 @@ async fn confirmed_reencryption_rejects_sender_key_epoch_change() {
     assert_eq!(store.get(envelope.key()).await.unwrap(), Some(prior));
 }
 
+fn assert_held_failure_refusal(error: &StorageError, marker: &str) {
+    let cause = match error {
+        StorageError::WriterTaskRequestFailed { source, .. } => source.as_ref(),
+        direct => direct,
+    };
+    assert!(
+        matches!(cause, StorageError::InvalidInput { message, .. }
+            if message == "sender record is held"),
+        "{marker}: expected the held sender refusal, got {error:?}"
+    );
+}
+
 #[tokio::test]
-async fn permanent_failure_clears_hold_and_policy() {
+async fn held_transport_refuses_every_failure_class_without_mutation() {
     for hold in [
         HoldReason::InsufficientCredit,
         HoldReason::RecipientKeyChanged,
@@ -716,47 +728,140 @@ async fn permanent_failure_clears_hold_and_policy() {
             revision: 7,
         },
     ] {
-        let (backend, envelope) = fixture();
-        let store = SenderTransportStore::new(backend.pool_arc());
-        store.create(envelope.clone(), false).await.unwrap();
-        store.hold(envelope.key(), Some(hold)).await.unwrap();
-        for class in [FailureClass::Transient, FailureClass::Authentication] {
-            store
-                .record_failure(envelope.key(), class, Some(42))
-                .await
-                .unwrap();
-            assert_eq!(
+        for (class, refusal_marker) in [
+            (
+                FailureClass::Permanent,
+                "held_permanent_failure_must_refuse",
+            ),
+            (
+                FailureClass::Transient,
+                "held_transient_failure_must_refuse",
+            ),
+            (
+                FailureClass::Authentication,
+                "held_authentication_failure_must_refuse",
+            ),
+        ] {
+            let (backend, envelope) = fixture();
+            let store = SenderTransportStore::new(backend.pool_arc());
+            store.create(envelope.clone(), false).await.unwrap();
+            for retry_at in [21, 42] {
                 store
-                    .get(envelope.key())
+                    .record_failure(envelope.key(), FailureClass::Transient, Some(retry_at))
                     .await
+                    .unwrap();
+            }
+            store.hold(envelope.key(), Some(hold)).await.unwrap();
+            assert_eq!(
+                backend
+                    .pool()
+                    .writer()
                     .unwrap()
+                    .conn()
+                    .execute("UPDATE comm_sender_transport SET updated_at=17", [])
+                    .unwrap(),
+                1
+            );
+            let policy_columns = || -> (Option<String>, Option<i64>) {
+                backend
+                    .pool()
+                    .writer()
                     .unwrap()
-                    .hold_reason,
-                Some(hold)
+                    .conn()
+                    .query_row(
+                        "SELECT policy_mode, policy_revision FROM comm_sender_transport",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap()
+            };
+            let before = store.get(envelope.key()).await.unwrap().unwrap();
+            let policy_before = policy_columns();
+            assert_eq!(before.state, TransportState::Pending);
+            assert_eq!(before.hold_reason, Some(hold));
+            assert_eq!(before.attempt_count, 2);
+            assert_eq!(before.next_retry_at, Some(42));
+            assert_eq!(before.last_failure_class, Some(FailureClass::Transient));
+            assert_eq!(before.updated_at, 17);
+            assert_eq!(
+                policy_before,
+                match hold {
+                    HoldReason::PolicyDenied { .. } => (Some("enforce".to_string()), Some(7)),
+                    _ => (None, None),
+                }
+            );
+
+            let error = store
+                .record_failure(envelope.key(), class, Some(84))
+                .await
+                .expect_err(refusal_marker);
+            assert_held_failure_refusal(&error, refusal_marker);
+            assert_eq!(
+                store.get(envelope.key()).await.unwrap(),
+                Some(before),
+                "held_failure_record_must_remain_unchanged: hold={hold:?}, class={class:?}"
+            );
+            assert_eq!(
+                policy_columns(),
+                policy_before,
+                "held_failure_policy_columns_must_remain_unchanged: hold={hold:?}, class={class:?}"
             );
         }
-        store
-            .record_failure(envelope.key(), FailureClass::Permanent, None)
-            .await
-            .expect("permanent failure must clear held metadata");
-        let row = store.get(envelope.key()).await.unwrap().unwrap();
-        assert_eq!(row.state, TransportState::Failed);
-        assert_eq!(row.hold_reason, None);
-        assert_eq!(row.envelope, envelope);
-        assert_eq!(row.next_retry_at, None);
-        let columns: (Option<String>, Option<i64>) = backend
-            .pool()
-            .writer()
-            .unwrap()
-            .conn()
-            .query_row(
-                "SELECT policy_mode, policy_revision FROM comm_sender_transport",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(columns, (None, None));
     }
+}
+
+#[tokio::test]
+async fn recipient_key_change_recovers_after_permanent_failure_refusal() {
+    let (backend, envelope) = fixture();
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(envelope.clone(), false).await.unwrap();
+    store
+        .record_failure(envelope.key(), FailureClass::Transient, Some(42))
+        .await
+        .unwrap();
+    store
+        .hold(envelope.key(), Some(HoldReason::RecipientKeyChanged))
+        .await
+        .unwrap();
+    let held = store.get(envelope.key()).await.unwrap().unwrap();
+    let error = store
+        .record_failure(envelope.key(), FailureClass::Permanent, None)
+        .await
+        .expect_err("key_change_permanent_failure_must_refuse");
+    assert_held_failure_refusal(&error, "key_change_permanent_failure_must_refuse");
+    assert_eq!(store.get(envelope.key()).await.unwrap(), Some(held.clone()));
+
+    let next = SenderEnvelope {
+        recipient_key_epoch: envelope.recipient_key_epoch + 1,
+        recipient_key_fingerprint: "cd".repeat(32),
+        enc: vec![3; 32],
+        ciphertext: vec![4, 0, 255],
+        ..envelope.clone()
+    };
+    assert!(
+        store.create(next.clone(), false).await.is_err(),
+        "key_change_recovery_still_requires_confirmation"
+    );
+    let recovered = store
+        .create(next.clone(), true)
+        .await
+        .expect("key_change_confirmed_reencryption_must_survive_failure_refusal");
+    assert_eq!(recovered.envelope, next);
+    assert_eq!(recovered.state, TransportState::Pending);
+    assert_eq!(recovered.hold_reason, None);
+    assert_eq!(recovered.envelope_seq, held.envelope_seq + 1);
+    assert_eq!(recovered.attempt_count, 0);
+    assert_eq!(recovered.next_retry_at, None);
+    assert_eq!(recovered.last_failure_class, None);
+    assert_eq!(store.get(envelope.key()).await.unwrap(), Some(held));
+    assert_eq!(
+        store
+            .list_pending("local", "khive", "local-device", i64::MAX, 10)
+            .await
+            .unwrap(),
+        vec![recovered],
+        "key_change_recovery_must_make_only_the_new_envelope_retryable"
+    );
 }
 
 #[tokio::test]

@@ -530,6 +530,8 @@ impl SenderTransportStore {
             })
             .await
     }
+    /// Record a failure only for an unheld pending envelope. A hold suspends failure updates as
+    /// well as automatic retry until the hold is resolved.
     pub async fn record_failure(
         &self,
         key: EnvelopeKey,
@@ -544,6 +546,9 @@ impl SenderTransportStore {
                     .ok_or_else(|| invalid("unknown sender record"))?;
                 if row.state != TransportState::Pending {
                     return Err(invalid("sender record is not pending"));
+                }
+                if row.hold_reason.is_some() {
+                    return Err(invalid("sender record is held"));
                 }
                 let state = if class == FailureClass::Permanent {
                     TransportState::Failed
