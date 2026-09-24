@@ -56,7 +56,11 @@ Fetch one URL under egress policy. Follows up to 5 redirects; a 301/308 hop mint
 the hop and links `new supersedes old`, a 302/307 hop mints nothing beyond a receipt entry naming
 it. The terminal hop's body (if `GET`; `HEAD` carries none) is stored via the runtime's blob
 store, content-addressed; storing byte-identical content again is a no-op. `persist` defaults to
-`true`; `false` fetches and returns the result without minting entities or writing a receipt.
+`true`; `false` stores no body or entities and returns the exact body as a JSON byte array in
+`body` (null for HEAD or a persisted fetch). It still writes a standalone receipt recording
+`final_url`, the BLAKE3 `content_digest`, `size` and RFC 3339 `fetched_at`; `content_ref` is null.
+A persisted body has one `content` attachment on its entity, on the main backend even when web
+records use a separate backend. Receipts never carry body attachments.
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 

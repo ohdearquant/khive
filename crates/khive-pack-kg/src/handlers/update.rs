@@ -354,19 +354,31 @@ impl KgPack {
         };
         // By-ID resolution (including the hex-prefix form) is namespace-agnostic
         // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
-        let id = if hard {
+        let id = if let Ok(id) = Uuid::parse_str(&p.id) {
+            id
+        } else if p.id.len() >= 8 && p.id.chars().all(|c| c.is_ascii_hexdigit()) {
+            registry
+                .resolve_kg_read_prefix(&self.runtime, token, &p.id, hard)
+                .await?
+                .ok_or_else(|| RuntimeError::NotFound(p.id.clone()))?
+        } else if hard {
             resolve_uuid_unfiltered_including_deleted(&p.id, &self.runtime, token).await?
         } else {
             resolve_uuid_unfiltered(&p.id, &self.runtime, token).await?
         };
+        let owner = registry
+            .resolve_entity_delete_runtime(&self.runtime, token, id, hard)
+            .await?;
+        let target = KgPack::new(owner.unwrap_or_else(|| self.runtime.clone()));
         let spec: Option<KindSpec> = match explicit_spec {
             Some(s) => Some(s),
             None => {
                 let infer_result = if hard {
-                    self.infer_kind_from_uuid_including_deleted(token, id, &p.id)
+                    target
+                        .infer_kind_from_uuid_including_deleted(token, id, &p.id)
                         .await
                 } else {
-                    self.infer_kind_from_uuid(token, id, &p.id).await
+                    target.infer_kind_from_uuid(token, id, &p.id).await
                 };
                 match infer_result {
                     Ok(s) => Some(s),
@@ -381,6 +393,16 @@ impl KgPack {
                             if maybe.is_some() {
                                 return resolver.delete_by_id(id, hard).await;
                             }
+                        }
+                        if hard
+                            && registry
+                                .cleanup_deleted_entity_attachments(&target.runtime, token, id)
+                                .await?
+                        {
+                            return Ok(serde_json::json!({
+                                "deleted": true, "id": p.id, "kind": "entity",
+                                "attachment_cleanup": true,
+                            }));
                         }
                         return Err(RuntimeError::NotFound(p.id.clone()));
                     }
@@ -398,12 +420,27 @@ impl KgPack {
                 // whether or not the caller named a kind, so the guard cannot
                 // be stepped around by omitting one.
                 let entity = if hard {
-                    self.runtime
+                    match target
+                        .runtime
                         .get_entity_including_deleted(token, id)
                         .await?
-                        .ok_or_else(|| RuntimeError::NotFound(format!("entity {}", p.id)))?
+                    {
+                        Some(entity) => entity,
+                        None => {
+                            if registry
+                                .cleanup_deleted_entity_attachments(&target.runtime, token, id)
+                                .await?
+                            {
+                                return Ok(serde_json::json!({
+                                    "deleted": true, "id": p.id, "kind": "entity",
+                                    "attachment_cleanup": true,
+                                }));
+                            }
+                            return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
+                        }
+                    }
                 } else {
-                    self.runtime.get_entity(token, id).await?
+                    target.runtime.get_entity(token, id).await?
                 };
                 refuse_pack_registry_row(&entity, "delete")?;
                 if let Some(ref expected) = specific {
@@ -419,7 +456,7 @@ impl KgPack {
                 // nothing, and a caller who deleted by a bare id or a hex prefix learns
                 // what it actually removed.
                 let resolved_kind = entity.kind.clone();
-                let deleted = self.runtime.delete_entity(token, id, hard).await?;
+                let deleted = target.runtime.delete_entity(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
@@ -433,12 +470,14 @@ impl KgPack {
                 // report a kind only when the caller had already supplied one.
                 let label = specific.as_deref().unwrap_or("note");
                 let note = if hard {
-                    self.runtime
+                    target
+                        .runtime
                         .get_note_including_deleted(token, id)
                         .await?
                         .ok_or_else(|| RuntimeError::NotFound(format!("{} {}", label, p.id)))?
                 } else {
-                    self.runtime
+                    target
+                        .runtime
                         .notes(token)?
                         .get_note(id)
                         .await
@@ -454,7 +493,7 @@ impl KgPack {
                     }
                 }
                 let resolved_kind = note.kind.clone();
-                let deleted = self.runtime.delete_note(token, id, hard).await?;
+                let deleted = target.runtime.delete_note(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
@@ -463,7 +502,7 @@ impl KgPack {
                 )
             }
             KindSpec::Edge => {
-                let deleted = self.runtime.delete_edge(token, id, hard).await?;
+                let deleted = target.runtime.delete_edge(token, id, hard).await?;
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
             }
             KindSpec::Event => Err(immutable_event_error()),

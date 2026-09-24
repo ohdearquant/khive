@@ -126,8 +126,9 @@ web_verbs! {
                               Authorization: Bearer header. Requires https at every hop, \
                               and only on a host in the credential's own configured set.", NotApplicable);
         #[serde(default)]
-        persist: Option<bool> => (2, "Defaults to true. False fetches without minting entities or \
-                              writing a receipt.", NotApplicable);
+        persist: Option<bool> => (2, "Defaults to true. False stores no body or entities, returns the body \
+                              as a JSON byte array, and writes a receipt with final URL, content \
+                              digest, size and fetch time. HEAD returns no body.", NotApplicable);
         #[serde(default)]
         max_bytes: Option<u64> => (3, "Caller-supplied byte ceiling; may only lower the operator's \
                               configured maximum, never raise it.", NotApplicable);

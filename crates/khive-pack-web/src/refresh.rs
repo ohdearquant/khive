@@ -404,23 +404,6 @@ async fn settle_refresh(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.refresh: receipt write failed: {error}"))
     })?;
-    if let Some(content_ref) = &new_content_ref {
-        crate::fetch::root_body(
-            runtime,
-            receipt_id,
-            khive_storage::AttachmentSubstrate::Note,
-            &khive_storage::ContentRef::from_hex(content_ref.clone()).map_err(|error| {
-                RuntimeError::Internal(format!("content_ref {content_ref:?} unparseable: {error}"))
-            })?,
-            outcome
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            body_bytes,
-        )
-        .await?;
-    }
-
     if let Some(previous) = previous_receipt {
         runtime
             .link(

@@ -4991,6 +4991,15 @@ impl KhiveRuntime {
             statement: row_statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
+        if substrate == SubstrateKind::Entity {
+            statements.push(PlanStatement {
+                statement: khive_db::stores::attachment::delete_record_attachments_statement(
+                    node_id,
+                    AttachmentSubstrate::Entity,
+                ),
+                guard: None,
+            });
+        }
         statements.extend(
             hard_delete_lineage_warning_statements(namespace, actor, node_id, substrate)
                 .into_iter()
@@ -5775,6 +5784,11 @@ impl KhiveRuntime {
                     SubstrateKind::Entity,
                 )
                 .await?;
+            // ADR-191 A1.2: commit the record first. A failed core cleanup may
+            // leak an orphan root, but must never unroot a still-live entity.
+            if deleted && self.backend_id() != self.core().backend_id() {
+                self.delete_entity_attachments_on_core(id).await?;
+            }
             self.remove_from_indexes(&record_tok, id).await?;
             deleted
         } else {
@@ -5801,6 +5815,16 @@ impl KhiveRuntime {
             })?;
         }
         Ok(deleted)
+    }
+
+    pub(crate) async fn delete_entity_attachments_on_core(&self, id: Uuid) -> RuntimeResult<bool> {
+        let core = self.core();
+        drop(core.attachments()?);
+        let statement = khive_db::stores::attachment::delete_record_attachments_statement(
+            id,
+            AttachmentSubstrate::Entity,
+        );
+        Ok(core.sql().writer().await?.execute(statement).await? > 0)
     }
 
     /// Count entities in a namespace, optionally filtered.

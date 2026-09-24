@@ -611,6 +611,15 @@ async fn extract_text(
         }),
     )
     .await?;
+    crate::fetch::root_body(
+        runtime,
+        text_id,
+        khive_storage::AttachmentSubstrate::Entity,
+        &content_ref,
+        Some("text/plain"),
+        excerpt_bytes as u64,
+    )
+    .await?;
     runtime
         .link(
             token,
@@ -1287,6 +1296,22 @@ mod tests {
             .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
             .await
             .unwrap();
+        let roots = runtime
+            .core()
+            .attachments()
+            .unwrap()
+            .list_attachments(entity.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            roots.len(),
+            1,
+            "repeated extraction retains one content root"
+        );
+        assert_eq!(roots[0].role, "content");
+        assert_eq!(roots[0].content_ref, content_ref);
+        assert_eq!(roots[0].media_type.as_deref(), Some("text/plain"));
+        assert_eq!(roots[0].size_bytes, Some(bytes.len() as u64));
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("Hello world"), "{text:?}");
         assert!(

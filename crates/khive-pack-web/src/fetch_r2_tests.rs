@@ -260,6 +260,10 @@ async fn transient_head_still_records_standalone_metadata_receipt() {
     assert_eq!(request["method"], "HEAD");
     assert_eq!(request["final_url"], url.as_str());
     assert_eq!(request["bytes"], 0);
+    assert_eq!(request["size"], 0);
+    assert!(request["content_digest"].is_null());
+    chrono::DateTime::parse_from_rfc3339(request["fetched_at"].as_str().unwrap()).unwrap();
+    assert!(reply["body"].is_null());
     assert!(request["content_ref"].is_null());
     assert!(runtime
         .neighbors(
@@ -286,4 +290,82 @@ async fn transient_head_still_records_standalone_metadata_receipt() {
         .await
         .unwrap()
         .is_none());
+}
+
+// Must fail if persist=false puts a blob, loses binary bytes, or omits receipt metadata.
+#[tokio::test]
+async fn transient_get_returns_exact_body_and_receipt_without_blob_storage() {
+    for configured_store in [false, true] {
+        let (runtime, token, _dir) = if configured_store {
+            fixture().await
+        } else {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            (runtime, token, tempfile::tempdir().unwrap())
+        };
+        for body in [vec![0, 255, 128, 10, 65], vec![]] {
+            let url = Url::parse("https://transient.example/final.bin").unwrap();
+            let digest = blake3::hash(&body).to_hex().to_string();
+            let reference = ContentRef::from_hex(&digest).unwrap();
+            let before = chrono::Utc::now();
+            let reply = settle(
+                &runtime,
+                &token,
+                "GET",
+                &url,
+                200,
+                &reqwest::header::HeaderMap::new(),
+                Some((body.clone(), true)),
+                &[],
+                false,
+            )
+            .await
+            .expect("transient fetch requires no blob store");
+            let after = chrono::Utc::now();
+            assert_eq!(reply["body"], json!(body));
+            assert_eq!(reply["bytes"], body.len() as u64);
+            assert_eq!(reply["truncated"], true);
+            assert!(reply["id"].is_null());
+            assert!(reply["content_ref"].is_null());
+            let receipt_id = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+            let receipt = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(receipt_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let request = &receipt.properties.as_ref().unwrap()["request"];
+            assert_eq!(request["final_url"], url.as_str());
+            assert_eq!(request["content_digest"], digest);
+            assert_eq!(request["size"], body.len() as u64);
+            assert!(request["content_ref"].is_null());
+            assert!(request.get("body").is_none());
+            let fetched_at =
+                chrono::DateTime::parse_from_rfc3339(request["fetched_at"].as_str().unwrap())
+                    .unwrap();
+            assert!(fetched_at >= before && fetched_at <= after);
+            for id in [document_id(&url), crate::identity::site_id(&url)] {
+                assert!(runtime
+                    .entities(&token)
+                    .unwrap()
+                    .get_entity(id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            for id in [document_id(&url), receipt_id] {
+                assert!(runtime
+                    .attachments()
+                    .unwrap()
+                    .list_attachments(id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+            if let Some(store) = runtime.blob_store() {
+                assert!(!store.exists(&reference).await.unwrap());
+            }
+        }
+    }
 }

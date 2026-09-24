@@ -1929,6 +1929,47 @@ impl VerbRegistry {
         }
     }
 
+    /// Find the unique configured backend holding an entity for deletion.
+    /// The dispatch-authorized token is preserved; lookup is namespace-agnostic.
+    pub async fn resolve_entity_delete_runtime(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+        include_deleted: bool,
+    ) -> Result<Option<KhiveRuntime>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.entity_runtime(token, id, include_deleted).await,
+            None => {
+                let store = runtime.entities(token)?;
+                let entity = if include_deleted {
+                    store.get_entity_including_deleted(id).await?
+                } else {
+                    store.get_entity(id).await?
+                };
+                Ok(entity.map(|_| runtime.clone()))
+            }
+        }
+    }
+
+    /// Retry the main-backend cleanup after a routed entity's delete committed.
+    /// A live or tombstoned entity on any configured backend keeps its roots.
+    pub async fn cleanup_deleted_entity_attachments(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<bool, RuntimeError> {
+        if self
+            .resolve_entity_delete_runtime(runtime, token, id, true)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        runtime.delete_entity_attachments_on_core(id).await
+    }
+
     /// Resolve a prefix across the same inventory, rejecting distinct UUIDs.
     ///
     /// Retains the local prefix scanner's entity/note/event/edge collision domain,

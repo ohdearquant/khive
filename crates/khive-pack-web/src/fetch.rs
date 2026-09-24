@@ -537,13 +537,6 @@ pub(crate) async fn root_body(
         .map_err(|error| RuntimeError::Internal(format!("body attachment write failed: {error}")))
 }
 
-/// Parse a content reference the way the blob store spells it.
-fn parse_content_ref(value: &str) -> Result<ContentRef, RuntimeError> {
-    ContentRef::from_hex(value).map_err(|error| {
-        RuntimeError::Internal(format!("content_ref {value:?} unparseable: {error}"))
-    })
-}
-
 /// Mint (if absent), blob-store the body, and patch one page/resource
 /// entity's full row: identity resolve, `site contains {page|resource}`
 /// link (arm29: minted before the blob put, so a failing store still leaves
@@ -743,10 +736,9 @@ async fn settle(
     let response_headers_json = extract_allowed_headers(headers);
     let content_type = header_str(headers, "content-type").map(str::to_string);
 
-    // persist=false still blob-puts and reports the content_ref/bytes back
-    // to the caller (a dry-run-ish read) but never touches the graph, so it
-    // cannot go through `settle_content` (which always mints); persist=true
-    // delegates the whole mint+link+blob+patch sequence to it.
+    let fetched_at = chrono::Utc::now().to_rfc3339();
+    let mut content_digest = None;
+    let mut response_body = None;
     let (final_entity_id, content_ref, bytes, truncated) = if persist {
         let settled = settle_content(
             runtime,
@@ -772,13 +764,15 @@ async fn settle(
         match body {
             None => (None, None, 0u64, false),
             Some((buffer, truncated)) => {
-                let store = crate::blob_store(runtime)?;
                 let len = buffer.len() as u64;
-                let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
-                (None, Some(content_ref.to_string()), len, truncated)
+                content_digest = Some(blake3::hash(&buffer).to_hex().to_string());
+                response_body = Some(buffer);
+                (None, None, len, truncated)
             }
         }
     };
+
+    let content_digest = content_digest.or_else(|| content_ref.clone());
 
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()
@@ -794,6 +788,9 @@ async fn settle(
         "bytes": bytes,
         "truncated": truncated,
         "content_ref": content_ref,
+        "content_digest": content_digest,
+        "size": bytes,
+        "fetched_at": fetched_at,
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
     });
@@ -807,22 +804,10 @@ async fn settle(
     .await
     .map_err(|error| {
         RuntimeError::Internal(format!(
-            "web.fetch: receipt write failed after a successful store (content_ref={:?}): {error}",
+            "web.fetch: receipt write failed after body settlement (content_ref={:?}): {error}",
             content_ref
         ))
     })?;
-    if let Some(content_ref) = &content_ref {
-        root_body(
-            runtime,
-            receipt_id,
-            AttachmentSubstrate::Note,
-            &parse_content_ref(content_ref)?,
-            headers.get("content-type").and_then(|v| v.to_str().ok()),
-            bytes,
-        )
-        .await?;
-    }
-
     Ok(json!({
         "final_url": final_url.to_string(),
         "status": status,
@@ -833,6 +818,7 @@ async fn settle(
         "redirects": redirect_hops.len() as u32,
         "receipt_id": receipt_id.to_string(),
         "id": final_entity_id.map(|id| id.to_string()),
+        "body": response_body,
     }))
 }
 
@@ -1200,13 +1186,10 @@ mod tests {
     // request) returns the same blob reference, mints no new entity, and
     // writes a receipt only; a different body is the control that yields a
     // different reference.
-    // A fetched body is rooted on its entity and on its receipt through the
-    // attachments table, the reference source blob garbage collection reads;
-    // the property naming the blob is not. Control: a HEAD fetch stores no
-    // body and roots nothing.
+    // A1.2: receipts never own the fetched body. Must fail if receipt rooting
+    // returns or entity rooting is removed. Control: a fresh HEAD roots nothing.
     #[tokio::test]
-    async fn fetched_body_is_rooted_as_a_content_attachment_on_entity_and_receipt_head_roots_nothing(
-    ) {
+    async fn fetched_body_is_rooted_only_on_entity_head_roots_nothing() {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://rooted.example.test/page.html").unwrap();
         let body = b"<html><body>rooted body</body></html>".to_vec();
@@ -1242,8 +1225,10 @@ mod tests {
             .list_attachments(receipt_id)
             .await
             .expect("list receipt attachments");
-        assert_eq!(on_receipt.len(), 1, "the receipt roots the same body");
-        assert_eq!(on_receipt[0].content_ref.to_string(), content_ref);
+        assert!(
+            on_receipt.is_empty(),
+            "the receipt never roots a fetched body"
+        );
 
         let head_url = Url::parse("https://rooted.example.test/other.html").unwrap();
         let head_reply = settle(
