@@ -925,7 +925,7 @@ async fn load_task(
     if !TASK_STATUSES.contains(&current.as_str()) {
         return Err(RuntimeError::InvalidInput(format!(
             "task {} has invalid stored status {current:?}; valid stored statuses: {}; \
-             legacy state requires reviewed repair, not a lifecycle transition",
+             legacy state requires explicit gtd.repair, not a lifecycle transition",
             short_id(note.id),
             TASK_STATUSES.join(", ")
         )));
@@ -1840,7 +1840,7 @@ impl GtdPack {
                     "hint": "no tasks matched, but the default filter excludes terminal and \
                               unrecognized stored statuses; pass status=\"done\" or \
                               status=\"cancelled\" for terminal tasks, or use list(kind=\"task\") \
-                              to inspect legacy records before a reviewed repair",
+                              to inspect legacy records before explicit gtd.repair",
                 });
                 if limit_clamped {
                     insert_limit_report(&mut response, requested_limit, limit);
