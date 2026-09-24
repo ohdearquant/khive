@@ -871,12 +871,14 @@ jobs:
             echo "no comparable base SHA -- running the MinIO leg to be safe"
             exit 0
           fi
-          if ! changed_paths=$(git diff --name-only "$base" HEAD -- ..); then
+          # Include both sides of a move: renaming out of a storage directory
+          # still changes the storage tests and must run this leg.
+          if ! changed_paths=$(git diff --no-renames --name-only "$base" HEAD -- ..); then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "base comparison failed -- running the MinIO leg to be safe"
             exit 0
           fi
-          if grep -qE '^(crates/khive-db/|crates/khive-storage/|docs/adr/ADR-111)' <<< "$changed_paths"; then
+          if grep -qE '^(crates/khive-db/|crates/khive-storage/|docs/adr/ADR-111|\.github/workflows/ci\.yml$|crates/Cargo\.(toml|lock)$)' <<< "$changed_paths"; then
             run=true
           else
             run=false

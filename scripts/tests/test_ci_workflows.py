@@ -254,6 +254,42 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
     def test_blob_contract_path_runs_minio_after_fetching_base(self):
         self._assert_protected_path("docs/adr/ADR-111-fixture.md", "BLOB_CONTRACT_PATH_RUNS_MINIO")
 
+    def test_ci_workflow_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path(".github/workflows/ci.yml", "CI_WORKFLOW_PATH_RUNS_MINIO")
+
+    def test_workspace_manifest_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/Cargo.toml", "WORKSPACE_MANIFEST_PATH_RUNS_MINIO")
+
+    def test_workspace_lockfile_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/Cargo.lock", "WORKSPACE_LOCKFILE_PATH_RUNS_MINIO")
+
+    def test_renaming_database_conformance_to_unprotected_crate_runs_minio(self):
+        protected = "crates/khive-db/tests/blob_conformance.rs"
+        unprotected = "crates/khive-types/tests/blob_conformance.rs"
+        checkout, _, env = self._shallow_fixture(protected)
+        base = self._git(checkout, env, "rev-parse", "HEAD").stdout.strip()
+        (checkout / unprotected).parent.mkdir(parents=True)
+        self._git(checkout, env, "mv", protected, unprotected)
+        self._git(checkout, env, "commit", "-m", "move conformance out of database crate")
+        # Pin the fixture to the behavior that hid the protected old path.
+        # The shipped script must override this with --no-renames.
+        self._git(checkout, env, "config", "diff.renames", "true")
+        self.assertEqual(
+            self._git(checkout, env, "diff", "--name-status", base, "HEAD").stdout,
+            f"R100\t{protected}\t{unprotected}\n",
+            "FIXTURE_IS_PROTECTED_TO_UNPROTECTED_RENAME",
+        )
+        self.assertEqual(
+            self._git(checkout, env, "diff", "--name-only", base, "HEAD").stdout,
+            f"{unprotected}\n",
+            "DEFAULT_RENAME_DIFF_HIDES_PROTECTED_SOURCE",
+        )
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=true\n",
+            "RENAMED_DATABASE_SOURCE_RUNS_MINIO",
+        )
+
     def test_missing_base_runs_minio(self):
         checkout, _, env = self._shallow_fixture()
         self.assertEqual(
@@ -293,6 +329,17 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             ),
             "run=true\n",
             "MANUAL_EVENT_RUNS_MINIO",
+        )
+
+    def test_scheduled_event_runs_minio_even_with_comparable_payload_bases(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self.assertEqual(
+            self._run_gate(
+                checkout, env, event="schedule", pr_base=base, push_before=base,
+            ),
+            "run=true\n",
+            "SCHEDULED_EVENT_RUNS_MINIO",
         )
 
     def test_locally_present_base_skips_nonstorage_without_remote(self):
