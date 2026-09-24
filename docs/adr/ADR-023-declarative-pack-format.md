@@ -967,3 +967,26 @@ their own later contract. [ADR-172](ADR-172-versioned-notes-compare-and-set.md) 
 replay stays singleton-only: this amendment does not add a key to bulk create. Empty-list semantics
 are unchanged: `create(items=[])` remains accepted and writes nothing; this amendment does not
 touch any other verb's empty-input contract.
+
+## Amendment: explicit GTD repair exception (2026-09-24)
+
+**Status: Accepted.**
+[ADR-019 Amendment 7](ADR-019-gtd-pack.md#amendment-7-2026-09-24-explicit-historical-task-repair-2394)
+defines `gtd.repair` as a named exception under the non-CRUD rule above. Its domain
+operation combines an exact observed-source check, a guarded historical correction,
+preservation of first-original provenance and a mandatory audit in one row
+transaction. An ordinary property patch cannot express that contract.
+
+The exception is limited to caller-reviewed `created_at`/`updated_at` corrections
+and an unknown stored TEXT status corrected to `done` or `cancelled`. It supplies
+no inferred units, automatic status mapping, generic mutation escape or new
+namespace authority. Canonical statuses and the absent/null/non-text `inbox`
+fallback remain under ordinary GTD lifecycle rules. Shared `update` restrictions
+remain unchanged.
+
+Dry run is the default and writes no repair audit; applying a batch commits each
+accepted row independently. The Gate classifies the verb as Write on both paths.
+A successful correction and its provenance must commit with the repair audit,
+or the row transaction must roll back. Inputs and SQL bindings are prepared
+outside the writer scope described in ADR-091 Amendment 20. This exception does
+not relax dispatch-by-kind or KindHook requirements for other operations.

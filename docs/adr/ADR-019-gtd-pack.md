@@ -144,7 +144,7 @@ Priorities `p0`/`p1`/`p2`/`p3` map to note `salience` `1.0`/`0.75`/`0.5`/`0.25` 
 hybrid search (ADR-012) can rank actionable items naturally without needing
 task-specific knowledge in retrieval.
 
-### Five disjoint verbs
+### GTD verbs
 
 | Verb             | Purpose                                                                                                                                                         |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -153,9 +153,11 @@ task-specific knowledge in retrieval.
 | `gtd.complete`   | Validate transition to a terminal state, record `completed_at` and optional `result`. Args: `id`, `status?` (`done` or `cancelled`; default `done`), `result?`. |
 | `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                                  |
 | `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                                       |
+| `gtd.census`     | Read-only raw timestamp evidence counts; optional bounded candidate rows. See Amendments 4 and 6.                                                               |
+| `gtd.repair`     | Preview explicit historical corrections (Amendment 7); `apply=true` commits each accepted row with mandatory repair audit. Args: `items`, `apply?`.             |
 
-No collision with kg pack's shared CRUD. ADR-017's `VerbRegistry` registers all five
-verbs as `gtd`-owned. The kg pack's `create(kind="note", note_kind="task", ...)`
+No collision with kg pack's shared CRUD. ADR-017's `VerbRegistry` registers the
+GTD verbs as `gtd`-owned. The kg pack's `create(kind="note", note_kind="task", ...)`
 path also produces tasks — see "Two equivalent paths" below.
 
 `gtd.complete` and `gtd.transition` follow ADR-007's by-ID contract. Their `id`
@@ -688,7 +690,7 @@ minimal. Operators who want GTD configure it explicitly.
 
 ### Neutral
 
-- The five verbs are stable. Adding more (`defer`, `activate`, `archive`) is a
+- The lifecycle verbs are stable. Adding more (`defer`, `activate`, `archive`) is a
   forward-compatible vocabulary extension.
 - `gtd_lifecycle_audit` is pack-auxiliary; its presence is invisible to non-GTD
   packs.
@@ -787,15 +789,16 @@ before correcting `archived`, and retain `archived_at` and the original transiti
 history as provenance. Neither successful completion nor cancellation may be
 inferred solely from the old spelling.
 
-The timestamp sub-request of #2394 is deferred. Storage timestamps are microseconds
+Automatic timestamp conversion remains deferred. Storage timestamps are microseconds
 since the Unix epoch; the report alone does not establish the import's original
 units or a correct replacement instant. There is no `gtd.stats` verb. Do not infer
 a replacement `created_at`/`updated_at` from `archived_at` or rewrite dates during
 reads or lifecycle validation. Any manual repair requires independently verified
 source timestamps/units, an operator-reviewed correction, and preserved original
 values; this amendment supplies neither an automatic repair nor speculative
-timestamp diagnostics. The later Amendment 4 permits only an evidence census;
-the repair deferral remains in force.
+timestamp diagnostics. Amendment 4 permits an evidence census; Amendment 7
+specifies an explicit, caller-reviewed repair path. That exception does not
+authorize inferred conversions or read-time repair.
 
 ## Amendment 3 (proposed, 2026-09-14): additive task-query filters (#2678)
 
@@ -834,10 +837,11 @@ migration or storage migration is part of this amendment.
 
 ## Amendment 4 (2026-09-22): read-only timestamp evidence census (#2394)
 
-The status boundaries in Amendment 2 stand unchanged. Historical timestamp
-conversion and repair remain deferred. This amendment permits only a read-only
+The status boundaries in Amendment 2 stand unchanged. Automatic historical timestamp
+conversion remains deferred. This amendment permits only a read-only
 `gtd.census` verb that counts raw value shapes on the bound runtime notes backend.
-It does not close the outstanding timestamp repair question.
+The census does not establish a correction; Amendment 7 separately specifies
+explicit repair.
 
 The verb takes no business parameters; the shared `namespace` routing argument
 retains its existing meaning. It counts live (`deleted_at IS NULL`) task notes in
@@ -957,6 +961,91 @@ generic record read path. The opt-in adds a way to find rows, not access to rows
 the caller could not already read. The handler still acquires only a SQL reader,
 mutates nothing, and keeps its Read gate classification.
 
-Timestamp conversion and repair remain deferred, as in Amendment 4. A correction
+Automatic timestamp conversion remains deferred, as in Amendment 4. A correction
 needs row provenance and an independently established source timestamp, and a
-candidate row supplies neither.
+candidate row supplies neither. Amendment 7 defines how a caller submits
+a reviewed correction; candidate discovery alone never authorizes or applies one.
+
+## Amendment 7 (2026-09-24): explicit historical task repair (#2394)
+
+This amendment defines the narrow repair exception referenced by Amendments 2,
+4 and 6. It does not declare the implementation merged. Automatic unit inference,
+replacement-date selection, status mapping, read-time repair and schema migration
+remain outside this contract.
+
+**Request and eligibility.** The verb is
+`gtd.repair(items=[{id, changes:{field:{observed,value}}}], apply=false)`.
+`items` contains 1–100 distinct canonical lowercase dashed full UUIDs; prefixes
+are not accepted. Each item has a nonempty `changes` object. Only `created_at`,
+`updated_at` and `status` may be corrected. Timestamp replacements are explicit
+signed 64-bit integers in the storage's microsecond representation, chosen from
+independently established source evidence. The verb does not derive them from
+`archived_at`, numeric magnitude or another timestamp.
+
+For each requested field the caller supplies the exact observed JSON source
+string, using the representation returned by census `raw.created_at`,
+`raw.updated_at` or `stored_status`. JSON quotes on a stored string are part of
+that source. An absent status member is represented by JSON null; an explicitly
+stored null is the string `"null"`. Numerically equivalent values with different
+source spellings do not satisfy this check. Candidate output identifies stored
+evidence, not the intended replacement; the caller must review both.
+
+A status correction accepts only a stored JSON TEXT string outside the canonical
+task vocabulary, and can set only `done` or `cancelled`. The old spelling alone,
+including `archived`, cannot determine which. Canonical strings use the ordinary
+lifecycle verbs. Absent, null and non-text status values retain their semantic
+`inbox` fallback and likewise use `gtd.transition` or `gtd.complete`; repair
+refuses their status correction. Timestamp-only repair is eligible regardless of
+stored status. The target must be a live task note with object properties (SQL
+NULL properties are treated as an empty object). Invalid property documents,
+unrepresentable raw timestamp values and malformed preserved repair history
+refuse the row rather than reinterpret it.
+
+**Scope and authorization.** Full-ID resolution is namespace-agnostic under
+[ADR-007 Rule 2](ADR-007-namespace.md); the stored namespace remains
+attribution. Census namespace scope governs discovery, not repair target
+authorization. The Gate remains authoritative and classifies `gtd.repair` as
+Write even for a dry run. This exception does not widen generic `update` or
+permit ordinary lifecycle verbs to reinterpret an unknown stored string.
+
+**Preview and commit.** Omitted `apply` means false. A preview returns acceptance
+decisions and stored/proposed values without changing task rows or writing repair
+audit entries. It reserves nothing: `apply=true` rereads the evidence. Malformed
+request shapes, duplicate IDs and an out-of-bound batch reject the entire request
+before effects. Semantic refusal is per row; each accepted row commits in its own
+transaction, not one transaction for the batch.
+
+The prepared UPDATE rechecks the task kind, live state, complete properties,
+version and both raw timestamps including their SQLite types. A changed decision
+snapshot refuses that row without replacing another writer's properties or
+resurrecting a deleted task. On a successful guarded UPDATE, one mandatory
+`gtd_lifecycle_audit` row is inserted in the same transaction. If that insert
+fails, the task correction and provenance update roll back together. This is
+stronger than the existing best-effort audit on ordinary lifecycle operations,
+whose contract is unchanged. Unexpected storage errors stop the call; earlier
+committed rows may remain applied, and an uncertain commit outcome requires a
+fresh read before retry. A successful preview is not evidence of a later commit.
+
+**Preserved evidence.** Each first correction of a field stores its original
+source in `properties.gtd_repair.originals[field] = {value, at, actor}`. `at` is
+the repair time in microseconds and `actor` identifies the acting caller. Later
+repairs keep that first original. `properties.gtd_repair.last` records the latest
+`{at, actor, changes}`; the mandatory audit records retain previous repairs and
+identify `operation="gtd.repair"`. Unrelated property values and their scalar
+lexemes, including `archived_at` and transition history, are preserved. Unrequested
+timestamps stay unchanged, including `updated_at` on a status-only correction;
+repair does not synthesize `completed_at` or an ordinary lifecycle transition.
+
+The response contains `apply`, `accepted`, `applied`, `refused` and an input-ordered
+`results` array. Each item reports `id`, `accepted`, `applied`, `stored`, `proposed`
+and `reason`; refusals also carry a message. An accepted preview has
+`accepted=true, applied=false`; only a committed row has `applied=true`. Per-row
+refusals write nothing and do not undo earlier committed rows. The guard protects
+this repair's own snapshot; it is not a new concurrency guarantee for other
+operations prepared before a timestamp-preserving repair.
+
+This amendment is the named non-CRUD exception in
+[ADR-023](ADR-023-declarative-pack-format.md#amendment-explicit-gtd-repair-exception-2026-09-24).
+Its writer scope is the GTD repair entry in ADR-091 Amendment 20: prepare
+all evidence, provenance and bindings before admission, then execute only the
+guarded UPDATE and audit INSERT with bounded result bookkeeping.
