@@ -211,6 +211,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-192](ADR-192-credential-and-producer-seams.md)                     | Credential Seam and Producer Seams for Network Packs                                                       |
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
 | [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
+| [ADR-195](ADR-195-comm-actor-trust-classes.md)                          | Actor Trust Classes and Per-Pair Message Policy for comm                                                   |
 
 <!-- END GENERATED ADR CATALOG -->
 

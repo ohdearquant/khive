@@ -628,6 +628,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "comm.probe",
         description: "Read-only poll for new inbound message metadata and stale unread count. \
+                      Probing your own mailbox needs no read grant; any other mailbox requires \
+                      the same mailbox read grant as comm.inbox(mailbox_actor=...). \
                       Selects the earliest 100 unseen messages by commit sequence, then displays \
                       that page by created_at ascending. cursor_us advances only through rows \
                       actually returned and never below the honored caller cursor; an empty page \
