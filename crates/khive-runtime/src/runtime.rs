@@ -2776,6 +2776,10 @@ mod tests {
     #[test]
     #[serial]
     fn tilde_prefixed_db_override_resolves_and_boots_like_the_absolute_equivalent() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let original_home = std::env::var_os("HOME");
         let original_cwd = std::env::current_dir().expect("read cwd");
         let home_dir = tempfile::tempdir().expect("home tempdir");

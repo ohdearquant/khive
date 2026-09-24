@@ -18,5 +18,8 @@ pub mod server;
 pub mod tools;
 pub mod transport;
 
+#[cfg(test)]
+mod test_isolation;
+
 #[cfg(feature = "bench-embedder")]
 pub(crate) mod bench_embedder;

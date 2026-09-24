@@ -5541,6 +5541,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn resolve_project_actor_id_reads_cwd_anchored_project_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -5575,6 +5579,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn seat_shaped_project_actor_resolves_through_full_tier_chain() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         // The seat: a project directory with its own `[actor] id`.
@@ -5640,6 +5648,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn resolve_runtime_config_unset_db_discovers_cwd_config_over_home() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -5688,6 +5700,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn cli_actor_flag_wins_over_project_config_actor() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -5792,6 +5808,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn real_clap_path_khive_actor_env_no_longer_wins_over_project_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use clap::Parser;
         std::env::remove_var("KHIVE_ACTOR");
 
@@ -5850,6 +5870,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn real_clap_path_khive_actor_env_falls_back_to_tier3_actor_id() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use clap::Parser;
         std::env::remove_var("KHIVE_ACTOR");
 
@@ -5905,6 +5929,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         // The seat: a project directory with its own `[actor] id`.
@@ -5977,6 +6005,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn config_id_byte_identical_across_different_actor_ids() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
@@ -9216,6 +9248,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn legacy_registry_rejects_unset_db_after_home_changes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let base_cfg = base_runtime_config_for_multi_backend();
@@ -9231,6 +9267,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn legacy_server_rejects_unset_db_after_home_changes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let base_cfg = base_runtime_config_for_multi_backend();
@@ -9297,6 +9337,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let config_path = first_home.path().join("config.toml");
@@ -9760,6 +9804,10 @@ region = "us-east-1"
     #[test]
     #[serial]
     fn config_id_matches_for_tilde_and_equivalent_absolute_db_override() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let original_home = std::env::var_os("HOME");
         let home_dir = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("HOME", home_dir.path());
@@ -10483,6 +10531,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10513,6 +10565,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_actor_identity() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10547,6 +10603,10 @@ region = "us-east-1"
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set(
     ) {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10574,6 +10634,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn default_read_only_server_omits_schedule_tick_and_warms_without_a_writer() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10631,6 +10695,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn multi_backend_schedule_tick_and_warm_use_each_assigned_backend_mode() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10821,6 +10889,10 @@ backend = "schedule-backend"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         // Regression for the exact "strict actor mode can make every tick
         // fail" scenario this fix addressed: before this fix, the
         // tick's separately-reconstructed `RuntimeConfig::default()` carried
@@ -10877,6 +10949,10 @@ backend = "schedule-backend"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
         // "schedule" pack is explicitly routed to its OWN backend, distinct
         // from "main". `build_server`'s returned schedule-tick runtime must
@@ -11010,6 +11086,10 @@ backend = "schedule-backend"
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
     ) {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");

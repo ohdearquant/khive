@@ -3286,6 +3286,8 @@ mod tests {
             .prefix("kh-drain-")
             .tempdir_in("/tmp")
             .expect("short isolated socket directory");
+        let child_home = dir.path().join("home");
+        std::fs::create_dir(&child_home).expect("empty daemon child HOME");
         let mut child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -3298,11 +3300,14 @@ mod tests {
             .envs(
                 std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
             )
-            .env("HOME", dir.path())
+            .env("HOME", &child_home)
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_DRAIN_TEST_CHILD", "1")
             .env("KHIVE_SOCKET", dir.path().join("s"))
             .env("KHIVE_PID", dir.path().join("p"))
             .env("KHIVE_LOCK", dir.path().join("l"))
+            .env("KHIVE_RECOVERER_LOCK", dir.path().join("r"))
             .env("KHIVE_DRAIN_TIMEOUT_SECS", "10")
             .current_dir(dir.path())
             .stdin(Stdio::null())
@@ -3329,6 +3334,10 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("STOPPED_LISTENER_DRAIN_VERIFIED"),
             "child must run the listener witness: {output:?}"
+        );
+        assert!(
+            std::fs::read_dir(child_home).unwrap().next().is_none(),
+            "daemon drain child must leave its private HOME empty"
         );
     }
 
@@ -5202,6 +5211,33 @@ mod tests {
             .expect("successor must receive connection");
     }
 
+    #[test]
+    fn isolated_daemon_locks_use_private_fixture_paths() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        for path in [lock_path(), recoverer_lock_path()] {
+            assert_eq!(
+                path.parent(),
+                home.parent(),
+                "runtime daemon locks must use private fixture paths outside HOME"
+            );
+        }
+        let _boot = acquire_daemon_boot_guard().expect("private boot lock");
+        let _recoverer = try_acquire_recoverer_lock_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("private recoverer lock")
+        .expect("private recoverer lock must be available");
+        assert!(lock_path().is_file());
+        assert!(recoverer_lock_path().is_file());
+        assert!(
+            std::fs::read_dir(home).unwrap().next().is_none(),
+            "both daemon lock producers must leave the child HOME empty"
+        );
+    }
+
     // ── the recovery lock actually serializes two boot sequences ─────────────
     //
     // Production wiring (`khive_mcp::serve::run` / `serve_server`) now acquires
@@ -5216,6 +5252,10 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_lock_serializes_two_concurrent_boot_sequences() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5259,6 +5299,10 @@ mod tests {
     #[test]
     #[serial]
     fn acquire_daemon_boot_guard_returns_guard_when_lock_available() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5276,6 +5320,10 @@ mod tests {
     #[test]
     #[serial]
     fn acquire_daemon_boot_guard_fails_loudly_when_lock_file_cannot_be_opened() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         // Point KHIVE_LOCK at a directory, not a file: opening a directory
         // with `write(true)` fails (EISDIR), so `acquire_recovery_lock`
