@@ -12,9 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
+use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, RequestIdentity, RuntimeConfig, VerbRegistry,
-    VerbRegistryBuilder,
+    ActorRef, AllowAllGate, BackendId, GateRef, KhiveRuntime, MailboxReadGate, Namespace,
+    RequestIdentity, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::note::Note;
 use khive_storage::types::{DeleteMode, SqlStatement, SqlValue};
@@ -23,9 +24,23 @@ use uuid::Uuid;
 
 /// Build a registry with the comm pack's auxiliary schema plan actually
 /// applied, so the probe's history and partial unread indexes exist.
-fn build_registry() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+fn build_registry(actor: Option<&str>) -> (VerbRegistry, KhiveRuntime) {
+    build_registry_with_gate(actor, Arc::new(AllowAllGate))
+}
+
+fn build_registry_with_gate(actor: Option<&str>, gate: GateRef) -> (VerbRegistry, KhiveRuntime) {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".into()],
+        brain_profile: None,
+        actor_id: actor.map(str::to_owned),
+        gate,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(runtime.config().actor_id.clone());
+    builder.with_gate(runtime.config().gate.clone());
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(CommPack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
@@ -142,7 +157,7 @@ async fn plant_inbound_message_in_namespace(
 
 #[tokio::test]
 async fn probe_empty_inbox_returns_zeroed_response() {
-    let (registry, _rt) = build_registry();
+    let (registry, _rt) = build_registry(Some("lambda:nobody"));
 
     let result = registry
         .dispatch("comm.probe", json!({ "actor": "lambda:nobody" }))
@@ -156,7 +171,7 @@ async fn probe_empty_inbox_returns_zeroed_response() {
 
 #[tokio::test]
 async fn probe_empty_page_preserves_a_negative_caller_cursor() {
-    let (registry, _rt) = build_registry();
+    let (registry, _rt) = build_registry(Some("lambda:nobody"));
     for cursor in [-1_i64, -100] {
         let result = registry
             .dispatch(
@@ -173,8 +188,8 @@ async fn probe_empty_page_preserves_a_negative_caller_cursor() {
 
 #[tokio::test]
 async fn probe_cursor_advances_and_filters_since_us() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t1 = 1_000_000_i64;
     let t2 = 2_000_000_i64;
@@ -222,8 +237,8 @@ async fn probe_cursor_advances_and_filters_since_us() {
 /// hides whichever row committed second but stamped an earlier clock read.
 #[tokio::test]
 async fn probe_survives_out_of_order_commit_vs_created_at() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t_high = 5_000_000_i64;
     let t_low = 1_000_000_i64;
@@ -275,8 +290,8 @@ async fn probe_survives_out_of_order_commit_vs_created_at() {
 
 #[tokio::test]
 async fn probe_new_messages_ordered_newest_last() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t1 = 1_000_000_i64;
     let t2 = 2_000_000_i64;
@@ -304,8 +319,8 @@ async fn probe_new_messages_ordered_newest_last() {
 
 #[tokio::test]
 async fn probe_caps_new_messages_at_100_earliest_unseen_sequences() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     // The first page selects the earliest unseen sequences, leaving the final
     // five for the next page instead of skipping them behind its cursor.
@@ -366,8 +381,8 @@ fn probe_message_ids(response: &Value) -> HashSet<String> {
 
 #[tokio::test]
 async fn probe_burst_150_drains_as_100_then_50_without_cursor_skips() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:burst";
+    let (registry, rt) = build_registry(Some(actor));
     let mut planted = Vec::new();
     for index in 0..150 {
         // Reverse timestamps make sequence selection observably different
@@ -459,8 +474,8 @@ async fn probe_burst_150_drains_as_100_then_50_without_cursor_skips() {
 
 #[tokio::test]
 async fn probe_stale_unread_count_uses_default_20_minutes() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     let old_unread = now_us - 25 * 60_000_000; // 25 min ago, unread -> stale
@@ -505,8 +520,8 @@ fn probe_note(namespace: &str, created_at: i64, properties: Value) -> Note {
 
 #[tokio::test]
 async fn probe_stale_count_saturates_at_1000_even_after_the_page_cursor() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:capped-stale";
+    let (registry, rt) = build_registry(Some(actor));
     let stale_time = chrono::Utc::now().timestamp_micros() - 60 * 60_000_000;
     let token = rt.authorize(Namespace::local()).expect("local token");
     let store = rt.notes(&token).expect("notes store");
@@ -544,8 +559,8 @@ async fn probe_stale_count_saturates_at_1000_even_after_the_page_cursor() {
 
 #[tokio::test]
 async fn probe_stale_count_is_independent_of_page_and_preserves_unread_eligibility() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:stale-controls";
+    let (registry, rt) = build_registry(Some(actor));
     let now = chrono::Utc::now().timestamp_micros();
     let fresh_time = now + 60 * 60_000_000;
     let stale_time = now - 60 * 60_000_000;
@@ -650,8 +665,8 @@ async fn probe_stale_count_is_independent_of_page_and_preserves_unread_eligibili
 
 #[tokio::test]
 async fn probe_production_sql_stale_cutoff_is_strict() {
-    let (_registry, rt) = build_registry();
     let actor = "lambda:cutoff";
+    let (_registry, rt) = build_registry(Some(actor));
     for created_at in [999, 1000, 1001] {
         plant_inbound_message(&rt, actor, "sender", created_at, None, false).await;
     }
@@ -680,8 +695,8 @@ async fn probe_production_sql_stale_cutoff_is_strict() {
 
 #[tokio::test]
 async fn probe_respects_custom_stale_minutes() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     let ten_min_ago = now_us - 10 * 60_000_000;
@@ -745,8 +760,8 @@ async fn read_flag_json_type(rt: &KhiveRuntime, actor: &str) -> Option<String> {
 
 #[tokio::test]
 async fn probe_is_strictly_read_only() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     plant_inbound_message(&rt, actor, "a", 1_000_000, Some("hi"), false).await;
 
@@ -786,7 +801,7 @@ async fn probe_is_strictly_read_only() {
 
 #[tokio::test]
 async fn probe_rejects_empty_actor() {
-    let (registry, _rt) = build_registry();
+    let (registry, _rt) = build_registry(Some("lambda:leo"));
 
     let err = registry
         .dispatch("comm.probe", json!({ "actor": "" }))
@@ -800,7 +815,7 @@ async fn probe_rejects_empty_actor() {
 
 #[tokio::test]
 async fn probe_rejects_non_positive_stale_minutes() {
-    let (registry, _rt) = build_registry();
+    let (registry, _rt) = build_registry(Some("lambda:leo"));
 
     let err = registry
         .dispatch(
@@ -817,7 +832,7 @@ async fn probe_rejects_non_positive_stale_minutes() {
 
 #[tokio::test]
 async fn probe_ignores_messages_addressed_to_other_actors() {
-    let (registry, rt) = build_registry();
+    let (registry, rt) = build_registry(Some("lambda:leo"));
 
     plant_inbound_message(&rt, "lambda:leo", "a", 1_000_000, None, false).await;
     plant_inbound_message(&rt, "lambda:khive", "a", 2_000_000, None, false).await;
@@ -842,8 +857,8 @@ async fn probe_ignores_messages_addressed_to_other_actors() {
 
 #[tokio::test]
 async fn probe_ignores_outbound_messages() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     // An outbound message stored with `to_actor` set to this actor (e.g. a
     // sent-mail record) must never be counted as an inbound poll result.
@@ -887,8 +902,8 @@ async fn probe_ignores_outbound_messages() {
 
 #[tokio::test]
 async fn probe_includes_subject_when_present_and_omits_when_absent() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     plant_inbound_message(&rt, actor, "a", 1_000_000, Some("with subject"), false).await;
     plant_inbound_message(&rt, actor, "b", 2_000_000, None, false).await;
@@ -917,7 +932,7 @@ async fn probe_includes_subject_when_present_and_omits_when_absent() {
 
 #[tokio::test]
 async fn probe_rejects_unknown_fields() {
-    let (registry, _rt) = build_registry();
+    let (registry, _rt) = build_registry(Some("lambda:leo"));
 
     let err = registry
         .dispatch(
@@ -933,7 +948,7 @@ async fn probe_rejects_unknown_fields() {
 
 #[tokio::test]
 async fn probe_production_sql_stale_count_plan_uses_partial_index_and_cutoff() {
-    let (_registry, rt) = build_registry();
+    let (_registry, rt) = build_registry(Some("lambda:leo"));
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("reader");
@@ -1014,8 +1029,8 @@ async fn probe_production_sql_stale_count_plan_uses_partial_index_and_cutoff() {
 /// resurface as "new" on the next poll.
 #[tokio::test]
 async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let id = plant_inbound_message(&rt, actor, "lambda:khive", 1_000_000, None, false).await;
 
@@ -1061,8 +1076,8 @@ async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
 /// without losing or replaying any message.
 #[tokio::test]
 async fn probe_survives_vacuum_between_probes() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t1 = 1_000_000_i64;
     plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
@@ -1131,8 +1146,8 @@ async fn probe_survives_vacuum_between_probes() {
 /// the new note be silently excluded by a stale cursor.
 #[tokio::test]
 async fn probe_survives_delete_of_highest_seq_note_before_next_insert() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t1 = 1_000_000_i64;
     let id1 = plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
@@ -1182,8 +1197,8 @@ async fn probe_survives_delete_of_highest_seq_note_before_next_insert() {
 /// one it already handed out.
 #[tokio::test]
 async fn probe_cursor_never_regresses_below_caller_supplied_since_us() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t1 = 1_000_000_i64;
     let t2 = 2_000_000_i64;
@@ -1226,8 +1241,8 @@ async fn probe_cursor_never_regresses_below_caller_supplied_since_us() {
 /// instead of permanently suppressing every message.
 #[tokio::test]
 async fn probe_resets_implausible_pre_upgrade_timestamp_cursor_to_baseline() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     let t1 = 1_000_000_i64;
     plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
@@ -1262,8 +1277,8 @@ async fn probe_resets_implausible_pre_upgrade_timestamp_cursor_to_baseline() {
 /// otherwise reset on every pass.
 #[tokio::test]
 async fn probe_omits_cursor_reset_when_the_cursor_is_honoured() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
     plant_inbound_message(&rt, actor, "lambda:khive", 1_000_000, None, false).await;
 
     let baseline = registry
@@ -1301,8 +1316,8 @@ async fn probe_omits_cursor_reset_when_the_cursor_is_honoured() {
 /// as `since_us` on the next call, at any magnitude.
 #[tokio::test]
 async fn probe_round_trips_a_legitimately_high_sequence_cursor() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     // Plant enough messages to push notes_seq comfortably past the old fixed
     // 1_000_000_000_000 cutoff would have been irrelevant at this count, so
@@ -1446,12 +1461,14 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
         brain_profile: None,
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
-        actor_id: None,
+        actor_id: Some(actor.into()),
         exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(runtime.config().actor_id.clone());
+    builder.with_gate(runtime.config().gate.clone());
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(CommPack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
@@ -1637,12 +1654,14 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         brain_profile: None,
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
-        actor_id: None,
+        actor_id: Some(actor.into()),
         exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 
     let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(runtime.config().actor_id.clone());
+    builder.with_gate(runtime.config().gate.clone());
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(CommPack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
@@ -1691,7 +1710,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
 /// per the fix's own requirement that this be observable deterministically.
 #[tokio::test]
 async fn notes_seq_repair_runs_once_per_backend_not_per_store_acquisition() {
-    let (_registry, runtime) = build_registry();
+    let (_registry, runtime) = build_registry(Some("lambda:leo"));
     let token = runtime
         .authorize(Namespace::local())
         .expect("authorize local namespace");
@@ -1747,8 +1766,8 @@ async fn notes_seq_repair_runs_once_per_backend_not_per_store_acquisition() {
 /// explicit `namespace="tenant-a"` must see only tenant-a's message.
 #[tokio::test]
 async fn probe_scoped_to_injected_namespace_sees_only_its_own_inbound_messages() {
-    let (registry, rt) = build_registry();
     let actor = "lambda:leo";
+    let (registry, rt) = build_registry(Some(actor));
 
     plant_inbound_message_in_namespace(
         &rt,
@@ -1804,4 +1823,99 @@ async fn probe_scoped_to_injected_namespace_sees_only_its_own_inbound_messages()
         scoped_messages[0]["subject"].as_str(),
         Some("tenant-a message")
     );
+}
+
+#[tokio::test]
+async fn probe_own_mailbox_preserves_cursor_call_shape_without_grant() {
+    for actor in [Some("probe-owner"), Some("local"), None] {
+        let (registry, runtime) = build_registry(actor);
+        let owner = actor.unwrap_or("local");
+        let id = plant_inbound_message(&runtime, owner, "sender", 1, None, false).await;
+        let first = registry
+            .dispatch("comm.probe", json!({"actor": owner, "stale_minutes": 20}))
+            .await
+            .expect("own mailbox must not require a read grant");
+        assert_eq!(first["new_messages"][0]["id"], json!(id));
+        let second = registry
+            .dispatch(
+                "comm.probe",
+                json!({"actor": owner, "since_us": first["cursor_us"], "stale_minutes": 20}),
+            )
+            .await
+            .expect("own mailbox cursor call must succeed");
+        assert_eq!(second["cursor_us"], first["cursor_us"]);
+        assert_eq!(second["new_messages"], json!([]));
+        assert_eq!(second["stale_unread_count"], 1);
+    }
+}
+
+#[tokio::test]
+async fn probe_other_mailbox_requires_inbox_read_grant() {
+    for actor in [Some("probe-reader"), None] {
+        let (registry, runtime) = build_registry(actor);
+        plant_inbound_message(&runtime, "probe-owner", "sender", 1, Some("subject"), false).await;
+        let inbox = registry
+            .dispatch("comm.inbox", json!({"mailbox_actor": "probe-owner"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(inbox, RuntimeError::PermissionDenied { .. }));
+        let probe = registry
+            .dispatch("comm.probe", json!({"actor": "probe-owner"}))
+            .await;
+        assert!(
+            matches!(probe, Err(RuntimeError::PermissionDenied { .. })),
+            "other mailbox probe must be permission_denied without data: {probe:?}"
+        );
+        // Direct pack dispatch must enforce the same boundary as the registry.
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let direct = CommPack::new(runtime.clone())
+            .dispatch(
+                "comm.probe",
+                json!({"actor": "probe-owner"}),
+                &registry,
+                &token,
+            )
+            .await;
+        assert!(
+            matches!(direct, Err(RuntimeError::PermissionDenied { .. })),
+            "direct other mailbox probe must be permission_denied without data: {direct:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_other_mailbox_uses_the_existing_inbox_grant() {
+    let gate = Arc::new(
+        MailboxReadGate::new(
+            Arc::new(AllowAllGate),
+            ActorRef::new("actor", "probe-owner"),
+            vec![ActorRef::new("actor", "probe-reader")],
+        )
+        .unwrap(),
+    );
+    let (registry, runtime) = build_registry_with_gate(Some("probe-reader"), gate);
+    let id = plant_inbound_message(&runtime, "probe-owner", "sender", 1, None, false).await;
+    let inbox = registry
+        .dispatch("comm.inbox", json!({"mailbox_actor": "probe-owner"}))
+        .await
+        .expect("configured reader can read the inbox");
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let pack = CommPack::new(runtime.clone());
+    let probe = pack
+        .dispatch(
+            "comm.probe",
+            json!({"actor": "probe-owner"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("the inbox read grant must also permit direct probe");
+    assert_eq!(probe["new_messages"][0]["id"], json!(id));
+    assert_eq!(probe["stale_unread_count"], 1);
+    let dispatched = registry
+        .dispatch("comm.probe", json!({"actor": "probe-owner"}))
+        .await
+        .expect("the inbox read grant must also permit registry probe");
+    assert_eq!(dispatched["new_messages"], probe["new_messages"]);
 }
