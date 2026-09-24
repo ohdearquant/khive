@@ -618,6 +618,10 @@ CI uses three layers:
 3. fake-client unit tests for timeout, authorization, quota, exhausted retry, and partial-page error
    mapping.
 
+> **Amended by Amendment 5 (2026-09-24):** layer 2 no longer pulls a MinIO container. The job builds the MinIO server from
+> its pinned release source and runs it as a local process, and it covers the same endpoint behaviors. Its required status is
+> unchanged.
+
 Live-provider tests are explicit, secret-gated, non-required smoke tests. A mock alone cannot prove
 wire compatibility; a live service alone is too dependent on credentials and network health to be
 the merge gate.
