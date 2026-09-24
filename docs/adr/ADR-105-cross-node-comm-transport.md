@@ -460,7 +460,9 @@ loss, and step 6 refuses all of those timestamps, because nonce memory starts at
 That holds on a service clock that does not run backward across the loss; instances that hold nonce
 memory, together or one after another, keep their clocks within a stated bound of one another, which
 holds for any two of them, including an instance started after another stopped, and for one instance
-before and after a loss of nonce memory, and the floor adds that bound. A replay of a request accepted before the loss
+before and after a loss of nonce memory, and the floor adds that bound. The service's operator
+states that bound, B, and it must be a true bound on those clocks; only the service computes the
+floor, so a client never needs B. A replay of a request accepted before the loss
 therefore stops at step 6 whatever the signer's clock, and has no effect; a request accepted after
 the loss is covered by nonce memory for as long as step 4 can admit it. The signature has already
 verified at step 5, so the refusal is retryable: it tells the key holder to sign again. A retry is
@@ -558,7 +560,9 @@ After A.4, the service:
 3. requires `sender_key_epoch` to equal the authenticated device's epoch, else `invalid_request`;
 4. resolves `recipient` inside its realm and requires an active grant for (sender, recipient) at
    exactly `contact_generation` with no block in either direction, else `contact_not_active`. A block
-   answers exactly as a missing grant does;
+   answers exactly as a missing grant does. A pair's contact generation is never reused: revocation, a
+   block, an unblock and a re-acceptance each move the pair to a generation above every earlier one,
+   so a delivery admitted at an earlier generation never passes this check again;
 5. requires `recipient_device_id` and `recipient_key_epoch` to name the recipient's active device and
    epoch, else `recipient_key_changed`;
 6. applies idempotency on (sender agent, `logical_message_id`), with the envelope digest
@@ -678,7 +682,10 @@ A **receipt** item is `{"seq": n, "receipt": {...}, "recorded_at": "<RFC 3339>"}
 the shape posted in A.6.4. The service returns receipts for which the device's agent is the sender,
 with `seq` greater than `receipts_after`, within the retention of the durable receipt record. `seq` is
 assigned when the durable receipt commits, one sender agent at a time, so `seq` order is commit order
-and a poll never returns `n + 1` while `n` is still to commit. `receipts_cursor` is the `seq` of the
+and a poll never returns `n + 1` while `n` is still to commit. A sender's `seq` values only increase
+and are never reused, even after every receipt of that sender has passed its retention: `seq` is
+assigned above that sender's receipt high-water (A.6.6), not above the highest receipt still kept.
+`receipts_cursor` is the `seq` of the
 last receipt in the page, or `receipts_after` when the page carries none. A client advances its stored
 `receipts_after` past a receipt once it has either verified it and durably recorded the outcome, or
 rejected it and reported it (A.8), so one receipt that fails verification cannot hold back the ones
@@ -736,8 +743,9 @@ this protocol serves, C-ADR-033 D8 as amended 2026-09-23 (Amendment 1: the trans
 carries the recipient device and the envelope digest as replay identity, and the durable receipt
 carries its commit-order position), and nothing else about a message is kept:
 
-- **Directory state**: agents, devices (both public keys, key epoch, status), grants, blocks and
-  requests.
+- **Directory state**: agents, each with its receipt high-water (the highest `seq` assigned to it as a
+  sender, A.6.3, kept while the agent exists and so beyond the retention of its receipts; it names no
+  recipient), devices (both public keys, key epoch, status), grants, blocks and requests.
 - **Transport log**, one row per admission or per refusal of an authenticated request (a request
   refused at A.4 writes none), kept 90 days: the `delivery_attempt_id`, a
   random identifier minted at admission, as the transport request identifier (a refusal row has
