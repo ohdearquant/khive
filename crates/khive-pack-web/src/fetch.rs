@@ -421,7 +421,8 @@ pub(crate) async fn mint_bare(
     token: &NamespaceToken,
     url: &Url,
 ) -> Result<(Uuid, Uuid), RuntimeError> {
-    let canonical = identity::canonicalize(url.clone());
+    let request_url = identity::request_url(url.clone());
+    let canonical = identity::canonicalize(request_url.clone());
     let site = canonical_site(runtime, token, &canonical).await?;
     let path_and_query = identity::path_and_query(&canonical);
     let id = identity::document_id(site, &path_and_query);
@@ -432,7 +433,7 @@ pub(crate) async fn mint_bare(
         "document",
         "resource",
         canonical.as_ref(),
-        json!({ "url": canonical.to_string(), "status": Value::Null }),
+        json!({ "url": request_url.to_string(), "status": Value::Null }),
     )
     .await?;
     runtime
@@ -620,7 +621,8 @@ pub(crate) async fn settle_content_body(
     last_modified: Option<&str>,
     body: Option<ContentBody>,
 ) -> Result<SettledContent, RuntimeError> {
-    let canonical = identity::canonicalize(url.clone());
+    let request_url = identity::request_url(url.clone());
+    let canonical = identity::canonicalize(request_url.clone());
     let site = canonical_site(runtime, token, &canonical).await?;
     let path_and_query = identity::path_and_query(&canonical);
     let id = identity::document_id(site, &path_and_query);
@@ -632,7 +634,7 @@ pub(crate) async fn settle_content_body(
         "document",
         entity_type,
         canonical.as_ref(),
-        json!({ "url": canonical.to_string() }),
+        json!({ "url": request_url.to_string() }),
     )
     .await?;
     runtime
@@ -680,7 +682,7 @@ pub(crate) async fn settle_content_body(
         id,
         Some(entity_type),
         representation_patch(
-            canonical.as_ref(),
+            request_url.as_ref(),
             content_type,
             status,
             etag,

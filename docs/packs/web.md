@@ -24,9 +24,17 @@ subtype — nothing about a document's id encodes whether it has been fetched ye
 body it turned out to have.
 
 Canonicalization (applied before any identity computation): scheme and host are lowercased, the
-default port for the scheme is dropped, the path is percent-normalized, query keys are sorted,
-and the fragment is dropped entirely — `https://Example.com/a?b=1&a=2#x` and
-`https://example.com/a?a=2&b=1` are the same resource.
+default port for the scheme is dropped, the path is percent-normalized, raw query pairs are
+stably sorted by their raw key bytes, and the fragment is dropped entirely. Query pairs are
+never form-decoded or re-encoded: `%FF` and `%FE`, `a+b` and `a%20b`, and `flag` and `flag=`
+remain distinct. Sorting still makes `https://Example.com/a?b=1&a=2#x` and
+`https://example.com/a?a=2&b=1` the same resource. Equal-key pairs retain their order.
+
+The document's `url` property keeps the actual parsed request address, with its fragment
+removed, independently of the sorted identity key. Refresh uses that address with its
+original query spelling and order. Newly fetched representations update this property;
+existing rows that only retain a previously rewritten address cannot recover its original
+spelling without being fetched again.
 
 ### Edge rules
 

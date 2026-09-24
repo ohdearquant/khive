@@ -433,7 +433,8 @@ async fn extract_links(
         let Some(target_url) = resolve_against(base_url, href) else {
             continue;
         };
-        let canonical = identity::canonicalize(target_url);
+        let request_url = identity::request_url(target_url);
+        let canonical = identity::canonicalize(request_url.clone());
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
@@ -463,7 +464,7 @@ async fn extract_links(
             "document",
             "resource",
             canonical.as_ref(),
-            json!({ "url": canonical.to_string(), "status": Value::Null }),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
         runtime
@@ -514,7 +515,8 @@ async fn extract_entries(
     let mut count = 0u32;
     for raw in urls {
         let Ok(url) = Url::parse(&raw) else { continue };
-        let canonical = identity::canonicalize(url);
+        let request_url = identity::request_url(url);
+        let canonical = identity::canonicalize(request_url.clone());
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
@@ -530,7 +532,7 @@ async fn extract_entries(
             "document",
             "resource",
             canonical.as_ref(),
-            json!({ "url": canonical.to_string(), "status": Value::Null }),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
         // Entries belong to the SITE that published the feed/sitemap, which
