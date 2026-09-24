@@ -178,10 +178,14 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
                     "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
             } else if let Some(context) = other.retryable_failure_context() {
                 let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
-                json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
+                let mut value = json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
                     "message":other.to_string(), "retryable":true, "timeout_ms":timeout_ms,
                     "capability":context.capability.map(storage_capability_wire_name),
-                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms})
+                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms});
+                if let Some(pool_identity) = context.pool_identity {
+                    value["pool_identity"] = json!(pool_identity);
+                }
+                value
             } else {
                 json!({"kind":"runtime_error", "message":other.to_string()})
             }
