@@ -59,7 +59,7 @@ async fn agent_insert_uses_writer_task_owned_transaction() {
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("agent-writer-task-transaction.db")),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -311,7 +311,7 @@ fn agent_write_strict_routing_fails_closed_without_writer_task() {
             path: Some(dir.path().join("agent-strict-routing.db")),
             write_queue_enabled: Some(false),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );

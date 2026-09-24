@@ -2560,7 +2560,7 @@ mod delete_subjects_atomic_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(write_queue_enabled),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -2755,7 +2755,7 @@ mod delete_subjects_atomic_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4467,7 +4467,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4571,7 +4571,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4770,7 +4770,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4837,7 +4837,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4941,7 +4941,7 @@ mod write_queue_tests {
                 path: Some(path),
                 write_queue_enabled: Some(false),
                 write_routing_strict: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4983,7 +4983,7 @@ mod write_queue_tests {
                 path: Some(path),
                 write_queue_enabled: Some(false),
                 write_routing_strict: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -5055,7 +5055,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );

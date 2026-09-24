@@ -2939,7 +2939,7 @@ mod tests {
             });
         let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
         let secondary_backend =
-            khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
+            khive_db::StorageBackend::sqlite_for_test(secondary_dir.path().join("secondary.db"))
                 .expect("file-backed secondary backend");
 
         let mut tasks = checkpoint_task_specs(
@@ -3004,8 +3004,9 @@ mod tests {
         );
 
         let file_main_dir = tempfile::tempdir().expect("file-backed main tempdir");
-        let file_main = khive_db::StorageBackend::sqlite(file_main_dir.path().join("main.db"))
-            .expect("file-backed main backend");
+        let file_main =
+            khive_db::StorageBackend::sqlite_for_test(file_main_dir.path().join("main.db"))
+                .expect("file-backed main backend");
         let tasks = checkpoint_task_specs(
             Some(file_main.pool_arc()),
             vec![secondary_backend.pool_arc()],
@@ -4703,7 +4704,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4765,7 +4766,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4870,7 +4871,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_enabled.db")),
                 write_queue_enabled: Some(true),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4892,7 +4893,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_disabled.db")),
                 write_queue_enabled: Some(false),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );

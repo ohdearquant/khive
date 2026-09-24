@@ -53,6 +53,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Integration binaries opt into explicit fixture constructors.
+khive-db = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks", "limits", "functions"] }
 bytes = "1"

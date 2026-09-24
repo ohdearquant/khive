@@ -3751,7 +3751,7 @@ mod tests {
     fn file_pool(path: &std::path::Path) -> Arc<ConnectionPool> {
         let cfg = PoolConfig {
             path: Some(path.to_path_buf()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
     }
@@ -4647,7 +4647,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_millis(1),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4909,7 +4909,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
                 busy_timeout: Duration::from_millis(2000),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -7061,7 +7061,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
                 read_only: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("read-only pool open"),
         );

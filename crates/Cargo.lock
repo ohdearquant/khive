@@ -1994,6 +1994,7 @@ dependencies = [
  "crossbeam-queue",
  "fs4",
  "futures",
+ "khive-db",
  "khive-score",
  "khive-storage",
  "khive-types",

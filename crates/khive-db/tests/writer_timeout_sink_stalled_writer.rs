@@ -47,7 +47,7 @@ fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
     let cfg = PoolConfig {
         path: Some(db_path),
         checkout_timeout,
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
 
     // Pool construction must not wait on the writer thread at all — `init`

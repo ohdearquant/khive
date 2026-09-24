@@ -76,7 +76,7 @@ fn sink_never_adds_measurable_latency_when_its_file_is_a_blocked_fifo() {
     let cfg = PoolConfig {
         path: Some(db_path),
         checkout_timeout,
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
 
     let pool =
