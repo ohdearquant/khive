@@ -875,8 +875,12 @@ jobs:
       # for the server and client downloads, and Docker Hub has refused
       # anonymous pulls since 2026-09-11. The server is therefore built from
       # source at its last release. The tag is checked against its commit, so
-      # a moved tag fails the job instead of changing the server under test,
-      # and Go module checksums pin every dependency the build fetches.
+      # a moved tag fails the job instead of changing the server under test.
+      # The compiler is pinned the same way: the installer action by commit
+      # SHA, the Go version to the release's own toolchain line, and the build
+      # refuses to switch toolchains or edit module metadata. Go module
+      # checksums pin every dependency, and a restored module cache is
+      # verified against them before the build reads it.
       - name: Fetch pinned MinIO source
         if: steps.changed.outputs.run == 'true'
         working-directory: .
@@ -884,25 +888,39 @@ jobs:
           git clone --quiet --depth 1 --branch RELEASE.2025-10-15T17-29-55Z \
             https://github.com/minio/minio.git .minio-src
           test "$(git -C .minio-src rev-parse HEAD)" = 9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
-      - uses: actions/setup-go@v5
+          grep -qx 'toolchain go1.24.8' .minio-src/go.mod
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.changed.outputs.run == 'true'
         with:
-          go-version-file: .minio-src/go.mod
+          go-version: '1.24.8'
+          check-latest: false
           cache-dependency-path: .minio-src/go.sum
       - name: Build and start MinIO
         if: steps.changed.outputs.run == 'true'
         working-directory: .minio-src
         env:
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
           MINIO_ROOT_USER: khive-ci
           MINIO_ROOT_PASSWORD: khive-ci-secret
         run: |
+          test "$(go env GOVERSION)" = go1.24.8
+          go mod verify
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/minio" .
+          # The health probe below must reach the server started here, so the
+          # port has to be free before it starts and the process has to be
+          # alive once the probe answers.
+          if curl -s -o /dev/null http://127.0.0.1:9000/; then
+            echo "127.0.0.1:9000 already answers before MinIO starts" >&2
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/minio-data"
           nohup "$RUNNER_TEMP/minio" server "$RUNNER_TEMP/minio-data" \
             --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/minio.pid"
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              kill -0 "$(cat "$RUNNER_TEMP/minio.pid")"
               exit 0
             fi
             sleep 1
