@@ -22,6 +22,12 @@ use khive_vamana::{
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+#[path = "ann/incremental.rs"]
+mod incremental;
+use incremental::*;
+#[path = "ann/checkpoint_timer.rs"]
+mod checkpoint_timer;
+
 // ── types ─────────────────────────────────────────────────────────────────────
 
 /// Cache key for a per-model ANN slot (one index per model, all namespaces combined).
@@ -47,6 +53,13 @@ impl AnnKey {
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
     id_map: Vec<Uuid>,
+    /// Built on first replay; subsequent batches update only changed subjects.
+    reverse_map: Option<HashMap<Uuid, u32>>,
+    #[cfg(test)]
+    reverse_map_builds: usize,
+    dirty_ops: u64,
+    published_seq: u64,
+    last_checkpoint: std::time::Instant,
     /// Digest of the v2 commit record this mmap bridge loaded. Every
     /// file-backed publication carries a fresh nonce, so equality means the
     /// mapped file generation is still current (#2081). Owned builds have no
@@ -75,6 +88,13 @@ pub(crate) struct AnnState {
     /// invoked to do.
     pub(crate) builds_corpus_indexes: bool,
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
+    checkpoint_policy: std::sync::RwLock<CheckpointPolicy>,
+    checkpoint_timers: std::sync::Mutex<HashSet<AnnKey>>,
+    checkpoint_timers_enabled: bool,
+    #[cfg(test)]
+    segment_load_count: AtomicUsize,
+    #[cfg(test)]
+    publication_count: AtomicUsize,
     /// Synchronous so `WarmingGuard::drop` can release it on every exit path.
     warming: std::sync::Mutex<HashSet<AnnKey>>,
     /// Per-model warm lock shared by boot, background, and cold-recall paths.
@@ -132,6 +152,13 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
     Arc::new(AnnState {
         builds_corpus_indexes,
         indexes: RwLock::new(HashMap::new()),
+        checkpoint_policy: std::sync::RwLock::new(CheckpointPolicy::from_env()),
+        checkpoint_timers: std::sync::Mutex::new(HashSet::new()),
+        checkpoint_timers_enabled: cfg!(not(test)),
+        #[cfg(test)]
+        segment_load_count: AtomicUsize::new(0),
+        #[cfg(test)]
+        publication_count: AtomicUsize::new(0),
         warming: std::sync::Mutex::new(HashSet::new()),
         model_locks: Mutex::new(HashMap::new()),
         generations: Mutex::new(HashMap::new()),
@@ -403,6 +430,12 @@ impl AnnBridge {
         Ok(Self {
             index,
             id_map,
+            reverse_map: None,
+            #[cfg(test)]
+            reverse_map_builds: 0,
+            dirty_ops: 0,
+            published_seq: 0,
+            last_checkpoint: std::time::Instant::now(),
             commit_digest: None,
             namespace_set,
             generation: 0,
@@ -449,6 +482,28 @@ impl AnnBridge {
     /// commit record.
     pub(crate) fn set_applied_seq(&mut self, seq: u64) {
         self.index.set_last_applied_seq(Some(seq));
+        self.published_seq = seq;
+    }
+
+    pub(crate) fn mark_checkpointed(&mut self) {
+        self.dirty_ops = 0;
+        self.published_seq = self.index.last_applied_seq().unwrap_or(0);
+        self.last_checkpoint = std::time::Instant::now();
+    }
+
+    fn rebuild_reverse_map(&mut self) {
+        // A tombstoned ordinal can retain its previous UUID until slot reuse.
+        let mut reverse = HashMap::with_capacity(self.index.live_count());
+        for (ordinal, uuid) in self.id_map.iter().enumerate() {
+            if !self.index.is_tombstoned(ordinal as u32) {
+                reverse.insert(*uuid, ordinal as u32);
+            }
+        }
+        self.reverse_map = Some(reverse);
+        #[cfg(test)]
+        {
+            self.reverse_map_builds += 1;
+        }
     }
 
     /// Apply a coalesced final-state tail (ADR-079 Amendment 1) to this
@@ -463,17 +518,10 @@ impl AnnBridge {
         ops: Vec<(Uuid, Option<Vec<f32>>)>,
         new_s: u64,
     ) -> Result<(), String> {
-        // Exclude already-tombstoned slots: `id_map` entries for them are
-        // stale (tombstoning never clears them), and including them lets a
-        // reused slot's new owner be tombstoned by a replay for the old,
-        // already-deleted subject (#1150).
-        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.index.live_count());
-        for (ordinal, uuid) in self.id_map.iter().enumerate() {
-            if self.index.is_tombstoned(ordinal as u32) {
-                continue;
-            }
-            reverse.insert(*uuid, ordinal as u32);
+        if self.reverse_map.is_none() {
+            self.rebuild_reverse_map();
         }
+        let reverse = self.reverse_map.as_mut().expect("initialized reverse map");
 
         for (uuid, op) in ops {
             match op {
@@ -500,9 +548,15 @@ impl AnnBridge {
                 Some(mut embedding) => {
                     l2_normalize(&mut embedding);
                     if let Some(&old) = reverse.get(&uuid) {
+                        if self.id_map.get(old as usize) != Some(&uuid) {
+                            return Err(format!(
+                                "replay upsert: ordinal {old} is no longer owned by {uuid}"
+                            ));
+                        }
                         self.index
                             .tombstone(old)
                             .map_err(|e| format!("replay tombstone({old}): {e}"))?;
+                        reverse.remove(&uuid);
                     }
                     let ordinal = self
                         .index
@@ -510,7 +564,13 @@ impl AnnBridge {
                         .map_err(|e| format!("replay insert: {e}"))?;
                     let slot = ordinal as usize;
                     match slot.cmp(&self.id_map.len()) {
-                        std::cmp::Ordering::Less => self.id_map[slot] = uuid,
+                        std::cmp::Ordering::Less => {
+                            let previous_owner = self.id_map[slot];
+                            if reverse.get(&previous_owner) == Some(&ordinal) {
+                                reverse.remove(&previous_owner);
+                            }
+                            self.id_map[slot] = uuid;
+                        }
                         std::cmp::Ordering::Equal => self.id_map.push(uuid),
                         std::cmp::Ordering::Greater => {
                             return Err(format!(
@@ -525,6 +585,33 @@ impl AnnBridge {
         }
         self.index.set_last_applied_seq(Some(new_s));
         Ok(())
+    }
+
+    pub(crate) fn consolidate_if_needed(&mut self, tau: usize) -> Result<bool, String> {
+        if !self.index.needs_consolidation() && self.index.ops_since_consolidation() < tau {
+            return Ok(false);
+        }
+        if self.id_map.len() != self.index.num_vectors() {
+            return Err("consolidation: id_map length differs from vector count".to_string());
+        }
+        let new_to_old = self
+            .index
+            .consolidate()
+            .map_err(|e| format!("memory ANN consolidation: {e}"))?;
+        if !new_to_old.is_empty() {
+            self.id_map = new_to_old
+                .into_iter()
+                .map(|old| {
+                    self.id_map.get(old as usize).copied().ok_or_else(|| {
+                        format!("consolidation: old ordinal {old} is outside id_map")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        if self.reverse_map.is_some() {
+            self.rebuild_reverse_map();
+        }
+        Ok(true)
     }
 
     /// Save this bridge to `dir` atomically: v2 Vamana segments (commit
@@ -579,9 +666,16 @@ impl AnnBridge {
                 index.num_vectors()
             ));
         }
+        let published_seq = index.last_applied_seq().unwrap_or(0);
         Ok(Self {
             index,
             id_map,
+            reverse_map: None,
+            #[cfg(test)]
+            reverse_map_builds: 0,
+            dirty_ops: 0,
+            published_seq,
+            last_checkpoint: std::time::Instant::now(),
             commit_digest: Some(commit_digest),
             namespace_set: HashSet::new(),
             generation: 0,
@@ -675,7 +769,13 @@ pub(crate) async fn search_loaded_with_seq(
             #[cfg(test)]
             ann.warm_route_count.fetch_add(1, Ordering::SeqCst);
             let hits = bridge.search(query, k)?;
-            let seq = bridge.index.last_applied_seq().unwrap_or(0);
+            // Keep the exact leg over unpublished deltas: incremental graph
+            // insertion alone does not guarantee immediate reachability.
+            let seq = if bridge.dirty_ops > 0 {
+                bridge.published_seq
+            } else {
+                bridge.index.last_applied_seq().unwrap_or(0)
+            };
             Ok(Some((hits, seq)))
         }
     }
@@ -757,7 +857,7 @@ pub(crate) async fn ensure_ann_background(
     let target_generation = current_generation(ann, &key).await;
 
     // Presence is insufficient: the installed generation must cover the caller's floor.
-    if installed_is_fresh(ann, &key, target_generation).await {
+    if installed_is_fresh(ann, &key, target_generation).await && !checkpoint_due(ann, &key).await {
         return false;
     }
 
@@ -996,9 +1096,18 @@ async fn refresh_rotated_segment(
             bridge.generation,
             bridge.epoch_baseline,
             bridge.index.last_applied_seq().unwrap_or(0),
+            bridge.published_seq,
+            bridge.dirty_ops > 0,
         )
     });
-    let Some((Some(incumbent_digest), generation, epoch_baseline, incumbent_seq)) = incumbent
+    let Some((
+        Some(incumbent_digest),
+        generation,
+        epoch_baseline,
+        incumbent_seq,
+        published_seq,
+        dirty,
+    )) = incumbent
     else {
         return;
     };
@@ -1031,12 +1140,13 @@ async fn refresh_rotated_segment(
         }
     };
 
-    let replacement = AnnBridge::load(&dir).and_then(|bridge| {
+    let replacement = load_segment(ann, &dir).and_then(|bridge| {
         if bridge.commit_digest != Some(observed) {
             return Err("commit identity changed during locked rotation reload".to_string());
         }
         let replacement_seq = bridge.index.last_applied_seq().unwrap_or(0);
-        if replacement_seq < incumbent_seq {
+        let protected_seq = if dirty { published_seq } else { incumbent_seq };
+        if replacement_seq < protected_seq {
             return Err(format!(
                 "rotated segment watermark {replacement_seq} regressed below installed {incumbent_seq}"
             ));
@@ -1052,7 +1162,13 @@ async fn refresh_rotated_segment(
             // bridge: a peer's checkpoint can cover namespaces this process
             // never observed. Leave the conservative empty set `load` set,
             // so recall keeps over-fetching until it repopulates.
+            let must_replay = dirty && bridge.index.last_applied_seq().unwrap_or(0) < incumbent_seq;
             if install_replacing(ann, key, bridge).await {
+                if must_replay {
+                    // Release the old files, but retain freshness pressure.
+                    // Recall merges the retained tail above the peer checkpoint.
+                    bump_generation(ann, key).await;
+                }
                 tracing::debug!(
                     model = %key.model,
                     "memory ANN adopted rotated mmap generation and released its predecessor"
@@ -1130,7 +1246,10 @@ pub(crate) async fn ensure_ann_for_model(
     let target_generation = current_generation(ann, &key).await;
 
     // Fast path: no lock needed if already warm AND fresh enough.
-    if !force_full_rebuild && installed_is_fresh(ann, &key, target_generation).await {
+    if !force_full_rebuild
+        && installed_is_fresh(ann, &key, target_generation).await
+        && !checkpoint_due(ann, &key).await
+    {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
@@ -1143,7 +1262,9 @@ pub(crate) async fn ensure_ann_for_model(
     match read_own_watermark(rt, model).await {
         Ok(Some(watermark)) if watermark >= 0 => {
             force_full_rebuild = false;
-            if installed_is_fresh(ann, &key, target_generation).await {
+            if installed_is_fresh(ann, &key, target_generation).await
+                && !checkpoint_due(ann, &key).await
+            {
                 return Ok(AnnEnsureStatus::AlreadyLoaded);
             }
         }
@@ -1188,13 +1309,24 @@ pub(crate) async fn ensure_ann_for_model(
     )
     .await;
 
-    let result =
-        ensure_ann_for_model_inner(rt, token, ann, model, target_generation, force_full_rebuild)
-            .await;
+    let mut details = AnnWarmDetails::default();
+    let result = ensure_ann_for_model_inner(
+        rt,
+        token,
+        ann,
+        model,
+        target_generation,
+        force_full_rebuild,
+        &mut details,
+    )
+    .await;
 
     let wall_us = phase_start.elapsed().as_micros() as i64;
     let cpu_us = khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
-    emit_ann_warm_terminal_phase(rt, token, model, &result, wall_us, cpu_us).await;
+    emit_ann_warm_terminal_phase(rt, token, model, &result, wall_us, cpu_us, details).await;
+    if result.is_ok() {
+        checkpoint_timer::schedule_checkpoint(rt, ann, &key).await;
+    }
     result
 }
 
@@ -1205,7 +1337,9 @@ async fn emit_ann_warm_terminal_phase(
     result: &Result<AnnEnsureStatus, RuntimeError>,
     wall_us: i64,
     cpu_us: Option<i64>,
+    mut details: AnnWarmDetails,
 ) {
+    details.finish(result);
     match result {
         Err(e) if is_benign_shutdown_cancellation(e) => {
             emit_ann_warm_phase_event(
@@ -1228,11 +1362,15 @@ async fn emit_ann_warm_terminal_phase(
                 token,
                 model,
                 khive_types::EventKind::PhaseCompleted,
-                khive_storage::PhaseCompletedPayload {
-                    work_class: "warm".into(),
-                    phase: "ann_warm".into(),
-                    wall_us,
-                    cpu_us,
+                AnnWarmCompletedPayload {
+                    phase: khive_storage::PhaseCompletedPayload {
+                        work_class: "warm".into(),
+                        phase: "ann_warm".into(),
+                        wall_us,
+                        cpu_us,
+                    },
+                    path: details.path,
+                    ops_applied: details.ops_applied,
                 },
             )
             .await;
@@ -1295,17 +1433,45 @@ async fn ensure_ann_for_model_inner(
     ann: &SharedAnn,
     model: &str,
     target_generation: u64,
-    force_full_rebuild: bool,
+    mut force_full_rebuild: bool,
+    details: &mut AnnWarmDetails,
 ) -> Result<AnnEnsureStatus, RuntimeError> {
     let ns = "global";
     let key = AnnKey::new(model);
 
-    if !force_full_rebuild && installed_is_fresh(ann, &key, target_generation).await {
+    if !force_full_rebuild
+        && installed_is_fresh(ann, &key, target_generation).await
+        && !checkpoint_due(ann, &key).await
+    {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
     // Stamp the epoch observed before this attempt; only a later reindex invalidates it.
     let target_epoch = durable_epoch(rt).await;
+    let epoch_changed = ann
+        .indexes
+        .read()
+        .await
+        .get(&key)
+        .is_some_and(|bridge| bridge.epoch_baseline != target_epoch);
+    force_full_rebuild |= epoch_changed;
+    if !force_full_rebuild && ann.builds_corpus_indexes {
+        match maintain_installed(
+            rt,
+            ann,
+            &key,
+            model,
+            target_generation,
+            target_epoch,
+            details,
+        )
+        .await?
+        {
+            InstalledMaintenance::Complete => return Ok(AnnEnsureStatus::AlreadyLoaded),
+            InstalledMaintenance::Rebuild => force_full_rebuild = true,
+            InstalledMaintenance::Absent => {}
+        }
+    }
 
     // v2 segment classifier (ADR-079 Amendment 1, global-scope addendum): the
     // 8-rule first-match decision table over the persisted commit record, this
@@ -1321,6 +1487,7 @@ async fn ensure_ann_for_model_inner(
                 &seg_dir,
                 target_generation,
                 target_epoch,
+                details,
             )
             .await
             {
@@ -1343,6 +1510,7 @@ async fn ensure_ann_for_model_inner(
 
     // The fingerprint sandwich bounds scan races; generation ordering closes the
     // later persistence/install window and prevents an older build from winning.
+    details.path = "full_build";
     let fp_before = compute_memory_fingerprint(rt, token, model).await;
     match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
@@ -2752,7 +2920,7 @@ async fn checkpoint_raise_compact_readopt(
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
-    bridge: AnnBridge,
+    mut bridge: AnnBridge,
     publication: CheckpointPublication,
 ) -> bool {
     let CheckpointPublication {
@@ -2769,6 +2937,7 @@ async fn checkpoint_raise_compact_readopt(
         // No filesystem commit record exists to re-resolve against, so
         // publish the bridge first; fresh-tail's registry check rejects and
         // evicts it until the conditional raise below succeeds.
+        bridge.mark_checkpointed();
         if !install_replacing(ann, key, stamp(bridge)).await {
             // A post-scan generation already installed something newer. Do
             // not advance the registry past log rows that rejected candidate
@@ -2786,22 +2955,50 @@ async fn checkpoint_raise_compact_readopt(
         return true;
     };
 
+    match persist_file_checkpoint(rt, ann, model, &dir, &bridge, authority).await {
+        Ok(reopened) => {
+            let mut replacement = reopened.unwrap_or(bridge);
+            replacement.mark_checkpointed();
+            replacement.set_namespace_set(namespace_set);
+            install_replacing(ann, key, stamp(replacement)).await
+        }
+        Err(unprotected) => {
+            if unprotected {
+                evict_unprotected_index(ann, key).await;
+            }
+            false
+        }
+    }
+}
+
+/// Publish through the existing registry fence while borrowing the candidate.
+/// A read guard can keep an incremental incumbent available throughout file I/O.
+/// `Err(true)` means registry protection was lost; other failures retain it.
+async fn persist_file_checkpoint(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    model: &str,
+    dir: &std::path::Path,
+    bridge: &AnnBridge,
+    authority: WatermarkAuthority,
+) -> Result<Option<AnnBridge>, bool> {
+    let applied = bridge.index.last_applied_seq().unwrap_or(0);
     // Every process writing this model's segment takes the same filesystem
     // lock. Revalidate the durable row only after acquiring it: otherwise a
     // stale publisher could overwrite a newer segment, lose its conditional
     // raise, and leave the registry ahead of the files that restart adopts.
-    let _publication_lock = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+    let _publication_lock = match acquire_bridge_checkpoint_lock_async(dir.to_path_buf()).await {
         Ok(lock) => lock,
         Err(e) => {
             tracing::warn!(error = %e, "failed to acquire memory ANN checkpoint lock");
-            return false;
+            return Err(false);
         }
     };
     let current_watermark = match read_own_watermark(rt, model).await {
         Ok(value) => value,
         Err(e) => {
             tracing::warn!(error = %e, "memory ANN checkpoint registry read failed");
-            return false;
+            return Err(false);
         }
     };
     let authorized = match authority {
@@ -2826,38 +3023,35 @@ async fn checkpoint_raise_compact_readopt(
             ?authority,
             "memory ANN checkpoint lost publication race before persistence"
         );
-        return false;
+        return Err(false);
     }
 
-    if let Err(e) = bridge.save_atomic(&dir) {
+    if let Err(e) = bridge.save_atomic(dir) {
         tracing::error!(error = %e, "failed to persist memory v2 Vamana segment");
         // An ordinary active rebuild still has a registry-protected incumbent
         // and a retained tail. Preserve that stale fallback until a complete
         // replacement commits; pending/closed paths already evicted before
         // entering the scan and therefore have nothing unsafe to retain.
-        return false;
+        return Err(false);
     }
+    #[cfg(test)]
+    ann.publication_count.fetch_add(1, Ordering::SeqCst);
     if let Err(e) = raise_watermark_with_authority(rt, model, applied, authority).await {
         // Retirement or a newer checkpoint won the writer race.  This build's
         // candidates are not protected by its own registry state, so never
         // install them; the next ensure re-resolves durable state.
         tracing::warn!(error = %e, "memory ann watermark publication rejected; dropping candidate bridge");
-        evict_unprotected_index(ann, key).await;
-        return false;
+        return Err(true);
     } else if let Err(e) = compact_log(rt, model).await {
         tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
     }
-    match AnnBridge::load(&dir) {
-        Ok(mut mmap_bridge) => {
-            mmap_bridge.set_namespace_set(namespace_set);
-            install_replacing(ann, key, stamp(mmap_bridge)).await;
-        }
+    match load_segment(ann, dir) {
+        Ok(mmap_bridge) => Ok(Some(mmap_bridge)),
         Err(e) => {
             tracing::warn!(error = %e, "memory ann mmap re-adoption failed; serving Owned build");
-            install_replacing(ann, key, stamp(bridge)).await;
+            Ok(None)
         }
     }
-    true
 }
 
 /// Outcome of the v2-segment decision table for this consumer's global scope.
@@ -2874,6 +3068,7 @@ enum SegmentOutcome {
 /// ADR-079 Amendment 1 restart classifier: the 8-rule first-match decision
 /// table for the memory pack's global-scope note index, followed by the
 /// matching adoption action. Full table and rationale: `docs/ann.md`.
+#[allow(clippy::too_many_arguments)]
 async fn classify_and_adopt_segment(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2882,6 +3077,7 @@ async fn classify_and_adopt_segment(
     seg_dir: &std::path::Path,
     target_generation: u64,
     target_epoch: u64,
+    details: &mut AnnWarmDetails,
 ) -> SegmentOutcome {
     // Rule 1: commit record absent, corrupt, or invalid length → Cold.
     let info = match read_commit_info(seg_dir) {
@@ -2938,12 +3134,13 @@ async fn classify_and_adopt_segment(
     // O(N) DISTINCT corpus scan.
     match tail_exists(rt, model, s).await {
         Ok(false) => {
-            return match AnnBridge::load(seg_dir) {
+            return match load_segment(ann, seg_dir) {
                 Ok(bridge) => {
                     let bridge = bridge
                         .with_generation(target_generation)
                         .with_epoch_baseline(target_epoch);
                     install_replacing(ann, key, bridge).await;
+                    details.path = "segment_load";
                     tracing::debug!(model = %model, "memory ANN loaded Hot from v2 segment");
                     SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot)
                 }
@@ -2980,7 +3177,7 @@ async fn classify_and_adopt_segment(
     // served bridge returns to mmap backing.
     let threshold = (ann_rebuild_threshold() * live as f64).ceil() as u64;
     if tail <= threshold {
-        let mut bridge = match AnnBridge::load(seg_dir) {
+        let mut bridge = match load_segment(ann, seg_dir) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, dir = %seg_dir.display(),
@@ -2995,6 +3192,7 @@ async fn classify_and_adopt_segment(
                 return SegmentOutcome::Cold;
             }
         };
+        details.ops_applied = ops.len() as u64;
         if let Err(e) = bridge.apply_final_ops(ops, new_s) {
             tracing::warn!(error = %e, "memory tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
@@ -3004,6 +3202,7 @@ async fn classify_and_adopt_segment(
         // replayed bridge and publishes nothing, so a client warming after a write
         // does not rewrite the segment for every other reader on the root.
         if !ann.builds_corpus_indexes {
+            details.path = "stale_tail_replay";
             install_replacing(
                 ann,
                 key,
@@ -3015,6 +3214,11 @@ async fn classify_and_adopt_segment(
             tracing::debug!(model = %model, tail,
                 "memory ANN served from Stale-tail replay without checkpoint; not the warm index host");
             return SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot);
+        }
+        details.path = "stale_tail_publication";
+        if let Err(error) = bridge.consolidate_if_needed(checkpoint_policy(ann).consolidate_tau) {
+            tracing::warn!(%error, "memory ANN consolidation failed before replay publication");
+            return SegmentOutcome::Cold;
         }
         let installed = checkpoint_raise_compact_readopt(
             rt,
@@ -3039,7 +3243,7 @@ async fn classify_and_adopt_segment(
     // Rule 8: tail above threshold → Stale-rebuild: serve the checksum-valid
     // segment while the caller's rebuild path replaces it. Cost decision,
     // never a demotion to FTS-only.
-    match AnnBridge::load(seg_dir) {
+    match load_segment(ann, seg_dir) {
         Ok(bridge) => {
             tracing::info!(model = %model, tail, live,
                 "memory tail above rebuild threshold; serving stale segment during rebuild");
@@ -3061,6 +3265,7 @@ async fn classify_and_adopt_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod incremental_tests;
     use serial_test::serial;
 
     #[tokio::test(start_paused = true)]
@@ -4138,12 +4343,13 @@ mod tests {
         );
         drop(reader);
 
-        // Force a new full scan without appending a new log row. Its corpus
-        // still includes the entire prefix compacted through active S=2.
+        // Remove the ephemeral cache to force a full scan without appending
+        // a log row; a generation-only bump now uses incremental maintenance.
+        clear_key(&ann, &key).await;
         bump_generation(&ann, &key).await;
         let second = ensure_ann_for_model(&rt, &token, &ann, MODEL)
             .await
-            .expect("generation-only full checkpoint");
+            .expect("cache-miss full checkpoint");
         assert!(
             matches!(second, AnnEnsureStatus::Built { vectors: 2 }),
             "the later full scan must remain publishable, got {second:?}"
@@ -4753,7 +4959,7 @@ mod tests {
 
             let rt = KhiveRuntime::memory().expect("in-memory runtime");
             let token = rt.authorize(Namespace::local()).expect("authorize local");
-            emit_ann_warm_terminal_phase(&rt, &token, "cancelled-store-join", &result, 1, None).await;
+            emit_ann_warm_terminal_phase(&rt, &token, "cancelled-store-join", &result, 1, None, AnnWarmDetails::default()).await;
             let page = rt.events(&token).expect("event store").query_events(
                 khive_storage::EventFilter::default(),
                 khive_storage::types::PageRequest { limit: 10, offset: 0 },
@@ -7008,3 +7214,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ann/bridge_incremental_tests.rs"]
+mod bridge_incremental_tests;
