@@ -23,6 +23,66 @@ const ENTITY_LIST_CAP: u32 = 500;
 const NOTE_LIST_CAP: u32 = 200;
 const EVENT_LIST_CAP: u32 = 1000;
 
+fn validate_list_filter_scope(
+    fields: &[String],
+    kind: &str,
+    spec: &KindSpec,
+) -> Result<(), RuntimeError> {
+    for field in fields {
+        let (valid, scope) = match field.as_str() {
+            "entity_kind" | "entity_type" => {
+                (matches!(spec, KindSpec::Entity { .. }), "entity lists")
+            }
+            "note_kind" | "key_prefix" | "after_key" | "created_after" | "updated_after"
+            | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read" | "delivered" => {
+                (matches!(spec, KindSpec::Note { .. }), "note lists")
+            }
+            "created_by_actor" => (
+                matches!(spec, KindSpec::Note { .. }),
+                "scheduled_event note lists",
+            ),
+            "tags" => (
+                matches!(spec, KindSpec::Entity { .. } | KindSpec::Note { .. }),
+                "entity and note lists",
+            ),
+            "source_id" | "relations" | "min_weight" | "max_weight" => {
+                (matches!(spec, KindSpec::Edge), "edge lists")
+            }
+            "target_id" => (
+                matches!(spec, KindSpec::Edge | KindSpec::Event),
+                "edge and event lists",
+            ),
+            "verb" | "verbs" | "outcome" | "substrate" | "since" | "until" | "event_kind"
+            | "event_kinds" | "session_id" | "observed" | "selected" => {
+                (matches!(spec, KindSpec::Event), "event lists")
+            }
+            "actor" => (
+                matches!(spec, KindSpec::Event | KindSpec::Proposal),
+                "event and proposal lists",
+            ),
+            "proposer" => (matches!(spec, KindSpec::Proposal), "proposal lists"),
+            "status" => (
+                matches!(spec, KindSpec::Note { .. } | KindSpec::Proposal),
+                "scheduled_event note and proposal lists",
+            ),
+            "after" => (
+                matches!(
+                    spec,
+                    KindSpec::Entity { .. } | KindSpec::Note { .. } | KindSpec::Edge
+                ),
+                "entity, note, and edge lists",
+            ),
+            _ => continue,
+        };
+        if !valid {
+            return Err(RuntimeError::InvalidInput(format!(
+                "list: parameter {field:?} is not valid for kind={kind:?}; it applies only to {scope}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn effective_list_limit(requested: u32, cap: u32) -> u32 {
     requested.min(cap)
 }
@@ -299,6 +359,11 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        let supplied_fields: Vec<String> = params
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys().cloned())
+            .collect();
         let raw_kind = params
             .get("kind")
             .and_then(Value::as_str)
@@ -306,6 +371,7 @@ impl KgPack {
             .trim()
             .to_ascii_lowercase();
         if raw_kind == "proposal" {
+            validate_list_filter_scope(&supplied_fields, &raw_kind, &KindSpec::Proposal)?;
             return self.handle_list_proposals(token, params).await;
         }
 
@@ -326,22 +392,7 @@ impl KgPack {
         }
         validate_graph_read_kind(&p.kind, "kind", "list")?;
         let spec = resolve_kind_spec(&p.kind, registry)?;
-        if has_schedule_filters && !matches!(&spec, KindSpec::Note { .. }) {
-            return Err(RuntimeError::InvalidInput(
-                "status and created_by_actor filters require scheduled_event notes; proposal lists retain their own status filter".into(),
-            ));
-        }
-        if !matches!(&spec, KindSpec::Note { .. })
-            && (p.key_prefix.is_some()
-                || p.after_key.is_some()
-                || p.created_after.is_some()
-                || p.updated_after.is_some()
-                || p.tag_mode.is_some())
-        {
-            return Err(RuntimeError::InvalidInput(
-                "key, timestamp and tag_mode filters require notes".into(),
-            ));
-        }
+        validate_list_filter_scope(&supplied_fields, &p.kind, &spec)?;
         if p.after_key.is_some() && p.key_prefix.is_none() {
             return Err(RuntimeError::InvalidInput(
                 "after_key requires key_prefix".into(),
@@ -349,11 +400,6 @@ impl KgPack {
         }
         match spec {
             KindSpec::Entity { specific } => {
-                if p.note_kind.as_deref().is_some_and(|s| !s.is_empty()) {
-                    return Err(RuntimeError::InvalidInput(
-                        "note_kind filter is not valid when kind=entity; use kind=note to list notes".into(),
-                    ));
-                }
                 let kind_filter = reconcile_specific(
                     specific,
                     p.entity_kind.as_deref(),
@@ -414,11 +460,6 @@ impl KgPack {
                 ))
             }
             KindSpec::Edge => {
-                if p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
-                    return Err(RuntimeError::InvalidInput(
-                        "tags filter is valid only for entity and note lists".into(),
-                    ));
-                }
                 let source_id = match p.source_id.as_deref() {
                     Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
                     None => None,
@@ -480,9 +521,10 @@ impl KgPack {
                     "note_kind",
                 )?;
                 if has_schedule_filters && kind_filter.as_deref() != Some("scheduled_event") {
-                    return Err(RuntimeError::InvalidInput(
-                        "status and created_by_actor filters require kind=scheduled_event or kind=note with note_kind=scheduled_event".into(),
-                    ));
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "list: kind={:?} with note_kind={kind_filter:?}: status and created_by_actor filters require kind=scheduled_event or kind=note with note_kind=scheduled_event",
+                        p.kind,
+                    )));
                 }
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
@@ -718,17 +760,6 @@ impl KgPack {
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
-                if p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
-                    return Err(RuntimeError::InvalidInput(
-                        "tags filter is valid only for entity and note lists".into(),
-                    ));
-                }
-                if p.after.is_some() {
-                    return Err(RuntimeError::InvalidInput(
-                        "after cursor pagination is supported only for entity, note, and edge lists"
-                            .into(),
-                    ));
-                }
                 let requested = p.limit.unwrap_or(100);
                 let limit = effective_list_limit(requested, EVENT_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
