@@ -745,3 +745,22 @@ bad edge as permanent invalid input and the otherwise-valid collateral items
 as `batch_aborted` with unknown per-item retryability. Ordinary all-or-nothing
 methods continue to return `Err(StorageError)` on a failed write rather than
 fabricating partial-success details.
+
+## Amendment: SQLite WAL capacity failure is a storage failure, not cancellation (2026-09-23)
+
+ADR-194 adds an enforced per-database SQLite WAL extent ceiling. This amendment states how its
+capacity refusal interacts with this ADR's completion rule for an admitted write (Amendment:
+request-scoped cancellation of SQLite reads, above): that rule is scoped to cancellation and
+timeout paths, and it does not by itself promise successful commit under an enabled
+storage-capacity limit.
+
+Completion preservation requires the owning worker to be joined to the admitted write's actual
+terminal outcome; it does not guarantee that outcome is a successful commit when an enabled WAL
+extent policy is exhausted. A WAL extent violation is a storage failure, never a read cancellation,
+and it is never converted into `SQLITE_INTERRUPT` or a fabricated timeout. The prohibited WAL write
+is refused before it reaches the underlying I/O implementation, the whole affected transaction is
+rolled back, and a conditionally retryable capacity result (ADR-194 §3) is returned only once
+rollback and connection state are proven, never merely attempted. An ambiguous or failed rollback
+preserves this ADR's existing outcome-unknown and connection-retirement contract instead of
+guessing at settlement. No completed commit, and no earlier committed unit within a multi-commit
+request, may be described as retryable work that never ran.

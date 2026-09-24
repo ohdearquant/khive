@@ -125,11 +125,16 @@ pub enum StorageError {
     /// operation never started, so retrying cannot duplicate a side effect —
     /// distinct from [`StorageError::Timeout`], which makes no claim about
     /// whether work was in flight when the deadline expired.
-    #[error("admission timeout during {operation} after {timeout_ms}ms")]
+    #[error("admission timeout during {operation} after {timeout_ms}ms{pool}", pool = match .pool_identity {
+        Some(identity) => format!(" (pool: {identity})"),
+        None => String::new(),
+    })]
     AdmissionTimeout {
         operation: Cow<'static, str>,
         /// The configured admission deadline that elapsed, in milliseconds.
         timeout_ms: u64,
+        /// Canonical database path display, or `:memory:`, when the refusing pool is known.
+        pool_identity: Option<String>,
     },
 
     #[error("sql transaction failure during {operation}: {message}")]
