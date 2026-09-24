@@ -141,6 +141,7 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             "tag.gpgsign": "false",
             "core.hooksPath": str(hooks),
             "core.autocrlf": "false",
+            "core.quotePath": "true",
         }
         env["GIT_CONFIG_COUNT"] = str(len(config))
         for index, (key, value) in enumerate(config.items()):
@@ -247,6 +248,26 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
 
     def test_database_path_runs_minio_after_fetching_base(self):
         self._assert_protected_path("crates/khive-db/src/fixture.rs", "DATABASE_PATH_RUNS_MINIO")
+
+    def _assert_quoted_database_path(self, path, marker):
+        checkout, base, env = self._shallow_fixture(path)
+        self.assertEqual(self._run_gate(checkout, env, pr_base=base), "run=true\n", marker)
+        self._assert_base_fetched(checkout, base, env)
+        listed = self._git(checkout, env, "diff", "--name-only", base, "HEAD").stdout
+        self.assertTrue(
+            listed.startswith('"'),
+            f"{marker}: fixture must expose Git's C-quoted name: {listed!r}",
+        )
+
+    def test_nonascii_database_path_runs_minio_after_fetching_base(self):
+        self._assert_quoted_database_path(
+            "crates/khive-db/tests/é.rs", "NONASCII_DATABASE_PATH_RUNS_MINIO",
+        )
+
+    def test_tab_in_database_path_runs_minio_after_fetching_base(self):
+        self._assert_quoted_database_path(
+            "crates/khive-db/tests/a\tb.rs", "TAB_DATABASE_PATH_RUNS_MINIO",
+        )
 
     def test_storage_path_runs_minio_after_fetching_base(self):
         self._assert_protected_path("crates/khive-storage/src/fixture.rs", "STORAGE_PATH_RUNS_MINIO")

@@ -872,17 +872,20 @@ jobs:
             echo "no comparable base SHA -- running the MinIO leg to be safe"
             exit 0
           fi
-          # Include both sides of a move: renaming out of a storage directory
-          # still changes the storage tests and must run this leg.
-          if ! changed_paths=$(git diff --no-renames --name-only "$base" HEAD -- ..); then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "base comparison failed -- running the MinIO leg to be safe"
-            exit 0
-          fi
-          if grep -qE '^(crates/khive-db/|crates/khive-storage/|docs/adr/ADR-111|\.github/workflows/ci\.yml$|crates/Cargo\.(toml|lock)$)' <<< "$changed_paths"; then
-            run=true
-          else
+          # Ask Git about watched paths directly: --name-only C-quotes unusual
+          # filenames, which makes line-based prefix matching miss them. With
+          # --no-renames, moving a file out of a watched directory still counts
+          # its old path. A failed comparison also runs the leg to be safe.
+          if git diff --quiet --no-renames "$base" HEAD -- \
+            ':(top)crates/khive-db/' \
+            ':(top)crates/khive-storage/' \
+            ':(top,glob)docs/adr/ADR-111*' \
+            ':(top).github/workflows/ci.yml' \
+            ':(top)crates/Cargo.toml' \
+            ':(top)crates/Cargo.lock'; then
             run=false
+          else
+            run=true
           fi
           echo "storage path comparison ${base}..HEAD: run=${run}"
           echo "run=${run}" >> "$GITHUB_OUTPUT"
