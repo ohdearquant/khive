@@ -854,6 +854,7 @@ async fn branch_denied_when_no_policy_configured() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
     if crate::test_process::run_in_child() {

@@ -12,6 +12,7 @@ mod eval;
 mod fold_handler;
 pub(crate) mod index_handler;
 mod lexical_timeout;
+mod refusal;
 mod search;
 mod sections;
 pub(crate) mod sections_index;

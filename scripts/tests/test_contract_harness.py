@@ -154,6 +154,15 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(ChildProcessError):
                 os.waitpid(child.pid, os.WNOHANG)
 
+    def assert_completion_envelope(self, elapsed, *, phase, exchange=0.0, reap=0.0, worker=0.0):
+        # Cleanup can wait once before killing and once to reap. One additional
+        # largest-budget interval allows scheduling; the watchdog bounds coverage
+        # runs while their process ownership and reaping assertions remain active.
+        envelope = exchange + worker + 2 * reap + max(exchange, reap, worker)
+        if "LLVM_PROFILE_FILE" not in os.environ:
+            self.assertLess(elapsed, envelope,
+                            f"{phase} exceeded completion envelope {envelope:g}s")
+
     @contextmanager
     def adapter(self, kind, store, mode="normal", timeout=0.3, reap_timeout=None):
         env = dict(os.environ, FAKE_LOG=str(self.log), FAKE_MODE=mode)
@@ -265,29 +274,39 @@ class HarnessTests(unittest.TestCase):
         self.assert_reaped()
 
     def test_stalled_initialize_is_bounded_and_reaped(self):
+        exchange_budget = 0.25
+        reap_budget = exchange_budget
         for kind in ("legacy", "pytest"):
             for mode in ("initialize_silent", "initialize_partial", "initialize_noise"):
                 with self.subTest(kind=kind, mode=mode), OwnedContractStore() as store:
                     start = time.monotonic()
                     with self.assertRaises(Exception) as error:
-                        with self.adapter(kind, store, mode, timeout=0.25):
+                        with self.adapter(kind, store, mode, timeout=exchange_budget,
+                                          reap_timeout=reap_budget):
                             self.fail("stalled initialize unexpectedly completed")
+                    elapsed = time.monotonic() - start
                     self.assertIn("exceeded", str(error.exception))
-                    self.assertLess(time.monotonic() - start, 1.5)
+                    self.assert_completion_envelope(elapsed, phase="stalled initialize",
+                                                    exchange=exchange_budget, reap=reap_budget)
                     self.assertTrue(store.root.exists())
                     self.assert_protocol_stage(mode)
                     self.assert_reaped()
 
     def test_stalled_request_is_bounded_and_reaped(self):
+        exchange_budget = 0.25
+        reap_budget = exchange_budget
         for kind in ("legacy", "pytest"):
             for mode in ("request_silent", "request_partial", "request_noise"):
                 with self.subTest(kind=kind, mode=mode), OwnedContractStore() as store:
-                    with self.adapter(kind, store, mode, timeout=0.25) as request:
+                    with self.adapter(kind, store, mode, timeout=exchange_budget,
+                                      reap_timeout=reap_budget) as request:
                         start = time.monotonic()
                         with self.assertRaises(Exception) as error:
                             request()
+                        elapsed = time.monotonic() - start
                         self.assertIn("exceeded", str(error.exception))
-                        self.assertLess(time.monotonic() - start, 1.5)
+                        self.assert_completion_envelope(elapsed, phase="stalled request",
+                                                        exchange=exchange_budget, reap=reap_budget)
                         self.assert_protocol_stage(mode)
                         self.assert_reaped()
 
@@ -312,19 +331,20 @@ class HarnessTests(unittest.TestCase):
                 self.assert_reaped()
 
     def test_close_reaps_after_kill(self):
+        reap_budget = 0.12
         for kind in ("legacy", "pytest"):
             with self.subTest(kind=kind), OwnedContractStore() as store:
-                start = time.monotonic()
                 # The short budget belongs to the reap: this server ignores EOF,
-                # and without it close would sit out the full wait. It used to be
-                # spent on the exchange as well, which made the spawn, the
-                # handshake and a tools/list round trip all have to finish inside
-                # 120 ms, so a machine under load failed the arm for its load.
-                with self.adapter(kind, store, "ignore_eof", reap_timeout=0.12) as request:
+                # so exclude spawn, handshake and the successful request from the
+                # timer that checks close's two reap waits.
+                with self.adapter(kind, store, "ignore_eof", reap_timeout=reap_budget) as request:
                     self.assertEqual(request(), [])
                     if kind == "pytest":
                         session = request.__self__
-                self.assertLess(time.monotonic() - start, 1.5)
+                    start = time.monotonic()
+                elapsed = time.monotonic() - start
+                self.assert_completion_envelope(elapsed, phase="close after EOF",
+                                                reap=reap_budget)
                 self.assert_reaped()
                 self.assertLess(self.children[-1].returncode, 0)
                 if kind == "legacy":
@@ -337,18 +357,23 @@ class HarnessTests(unittest.TestCase):
     def test_reap_budget_is_independent_of_the_exchange_budget(self):
         from contract_harness import attach_transport
 
+        exchange_budget = 30.0
+        reap_budget = 0.05
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, bufsize=0)
-        transport = attach_transport(proc, 30.0, 0.05)
+        transport = attach_transport(proc, exchange_budget, reap_budget)
         try:
-            self.assertEqual((transport.timeout, transport.reap_timeout), (30.0, 0.05))
+            self.assertEqual((transport.timeout, transport.reap_timeout),
+                             (exchange_budget, reap_budget))
             # A child that never exits on its own: close returns on the reap
             # budget, the small number, not on the 30-second exchange budget.
             start = time.monotonic()
             transport.close()
-            self.assertLess(time.monotonic() - start, 5)
-            self.assertIsNotNone(proc.returncode)
+            elapsed = time.monotonic() - start
+            self.assert_completion_envelope(elapsed, phase="independent reap", reap=reap_budget)
+            self.assertIsNotNone(proc.returncode, "independent close must reap its child")
+            self.assert_reaped()
         finally:
             # This suite runs under a 20-second watchdog, so an arm that leaves a
             # 30-second sleeper behind spends the budget the later arms need.
@@ -460,17 +485,22 @@ class HarnessTests(unittest.TestCase):
         self.assert_reaped()
 
     def test_outer_timeout_stops_owned_worker_group(self):
+        worker_budget = 0.5
+        reap_budget = worker_budget
         record = self.root / "worker-group.json"
         worker = self.root / "parked-worker.py"
         worker.write_text(WORKER_GROUP_CONTROL)
         start = time.monotonic()
-        code = run_worker([sys.executable, str(worker), str(record)], timeout=0.5)
+        code = run_worker([sys.executable, str(worker), str(record)],
+                          timeout=worker_budget, grace=reap_budget)
+        elapsed = time.monotonic() - start
         self.assertEqual(code, 124)
-        self.assertLess(time.monotonic() - start, 3)
+        self.assert_completion_envelope(elapsed, phase="worker timeout",
+                                        worker=worker_budget, reap=reap_budget)
         outcome = json.loads(record.read_text())
         self.assertEqual(outcome["worker_group"], outcome["worker_pid"])
         self.assertEqual(outcome["child_group"], outcome["worker_group"])
-        self.assertTrue(outcome["child_reaped"])
+        self.assertTrue(outcome.get("child_reaped"), "worker must reap its child before exit")
         self.assertLess(outcome["child_returncode"], 0)
         with self.assertRaises(ProcessLookupError):
             os.killpg(outcome["worker_group"], 0)

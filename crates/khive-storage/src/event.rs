@@ -101,7 +101,7 @@ impl Event {
         self
     }
 
-    /// Set the target entity/note ID for this event.
+    /// Set the exact subject UUID for this event; it need not be a graph record.
     pub fn with_target(mut self, id: Uuid) -> Self {
         self.target_id = Some(id);
         self
@@ -187,6 +187,9 @@ pub struct EventView {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EventFilter {
     pub ids: Vec<Uuid>,
+    /// Exact event subject, independent of the graph observation projection.
+    #[serde(default)]
+    pub target_id: Option<Uuid>,
     pub kinds: Vec<EventKind>,
     pub verbs: Vec<String>,
     pub substrates: Vec<SubstrateKind>,
@@ -292,5 +295,26 @@ pub trait EventStore: Send + Sync + 'static {
     /// build time instead of appearing healthy.
     fn supports_idempotent_audit_batch(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_filter_target_id_roundtrips_and_defaults_for_legacy_frames() {
+        let target = Uuid::new_v4();
+        let filter = EventFilter {
+            target_id: Some(target),
+            ..EventFilter::default()
+        };
+        let mut wire = serde_json::to_value(&filter).unwrap();
+        assert_eq!(wire["target_id"], target.to_string());
+        let decoded: EventFilter = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.target_id, Some(target));
+        wire.as_object_mut().unwrap().remove("target_id");
+        let legacy: EventFilter = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.target_id, None);
     }
 }

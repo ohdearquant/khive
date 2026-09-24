@@ -62,7 +62,7 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 39 typed event variants produced by the verb dispatch path
+/// Discriminant for the 40 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -147,11 +147,13 @@ pub enum EventKind {
     PhaseCompleted,
     /// A background phase was cancelled before completion (ADR-103 Stage 1).
     PhaseCancelled,
+    /// An attempted operation was refused while retaining its existing subject.
+    Refusal,
 }
 
 impl EventKind {
-    /// All 39 event kind variants in declaration order.
-    pub const ALL: [Self; 39] = [
+    /// All 40 event kind variants in declaration order.
+    pub const ALL: [Self; 40] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -191,6 +193,7 @@ impl EventKind {
         Self::PhaseStarted,
         Self::PhaseCompleted,
         Self::PhaseCancelled,
+        Self::Refusal,
     ];
 
     /// Return the canonical snake_case string for this event kind.
@@ -235,6 +238,7 @@ impl EventKind {
             Self::PhaseStarted => "phase_started",
             Self::PhaseCompleted => "phase_completed",
             Self::PhaseCancelled => "phase_cancelled",
+            Self::Refusal => "refusal",
         }
     }
 }
@@ -285,6 +289,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "phase_started",
     "phase_completed",
     "phase_cancelled",
+    "refusal",
 ];
 
 impl core::str::FromStr for EventKind {
@@ -331,6 +336,7 @@ impl core::str::FromStr for EventKind {
             "phase_started" => Ok(Self::PhaseStarted),
             "phase_completed" => Ok(Self::PhaseCompleted),
             "phase_cancelled" => Ok(Self::PhaseCancelled),
+            "refusal" => Ok(Self::Refusal),
             other => Err(crate::error::UnknownVariant::new(
                 "event_kind",
                 other,
@@ -919,6 +925,21 @@ mod tests {
                 .expect("EventKind::name must parse back");
             assert_eq!(parsed, kind);
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn refusal_kind_has_canonical_string_and_serde_roundtrip() {
+        let kind = EventKind::Refusal;
+        assert!(EventKind::ALL.contains(&kind));
+        assert_eq!(kind.name(), "refusal");
+        assert_eq!(kind.to_string(), "refusal");
+        assert_eq!("refusal".parse::<EventKind>().unwrap(), kind);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"refusal\"");
+        assert_eq!(
+            serde_json::from_str::<EventKind>("\"refusal\"").unwrap(),
+            kind
+        );
     }
 
     #[test]

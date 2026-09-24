@@ -789,13 +789,20 @@ fn move_kinded_subject(
     rows: &mut BTreeMap<String, u64>,
 ) -> rusqlite::Result<u64> {
     let KindedTables { base, fts, rowids } = *tables;
-    let moved = conn.execute(
-        &format!(
+    // Entity writers advance revisions explicitly; note revisions belong to
+    // their update trigger. Keep the entity target and both assignment lists
+    // literal so the two writer contracts can be inspected independently.
+    let statement = if base == "entities" {
+        "UPDATE entities SET namespace = ?2, version = version + 1 \
+         WHERE namespace = ?1 AND kind = ?3"
+            .to_owned()
+    } else {
+        format!(
             "UPDATE {} SET namespace = ?2 WHERE namespace = ?1 AND kind = ?3",
             namespace_census::quote_ident(base)
-        ),
-        rusqlite::params![source, target, kind],
-    )? as u64;
+        )
+    };
+    let moved = conn.execute(&statement, rusqlite::params![source, target, kind])? as u64;
     *rows.entry(base.to_string()).or_default() += moved;
 
     // An ordinary fts5 table accepts this and preserves the rowid, which is what
@@ -1544,5 +1551,87 @@ mod tests {
         assert_eq!(collisions[0].table, "knowledge_atoms");
         assert_eq!(collisions[0].constraint, "idx_knowledge_atoms_ns_slug");
         assert_eq!(collisions[0].key, "shared-slug");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn issue2673_namespace_move_advances_entity_version_without_changing_timestamp() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    crate::migrations::run_migrations(&mut conn).unwrap();
+    conn.execute("INSERT INTO entities(id,namespace,kind,name,created_at,updated_at) VALUES('versioned','source','concept','moved',7,7)", []).unwrap();
+    conn.execute(
+        "INSERT INTO notes(id,namespace,kind,content,created_at,updated_at) \
+         VALUES('note-moved','source','observation','moved',11,11), \
+               ('note-control','unrelated','observation','unchanged',13,13)",
+        [],
+    )
+    .unwrap();
+    let request = MoveRequest::new(
+        "source",
+        vec![
+            MoveRoute {
+                class: SubjectClass::Entity("concept".into()),
+                target: "target".into(),
+            },
+            MoveRoute {
+                class: SubjectClass::Note("observation".into()),
+                target: "target".into(),
+            },
+        ],
+    );
+    let tx = conn.transaction().unwrap();
+    let moved = move_namespace(&tx, &request).unwrap();
+    assert_eq!(moved.subjects.get("entity:concept"), Some(&1));
+    assert_eq!(moved.subjects.get("note:observation"), Some(&1));
+    tx.commit().unwrap();
+    let stored = conn
+        .query_row(
+            "SELECT namespace,updated_at,version FROM entities WHERE id='versioned'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(stored, ("target".into(), 7, 2));
+    for (id, namespace, timestamp, version) in [
+        ("note-moved", "target", 11_i64, 2_i64),
+        ("note-control", "unrelated", 13_i64, 1_i64),
+    ] {
+        let stored = conn
+            .query_row(
+                "SELECT namespace,updated_at,version FROM notes WHERE id=?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored, (namespace.into(), timestamp, version));
+    }
+
+    let tx = conn.transaction().unwrap();
+    let repeated = move_namespace(&tx, &request).unwrap();
+    assert_eq!(repeated.subjects.get("entity:concept"), Some(&0));
+    assert_eq!(repeated.subjects.get("note:observation"), Some(&0));
+    tx.commit().unwrap();
+    for (sql, expected) in [
+        ("SELECT version FROM entities WHERE id='versioned'", 2_i64),
+        ("SELECT version FROM notes WHERE id='note-moved'", 2_i64),
+        ("SELECT version FROM notes WHERE id='note-control'", 1_i64),
+    ] {
+        assert_eq!(
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap(),
+            expected
+        );
     }
 }

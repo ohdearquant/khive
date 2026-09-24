@@ -204,12 +204,14 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-185](ADR-185-daemon-rendezvous-ownership.md)                       | Daemon Rendezvous Ownership — a client must not take the socket a supervisor is for                        |
 | [ADR-186](ADR-186-note-listing-order-index.md)                          | One partial index for the note listing order                                                               |
 | [ADR-187](ADR-187-comm-seek-plan-pinning.md)                            | Pin the comm seeks' index instead of hoping the planner picks it                                           |
-| [ADR-188](ADR-188-entity-version-fence.md)                              | Entities get a version, and then a fence                                                                   |
+| [ADR-188](ADR-188-entity-version-fence.md)                              | Persisted entity revisions and the update version fence                                                    |
 | [ADR-189](ADR-189-namespace-move.md)                                    | Moving records between namespaces                                                                          |
 | [ADR-190](ADR-190-adr-to-code-citation-check.md)                        | One code-keyed check for ADR-to-code citations                                                             |
 | [ADR-191](ADR-191-web-pack-ontology-and-operations.md)                  | Web Pack — Web Ontology, Relation Rules, and Operations                                                    |
 | [ADR-192](ADR-192-credential-and-producer-seams.md)                     | Credential Seam and Producer Seams for Network Packs                                                       |
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
+| [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
+| [ADR-195](ADR-195-comm-actor-trust-classes.md)                          | Actor Trust Classes and Per-Pair Message Policy for comm                                                   |
 
 <!-- END GENERATED ADR CATALOG -->
 

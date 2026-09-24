@@ -59,6 +59,7 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        version: 1,
         content_ref: None,
     }
 }
@@ -890,6 +891,320 @@ async fn test_query_by_kind_and_entity_type() {
     assert_eq!(result.items[0].entity_type, Some("researcher".to_string()));
 }
 
+#[test]
+fn legacy_entity_type_fallback_seeks_both_type_indexes() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    run_migrations(&mut conn).unwrap();
+    for filter in [
+        EntityFilter {
+            kinds: vec!["concept".into()],
+            entity_types: vec!["algorithm".into()],
+            legacy_entity_type_fallback: true,
+            ..Default::default()
+        },
+        EntityFilter {
+            entity_types_by_kind: [("concept".into(), vec!["algorithm".into()])].into(),
+            legacy_entity_type_fallback: true,
+            ..Default::default()
+        },
+    ] {
+        for ordered in [false, true] {
+            let (where_sql, mut params) = build_entity_where("local", &filter);
+            let query = if ordered {
+                params.push(Box::new(2_i64));
+                params.push(Box::new(1_i64));
+                let limit_idx = params.len() - 1;
+                let offset_idx = params.len();
+                format!(
+                    "SELECT {ENTITY_SELECT_COLUMNS} FROM entities{where_sql} \
+                     ORDER BY created_at DESC, id DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                )
+            } else {
+                format!("SELECT COUNT(*) FROM entities{where_sql}")
+            };
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let details: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("SEARCH entities")
+                        && detail.contains("idx_entities_kind_entity_type")
+                        && detail.contains("namespace=? AND kind=? AND entity_type=?")
+                }),
+                "typed rows must retain the third-column seek: {query}; {details:?}"
+            );
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("SEARCH entities")
+                        && detail.contains("idx_entities_legacy_type")
+                        && detail.contains("namespace=? AND kind=? AND <expr>=?")
+                }),
+                "legacy rows must seek the partial expression index: {query}; {details:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_entity_type_union_preserves_offset_seek_and_kind_filters() {
+    let store = setup_memory_store();
+    let mut legacy = Entity::new("local", "concept", "Alpha-one")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    legacy.id = Uuid::from_u128(1);
+    legacy.created_at = 500;
+    let mut typed = Entity::new("local", "concept", "Alpha").with_entity_type(Some("algorithm"));
+    typed.id = Uuid::from_u128(2);
+    typed.created_at = 100;
+    let mut team = Entity::new("team", "concept", "Alpha-team").with_entity_type(Some("algorithm"));
+    team.id = Uuid::from_u128(5);
+    team.created_at = 600;
+    let mut legacy_tie = Entity::new("local", "concept", "Alpha-three")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    legacy_tie.id = Uuid::from_u128(3);
+    legacy_tie.created_at = 400;
+    let mut typed_tie = Entity::new("local", "concept", "Alpha-four")
+        .with_entity_type(Some("algorithm"))
+        .with_properties(serde_json::json!({"type": "technique"}));
+    typed_tie.id = Uuid::from_u128(4);
+    typed_tie.created_at = 400;
+    for entity in [&legacy, &typed, &team, &legacy_tie, &typed_tie] {
+        store.upsert_entity(entity.clone()).await.unwrap();
+    }
+    legacy.description = Some("Revised legacy description".into());
+    store.upsert_entity(legacy.clone()).await.unwrap();
+    for description in ["First typed revision", "Second typed revision"] {
+        typed.description = Some(description.into());
+        store.upsert_entity(typed.clone()).await.unwrap();
+    }
+    let mut deleted = Entity::new("local", "concept", "Alpha-deleted")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    deleted.deleted_at = Some(deleted.created_at);
+    for entity in [
+        deleted,
+        Entity::new("local", "concept", "Alpha-overridden")
+            .with_entity_type(Some("technique"))
+            .with_properties(serde_json::json!({"type": "algorithm"})),
+        Entity::new("local", "document", "Alpha-document")
+            .with_properties(serde_json::json!({"type": "algorithm"})),
+        Entity::new("foreign", "concept", "Alpha-foreign").with_entity_type(Some("algorithm")),
+    ] {
+        store.upsert_entity(entity).await.unwrap();
+    }
+    let filter = EntityFilter {
+        namespaces: vec!["local".into(), "team".into()],
+        kinds: vec!["concept".into()],
+        entity_types: vec!["algorithm".into()],
+        legacy_entity_type_fallback: true,
+        name_prefix: Some("Alpha".into()),
+        ..Default::default()
+    };
+    let mut grouped = filter.clone();
+    grouped.kinds.clear();
+    grouped.entity_types.clear();
+    grouped.entity_types_by_kind = [("concept".into(), vec!["algorithm".into()])].into();
+    for filter in [filter, grouped] {
+        assert_eq!(
+            store
+                .count_entities("unused", filter.clone())
+                .await
+                .unwrap(),
+            5
+        );
+        let mut offset_rows = Vec::new();
+        for offset in 0..5 {
+            let page = store
+                .query_entities("unused", filter.clone(), PageRequest { limit: 1, offset })
+                .await
+                .unwrap();
+            assert_eq!(page.total, Some(5));
+            assert_eq!(page.items.len(), 1);
+            offset_rows.push((page.items[0].id, page.items[0].version));
+        }
+        assert_eq!(
+            offset_rows,
+            vec![
+                (typed.id, 3),
+                (team.id, 1),
+                (legacy.id, 2),
+                (typed_tie.id, 1),
+                (legacy_tie.id, 1),
+            ]
+        );
+        let first = store
+            .query_entities_after("unused", filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|entity| (entity.id, entity.version))
+                .collect::<Vec<_>>(),
+            vec![(legacy.id, 2), (typed.id, 3)]
+        );
+        assert_eq!(
+            first.next_after,
+            Some(SeekCursor {
+                sequence: 2,
+                id: typed.id,
+            })
+        );
+        let second = store
+            .query_entities_after("unused", filter.clone(), first.next_after, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|entity| (entity.id, entity.version))
+                .collect::<Vec<_>>(),
+            vec![(team.id, 1), (legacy_tie.id, 1)]
+        );
+        assert_eq!(
+            second.next_after,
+            Some(SeekCursor {
+                sequence: 4,
+                id: legacy_tie.id,
+            })
+        );
+        let third = store
+            .query_entities_after("unused", filter, second.next_after, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            third
+                .items
+                .iter()
+                .map(|entity| (entity.id, entity.version))
+                .collect::<Vec<_>>(),
+            vec![(typed_tie.id, 1)]
+        );
+        assert!(third.next_after.is_none());
+    }
+}
+
+#[tokio::test]
+async fn legacy_entity_type_filters_skip_invalid_json_and_json5() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let invalid_properties = [
+        "not-json",
+        r#"{"type":"algorithm""#,
+        r#"{type:'algorithm'}"#,
+        r#"{"type":"algorithm",}"#,
+    ];
+    for (index, properties) in invalid_properties.iter().enumerate() {
+        let mut entity = Entity::new("local", "concept", "Invalid legacy properties");
+        entity.id = Uuid::from_u128(index as u128 + 1);
+        store.upsert_entity(entity.clone()).await.unwrap();
+        // Typed writes cannot represent malformed JSON or JSON5-only text.
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE entities SET properties = ?1, version = version + 1 WHERE id = ?2",
+                rusqlite::params![properties, entity.id.to_string()],
+            )
+            .unwrap();
+    }
+    let mut legacy = Entity::new("local", "concept", "Legacy")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    legacy.id = Uuid::from_u128(10);
+    legacy.created_at = 10;
+    let mut typed = Entity::new("local", "concept", "Typed")
+        .with_entity_type(Some("algorithm"))
+        .with_properties(serde_json::json!({"type": "technique"}));
+    typed.id = Uuid::from_u128(11);
+    typed.created_at = 20;
+    let overridden = Entity::new("local", "concept", "Overridden")
+        .with_entity_type(Some("technique"))
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    for entity in [&legacy, &typed, &overridden] {
+        store.upsert_entity(entity.clone()).await.unwrap();
+    }
+
+    for indexed in [true, false] {
+        if !indexed {
+            pool.writer()
+                .unwrap()
+                .conn()
+                .execute_batch("DROP INDEX idx_entities_legacy_type")
+                .unwrap();
+        }
+        for filter in [
+            EntityFilter {
+                kinds: vec!["concept".into()],
+                entity_types: vec!["algorithm".into()],
+                legacy_entity_type_fallback: true,
+                ..Default::default()
+            },
+            EntityFilter {
+                entity_types_by_kind: [("concept".into(), vec!["algorithm".into()])].into(),
+                legacy_entity_type_fallback: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                store.count_entities("local", filter.clone()).await.unwrap(),
+                2,
+                "indexed={indexed}"
+            );
+            for (offset, expected_id) in (0_u64..).zip([typed.id, legacy.id]) {
+                let page = store
+                    .query_entities("local", filter.clone(), PageRequest { offset, limit: 1 })
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, Some(2), "indexed={indexed}");
+                assert_eq!(page.items.len(), 1, "indexed={indexed}");
+                assert_eq!(page.items[0].id, expected_id, "indexed={indexed}");
+            }
+            let first = store
+                .query_entities_after("local", filter.clone(), None, 1)
+                .await
+                .unwrap();
+            assert_eq!(first.items.len(), 1, "indexed={indexed}");
+            assert_eq!(first.items[0].id, legacy.id, "indexed={indexed}");
+            assert_eq!(
+                first.next_after,
+                Some(SeekCursor {
+                    sequence: 5,
+                    id: legacy.id,
+                }),
+                "indexed={indexed}"
+            );
+            let second = store
+                .query_entities_after("local", filter, first.next_after, 1)
+                .await
+                .unwrap();
+            assert_eq!(second.items.len(), 1, "indexed={indexed}");
+            assert_eq!(second.items[0].id, typed.id, "indexed={indexed}");
+            assert!(second.next_after.is_none(), "indexed={indexed}");
+        }
+    }
+
+    for (index, properties) in invalid_properties.iter().enumerate() {
+        let stored: (String, i64) = pool
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT properties, version FROM entities WHERE id = ?1",
+                [Uuid::from_u128(index as u128 + 1).to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (properties.to_string(), 2));
+    }
+}
+
 #[tokio::test]
 async fn test_legacy_entity_type_filter_is_opt_in_and_preserves_column_precedence() {
     let store = setup_memory_store();
@@ -1036,6 +1351,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        version: 1,
         content_ref: None,
     };
     store.upsert_entity(entity_a).await.unwrap();
@@ -1060,6 +1376,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        version: 1,
         content_ref: None,
     };
     store.upsert_entity(entity_b).await.unwrap();
@@ -1797,7 +2114,8 @@ async fn cursor_kind_filter_returns_records() {
 
     let mut walked_ids: Vec<Uuid> = Vec::new();
     let mut after = None;
-    loop {
+    // A cursor that stops advancing must fail here rather than loop forever.
+    for _ in 0..=concept_ids.len() {
         let page = store
             .query_entities_after("ns1", filter.clone(), after, 2)
             .await
@@ -1810,6 +2128,7 @@ async fn cursor_kind_filter_returns_records() {
             break;
         }
     }
+    assert!(after.is_none(), "cursor did not reach the last page");
 
     assert_eq!(
         walked_ids.len(),
@@ -1976,5 +2295,93 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
     assert_eq!(
         reader.standalone_opens, 0,
         "neither saturation nor cancellation may fall back to a standalone reader"
+    );
+}
+
+#[tokio::test]
+async fn issue2673_entity_versions_cover_typed_storage_writers() {
+    let store = setup_memory_store();
+    let entity = Entity::new("local", "concept", "Versioned");
+    let id = entity.id;
+    store.upsert_entity(entity.clone()).await.unwrap();
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 1);
+
+    // Upsert must increment the stored counter even when passed an old clone.
+    store.upsert_entity(entity.clone()).await.unwrap();
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 2);
+    let batch = store
+        .upsert_entities(vec![entity.clone(), entity.clone()])
+        .await
+        .unwrap();
+    assert_eq!((batch.affected, batch.failed), (2, 0));
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 4);
+
+    assert!(!store.insert_entity_if_absent(entity).await.unwrap());
+    let before = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(
+        before.version, 4,
+        "losing conditional insert is not a write"
+    );
+    let mut changed = before.clone();
+    changed.name = "CAS winner".into();
+    changed.updated_at += 1;
+    assert!(store
+        .replace_entity_if_unchanged(changed.clone(), before.updated_at, before.deleted_at)
+        .await
+        .unwrap());
+    let winner = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(winner.version, 5);
+    assert!(!store
+        .replace_entity_if_unchanged(changed, before.updated_at, before.deleted_at)
+        .await
+        .unwrap());
+    assert_eq!(
+        serde_json::to_value(store.get_entity(id).await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
+
+    // A same-timestamp upsert still invalidates the persisted revision.
+    let mut stale = winner.clone();
+    stale.updated_at += 1;
+    stale.name = "must not land".into();
+    store.upsert_entity(winner.clone()).await.unwrap();
+    assert!(!store
+        .replace_entity_if_unchanged(stale, winner.updated_at, winner.deleted_at)
+        .await
+        .unwrap());
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 6);
+
+    let current = store.get_entity(id).await.unwrap().unwrap();
+    store
+        .upsert_entity_with_attachments(current, vec![content_attachment(id, &"a".repeat(64))])
+        .await
+        .unwrap();
+    assert_eq!(store.get_entity(id).await.unwrap().unwrap().version, 7);
+    assert!(store.delete_entity(id, DeleteMode::Soft).await.unwrap());
+    assert_eq!(
+        store
+            .get_entity_including_deleted(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        8
+    );
+    assert!(!store.delete_entity(id, DeleteMode::Soft).await.unwrap());
+    assert_eq!(
+        store
+            .get_entity_including_deleted(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        8
+    );
+
+    let fresh = Entity::new("local", "concept", "Conditional");
+    assert!(store.insert_entity_if_absent(fresh.clone()).await.unwrap());
+    assert_eq!(
+        store.get_entity(fresh.id).await.unwrap().unwrap().version,
+        1
     );
 }

@@ -2600,15 +2600,19 @@ mod tests {
 
     #[test]
     fn diagnostics_exposes_reader_saturation_and_completed_hold_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A pre-opened reader makes setup independent of the exhaustion timeout.
         let pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("reader_saturation.db")),
+            max_readers: 1,
             checkout_timeout: Duration::from_millis(2),
             ..PoolConfig::default()
         })
-        .expect("in-memory pool");
+        .expect("one-reader file-backed pool");
         let held = pool.reader().expect("first reader checkout");
         assert!(
             pool.reader().is_err(),
-            "the live checkout must exhaust the one-slot degraded reader budget"
+            "the live checkout must exhaust the one-slot reader budget"
         );
         drop(held);
 

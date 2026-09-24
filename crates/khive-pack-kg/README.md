@@ -5,6 +5,8 @@ event-sourced proposals for khive's research knowledge graph substrate. This is
 the first-party pack shipped with the khive binary; every other pack in this
 workspace declares it as a dependency.
 
+See [event subject history](docs/api/event-target-filter.md) for exact event `target_id` filtering and refusal-event readback.
+
 ## Verbs
 
 26 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):

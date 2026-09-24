@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS entities (
     tags           TEXT NOT NULL DEFAULT '[]',
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
+    version        INTEGER NOT NULL DEFAULT 1,
     deleted_at     INTEGER,
     merged_into    TEXT,
     merge_event_id TEXT
@@ -20,6 +21,9 @@ CREATE TABLE IF NOT EXISTS entities (
 CREATE INDEX IF NOT EXISTS idx_entities_namespace ON entities(namespace);
 CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type ON entities(namespace, kind, entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_legacy_type
+    ON entities(namespace, kind, json_extract(properties, '$.type'))
+    WHERE entity_type IS NULL AND json_valid(properties);
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(namespace, name);
 CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merged_into);
@@ -40,4 +44,21 @@ BEGIN
     -- that trigger policy and would reassign this immutable sequence.
     INSERT INTO entities_seq (entity_id) VALUES (NEW.id)
     ON CONFLICT(entity_id) DO NOTHING;
+END;
+
+-- The row version is independent of updated_at and cannot be caller-selected.
+CREATE TRIGGER IF NOT EXISTS entities_version_insert_guard
+BEFORE INSERT ON entities
+WHEN typeof(NEW.version) != 'integer' OR NEW.version != 1
+BEGIN
+    SELECT RAISE(ABORT, 'entity insert version must be 1');
+END;
+
+CREATE TRIGGER IF NOT EXISTS entities_version_update_guard
+BEFORE UPDATE ON entities
+WHEN OLD.version = 9223372036854775807
+  OR typeof(NEW.version) != 'integer'
+  OR NEW.version != OLD.version + 1
+BEGIN
+    SELECT RAISE(ABORT, 'entity update version must advance by exactly one');
 END;

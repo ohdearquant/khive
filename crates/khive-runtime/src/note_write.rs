@@ -899,6 +899,7 @@ impl KhiveRuntime {
                 post_commit: PostCommitEffect::None,
                 edge_natural_key: None,
                 idempotent_noop: true,
+                entity_guard: None,
                 note_guard: Some(NoteWriteGuard {
                     namespace: token.namespace().as_str().into(),
                     target_id: note.id,
@@ -1011,6 +1012,7 @@ impl KhiveRuntime {
             post_commit,
             edge_natural_key: None,
             idempotent_noop: false,
+            entity_guard: None,
             note_guard: Some(NoteWriteGuard {
                 namespace: token.namespace().as_str().into(),
                 target_id: note.id,
