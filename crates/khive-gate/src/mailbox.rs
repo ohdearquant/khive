@@ -45,17 +45,26 @@ fn valid_actor(actor: &ActorRef) -> bool {
 /// Runtime labels resolve to `ActorRef { kind: "actor", id: full_label }`.
 /// An omitted selector retains legacy behavior, including the local mailbox.
 pub fn mailbox_read_owner(req: &GateRequest) -> Result<Option<ActorRef>, MailboxPolicyError> {
-    if !matches!(req.verb.as_str(), "comm.inbox" | "comm.thread") {
-        return Ok(None);
-    }
-    let Some(value) = req.args.get("mailbox_actor") else {
+    let selector = match req.verb.as_str() {
+        "comm.inbox" | "comm.thread" => "mailbox_actor",
+        "comm.probe" => "actor",
+        _ => return Ok(None),
+    };
+    let Some(value) = req.args.get(selector) else {
         return Ok(None);
     };
     let label = value
         .as_str()
-        .filter(|label| is_valid_mailbox_actor_label(label))
+        .filter(|label| {
+            is_valid_mailbox_actor_label(label) || (req.verb == "comm.probe" && *label == "local")
+        })
         .ok_or(MailboxPolicyError::InvalidSelector)?;
-    let owner = ActorRef::new("actor", label);
+    // Probe has always allowed the anonymous caller's exact local mailbox.
+    let owner = if req.verb == "comm.probe" && label == "local" && req.actor.is_anonymous() {
+        ActorRef::anonymous()
+    } else {
+        ActorRef::new("actor", label)
+    };
     Ok((owner != req.actor).then_some(owner))
 }
 
@@ -176,8 +185,10 @@ impl Gate for MailboxReadGate {
         req: &GateRequest,
         owner: &ActorRef,
     ) -> Result<GateDecision, GateError> {
-        if matches!(req.verb.as_str(), "comm.inbox" | "comm.thread")
-            && valid_actor(&req.actor)
+        if matches!(
+            req.verb.as_str(),
+            "comm.inbox" | "comm.thread" | "comm.probe"
+        ) && valid_actor(&req.actor)
             && owner == &self.owner
             && self
                 .readers
