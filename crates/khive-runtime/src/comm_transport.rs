@@ -32,13 +32,15 @@ impl KhiveRuntime {
     }
     /// Persist immutable bytes before first submission. An exact retry is a no-op;
     /// a different envelope with the same identity is refused. The namespace is
-    /// caller attribution and is always taken from the token.
+    /// caller attribution and is always taken from the token. Sender assurance
+    /// is claimed until authenticated verification is available.
     pub async fn create_sender_transport(
         &self,
         token: &NamespaceToken,
         mut envelope: SenderEnvelope,
     ) -> RuntimeResult<SenderRecord> {
         envelope.namespace = token.namespace().as_str().to_owned();
+        envelope.sender_assurance = SenderAssurance::Claimed;
         Ok(self
             .sender_transport_store()
             .create(envelope, false)
@@ -47,12 +49,14 @@ impl KhiveRuntime {
     /// Re-encrypt only after the caller confirms the recipient key change. The
     /// old record must be on a key-change hold, and the new epoch must increase.
     /// Cryptographic construction and directory confirmation belong to the caller.
+    /// Caller-supplied assurance is normalized to claimed as on initial creation.
     pub async fn reencrypt_sender_transport_after_confirmed_key_change(
         &self,
         token: &NamespaceToken,
         mut envelope: SenderEnvelope,
     ) -> RuntimeResult<SenderRecord> {
         envelope.namespace = token.namespace().as_str().to_owned();
+        envelope.sender_assurance = SenderAssurance::Claimed;
         Ok(self.sender_transport_store().create(envelope, true).await?)
     }
     /// Read by durable identity. Absence means unknown; unknown is not persisted.
@@ -122,12 +126,8 @@ mod tests {
     use khive_channel::{DeliveryReceiptBinding, ReceiptDisposition};
     use uuid::Uuid;
 
-    #[tokio::test]
-    async fn verified_receipt_uses_bound_backend_and_token_attribution() {
-        let runtime = KhiveRuntime::memory().unwrap();
-        let unrelated = KhiveRuntime::memory().unwrap();
-        let token = NamespaceToken::local();
-        let envelope = SenderEnvelope {
+    fn envelope() -> SenderEnvelope {
+        SenderEnvelope {
             namespace: "untrusted-envelope-attribution".into(),
             logical_message_id: Uuid::new_v4(),
             outbound_note_id: Uuid::new_v4(),
@@ -146,17 +146,22 @@ mod tests {
             recipient_key_fingerprint: "ab".repeat(32),
             enc: vec![1; 32],
             ciphertext: vec![2, 0, 255],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_receipt_uses_bound_backend_and_token_attribution() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let unrelated = KhiveRuntime::memory().unwrap();
+        let token = NamespaceToken::local();
+        let envelope = envelope();
         let key = envelope.key();
         let stored = runtime
             .create_sender_transport(&token, envelope.clone())
             .await
             .unwrap();
         assert_eq!(stored.envelope.namespace, token.namespace().as_str());
-        assert_eq!(
-            stored.envelope.sender_assurance,
-            SenderAssurance::DaemonBearer
-        );
+        assert_eq!(stored.envelope.sender_assurance, SenderAssurance::Claimed);
         assert_eq!(
             runtime
                 .sender_transport(key)
@@ -165,7 +170,7 @@ mod tests {
                 .unwrap()
                 .envelope
                 .sender_assurance,
-            SenderAssurance::DaemonBearer
+            SenderAssurance::Claimed
         );
         assert!(
             unrelated.sender_transport(key).await.unwrap().is_none(),
@@ -231,5 +236,44 @@ mod tests {
             runtime.sender_transport(key).await.unwrap().unwrap().state,
             TransportState::RecipientStored
         );
+    }
+    #[tokio::test]
+    async fn caller_sender_assurance_is_claimed() {
+        for assurance in [
+            SenderAssurance::DaemonBearer,
+            SenderAssurance::ActorSignature,
+        ] {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = NamespaceToken::local();
+            let mut envelope = envelope();
+            envelope.sender_assurance = assurance;
+            let first = runtime
+                .create_sender_transport(&token, envelope.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                first.envelope.sender_assurance,
+                SenderAssurance::Claimed,
+                "create must normalize caller assurance"
+            );
+            assert_eq!(
+                runtime.sender_transport(envelope.key()).await.unwrap(),
+                Some(first)
+            );
+            runtime
+                .hold_sender_transport(envelope.key(), Some(HoldReason::RecipientKeyChanged))
+                .await
+                .unwrap();
+            envelope.recipient_key_epoch += 1;
+            let next = runtime
+                .reencrypt_sender_transport_after_confirmed_key_change(&token, envelope.clone())
+                .await
+                .expect("re-encryption must normalize caller assurance");
+            assert_eq!(next.envelope.sender_assurance, SenderAssurance::Claimed);
+            assert_eq!(
+                runtime.sender_transport(envelope.key()).await.unwrap(),
+                Some(next)
+            );
+        }
     }
 }

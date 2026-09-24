@@ -667,3 +667,127 @@ async fn sender_assurance_insert_rejects_unknown_spelling() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn confirmed_reencryption_rejects_sender_key_epoch_change() {
+    let (backend, envelope) = fixture();
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(envelope.clone(), false).await.unwrap();
+    store
+        .hold(envelope.key(), Some(HoldReason::RecipientKeyChanged))
+        .await
+        .unwrap();
+    let prior = store.get(envelope.key()).await.unwrap().unwrap();
+    let mut next = SenderEnvelope {
+        recipient_key_epoch: 2,
+        sender_key_epoch: 2,
+        ..envelope.clone()
+    };
+    let error = store
+        .create(next.clone(), true)
+        .await
+        .expect_err("re-encryption must refuse changed sender key epoch");
+    assert!(
+        matches!(&error, StorageError::WriterTaskRequestFailed { source, .. }
+        if matches!(source.as_ref(), StorageError::InvalidInput { message, .. }
+            if message == "logical message identity cannot change")),
+        "unexpected error: {error:?}"
+    );
+    assert!(store.get(next.key()).await.unwrap().is_none());
+    assert_eq!(
+        store.get(envelope.key()).await.unwrap(),
+        Some(prior.clone())
+    );
+    next.sender_key_epoch = envelope.sender_key_epoch;
+    assert_eq!(
+        store.create(next.clone(), true).await.unwrap().envelope,
+        next
+    );
+    assert_eq!(store.get(envelope.key()).await.unwrap(), Some(prior));
+}
+
+#[tokio::test]
+async fn permanent_failure_clears_hold_and_policy() {
+    for hold in [
+        HoldReason::InsufficientCredit,
+        HoldReason::RecipientKeyChanged,
+        HoldReason::PolicyDenied {
+            mode: PolicyMode::Enforce,
+            revision: 7,
+        },
+    ] {
+        let (backend, envelope) = fixture();
+        let store = SenderTransportStore::new(backend.pool_arc());
+        store.create(envelope.clone(), false).await.unwrap();
+        store.hold(envelope.key(), Some(hold)).await.unwrap();
+        for class in [FailureClass::Transient, FailureClass::Authentication] {
+            store
+                .record_failure(envelope.key(), class, Some(42))
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get(envelope.key())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .hold_reason,
+                Some(hold)
+            );
+        }
+        store
+            .record_failure(envelope.key(), FailureClass::Permanent, None)
+            .await
+            .expect("permanent failure must clear held metadata");
+        let row = store.get(envelope.key()).await.unwrap().unwrap();
+        assert_eq!(row.state, TransportState::Failed);
+        assert_eq!(row.hold_reason, None);
+        assert_eq!(row.envelope, envelope);
+        assert_eq!(row.next_retry_at, None);
+        let columns: (Option<String>, Option<i64>) = backend
+            .pool()
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT policy_mode, policy_revision FROM comm_sender_transport",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(columns, (None, None));
+    }
+}
+
+#[tokio::test]
+async fn non_pending_transport_cannot_hold() {
+    let (backend, envelope) = fixture();
+    SenderTransportStore::new(backend.pool_arc())
+        .create(envelope, false)
+        .await
+        .unwrap();
+    let writer = backend.pool().writer().unwrap();
+    let conn = writer.conn();
+    let update = "UPDATE comm_sender_transport SET state=?1,hold_reason=?2";
+    for state in ["failed", "recipient_stored", "recipient_quarantined"] {
+        assert_eq!(
+            conn.execute(update, params![state, Option::<String>::None])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute(update, params!["pending", "insufficient_credit"])
+                .unwrap(),
+            1
+        );
+        let error = conn
+            .execute(update, params![state, "insufficient_credit"])
+            .expect_err("non-pending hold must fail the table CHECK");
+        match error {
+            rusqlite::Error::SqliteFailure(code, _) => {
+                assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_CHECK)
+            }
+            other => panic!("expected CHECK constraint failure, got {other}"),
+        }
+    }
+}

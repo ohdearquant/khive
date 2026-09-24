@@ -33,6 +33,7 @@ CREATE TABLE comm_sender_transport (
            AND policy_revision IS NOT NULL)
        OR (hold_reason IS NOT 'policy_denied' AND policy_mode IS NULL
            AND policy_revision IS NULL)),
+    CHECK(state = 'pending' OR hold_reason IS NULL),
     PRIMARY KEY(logical_message_id, recipient_device_id, recipient_key_epoch),
     UNIQUE(logical_message_id,envelope_seq),
     CHECK(length(enc) = 32), CHECK(length(ciphertext) <= 65536),

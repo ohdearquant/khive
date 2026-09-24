@@ -348,7 +348,10 @@ const PENDING_SQL: &str = concat!(
 
 const FAILURE_SQL: &str = concat!(
     "UPDATE comm_sender_transport SET ",
-    "state=?4,attempt_count=?5,next_retry_at=?6,last_failure_class=?7,updated_at=?8 ",
+    "state=?4,attempt_count=?5,next_retry_at=?6,last_failure_class=?7,updated_at=?8,",
+    "hold_reason=CASE WHEN ?4='pending' THEN hold_reason ELSE NULL END,",
+    "policy_mode=CASE WHEN ?4='pending' THEN policy_mode ELSE NULL END,",
+    "policy_revision=CASE WHEN ?4='pending' THEN policy_revision ELSE NULL END ",
     "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND ",
     "recipient_key_epoch=?3",
 );
@@ -453,6 +456,7 @@ impl SenderTransportStore {
                         || a.kind != b.kind
                         || a.slug != b.slug
                         || a.sender_agent_id != b.sender_agent_id
+                        || a.sender_key_epoch != b.sender_key_epoch
                         || a.recipient_agent_id != b.recipient_agent_id
                         || a.recipient_address != b.recipient_address
                     {
