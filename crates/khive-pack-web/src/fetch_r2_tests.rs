@@ -1,6 +1,5 @@
 //! Settlement and preflight regressions use the production fetch seams.
 use super::*;
-use base64::Engine as _;
 use khive_runtime::{Namespace, VerbRegistryBuilder};
 use khive_storage::{Direction, EdgeRelation};
 use std::sync::Arc;
@@ -406,8 +405,7 @@ async fn transient_size_refusal_precedes_receipt_and_counts_header_metadata() {
         false,
     )
     .await
-    .err()
-    .expect("INLINE_METADATA_REFUSED");
+    .expect_err("INLINE_METADATA_REFUSED");
     assert!(
         error.to_string().contains("inline response budget"),
         "INLINE_METADATA_REFUSED: {error}"
@@ -448,8 +446,7 @@ async fn transient_settlement_rejects_body_above_inline_budget_before_receipt() 
         false,
     )
     .await
-    .err()
-    .expect("INLINE_BODY_REFUSED");
+    .expect_err("INLINE_BODY_REFUSED");
     assert!(
         error.to_string().contains("inline response budget"),
         "INLINE_BODY_REFUSED: {error}"

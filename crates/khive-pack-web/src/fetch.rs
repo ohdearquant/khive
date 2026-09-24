@@ -752,7 +752,7 @@ async fn settle(
     if !persist {
         if let Some((bytes, truncated)) = body.as_ref() {
             let encoded_size = base64::encoded_len(bytes.len(), true);
-            if !encoded_size.is_some_and(|size| size <= INLINE_BODY_BUDGET) {
+            if encoded_size.is_none_or(|size| size > INLINE_BODY_BUDGET) {
                 return Err(RuntimeError::InvalidInput(
                     "web.fetch: transient base64 body exceeds the inline response budget; lower max_bytes or use persist=true".into(),
                 ));
