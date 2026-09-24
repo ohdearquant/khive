@@ -63,10 +63,10 @@ db.session.transport.close()
 ```sh
 khive-cloud whoami
 khive-cloud exec 'whoami() | stats()'
-khive-cloud --url https://example.invalid --api-key "$KHIVE_CLOUD_API_KEY" whoami
+khive-cloud --url https://example.invalid whoami
 ```
 
-`--url` and `--api-key` override the corresponding environment variables;
+The credential comes only from `KHIVE_CLOUD_API_KEY`. `--url` overrides `KHIVE_CLOUD_URL`;
 `--allow-insecure` permits non-loopback HTTP. Options may precede or follow the
 command. `whoami` sends `whoami()`; `exec` sends its argument unchanged. Both print
 the REST result envelope as JSON. Credentials are redacted from CLI output,

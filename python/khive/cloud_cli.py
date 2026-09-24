@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from typing import Any
 
 from .cloud import _cloud_configuration
 from .errors import AuthError, RateLimited, TransportError
@@ -24,8 +25,26 @@ def _redact(text: str, secrets: list[str]) -> str:
     return text
 
 
+def _redact_result(value: Any, secrets: list[str]) -> Any:
+    if isinstance(value, str):
+        return _redact(value, secrets)
+    if isinstance(value, list):
+        return [_redact_result(item, secrets) for item in value]
+    if isinstance(value, dict):
+        return {
+            _redact_result(key, secrets): _redact_result(item, secrets)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _error(exc: Exception, code: int, secrets: list[str]) -> int:
-    message = _redact(str(exc), secrets)
+    escaped = [
+        json.dumps(secret, ensure_ascii=ascii_only)[1:-1]
+        for secret in secrets
+        for ascii_only in (False, True)
+    ]
+    message = _redact(str(exc), secrets + escaped)
     message = " ".join(message.splitlines())
     print(f"{type(exc).__name__}: {message}", file=sys.stderr)
     return code
@@ -43,7 +62,6 @@ def main(argv: list[str] | None = None) -> int:
             secrets.append(arg.partition("=")[2])
     parser = _Parser(prog="khive-cloud", allow_abbrev=False)
     parser.add_argument("--url", help="base URL (otherwise KHIVE_CLOUD_URL)")
-    parser.add_argument("--api-key", help="API credential (otherwise KHIVE_CLOUD_API_KEY)")
     parser.add_argument("--allow-insecure", action="store_true")
     parser.add_argument("command", choices=("whoami", "exec"))
     parser.add_argument("ops", nargs="?", help="request DSL for exec, sent verbatim")
@@ -54,17 +72,17 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "whoami" and options.ops is not None:
             raise ValueError("whoami takes no ops argument")
         try:
-            url, api_key = _cloud_configuration(options.url, options.api_key)
+            url, api_key = _cloud_configuration(options.url, None)
         except ValueError as exc:
             raise ValueError(
                 str(exc)
                 .replace("base_url", "--url/base_url")
-                .replace("api_key", "--api-key/api_key")
+                .replace("api_key or KHIVE_CLOUD_API_KEY", "KHIVE_CLOUD_API_KEY")
             ) from None
         with HttpTransport(url, api_key, allow_insecure=options.allow_insecure) as transport:
             ops = "whoami()" if options.command == "whoami" else options.ops
             result = transport.send_dsl(ops, timeout=30.0)["result"]
-        rendered = _redact(json.dumps(result, ensure_ascii=False), secrets)
+        rendered = json.dumps(_redact_result(result, secrets), ensure_ascii=False)
         print(rendered)
         return 0
     except SystemExit as exc:
