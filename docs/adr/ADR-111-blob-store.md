@@ -3,7 +3,7 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch added
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; Amendment 5 accepted 2026-09-24; attachment-GC compatibility epoch added
 2026-08-16 by ADR-160)
 **Authors**: khive maintainers
 **Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
@@ -791,6 +791,31 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   preserved either way.
 - Sensitive low-entropy content is enveloped client-side before `blob.put` (usage rule).
 - No trait, schema, or wire change; this amendment is documentation of intent.
+
+---
+
+## Amendment 5 (2026-09-24): the MinIO compatibility server is built from its pinned release source
+
+**Status:** accepted.
+
+Amendment 2 names a pinned MinIO container as the required compatibility test (layer 2 of CI). MinIO
+no longer publishes a server image or binary that an anonymous CI job can fetch: quay.io answers 401
+for `minio/minio`, including the digest the job pinned, `dl.min.io` answers 410 Gone for the server
+download, and Docker Hub refuses anonymous pulls. The layer 2 job could no longer start its server.
+
+Layer 2 now runs the same shared conformance suite against a MinIO server that the job builds from
+its last release source. The pin moves from an image digest to three parts:
+
+- the release tag `RELEASE.2025-10-15T17-29-55Z`, checked against its commit
+  `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`, so a moved tag fails the job;
+- the Go module checksums in the release's `go.sum` for every dependency, with a restored module
+  cache verified against them before the build;
+- the compiler: the Go installer action pinned by commit SHA, Go pinned to the release's own
+  toolchain line, and the build refusing automatic toolchain switches and module metadata edits.
+
+The job fails if its port already answers before the server starts, and requires the recorded server
+process to be alive when the health probe succeeds, so the suite cannot pass against a different
+process. Layer 2 remains required; layers 1 and 3 are unchanged.
 
 ---
 
