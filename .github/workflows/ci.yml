@@ -124,10 +124,11 @@ jobs:
       # step on the Linux shard did not run whenever another arm was red first.
       fail-fast: false
       # The workspace test suite is nextest-partitioned 2-way per OS (see the
-      # "Workspace tests" step below). Every other phase in this job is gated to
-      # shard 1 so it still runs exactly once per OS — shard 2 exists only to
-      # carry the second test partition, not a second copy of lint/clippy/
-      # release/etc.
+      # "Workspace tests" step below). Non-partitioned phases run exactly once
+      # per OS: forward-deployed checks, Clippy, and channel feature tests run
+      # on shard 2, while the release build and its dependent checks remain on
+      # shard 1. The split follows measured step durations; dividing the test
+      # count alone leaves the complete jobs badly unbalanced.
       #
       # On a pull request CI_SUITE is `macos-pr` for macos-latest, and every
       # macos-pr step is gated `matrix.shard == 1`, so there is no second
@@ -284,7 +285,7 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lockfile
       - name: Forward-deployed crate checks
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        if: env.CI_SUITE == 'full' && matrix.shard == 2
         run: ../scripts/ci.sh forward-deployed
       - name: Format, SQL, and ADR lints
         if: env.CI_SUITE == 'full' && matrix.shard == 1
@@ -293,7 +294,7 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-stubs
       - name: Clippy
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        if: env.CI_SUITE == 'full' && matrix.shard == 2
         run: ../scripts/ci.sh clippy
       # Rustdoc is already the separately gated doc-build job below; keep it in
       # ci.sh's local all-mode without paying for duplicate per-OS CI builds.
@@ -305,11 +306,9 @@ jobs:
       # Sharded across both matrix.shard values via nextest's count-based
       # partitioning (cargo-nextest's default and simplest partition scheme;
       # hash-based partitioning was considered but count is deterministic
-      # across reruns without needing a stored test-name manifest, which is
-      # what this job cares about). nextest does not execute doctests, so the
-      # dedicated "Workspace doctests" step below covers that slice once per
-      # OS (shard 1 only) to keep coverage equivalent to the prior unsharded
-      # `cargo test --workspace`.
+      # across reruns without needing a stored test-name manifest). nextest
+      # does not execute doctests, so the dedicated "Workspace doctests" step
+      # below covers that slice once per OS (shard 1 only).
       - name: Workspace tests (nextest shard ${{ matrix.shard }}/2)
         if: env.CI_SUITE == 'full'
         env:
@@ -319,16 +318,11 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh tests-doc
       - name: Channel-email feature tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        if: env.CI_SUITE == 'full' && matrix.shard == 2
         run: ../scripts/ci.sh channel-email
-      # Gated to ONE shard per OS, as every non-partitioned phase here is, but
-      # to shard 2 rather than shard 1, which is the only thing "exactly once
-      # per OS" actually requires. Everything else in this job sits on shard 1,
-      # and this step is its largest single contributor at ~14.8 min, so the
-      # two-way split carried ~29 min of work on one side: measured over 12
-      # pull_request runs, ubuntu shard 1 ran a median 48.6 min against shard
-      # 2's 11.2, and CI gate cannot report until both conclude. Moving this
-      # one step puts them at roughly 26 each.
+      # Run this 25-repeat gate once per OS on shard 2. It is independent of
+      # the workspace test partition, and its placement contributes to the
+      # balance of the two complete jobs.
       #
       # It runs 25x per OS on push/nightly/manual full lanes; the macos-pr lane
       # already covers this pair once via macos-pr-tests, which runs khive-mcp's
