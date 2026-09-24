@@ -188,7 +188,7 @@ mod unix {
         }
         let (explicit, namespace) =
             khive_mcp::args::resolve_cli_namespace(args).map_err(anyhow::Error::msg)?;
-        let _ = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
+        let (resolved, _) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
             db: args.db.as_deref(),
             config: args.config.as_deref(),
             namespace,
@@ -198,6 +198,7 @@ mod unix {
             packs: (!args.pack.is_empty()).then(|| args.pack.clone()),
             brain_profile: args.brain_profile.clone(),
         })?;
+        khive_runtime::PackRegistry::validate_pack_selection(&resolved.packs)?;
         // Resolution ends before runtime/store construction: no database,
         // migration, model, transport, or incumbent-daemon probe is opened.
         Ok(())

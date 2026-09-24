@@ -87,6 +87,10 @@ impl Fixture {
     }
 
     fn launch_command(&self, config: &Path) -> Command {
+        self.launch_command_with_packs(config, &["kg"])
+    }
+
+    fn launch_command_with_packs(&self, config: &Path, packs: &[&str]) -> Command {
         let mut command = self.command();
         command
             .args([
@@ -100,7 +104,10 @@ impl Fixture {
                 "--config",
             ])
             .arg(config)
-            .args(["--no-embed", "--pack", "kg", "--actor", LABEL]);
+            .args(["--no-embed", "--actor", LABEL]);
+        for pack in packs {
+            command.args(["--pack", pack]);
+        }
         command
     }
 
@@ -280,5 +287,80 @@ fn supervisor_foreign_marker_survives_launch_and_release_refusals() {
     assert_eq!(
         std::fs::read(&fixture.marker).unwrap().as_slice(),
         foreign.as_slice()
+    );
+}
+
+fn assert_pack_refusal(fixture: &Fixture, command: &mut Command, expected: &str) {
+    let (status, log) = fixture.completed(command, "pack-refusal.log");
+    assert!(
+        status.success(),
+        "pack CONFIG refusal must exit zero: {log}"
+    );
+    assert!(
+        log.contains("CONFIG"),
+        "must disclose CONFIG refusal: {log}"
+    );
+    assert!(log.contains(expected), "wrong pack refusal: {log}");
+    assert!(
+        !fixture.marker.exists(),
+        "pack refusal must release the marker: {log}"
+    );
+    assert!(!fixture.socket.exists());
+    assert!(!fixture.pid_file.exists());
+    assert!(
+        !fixture.database.exists(),
+        "pack refusal must precede database creation: {log}"
+    );
+}
+
+#[test]
+fn supervisor_unknown_cli_pack_refuses_before_publish_and_releases_prior_marker() {
+    for prior_marker in [false, true] {
+        let fixture = Fixture::new();
+        if prior_marker {
+            std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
+        }
+        assert_pack_refusal(
+            &fixture,
+            &mut fixture.launch_command_with_packs(&fixture.config, &["not-a-pack"]),
+            "unknown pack",
+        );
+    }
+}
+
+#[test]
+fn supervisor_unknown_environment_pack_releases_prior_marker() {
+    let fixture = Fixture::new();
+    std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
+    let mut command = fixture.launch_command_with_packs(&fixture.config, &[]);
+    command.env("KHIVE_PACKS", "not-a-pack");
+    assert_pack_refusal(&fixture, &mut command, "unknown pack");
+}
+
+#[test]
+fn supervisor_unknown_config_pack_releases_prior_marker() {
+    let fixture = Fixture::new();
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        config.replace("packs = [\"kg\"]", "packs = [\"not-a-pack\"]"),
+    )
+    .unwrap();
+    std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
+    assert_pack_refusal(
+        &fixture,
+        &mut fixture.launch_command_with_packs(&fixture.config, &[]),
+        "unknown pack",
+    );
+}
+
+#[test]
+fn supervisor_missing_pack_dependency_releases_prior_marker() {
+    let fixture = Fixture::new();
+    std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
+    assert_pack_refusal(
+        &fixture,
+        &mut fixture.launch_command_with_packs(&fixture.config, &["git"]),
+        "requires",
     );
 }

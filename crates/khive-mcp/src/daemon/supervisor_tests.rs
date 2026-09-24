@@ -445,3 +445,36 @@ async fn crash_loop_marker_rewrites_cannot_reset_bound_and_log_latest_owner() {
     assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 1);
     assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+#[serial]
+fn supervisor_fifo_marker_is_unreadable_without_a_writer() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let path = std::ffi::CString::new(marker_path().as_os_str().as_bytes()).unwrap();
+    // SAFETY: the NUL-terminated path belongs to this fixture and remains live.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    // No writer opens this FIFO: a blocking read-open could never return.
+    let marker = read_supervisor_marker().expect("FIFO remains a declaration");
+    assert_eq!(marker.job, "<unreadable>");
+    assert_eq!(marker.pid, 0);
+    assert_eq!(marker.restart_interval, DEFAULT_SUPERVISOR_RESTART_INTERVAL);
+}
+
+#[test]
+#[serial]
+fn supervisor_symlink_marker_is_unreadable_even_with_a_valid_target() {
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let target = dir.path().join("other-marker");
+    std::fs::write(&target, "another.job\n42\n1\n").unwrap();
+    std::os::unix::fs::symlink(&target, marker_path()).unwrap();
+    let marker = read_supervisor_marker().expect("symlink remains a declaration");
+    assert_eq!(marker.job, "<unreadable>");
+    assert_eq!(marker.pid, 0);
+    assert_eq!(marker.restart_interval, DEFAULT_SUPERVISOR_RESTART_INTERVAL);
+}

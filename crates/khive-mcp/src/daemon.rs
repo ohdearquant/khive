@@ -828,10 +828,31 @@ impl SupervisorMarker {
 /// interval. Only a genuinely absent file means "no marker".
 fn read_supervisor_marker() -> Option<SupervisorMarker> {
     let path = daemon::supervisor_marker_path();
-    let modified = std::fs::metadata(&path)
+    let modified = std::fs::symlink_metadata(&path)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
-    let contents = match std::fs::read_to_string(path) {
+    let read_regular_marker = || -> std::io::Result<String> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Inspect the opened file, not only a pathname that can be replaced.
+        // Nonblocking open prevents a FIFO from stalling before that check;
+        // no-follow treats a symlink as an unreadable declaration.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "supervisor marker is not a regular file",
+            ));
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        Ok(contents)
+    };
+    let contents = match read_regular_marker() {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => {
