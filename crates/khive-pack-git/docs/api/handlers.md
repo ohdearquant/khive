@@ -5,6 +5,27 @@ Extracted from `crates/khive-pack-git/src/handlers.rs` doc-comments.
 For the separate read of persisted ingest progress, see
 [`git.ingest_cursor`](ingest_cursor.md). It does not run this digest handler.
 
+## Argument boundary
+
+Every registered `git.*` verb accepts a named JSON object. Each handler
+deserializes it through that verb's closed argument struct at its existing
+validation seam. An unknown field returns its name and the accepted names
+before repository access, process execution or tool-policy calls. Local and
+remote operation refusals still persist exactly one `not_committed` receipt
+with reason `invalid_params`; legacy commit preserves its denial audit, and
+the existing local/remote supplementary audits remain in place. Receipt
+storage failures keep their existing uncertainty behavior. Read and ingest
+validation has no operation receipt. Dispatcher audit is independent of
+these handler records. Unknown values are not copied to safe receipt inputs
+or echoed in the error, and never become Git flags or executable selectors.
+
+The boundary preserves each known field's JSON value and whether it was
+supplied. Existing handlers still decide value types, ranges, policy and
+cross-field rules: explicit null is not rewritten as omission, `git.commit`
+still selects its tree form by the presence of `tree`, and digest's signed
+`max_items` keeps its default and clamp behavior. This does not strengthen
+or weaken the existing argv, allowlist, credential, or ref-comparison rules.
+
 ## `RemoteRecoveryStage` / `RemoteCommitRecovery`
 
 Issue #765 remote-only repair policy: at most one `git fetch --refetch`,
