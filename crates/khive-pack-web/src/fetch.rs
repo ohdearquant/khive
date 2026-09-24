@@ -7,7 +7,7 @@
 //! already-decided target, with zero policy judgment. [`run_hop_chain`] wires
 //! the two together for fetch, refresh, and HTTP search provider requests.
 //!
-//! Entity minting (D1/D3) lives in [`settle`], run once the redirect loop
+//! Entity minting (D1/D3) lives in [`settle_with_request_headers`], run once the redirect loop
 //! reaches its terminal hop: every hop in the chain — including redirect
 //! hops that never carry a body — becomes a `site`-scoped `page`/`resource`
 //! row (unfetched placeholders for anything but the terminal hop), a
@@ -53,7 +53,7 @@ const INLINE_RAW_BODY_LIMIT: u64 = (INLINE_BODY_BUDGET / 4 * 3) as u64;
 const ALLOWED_RESPONSE_HEADERS: &[&str] =
     &["content-type", "content-length", "last-modified", "etag"];
 
-fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> Value {
+pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> Value {
     let mut out = serde_json::Map::new();
     for name in ALLOWED_RESPONSE_HEADERS {
         if let Some(value) = headers.get(*name) {
@@ -63,6 +63,65 @@ fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> Value {
         }
     }
     Value::Object(out)
+}
+
+const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language"];
+
+/// Keep only representation negotiation, never credentials or conditional
+/// validators. Lists retain repeated header values in their sent order.
+pub(crate) fn negotiation_headers(headers: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut selected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        if NEGOTIATION_HEADERS.contains(&name.as_str()) {
+            selected.entry(name).or_default().push(value.clone());
+        }
+    }
+    selected
+}
+
+pub(crate) fn stored_negotiation_headers(
+    properties: &Value,
+) -> Result<Vec<(String, String)>, RuntimeError> {
+    let mut headers = Vec::new();
+    for name in NEGOTIATION_HEADERS {
+        if let Some(value) = properties
+            .get("request_headers")
+            .and_then(|headers| headers.get(*name))
+        {
+            let values: Vec<String> = serde_json::from_value(value.clone()).map_err(|error| {
+                RuntimeError::InvalidInput(format!("stored {name} negotiation is invalid: {error}"))
+            })?;
+            headers.extend(values.into_iter().map(|value| ((*name).to_string(), value)));
+        }
+    }
+    Ok(headers)
+}
+
+pub(crate) async fn persist_negotiation_headers(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    headers: &[(String, String)],
+) -> Result<(), RuntimeError> {
+    let entity = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let properties = entity.properties.unwrap_or(Value::Null);
+    let selected = negotiation_headers(headers);
+    if negotiation_headers(&stored_negotiation_headers(&properties)?) != selected {
+        crate::entities::patch(
+            runtime,
+            token,
+            id,
+            None,
+            json!({"request_headers": selected}),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
@@ -186,7 +245,7 @@ struct CredentialAttachment {
 }
 
 /// One traversed redirect: `from` responded `status` naming `to` as its
-/// `Location`. Never the terminal hop — that one is handled by [`settle`]
+/// `Location`. Never the terminal hop — that one is handled by [`settle_with_request_headers`]
 /// (or, for `web.refresh`, [`settle_redirect_hops`] directly) from the
 /// loop's final outcome. `pub(crate)` so [`crate::refresh`] shares this type
 /// rather than declaring an equivalent one of its own.
@@ -318,7 +377,7 @@ async fn run_fetch(
     )
     .await?;
 
-    settle(
+    settle_with_request_headers(
         runtime,
         token,
         &method_name,
@@ -328,6 +387,7 @@ async fn run_fetch(
         outcome.body,
         &redirect_hops,
         persist,
+        &allowed_headers,
     )
     .await
 }
@@ -554,7 +614,7 @@ pub(crate) async fn root_body(
 /// link (arm29: minted before the blob put, so a failing store still leaves
 /// a fetchable placeholder behind), blob put, then the fetched-content
 /// property patch (url/content_type/blob_ref/content_digest/size/status/
-/// fetched_at/etag/last_modified). Shared by [`settle`] (`web.fetch`'s
+/// fetched_at/etag/last_modified). Shared by [`settle_with_request_headers`] (`web.fetch`'s
 /// terminal hop, when `persist` is set) and `ingest::ingest_disk_file`
 /// (`web.ingest`'s disk-tree path, which always persists), so there is one
 /// row-minting code path for both a fetched and an ingested `page`/
@@ -729,7 +789,7 @@ pub(crate) async fn settle_content_body(
 /// blob store before the receipt is written (D4), and the receipt/reply
 /// share one allow-listed header projection.
 #[allow(clippy::too_many_arguments)]
-async fn settle(
+pub(crate) async fn settle_with_request_headers(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     method_name: &str,
@@ -739,6 +799,7 @@ async fn settle(
     body: Option<(Vec<u8>, bool)>,
     redirect_hops: &[RedirectHop],
     persist: bool,
+    request_headers: &[(String, String)],
 ) -> Result<Value, RuntimeError> {
     let mut entities_touched: Vec<Uuid> = Vec::new();
 
@@ -818,6 +879,13 @@ async fn settle(
 
     let content_digest = content_digest.or_else(|| content_ref.clone());
 
+    // A HEAD cannot replace the request context of a cached GET body.
+    if method_name == "GET" {
+        if let Some(id) = final_entity_id {
+            persist_negotiation_headers(runtime, token, id, request_headers).await?;
+        }
+    }
+
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()
         .map(|hop| json!({ "from": hop.from.to_string(), "to": hop.to.to_string(), "status": hop.status }))
@@ -829,6 +897,7 @@ async fn settle(
         "final_url": final_url.to_string(),
         "status": status,
         "headers": response_headers_json,
+        "request_headers": negotiation_headers(request_headers),
         "bytes": bytes,
         "truncated": truncated,
         "content_ref": content_ref,
@@ -864,6 +933,34 @@ async fn settle(
         "id": final_entity_id.map(|id| id.to_string()),
         "body": response_body.as_deref().map(|bytes| BASE64.encode(bytes)),
     }))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn settle(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    method_name: &str,
+    final_url: &Url,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<(Vec<u8>, bool)>,
+    redirect_hops: &[RedirectHop],
+    persist: bool,
+) -> Result<Value, RuntimeError> {
+    settle_with_request_headers(
+        runtime,
+        token,
+        method_name,
+        final_url,
+        status,
+        headers,
+        body,
+        redirect_hops,
+        persist,
+        &[],
+    )
+    .await
 }
 
 impl WebPack {
