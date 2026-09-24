@@ -22,6 +22,13 @@ verbs: `blob.put`, `blob.get`, `blob.stat`, `blob.begin`, `blob.put_part`, `blob
 
 ## Verb contracts
 
+Each verb deserializes a closed typed argument object before accessing blob or upload state.
+Unknown fields are rejected by name with the allowed fields. The optional `blob.get` range
+is also closed: only `offset` and `length` are accepted. An omitted offset defaults to zero;
+an explicit null offset is invalid. An omitted or null range means the whole object, and an
+omitted or null length means through the end. Existing size, base64 and capability checks
+still apply after argument parsing.
+
 - `blob.put(bytes)` decodes base64, stores the bytes, and returns `{content_ref, size}`. Content
   addressing makes identical puts idempotent.
 - `blob.get(content_ref, range?)` verifies and hydrates the complete object through the runtime's

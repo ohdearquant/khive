@@ -48,6 +48,9 @@ mod local_handlers;
 mod local_remote_tests;
 mod local_vocab;
 mod pack;
+mod params;
+#[cfg(all(test, unix))]
+mod params_tests;
 #[cfg(test)]
 mod policy_tests;
 mod receipts;

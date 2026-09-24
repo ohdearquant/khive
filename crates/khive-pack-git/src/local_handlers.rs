@@ -105,6 +105,8 @@ pub(crate) fn oid(value: &str) -> Result<(), Failure> {
 }
 
 fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
+    crate::params::parse(verb, params.clone())
+        .map_err(|error| Failure::invalid(error.to_string()))?;
     let keys: &[&str] = match verb {
         "git.checkout" => &["repo", "ref", "session_id"],
         "git.diff" => &["repo", "input_kind", "base", "head", "session_id"],
@@ -674,6 +676,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.receipts", params)?;
         let actor = policy::actor_label(token);
         let invalid = || RuntimeError::InvalidInput("invalid_params".into());
         validate_keys(&params, &["repo", "actor", "session_id", "limit", "offset"])
@@ -749,6 +752,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.status", params)?;
         let invalid = || RuntimeError::InvalidInput("invalid_params".into());
         validate_keys(&params, &["repo", "untracked", "limit"]).map_err(|_| invalid())?;
         let repo = required(&params, "repo").map_err(|_| invalid())?;
@@ -792,6 +796,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.log", params)?;
         let invalid = || RuntimeError::InvalidInput("invalid_params".into());
         validate_keys(&params, &["repo", "ref", "limit", "path"]).map_err(|_| invalid())?;
         let repo = required(&params, "repo").map_err(|_| invalid())?;
@@ -834,6 +839,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.gates", params)?;
         let invalid = || RuntimeError::InvalidInput("invalid_params".into());
         validate_keys(&params, &["repo"]).map_err(|_| invalid())?;
         let repo = required(&params, "repo").map_err(|_| invalid())?;
