@@ -238,6 +238,73 @@ async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
     }
 }
 
+// Must fail if web.extract leaves the derived body unrooted, roots it in the
+// routed database, or creates a second root when extraction is retried.
+#[tokio::test]
+async fn routed_extract_roots_derived_text_in_main_backend_once() {
+    let fixture = Fixture::new();
+    fixture.ingest().await;
+    let page = fetched_entities(&fixture.routed)
+        .await
+        .into_iter()
+        .find(|entity| entity.entity_type.as_deref() == Some("page"))
+        .expect("ingest creates a fetched page");
+    let token = fixture.main.authorize(Namespace::local()).unwrap();
+
+    for _ in 0..2 {
+        let reply = fixture
+            .registry
+            .dispatch("web.extract", json!({ "id": page.id, "kinds": ["text"] }))
+            .await
+            .expect("extract routed page text");
+        let text_id = uuid::Uuid::parse_str(reply["result"]["text"]["id"].as_str().unwrap())
+            .expect("derived text id");
+        let derived = fixture
+            .routed
+            .entities(&token)
+            .unwrap()
+            .get_entity(text_id)
+            .await
+            .unwrap()
+            .expect("derived text resource stays in web backend");
+        assert_eq!(derived.entity_type.as_deref(), Some("resource"));
+        assert!(fixture
+            .main
+            .entities(&token)
+            .unwrap()
+            .get_entity(text_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let roots = fixture
+            .main
+            .attachments()
+            .unwrap()
+            .list_attachments(text_id)
+            .await
+            .unwrap();
+        assert_eq!(roots.len(), 1, "derived text has one durable root");
+        assert_eq!(roots[0].role, "content");
+        assert_eq!(roots[0].media_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            roots[0].content_ref.as_str(),
+            derived.properties.as_ref().unwrap()["blob_ref"]
+                .as_str()
+                .unwrap()
+        );
+        assert!(fixture
+            .routed
+            .backend()
+            .attachments()
+            .unwrap()
+            .list_attachments(text_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
 #[tokio::test]
 async fn a9_control_web_pack_without_binding_writes_to_default_backend() {
     let fixture = Fixture::new();
