@@ -9,7 +9,8 @@ use crate::{KhiveRuntime, NamespaceToken};
 use khive_channel::DeliveryReceipt;
 use khive_db::stores::note::transport::SenderTransportStore;
 pub use khive_db::stores::note::transport::{
-    EnvelopeKey, FailureClass, HoldReason, PolicyMode, SenderEnvelope, SenderRecord, TransportState,
+    EnvelopeKey, FailureClass, HoldReason, PolicyMode, SenderAssurance, SenderEnvelope,
+    SenderRecord, TransportState,
 };
 
 /// An explicit assertion by the trusted caller that it verified the signature
@@ -136,6 +137,7 @@ mod tests {
             recipient_address: format!("khive1:example/{}", Uuid::nil()),
             protocol_version: 1,
             sender_agent_id: Uuid::new_v4().to_string(),
+            sender_assurance: SenderAssurance::DaemonBearer,
             recipient_agent_id: Uuid::nil().to_string(),
             recipient_device_id: Uuid::new_v4(),
             recipient_key_epoch: 1,
@@ -151,6 +153,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.envelope.namespace, token.namespace().as_str());
+        assert_eq!(
+            stored.envelope.sender_assurance,
+            SenderAssurance::DaemonBearer
+        );
+        assert_eq!(
+            runtime
+                .sender_transport(key)
+                .await
+                .unwrap()
+                .unwrap()
+                .envelope
+                .sender_assurance,
+            SenderAssurance::DaemonBearer
+        );
         assert!(
             unrelated.sender_transport(key).await.unwrap().is_none(),
             "transport must use bound backend"

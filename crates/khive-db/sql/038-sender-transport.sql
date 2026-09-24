@@ -8,6 +8,8 @@ CREATE TABLE comm_sender_transport (
     recipient_address TEXT NOT NULL,
     protocol_version INTEGER NOT NULL,
     sender_agent_id TEXT NOT NULL,
+    sender_assurance TEXT NOT NULL
+        CHECK(sender_assurance IN ('claimed','daemon_bearer','actor_signature')),
     recipient_agent_id TEXT NOT NULL,
     recipient_device_id TEXT NOT NULL,
     recipient_key_epoch INTEGER NOT NULL,

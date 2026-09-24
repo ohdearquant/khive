@@ -15,6 +15,7 @@ fn fixture() -> (StorageBackend, SenderEnvelope) {
         recipient_address: format!("khive1:example/{}", Uuid::nil()),
         protocol_version: 1,
         sender_agent_id: Uuid::new_v4().to_string(),
+        sender_assurance: SenderAssurance::Claimed,
         recipient_agent_id: Uuid::nil().to_string(),
         recipient_device_id: Uuid::new_v4(),
         recipient_key_epoch: 1,
@@ -471,4 +472,198 @@ async fn policy_columns_reject_revision_on_other_hold() {
 async fn policy_columns_reject_invalid_mode_and_negative_revision() {
     assert_policy_columns_rejected(Some("policy_denied"), Some("invalid"), Some(7)).await;
     assert_policy_columns_rejected(Some("policy_denied"), Some("enforce"), Some(-1)).await;
+}
+
+#[tokio::test]
+async fn sender_assurance_round_trips_and_exact_retry_compares_it() {
+    for (assurance, spelling) in [
+        (SenderAssurance::Claimed, "claimed"),
+        (SenderAssurance::DaemonBearer, "daemon_bearer"),
+        (SenderAssurance::ActorSignature, "actor_signature"),
+    ] {
+        let (backend, mut envelope) = fixture();
+        envelope.sender_assurance = assurance;
+        let store = SenderTransportStore::new(backend.pool_arc());
+        let first = store.create(envelope.clone(), false).await.unwrap();
+        assert_eq!(first.envelope, envelope);
+        assert_eq!(
+            store.get(envelope.key()).await.unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.create(envelope.clone(), false).await.unwrap(), first);
+        let stored: String = backend
+            .pool()
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT sender_assurance FROM comm_sender_transport",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, spelling);
+        let mut json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["sender_assurance"], spelling);
+        assert_eq!(
+            serde_json::from_value::<SenderEnvelope>(json.clone()).unwrap(),
+            envelope
+        );
+        json.as_object_mut().unwrap().remove("sender_assurance");
+        assert!(serde_json::from_value::<SenderEnvelope>(json).is_err());
+        for different in [
+            SenderAssurance::Claimed,
+            SenderAssurance::DaemonBearer,
+            SenderAssurance::ActorSignature,
+        ] {
+            if different == assurance {
+                continue;
+            }
+            let mut changed = envelope.clone();
+            changed.sender_assurance = different;
+            let error = store.create(changed, false).await.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::WriterTaskRequestFailed {
+                        request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                        source,
+                    } if matches!(source.as_ref(), StorageError::InvalidInput { message, .. }
+                        if message == "envelope_conflict")
+                ),
+                "expected rolled-back envelope_conflict; got {error:?}"
+            );
+            assert_eq!(
+                store.get(envelope.key()).await.unwrap(),
+                Some(first.clone())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn confirmed_reencryption_preserves_sender_assurance() {
+    for assurance in [
+        SenderAssurance::Claimed,
+        SenderAssurance::DaemonBearer,
+        SenderAssurance::ActorSignature,
+    ] {
+        let (backend, mut envelope) = fixture();
+        envelope.sender_assurance = assurance;
+        let store = SenderTransportStore::new(backend.pool_arc());
+        store.create(envelope.clone(), false).await.unwrap();
+        store
+            .hold(envelope.key(), Some(HoldReason::RecipientKeyChanged))
+            .await
+            .unwrap();
+        let prior = store.get(envelope.key()).await.unwrap().unwrap();
+        let next = SenderEnvelope {
+            recipient_key_epoch: 2,
+            enc: vec![3; 32],
+            ..envelope.clone()
+        };
+        for different in [
+            SenderAssurance::Claimed,
+            SenderAssurance::DaemonBearer,
+            SenderAssurance::ActorSignature,
+        ] {
+            if different == assurance {
+                continue;
+            }
+            let mut changed = next.clone();
+            changed.sender_assurance = different;
+            let error = store
+                .create(changed, true)
+                .await
+                .expect_err("re-encryption must refuse changed sender assurance");
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::WriterTaskRequestFailed {
+                        request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                        source,
+                    } if matches!(source.as_ref(), StorageError::InvalidInput { message, .. }
+                        if message == "sender_assurance_conflict")
+                ),
+                "expected rolled-back sender_assurance_conflict; got {error:?}"
+            );
+            assert!(store.get(next.key()).await.unwrap().is_none());
+            assert_eq!(
+                store.get(envelope.key()).await.unwrap(),
+                Some(prior.clone())
+            );
+            let count: i64 = backend
+                .pool()
+                .writer()
+                .unwrap()
+                .conn()
+                .query_row("SELECT count(*) FROM comm_sender_transport", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "refusal must not write a row");
+        }
+        let created = store.create(next.clone(), true).await.unwrap();
+        assert_eq!(created.envelope, next);
+        assert_eq!(created.envelope_seq, 2);
+        assert_eq!(store.get(next.key()).await.unwrap(), Some(created));
+        assert_eq!(store.get(envelope.key()).await.unwrap(), Some(prior));
+    }
+}
+
+async fn assert_sender_assurance_insert_rejected(value: Option<&str>, code: i32) {
+    let (backend, envelope) = fixture();
+    SenderTransportStore::new(backend.pool_arc())
+        .create(envelope, false)
+        .await
+        .unwrap();
+    let writer = backend.pool().writer().unwrap();
+    let conn = writer.conn();
+    let selected = COLUMNS
+        .split(',')
+        .map(|column| match column.trim() {
+            "logical_message_id" => "?1",
+            "sender_assurance" => "?2",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let insert = format!(
+        "INSERT INTO comm_sender_transport ({COLUMNS}) \
+        SELECT {selected} FROM comm_sender_transport LIMIT 1"
+    );
+    for spelling in ["claimed", "daemon_bearer", "actor_signature"] {
+        assert_eq!(
+            conn.execute(&insert, params![Uuid::new_v4().to_string(), spelling])
+                .unwrap(),
+            1
+        );
+    }
+    let error = conn
+        .execute(&insert, params![Uuid::new_v4().to_string(), value])
+        .expect_err("invalid sender assurance must be refused by SQL");
+    match error {
+        rusqlite::Error::SqliteFailure(error, _) => assert_eq!(error.extended_code, code),
+        other => panic!("expected constraint failure, got {other}"),
+    }
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM comm_sender_transport", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 4);
+}
+
+#[tokio::test]
+async fn sender_assurance_insert_rejects_null() {
+    assert_sender_assurance_insert_rejected(None, rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL).await;
+}
+
+#[tokio::test]
+async fn sender_assurance_insert_rejects_unknown_spelling() {
+    assert_sender_assurance_insert_rejected(
+        Some("unspecified"),
+        rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+    )
+    .await;
 }

@@ -28,6 +28,7 @@ pub struct SenderEnvelope {
     pub recipient_address: String,
     pub protocol_version: u32,
     pub sender_agent_id: String,
+    pub sender_assurance: SenderAssurance,
     pub recipient_agent_id: String,
     pub recipient_device_id: Uuid,
     pub recipient_key_epoch: u64,
@@ -81,6 +82,15 @@ impl SenderEnvelope {
         }
         Ok(())
     }
+}
+
+/// Sender identity assurance recorded at send time and preserved across transport attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderAssurance {
+    Claimed,
+    DaemonBearer,
+    ActorSignature,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +152,15 @@ fn invalid(message: &str) -> StorageError {
 trait StorageSpelling {
     fn storage_spelling(&self) -> &'static str;
 }
+impl StorageSpelling for SenderAssurance {
+    fn storage_spelling(&self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::DaemonBearer => "daemon_bearer",
+            Self::ActorSignature => "actor_signature",
+        }
+    }
+}
 impl StorageSpelling for TransportState {
     fn storage_spelling(&self) -> &'static str {
         match self {
@@ -198,7 +217,7 @@ const COLUMNS: &str = concat!(
     "recipient_device_id, recipient_key_epoch, contact_generation, sender_key_epoch, ",
     "recipient_key_fingerprint, enc, ciphertext, state, attempt_count, next_retry_at, ",
     "last_failure_class, hold_reason, receipt, created_at, updated_at, envelope_seq, ",
-    "policy_mode, policy_revision",
+    "policy_mode, policy_revision, sender_assurance",
 );
 fn unsigned_column(value: i64, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|error| {
@@ -233,6 +252,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SenderRecord> {
             recipient_address: row.get(6)?,
             protocol_version: row.get(7)?,
             sender_agent_id: row.get(8)?,
+            sender_assurance: decode(row.get(28)?)?,
             recipient_agent_id: row.get(9)?,
             recipient_device_id: uuid(row, 10)?,
             recipient_key_epoch: read_unsigned(row, 11)?,
@@ -311,9 +331,9 @@ const INSERT_SQL: &str = concat!(
     "protocol_version, sender_agent_id, recipient_agent_id, recipient_device_id, ",
     "recipient_key_epoch, contact_generation, sender_key_epoch, ",
     "recipient_key_fingerprint, enc, ",
-    "ciphertext,state,created_at,updated_at,envelope_seq) VALUES ",
+    "ciphertext,state,created_at,updated_at,envelope_seq,sender_assurance) VALUES ",
     "(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17, ",
-    "'pending',?18,?18,?19)",
+    "'pending',?18,?18,?19,?20)",
 );
 
 const PENDING_SQL: &str = concat!(
@@ -425,6 +445,9 @@ impl SenderTransportStore {
                     }
                     let a = &prior.envelope;
                     let b = &envelope;
+                    if a.sender_assurance != b.sender_assurance {
+                        return Err(invalid("sender_assurance_conflict"));
+                    }
                     if a.namespace != b.namespace
                         || a.outbound_note_id != b.outbound_note_id
                         || a.kind != b.kind
@@ -468,7 +491,8 @@ impl SenderTransportStore {
                         envelope.enc,
                         envelope.ciphertext,
                         now,
-                        sql_integer(envelope_seq)?
+                        sql_integer(envelope_seq)?,
+                        encode(&envelope.sender_assurance)
                     ],
                 )
                 .map_err(|e| map_err(e, op))?;
