@@ -1959,6 +1959,13 @@ impl khive_types::Pack for ErrorInjectPack {
             params: &[],
         },
         HandlerDef {
+            name: "storage_admission_timeout_with_pool",
+            description: "returns a storage-admission timeout naming its pool",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
             name: "read_tx_age_evicted",
             description: "returns a typed cached-reader read-transaction age eviction error",
             visibility: Visibility::Verb,
@@ -2044,6 +2051,16 @@ impl PackRuntime for ErrorInjectPack {
                 khive_storage::StorageError::AdmissionTimeout {
                     operation: "sql_bridge.writer_handle".into(),
                     timeout_ms: 30_000,
+                    pool_identity: None,
+                },
+            ));
+        }
+        if verb == "storage_admission_timeout_with_pool" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::AdmissionTimeout {
+                    operation: "sql_bridge.reader_operation".into(),
+                    timeout_ms: 25,
+                    pool_identity: Some("khive.db".to_string()),
                 },
             ));
         }
@@ -2369,6 +2386,42 @@ async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> an
         "an admission deadline that expired before acquisition must stay a retryable resource failure on the wire"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_admission_pool_identity_survives_the_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "storage_admission_timeout_with_pool()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"], false,
+        "expected pool admission refusal: {first}"
+    );
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "storage_admission_timeout",
+            "stage": "storage_admission_timeout",
+            "domain_disposition": "unknown",
+            "message": "storage: admission timeout during sql_bridge.reader_operation after 25ms (pool: khive.db)",
+            "retryable": true,
+            "timeout_ms": 25,
+            "capability": serde_json::Value::Null,
+            "operation": "sql_bridge.reader_operation",
+            "pool_identity": "khive.db",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "pool identity must survive the wire without changing operation or retry semantics"
+    );
     Ok(())
 }
 
