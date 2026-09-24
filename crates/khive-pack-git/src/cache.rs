@@ -1922,26 +1922,76 @@ fn touch(repo_dir: &Path) -> Result<(), CacheError> {
 /// `CacheError::Io(NotFound)`. See
 /// crates/khive-pack-git/docs/api/cache.md#dir_size.
 fn dir_size(path: &Path) -> Result<u64, CacheError> {
+    dir_size_with(
+        path,
+        cfg!(windows),
+        |path| std::fs::symlink_metadata(path),
+        || std::thread::sleep(DIR_SIZE_DENIED_WAIT),
+    )
+}
+
+// A brief cleanup grace period, not evidence that an unreadable file vanished.
+// Windows delete-pending handles have no guaranteed release deadline. Four
+// rechecks at 10 ms bound this grace at 40 ms; persistent denial still fails.
+const DIR_SIZE_DENIED_RETRIES: usize = 4;
+const DIR_SIZE_DENIED_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn dir_size_io<T>(
+    is_root: bool,
+    retry_denied: bool,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+    wait: &mut impl FnMut(),
+) -> std::io::Result<Option<T>> {
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !is_root => {
+                return Ok(None);
+            }
+            Err(error)
+                if retry_denied
+                    && !is_root
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && retries < DIR_SIZE_DENIED_RETRIES =>
+            {
+                retries += 1;
+                wait();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+// The operation and wait seams keep portable fault tests deterministic while
+// the production wrapper alone chooses the platform-specific retry policy.
+fn dir_size_with(
+    path: &Path,
+    retry_denied: bool,
+    mut stat: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    mut wait: impl FnMut(),
+) -> Result<u64, CacheError> {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
         let is_root = p == path;
-        let md = match std::fs::symlink_metadata(&p) {
-            Ok(md) => md,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !is_root => continue,
-            Err(e) => return Err(io_err("dir_size: stat", &p, e)),
+        let Some(md) = dir_size_io(is_root, retry_denied, || stat(&p), &mut wait)
+            .map_err(|error| io_err("dir_size: stat", &p, error))?
+        else {
+            continue;
         };
         if md.is_dir() {
-            let read_dir = match std::fs::read_dir(&p) {
-                Ok(read_dir) => read_dir,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !is_root => continue,
-                Err(e) => return Err(io_err("dir_size: read_dir", &p, e)),
+            let Some(read_dir) =
+                dir_size_io(is_root, retry_denied, || std::fs::read_dir(&p), &mut wait)
+                    .map_err(|error| io_err("dir_size: read_dir", &p, error))?
+            else {
+                continue;
             };
             for entry in read_dir {
                 match entry {
                     Ok(entry) => stack.push(entry.path()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(io_err("dir_size: read_dir entry", &p, e)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(io_err("dir_size: read_dir entry", &p, error)),
                 }
             }
         } else {
@@ -1950,6 +2000,10 @@ fn dir_size(path: &Path) -> Result<u64, CacheError> {
     }
     Ok(total)
 }
+
+#[cfg(test)]
+#[path = "cache_dir_size_tests.rs"]
+mod dir_size_tests;
 
 fn is_cache_key_name(name: &str) -> bool {
     name.len() == 16
