@@ -310,3 +310,91 @@ Each arm names the control that must fail:
   owner's decision, and the local table cannot speak for them.
 - **Most-specific rule wins.** Rejected: an absolute prohibition could then be overridden by any
   narrower allow.
+
+## Amendment: held-message state, unreadable policy, receive-side errors, wire kind and recorded assurance (2026-09-24)
+
+This amendment aligns D1, D4, D6 and D8 with the hosted service's delivery contract (C-ADR-033 D5, amended in its
+own repository to say the same). It replaces one sentence of D6 and adds rules; everything not named here is
+unchanged.
+
+1. **A hold records the policy state it was refused under (D6).** A message refused at a transport attempt records
+   the mode (D7) and the revision it was evaluated under. It is evaluated again, once, whenever the current policy
+   state differs from the recorded one, whether the change was published before or after the hold was written. A
+   mode change is a state change. Under `off` or `shadow` a held message is released to its transport; under
+   `shadow` the release is audited as a would-be refusal when the current rules still refuse it. A message refused
+   again records the new state. This replaces "A change of policy revision re-queues every message held with
+   `policy_denied` for one re-evaluation; nothing else retries a held message."
+2. **An unreadable policy store makes no attempt (D6).** When the policy state or rules cannot be read at a transport
+   attempt, no attempt is made and the message stays pending under the transport's own retry backoff. It is not
+   held, because a store that recovers publishes no new state and the hold would never be evaluated again, and it
+   is not sent unevaluated, because that fails open.
+3. **A resubmission after admission is an attempt (D6).** On the node channel, a message the hosted service admitted
+   is resubmitted under ADR-105 Appendix A.8 (600 seconds after `admitted_at` without a verified receipt). That
+   resubmission is a transport attempt and is evaluated. A refusal stops the resubmission and recalls nothing: the
+   earlier admission may still deliver, a verified receipt for it ends the hold, and the message stays shown as
+   possibly charged. This is the case "A message already handed to a transport cannot be recalled" covers.
+4. **Receive side (D8).**
+   (a) When the recipient's policy store answers with an error, nothing is committed and no receipt is sent, as for a
+   failed write, and the runtime reports it where it reports a failed write. An actor with no record is
+   `unclassified` (D3), which is a decision, not an error. A store holding no policy state is in mode `off`.
+   (b) A delivery of a message already committed is answered from its replay identity and is not evaluated again,
+   so a later policy change never turns a stored message into a quarantined one.
+   (c) Under `shadow` a receive-side refusal is audited and the message is stored.
+5. **Kind on the wire (D4).** A sending deployment writes `kind` on the wire only as `announce`, `report` or `ask`,
+   and otherwise omits it; it never writes `unspecified`, `reply` or null. The receiving deployment records an
+   omitted kind as `unspecified`. A message whose `in_reply_to` names a verified parent is evaluated as `reply`
+   whatever kind it declares. A verified parent is a message committed in the recipient's store that the current
+   recipient sent to the current sender. A follow-up to a message the sender itself sent is not a reply for policy
+   and is evaluated by its declared kind. Local `comm.reply` applies the same rule when it evaluates the pair: the
+   verb still accepts a parent addressed to or from the caller, and a reply to the caller's own message is
+   evaluated by its declared kind.
+
+6. **What advances the revision (D2, D9).** The revision advances on every D9 change, a removal included: an actor
+   record, a class, an address binding, a rule or the mode. A decision reads all of them (D5), so a change to any of
+   them is a change of policy state for item 1, and correcting a class releases the messages it held.
+7. **Receive-side keeping and claim (D8).**
+   (a) A policy-refused delivery is kept with its parsed plaintext under a bound per sender, separate from the bound
+   for undecryptable or held deliveries, so one sender's refusals never evict another sender's items.
+   (b) The replay identity is claimed inside the commit transaction, on one identity shared by the message note and
+   the quarantine record. Two concurrent arrivals of one message, with the policy changing between their
+   evaluations, commit once, and both acknowledgement entries carry that one disposition.
+8. **Assurance where no request is present (D1, D6, D8).**
+   (a) A message records the assurance of its sender identity when it is sent, in every mode. Every transport
+   attempt, and every evaluation under item 1, evaluates that recorded value and never derives one from the
+   context of the transport, so a message sent `claimed` is never admitted later by a rule that requires
+   `DaemonBearer` or `ActorSignature`.
+   (b) On receipt, an envelope opened under ADR-105 Appendix A.5 is evaluated at `claimed`. It proves possession
+   of the sender device key pinned for that contact, which is neither of ADR-127's classes, and HPKE Auth mode
+   does not resist key-compromise impersonation. A rule requiring `DaemonBearer` or `ActorSignature` therefore
+   never admits a delivery from another deployment until a later decision names an assurance for one.
+
+Acceptance arms added (each names the control that must fail):
+
+11. A hold written after a revision was published is evaluated under that revision. Control: a re-queue keyed on
+    the publish event leaves it held.
+12. Moving from `enforce` to `off` or `shadow` releases held messages. Control: a revision-only trigger leaves them
+    held.
+13. With the policy store unreadable at an attempt, no attempt is made, no hold is written and the message stays
+    pending. Control: an attempt made without a decision.
+14. A recipient-side policy store error commits nothing and sends no receipt. Control: a quarantine written on the
+    error.
+15. A redelivery of a committed message returns the original receipt with no evaluation, after a policy change
+    between the two deliveries. Control: an evaluation that turns stored into quarantined.
+16. No message on the wire carries `kind` as `unspecified`, `reply` or null. Control: a sender that serializes the
+    local kind value unchanged.
+17. Under a pair rule that allows `reply` and refuses `ask`, a reply to a message the recipient sent is admitted and
+    a follow-up threaded on the sender's own admitted message is refused, locally and on receipt. Control: a
+    self-threaded follow-up evaluated as `reply`.
+18. A class changed and changed back, with no rule edited, advances the revision twice and releases a message held
+    under the first change. Deleting a deny rule advances the revision and releases a message it held. Controls: a
+    revision that advances only on rule changes; one that advances only on a create or a change.
+19. Two concurrent arrivals of one message, with a policy change between their evaluations, commit one record and
+    both acknowledgements carry its disposition; a flood of refused deliveries from one sender evicts none of
+    another sender's kept items. Controls: a claim taken outside the commit transaction; one shared bound.
+20. With a test assurance source that reports a stronger assurance at the attempt than at send, a message sent
+    `claimed` and held under a rule requiring `ActorSignature` stays held at the next attempt; a message sent while
+    the mode is `off` carries its recorded assurance to an attempt under `enforce`. Control: an attempt that takes
+    its assurance from the transport's context.
+21. A delivery from another deployment, under a pair rule that allows it only at `DaemonBearer` or above, is
+    quarantined, and its decision records `claimed`. Control: a receive path that maps envelope authentication to
+    `ActorSignature`.
