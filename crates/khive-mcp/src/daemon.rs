@@ -899,6 +899,8 @@ async fn wait_for_supervisor(
     request_started: tokio::time::Instant,
     initial_marker: SupervisorMarker,
 ) -> Result<ForwardOutcome, McpError> {
+    #[cfg(test)]
+    supervisor_discovery_hook(SupervisorDiscoveryPoint::SupervisorWait);
     let supervisor_deadline = initial_marker.wait_deadline(request_started);
     let caller_deadline = khive_storage::capture_request_read_context()
         .deadline()
@@ -2791,6 +2793,36 @@ where
     forward_or_spawn_with_policy(frame, spawn, false).await
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SupervisorDiscoveryPoint {
+    UnmanagedRetry,
+    BeforeRecovery,
+    SupervisorWait,
+}
+
+#[cfg(test)]
+type SupervisorDiscoveryHook = (SupervisorDiscoveryPoint, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static SUPERVISOR_DISCOVERY_HOOK: std::sync::Mutex<Option<SupervisorDiscoveryHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn supervisor_discovery_hook(point: SupervisorDiscoveryPoint) {
+    let action = {
+        let mut hook = SUPERVISOR_DISCOVERY_HOOK.lock().expect("discovery hook");
+        if hook.as_ref().is_some_and(|(at, _)| *at == point) {
+            hook.take().map(|(_, action)| action)
+        } else {
+            None
+        }
+    };
+    if let Some(action) = action {
+        action();
+    }
+}
+
 async fn forward_or_spawn_with_policy<F>(
     frame: &DaemonRequestFrame,
     spawn: &F,
@@ -2808,8 +2840,10 @@ where
         replay_read_only && crate::request_policy::read_replay_safe(&frame.ops),
     );
     let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
+    let mut supervisor_waited = false;
     if matches!(first, ForwardOutcome::NoSocket) {
         if let Some(marker) = read_supervisor_marker() {
+            supervisor_waited = true;
             first = match wait_for_supervisor(frame, &mut replay, request_started, marker).await {
                 Ok(outcome) => outcome,
                 Err(error) => return Some(Err(error)),
@@ -2822,6 +2856,18 @@ where
                 && !khive_storage::request_read_is_cancelled()
             {
                 sleep_until_retry(deadline).await;
+                #[cfg(test)]
+                supervisor_discovery_hook(SupervisorDiscoveryPoint::UnmanagedRetry);
+                if let Some(marker) = read_supervisor_marker() {
+                    supervisor_waited = true;
+                    first = match wait_for_supervisor(frame, &mut replay, request_started, marker)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    break;
+                }
                 if tokio::time::Instant::now() >= deadline
                     || khive_storage::request_read_is_cancelled()
                 {
@@ -2829,6 +2875,18 @@ where
                 }
                 first = try_forward_with_read_replay(frame, &mut replay, Some(deadline)).await;
             }
+        }
+    }
+    // A claim may arrive at the end of unmanaged grace or without a PID file.
+    // Never restart a supervisor budget already consumed by this request.
+    if matches!(first, ForwardOutcome::NoSocket) && !supervisor_waited {
+        #[cfg(test)]
+        supervisor_discovery_hook(SupervisorDiscoveryPoint::BeforeRecovery);
+        if let Some(marker) = read_supervisor_marker() {
+            first = match wait_for_supervisor(frame, &mut replay, request_started, marker).await {
+                Ok(outcome) => outcome,
+                Err(error) => return Some(Err(error)),
+            };
         }
     }
     if matches!(first, ForwardOutcome::NoSocket)

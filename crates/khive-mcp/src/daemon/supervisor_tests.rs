@@ -478,3 +478,142 @@ fn supervisor_symlink_marker_is_unreadable_even_with_a_valid_target() {
     assert_eq!(marker.pid, 0);
     assert_eq!(marker.restart_interval, DEFAULT_SUPERVISOR_RESTART_INTERVAL);
 }
+
+struct LateMarkerOwner(std::process::Child);
+
+impl LateMarkerOwner {
+    fn spawn() -> Self {
+        Self(std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap())
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for LateMarkerOwner {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct LateMarkerHookGuard {
+    wait_started: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl LateMarkerHookGuard {
+    fn publish_at(point: SupervisorDiscoveryPoint, path: std::path::PathBuf, pid: u32) -> Self {
+        let wait_started = Arc::new(std::sync::Mutex::new(None));
+        let observed = wait_started.clone();
+        let mut hook = SUPERVISOR_DISCOVERY_HOOK.lock().unwrap();
+        assert!(hook.is_none(), "isolated discovery hook");
+        *hook = Some((point, Box::new(move || {
+            assert!(!path.exists(), "marker must be absent on the initial probe");
+            assert!(process_is_alive(pid), "the fixture's old owner must still be alive");
+            assert!(!socket_path().exists(), "the socket must remain unbound");
+            write_marker(&path, "late.supervisor", pid, Some(10));
+            *SUPERVISOR_DISCOVERY_HOOK.lock().unwrap() = Some((
+                SupervisorDiscoveryPoint::SupervisorWait,
+                Box::new(move || { *observed.lock().unwrap() = Some(tokio::time::Instant::now()); }),
+            ));
+        })));
+        Self { wait_started }
+    }
+}
+
+impl Drop for LateMarkerHookGuard {
+    fn drop(&mut self) {
+        SUPERVISOR_DISCOVERY_HOOK.lock().unwrap().take();
+    }
+}
+
+fn assert_late_supervisor_waited(
+    result: Result<Option<Result<String, McpError>>, tokio::time::error::Elapsed>,
+    marker: &str,
+) {
+    assert!(result.is_ok(), "{marker}: request must finish at its caller deadline");
+    let result = result.unwrap();
+    assert!(result.is_some(), "{marker}: no local fallback while the supervisor owns startup");
+    let result = result.unwrap();
+    assert!(result.is_err(), "{marker}: no socket has been bound");
+    let error = result.unwrap_err();
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("reason")),
+        Some(&serde_json::json!("supervised_daemon_starting")),
+        "{marker}: late marker must enter the existing supervisor wait: {error:?}"
+    );
+    assert!(error.message.contains("late.supervisor"), "{marker}: report the discovered owner");
+    assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0, "{marker}: no lifecycle recovery");
+    assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0, "{marker}: no incumbent signal");
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn supervisor_published_during_unmanaged_retry_owns_caller_deadline() {
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let mut owner = LateMarkerOwner::spawn();
+    assert!(owner.0.try_wait().unwrap().is_none());
+    std::fs::write(pid_path(), owner.id().to_string()).unwrap();
+    let started = tokio::time::Instant::now();
+    let hook = LateMarkerHookGuard::publish_at(
+        SupervisorDiscoveryPoint::UnmanagedRetry,
+        marker_path(),
+        owner.id(),
+    );
+    let spawn = || -> std::io::Result<std::process::Child> {
+        Err(std::io::ErrorKind::NotFound.into())
+    };
+    let frame = request("stats()");
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        khive_storage::scope_request_read_deadline(
+            Duration::from_millis(250),
+            forward_or_spawn_with(&frame, &spawn),
+        ),
+    ).await;
+    assert!(marker_path().exists(), "UNMANAGED_RETRY_REREADS_SUPERVISOR: publication seam reached");
+    assert_late_supervisor_waited(result, "UNMANAGED_RETRY_REREADS_SUPERVISOR");
+    assert!(hook.wait_started.lock().unwrap().is_some_and(|at| at - started < Duration::from_millis(200)),
+        "UNMANAGED_RETRY_REREADS_SUPERVISOR: enter supervision during grace, not only after the unmanaged caller deadline");
+    assert!(owner.0.try_wait().unwrap().is_none());
+    assert_eq!(std::fs::read_to_string(pid_path()).unwrap(), owner.id().to_string());
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn supervisor_published_at_recovery_boundary_prevents_bootstrap() {
+    let _cleanup = RecoveryTestGuard::new();
+    for recorded_owner in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        isolate(dir.path());
+        let mut owner = LateMarkerOwner::spawn();
+        assert!(owner.0.try_wait().unwrap().is_none());
+        if recorded_owner {
+            std::fs::write(pid_path(), owner.id().to_string()).unwrap();
+        }
+        let _hook = LateMarkerHookGuard::publish_at(
+            SupervisorDiscoveryPoint::BeforeRecovery,
+            marker_path(),
+            owner.id(),
+        );
+        let spawn = || -> std::io::Result<std::process::Child> {
+            Err(std::io::ErrorKind::NotFound.into())
+        };
+        let frame = request("stats()");
+        let deadline = if recorded_owner { Duration::from_secs(12) } else { Duration::from_millis(250) };
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            khive_storage::scope_request_read_deadline(
+                deadline,
+                forward_or_spawn_with(&frame, &spawn),
+            ),
+        ).await;
+        assert!(marker_path().exists(), "RECOVERY_BOUNDARY_REREADS_SUPERVISOR: publication seam reached");
+        assert_late_supervisor_waited(result, "RECOVERY_BOUNDARY_REREADS_SUPERVISOR");
+        assert!(owner.0.try_wait().unwrap().is_none());
+        assert_eq!(pid_path().exists(), recorded_owner);
+    }
+}
