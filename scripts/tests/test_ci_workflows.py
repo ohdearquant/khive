@@ -17,6 +17,7 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+REPLAY_NAME_PREFIX = "${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}"
 
 
 def workflow_text(name: str) -> str:
@@ -78,7 +79,7 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         # The job was named "(advisory)" while a missing measurement left the
         # gate green. It is not advisory now: the step below turns an absent
         # measurement into a failing job, so the name would misdescribe it.
-        self.assertIn("name: Coverage measurement\n", measurement)
+        self.assertIn("name: " + REPLAY_NAME_PREFIX + "Coverage measurement\n", measurement)
         self.assertNotIn("advisory", measurement)
         self.assertIn("id: compute_coverage", measurement)
         self.assertIn("continue-on-error: true", measurement)
@@ -96,7 +97,7 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         ratchet = indented_block(workflow, "coverage-ratchet", 2)
         gate = indented_block(workflow, "ci-gate", 2)
 
-        self.assertIn("needs: coverage-measurement", ratchet)
+        self.assertIn("needs: [resolve-revision, coverage-measurement]", ratchet)
         self.assertIn(
             "if: needs.coverage-measurement.outputs.available == 'true'", ratchet
         )
@@ -1348,6 +1349,216 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("could not look up @khive-ai/cli@", completed.stderr)
         self.assertIn("ECONNREFUSED", completed.stderr)
         self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
+
+
+class HistoricalReplayWorkflowTests(unittest.TestCase):
+    CHECKOUT_NAMES = {
+        "ci": "CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)",
+        "khive-py": "Python client tests",
+        "kg-editor": "KG Studio (Next.js)",
+        "supply-chain": "Supply-chain (cargo-deny)",
+        "data-leak-guard": "JSON/JSONL data-leak guard",
+        "secret-scan": "Secret scan (gitleaks)",
+        "docs": "Docs lint",
+        "marketplace": "Marketplace example validator",
+        "doc-build": "Doc build (-D warnings)",
+        "dependency-review": "Dependency review",
+        "wasm-parity": "wasm-parity (khive-changeset)",
+        "vamana-portability": "vamana portability (ADR-110 Layer A)",
+        "minio-blob-compat": "MinIO BlobStore compatibility (ADR-111 Amendment 2)",
+        "check-windows": "Windows compile check",
+        "coverage-measurement": "Coverage measurement",
+        "coverage-ratchet": "Coverage ratchet",
+    }
+
+    def setUp(self):
+        self.workflow = workflow_text("ci.yml")
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.output = self.root / "output"
+        self.summary = self.root / "summary"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GITHUB_OUTPUT=str(self.output), GITHUB_STEP_SUMMARY=str(self.summary))
+
+    def script(self, job_name, step_name):
+        job = indented_block(self.workflow, job_name, 2)
+        step = job.split(f"- name: {step_name}\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match, f"missing executable step {step_name}")
+        return textwrap.dedent(match.group(1))
+
+    def run_script(self, script, *, cwd=None, **env):
+        self.output.write_text("")
+        self.summary.write_text("")
+        completed = subprocess.run(
+            ["bash", "-e", "-c", script], cwd=cwd or self.root,
+            env={**self.env, **env}, text=True, capture_output=True,
+            timeout=10, check=False,
+        )
+        return completed, self.output.read_text()
+
+    def git(self, cwd, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=cwd,
+            env=self.env, text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def repository(self):
+        remote = self.root / "origin.git"
+        work = self.root / "work"
+        self.git(self.root, "init", "--bare", "--initial-branch=main", str(remote))
+        self.git(self.root, "init", "--initial-branch=main", str(work))
+        self.git(work, "config", "user.name", "CI replay fixture")
+        self.git(work, "config", "user.email", "ci-replay@example.invalid")
+        self.git(work, "remote", "add", "origin", str(remote))
+        (work / "fixture").write_text("parent\n")
+        self.git(work, "add", "fixture")
+        self.git(work, "commit", "-m", "parent")
+        parent = self.git(work, "rev-parse", "HEAD")
+        (work / "fixture").write_text("tip\n")
+        self.git(work, "commit", "-am", "tip")
+        tip = self.git(work, "rev-parse", "HEAD")
+        self.git(work, "tag", "-a", "fixture-tag", "-m", "annotated tag")
+        tag = self.git(work, "rev-parse", "fixture-tag")
+        tree = self.git(work, "rev-parse", "HEAD^{tree}")
+        blob = self.git(work, "rev-parse", "HEAD:fixture")
+        self.git(work, "checkout", "-b", "side", parent)
+        (work / "fixture").write_text("side\n")
+        self.git(work, "commit", "-am", "side")
+        side = self.git(work, "rev-parse", "HEAD")
+        self.git(work, "checkout", "main")
+        self.git(work, "push", "origin", "main", "side", "--tags")
+        return work, {"parent": parent, "tip": tip, "side": side,
+                      "tag": tag, "tree": tree, "blob": blob}
+
+    def test_input_is_strict_hex_and_never_shell_source(self):
+        script = self.script("resolve-revision", "Validate replay input")
+        self.assertNotIn("${{", script, "input must be passed through environment")
+        for value in ["a" * 40, "F" * 40]:
+            result, output = self.run_script(script, EVENT_NAME="workflow_dispatch", REPLAY_SHA=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, "replay=true\n")
+        marker = self.root / "injected"
+        for value in ["main", "a" * 39, "a" * 41, "g" * 40, "--help",
+                      "a" * 40 + "\n", " " + "a" * 40, "a" * 40 + "^",
+                      f"$(touch {marker})", f"`touch {marker}`", f"'; touch {marker}; #"]:
+            with self.subTest(value=value):
+                result, output = self.run_script(script, EVENT_NAME="workflow_dispatch", REPLAY_SHA=value)
+                self.assertNotEqual(result.returncode, 0, "invalid replay input must be rejected")
+                self.assertIn("exactly 40 hexadecimal", result.stderr)
+                self.assertEqual(output, "")
+                self.assertFalse(marker.exists(), "input executed a shell command")
+
+    def test_ordinary_events_and_empty_dispatch_keep_event_checkout(self):
+        script = self.script("resolve-revision", "Validate replay input")
+        for event, value in [("workflow_dispatch", ""), ("push", ""),
+                             ("pull_request", "untrusted"), ("schedule", "")]:
+            result, output = self.run_script(script, EVENT_NAME=event, REPLAY_SHA=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, "replay=false\n")
+        resolver = indented_block(self.workflow, "resolve-revision", 2)
+        self.assertEqual(resolver.count("if: steps.request.outputs.replay == 'true'"), 2)
+        self.assertIn("checkout_sha: ${{ steps.resolve.outputs.checkout_sha }}", resolver)
+        self.assertNotIn("github.sha", resolver.split("outputs:", 1)[1].split("steps:", 1)[0])
+
+    def test_validator_accepts_main_ancestors_without_changing_checkout(self):
+        work, commits = self.repository()
+        script = self.script("resolve-revision", "Validate main ancestry")
+        self.assertNotIn("${{", script, "candidate must be passed through environment")
+        refs_before = self.git(work, "ls-remote", "origin")
+        for key in ["parent", "tip"]:
+            result, output = self.run_script(script, cwd=work, REPLAY_SHA=commits[key].upper())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, f"checkout_sha={commits[key]}\n")
+            self.assertIn(commits[key], self.summary.read_text())
+            self.assertEqual(self.git(work, "rev-parse", "HEAD"), commits["tip"])
+        self.assertEqual(self.git(work, "ls-remote", "origin"), refs_before)
+
+    def test_validator_rejects_non_main_commit(self):
+        work, commits = self.repository()
+        result, output = self.run_script(
+            self.script("resolve-revision", "Validate main ancestry"),
+            cwd=work, REPLAY_SHA=commits["side"],
+        )
+        self.assertNotEqual(result.returncode, 0, "non-main commit must be rejected")
+        self.assertIn("reachable from origin/main", result.stderr)
+        self.assertEqual(output, "")
+
+    def test_validator_rejects_non_commit_object_ids(self):
+        work, commits = self.repository()
+        for value in [commits["tag"], commits["tree"], commits["blob"], "0" * 40]:
+            with self.subTest(value=value):
+                result, output = self.run_script(
+                    self.script("resolve-revision", "Validate main ancestry"),
+                    cwd=work, REPLAY_SHA=value,
+                )
+                self.assertNotEqual(result.returncode, 0, "non-commit object must be rejected")
+                self.assertIn("must identify a commit object", result.stderr)
+                self.assertEqual(output, "")
+
+    def test_every_ci_checkout_uses_the_validated_sha_after_validation(self):
+        checkout_jobs = set()
+        for name in re.findall(r"(?m)^  ([a-z][a-z0-9-]*):$", self.workflow.split("jobs:\n", 1)[1]):
+            job = indented_block(self.workflow, name, 2)
+            if "uses: actions/checkout@v7" not in job:
+                continue
+            checkout_jobs.add(name)
+            if name == "resolve-revision":
+                self.assertLess(job.index("- name: Validate replay input"), job.index("uses: actions/checkout@v7"))
+                self.assertIn("ref: ${{ github.sha }}\n          fetch-depth: 0", job)
+                self.assertNotIn("run: scripts/", job)
+                continue
+            self.assertRegex(job, r"(?m)^    needs: (?:resolve-revision|\[resolve-revision, coverage-measurement\])$",
+                             "every source job must wait for validation")
+            self.assertEqual(job.count("uses: actions/checkout@v7"), 1)
+            self.assertIn("ref: ${{ needs.resolve-revision.outputs.checkout_sha }}", job,
+                          "every CI checkout must use the validated SHA")
+        self.assertEqual(checkout_jobs, set(self.CHECKOUT_NAMES) | {"resolve-revision"})
+        gate = indented_block(self.workflow, "ci-gate", 2)
+        self.assertIn("- resolve-revision", indented_block(gate, "needs", 4),
+                      "aggregate must require revision validation")
+        self.assertNotIn('"resolve-revision"', gate.split("as $allowed_skips", 1)[0].split("bad=", 1)[1])
+
+    def test_replay_check_names_are_distinct_and_ordinary_names_unchanged(self):
+        for name, ordinary in {**self.CHECKOUT_NAMES, "ci-gate": "CI gate"}.items():
+            with self.subTest(job=name):
+                job = indented_block(self.workflow, name, 2)
+                self.assertIn(f"name: {REPLAY_NAME_PREFIX}{ordinary}\n", job,
+                              "replay checks must not reuse ordinary required check names")
+        self.assertIn("format('CI replay {0}', inputs.main_sha) || ''", self.workflow)
+        dispatch = indented_block(indented_block(self.workflow, "on", 0), "workflow_dispatch", 2)
+        self.assertIn("main_sha:", dispatch)
+        self.assertIn("required: false", dispatch)
+        self.assertIn('default: ""', dispatch)
+
+    def test_replay_secret_scan_excludes_future_and_other_branch_commits(self):
+        work, commits = self.repository()
+        script = self.script("secret-scan", "Resolve scan scope")
+        script = script.replace("${{ github.event_name }}", "workflow_dispatch")
+        script = script.replace("${{ github.event.before }}", "").replace("${{ github.sha }}", commits["tip"])
+        result, output = self.run_script(script, cwd=work, REPLAY_SHA=commits["parent"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, f"range={commits['parent']}\n",
+                         "replay scan must use only the selected commit history")
+        scope = self.git(work, "rev-list", output.strip().removeprefix("range="))
+        self.assertEqual(scope, commits["parent"])
+        result, output = self.run_script(script, cwd=work, REPLAY_SHA="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, "range=\n")
+        nightly = self.script("secret-scan", "Resolve scan scope").replace("${{ github.event_name }}", "schedule")
+        nightly = nightly.replace("${{ github.event.before }}", "").replace("${{ github.sha }}", commits["tip"])
+        result, output = self.run_script(nightly, cwd=work, REPLAY_SHA="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, "range=\n")
+        job = indented_block(self.workflow, "secret-scan", 2)
+        self.assertIn("REPLAY_SHA: ${{ needs.resolve-revision.outputs.checkout_sha }}", job)
+        self.assertIn('range="${base}..${head}"', job)
+        self.assertIn('range="${before}..${{ github.sha }}"', job)
+        minio = indented_block(self.workflow, "minio-blob-compat", 2)
+        self.assertIn("no comparable base SHA -- running the MinIO leg to be safe", minio)
 
 
 if __name__ == "__main__":
