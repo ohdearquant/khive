@@ -564,15 +564,15 @@ fn ingest_namespace_from_env() -> String {
 
 /// Resolve the default inbound actor for fresh (uncorrelated) email messages.
 ///
-/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"local"` when the
-/// variable is unset or blank. Called once at server startup alongside
-/// `ingest_namespace_from_env`, and defaults to the same neutral value.
+/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"channel:email"` when
+/// the variable is unset or blank. Called once at server startup alongside
+/// `ingest_namespace_from_env`.
 #[cfg(feature = "channel-email")]
 fn default_inbound_actor_from_env() -> String {
     std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "local".to_string())
+        .unwrap_or_else(|| "channel:email".to_string())
 }
 
 /// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
@@ -9816,13 +9816,14 @@ region = "us-east-1"
 
         #[test]
         #[serial]
-        fn default_inbound_actor_defaults_to_local() {
+        fn default_inbound_actor_is_channel_scoped() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(
-                default_inbound_actor_from_env(),
-                "local",
-                "an unset actor must resolve to the neutral namespace, not to any particular \
-                 deployment's identity"
+            let actor = default_inbound_actor_from_env();
+            assert_eq!(actor, "channel:email");
+            assert_ne!(
+                actor,
+                khive_runtime::resolve_actor(None).id,
+                "fresh email must never inherit the unconfigured caller's actor"
             );
         }
 
@@ -9841,7 +9842,75 @@ region = "us-east-1"
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
             let actor = default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(actor, "local", "blank env var must fall back to default");
+            assert_eq!(
+                actor, "channel:email",
+                "blank env var must fall back to default"
+            );
+            assert_ne!(actor, khive_runtime::resolve_actor(None).id);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn uncorrelated_email_ingest_uses_channel_actor_or_explicit_override() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let channel_actor = default_inbound_actor_from_env();
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mailbox-owner");
+            let override_actor = default_inbound_actor_from_env();
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            let registry = builder.build().expect("registry builds");
+
+            for (external_id, expected_actor) in [
+                ("email-default-actor", channel_actor),
+                ("email-override-actor", override_actor),
+            ] {
+                let result = registry
+                    .dispatch(
+                        "comm.ingest",
+                        serde_json::json!({
+                            "namespace": "local",
+                            "from": "email:sender@example.com",
+                            "to": "email:mailbox@example.com",
+                            "content": "fresh email",
+                            "channel_kind": "email",
+                            "external_id": external_id,
+                            "default_inbound_actor": expected_actor,
+                        }),
+                    )
+                    .await
+                    .expect("uncorrelated email ingests");
+                let note_id = result["full_id"]
+                    .as_str()
+                    .expect("ingest receipt has full_id")
+                    .parse::<uuid::Uuid>()
+                    .expect("ingest id is UUID");
+                let token = runtime
+                    .authorize(khive_runtime::Namespace::local())
+                    .expect("authorize local");
+                let note = runtime
+                    .notes(&token)
+                    .expect("notes store")
+                    .get_note(note_id)
+                    .await
+                    .expect("read ingested email")
+                    .expect("ingested email exists");
+                let props = note.properties.expect("inbound note properties");
+                assert_eq!(
+                    props["to_actor"].as_str(),
+                    Some(expected_actor.as_str()),
+                    "fresh email must land under the configured channel recipient"
+                );
+                assert_eq!(props["direction"].as_str(), Some("inbound"));
+            }
         }
     }
 
