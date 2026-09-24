@@ -436,6 +436,7 @@ mod tests {
         let err = StorageError::AdmissionTimeout {
             operation: std::borrow::Cow::Borrowed("search"),
             timeout_ms: 30_000,
+            pool_identity: None,
         };
         let ret = storage_err_to_retrieval(err, "vector search");
         assert!(

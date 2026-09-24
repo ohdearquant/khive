@@ -574,11 +574,24 @@ fn build_entity_where(
         conditions.push(format!("kind IN ({})", placeholders.join(", ")));
     }
 
-    let type_expr = if filter.legacy_entity_type_fallback {
-        "COALESCE(entity_type, CASE WHEN json_type(properties, '$.type') = 'text' \
-         THEN json_extract(properties, '$.type') END)"
-    } else {
-        "entity_type"
+    let type_scope = conditions.join(" AND ");
+    let type_predicate = |scope: &str, placeholders: &str| {
+        if filter.legacy_entity_type_fallback {
+            // Legacy properties can contain invalid JSON. Exclude those rows
+            // from type fallback without rewriting them. Keep json_valid as
+            // an explicit term matching the partial legacy-type index;
+            // json_type alone does not imply its validity predicate to SQLite.
+            format!(
+                "id IN (SELECT id FROM entities WHERE {scope} \
+                 AND entity_type IN ({placeholders}) \
+                 UNION ALL SELECT id FROM entities WHERE {scope} \
+                 AND entity_type IS NULL AND json_valid(properties) \
+                 AND json_type(properties, '$.type') = 'text' \
+                 AND json_extract(properties, '$.type') IN ({placeholders}))"
+            )
+        } else {
+            format!("entity_type IN ({placeholders})")
+        }
     };
     if !filter.entity_types.is_empty() {
         let placeholders: Vec<String> = filter
@@ -589,7 +602,7 @@ fn build_entity_where(
                 format!("?{}", params.len())
             })
             .collect();
-        conditions.push(format!("{type_expr} IN ({})", placeholders.join(", ")));
+        conditions.push(type_predicate(&type_scope, &placeholders.join(", ")));
     }
 
     if !filter.entity_types_by_kind.is_empty() {
@@ -608,9 +621,9 @@ fn build_entity_where(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            groups.push(format!(
-                "(kind = ?{kind_param} AND {type_expr} IN ({placeholders}))"
-            ));
+            let scope = format!("{type_scope} AND kind = ?{kind_param}");
+            let predicate = type_predicate(&scope, &placeholders);
+            groups.push(format!("(kind = ?{kind_param} AND {predicate})"));
         }
         conditions.push(if groups.is_empty() {
             "0".to_string()

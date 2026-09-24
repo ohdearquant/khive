@@ -2104,6 +2104,7 @@ undeclared-dep = 1
                 .conn_mut()
                 .execute_batch(
                     "DROP INDEX IF EXISTS idx_entities_kind_entity_type; \
+                     DROP INDEX IF EXISTS idx_entities_legacy_type; \
                      ALTER TABLE entities DROP COLUMN entity_type;",
                 )
                 .expect("drop entity_type to simulate an older map schema");

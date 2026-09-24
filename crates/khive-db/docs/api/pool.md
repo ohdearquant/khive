@@ -116,6 +116,28 @@ expired request context returns non-retryable `StorageError::Timeout`. Raw-SQL
 ordinary reads name `sql_bridge.reader_operation`; typed stores retain their
 capability operation name.
 
+Pooled-reader admission refusals include `pool_identity: Some(...)` alongside
+the unchanged operation and timeout. File-backed pools report only the final
+file name of their canonical path, never a directory, on every server including
+local stdio. In-memory pools use `:memory:`. Display appends
+` (pool: {identity})`, and the structured error includes the same optional
+`pool_identity` string. File names render lossily when they are not UTF-8.
+
+If distinct canonical paths with the same rendered file name are open in the
+process at refusal time, each reports `<filename>#<8 hex>`. The suffix is a
+SHA-256 digest of the canonical path: raw bytes on Unix, UTF-16 little-endian
+code units on Windows (lossy UTF-8 on other platforms). The first eight lowercase
+hex digits are stable across processes, restarts and builds for the same path
+bytes. This unkeyed, truncated hash can be matched against guessed paths and can
+collide; it does not provide secrecy or a globally unique identifier. Repeated opens of
+the same canonical path share a registration and never cause a suffix on their
+own. They share the same suffix if a different colliding store is also open.
+The suffix disappears once no other colliding store remains open. Registration
+is reference-counted and removed when the last pool for that path drops. A
+failed pool constructor leaves no registration. This is a process-local store
+label, not a globally unique ID, a pool-instance ID, or a pool role. It describes no
+remote process's pools; all in-memory pools share the memory label.
+
 `KHIVE_CHECKOUT_TIMEOUT_SECS` configures `checkout_timeout` (default five
 seconds) for each reader-admission attempt. One operation can perform several
 sequential reads, and each operation-scoped checkout has its own bounded wait;
