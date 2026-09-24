@@ -250,6 +250,16 @@ a pure backend-scoped memory read: a metrics scrape performs neither another
 checkpoint nor another filesystem stat, and a secondary backend cannot win a
 process-global race and masquerade as the main backend's sample (#1849).
 
+The existing `WAL checkpoint issued` DEBUG record also carries `elapsed_us` and the
+raw SQLite `busy` result. `checkpoint_timing(pool)` reads cumulative per-store
+routine PASSIVE call count, elapsed-microsecond sum/max, busy count, and error count.
+Timing encloses only the actual PASSIVE call; skipped ticks and post-TRUNCATE probes
+do not contribute. Failed calls contribute elapsed time and an error count, without
+inventing a busy result. A held reader can leave pending frames with `busy=0`;
+incomplete progress is not counted as SQLite busy. Counters are process-lifetime,
+coherently read under one registry lock, and saturate rather than wrap. This adds
+observation only; checkpoint order, scheduling and escalation thresholds are unchanged.
+
 ## `run_checkpoint_task` — shutdown design history
 
 See `crates/khive-db/src/checkpoint.rs` — `run_checkpoint_task`.

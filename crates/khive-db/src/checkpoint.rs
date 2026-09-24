@@ -127,6 +127,50 @@ pub struct RoutineWalObservation {
     pub observed_at_unix_ms: u64,
 }
 
+/// Process-lifetime totals for actual routine PASSIVE calls on one store.
+/// Skipped ticks and post-TRUNCATE probes are excluded. Busy counts only
+/// SQLite's returned busy flag, never an incomplete checkpoint's pending frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CheckpointTiming {
+    pub ticks: u64,
+    pub elapsed_us_sum: u64,
+    pub elapsed_us_max: u64,
+    pub busy_ticks: u64,
+    pub error_ticks: u64,
+}
+
+static CHECKPOINT_TIMINGS: OnceLock<Mutex<HashMap<Option<PathBuf>, CheckpointTiming>>> =
+    OnceLock::new();
+
+fn checkpoint_timings() -> &'static Mutex<HashMap<Option<PathBuf>, CheckpointTiming>> {
+    CHECKPOINT_TIMINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_checkpoint_timing(pool: &ConnectionPool, elapsed_us: u64, busy: Option<i64>) {
+    let mut timings = checkpoint_timings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let timing = timings.entry(checkpoint_db_key(pool)).or_default();
+    timing.ticks = timing.ticks.saturating_add(1);
+    timing.elapsed_us_sum = timing.elapsed_us_sum.saturating_add(elapsed_us);
+    timing.elapsed_us_max = timing.elapsed_us_max.max(elapsed_us);
+    timing.busy_ticks = timing
+        .busy_ticks
+        .saturating_add(u64::from(busy.is_some_and(|value| value != 0)));
+    timing.error_ticks = timing.error_ticks.saturating_add(u64::from(busy.is_none()));
+}
+
+/// Pure in-memory read; zero means no routine call has been recorded for this key.
+pub fn checkpoint_timing(pool: &ConnectionPool) -> CheckpointTiming {
+    checkpoint_timings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&checkpoint_db_key(pool))
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Latest routine observation by canonical database identity. Checkpoint
 /// tasks fan out per backend, so a single process-global "last task wins"
 /// gauge would misattribute a secondary backend to the main metrics frame.
@@ -2662,10 +2706,21 @@ fn checkpoint_once_core(
 ) -> Result<CheckpointCoreOutcome, rusqlite::Error> {
     #[cfg(unix)]
     truncate_state.begin_tick();
-    let raw_observation = match query_checkpoint_observation(conn) {
+    let started = Instant::now();
+    let checkpoint_result = query_checkpoint_observation(conn);
+    let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    record_checkpoint_timing(
+        pool,
+        elapsed_us,
+        checkpoint_result
+            .as_ref()
+            .ok()
+            .map(|observation| observation.busy),
+    );
+    let raw_observation = match checkpoint_result {
         Ok(observation) => observation,
         Err(e) => {
-            tracing::warn!(error = %e, "WAL checkpoint failed");
+            tracing::warn!(error = %e, elapsed_us, "WAL checkpoint failed");
             return Err(e);
         }
     };
@@ -2686,6 +2741,8 @@ fn checkpoint_once_core(
     }
     tracing::debug!(
         wal_pages,
+        elapsed_us,
+        busy = raw_observation.busy,
         wal_checkpointed_frames = observation.checkpointed_frames,
         wal_pending_frames = observation.pending_frames,
         wal_physical_bytes = ?observation.physical_wal_bytes,
@@ -3428,6 +3485,8 @@ mod tests {
         message: Option<String>,
         open_tx_count: Option<u64>,
         oldest_tx_age_secs: Option<String>,
+        elapsed_us: Option<u64>,
+        busy: Option<i64>,
         oldest_tx_label: Option<String>,
         tx_label: Option<String>,
         census_only: Option<String>,
@@ -3438,8 +3497,16 @@ mod tests {
 
     impl Visit for CapturedEventVisitor {
         fn record_u64(&mut self, field: &Field, value: u64) {
-            if field.name() == "open_tx_count" {
-                self.0.open_tx_count = Some(value);
+            match field.name() {
+                "open_tx_count" => self.0.open_tx_count = Some(value),
+                "elapsed_us" => self.0.elapsed_us = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            if field.name() == "busy" {
+                self.0.busy = Some(value);
             }
         }
 
@@ -7947,6 +8014,16 @@ mod tests {
             "one routine tick must issue exactly one PASSIVE checkpoint"
         );
         let pinned = routine_wal_observation(&pool).expect("routine sample");
+        assert_eq!(
+            pinned.busy, 0,
+            "a pinned reader is not checkpoint-lock contention"
+        );
+        let first_timing = checkpoint_timing(&pool);
+        assert_eq!(first_timing.ticks, 1);
+        assert_eq!(
+            first_timing.busy_ticks, 0,
+            "pending frames must not count as busy"
+        );
         assert!(pinned.log_frames > 0, "the test must create WAL frames");
         assert!(
             pinned.pending_frames > 0,
@@ -7970,11 +8047,273 @@ mod tests {
         )
         .unwrap();
         let drained = routine_wal_observation(&pool).expect("drained routine sample");
+        let drained_timing = checkpoint_timing(&pool);
+        assert_eq!(drained_timing.ticks, first_timing.ticks + 1);
+        assert!(drained_timing.elapsed_us_sum >= first_timing.elapsed_us_sum);
+        assert!(drained_timing.elapsed_us_max >= first_timing.elapsed_us_max);
+        assert_eq!(drained_timing.busy_ticks, 0);
         assert_eq!(drained.pending_frames, 0, "unpinned PASSIVE must drain");
         assert!(
             drained.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
             "PASSIVE may reuse rather than shrink the physical WAL; the two gauges must remain \
              independently visible: {drained:?}"
+        );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_timing_records_real_call_and_debug_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("timed_tick.db"));
+        let conn = checkpoint_conn(&pool);
+        conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let release_rx = Mutex::new(release_rx);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
+                if pragma_name.eq_ignore_ascii_case("wal_checkpoint"))
+            {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+        let tick_pool = Arc::clone(&pool);
+        let tick = std::thread::spawn(move || {
+            let mut result = None;
+            let events = capture(|| {
+                result = Some(checkpoint_once(
+                    &tick_pool,
+                    &conn,
+                    &CheckpointConfig {
+                        truncate_high_water_pages: u64::MAX,
+                        ..CheckpointConfig::default()
+                    },
+                    &mut TruncateState::default(),
+                ));
+            });
+            (result.unwrap(), events)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let during = checkpoint_timing(&pool);
+        release_tx.send(()).unwrap();
+        let (result, events) = tick.join().unwrap();
+        result.unwrap();
+        assert_eq!(
+            during.ticks, 0,
+            "in-flight call must not publish partial counters"
+        );
+        let timing = checkpoint_timing(&pool);
+        assert_eq!(
+            timing.ticks, 1,
+            "one actual PASSIVE call must advance the count"
+        );
+        assert!(
+            timing.elapsed_us_sum > 0,
+            "channel-held checkpoint call must record elapsed time"
+        );
+        assert_eq!(timing.elapsed_us_max, timing.elapsed_us_sum);
+        assert_eq!(timing.busy_ticks, 0);
+        assert_eq!(timing.error_ticks, 0);
+        let issued: Vec<_> = events
+            .iter()
+            .filter(|event| event.message.as_deref() == Some("WAL checkpoint issued"))
+            .collect();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].elapsed_us, Some(timing.elapsed_us_sum));
+        assert_eq!(issued[0].busy, Some(0));
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_timing_counts_sqlite_busy_from_competing_checkpoint() {
+        struct BusyGate {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        static BUSY_GATE: Mutex<Option<BusyGate>> = Mutex::new(None);
+        fn hold_checkpoint_lock(_attempt: i32) -> bool {
+            let gate = BUSY_GATE
+                .lock()
+                .unwrap()
+                .take()
+                .expect("armed busy handler");
+            gate.entered.send(()).unwrap();
+            gate.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            false
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy_checkpoint.db");
+        let pool = file_pool(&path);
+        let conn = checkpoint_conn(&pool);
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0; CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch("INSERT INTO t VALUES (2);").unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *BUSY_GATE.lock().unwrap() = Some(BusyGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let competing = std::thread::spawn(move || {
+            let checkpoint = rusqlite::Connection::open(path).unwrap();
+            checkpoint.busy_handler(Some(hold_checkpoint_lock)).unwrap();
+            checkpoint.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FULL checkpoint holds CKPT lock while waiting on reader");
+        let mut result = None;
+        let events = capture(|| {
+            result = Some(checkpoint_once(
+                &pool,
+                &conn,
+                &CheckpointConfig {
+                    truncate_high_water_pages: u64::MAX,
+                    ..CheckpointConfig::default()
+                },
+                &mut TruncateState::default(),
+            ));
+        });
+        release_tx.send(()).unwrap();
+        let competing_busy = competing.join().unwrap().unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(competing_busy, 1);
+        assert_eq!(
+            routine_wal_observation(&pool).unwrap().busy,
+            1,
+            "fixture must reach SQLite busy"
+        );
+        let timing = checkpoint_timing(&pool);
+        assert_eq!(timing.ticks, 1);
+        assert_eq!(
+            timing.busy_ticks, 1,
+            "SQLite busy result must increment busy ticks"
+        );
+        assert_eq!(timing.error_ticks, 0);
+        let issued = events
+            .iter()
+            .find(|event| event.message.as_deref() == Some("WAL checkpoint issued"))
+            .expect("existing tick record");
+        assert_eq!(issued.busy, Some(1), "tick record must retain SQLite busy");
+        assert_eq!(issued.elapsed_us, Some(timing.elapsed_us_sum));
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_timing_counts_errors_and_excludes_post_truncate_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("failed_tick.db"));
+        let conn = checkpoint_conn(&pool);
+        conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
+                if pragma_name.eq_ignore_ascii_case("wal_checkpoint"))
+            {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .unwrap();
+        let result = checkpoint_once(
+            &pool,
+            &conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        );
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert!(result.is_err());
+        let timing = checkpoint_timing(&pool);
+        assert_eq!(timing.ticks, 1);
+        assert_eq!(timing.error_ticks, 1);
+        assert_eq!(timing.busy_ticks, 0);
+        query_wal_pages(&conn);
+        assert_eq!(
+            checkpoint_timing(&pool),
+            timing,
+            "post-TRUNCATE observation is not a routine tick"
+        );
+    }
+
+    #[test]
+    fn checkpoint_timing_accumulates_per_store_and_saturates() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = file_pool(&dir.path().join("a.db"));
+        let b = file_pool(&dir.path().join("b.db"));
+        record_checkpoint_timing(&a, 17, Some(0));
+        record_checkpoint_timing(&a, 31, Some(1));
+        record_checkpoint_timing(&a, 7, None);
+        record_checkpoint_timing(&b, 3, Some(0));
+        assert_eq!(
+            checkpoint_timing(&a),
+            CheckpointTiming {
+                ticks: 3,
+                elapsed_us_sum: 55,
+                elapsed_us_max: 31,
+                busy_ticks: 1,
+                error_ticks: 1,
+            }
+        );
+        assert_eq!(
+            checkpoint_timing(&b),
+            CheckpointTiming {
+                ticks: 1,
+                elapsed_us_sum: 3,
+                elapsed_us_max: 3,
+                busy_ticks: 0,
+                error_ticks: 0,
+            }
+        );
+        checkpoint_timings().lock().unwrap().insert(
+            checkpoint_db_key(&a),
+            CheckpointTiming {
+                ticks: u64::MAX,
+                elapsed_us_sum: u64::MAX,
+                elapsed_us_max: 31,
+                busy_ticks: u64::MAX,
+                error_ticks: u64::MAX,
+            },
+        );
+        record_checkpoint_timing(&a, 1, Some(1));
+        assert_eq!(
+            checkpoint_timing(&a).elapsed_us_sum,
+            u64::MAX,
+            "elapsed sum must saturate on the first overflowing addition"
+        );
+        record_checkpoint_timing(&a, u64::MAX, None);
+        assert_eq!(
+            checkpoint_timing(&a),
+            CheckpointTiming {
+                ticks: u64::MAX,
+                elapsed_us_sum: u64::MAX,
+                elapsed_us_max: u64::MAX,
+                busy_ticks: u64::MAX,
+                error_ticks: u64::MAX,
+            }
         );
     }
 }
