@@ -2582,6 +2582,7 @@ name = "khive-pack-web"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "flate2",

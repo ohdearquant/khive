@@ -127,11 +127,13 @@ web_verbs! {
                               and only on a host in the credential's own configured set.", NotApplicable);
         #[serde(default)]
         persist: Option<bool> => (2, "Defaults to true. False stores no body or entities, returns the body \
-                              as a JSON byte array, and writes a receipt with final URL, content \
-                              digest, size and fetch time. HEAD returns no body.", NotApplicable);
+                              as a standard padded base64 string, and writes a receipt with final URL, content \
+                              digest, size and fetch time. HEAD returns no body. Transient GET requires effective max_bytes \
+                              at most 6288384 before network access; oversized body or header metadata is refused before a receipt.", NotApplicable);
         #[serde(default)]
         max_bytes: Option<u64> => (3, "Caller-supplied byte ceiling; may only lower the operator's \
-                              configured maximum, never raise it.", NotApplicable);
+                              configured maximum, never raise it. With persist=false, GET accepts at most 6288384 raw bytes; \
+                              lower this value or use persist=true for larger bodies. HEAD is exempt from this inline limit.", NotApplicable);
         #[serde(default)]
         timeout_s: Option<u64> => (4, "Caller-supplied time ceiling in seconds; may only lower the \
                               operator's configured maximum, never raise it.", NotApplicable);

@@ -64,11 +64,25 @@ Fetch one URL under egress policy. Follows up to 5 redirects; a 301/308 hop mint
 the hop and links `new supersedes old`, a 302/307 hop mints nothing beyond a receipt entry naming
 it. The terminal hop's body (if `GET`; `HEAD` carries none) is stored via the runtime's blob
 store, content-addressed; storing byte-identical content again is a no-op. `persist` defaults to
-`true`; `false` stores no body or entities and returns the exact body as a JSON byte array in
-`body` (null for HEAD or a persisted fetch). It still writes a standalone receipt recording
+`true`; `false` stores no body or entities and returns the exact body as a standard-alphabet,
+padded base64 string in `body` (null for HEAD or a persisted fetch). It still writes a standalone receipt recording
 `final_url`, the BLAKE3 `content_digest`, `size` and RFC 3339 `fetched_at`; `content_ref` is null.
 A persisted body has one `content` attachment on its entity, on the main backend even when web
 records use a separate backend. Receipts never carry body attachments.
+The egress `max_bytes` ceiling bounds raw bytes; base64 uses `4 * ceil(bytes / 3)` characters.
+For a transient GET, the effective `max_bytes` (including an omitted argument's configured
+default) must be at most **6,288,384 raw bytes**. A higher value is refused as invalid input
+before DNS or network access, with no receipt; lower `max_bytes` or use `persist=true`.
+HEAD has no inline body and is exempt from this extra ceiling; persisted fetches retain their
+configured egress ceiling.
+
+The limit leaves 4 KiB below the 8 MiB daemon frame cap for base64 body encoding. Settlement
+checks both that encoded-body limit and the complete serialized verb result, including the
+actual URL and allowed response headers. The result may use up to 8 MiB minus 1 KiB, leaving
+3 KiB beyond the body budget for verb metadata and 1 KiB for the outer transport envelope.
+Large or heavily escaped metadata can therefore refuse an otherwise valid body before its
+receipt is written. The transport still checks the final frame, including responses that
+aggregate multiple operations.
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 

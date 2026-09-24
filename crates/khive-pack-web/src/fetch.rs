@@ -21,6 +21,8 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use khive_runtime::engine_config::WebSectionConfig;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
@@ -40,6 +42,10 @@ use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 /// operator-configurable — a fixed default with no override, unlike the
 /// byte/time ceilings.
 pub const MAX_REDIRECTS: u32 = 5;
+
+const INLINE_BODY_BUDGET: usize = khive_runtime::daemon::MAX_FRAME_BYTES - 4096;
+const INLINE_RESULT_BUDGET: usize = khive_runtime::daemon::MAX_FRAME_BYTES - 1024;
+const INLINE_RAW_BODY_LIMIT: u64 = (INLINE_BODY_BUDGET / 4 * 3) as u64;
 
 /// Response headers echoed to the caller and recorded in the receipt: a
 /// response header set is attacker-controlled, so only this allow-listed
@@ -251,6 +257,11 @@ async fn run_fetch(
         ceilings.max_bytes_max,
         "max_bytes",
     )?;
+    if !persist && method == reqwest::Method::GET && max_bytes > INLINE_RAW_BODY_LIMIT {
+        return Err(RuntimeError::InvalidInput(format!(
+            "web.fetch: max_bytes={max_bytes} exceeds the transient inline response budget of {INLINE_RAW_BODY_LIMIT} raw bytes; lower max_bytes or use persist=true"
+        )));
+    }
     let timeout_s = egress::check_ceiling(
         params.timeout_s,
         ceilings.timeout_default_s,
@@ -738,6 +749,37 @@ async fn settle(
     let response_headers_json = extract_allowed_headers(headers);
     let content_type = header_str(headers, "content-type").map(str::to_string);
 
+    if !persist {
+        if let Some((bytes, truncated)) = body.as_ref() {
+            let encoded_size = base64::encoded_len(bytes.len(), true);
+            if !encoded_size.is_some_and(|size| size <= INLINE_BODY_BUDGET) {
+                return Err(RuntimeError::InvalidInput(
+                    "web.fetch: transient base64 body exceeds the inline response budget; lower max_bytes or use persist=true".into(),
+                ));
+            }
+            // An empty body string already includes its JSON quotes. Base64
+            // adds no escaping; a canonical receipt UUID has this fixed width.
+            let envelope = json!({
+                "final_url": final_url.to_string(), "status": status,
+                "headers": response_headers_json, "content_ref": null,
+                "bytes": bytes.len() as u64, "truncated": truncated,
+                "redirects": redirect_hops.len() as u32,
+                "receipt_id": Uuid::nil().to_string(), "id": null, "body": "",
+            });
+            let metadata_size = serde_json::to_vec(&envelope)
+                .map_err(|e| RuntimeError::Internal(format!("web.fetch: response metadata: {e}")))?
+                .len();
+            let fits = encoded_size
+                .and_then(|encoded| encoded.checked_add(metadata_size))
+                .is_some_and(|total| total <= INLINE_RESULT_BUDGET);
+            if !fits {
+                return Err(RuntimeError::InvalidInput(
+                    "web.fetch: transient base64 body and metadata exceed the inline response budget; lower max_bytes or use persist=true".into(),
+                ));
+            }
+        }
+    }
+
     let fetched_at = chrono::Utc::now().to_rfc3339();
     let mut content_digest = None;
     let mut response_body = None;
@@ -820,7 +862,7 @@ async fn settle(
         "redirects": redirect_hops.len() as u32,
         "receipt_id": receipt_id.to_string(),
         "id": final_entity_id.map(|id| id.to_string()),
-        "body": response_body,
+        "body": response_body.as_deref().map(|bytes| BASE64.encode(bytes)),
     }))
 }
 
