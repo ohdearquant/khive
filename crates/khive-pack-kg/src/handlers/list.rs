@@ -14,7 +14,7 @@ use super::common::{
     event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_specific,
     remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json,
-    validate_entity_type_filter, KindSpec, ListParams,
+    validate_entity_type_filter, validate_graph_read_kind, KindSpec, ListParams,
 };
 use crate::sql::sql;
 use crate::KgPack;
@@ -324,6 +324,7 @@ impl KgPack {
                 "cursor pagination requires limit greater than zero".into(),
             ));
         }
+        validate_graph_read_kind(&p.kind, "kind", "list")?;
         let spec = resolve_kind_spec(&p.kind, registry)?;
         if has_schedule_filters && !matches!(&spec, KindSpec::Note { .. }) {
             return Err(RuntimeError::InvalidInput(
@@ -356,7 +357,10 @@ impl KgPack {
                 let kind_filter = reconcile_specific(
                     specific,
                     p.entity_kind.as_deref(),
-                    |s| canonical_entity_kind(s, registry),
+                    |s| {
+                        validate_graph_read_kind(s, "entity_kind", "list")?;
+                        canonical_entity_kind(s, registry)
+                    },
                     "entity_kind",
                 )?;
                 let validated_et = validate_entity_type_filter(
