@@ -9,7 +9,7 @@ use crate::{KhiveRuntime, NamespaceToken};
 use khive_channel::DeliveryReceipt;
 use khive_db::stores::note::transport::SenderTransportStore;
 pub use khive_db::stores::note::transport::{
-    EnvelopeKey, FailureClass, HoldReason, SenderEnvelope, SenderRecord, TransportState,
+    EnvelopeKey, FailureClass, HoldReason, PolicyMode, SenderEnvelope, SenderRecord, TransportState,
 };
 
 /// An explicit assertion by the trusted caller that it verified the signature
@@ -86,8 +86,9 @@ impl KhiveRuntime {
             .record_failure(key, class, next_retry_at)
             .await?)
     }
-    /// Set/release a credit hold, or set a key-change hold. Key-change holds can
-    /// only be superseded through explicit confirmed re-encryption.
+    /// Set/release credit or policy holds, or set a key-change hold. A policy hold
+    /// carries the evaluated mode and revision. Key-change holds can only be
+    /// superseded through explicit confirmed re-encryption.
     pub async fn hold_sender_transport(
         &self,
         key: EnvelopeKey,
@@ -154,6 +155,23 @@ mod tests {
             unrelated.sender_transport(key).await.unwrap().is_none(),
             "transport must use bound backend"
         );
+        let hold = HoldReason::PolicyDenied {
+            mode: PolicyMode::Enforce,
+            revision: 7,
+        };
+        runtime
+            .hold_sender_transport(key, Some(hold))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .sender_transport(key)
+                .await
+                .unwrap()
+                .unwrap()
+                .hold_reason,
+            Some(hold)
+        );
         let receipt = DeliveryReceipt {
             binding: DeliveryReceiptBinding {
                 protocol_version: 1,
@@ -184,6 +202,15 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            runtime
+                .sender_transport(key)
+                .await
+                .unwrap()
+                .unwrap()
+                .hold_reason,
+            None
+        );
         assert_eq!(
             runtime.sender_transport(key).await.unwrap().unwrap().state,
             TransportState::RecipientStored

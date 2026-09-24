@@ -103,7 +103,20 @@ pub enum FailureClass {
 pub enum HoldReason {
     InsufficientCredit,
     RecipientKeyChanged,
-    PolicyDenied,
+    /// Policy state evaluated at the refused transport attempt.
+    PolicyDenied {
+        mode: PolicyMode,
+        revision: u64,
+    },
+}
+
+/// Recorded evaluation mode; this does not enable or change runtime policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Off,
+    Shadow,
+    Enforce,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SenderRecord {
@@ -153,7 +166,16 @@ impl StorageSpelling for HoldReason {
         match self {
             Self::InsufficientCredit => "insufficient_credit",
             Self::RecipientKeyChanged => "recipient_key_changed",
-            Self::PolicyDenied => "policy_denied",
+            Self::PolicyDenied { .. } => "policy_denied",
+        }
+    }
+}
+impl StorageSpelling for PolicyMode {
+    fn storage_spelling(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
         }
     }
 }
@@ -175,7 +197,8 @@ const COLUMNS: &str = concat!(
     "recipient_address, protocol_version, sender_agent_id, recipient_agent_id, ",
     "recipient_device_id, recipient_key_epoch, contact_generation, sender_key_epoch, ",
     "recipient_key_fingerprint, enc, ciphertext, state, attempt_count, next_retry_at, ",
-    "last_failure_class, hold_reason, receipt, created_at, updated_at, envelope_seq",
+    "last_failure_class, hold_reason, receipt, created_at, updated_at, envelope_seq, ",
+    "policy_mode, policy_revision",
 );
 fn unsigned_column(value: i64, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|error| {
@@ -223,7 +246,13 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SenderRecord> {
         attempt_count: read_unsigned(row, 18)?,
         next_retry_at: row.get(19)?,
         last_failure_class: row.get::<_, Option<String>>(20)?.map(decode).transpose()?,
-        hold_reason: row.get::<_, Option<String>>(21)?.map(decode).transpose()?,
+        hold_reason: match row.get::<_, Option<String>>(21)?.as_deref() {
+            Some("policy_denied") => Some(HoldReason::PolicyDenied {
+                mode: decode(row.get(26)?)?,
+                revision: read_unsigned(row, 27)?,
+            }),
+            reason => reason.map(|r| decode(r.to_owned())).transpose()?,
+        },
         receipt: row
             .get::<_, Option<String>>(22)?
             .map(|s| {
@@ -305,13 +334,15 @@ const FAILURE_SQL: &str = concat!(
 );
 
 const HOLD_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET hold_reason=?4,updated_at=?5 WHERE ",
+    "UPDATE comm_sender_transport SET hold_reason=?4,updated_at=?5,",
+    "policy_mode=?6,policy_revision=?7 WHERE ",
     "logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3",
 );
 
 const RECEIPT_SQL: &str = concat!(
     "UPDATE comm_sender_transport SET ",
-    "state=?4,receipt=?5,next_retry_at=NULL,hold_reason=NULL,updated_at=?6 WHERE ",
+    "state=?4,receipt=?5,next_retry_at=NULL,hold_reason=NULL,",
+    "policy_mode=NULL,policy_revision=NULL,updated_at=?6 WHERE ",
     "logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3",
 );
 
@@ -520,7 +551,8 @@ impl SenderTransportStore {
             .await
     }
     /// Release credit or policy holds explicitly. Key-change holds release by creating a confirmed
-    /// new envelope.
+    /// new envelope. Policy holds require the evaluated mode and revision in the reason;
+    /// every other reason, including release (`None`), clears both policy columns.
     pub async fn hold(&self, key: EnvelopeKey, reason: Option<HoldReason>) -> StorageResult<()> {
         self.notes
             .with_writer_tx_storage("sender_transport_hold", move |conn| {
@@ -536,6 +568,12 @@ impl SenderTransportStore {
                 {
                     return Err(invalid("key change requires confirmed re-encryption"));
                 }
+                let (policy_mode, policy_revision) = match reason {
+                    Some(HoldReason::PolicyDenied { mode, revision }) => {
+                        (Some(encode(&mode)), Some(sql_integer(revision)?))
+                    }
+                    _ => (None, None),
+                };
                 conn.execute(
                     HOLD_SQL,
                     params![
@@ -543,7 +581,9 @@ impl SenderTransportStore {
                         key.recipient_device_id.to_string(),
                         sql_integer(key.recipient_key_epoch)?,
                         reason.map(|r| encode(&r)),
-                        chrono::Utc::now().timestamp_micros()
+                        chrono::Utc::now().timestamp_micros(),
+                        policy_mode,
+                        policy_revision
                     ],
                 )
                 .map_err(|e| map_err(e, op))?;

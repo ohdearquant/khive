@@ -4555,6 +4555,19 @@ fn sender_transport_migration_fresh_and_previous_tail() {
         }
         run_migrations(&mut conn).unwrap();
         assert!(table_exists(&conn, "comm_sender_transport"));
+        for (name, kind) in [("policy_mode", "TEXT"), ("policy_revision", "INTEGER")] {
+            let column: (String, i64) = conn
+                .query_row(
+                    concat!(
+                        "SELECT type, [notnull] FROM pragma_table_info('comm_sender_transport') ",
+                        "WHERE name=?1"
+                    ),
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(column, (kind.to_owned(), 0));
+        }
         let foreign_keys: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_foreign_key_list('comm_sender_transport')",

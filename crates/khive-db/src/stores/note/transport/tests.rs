@@ -130,11 +130,23 @@ async fn policy_denied_hold_preserves_retry_state_and_bytes() {
         .unwrap();
     let before = store.get(envelope.key()).await.unwrap().unwrap();
     store
-        .hold(envelope.key(), Some(HoldReason::PolicyDenied))
+        .hold(
+            envelope.key(),
+            Some(HoldReason::PolicyDenied {
+                mode: PolicyMode::Enforce,
+                revision: 7,
+            }),
+        )
         .await
         .expect("policy_denied hold must be accepted");
     let held = store.get(envelope.key()).await.unwrap().unwrap();
-    assert_eq!(held.hold_reason, Some(HoldReason::PolicyDenied));
+    assert_eq!(
+        held.hold_reason,
+        Some(HoldReason::PolicyDenied {
+            mode: PolicyMode::Enforce,
+            revision: 7
+        })
+    );
     assert!(
         store
             .list_pending("local", "khive", "local-device", i64::MAX, 10)
@@ -143,9 +155,28 @@ async fn policy_denied_hold_preserves_retry_state_and_bytes() {
             .is_empty(),
         "policy_denied hold must suppress pending delivery"
     );
-    store.hold(envelope.key(), None).await.unwrap();
+    store
+        .hold(envelope.key(), None)
+        .await
+        .expect("release must clear both policy columns");
     let released = store.get(envelope.key()).await.unwrap().unwrap();
     assert_eq!(released.hold_reason, None);
+    let columns: (Option<String>, Option<i64>) = backend
+        .pool()
+        .writer()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT policy_mode, policy_revision FROM comm_sender_transport",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        columns,
+        (None, None),
+        "release must clear both policy columns"
+    );
     let pending = store
         .list_pending("local", "khive", "local-device", i64::MAX, 10)
         .await
@@ -375,4 +406,69 @@ async fn device_replacement_uses_local_sequence_and_same_device_epoch_increases(
         .unwrap();
     assert_eq!(rows[0].envelope, higher);
     assert_eq!(rows[0].envelope_seq, 3);
+}
+
+async fn assert_policy_columns_rejected(
+    hold: Option<&str>,
+    mode: Option<&str>,
+    revision: Option<i64>,
+) {
+    let (backend, envelope) = fixture();
+    SenderTransportStore::new(backend.pool_arc())
+        .create(envelope, false)
+        .await
+        .unwrap();
+    let writer = backend.pool().writer().unwrap();
+    let conn = writer.conn();
+    // Prove this statement and these column names work before testing invalid combinations.
+    let update =
+        "UPDATE comm_sender_transport SET hold_reason=?1,policy_mode=?2,policy_revision=?3";
+    assert_eq!(
+        conn.execute(update, params!["policy_denied", "enforce", 7])
+            .unwrap(),
+        1
+    );
+    let error = conn
+        .execute(update, params![hold, mode, revision])
+        .expect_err("inconsistent policy columns must fail the table CHECK");
+    match error {
+        rusqlite::Error::SqliteFailure(code, _) => {
+            assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_CHECK)
+        }
+        other => panic!("expected CHECK constraint failure, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn policy_columns_reject_missing_mode() {
+    assert_policy_columns_rejected(Some("policy_denied"), None, Some(7)).await;
+}
+#[tokio::test]
+async fn policy_columns_reject_missing_revision() {
+    assert_policy_columns_rejected(Some("policy_denied"), Some("enforce"), None).await;
+}
+#[tokio::test]
+async fn policy_columns_reject_mode_on_other_hold() {
+    for hold in [
+        Some("insufficient_credit"),
+        Some("recipient_key_changed"),
+        None,
+    ] {
+        assert_policy_columns_rejected(hold, Some("enforce"), None).await;
+    }
+}
+#[tokio::test]
+async fn policy_columns_reject_revision_on_other_hold() {
+    for hold in [
+        Some("insufficient_credit"),
+        Some("recipient_key_changed"),
+        None,
+    ] {
+        assert_policy_columns_rejected(hold, None, Some(7)).await;
+    }
+}
+#[tokio::test]
+async fn policy_columns_reject_invalid_mode_and_negative_revision() {
+    assert_policy_columns_rejected(Some("policy_denied"), Some("invalid"), Some(7)).await;
+    assert_policy_columns_rejected(Some("policy_denied"), Some("enforce"), Some(-1)).await;
 }
