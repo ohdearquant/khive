@@ -9,12 +9,12 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT,
+    NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
-    RtlNtStatusToDosError, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
-    UNICODE_STRING,
+    RtlNtStatusToDosError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    OBJ_CASE_INSENSITIVE, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FileRenameInfoEx,
@@ -38,6 +38,84 @@ mod tests;
 
 pub(super) fn write_via_dir_handle(dir: &Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
     write_via_dir_handle_with(dir, buf, rename_relative)
+}
+
+/// The checkpoint writer shares the sidecar's verified directory-handle
+/// boundary. All later operations are relative to this pinned handle.
+pub(crate) fn open_checkpoint_directory(dir: &Path) -> std::io::Result<std::fs::File> {
+    ensure_portable_ancestors_not_symlinks(dir, "inspect checkpoint dir ancestor")
+        .map_err(std::io::Error::other)?;
+    let metadata = ensure_not_symlink_or_reparse(dir, "inspect checkpoint dir")
+        .map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory));
+    }
+    let expected = std::fs::canonicalize(dir)?;
+    let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
+    let handle = open_directory(dir).map_err(std::io::Error::other)?;
+    verify_handle_kind(&handle, true, "inspect opened checkpoint dir")
+        .map_err(std::io::Error::other)?;
+    if !windows_final_path_matches(
+        &expected_wide,
+        &final_path(&handle).map_err(std::io::Error::other)?,
+    ) {
+        return Err(std::io::Error::other(
+            "checkpoint directory identity changed",
+        ));
+    }
+    Ok(handle)
+}
+
+pub(crate) fn open_checkpoint_lock(dir: &std::fs::File) -> std::io::Result<std::fs::File> {
+    let file = open_relative(
+        dir,
+        ".checkpoint.lock",
+        GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN_IF,
+    )?;
+    verify_handle_kind(&file, false, "inspect opened checkpoint lock")
+        .map_err(std::io::Error::other)?;
+    Ok(file)
+}
+
+pub(crate) fn stage_checkpoint_file(
+    dir: &std::fs::File,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    remove_relative_if_exists(dir, name, "inspect stale checkpoint staging file")
+        .map_err(std::io::Error::other)?;
+    let mut file = open_relative(
+        dir,
+        name,
+        GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_CREATE,
+    )?;
+    verify_handle_kind(&file, false, "inspect created checkpoint staging file")
+        .map_err(std::io::Error::other)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+pub(crate) fn rename_checkpoint_file(
+    dir: &std::fs::File,
+    from: &str,
+    to: &str,
+) -> std::io::Result<()> {
+    let file = open_relative(
+        dir,
+        from,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+    )?;
+    verify_handle_kind(
+        &file,
+        false,
+        "inspect checkpoint staging file before rename",
+    )
+    .map_err(std::io::Error::other)?;
+    rename_relative(&file, dir, to)
 }
 
 fn write_via_dir_handle_with(
