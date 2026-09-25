@@ -336,9 +336,24 @@ pub(crate) fn consume_vector_fail_fault(ns: &str) -> bool {
 pub struct NoteSearchHit {
     pub note_id: Uuid,
     pub score: DeterministicScore,
+    pub rank_score_kind: crate::RankScoreKind,
+    pub signals: crate::SearchSignals,
     pub source: crate::SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
+}
+
+fn salience_weighted_rank(score: DeterministicScore, salience: Option<f64>) -> DeterministicScore {
+    const SCALE_RAW: i128 = 1_i128 << 32;
+    let salience = DeterministicScore::from_f64(salience.unwrap_or(0.5));
+    let weight_raw = SCALE_RAW / 2 + i128::from(salience.to_raw()) / 2;
+    // Match khive-score's fixed-point multiplication and saturation without
+    // converting the derived weight or ranking score back to floating point.
+    let weighted_raw = i128::from(score.to_raw()) * weight_raw / SCALE_RAW;
+    DeterministicScore::from_raw(weighted_raw.clamp(
+        i128::from(DeterministicScore::NEG_INF.to_raw()),
+        i128::from(DeterministicScore::MAX.to_raw()),
+    ) as i64)
 }
 
 /// Result of [`KhiveRuntime::search_notes_outcome`]: the fused hits — text
@@ -4540,12 +4555,12 @@ impl KhiveRuntime {
             .into_iter()
             .filter_map(|hit| {
                 let note = alive_notes.get(&hit.entity_id)?;
-                let salience = note.salience.unwrap_or(0.5);
-                let weight = 0.5 + 0.5 * salience;
-                let weighted = DeterministicScore::from_f64(hit.score.to_f64() * weight);
+                let weighted = salience_weighted_rank(hit.score, note.salience);
                 Some(NoteSearchHit {
                     note_id: hit.entity_id,
                     score: weighted,
+                    rank_score_kind: hit.rank_score_kind,
+                    signals: hit.signals,
                     source: hit.source,
                     title: hit.title.or_else(|| note_title(note)),
                     snippet: hit.snippet.or_else(|| note_snippet(note)),
@@ -7179,6 +7194,50 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[test]
+    fn salience_rank_uses_fixed_point_at_q32_boundaries() {
+        for (input, expected) in [(6, 4), (-6, -4), (1, 0), (-1, 0)] {
+            for salience in [Some(0.5), None] {
+                assert_eq!(
+                    salience_weighted_rank(DeterministicScore::from_raw(input), salience).to_raw(),
+                    expected
+                );
+            }
+        }
+        let one = DeterministicScore::from_raw(1_i64 << 32);
+        for (salience, expected) in [
+            (1.0 / 4_294_967_296.0, 2_147_483_648),
+            (3.0 / 4_294_967_296.0, 2_147_483_649),
+        ] {
+            assert_eq!(
+                salience_weighted_rank(one, Some(salience)).to_raw(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn salience_rank_preserves_identity_and_saturates() {
+        let exact = DeterministicScore::from_raw((1_i64 << 53) + 1);
+        assert_eq!(salience_weighted_rank(exact, Some(1.0)), exact);
+        assert_eq!(
+            salience_weighted_rank(DeterministicScore::from_raw(6), Some(0.0)).to_raw(),
+            3
+        );
+        assert_eq!(
+            salience_weighted_rank(DeterministicScore::MAX, Some(3.0)),
+            DeterministicScore::MAX
+        );
+        assert_eq!(
+            salience_weighted_rank(DeterministicScore::NEG_INF, Some(3.0)),
+            DeterministicScore::NEG_INF
+        );
+        assert_eq!(
+            salience_weighted_rank(DeterministicScore::ZERO, None),
+            DeterministicScore::ZERO
+        );
     }
 
     #[tokio::test]
