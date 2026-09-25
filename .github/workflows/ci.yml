@@ -1114,6 +1114,27 @@ jobs:
             kill "$(cat "$RUNNER_TEMP/minio.pid")" || true
           fi
 
+  msrv-check:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
+    needs: resolve-revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          key: msrv-1.93
+      - name: Check workspace on the declared minimum Rust version
+        run: cargo +1.93.0 check --workspace --locked
+
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
     needs: resolve-revision
@@ -1378,6 +1399,7 @@ jobs:
       - wasm-parity
       - vamana-portability
       - minio-blob-compat
+      - msrv-check
     if: always()
     steps:
       - name: Check aggregated job results
