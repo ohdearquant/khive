@@ -2447,7 +2447,8 @@ impl KhiveRuntime {
             })?,
         );
 
-        let store = self.notes(token)?;
+        // Delivery outcomes preserve transport-owned route fields from the loaded snapshot.
+        let store = self.raw_notes(token)?;
         let persisted = store
             .replace_note_if_unchanged(snapshot, expected_updated_at, expected_deleted_at)
             .await?;
