@@ -104,8 +104,7 @@ The qualification requires acceptance before its dependent implementation merges
 
 ### Qualification: `neighbors` and `traverse` on an anchor outside the read scope
 
-**Status**: proposed, dated 2026-09-25. It requires acceptance before any change to anchor
-behaviour merges.
+**Status**: accepted, dated 2026-09-25.
 
 **Context.** Rule 9 says "several parameters declare prefix-scoped-to-primary resolution instead,
 `neighbors(node_id)` among them, where the _prefix_ form resolves within the caller's primary

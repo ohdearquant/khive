@@ -312,7 +312,7 @@ only, and its attachment rows land on the main backend only (ADR-160); the arm a
 
 ## Amendment 2 (2026-09-25): which resolved addresses egress refuses, and no ambient proxy
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** D3 carries the egress rules of ADR-175 Amendment 1 over "on their own merits", naming
 "address classification after resolution (loopback, link-local, private, and metadata ranges
@@ -400,7 +400,7 @@ Two gaps in the implementation of that rule:
 
 ## Amendment 3 (2026-09-25): a HEAD receipt records no digest and no size
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** D4, as amended by A1.2, says "a request that stores no body, `persist` false or a HEAD,
 writes a receipt with no blob reference and records the content digest, size, final URL and fetch
@@ -441,7 +441,7 @@ a GET receipt with `persist` false carries both.
 
 ## Amendment 4 (2026-09-25): deterministic identity is per namespace
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** D1 says "Identities are deterministic (UUIDv5 over the identity tuple under the pack
 namespace) so repeated fetches and independent ingests converge on the same rows", and D3 says

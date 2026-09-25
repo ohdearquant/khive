@@ -735,9 +735,9 @@ semantics remain fixed; only stale full-row persistence becomes explicitly refus
 
 ## Amendment — Merge event committed with the merge (#3262)
 
-**Status**: Proposed (2026-09-25)
+**Status**: Accepted (2026-09-25)
 
-This amendment would qualify steps 9 to 11 of `merge_entity` semantics, step 6 of `merge_note`
+This amendment qualifies steps 9 to 11 of `merge_entity` semantics, step 6 of `merge_note`
 semantics, and the transaction-boundary paragraph after "Reversible edge-conflict resolution". The
 accepted text above is left as written until it is accepted.
 

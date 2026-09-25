@@ -1,10 +1,15 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
+**Status**: Accepted (amended 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication;
+amended 2026-09-25 -- `external_id` on a message note is transport-owned at creation; amended 2026-09-25 --
+inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
 identifiers in dedup acknowledgements; see
+[§Amendment 2026-09-25, Telegram outbound delivery](#amendment-2026-09-25----telegram-outbound-delivery-is-at-least-once-without-deduplication),
+[§Amendment 2026-09-25, `external_id`](#amendment-2026-09-25----external_id-on-a-message-note-is-transport-owned-at-creation),
+[§Amendment 2026-09-25, inbound email byte cap](#amendment-2026-09-25----inbound-email-has-a-per-message-byte-cap),
 [§Amendment 2026-08-09](#amendment-2026-08-09----quarantine-health-and-recovery),
 [§Amendment 2026-08-01](#amendment-2026-08-01----bounded-inbox-long-poll),
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
@@ -13,7 +18,7 @@ identifiers in dedup acknowledgements; see
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
 [§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -29,7 +34,7 @@ by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-
 
 ## Amendment 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** The Telegram amendment (2026-07-05) states at-least-once delivery only for inbound
 updates, where the `tg:{chat_id}:{update_id}` key deduplicates a re-delivered update. ADR-122 §3 and
@@ -64,7 +69,7 @@ retries after a 429 is a separate question (#3201).
 
 ## Amendment 2026-09-25 -- `external_id` on a message note is transport-owned at creation
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** The 2026-08-09 amendment says "Generic `message` create and update paths MUST refuse
 caller-supplied `channel_kind`, `channel_slug`, and `quarantined`; only the trusted `comm.ingest`
@@ -114,7 +119,7 @@ pending note.
 
 ## Amendment 2026-09-25 -- Inbound email has a per-message byte cap
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** The IMAP poll fetches every selected message whole
 (`uid_fetch(..., "RFC822")` in `crates/khive-channel-email/src/connector/imap.rs`), up to
