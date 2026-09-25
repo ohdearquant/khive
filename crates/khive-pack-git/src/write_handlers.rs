@@ -309,6 +309,17 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        if let Err(error) = crate::params::parse("git.commit", params.clone()) {
+            let repo = Path::new(
+                params
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<invalid-repo>"),
+            );
+            return Err(self
+                .audit_early_failure(token, "git.commit", repo, None, EventOutcome::Denied, error)
+                .await);
+        }
         let repo = self
             .parse_audited_repo(token, "git.commit", &params)
             .await?;

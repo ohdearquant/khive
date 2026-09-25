@@ -123,6 +123,8 @@ where
 pub(crate) struct UpsertAtomsParams {
     pub atoms: Vec<AtomWrite>,
     #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
     // REASON: chunk_size is accepted from callers as a hint for client-side pagination;
     // server-side chunking is not yet implemented but the field must be deserialized
     // so callers that send it don't receive unexpected errors.

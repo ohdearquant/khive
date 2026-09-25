@@ -107,6 +107,12 @@ fn run_lock_order(read_only_first: bool) {
             command.env_remove(key);
         }
     }
+    let child_home = dir.path().join("child-home");
+    std::fs::create_dir(&child_home).unwrap();
+    // The scrub above must not turn off the database test-harness guards.
+    command
+        .env("KHIVE_TEST_HARNESS", "1")
+        .env("HOME", &child_home);
     command.env(
         CHILD_MODE,
         if read_only_first {
@@ -151,6 +157,10 @@ fn run_lock_order(read_only_first: bool) {
         status.success(),
         "child failed: {}",
         std::fs::read_to_string(stderr_path).unwrap()
+    );
+    assert!(
+        std::fs::read_dir(&child_home).unwrap().next().is_none(),
+        "events registry child must leave its isolated HOME empty"
     );
     let (existing, requested) = if read_only_first {
         ("read-only", "writable")

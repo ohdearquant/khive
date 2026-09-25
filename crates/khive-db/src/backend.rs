@@ -232,18 +232,28 @@ impl StorageBackend {
     /// 1 writer + N readers in WAL mode for concurrent access.
     /// No schema is applied — call `apply_schema()` for each service.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
-        Self::sqlite_with_pool_config(path, PoolConfig::default())
+        Self::sqlite_with_pool_config(path, PoolConfig::default(), None)
     }
 
     /// A private test database with a small, explicitly sized reader pool.
     #[cfg(any(test, feature = "test-support"))]
     pub fn sqlite_for_test(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
-        Self::sqlite_with_pool_config(path, PoolConfig::for_test())
+        Self::sqlite_with_pool_config(path, PoolConfig::for_test(), None)
+    }
+
+    /// Open SQLite with a reader count selected before any connections are opened.
+    /// `None` preserves the default pool size and filesystem read-only detection.
+    pub fn sqlite_with_max_readers(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(path, PoolConfig::default(), max_readers)
     }
 
     fn sqlite_with_pool_config(
         path: impl AsRef<Path>,
         pool_config: PoolConfig,
+        max_readers: Option<usize>,
     ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
@@ -254,6 +264,9 @@ impl StorageBackend {
             read_only,
             ..pool_config
         };
+        if let Some(max_readers) = max_readers {
+            config.max_readers = max_readers;
+        }
         if read_only {
             config.write_queue_enabled = Some(false);
         }
@@ -277,27 +290,39 @@ impl StorageBackend {
     /// The database file must already exist — unlike `sqlite()` this constructor
     /// does not create a new file.
     pub fn sqlite_read_only(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
-        Self::sqlite_read_only_with_pool_config(path, PoolConfig::default())
+        Self::sqlite_read_only_with_pool_config(path, PoolConfig::default(), None)
     }
 
     /// A private read-only test database with a small reader pool.
     #[cfg(any(test, feature = "test-support"))]
     pub fn sqlite_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
-        Self::sqlite_read_only_with_pool_config(path, PoolConfig::for_test())
+        Self::sqlite_read_only_with_pool_config(path, PoolConfig::for_test(), None)
+    }
+
+    /// Open a read-only SQLite store with a construction-time reader count.
+    pub fn sqlite_read_only_with_max_readers(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_pool_config(path, PoolConfig::default(), max_readers)
     }
 
     fn sqlite_read_only_with_pool_config(
         path: impl AsRef<Path>,
         pool_config: PoolConfig,
+        max_readers: Option<usize>,
     ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
-        let config = PoolConfig {
+        let mut config = PoolConfig {
             path: Some(resolved.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
             ..pool_config
         };
+        if let Some(max_readers) = max_readers {
+            config.max_readers = max_readers;
+        }
         // `ConnectionPool::new` opens the writer slot with `SQLITE_OPEN_READ_ONLY`
         // (no `SQLITE_OPEN_CREATE`) and sets `PRAGMA query_only = ON` on it, so a
         // missing path is rejected instead of created, and any write attempt is
@@ -1852,61 +1877,102 @@ mod tests {
     /// runs on essentially every text-store access. A first draft of that
     /// function used `SELECT COUNT(*)` for the short-circuit — correct, but
     /// `COUNT(*)` over an FTS5 table costs real per-call time proportional to
-    /// row count (measured directly: ~130ms per call at 200,000 rows, vs
-    /// ~0.01ms for the `EXISTS(...LIMIT 1)` this test pins), which would have
-    /// reintroduced a scan on the read path this whole migration exists to
-    /// remove. This test seeds enough rows that an O(n) short-circuit would
-    /// make repeated calls visibly slow, then bounds many repeated
-    /// `backend.text()` calls to a budget only a same-order-as-O(1)
-    /// short-circuit can meet.
+    /// row count, which would reintroduce a scan on the read path this
+    /// migration exists to remove. Compare SQLite VM work for the same
+    /// repeated-open batch at 100 and 5,000 rows. The completion-marker probe
+    /// should need similar work at both sizes; a full-table count should not.
+    /// Counting executed work keeps scheduler delays out of this growth test.
     #[tokio::test]
     async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        fn repeated_open_work(backend: &StorageBackend) -> u64 {
+            let work = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&work);
+            {
+                let writer = backend.pool().writer().unwrap();
+                writer
+                    .conn()
+                    .progress_handler(
+                        1,
+                        Some(move || {
+                            counted.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }),
+                    )
+                    .unwrap();
+            }
+
+            // All opens use this private backend's pooled writer. Release
+            // its guard before re-entry, and remove the hook even when an
+            // open returns an error, before asserting or growing the fixture.
+            let result = (0..500).try_for_each(|_| backend.text("hot_path_reopen").map(|_| ()));
+            backend
+                .pool()
+                .writer()
+                .unwrap()
+                .conn()
+                .progress_handler(0, None::<fn() -> bool>)
+                .unwrap();
+            result.expect("repeated text-store opens must succeed");
+            work.load(Ordering::Relaxed)
+        }
+
         let backend = StorageBackend::memory().unwrap();
         let store = backend.text("hot_path_reopen").unwrap();
-
         let body = "the quick brown fox jumps over the lazy dog ".repeat(35);
-        for _ in 0..5_000 {
-            let doc = khive_storage::types::TextDocument {
-                subject_id: uuid::Uuid::new_v4(),
-                kind: khive_types::SubstrateKind::Note,
-                record_kind: Some("memory".to_string()),
-                title: None,
-                body: body.clone(),
-                tags: vec![],
-                namespace: "test_ns".to_string(),
-                metadata: None,
-                updated_at: chrono::Utc::now(),
-            };
-            store.upsert_document(doc).await.unwrap();
-        }
+        let mut seeded = 0;
+        let mut work = Vec::new();
+        for target_rows in [100, 5_000] {
+            for _ in seeded..target_rows {
+                let doc = khive_storage::types::TextDocument {
+                    subject_id: uuid::Uuid::new_v4(),
+                    kind: khive_types::SubstrateKind::Note,
+                    record_kind: Some("memory".to_string()),
+                    title: None,
+                    body: body.clone(),
+                    tags: vec![],
+                    namespace: "test_ns".to_string(),
+                    metadata: None,
+                    updated_at: chrono::Utc::now(),
+                };
+                store.upsert_document(doc).await.unwrap();
+            }
+            seeded = target_rows;
+            assert_eq!(
+                store
+                    .count(khive_storage::types::TextFilter {
+                        namespaces: vec!["test_ns".to_string()],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+                target_rows,
+                "the work comparison requires both declared row populations"
+            );
 
-        // First call after seeding backfills the map (a real, one-time full
-        // scan) — not part of what this test bounds.
-        let _ = backend.text("hot_path_reopen").unwrap();
-
-        let start = std::time::Instant::now();
-        for _ in 0..500 {
+            // The first populated open records completion outside the work
+            // measurement; later upserts maintain the rowid map atomically.
             let _ = backend.text("hot_path_reopen").unwrap();
+            work.push(repeated_open_work(&backend));
         }
-        let elapsed = start.elapsed();
+
+        let [small, large] = [work[0], work[1]];
+        assert!(small > 0 && large > 0, "both work meters must be active");
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "500 repeated backend.text() calls over a 5,000-row table took {elapsed:?} — \
-             an O(1) already-backfilled short-circuit should clear this budget by a wide \
-             margin; an O(row-count) short-circuit (e.g. `COUNT(*)`) would not"
+            large <= small * 2,
+            "500 repeated backend.text() calls used {small} SQLite VM progress units at \
+             100 rows and {large} at 5,000 rows; growing the table 50-fold must not \
+             more than double already-backfilled work (for example via COUNT(*))"
         );
     }
 
-    /// `text_repeated_open_after_backfill_...` above seeds through
-    /// `upsert_document`, which already maintains the map transactionally —
-    /// the map is never actually empty by the time `backend.text()` is
-    /// called, so that test's short-circuit bound never exercises the real
-    /// backfill body at all. This test seeds
-    /// the FTS table with raw SQL, bypassing the map entirely, to reproduce
-    /// a genuinely pre-migration database, then asserts the backfill that
-    /// runs on the next `backend.text()` call gives every FTS row exactly
-    /// one map entry (LEFT JOIN parity, both directions) before repeating
-    /// the same O(1) re-open bound.
+    /// Legacy FTS tables can hold rows with no corresponding rowid-map
+    /// entries. Seed that state without the maintained write path, then
+    /// assert that opening the text store restores bidirectional rowid
+    /// parity without losing records. Repeated-open work growth is covered
+    /// separately by `text_repeated_open_after_backfill_does_not_scale_with_row_count`.
     #[tokio::test]
     async fn text_open_after_legacy_seed_backfills_the_map_with_full_parity() {
         let backend = StorageBackend::memory().unwrap();
@@ -1989,19 +2055,6 @@ mod tests {
             assert_eq!(fts_count, 500);
             assert_eq!(map_count, 500);
         }
-
-        // Now that a REAL backfill ran, repeated re-opens must still stay
-        // O(1) — same budget/rationale as
-        // `text_repeated_open_after_backfill_does_not_scale_with_row_count`.
-        let start = std::time::Instant::now();
-        for _ in 0..500 {
-            let _ = backend.text(table_key).unwrap();
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "500 repeated backend.text() calls after a real backfill took {elapsed:?}"
-        );
     }
 
     /// A map holding a row for B but none for A (the exact state a crash

@@ -817,8 +817,12 @@ impl KhiveRuntime {
                     if !split.db_path.exists() {
                         return Ok(legacy);
                     }
-                    let lane = crate::events_split::direct_backend_read_only_for(&split.db_path)?
-                        .events_for_namespace(namespace)?;
+                    let lane = crate::events_split::direct_backend_with_max_readers(
+                        &split.db_path,
+                        true,
+                        Some(self.backend.pool().config().max_readers),
+                    )?
+                    .events_for_namespace(namespace)?;
                     return Ok(Arc::new(crate::events_split::SplitEventStore::new(
                         legacy, lane,
                     )));
@@ -839,8 +843,12 @@ impl KhiveRuntime {
                                 .to_string(),
                         ));
                     }
-                    None => crate::events_split::direct_backend_for(&split.db_path)?
-                        .events_for_namespace(namespace)?,
+                    None => crate::events_split::direct_backend_with_max_readers(
+                        &split.db_path,
+                        false,
+                        Some(self.backend.pool().config().max_readers),
+                    )?
+                    .events_for_namespace(namespace)?,
                 };
                 Ok(Arc::new(crate::events_split::SplitEventStore::new(
                     legacy, lane,
@@ -879,9 +887,17 @@ impl KhiveRuntime {
                     return Ok(None);
                 }
                 let backend = if self.backend.is_read_only() {
-                    crate::events_split::direct_backend_read_only_for(&split.db_path)?
+                    crate::events_split::direct_backend_with_max_readers(
+                        &split.db_path,
+                        true,
+                        Some(self.backend.pool().config().max_readers),
+                    )?
                 } else {
-                    crate::events_split::direct_backend_for(&split.db_path)?
+                    crate::events_split::direct_backend_with_max_readers(
+                        &split.db_path,
+                        false,
+                        Some(self.backend.pool().config().max_readers),
+                    )?
                 };
                 Ok(Some(backend.sql()))
             }
@@ -2806,6 +2822,10 @@ mod tests {
     #[test]
     #[serial]
     fn tilde_prefixed_db_override_resolves_and_boots_like_the_absolute_equivalent() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let original_home = std::env::var_os("HOME");
         let original_cwd = std::env::current_dir().expect("read cwd");
         let home_dir = tempfile::tempdir().expect("home tempdir");

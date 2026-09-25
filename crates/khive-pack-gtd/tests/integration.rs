@@ -73,6 +73,7 @@ async fn pack_metadata_matches_trait_consts() {
     assert!(pack.note_kinds().contains(&"task"));
     let verbs: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
     assert!(verbs.contains(&"gtd.assign"));
+    assert!(verbs.contains(&"gtd.repair"));
     assert!(verbs.contains(&"gtd.next"));
     assert!(verbs.contains(&"gtd.complete"));
     assert!(verbs.contains(&"gtd.tasks"));

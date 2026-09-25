@@ -11353,6 +11353,158 @@ async fn i1422_time_bounds_are_since_inclusive_and_before_exclusive() {
 }
 
 #[tokio::test]
+async fn i1797_read_returns_message_and_body_false_keeps_ack_shape() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend.clone(), "lambda:reader");
+    let (other_registry, _) = build_actor_registry(backend, "lambda:other");
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let first = insert_i1422_message(
+        &runtime,
+        179701,
+        created_at,
+        "lambda:sender",
+        "lambda:reader",
+        Some("private subject"),
+        "private body",
+    )
+    .await;
+
+    let denied = other_registry
+        .dispatch("comm.read", serde_json::json!({"id": first.to_string()}))
+        .await
+        .expect_err("a different actor cannot read the message");
+    let denial = denied.to_string();
+    assert!(!denial.contains("private subject"), "{denial}");
+    assert!(!denial.contains("private body"), "{denial}");
+
+    let read = registry
+        .dispatch("comm.read", serde_json::json!({"id": first.to_string()}))
+        .await
+        .expect("read message");
+    assert_eq!(read["status"], "success");
+    assert_eq!(read["read"], true);
+    assert_eq!(read["subject"], "private subject");
+    assert_eq!(read["content"], "private body");
+    assert_eq!(read["from"], "lambda:sender");
+    assert_eq!(read["to"], "lambda:reader");
+    assert_eq!(read["direction"], "inbound");
+    assert!(read["created_at"].is_string());
+
+    let second = insert_i1422_message(
+        &runtime,
+        179702,
+        created_at + 1,
+        "lambda:sender",
+        "lambda:reader",
+        Some("ack subject"),
+        "ack body",
+    )
+    .await;
+    let ack = registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({"id": second.to_string(), "body": false}),
+        )
+        .await
+        .expect("ack without body");
+    assert_eq!(ack["status"], "success");
+    assert_eq!(ack["read"], true);
+    for field in [
+        "subject",
+        "content",
+        "from",
+        "to",
+        "direction",
+        "created_at",
+    ] {
+        assert!(ack.get(field).is_none(), "{field} appeared in {ack}");
+    }
+    assert_eq!(ack["properties"]["subject"], "ack subject");
+
+    let unread = registry
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread after both marks");
+    assert_eq!(unread["count"], 0);
+}
+
+#[tokio::test]
+async fn i1797_bulk_read_returns_each_message_but_mark_read_stays_ack_only() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let first = insert_i1422_message(
+        &runtime,
+        179703,
+        created_at,
+        "lambda:sender",
+        "lambda:reader",
+        Some("first subject"),
+        "first body",
+    )
+    .await;
+    let second = insert_i1422_message(
+        &runtime,
+        179704,
+        created_at + 1,
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "second body",
+    )
+    .await;
+    let result = registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({"ids": [first.to_string(), second.to_string(), first.to_string()]}),
+        )
+        .await
+        .expect("bulk read");
+    assert_eq!(result["requested_count"], 3);
+    assert_eq!(result["unique_count"], 2);
+    assert_eq!(result["marked_count"], 2);
+    assert_eq!(result["results"][0]["subject"], "first subject");
+    assert_eq!(result["results"][0]["content"], "first body");
+    assert!(result["results"][1]["subject"].is_null());
+    assert_eq!(result["results"][1]["content"], "second body");
+
+    let ack = registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({"ids": [first.to_string(), second.to_string()], "body": false}),
+        )
+        .await
+        .expect("bulk acknowledgement without bodies");
+    assert_eq!(ack["marked_count"], 2);
+    assert!(ack["results"]
+        .as_array()
+        .expect("bulk ack results")
+        .iter()
+        .all(|item| item.get("content").is_none() && item.get("subject").is_none()));
+
+    let third = insert_i1422_message(
+        &runtime,
+        179705,
+        created_at + 2,
+        "lambda:sender",
+        "lambda:reader",
+        Some("third subject"),
+        "third body",
+    )
+    .await;
+    let mark = registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({"ids": [third.to_string()]}),
+        )
+        .await
+        .expect("named mark read");
+    assert_eq!(mark["results"][0]["read"], true);
+    assert!(mark["results"][0].get("content").is_none());
+    assert!(mark["results"][0].get("subject").is_none());
+}
+
+#[tokio::test]
 async fn i1422_read_ids_marks_a_supplied_set_in_one_operation() {
     let backend = shared_backend();
     let (registry, runtime) = build_actor_registry(backend, "lambda:reader");

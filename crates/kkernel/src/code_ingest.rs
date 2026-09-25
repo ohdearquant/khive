@@ -794,7 +794,8 @@ mod tests {
     /// (`resolve_runtime_config_with_db_anchor` in `khive-mcp/src/serve.rs`),
     /// so a test that names its pack set in a TOML fixture is still steered by
     /// whatever the ambient shell exported unless the variable is pinned too.
-    /// Tests using this guard must be `#[serial]`: process env is global.
+    /// Tests using this guard run in an exact child: restoring an environment
+    /// value does not stop unrelated concurrent readers from observing it.
     struct PacksEnvGuard {
         previous: Option<std::ffi::OsString>,
     }
@@ -922,13 +923,35 @@ mod tests {
     }
 
     async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
-        let config = write_empty_test_config(
-            args.findings
-                .parent()
-                .expect("findings fixture must have a parent directory"),
-        );
-        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), |_| Ok(()))
+        code_ingest_batch_with_runtime_setup(args, |_| Ok(())).await
+    }
+
+    fn install_test_embedders(runtime: &KhiveRuntime) -> Result<()> {
+        for name in runtime.registered_embedding_model_names() {
+            let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
+            runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_ingest_fixture_writes_without_model_cache() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("ingest fixture");
+        let findings = write_valid_findings(dir.path());
+        let report = code_ingest_batch(base_args(findings, dir.path().join("ingest.db")))
             .await
+            .expect("offline fixture ingest");
+        assert_eq!(report.entities_created, 1);
+        assert_eq!(report.notes_created, 1);
+        assert_eq!(report.edges_created, 1);
+        let home = std::env::var_os("HOME").expect("private child HOME");
+        assert!(
+            std::fs::read_dir(home).unwrap().next().is_none(),
+            "default ingest fixture must not create a native model cache"
+        );
     }
 
     async fn code_ingest_batch_with_runtime_setup<F>(
@@ -943,8 +966,11 @@ mod tests {
                 .parent()
                 .expect("findings fixture must have a parent directory"),
         );
-        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), runtime_setup)
-            .await
+        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), |runtime| {
+            install_test_embedders(runtime)?;
+            runtime_setup(runtime)
+        })
+        .await
     }
 
     fn write_valid_findings(dir: &std::path::Path) -> PathBuf {
@@ -1125,6 +1151,10 @@ mod tests {
     #[serial]
     #[test]
     fn packs_env_guard_pins_the_fixture_pack_set_over_an_ambient_override() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
         let db = tmp.path().join("hermetic.db");
@@ -1170,6 +1200,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_batch_gate_denial_precedes_setup_and_record_writes() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let _packs = PacksEnvGuard::pin(ALL_PACKS);
         let findings = write_valid_findings(tmp.path());
@@ -1241,6 +1275,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_batch_gate_allow_persists_success_audit_event() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let _packs = PacksEnvGuard::pin(ALL_PACKS);
         let findings = write_valid_findings(tmp.path());
@@ -1252,7 +1290,7 @@ mod tests {
             base_args(findings, db.clone()),
             Some(&config),
             Some(gate as GateRef),
-            |_| Ok(()),
+            install_test_embedders,
         )
         .await
         .expect("an allowing gate must let the batch proceed");
@@ -1270,6 +1308,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_batch_gate_error_precedes_setup_and_record_writes() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let _packs = PacksEnvGuard::pin(ALL_PACKS);
         let findings = write_valid_findings(tmp.path());
@@ -1491,6 +1533,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_with_no_queue_writes_does_not_warn_on_drain() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _write_queue_env = WriteQueueEnvGuard::unset();
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
@@ -1649,6 +1695,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_return_implies_settled_file_state() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         // Pin the queue default: with the variable unset, a file-backed pool
         // resolves the write queue ON, so this test exercises the writer-task
         // drain rather than silently passing through the queue-off path an
@@ -1880,6 +1930,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_fails_loud_when_code_pack_not_configured() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -2151,6 +2205,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn take_writer_task_join_or_warn_already_taken_warns_loudly() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         // The helper reads the resolved config only, but the pool's
         // `PoolConfig::default()` reads KHIVE_WRITE_QUEUE at construction, so
         // pin the variable unset to get the file-backed queue-ON default.
@@ -2213,6 +2271,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_failed_ingest_still_drains_and_surfaces_primary_error() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _write_queue_env = WriteQueueEnvGuard::unset();
 
         let tmp = tempfile::TempDir::new().expect("temp dir");
