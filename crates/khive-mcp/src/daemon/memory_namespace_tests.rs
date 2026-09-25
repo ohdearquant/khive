@@ -290,6 +290,10 @@ async fn exercise(socket: &Path, config_id: &str) -> [bool; 3] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn bound_actor_memory_namespace_round_trip() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _environment = RecoveryTestGuard::new();
     clear_daemon_env();
     let directory = tempfile::tempdir().expect("isolated daemon storage");
