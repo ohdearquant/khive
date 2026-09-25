@@ -1178,7 +1178,7 @@ fn v38_malformed_legacy_properties_survive_boot_and_index_transitions() {
     assert_eq!(before.1, malformed.as_bytes());
     assert_eq!(before.4, 1);
 
-    let backend = crate::StorageBackend::sqlite(&path).expect("open legacy backend");
+    let backend = crate::StorageBackend::sqlite_for_test(&path).expect("open legacy backend");
     assert_eq!(
         backend
             .prepare_core_schema()
@@ -1254,7 +1254,7 @@ fn v38_malformed_legacy_properties_survive_boot_and_index_transitions() {
         snapshot(conn)
     };
     drop(backend);
-    let reopened = crate::StorageBackend::sqlite(&path).expect("reopen migrated backend");
+    let reopened = crate::StorageBackend::sqlite_for_test(&path).expect("reopen migrated backend");
     assert_eq!(
         reopened
             .prepare_core_schema()
@@ -3772,8 +3772,8 @@ fn concurrent_boots_converge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("concurrent-boot.db");
     let backends = [
-        crate::StorageBackend::sqlite(&path).expect("open first backend"),
-        crate::StorageBackend::sqlite(&path).expect("open second backend"),
+        crate::StorageBackend::sqlite_for_test(&path).expect("open first backend"),
+        crate::StorageBackend::sqlite_for_test(&path).expect("open second backend"),
     ];
     let canonical = backends[0]
         .pool()

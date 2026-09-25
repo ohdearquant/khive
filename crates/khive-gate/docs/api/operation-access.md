@@ -21,8 +21,8 @@ when that feature is not built. Workspace and formal declare no handlers.
 
 The implementation is [operation.rs](../../src/operation.rs). Its classifier
 version is part of every nonempty restriction's policy fingerprint.
-Revision `domain-effects-v5` explicitly classifies `session.search` as
-`Read`. Adding this classification changes that identity even though unknown
+Revision `domain-effects-v6` explicitly classifies `git.update_ref` as
+`Write`. Adding this classification changes that identity even though unknown
 operations were already denied. Empty restrictions retain their enrollment-only
 fingerprint.
 
@@ -106,6 +106,7 @@ fingerprint.
 | `git.receipts`               | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L44)   |
 | `git.reconcile`              | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L64)   |
 | `git.status`                 | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L72)   |
+| `git.update_ref`             | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L24)   |
 | `gtd.assign`                 | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.census`                 | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.complete`               | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)              |

@@ -2165,7 +2165,7 @@ mod tests {
         let path = dir.path().join("diag.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path.clone()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         {
@@ -3206,7 +3206,7 @@ mod tests {
 
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(alias_path.clone()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open through symlinked path");
         {
@@ -3299,7 +3299,7 @@ mod tests {
 
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(alias_path.clone()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open through symlinked path");
         {

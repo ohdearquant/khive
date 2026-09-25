@@ -776,7 +776,7 @@ async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
         ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -985,7 +985,7 @@ async fn filtered_count_free_page_keeps_one_statement_snapshot_and_total_order()
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("note-count-free-snapshot.db")),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -1142,7 +1142,7 @@ async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQue
         ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -1731,7 +1731,7 @@ async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("atomic-note-property-writer-task.db")),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -2716,7 +2716,7 @@ async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2773,7 +2773,7 @@ async fn upsert_note_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2867,7 +2867,7 @@ async fn upsert_note_reports_configured_write_queue_admission_deadline() {
         write_queue_enabled: Some(true),
         write_queue_capacity: 1,
         write_admission_deadline_ms: 100,
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2973,7 +2973,7 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("note-late-writer-task.db")),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
