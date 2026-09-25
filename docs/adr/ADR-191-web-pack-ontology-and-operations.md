@@ -289,6 +289,13 @@ reverse order is forbidden: a crash after the attachment
 rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
 which is data loss, and this amendment exists to make stored bodies stay alive.
 
+**Proposed correction (2026-09-25; ADR-121 Amendment 1).** The preceding scheduling claim does not
+bound this leak: the blob orphan sweep counts a still-present attachment row as live even when its
+record no longer exists. Removing such rows requires its own reconciliation (#3178). ADR-121
+Amendment 1 proposes a scheduled object sweep (#3038) under complete liveness and store-binding
+gates; that sweep does not discharge the attachment-row reconciliation. The accepted wording above
+remains intact pending the proposed correction.
+
 Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
 attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the
 receipt carries digest and size, and neither record carries an attachment; hard-deleting a routed
