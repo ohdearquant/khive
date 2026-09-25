@@ -581,3 +581,42 @@ async fn checkpoint_consolidates_updates_and_deletes_with_correct_uuid_mapping()
 
 #[path = "incremental_edge_tests.rs"]
 mod edge_tests;
+
+#[tokio::test]
+async fn pathless_incremental_tail_does_not_hold_shared_writer_after_read() {
+    const MODEL: &str = "fixture";
+    const DIMS: usize = 8;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    provision_test_vector_store(&rt, MODEL, DIMS);
+    let ann = new_shared();
+    ann.protected_tail_barrier.store(true, Ordering::SeqCst);
+
+    let reached_pause = ann.protected_tail_notify.notified();
+    let task_rt = rt.clone();
+    let task_ann = ann.clone();
+    let maintenance = tokio::spawn(async move {
+        crate::ann::incremental::protected_tail(&task_rt, &task_ann, MODEL, 0, 10)
+            .await
+            .expect("protected incremental tail")
+    });
+    reached_pause.await;
+
+    let writer = rt
+        .backend()
+        .pool()
+        .try_writer_nowait()
+        .unwrap_or_else(|error| {
+            panic!(
+                "PATHLESS_TAIL_WRITER_RELEASE: expected the shared writer to be available while incremental tail maintenance is paused; got {error}"
+            )
+        });
+    drop(writer);
+
+    ann.protected_tail_release.notify_one();
+    let tail = maintenance.await.expect("incremental-tail task");
+    assert!(
+        tail.is_some(),
+        "an empty tail remains within the replay limit"
+    );
+}

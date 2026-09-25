@@ -133,6 +133,15 @@ pub(crate) struct AnnState {
     /// Releases the armed pathless incremental checkpoint pause.
     #[cfg(test)]
     pub(crate) pathless_checkpoint_release: tokio::sync::Notify,
+    /// Test barrier after the single-statement incremental-tail read returns.
+    #[cfg(test)]
+    pub(crate) protected_tail_barrier: std::sync::atomic::AtomicBool,
+    /// Notified when incremental-tail maintenance reaches the post-read pause.
+    #[cfg(test)]
+    pub(crate) protected_tail_notify: tokio::sync::Notify,
+    /// Releases the incremental-tail post-read pause.
+    #[cfg(test)]
+    pub(crate) protected_tail_release: tokio::sync::Notify,
     /// Arms the test-only pause in `fresh_tail_reresolve` between its
     /// segment load and its registry-minimum re-check.
     #[cfg(test)]
@@ -191,6 +200,12 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         pathless_checkpoint_notify: tokio::sync::Notify::new(),
         #[cfg(test)]
         pathless_checkpoint_release: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        protected_tail_barrier: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        protected_tail_notify: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        protected_tail_release: tokio::sync::Notify::new(),
         #[cfg(test)]
         reresolve_race_barrier: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -417,6 +432,13 @@ impl AnnState {
         {
             self.pathless_checkpoint_notify.notify_one();
             self.pathless_checkpoint_release.notified().await;
+        }
+    }
+
+    pub(crate) async fn pause_protected_tail_for_test(&self) {
+        if self.protected_tail_barrier.swap(false, Ordering::SeqCst) {
+            self.protected_tail_notify.notify_one();
+            self.protected_tail_release.notified().await;
         }
     }
 }
@@ -2164,6 +2186,99 @@ async fn fetch_final_tail_on(
         .await
         .map_err(|e| e.to_string())?;
 
+    parse_final_tail_rows(&rows, model, s)
+}
+
+/// Read registry protection, raw delta size, and final vector state in one
+/// statement. Pathless SQLite readers share the writer connection, so keeping
+/// an explicit read transaction across several async reads would retain the
+/// only pooled connection while the task is suspended.
+async fn fetch_protected_tail_on(
+    reader: &mut dyn khive_storage::SqlReader,
+    model: &str,
+    s: u64,
+    max_delta: u64,
+) -> Result<Option<(Vec<(Uuid, Option<Vec<f32>>)>, u64, u64)>, String> {
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "WITH tail AS MATERIALIZED (\
+                   SELECT seq, subject_id, op FROM ann_write_log \
+                   WHERE embedding_model = ?1 \
+                     AND kind = 'note' AND field = 'note.content' AND seq > ?2\
+                 ), summary AS MATERIALIZED (\
+                   SELECT COUNT(*) AS raw_count, \
+                          (SELECT MIN(watermark) FROM ann_consumer_watermark \
+                           WHERE (namespace = ?3 OR namespace = '*') \
+                             AND embedding_model = ?1) AS min_watermark \
+                   FROM tail\
+                 ), selected AS MATERIALIZED (\
+                   SELECT seq, subject_id, op FROM tail \
+                   WHERE (SELECT raw_count FROM summary) <= ?4\
+                 ) \
+                 SELECT 0 AS is_summary, summary.raw_count, summary.min_watermark, \
+                        NULL AS seq, NULL AS subject_id, NULL AS op, \
+                        NULL AS vector_model, NULL AS vector_kind, NULL AS vector_field, \
+                        NULL AS embedding, NULL AS live_note_id \
+                 FROM summary \
+                 UNION ALL \
+                 SELECT 1 AS is_summary, NULL AS raw_count, NULL AS min_watermark, \
+                        selected.seq, selected.subject_id, selected.op, \
+                        vectors.embedding_model AS vector_model, \
+                        vectors.kind AS vector_kind, vectors.field AS vector_field, \
+                        vectors.embedding, live_note.id AS live_note_id \
+                 FROM selected \
+                 LEFT JOIN {table_name} AS vectors \
+                   ON vectors.subject_id = selected.subject_id \
+                 LEFT JOIN notes AS live_note \
+                   ON live_note.id = selected.subject_id \
+                  AND live_note.deleted_at IS NULL \
+                 ORDER BY is_summary, seq"
+            ),
+            params: vec![
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+                SqlValue::Text(ANN_WILDCARD_NS.to_owned()),
+                SqlValue::Integer(max_delta.min(i64::MAX as u64) as i64),
+            ],
+            label: Some("memory_ann_incremental_protected_tail".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let summary = rows
+        .first()
+        .filter(|row| matches!(row.get("is_summary"), Some(SqlValue::Integer(0))))
+        .ok_or_else(|| "incremental tail summary is missing".to_owned())?;
+    let raw_count = match summary.get("raw_count") {
+        Some(SqlValue::Integer(n)) if *n >= 0 => *n as u64,
+        _ => return Err("incremental tail count is invalid".into()),
+    };
+    if let Some(SqlValue::Integer(minimum)) = summary.get("min_watermark") {
+        if u64::try_from(*minimum).is_ok_and(|minimum| minimum > s) {
+            return Err("installed watermark is behind compacted history".into());
+        }
+    } else if !matches!(summary.get("min_watermark"), Some(SqlValue::Null)) {
+        return Err("incremental tail registry minimum is invalid".into());
+    }
+    if raw_count > max_delta {
+        return Ok(None);
+    }
+
+    let tail_rows = &rows[1..];
+    let (ops, end) = parse_final_tail_rows(tail_rows, model, s)?;
+    Ok(Some((ops, end, raw_count)))
+}
+
+/// Final op per subject, in sequence order, plus the last applied sequence.
+type FinalTail = (Vec<(Uuid, Option<Vec<f32>>)>, u64);
+
+fn parse_final_tail_rows(
+    rows: &[khive_storage::types::SqlRow],
+    model: &str,
+    s: u64,
+) -> Result<FinalTail, String> {
     let mut new_s = s;
     type RawVector = (
         Option<String>,
@@ -2174,7 +2289,7 @@ async fn fetch_final_tail_on(
     // Ordered iteration + insert-overwrite = final op per subject wins.
     let mut finals: Vec<(Uuid, bool, RawVector, bool)> = Vec::new();
     let mut index_of: HashMap<Uuid, usize> = HashMap::new();
-    for row in &rows {
+    for row in rows {
         let seq = match row.get("seq") {
             Some(SqlValue::Integer(n)) => *n,
             _ => return Err("ann_write_log.seq: unexpected value".into()),

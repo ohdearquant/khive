@@ -109,7 +109,7 @@ pub(super) enum InstalledMaintenance {
     Absent,
 }
 
-struct IncrementalTail {
+pub(super) struct IncrementalTail {
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
     applied: u64,
     raw_count: u64,
@@ -117,55 +117,27 @@ struct IncrementalTail {
 
 /// Read the delta and its raw row count under the same registry-protected snapshot.
 /// Coalescing repeatedly updated subjects must not hide the restart tail's size.
-async fn protected_tail(
+pub(super) async fn protected_tail(
     rt: &KhiveRuntime,
+    ann: &SharedAnn,
     model: &str,
     applied: u64,
     max_delta: u64,
 ) -> Result<Option<IncrementalTail>, String> {
+    #[cfg(not(test))]
+    let _ = ann;
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    begin_read_snapshot(reader.as_mut()).await?;
-    let result = async {
-        let minimum = registry_min_watermark_on(reader.as_mut(), model).await?;
-        if minimum
-            .and_then(|s| u64::try_from(s).ok())
-            .is_some_and(|s| s > applied)
-        {
-            return Err("installed watermark is behind compacted history".into());
-        }
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: "SELECT COUNT(*) AS count FROM ann_write_log \
-                  WHERE embedding_model = ?1 AND kind = 'note' AND field = 'note.content' \
-                    AND seq > ?2"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(applied as i64),
-                ],
-                label: Some("memory_ann_incremental_tail_count".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let count = match rows.first().and_then(|row| row.get("count")) {
-            Some(SqlValue::Integer(n)) if *n >= 0 => *n as u64,
-            _ => return Err("incremental tail count is invalid".into()),
-        };
-        // Decide before hydrating a large tail. Both reads use this snapshot.
-        if count > max_delta {
-            return Ok(None);
-        }
-        let (ops, end) = fetch_final_tail_on(reader.as_mut(), model, applied, None).await?;
-        Ok(Some(IncrementalTail {
+    let result = fetch_protected_tail_on(reader.as_mut(), model, applied, max_delta).await;
+    #[cfg(test)]
+    ann.pause_protected_tail_for_test().await;
+    result.map(|tail| {
+        tail.map(|(ops, applied, raw_count)| IncrementalTail {
             ops,
-            applied: end,
-            raw_count: count,
-        }))
-    }
-    .await;
-    end_read_snapshot(reader.as_mut()).await;
-    result
+            applied,
+            raw_count,
+        })
+    })
 }
 
 pub(super) async fn maintain_installed(
@@ -191,7 +163,7 @@ pub(super) async fn maintain_installed(
         ops,
         applied: new_s,
         raw_count,
-    } = match protected_tail(rt, model, applied, max_delta).await {
+    } = match protected_tail(rt, ann, model, applied, max_delta).await {
         Ok(Some(tail)) => tail,
         Ok(None) => return Ok(InstalledMaintenance::Rebuild),
         Err(error) => {
