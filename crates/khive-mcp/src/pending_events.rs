@@ -7965,6 +7965,10 @@ mod tests {
     #[serial_test::serial]
     #[serial_test::serial(config_ledger)]
     async fn run_pending_events_keeps_db_override_conflict_top_level() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
@@ -8008,6 +8012,10 @@ mod tests {
     #[serial_test::serial]
     #[serial_test::serial(config_ledger)]
     async fn run_pending_events_wraps_non_conflict_build_errors_with_context() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
@@ -8046,6 +8054,10 @@ mod tests {
     #[serial_test::serial]
     #[serial_test::serial(config_ledger)]
     async fn run_pending_events_fails_loud_for_missing_explicit_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
@@ -8097,6 +8109,10 @@ mod tests {
     #[serial_test::serial]
     #[serial_test::serial(config_ledger)]
     async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -8148,6 +8164,10 @@ mod tests {
     #[serial_test::serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -8194,6 +8214,10 @@ mod tests {
     #[serial_test::serial]
     #[serial_test::serial(config_ledger)]
     async fn wrapper_succeeds_under_strict_actor_mode_with_configured_project_actor() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");

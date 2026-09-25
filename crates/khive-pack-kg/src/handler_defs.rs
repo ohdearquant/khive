@@ -205,7 +205,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         description: "Fetch any record by UUID. Returns the bare record, no envelope: `kind` is \
                       the granular kind (concept, task, observation, ...), `entity_type` is the \
                       governed subtype when one is set, and an entity's vocabulary type lives \
-                      at `properties.type`.",
+                      at `properties.type`. A merged entity id returns the live kept entity with \
+                      `redirected_from` listing the traversed ids; include_deleted=true returns \
+                      the requested tombstone instead. Redirect cycles and excessive chains fail \
+                      with distinct errors, and the Gate checks the effective kept id.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -233,7 +236,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "boolean",
                 required: false,
                 description:
-                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated). Default false. \
+                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated), without following a merge redirect. Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
                      to soft-deleted records when no live record matches.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -255,7 +258,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       Entity, note, and edge cursor modes return \
                       {\"entities|notes|edges\": [...], \"next_after\": ...} with the same \
                       limit metadata. Caps are entity 500, note 200, edge 1000, event 1000, \
-                      and proposal 500.",
+                      and proposal 500. Unknown parameters are rejected. Filters that do not \
+                      apply to the requested kind are rejected even when null or empty.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -391,6 +395,62 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "string",
                 required: false,
                 description: "Filter events to a single EventKind (kind=\"event\" only). E.g. \"ProposalCreated\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "verb",
+                param_type: "string",
+                required: false,
+                description: "Events only: exact operation verb filter. Additive with verbs.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "verbs",
+                param_type: "array of string",
+                required: false,
+                description: "Events only: match any listed operation verb, including verb when supplied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "outcome",
+                param_type: "string",
+                required: false,
+                description: "Events only: success, denied, or error. A bounded scan applies this filter before result pagination; scan_incomplete discloses an exhausted scan budget.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Events only: exact stored actor filter. For proposals, filter by proposer actor (defaults to the caller; * selects all); explicit proposer takes precedence. Other kinds reject actor, including observation notes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "proposer",
+                param_type: "string",
+                required: false,
+                description: "Proposals only: exact proposer filter, overriding actor when both are supplied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "substrate",
+                param_type: "string",
+                required: false,
+                description: "Events only: filter by the stored substrate kind (note, entity, or event).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "since",
+                param_type: "integer",
+                required: false,
+                description: "Events only: exclusive created_at lower bound, in UTC epoch microseconds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "until",
+                param_type: "integer",
+                required: false,
+                description: "Events only: exclusive created_at upper bound, in UTC epoch microseconds.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1346,7 +1406,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                        -> Resolved; several identically-named entities -> \
                        Ambiguous over exactly that set); (4) hybrid search over \
                        the namespace, discarding vector hits with raw cosine similarity \
-                       below 0.3 before RRF fusion. Returns one of Resolved{id,confidence} | \
+                       below 0.3 before RRF fusion. A merged entity id resolves to the live kept \
+                       id with an ordered `redirected_from` chain after an effective-id Gate check; \
+                       cycles and excessive chains fail with distinct errors. Returns one of Resolved{id,confidence} | \
                        Ambiguous{candidates} | NotFound per ref — never a silent \
                        pick among close candidates. For a non-exact ref that \
                        stays ambiguous, `candidates` is a bounded sample capped \

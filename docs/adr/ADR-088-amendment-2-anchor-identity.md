@@ -1,11 +1,13 @@
 # ADR-088 Amendment 2: Canonical Repo-Anchor Identity for `git.digest`
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 **Date**: 2026-07-20
 **Amends**: [ADR-088 Amendment 1](ADR-088-amendment-1-git-digest.md)
 (anchor-resolution clause of the `project`
 parameter)
-**Tracking**: issues #1173, #1708
+**Tracking**: issues #1173, #1708; #3175 (the slug derivation did not yet
+confine userinfo to the URL authority, so an `@` in a path segment replaced
+the host, contrary to the all-segments rule below)
 
 ## Context
 
@@ -31,8 +33,10 @@ Every digest source resolves to one canonical **repo slug** stored in
   components, a `.git` suffix, and trailing slashes are stripped; the host
   is lowercased (DNS is case-insensitive) and a leading `www.` label is
   folded (matching the existing github.com owner/repo derivation). This
-  broad grammar governs **origin-remote normalization only** — the identity
-  derived for a local path from its configured `origin`. The `git.digest`
+  broad grammar governs **normalization only**: the identity derived for a
+  local path from its configured `origin`, and the stored
+  `properties.repo_url` values compared during step-2 reconciliation below,
+  which may hold any spelling an earlier anchor recorded. The `git.digest`
   `source` argument itself remains restricted to `https://` URLs and local
   paths exactly as Amendment 1 specifies; no new transport is accepted.
   **All** path segments are preserved in the slug — a nested-group URL such

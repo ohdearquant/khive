@@ -56,6 +56,8 @@ pub enum AuditProducer {
     DispatchSucceeded,
     /// A pack dispatch returned an error result.
     DispatchFailed,
+    /// A redirected KG read consulted the gate on its effective entity id.
+    EffectiveTargetCheck,
     /// The gate allowed a verb no pack owns.
     UnknownVerb,
     /// The strict `git.digest` success receipt (schema v2).
@@ -83,6 +85,7 @@ pub(crate) const fn classify(producer: AuditProducer) -> AuditProductionClass {
         AuditProducer::GateDenied
         | AuditProducer::DispatchSucceeded
         | AuditProducer::DispatchFailed
+        | AuditProducer::EffectiveTargetCheck
         | AuditProducer::UnknownVerb
         | AuditProducer::GitDigestReceipt => AuditProductionClass::DispatchObligation,
         AuditProducer::ConfigLocked

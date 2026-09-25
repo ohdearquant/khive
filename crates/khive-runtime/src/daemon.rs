@@ -745,6 +745,20 @@ pub struct DaemonResponseFrame {
     pub request_id: Option<u64>,
 }
 
+/// One checkpoint store in this daemon's fixed topology. IDs are process-local:
+/// `main` or `secondary:<index>` in dispatcher order. The basename is display-only,
+/// not an identity; no directory path is exposed. Restart/topology changes reset
+/// the interpretation of interval deltas.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct CheckpointStoreMetrics {
+    pub store_id: String,
+    pub role: String,
+    pub database: Option<String>,
+    #[serde(flatten)]
+    pub timing: khive_db::checkpoint::CheckpointTiming,
+}
+
 /// Point-in-time snapshot of the daemon's server-side gauges — the
 /// load/perf harness read-surface (measurement substrate, not a product feature).
 ///
@@ -778,6 +792,11 @@ pub struct MetricsSnapshot {
     /// Wall-clock timestamp of the routine WAL sample, for staleness checks.
     #[serde(default)]
     pub wal_observed_at_unix_ms: Option<u64>,
+    /// Cumulative actual routine PASSIVE calls for each store this daemon
+    /// checkpoints. Microseconds preserve sub-millisecond costs; max is since
+    /// process start, not an interval maximum. Counters saturate rather than wrap.
+    #[serde(default)]
+    pub wal_checkpoint_stores: Vec<CheckpointStoreMetrics>,
     /// Total WAL TRUNCATE escalation attempts (ADR-091 Plank 2) made in this
     /// process's lifetime, regardless of whether they succeeded in reclaiming
     /// pages.
@@ -1326,6 +1345,34 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         };
 
     let checkpoint_pool = dispatcher.pool_for_checkpoint();
+    let mut secondary_index = 0;
+    let wal_checkpoint_stores = checkpoint_task_specs(
+        checkpoint_pool.clone(),
+        dispatcher.secondary_pools_for_checkpoint(),
+        None,
+        String::new(),
+    )
+    .into_iter()
+    .map(|task| {
+        let (store_id, role) = if task.is_main {
+            ("main".to_string(), "main".to_string())
+        } else {
+            let store_id = format!("secondary:{secondary_index}");
+            secondary_index += 1;
+            (store_id, "secondary".to_string())
+        };
+        CheckpointStoreMetrics {
+            store_id,
+            role,
+            database: task
+                .pool
+                .canonical_path()
+                .and_then(std::path::Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned()),
+            timing: khive_db::checkpoint::checkpoint_timing(&task.pool),
+        }
+    })
+    .collect();
     let routine_wal = checkpoint_pool
         .as_deref()
         .and_then(khive_db::checkpoint::routine_wal_observation);
@@ -1351,6 +1398,7 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         wal_observed_at_unix_ms: routine_wal
             .as_ref()
             .map(|sample| sample.observed_at_unix_ms),
+        wal_checkpoint_stores,
         wal_truncate_attempts: khive_db::checkpoint::truncate_attempts(),
         wal_truncate_consecutive_failures: khive_db::checkpoint::truncate_consecutive_failures(),
         wal_checkpoint_skipped_ticks: khive_db::checkpoint::checkpoint_skipped_ticks(),
@@ -2291,6 +2339,17 @@ where
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),
         }
+        // Tokio retains its process-wide handlers after the streams are dropped.
+        // This daemon cannot restart without exec; a repeat signal must terminate
+        // even if shutdown is blocked in synchronous recovery-lock acquisition.
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            // SAFETY: setting SIG_DFL for these valid signals needs no handler
+            // pointer or shared Rust state and applies to the whole process.
+            if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok::<(), std::io::Error>(())
     };
 
     // SAFETY: `geteuid` is always successful and takes no arguments.
@@ -2351,7 +2410,7 @@ where
                 }
             }
         } => {}
-        _ = shutdown => {}
+        result = shutdown => result?,
     }
 
     // A listening backlog is not admitted work. Close it before draining so
@@ -2811,6 +2870,9 @@ pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, di
 #[cfg(all(test, unix))]
 mod tests {
     include!("daemon/plan_tests.rs");
+    mod shutdown_signals {
+        include!("daemon/shutdown_signal_tests.rs");
+    }
     use super::*;
     use serial_test::serial;
 
@@ -3286,6 +3348,8 @@ mod tests {
             .prefix("kh-drain-")
             .tempdir_in("/tmp")
             .expect("short isolated socket directory");
+        let child_home = dir.path().join("home");
+        std::fs::create_dir(&child_home).expect("empty daemon child HOME");
         let mut child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -3298,11 +3362,14 @@ mod tests {
             .envs(
                 std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
             )
-            .env("HOME", dir.path())
+            .env("HOME", &child_home)
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_DRAIN_TEST_CHILD", "1")
             .env("KHIVE_SOCKET", dir.path().join("s"))
             .env("KHIVE_PID", dir.path().join("p"))
             .env("KHIVE_LOCK", dir.path().join("l"))
+            .env("KHIVE_RECOVERER_LOCK", dir.path().join("r"))
             .env("KHIVE_DRAIN_TIMEOUT_SECS", "10")
             .current_dir(dir.path())
             .stdin(Stdio::null())
@@ -3329,6 +3396,10 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("STOPPED_LISTENER_DRAIN_VERIFIED"),
             "child must run the listener witness: {output:?}"
+        );
+        assert!(
+            std::fs::read_dir(child_home).unwrap().next().is_none(),
+            "daemon drain child must leave its private HOME empty"
         );
     }
 
@@ -4749,6 +4820,9 @@ mod tests {
         assert!(snapshot.wal_pending_frames.is_some());
         assert!(snapshot.wal_physical_bytes.is_some());
         assert!(snapshot.wal_observed_at_unix_ms.is_some());
+        assert_eq!(snapshot.wal_checkpoint_stores.len(), 1);
+        assert_eq!(snapshot.wal_checkpoint_stores[0].store_id, "main");
+        assert_eq!(snapshot.wal_checkpoint_stores[0].timing.ticks, 1);
         // The snapshot carries the checkpoint-pressure fields read-only
         // (no mutation path reachable through `MetricsSnapshot`/`DaemonRequestFrame`);
         // an observed tick (not a skip) must report a zero-length skip streak.
@@ -4756,6 +4830,195 @@ mod tests {
             snapshot.wal_checkpoint_consecutive_skips, 0,
             "an observed (non-skipped) tick must report zero consecutive skips, got {snapshot:?}"
         );
+    }
+
+    #[derive(Clone)]
+    struct CheckpointMetricsDispatch {
+        main: Option<Arc<ConnectionPool>>,
+        secondaries: Vec<Arc<ConnectionPool>>,
+    }
+
+    #[async_trait]
+    impl DaemonDispatch for CheckpointMetricsDispatch {
+        fn plan(&self, _ops: &str) -> String {
+            panic!("metrics must not plan")
+        }
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<RequestIdentity>,
+        ) -> Result<String, String> {
+            panic!("metrics must not dispatch")
+        }
+        async fn warm_all(&self) {}
+        fn namespace(&self) -> &str {
+            "local"
+        }
+        fn config_id(&self) -> &str {
+            "checkpoint-metrics"
+        }
+        fn pool_for_checkpoint(&self) -> Option<Arc<ConnectionPool>> {
+            self.main.clone()
+        }
+        fn secondary_pools_for_checkpoint(&self) -> Vec<Arc<ConnectionPool>> {
+            self.secondaries.clone()
+        }
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn metrics_checkpoint_timing_keeps_stores_separate_and_scrapes_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pools = Vec::new();
+        for label in ["primary", "secondary"] {
+            let directory = dir.path().join(label);
+            std::fs::create_dir(&directory).unwrap();
+            let pool = Arc::new(
+                ConnectionPool::new(khive_db::PoolConfig {
+                    path: Some(directory.join("same.db")),
+                    ..khive_db::PoolConfig::default()
+                })
+                .unwrap(),
+            );
+            pool.try_writer()
+                .unwrap()
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+            pools.push(pool);
+        }
+        let dispatcher = CheckpointMetricsDispatch {
+            main: Some(Arc::clone(&pools[0])),
+            secondaries: vec![Arc::clone(&pools[1])],
+        };
+        let before = build_metrics_snapshot(&dispatcher);
+        assert_eq!(before.wal_checkpoint_stores.len(), 2);
+        assert!(before
+            .wal_checkpoint_stores
+            .iter()
+            .all(|store| store.timing.ticks == 0));
+        for (index, pool) in pools.iter().enumerate() {
+            let conn = pool.open_standalone_writer().unwrap();
+            for _ in 0..=index {
+                khive_db::checkpoint_once(
+                    pool,
+                    &conn,
+                    &CheckpointConfig {
+                        truncate_high_water_pages: u64::MAX,
+                        ..CheckpointConfig::default()
+                    },
+                    &mut khive_db::checkpoint::TruncateState::default(),
+                )
+                .unwrap();
+            }
+        }
+        let mut request = base_request_frame("checkpoint-metrics");
+        request.metrics_only = true;
+        let snapshot = round_trip(dispatcher.clone(), &request)
+            .await
+            .metrics
+            .unwrap();
+        let stores = &snapshot.wal_checkpoint_stores;
+        assert_eq!(stores.len(), 2);
+        assert_eq!(stores[0].store_id, "main");
+        assert_eq!(stores[0].role, "main");
+        assert_eq!(stores[1].store_id, "secondary:0");
+        assert_eq!(stores[1].role, "secondary");
+        for store in stores {
+            assert_eq!(
+                store.database.as_deref(),
+                Some("same.db"),
+                "wire label must omit directories"
+            );
+            assert!(store.timing.elapsed_us_max <= store.timing.elapsed_us_sum);
+        }
+        assert_eq!(stores[0].timing.ticks, 1);
+        assert_eq!(stores[1].timing.ticks, 2);
+        let again = build_metrics_snapshot(&dispatcher);
+        assert_eq!(
+            again.wal_checkpoint_stores, *stores,
+            "scraping must not checkpoint"
+        );
+        let secondary_only = build_metrics_snapshot(&CheckpointMetricsDispatch {
+            main: None,
+            secondaries: vec![Arc::clone(&pools[1])],
+        });
+        assert_eq!(secondary_only.wal_checkpoint_stores.len(), 1);
+        assert_eq!(
+            secondary_only.wal_checkpoint_stores[0].store_id,
+            "secondary:0"
+        );
+        assert_eq!(secondary_only.wal_checkpoint_stores[0].timing.ticks, 2);
+        assert!(build_metrics_snapshot(&CheckpointMetricsDispatch {
+            main: None,
+            secondaries: vec![]
+        })
+        .wal_checkpoint_stores
+        .is_empty());
+    }
+
+    #[test]
+    fn metrics_checkpoint_timing_serde_is_additive_and_round_trips() {
+        let snapshot = MetricsSnapshot {
+            wal_checkpoint_stores: vec![CheckpointStoreMetrics {
+                store_id: "secondary:0".into(),
+                role: "secondary".into(),
+                database: Some("memory.db".into()),
+                timing: khive_db::checkpoint::CheckpointTiming {
+                    ticks: 7,
+                    elapsed_us_sum: 123,
+                    elapsed_us_max: 50,
+                    busy_ticks: 2,
+                    error_ticks: 1,
+                },
+            }],
+            ..MetricsSnapshot::default()
+        };
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        let store = &wire["wal_checkpoint_stores"][0];
+        assert_eq!(
+            store,
+            &serde_json::json!({
+                "store_id": "secondary:0", "role": "secondary", "database": "memory.db",
+                "ticks": 7, "elapsed_us_sum": 123, "elapsed_us_max": 50, "busy_ticks": 2, "error_ticks": 1,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<MetricsSnapshot>(wire.clone()).unwrap(),
+            snapshot
+        );
+        let mut old_wire = wire.clone();
+        old_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("wal_checkpoint_stores");
+        let old = serde_json::from_value::<MetricsSnapshot>(old_wire).unwrap();
+        assert!(
+            old.wal_checkpoint_stores.is_empty(),
+            "old snapshot must default the new vector"
+        );
+        let partial = serde_json::from_value::<CheckpointStoreMetrics>(serde_json::json!({
+            "store_id": "main", "role": "main"
+        }))
+        .unwrap();
+        assert_eq!(
+            partial.timing,
+            khive_db::checkpoint::CheckpointTiming::default()
+        );
+        assert_eq!(partial.database, None);
+        #[derive(serde::Deserialize)]
+        struct LegacyMetrics {
+            wal_pages: Option<u64>,
+            open_tx_count: usize,
+        }
+        let legacy: LegacyMetrics = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.wal_pages, None);
+        assert_eq!(legacy.open_tx_count, 0);
     }
 
     #[tokio::test]
@@ -5202,6 +5465,33 @@ mod tests {
             .expect("successor must receive connection");
     }
 
+    #[test]
+    fn isolated_daemon_locks_use_private_fixture_paths() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        for path in [lock_path(), recoverer_lock_path()] {
+            assert_eq!(
+                path.parent(),
+                home.parent(),
+                "runtime daemon locks must use private fixture paths outside HOME"
+            );
+        }
+        let _boot = acquire_daemon_boot_guard().expect("private boot lock");
+        let _recoverer = try_acquire_recoverer_lock_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("private recoverer lock")
+        .expect("private recoverer lock must be available");
+        assert!(lock_path().is_file());
+        assert!(recoverer_lock_path().is_file());
+        assert!(
+            std::fs::read_dir(home).unwrap().next().is_none(),
+            "both daemon lock producers must leave the child HOME empty"
+        );
+    }
+
     // ── the recovery lock actually serializes two boot sequences ─────────────
     //
     // Production wiring (`khive_mcp::serve::run` / `serve_server`) now acquires
@@ -5216,6 +5506,10 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_lock_serializes_two_concurrent_boot_sequences() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5259,6 +5553,10 @@ mod tests {
     #[test]
     #[serial]
     fn acquire_daemon_boot_guard_returns_guard_when_lock_available() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5276,6 +5574,10 @@ mod tests {
     #[test]
     #[serial]
     fn acquire_daemon_boot_guard_fails_loudly_when_lock_file_cannot_be_opened() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         // Point KHIVE_LOCK at a directory, not a file: opening a directory
         // with `write(true)` fails (EISDIR), so `acquire_recovery_lock`

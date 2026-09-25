@@ -17,6 +17,7 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+REPLAY_NAME_PREFIX = "${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}"
 
 
 def workflow_text(name: str) -> str:
@@ -69,6 +70,340 @@ def step_block(job, step_name):
     return job.split(f"- name: {step_name}", 1)[1].split("\n      - name: ", 1)[0]
 
 
+class MinioStorageChangeWorkflowTests(unittest.TestCase):
+    """Execute the shipped path gate with real, private shallow repositories."""
+
+    def setUp(self):
+        self.git = shutil.which("git")
+        self.bash = shutil.which("bash")
+        self.assertIsNotNone(self.git, "GIT_FIXTURE_TOOL_REQUIRED")
+        self.assertIsNotNone(self.bash, "BASH_FIXTURE_TOOL_REQUIRED")
+
+    def _gate_script(self):
+        job = indented_block(workflow_text("ci.yml"), "minio-blob-compat", 2)
+        step = step_block(job, "Determine whether storage crates changed")
+        lines = step.splitlines()
+        start = lines.index("        run: |") + 1
+        script_lines = []
+        for line in lines[start:]:
+            if line.strip() and not line.startswith("          "):
+                break
+            script_lines.append(line)
+        script = textwrap.dedent("\n".join(script_lines))
+        self.assertTrue(script.strip(), "WORKFLOW_BASH_EXTRACTED")
+        return script
+
+    def _git(self, cwd, env, *args, check=True):
+        result = subprocess.run(
+            [self.git, *args],
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if check:
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"GIT_FIXTURE_SETUP: {args!r}\n{result.stdout}\n{result.stderr}",
+            )
+        return result
+
+    def _shallow_fixture(self, changed_path="README.md"):
+        temporary = tempfile.TemporaryDirectory(prefix="minio-workflow-")
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        home = root / "home"
+        hooks = root / "empty-hooks"
+        home.mkdir()
+        hooks.mkdir()
+        # No inherited Git config, signing, hooks, credentials, or shell startup
+        # files may affect this fixture. Only its private file:// remote is used.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("GIT_", "BASH_FUNC_")) and key not in {"BASH_ENV", "ENV"}
+        }
+        env.update(
+            HOME=str(home),
+            XDG_CONFIG_HOME=str(home / "config"),
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_SYSTEM=os.devnull,
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_TERMINAL_PROMPT="0",
+            GIT_ALLOW_PROTOCOL="file",
+        )
+        config = {
+            "user.name": "MinIO workflow fixture",
+            "user.email": "minio-workflow@example.invalid",
+            "commit.gpgsign": "false",
+            "tag.gpgsign": "false",
+            "core.hooksPath": str(hooks),
+            "core.autocrlf": "false",
+            "core.quotePath": "true",
+        }
+        env["GIT_CONFIG_COUNT"] = str(len(config))
+        for index, (key, value) in enumerate(config.items()):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
+
+        source = root / "source"
+        remote = root / "remote.git"
+        checkout = root / "checkout"
+        self._git(root, env, "init", "--bare", str(remote))
+        self._git(root, env, "init", "--initial-branch=main", str(source))
+        (source / "crates").mkdir()
+        (source / "crates" / ".keep").write_text("fixture working directory\n")
+        (source / "README.md").write_text("base revision\n")
+        self._git(source, env, "add", "--all")
+        self._git(source, env, "commit", "-m", "base fixture")
+        base = self._git(source, env, "rev-parse", "HEAD").stdout.strip()
+        changed = source / changed_path
+        changed.parent.mkdir(parents=True, exist_ok=True)
+        changed.write_text("changed revision\n")
+        self._git(source, env, "add", "--all")
+        self._git(source, env, "commit", "-m", "change fixture")
+        head = self._git(source, env, "rev-parse", "HEAD").stdout.strip()
+        remote_url = remote.as_uri()
+        self._git(source, env, "push", remote_url, "HEAD:refs/heads/main")
+        self._git(
+            root, env, "clone", "--depth=1", "--no-local", "--branch", "main",
+            remote_url, str(checkout),
+        )
+        self.assertEqual(
+            self._git(checkout, env, "rev-parse", "HEAD").stdout.strip(),
+            head,
+            "SHALLOW_CHECKOUT_IS_CHANGED_REVISION",
+        )
+        self.assertEqual(
+            self._git(checkout, env, "rev-parse", "--is-shallow-repository").stdout.strip(),
+            "true",
+            "FIXTURE_IS_DEPTH_ONE_CLONE",
+        )
+        self.assertNotEqual(
+            self._git(checkout, env, "cat-file", "-e", f"{base}^{{commit}}", check=False).returncode,
+            0,
+            "SHALLOW_PARENT_INITIALLY_ABSENT",
+        )
+        return checkout, base, env
+
+    def _run_gate(self, checkout, env, *, event="pull_request", pr_base="", push_before=""):
+        output = checkout.parent / "github-output"
+        gate_env = {
+            **env,
+            "EVENT_NAME": event,
+            "PR_BASE_SHA": pr_base,
+            "PUSH_BEFORE_SHA": push_before,
+            "GITHUB_OUTPUT": str(output),
+        }
+        result = subprocess.run(
+            [self.bash, "--noprofile", "--norc", "-c", self._gate_script()],
+            cwd=checkout / "crates",
+            env=gate_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"WORKFLOW_BASH_SUCCEEDED\n{result.stdout}\n{result.stderr}",
+        )
+        self.assertTrue(output.is_file(), "WORKFLOW_OUTPUT_WAS_WRITTEN")
+        return output.read_text()
+
+    def _assert_base_fetched(self, checkout, base, env):
+        self.assertEqual(
+            self._git(checkout, env, "cat-file", "-e", f"{base}^{{commit}}", check=False).returncode,
+            0,
+            "COMPARISON_BASE_WAS_FETCHED",
+        )
+
+    def test_pull_request_nonstorage_change_fetches_missing_base(self):
+        checkout, base, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=false\n",
+            "PR_BASE_FETCH_SKIPS_NONSTORAGE",
+        )
+        self._assert_base_fetched(checkout, base, env)
+
+    def test_push_nonstorage_change_fetches_missing_base(self):
+        checkout, base, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, event="push", push_before=base),
+            "run=false\n",
+            "PUSH_BASE_FETCH_SKIPS_NONSTORAGE",
+        )
+        self._assert_base_fetched(checkout, base, env)
+
+    def _assert_protected_path(self, path, marker):
+        checkout, base, env = self._shallow_fixture(path)
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base), "run=true\n", marker,
+        )
+        self._assert_base_fetched(checkout, base, env)
+
+    def test_database_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/khive-db/src/fixture.rs", "DATABASE_PATH_RUNS_MINIO")
+
+    def _assert_quoted_database_path(self, path, marker):
+        checkout, base, env = self._shallow_fixture(path)
+        self.assertEqual(self._run_gate(checkout, env, pr_base=base), "run=true\n", marker)
+        self._assert_base_fetched(checkout, base, env)
+        listed = self._git(checkout, env, "diff", "--name-only", base, "HEAD").stdout
+        self.assertTrue(
+            listed.startswith('"'),
+            f"{marker}: fixture must expose Git's C-quoted name: {listed!r}",
+        )
+
+    def test_nonascii_database_path_runs_minio_after_fetching_base(self):
+        self._assert_quoted_database_path(
+            "crates/khive-db/tests/é.rs", "NONASCII_DATABASE_PATH_RUNS_MINIO",
+        )
+
+    def test_tab_in_database_path_runs_minio_after_fetching_base(self):
+        self._assert_quoted_database_path(
+            "crates/khive-db/tests/a\tb.rs", "TAB_DATABASE_PATH_RUNS_MINIO",
+        )
+
+    def test_storage_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/khive-storage/src/fixture.rs", "STORAGE_PATH_RUNS_MINIO")
+
+    def test_blob_contract_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("docs/adr/ADR-111-fixture.md", "BLOB_CONTRACT_PATH_RUNS_MINIO")
+
+    def test_ci_workflow_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path(".github/workflows/ci.yml", "CI_WORKFLOW_PATH_RUNS_MINIO")
+
+    def test_workspace_manifest_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/Cargo.toml", "WORKSPACE_MANIFEST_PATH_RUNS_MINIO")
+
+    def test_workspace_lockfile_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/Cargo.lock", "WORKSPACE_LOCKFILE_PATH_RUNS_MINIO")
+
+    def test_renaming_database_conformance_to_unprotected_crate_runs_minio(self):
+        protected = "crates/khive-db/tests/blob_conformance.rs"
+        unprotected = "crates/khive-types/tests/blob_conformance.rs"
+        checkout, _, env = self._shallow_fixture(protected)
+        base = self._git(checkout, env, "rev-parse", "HEAD").stdout.strip()
+        (checkout / unprotected).parent.mkdir(parents=True)
+        self._git(checkout, env, "mv", protected, unprotected)
+        self._git(checkout, env, "commit", "-m", "move conformance out of database crate")
+        # Pin the fixture to the behavior that hid the protected old path.
+        # The shipped script must override this with --no-renames.
+        self._git(checkout, env, "config", "diff.renames", "true")
+        self.assertEqual(
+            self._git(checkout, env, "diff", "--name-status", base, "HEAD").stdout,
+            f"R100\t{protected}\t{unprotected}\n",
+            "FIXTURE_IS_PROTECTED_TO_UNPROTECTED_RENAME",
+        )
+        self.assertEqual(
+            self._git(checkout, env, "diff", "--name-only", base, "HEAD").stdout,
+            f"{unprotected}\n",
+            "DEFAULT_RENAME_DIFF_HIDES_PROTECTED_SOURCE",
+        )
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=true\n",
+            "RENAMED_DATABASE_SOURCE_RUNS_MINIO",
+        )
+
+    def test_missing_base_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env), "run=true\n", "MISSING_BASE_RUNS_MINIO",
+        )
+
+    def test_new_branch_zero_push_base_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, event="push", push_before="0" * 40),
+            "run=true\n",
+            "ZERO_PUSH_BASE_RUNS_MINIO",
+        )
+
+    def test_unresolvable_base_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base="f" * 40),
+            "run=true\n",
+            "UNRESOLVABLE_BASE_RUNS_MINIO",
+        )
+
+    def test_non_sha_local_ref_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base="HEAD"),
+            "run=true\n",
+            "NON_SHA_BASE_RUNS_MINIO",
+        )
+
+    def test_manual_event_runs_minio_even_with_comparable_payload_bases(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self.assertEqual(
+            self._run_gate(
+                checkout, env, event="workflow_dispatch", pr_base=base, push_before=base,
+            ),
+            "run=true\n",
+            "MANUAL_EVENT_RUNS_MINIO",
+        )
+
+    def test_scheduled_event_runs_minio_even_with_comparable_payload_bases(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self.assertEqual(
+            self._run_gate(
+                checkout, env, event="schedule", pr_base=base, push_before=base,
+            ),
+            "run=true\n",
+            "SCHEDULED_EVENT_RUNS_MINIO",
+        )
+
+    def test_locally_present_base_skips_nonstorage_without_remote(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self._git(checkout, env, "remote", "remove", "origin")
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=false\n",
+            "LOCAL_BASE_NEEDS_NO_REMOTE",
+        )
+
+    def test_diff_failure_runs_minio(self):
+        checkout, base, env = self._shallow_fixture()
+        wrappers = checkout.parent / "wrappers"
+        wrappers.mkdir()
+        trace = checkout.parent / "diff-failure-trace"
+        wrapper = wrappers / "git"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "diff" ]; then\n'
+            '  printf "%s\\n" "forced diff failure" >> "$CI_DIFF_FAILURE_TRACE"\n'
+            "  exit 73\n"
+            "fi\n"
+            f"exec {shlex.quote(self.git)} \"$@\"\n"
+        )
+        wrapper.chmod(0o700)
+        gate_env = {
+            **env,
+            "PATH": f"{wrappers}{os.pathsep}{env.get('PATH', os.defpath)}",
+            "CI_DIFF_FAILURE_TRACE": str(trace),
+        }
+        self.assertEqual(
+            self._run_gate(checkout, gate_env, pr_base=base),
+            "run=true\n",
+            "DIFF_FAILURE_RUNS_MINIO",
+        )
+        self.assertTrue(trace.is_file(), "DIFF_FAILURE_WAS_EXERCISED")
+        self.assertEqual(trace.read_text(), "forced diff failure\n", "ONLY_DIFF_WAS_FORCED_TO_FAIL")
+        self._assert_base_fetched(checkout, base, env)
+
+
 class CoverageRatchetWorkflowTests(unittest.TestCase):
     def test_measurement_job_reports_compute_unavailability(self):
         workflow = workflow_text("ci.yml")
@@ -78,7 +413,7 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         # The job was named "(advisory)" while a missing measurement left the
         # gate green. It is not advisory now: the step below turns an absent
         # measurement into a failing job, so the name would misdescribe it.
-        self.assertIn("name: Coverage measurement\n", measurement)
+        self.assertIn("name: " + REPLAY_NAME_PREFIX + "Coverage measurement\n", measurement)
         self.assertNotIn("advisory", measurement)
         self.assertIn("id: compute_coverage", measurement)
         self.assertIn("continue-on-error: true", measurement)
@@ -96,9 +431,12 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         ratchet = indented_block(workflow, "coverage-ratchet", 2)
         gate = indented_block(workflow, "ci-gate", 2)
 
-        self.assertIn("needs: coverage-measurement", ratchet)
+        self.assertIn("needs: [resolve-revision, coverage-measurement]", ratchet)
         self.assertIn(
-            "if: needs.coverage-measurement.outputs.available == 'true'", ratchet
+            "if: needs.resolve-revision.result == 'success' && "
+            "needs.coverage-measurement.result == 'success' && "
+            "needs.coverage-measurement.outputs.available == 'true'",
+            step_block(ratchet, "Check coverage does not regress"),
         )
         self.assertNotIn("cargo llvm-cov", ratchet)
         self.assertIn("Check coverage does not regress", ratchet)
@@ -151,15 +489,10 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
-    # Jobs carrying a job-level `if:`, so they are the only ones that CAN skip.
-    CONDITIONAL_JOBS = {
-        "automerge-push-guard", "dependency-review", "coverage-ratchet",
-    }
-    # Jobs whose skip the gate FORGIVES, which is a smaller set and not the same
-    # question. The push guard and dependency review skip on run shape: they do
-    # not apply to this event. The coverage ratchet skips on a missing input, so
-    # forgiving it reports a coverage judgment that was never made.
-    FORGIVEN_SKIPS = {"automerge-push-guard", "dependency-review"}
+    # The push guard is the only remaining job with an eligibility predicate.
+    # always() admits a job after failed dependencies; it is not such a predicate.
+    CONDITIONAL_JOBS = {"automerge-push-guard"}
+    FORGIVEN_SKIPS = {"automerge-push-guard"}
 
     def setUp(self):
         self.workflow = workflow_text("ci.yml")
@@ -184,12 +517,11 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         conditional = {
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
+            and "    if: always()" not in indented_block(self.workflow, job, 2)
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
-        # Forgiving a job that cannot skip would be dead configuration, so the
-        # allow list stays inside the conditional set without being equal to it.
-        self.assertTrue(self.FORGIVEN_SKIPS < conditional)
+        self.assertEqual(self.FORGIVEN_SKIPS, conditional)
         for job in sorted(self.needs):
             for outcome in ("success", "skipped", "failure", "cancelled"):
                 with self.subTest(job=job, outcome=outcome):
@@ -199,8 +531,11 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                     accepted = outcome == "success" or (
                         outcome == "skipped" and job in self.FORGIVEN_SKIPS
                     )
-                    self.assertEqual(result.returncode, 0 if accepted else 1,
-                                     result.stdout + result.stderr)
+                    self.assertEqual(
+                        result.returncode, 0 if accepted else 1,
+                        f"AGGREGATE_SKIP_POLICY: {job}={outcome}\n"
+                        + result.stdout + result.stderr,
+                    )
                     if not accepted:
                         self.assertIn(f"Gate failure — jobs not green: {job}", result.stdout)
 
@@ -214,18 +549,18 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                                  result.stdout + result.stderr)
 
     def test_gate_mixed_results_report_only_rejected_jobs(self):
-        # The gate reports in NEEDS order, so the conditional jobs are inserted
-        # sorted rather than in set-iteration order: one of them is rejected now,
-        # which makes its position in the output an asserted value.
+        # Only the push guard's skip is expected; the newly admitted jobs must
+        # finish their no-work/failure path instead of silently skipping.
         results = {
             "ci": "skipped", "docs": "failure", "secret-scan": "cancelled",
-            **{job: "skipped" for job in sorted(self.CONDITIONAL_JOBS)},
+            "automerge-push-guard": "skipped", "dependency-review": "skipped",
+            "coverage-ratchet": "skipped",
         }
         result = self.run_gate(results)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(
             result.stdout.split("Gate failure — jobs not green: ", 1)[1].splitlines(),
-            ["ci", "docs", "secret-scan", "coverage-ratchet"],
+            ["ci", "docs", "secret-scan", "dependency-review", "coverage-ratchet"],
         )
 
 
@@ -1348,6 +1683,320 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("could not look up @khive-ai/cli@", completed.stderr)
         self.assertIn("ECONNREFUSED", completed.stderr)
         self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
+
+
+class HistoricalReplayWorkflowTests(unittest.TestCase):
+    CHECKOUT_NAMES = {
+        "ci": "CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)",
+        "khive-py": "Python client tests",
+        "kg-editor": "KG Studio (Next.js)",
+        "supply-chain": "Supply-chain (cargo-deny)",
+        "data-leak-guard": "JSON/JSONL data-leak guard",
+        "secret-scan": "Secret scan (gitleaks)",
+        "docs": "Docs lint",
+        "marketplace": "Marketplace example validator",
+        "doc-build": "Doc build (-D warnings)",
+        "dependency-review": "Dependency review",
+        "wasm-parity": "wasm-parity (khive-changeset)",
+        "vamana-portability": "vamana portability (ADR-110 Layer A)",
+        "minio-blob-compat": "MinIO BlobStore compatibility (ADR-111 Amendment 2)",
+        "check-windows": "Windows compile check",
+        "coverage-measurement": "Coverage measurement",
+        "coverage-ratchet": "Coverage ratchet",
+    }
+
+    def setUp(self):
+        self.workflow = workflow_text("ci.yml")
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.output = self.root / "output"
+        self.summary = self.root / "summary"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GITHUB_OUTPUT=str(self.output), GITHUB_STEP_SUMMARY=str(self.summary))
+
+    def script(self, job_name, step_name):
+        job = indented_block(self.workflow, job_name, 2)
+        step = job.split(f"- name: {step_name}\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match, f"missing executable step {step_name}")
+        return textwrap.dedent(match.group(1))
+
+    def run_script(self, script, *, cwd=None, **env):
+        self.output.write_text("")
+        self.summary.write_text("")
+        completed = subprocess.run(
+            ["bash", "-e", "-c", script], cwd=cwd or self.root,
+            env={**self.env, **env}, text=True, capture_output=True,
+            timeout=10, check=False,
+        )
+        return completed, self.output.read_text()
+
+    def git(self, cwd, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=cwd,
+            env=self.env, text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def repository(self):
+        remote = self.root / "origin.git"
+        work = self.root / "work"
+        self.git(self.root, "init", "--bare", "--initial-branch=main", str(remote))
+        self.git(self.root, "init", "--initial-branch=main", str(work))
+        self.git(work, "config", "user.name", "CI replay fixture")
+        self.git(work, "config", "user.email", "ci-replay@example.invalid")
+        self.git(work, "remote", "add", "origin", str(remote))
+        (work / "fixture").write_text("parent\n")
+        self.git(work, "add", "fixture")
+        self.git(work, "commit", "-m", "parent")
+        parent = self.git(work, "rev-parse", "HEAD")
+        (work / "fixture").write_text("tip\n")
+        self.git(work, "commit", "-am", "tip")
+        tip = self.git(work, "rev-parse", "HEAD")
+        self.git(work, "tag", "-a", "fixture-tag", "-m", "annotated tag")
+        tag = self.git(work, "rev-parse", "fixture-tag")
+        tree = self.git(work, "rev-parse", "HEAD^{tree}")
+        blob = self.git(work, "rev-parse", "HEAD:fixture")
+        self.git(work, "checkout", "-b", "side", parent)
+        (work / "fixture").write_text("side\n")
+        self.git(work, "commit", "-am", "side")
+        side = self.git(work, "rev-parse", "HEAD")
+        self.git(work, "checkout", "main")
+        self.git(work, "push", "origin", "main", "side", "--tags")
+        return work, {"parent": parent, "tip": tip, "side": side,
+                      "tag": tag, "tree": tree, "blob": blob}
+
+    def test_input_is_strict_hex_and_never_shell_source(self):
+        script = self.script("resolve-revision", "Validate replay input")
+        self.assertNotIn("${{", script, "input must be passed through environment")
+        for value in ["a" * 40, "F" * 40]:
+            result, output = self.run_script(script, EVENT_NAME="workflow_dispatch", REPLAY_SHA=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, "replay=true\n")
+        marker = self.root / "injected"
+        for value in ["main", "a" * 39, "a" * 41, "g" * 40, "--help",
+                      "a" * 40 + "\n", " " + "a" * 40, "a" * 40 + "^",
+                      f"$(touch {marker})", f"`touch {marker}`", f"'; touch {marker}; #"]:
+            with self.subTest(value=value):
+                result, output = self.run_script(script, EVENT_NAME="workflow_dispatch", REPLAY_SHA=value)
+                self.assertNotEqual(result.returncode, 0, "invalid replay input must be rejected")
+                self.assertIn("exactly 40 hexadecimal", result.stderr)
+                self.assertEqual(output, "")
+                self.assertFalse(marker.exists(), "input executed a shell command")
+
+    def test_ordinary_events_and_empty_dispatch_keep_event_checkout(self):
+        script = self.script("resolve-revision", "Validate replay input")
+        for event, value in [("workflow_dispatch", ""), ("push", ""),
+                             ("pull_request", "untrusted"), ("schedule", "")]:
+            result, output = self.run_script(script, EVENT_NAME=event, REPLAY_SHA=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, "replay=false\n")
+        resolver = indented_block(self.workflow, "resolve-revision", 2)
+        self.assertEqual(resolver.count("if: steps.request.outputs.replay == 'true'"), 2)
+        self.assertIn("checkout_sha: ${{ steps.resolve.outputs.checkout_sha }}", resolver)
+        self.assertNotIn("github.sha", resolver.split("outputs:", 1)[1].split("steps:", 1)[0])
+
+    def test_validator_accepts_main_ancestors_without_changing_checkout(self):
+        work, commits = self.repository()
+        script = self.script("resolve-revision", "Validate main ancestry")
+        self.assertNotIn("${{", script, "candidate must be passed through environment")
+        refs_before = self.git(work, "ls-remote", "origin")
+        for key in ["parent", "tip"]:
+            result, output = self.run_script(script, cwd=work, REPLAY_SHA=commits[key].upper())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, f"checkout_sha={commits[key]}\n")
+            self.assertIn(commits[key], self.summary.read_text())
+            self.assertEqual(self.git(work, "rev-parse", "HEAD"), commits["tip"])
+        self.assertEqual(self.git(work, "ls-remote", "origin"), refs_before)
+
+    def test_validator_rejects_non_main_commit(self):
+        work, commits = self.repository()
+        result, output = self.run_script(
+            self.script("resolve-revision", "Validate main ancestry"),
+            cwd=work, REPLAY_SHA=commits["side"],
+        )
+        self.assertNotEqual(result.returncode, 0, "non-main commit must be rejected")
+        self.assertIn("reachable from origin/main", result.stderr)
+        self.assertEqual(output, "")
+
+    def test_validator_rejects_non_commit_object_ids(self):
+        work, commits = self.repository()
+        for value in [commits["tag"], commits["tree"], commits["blob"], "0" * 40]:
+            with self.subTest(value=value):
+                result, output = self.run_script(
+                    self.script("resolve-revision", "Validate main ancestry"),
+                    cwd=work, REPLAY_SHA=value,
+                )
+                self.assertNotEqual(result.returncode, 0, "non-commit object must be rejected")
+                self.assertIn("must identify a commit object", result.stderr)
+                self.assertEqual(output, "")
+
+    def test_every_ci_checkout_uses_the_validated_sha_after_validation(self):
+        checkout_jobs = set()
+        for name in re.findall(r"(?m)^  ([a-z][a-z0-9-]*):$", self.workflow.split("jobs:\n", 1)[1]):
+            job = indented_block(self.workflow, name, 2)
+            if "uses: actions/checkout@v7" not in job:
+                continue
+            checkout_jobs.add(name)
+            if name == "resolve-revision":
+                self.assertLess(job.index("- name: Validate replay input"), job.index("uses: actions/checkout@v7"))
+                self.assertIn("ref: ${{ github.sha }}\n          fetch-depth: 0", job)
+                self.assertNotIn("run: scripts/", job)
+                continue
+            self.assertRegex(job, r"(?m)^    needs: (?:resolve-revision|\[resolve-revision, coverage-measurement\])$",
+                             "every source job must wait for validation")
+            self.assertEqual(job.count("uses: actions/checkout@v7"), 1)
+            self.assertIn("ref: ${{ needs.resolve-revision.outputs.checkout_sha }}", job,
+                          "every CI checkout must use the validated SHA")
+        self.assertEqual(checkout_jobs, set(self.CHECKOUT_NAMES) | {"resolve-revision"})
+        gate = indented_block(self.workflow, "ci-gate", 2)
+        self.assertIn("- resolve-revision", indented_block(gate, "needs", 4),
+                      "aggregate must require revision validation")
+        self.assertNotIn('"resolve-revision"', gate.split("as $allowed_skips", 1)[0].split("bad=", 1)[1])
+
+    def test_replay_check_names_are_distinct_and_ordinary_names_unchanged(self):
+        for name, ordinary in {**self.CHECKOUT_NAMES, "ci-gate": "CI gate"}.items():
+            with self.subTest(job=name):
+                job = indented_block(self.workflow, name, 2)
+                self.assertIn(f"name: {REPLAY_NAME_PREFIX}{ordinary}\n", job,
+                              "replay checks must not reuse ordinary required check names")
+        self.assertIn("format('CI replay {0}', inputs.main_sha) || ''", self.workflow)
+        dispatch = indented_block(indented_block(self.workflow, "on", 0), "workflow_dispatch", 2)
+        self.assertIn("main_sha:", dispatch)
+        self.assertIn("required: false", dispatch)
+        self.assertIn('default: ""', dispatch)
+
+    def test_conditional_check_names_are_admitted_before_work_eligibility(self):
+        # Hosted R2 evidence showed literal name expressions when job-level
+        # eligibility skipped a job. This prevents that source pattern; only a
+        # hosted run can establish how GitHub renders the resulting check names.
+        for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
+            with self.subTest(job=name):
+                job = indented_block(self.workflow, name, 2)
+                conditions = re.findall(r"(?m)^    if: (.+)$", job)
+                self.assertNotRegex(job, r"(?m)^    if: [>|]",
+                                    "CHECK_NAME_ADMISSION: no folded eligibility predicate")
+                self.assertIn(conditions, [[], ["always()"]],
+                              "CHECK_NAME_ADMISSION: eligibility belongs on steps")
+                if name in {"dependency-review", "coverage-ratchet"}:
+                    self.assertEqual(
+                        conditions, ["always()"],
+                        "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
+                    )
+
+    def test_dependency_review_work_is_pr_only_after_revision_validation(self):
+        job = indented_block(self.workflow, "dependency-review", 2)
+        expected = "needs.resolve-revision.result == 'success' && github.event_name == 'pull_request'"
+        for name in ["Checkout dependency review revision", "Dependency review"]:
+            with self.subTest(step=name):
+                step = step_block(job, name)
+                self.assertEqual(
+                    re.findall(r"(?m)^        if: (.+)$", step), [expected],
+                    "DEPENDENCY_REVIEW_ELIGIBILITY: checkout and action remain validated PR-only work",
+                )
+        self.assertEqual(
+            mapping_entries(indented_block(job, "permissions", 4)), {"contents: read"},
+            "DEPENDENCY_REVIEW_PERMISSIONS: review stays read-only",
+        )
+        review = step_block(job, "Dependency review")
+        self.assertIn("uses: actions/dependency-review-action@v4", review)
+        self.assertIn("fail-on-severity: high", review)
+        self.assertIn("allow-licenses:", review)
+        self.assertIn("allow-dependencies-licenses: pkg:pypi/typing-extensions, pkg:cargo/sqlite-vec", review)
+        self.assertNotIn("continue-on-error", job,
+                         "DEPENDENCY_REVIEW_FAILURES: real review failures must fail the job")
+
+    def test_non_pr_dependency_review_explicitly_reports_successful_no_work(self):
+        job = indented_block(self.workflow, "dependency-review", 2)
+        step = step_block(job, "Report dependency review not applicable")
+        self.assertEqual(
+            re.findall(r"(?m)^        if: (.+)$", step),
+            ["needs.resolve-revision.result == 'success' && github.event_name != 'pull_request'"],
+            "DEPENDENCY_REVIEW_NO_WORK: only validated non-PR runs take this path",
+        )
+        script = self.script("dependency-review", "Report dependency review not applicable")
+        self.assertNotIn("${{", script)
+        result, _ = self.run_script(script)
+        self.assertEqual(result.returncode, 0,
+                         "DEPENDENCY_REVIEW_NO_WORK: ineligible work completes successfully")
+        self.assertIn("no dependency comparison was run", result.stdout,
+                      "DEPENDENCY_REVIEW_NO_WORK: no-work must be explicit")
+
+    def test_failed_revision_is_a_named_dependency_review_failure(self):
+        job = indented_block(self.workflow, "dependency-review", 2)
+        step = step_block(job, "Refuse unvalidated dependency review revision")
+        self.assertEqual(
+            re.findall(r"(?m)^        if: (.+)$", step),
+            ["needs.resolve-revision.result != 'success'"],
+            "UNVALIDATED_REVISION_REJECTED: all non-success validation outcomes fail closed",
+        )
+        self.assertLess(job.index("- name: Refuse unvalidated dependency review revision"),
+                        job.index("uses: actions/checkout@v7"))
+        result, _ = self.run_script(self.script("dependency-review", "Refuse unvalidated dependency review revision"))
+        self.assertNotEqual(result.returncode, 0,
+                            "UNVALIDATED_REVISION_REJECTED: failed selection must not pass a check")
+        self.assertIn("dependency review did not run", result.stderr)
+
+    def test_coverage_work_requires_a_validated_available_measurement(self):
+        job = indented_block(self.workflow, "coverage-ratchet", 2)
+        expected = (
+            "needs.resolve-revision.result == 'success' && "
+            "needs.coverage-measurement.result == 'success' && "
+            "needs.coverage-measurement.outputs.available == 'true'"
+        )
+        for name in ["Checkout coverage baseline revision", "Check coverage does not regress"]:
+            with self.subTest(step=name):
+                self.assertEqual(
+                    re.findall(r"(?m)^        if: (.+)$", step_block(job, name)), [expected],
+                    "COVERAGE_WORK_ELIGIBILITY: validation and measurement must both succeed",
+                )
+        self.assertNotIn("continue-on-error", job,
+                         "COVERAGE_FAILURES: a regression must fail the job")
+
+    def test_unavailable_coverage_is_a_named_failure_without_a_judgment(self):
+        job = indented_block(self.workflow, "coverage-ratchet", 2)
+        step = step_block(job, "Refuse unavailable coverage input")
+        self.assertEqual(
+            re.findall(r"(?m)^        if: (.+)$", step),
+            ["needs.resolve-revision.result != 'success' || "
+             "needs.coverage-measurement.result != 'success' || "
+             "needs.coverage-measurement.outputs.available != 'true'"],
+            "UNAVAILABLE_COVERAGE_REJECTED: failure, cancellation, skip and missing output remain closed",
+        )
+        self.assertLess(job.index("- name: Refuse unavailable coverage input"),
+                        job.index("uses: actions/checkout@v7"))
+        result, _ = self.run_script(self.script("coverage-ratchet", "Refuse unavailable coverage input"))
+        self.assertNotEqual(result.returncode, 0,
+                            "UNAVAILABLE_COVERAGE_REJECTED: absent inputs cannot produce success")
+        self.assertIn("no coverage-regression judgment was made", result.stderr)
+
+    def test_replay_secret_scan_excludes_future_and_other_branch_commits(self):
+        work, commits = self.repository()
+        script = self.script("secret-scan", "Resolve scan scope")
+        script = script.replace("${{ github.event_name }}", "workflow_dispatch")
+        script = script.replace("${{ github.event.before }}", "").replace("${{ github.sha }}", commits["tip"])
+        result, output = self.run_script(script, cwd=work, REPLAY_SHA=commits["parent"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, f"range={commits['parent']}\n",
+                         "replay scan must use only the selected commit history")
+        scope = self.git(work, "rev-list", output.strip().removeprefix("range="))
+        self.assertEqual(scope, commits["parent"])
+        result, output = self.run_script(script, cwd=work, REPLAY_SHA="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, "range=\n")
+        nightly = self.script("secret-scan", "Resolve scan scope").replace("${{ github.event_name }}", "schedule")
+        nightly = nightly.replace("${{ github.event.before }}", "").replace("${{ github.sha }}", commits["tip"])
+        result, output = self.run_script(nightly, cwd=work, REPLAY_SHA="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, "range=\n")
+        job = indented_block(self.workflow, "secret-scan", 2)
+        self.assertIn("REPLAY_SHA: ${{ needs.resolve-revision.outputs.checkout_sha }}", job)
+        self.assertIn('range="${base}..${head}"', job)
+        self.assertIn('range="${before}..${{ github.sha }}"', job)
+        minio = indented_block(self.workflow, "minio-blob-compat", 2)
+        self.assertIn("no comparable base SHA -- running the MinIO leg to be safe", minio)
 
 
 if __name__ == "__main__":

@@ -125,6 +125,14 @@ anything else short of a persisted document): a refused URL is named in the repl
 silently dropped from the crawl, so a caller can tell "nothing matched" apart from "some targets
 were refused."
 
+### Deleting routed entities
+
+Web entities are stored on the web backend while their body attachments are rooted on the main
+backend. A hard-delete retry that finds the entity row already absent can remove a remaining main
+backend attachment. Its response has `deleted: false` and `attachment_cleanup: true`. `deleted`
+reports whether this call removed the entity row; attachment-only cleanup does not establish
+whether an earlier attempt completed its index cleanup or appended its entity deletion event.
+
 ### `web.search(query, provider?, limit?, persist?)`
 
 Query a configured `[[web.search_providers]]` entry — a `Fixture` (canned results, for tests and

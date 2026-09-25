@@ -54,6 +54,8 @@ fn failed_establishment_never_starts_components_and_always_cancels() {
             .prefix("kh-start-")
             .tempdir_in("/tmp")
             .unwrap();
+        let child_home = dir.path().join("home");
+        std::fs::create_dir(&child_home).expect("empty component child HOME");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -66,11 +68,14 @@ fn failed_establishment_never_starts_components_and_always_cancels() {
             .envs(
                 std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
             )
-            .env("HOME", dir.path())
+            .env("HOME", &child_home)
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_COMPONENT_START_CASE", scenario)
             .env("KHIVE_SOCKET", dir.path().join("s"))
             .env("KHIVE_PID", dir.path().join("p"))
             .env("KHIVE_LOCK", dir.path().join("l"))
+            .env("KHIVE_RECOVERER_LOCK", dir.path().join("r"))
             .current_dir(dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -98,6 +103,10 @@ fn failed_establishment_never_starts_components_and_always_cancels() {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("COMPONENT_START_OWNERSHIP_VERIFIED"),
             "{scenario}: {output:?}"
+        );
+        assert!(
+            std::fs::read_dir(child_home).unwrap().next().is_none(),
+            "component-start child must leave its private HOME empty: {scenario}"
         );
     }
 }
