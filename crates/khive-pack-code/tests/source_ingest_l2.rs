@@ -2088,6 +2088,100 @@ async fn positive_inherent_and_negative_impl_behavior_is_exact() {
     assert_ne!(first_times.1, second_times.1);
 }
 
+#[tokio::test]
+async fn generic_impl_methods_keep_distinct_l2_ids_and_legacy_stamps_reparse() {
+    let root = TempDir::new().expect("tempdir");
+    let pkg = root.path().join("pkg_generic_impls");
+    write_manifest(root.path(), "pkg_generic_impls");
+    std::fs::write(
+        pkg.join("src/lib.rs"),
+        r#"
+            struct S;
+            impl From<u8> for S { fn from(_: u8) -> Self { S } }
+            impl From<u16> for S { fn from(_: u16) -> Self { S } }
+            struct G<T>(T);
+            impl G<u8> { fn f() {} }
+            impl G<u16> { fn f() {} }
+        "#,
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("generic.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(&rt, &token, l2_only_opts(&pkg))
+        .await
+        .expect("first ingest succeeds");
+
+    let names = [
+        "<S as From<u8>>::from",
+        "<S as From<u16>>::from",
+        "G<u8>::f",
+        "G<u16>::f",
+    ];
+    let declarations = concepts_by_type(&rt, "pkg_generic_impls", "rust", "function").await;
+    assert_eq!(
+        declarations.len(),
+        names.len(),
+        "generic instantiations must not overwrite one another: {declarations:?}"
+    );
+    let mut ids = BTreeSet::new();
+    for name in names {
+        assert!(
+            declarations.iter().any(|(stored, _)| stored == name),
+            "missing {name}: {declarations:?}"
+        );
+        ids.insert(symbol_id(&rt, "pkg_generic_impls", name).await);
+    }
+    assert_eq!(ids.len(), names.len(), "each method needs its own UUID");
+
+    let module = module_properties(&rt, "pkg_generic_impls", "crate").await;
+    assert_eq!(module["l2_scanner_identity_version"].as_u64(), Some(2));
+    assert_eq!(module["declaration_ids"].as_array().unwrap().len(), 6);
+
+    let module_id = symbol_id(&rt, "pkg_generic_impls", "crate").await;
+    let mut legacy_module = rt
+        .get_entity(&token, module_id)
+        .await
+        .expect("module exists");
+    let prior_version = legacy_module.version;
+    legacy_module
+        .properties
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("module properties")
+        .remove("l2_scanner_identity_version");
+    legacy_module.updated_at += 1;
+    rt.entities(&token)
+        .expect("entity store")
+        .upsert_entity(legacy_module)
+        .await
+        .expect("persist legacy stamp through versioned store update");
+    assert_eq!(
+        rt.get_entity(&token, module_id)
+            .await
+            .expect("legacy module")
+            .version,
+        prior_version + 1,
+        "the fixture mutation must satisfy the entity version contract"
+    );
+
+    run_code_ingest(&rt, &token, l2_only_opts(&pkg))
+        .await
+        .expect("unchanged source reparses after legacy stamp");
+    let module = module_properties(&rt, "pkg_generic_impls", "crate").await;
+    assert_eq!(module["l2_scanner_identity_version"].as_u64(), Some(2));
+    let mut reingested_ids = BTreeSet::new();
+    for name in [
+        "<S as From<u8>>::from",
+        "<S as From<u16>>::from",
+        "G<u8>::f",
+        "G<u16>::f",
+    ] {
+        reingested_ids.insert(symbol_id(&rt, "pkg_generic_impls", name).await);
+    }
+    assert_eq!(ids, reingested_ids);
+}
+
 /// UUID5 identity is stable across a byte-identical re-ingest, survives a
 /// content change (same name/kind/module/project/language), and a rename
 /// creates a new identity while the old row remains as history.
@@ -2476,6 +2570,79 @@ async fn removed_dependency_edges_are_not_current_after_reingest() {
         l2_edge_metadata(&rt, "pkg_edge_currency", "depends_on", "caller", "helper").await;
     assert_eq!(metadata["last_seen_at"], first_sweep.to_rfc3339());
     assert_ne!(metadata["last_seen_at"], second_sweep.to_rfc3339());
+}
+
+#[tokio::test]
+async fn unchanged_l2_file_refreshes_only_edges_current_at_previous_project_sweep() {
+    let root = TempDir::new().expect("tempdir");
+    let pkg = root.path().join("pkg_edge_history");
+    write_manifest(root.path(), "pkg_edge_history");
+    let source = pkg.join("src/lib.rs");
+    std::fs::write(
+        &source,
+        "pub fn helper() {}\npub fn caller() { helper(); }\npub fn stable() { helper(); }\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("edge-history.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let first_sweep = Utc::now();
+    let second_sweep = first_sweep + chrono::Duration::seconds(1);
+    let third_sweep = second_sweep + chrono::Duration::seconds(1);
+    let ingest = |sweep_time| CodeSourceIngestOptions {
+        path: &pkg,
+        languages: rust_only(),
+        sweep_time,
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: true,
+    };
+
+    run_code_ingest(&rt, &token, ingest(first_sweep))
+        .await
+        .expect("T1 records both calls");
+    assert_eq!(
+        l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "caller", "helper").await
+            ["last_seen_at"],
+        first_sweep.to_rfc3339()
+    );
+
+    std::fs::write(
+        &source,
+        "pub fn helper() {}\npub fn caller() {}\npub fn stable() { helper(); }\n",
+    )
+    .unwrap();
+    run_code_ingest(&rt, &token, ingest(second_sweep))
+        .await
+        .expect("T2 removes one call");
+    assert_eq!(
+        l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "caller", "helper").await
+            ["last_seen_at"],
+        first_sweep.to_rfc3339(),
+        "removed call remains historical after the changed parse"
+    );
+    assert_eq!(
+        l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "stable", "helper").await
+            ["last_seen_at"],
+        second_sweep.to_rfc3339()
+    );
+
+    let third = run_code_ingest(&rt, &token, ingest(third_sweep))
+        .await
+        .expect("T3 reuses the unchanged file");
+    assert_eq!(
+        l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "caller", "helper").await
+            ["last_seen_at"],
+        first_sweep.to_rfc3339(),
+        "unchanged-file refresh must not revive the removed call"
+    );
+    assert_eq!(
+        l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "stable", "helper").await
+            ["last_seen_at"],
+        third_sweep.to_rfc3339(),
+        "a still-current call must advance using the pre-L1 project clock"
+    );
+    assert_eq!(third.l2.expect("T3 L2 report").symbol_edges_stamped, 1);
 }
 
 /// A valid, empty Rust file stamps `declaration_ids=[]`; a complete
