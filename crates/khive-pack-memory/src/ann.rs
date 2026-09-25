@@ -124,6 +124,15 @@ pub(crate) struct AnnState {
     /// Notified when a pathless fresh-tail reader waits for pending publication.
     #[cfg(test)]
     pub(crate) pathless_pending_publication_wait: tokio::sync::Notify,
+    /// Arms a pause before a pathless incremental checkpoint publishes its watermark.
+    #[cfg(test)]
+    pub(crate) pathless_checkpoint_barrier: std::sync::atomic::AtomicBool,
+    /// Notified when the pathless incremental checkpoint reaches the armed pause.
+    #[cfg(test)]
+    pub(crate) pathless_checkpoint_notify: tokio::sync::Notify,
+    /// Releases the armed pathless incremental checkpoint pause.
+    #[cfg(test)]
+    pub(crate) pathless_checkpoint_release: tokio::sync::Notify,
     /// Arms the test-only pause in `fresh_tail_reresolve` between its
     /// segment load and its registry-minimum re-check.
     #[cfg(test)]
@@ -176,6 +185,12 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         warming_idle: tokio::sync::Notify::new(),
         #[cfg(test)]
         pathless_pending_publication_wait: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_checkpoint_barrier: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        pathless_checkpoint_notify: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_checkpoint_release: tokio::sync::Notify::new(),
         #[cfg(test)]
         reresolve_race_barrier: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -393,6 +408,16 @@ impl AnnState {
 
     pub(crate) fn reset_warm_route_count(&self) {
         self.warm_route_count.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn pause_pathless_checkpoint_for_test(&self) {
+        if self
+            .pathless_checkpoint_barrier
+            .swap(false, Ordering::SeqCst)
+        {
+            self.pathless_checkpoint_notify.notify_one();
+            self.pathless_checkpoint_release.notified().await;
+        }
     }
 }
 

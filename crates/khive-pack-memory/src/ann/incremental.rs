@@ -237,8 +237,8 @@ pub(super) async fn maintain_installed(
     if !publish {
         return Ok(InstalledMaintenance::Complete);
     }
-    // Readers retain access to the incumbent during publication. No index write
-    // lock spans filesystem or database I/O; the caller owns the model warm lock.
+    // Readers retain access to the incumbent during file-backed publication. No
+    // index write lock spans that filesystem I/O; the caller owns the model warm lock.
     if let Some(dir) = ann_segment_dir(rt, model) {
         let indexes = ann.indexes.read().await;
         let Some(bridge) = indexes.get(key) else {
@@ -268,15 +268,23 @@ pub(super) async fn maintain_installed(
             }
         }
     } else {
-        if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
-            bridge.mark_checkpointed();
-        }
+        #[cfg(test)]
+        ann.pause_pathless_checkpoint_for_test().await;
+        // Keep the bridge's old exact-tail floor visible until the registry
+        // protects the applied sequence. Hold the write lock across both state
+        // changes so a reader cannot pair the raised floor with the old registry.
+        let mut indexes = ann.indexes.write().await;
         if let Err(error) =
             raise_watermark_with_authority(rt, model, new_s, WatermarkAuthority::Active).await
         {
+            drop(indexes);
             evict_unprotected_index(ann, key).await;
             return Err(RuntimeError::Internal(error));
         }
+        if let Some(bridge) = indexes.get_mut(key) {
+            bridge.mark_checkpointed();
+        }
+        drop(indexes);
         if let Err(error) = compact_log(rt, model).await {
             tracing::warn!(%error, model, "memory ANN log compaction failed after incremental checkpoint");
         }
