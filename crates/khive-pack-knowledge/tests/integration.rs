@@ -3499,6 +3499,60 @@ async fn compose_returns_markdown_for_atoms() {
     assert_eq!(count, 2);
 }
 
+/// #3233/#3235: a large first candidate must not stop packing, and the
+/// structured atom list/count must describe only what the briefing contains.
+#[tokio::test]
+async fn compose_skips_large_candidate_and_reports_only_packed_atoms() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "compose-too-large",
+                    "name": "Too Large",
+                    "content": "oversized ".repeat(400)
+                },
+                {
+                    "slug": "compose-small-a",
+                    "name": "Small A",
+                    "content": "first small relevant content ".repeat(22)
+                },
+                {
+                    "slug": "compose-small-b",
+                    "name": "Small B",
+                    "content": "second small relevant content ".repeat(22)
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    let response = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["compose-too-large", "compose-small-a", "compose-small-b"],
+                "query": "relevant content",
+                "max_tokens": 500,
+            }),
+        )
+        .await
+        .expect("compose with bounded output");
+    let data = &response["data"];
+    let markdown = data["markdown"].as_str().expect("markdown");
+    assert!(markdown.len() <= 2_000);
+    assert!(!markdown.contains("Too Large"));
+    assert!(markdown.contains("Small A"));
+    assert!(markdown.contains("Small B"));
+    let atoms = data["atoms"].as_array().expect("packed atoms");
+    assert_eq!(atoms.len(), 2);
+    assert_eq!(data["count"], json!(2));
+    assert_eq!(atoms[0]["slug"], json!("compose-small-a"));
+    assert_eq!(atoms[1]["slug"], json!("compose-small-b"));
+}
+
 /// #1505: the public namespace parameter is an exact compose scope, not a
 /// widened visible set. Identical slugs in local and a measurement arm must
 /// resolve to the arm's atom only, while an absent parameter preserves the
@@ -5466,11 +5520,10 @@ mod kg_blend {
     async fn blended_entities_respect_max_tokens_budget() {
         let f = pack(rt_with_marker_embedder());
 
-        // A padded atom whose cost alone consumes nearly all of the
-        // minimum-clamped max_tokens=500 budget (2000 chars), leaving too
-        // little remaining for the entity section but not exceeding the
-        // budget itself — the atom must survive either way.
-        let filler = "x".repeat(1677);
+        // A padded atom whose fully rendered briefing consumes nearly all
+        // of the 2000-byte floor budget, leaving too little for a KG heading
+        // and entity line. The atom must survive either way.
+        let filler = "x".repeat(1510);
         let big_content = format!("{OVERLAP_CONTENT} {filler}");
         f.dispatch(
             "knowledge.upsert_atoms",
@@ -5526,6 +5579,10 @@ mod kg_blend {
             .expect("tight-budget compose ok");
         let tight_atoms = tight["data"]["atoms"].as_array().expect("atoms array");
         assert!(!tight_atoms.is_empty(), "atoms must survive a tight budget");
+        assert!(
+            tight["data"]["markdown"].as_str().expect("markdown").len() <= 2_000,
+            "the whole rendered briefing, including the KG tail, must fit"
+        );
         assert!(
             tight["data"].get("entities").is_none(),
             "entity must be trimmed out under a tight budget, got: {}",

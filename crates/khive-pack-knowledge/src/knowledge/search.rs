@@ -27,10 +27,10 @@ use super::scoring::{
 };
 use super::sections::to_slug;
 use super::util::{
-    atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
-    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
-    sql_err, status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
-    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
+    atom_embed_text, atom_from_row, deser, domain_from_row, estimate_compose_item_tokens,
+    explicitly_requested_status, is_stop, row_bool, row_i64, row_str, sql_err, status_multiplier,
+    status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN, D_SUGGEST_RERANK_ALPHA,
+    MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -2739,107 +2739,346 @@ async fn search_kg_entities(
     Ok(hits)
 }
 
-/// Trims already-sorted, best-first `hits` to fit `remaining_budget`
-/// characters, using the same per-item cost accounting the atom/section trim
-/// loops use (`name + description` length plus a fixed per-entry overhead).
-/// Entities are trimmed against whatever budget the atom/section trim left
-/// over, so a tight `max_tokens` never evicts an atom to make room for a
-/// blended entity.
+const KG_ENTITIES_HEADING: &str = "\n---\n\n## Knowledge graph\n\n";
+
+fn format_kg_entity_line(entity: &KgEntityHit) -> String {
+    let mut line = format!("- **{}** ({})", entity.name, entity.kind);
+    if !entity.description.is_empty() {
+        line.push_str(&format!(" — {}", entity.description));
+    }
+    line.push('\n');
+    line
+}
+
+/// The supplementary KG block has its own heading. Price the exact bytes
+/// rendered, and skip a too-large hit so smaller lower-ranked hits can fit.
 fn trim_kg_entities_to_budget(hits: Vec<KgEntityHit>, remaining_budget: usize) -> Vec<KgEntityHit> {
     let mut used = 0usize;
     hits.into_iter()
-        .take_while(|h| {
-            let cost = compose_item_char_cost(&h.name, &h.description);
-            if used + cost > remaining_budget {
-                return false;
+        .filter(|h| {
+            let heading = if used == 0 {
+                KG_ENTITIES_HEADING.len()
+            } else {
+                0
+            };
+            let cost = heading + format_kg_entity_line(h).len();
+            if cost > remaining_budget.saturating_sub(used) {
+                false
+            } else {
+                used += cost;
+                true
             }
-            used += cost;
-            true
         })
         .collect()
 }
 
 fn format_kg_entities_markdown(entities: &[KgEntityHit]) -> String {
-    let mut out = String::from("\n---\n\n## Knowledge graph\n\n");
+    let mut out = String::from(KG_ENTITIES_HEADING);
     for e in entities {
-        out.push_str(&format!("- **{}** ({})", e.name, e.kind));
-        if !e.description.is_empty() {
-            out.push_str(&format!(" — {}", e.description));
-        }
+        out.push_str(&format_kg_entity_line(e));
+    }
+    out
+}
+
+fn format_compose_atom_heading(atom: &Atom) -> String {
+    format!("\n## {}\n\nSource: {}\n", atom.name, atom.slug)
+}
+
+fn format_compose_section(section: &super::compose::ComposeSectionResult, explain: bool) -> String {
+    let mut out = if explain {
+        format!(
+            "\n### {} (score: {:.4})\n\n",
+            section.heading, section.score
+        )
+    } else {
+        format!("\n### {}\n\n", section.heading)
+    };
+    if !section.content.is_empty() {
+        out.push_str(&section.content);
         out.push('\n');
     }
     out
 }
 
-fn format_section_compose_markdown(
+fn format_compose_whole_atom(atom: &Atom, score: f32, explain: bool) -> String {
+    let mut out = format_compose_atom_heading(atom);
+    if explain {
+        out.push_str(&format!("Score: {score:.4}\n"));
+    }
+    if !atom.content.is_empty() {
+        out.push('\n');
+        out.push_str(&atom.content);
+        out.push('\n');
+    }
+    out
+}
+
+fn format_compose_domain_footer(domains: &[Domain]) -> String {
+    if domains.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
+    format!("\n---\n\nDomains: {}\n", names.join(", "))
+}
+
+/// A composed body and the exact records that made it into that body.
+struct PackedCompose<'a> {
+    markdown: String,
+    sections: Vec<&'a super::compose::ComposeSectionResult>,
+    included_atom_ids: HashSet<String>,
+}
+
+/// Greedily pack ranked sections, then whole atoms that have no sections.
+/// When no section fits, retain the historical whole-atom fallback. Costs use
+/// the same fragments as rendering, including shared headings and metadata.
+fn pack_compose_markdown<'a>(
     query: &str,
     domains: &[Domain],
-    atoms: &[Atom],
-    sections: &[super::compose::ComposeSectionResult],
+    atoms: &'a [Atom],
+    items: &[ScoredTextItem],
+    sections: &'a [super::compose::ComposeSectionResult],
     explain: bool,
-) -> String {
-    let mut out = String::from("# Knowledge Briefing\n\n");
-    out.push_str(&format!("Query: {query}\n"));
-
-    let mut by_atom: HashMap<&str, Vec<&super::compose::ComposeSectionResult>> = HashMap::new();
-    for s in sections {
-        by_atom.entry(s.atom_id.as_str()).or_default().push(s);
+    char_budget: usize,
+) -> PackedCompose<'a> {
+    const PREFIX: &str = "# Knowledge Briefing\n\nQuery: ";
+    let mut footer = format_compose_domain_footer(domains);
+    if PREFIX.len() + 1 + footer.len() > char_budget {
+        // Full domain metadata remains in `data.domains`; omit an oversized
+        // display footer rather than letting it consume the entire briefing.
+        footer.clear();
+    }
+    let query_budget = char_budget - PREFIX.len() - 1 - footer.len();
+    let mut query_end = query.len().min(query_budget);
+    while !query.is_char_boundary(query_end) {
+        query_end -= 1;
+    }
+    let mut markdown = format!("{PREFIX}{}\n", &query[..query_end]);
+    let mut body_used = 0usize;
+    let body_budget = char_budget - markdown.len() - footer.len();
+    let by_id: HashMap<String, &Atom> = atoms.iter().map(|a| (a.id.to_string(), a)).collect();
+    let sectioned_atom_ids: HashSet<&str> = sections.iter().map(|s| s.atom_id.as_str()).collect();
+    let mut selected_by_atom: HashMap<&str, Vec<&super::compose::ComposeSectionResult>> =
+        HashMap::new();
+    let mut selected_sections = Vec::new();
+    let mut included_atom_ids = HashSet::new();
+    for section in sections {
+        let Some(atom) = by_id.get(&section.atom_id) else {
+            continue;
+        };
+        let atom_header_cost = if selected_by_atom.contains_key(section.atom_id.as_str()) {
+            0
+        } else {
+            format_compose_atom_heading(atom).len()
+        };
+        let cost = atom_header_cost + format_compose_section(section, explain).len();
+        if cost > body_budget.saturating_sub(body_used) {
+            continue;
+        }
+        body_used += cost;
+        selected_by_atom
+            .entry(section.atom_id.as_str())
+            .or_default()
+            .push(section);
+        included_atom_ids.insert(section.atom_id.clone());
+        selected_sections.push(section);
     }
 
+    let mut whole_atoms = Vec::new();
+    for item in items {
+        if !selected_sections.is_empty() && sectioned_atom_ids.contains(item.id.as_str()) {
+            continue;
+        }
+        let Some(atom) = by_id.get(&item.id) else {
+            continue;
+        };
+        let fragment = format_compose_whole_atom(atom, item.score, explain);
+        if fragment.len() > body_budget.saturating_sub(body_used) {
+            continue;
+        }
+        body_used += fragment.len();
+        included_atom_ids.insert(item.id.clone());
+        whole_atoms.push(fragment);
+    }
+
+    // Sections retain their existing per-atom presentation order. The
+    // sectionless whole-atom tail follows the atom rerank order.
     for atom in atoms {
         let atom_id = atom.id.to_string();
-        if let Some(secs) = by_atom.get(atom_id.as_str()) {
-            out.push_str(&format!("\n## {}\n\n", atom.name));
-            out.push_str(&format!("Source: {}\n", atom.slug));
-            for s in secs {
-                if explain {
-                    out.push_str(&format!("\n### {} (score: {:.4})\n\n", s.heading, s.score));
-                } else {
-                    out.push_str(&format!("\n### {}\n\n", s.heading));
-                }
-                if !s.content.is_empty() {
-                    out.push_str(&s.content);
-                    out.push('\n');
-                }
+        if let Some(secs) = selected_by_atom.get(atom_id.as_str()) {
+            markdown.push_str(&format_compose_atom_heading(atom));
+            for section in secs {
+                markdown.push_str(&format_compose_section(section, explain));
             }
         }
     }
-    if !domains.is_empty() {
-        out.push_str("\n---\n\nDomains: ");
-        let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
-        out.push_str(&names.join(", "));
-        out.push('\n');
+    for fragment in whole_atoms {
+        markdown.push_str(&fragment);
     }
-    out
+    markdown.push_str(&footer);
+    debug_assert_eq!(markdown.len(), char_budget - body_budget + body_used);
+    PackedCompose {
+        markdown,
+        sections: selected_sections,
+        included_atom_ids,
+    }
 }
 
-fn format_compose_markdown(
-    query: &str,
-    domains: &[Domain],
-    atoms: &[(&Atom, f32)],
-    explain: bool,
-) -> String {
-    let mut out = String::from("# Knowledge Briefing\n\n");
-    out.push_str(&format!("Query: {query}\n"));
-    for (atom, score) in atoms {
-        out.push_str(&format!("\n## {}\n\n", atom.name));
-        out.push_str(&format!("Source: {}\n", atom.slug));
-        if explain {
-            out.push_str(&format!("Score: {:.4}\n", score));
-        }
-        if !atom.content.is_empty() {
-            out.push('\n');
-            out.push_str(&atom.content);
-            out.push('\n');
+#[cfg(test)]
+mod compose_packing_tests {
+    use super::super::compose::{ComposeSectionResult, ScoreBreakdown};
+    use super::*;
+
+    fn atom(number: u128, name: &str, content: String) -> Atom {
+        Atom {
+            id: Uuid::from_u128(number),
+            namespace: "local".into(),
+            slug: format!("atom-{number}"),
+            name: name.into(),
+            content,
+            tags: "[]".into(),
+            properties: None,
+            status: Some("reviewed".into()),
+            source_uri: None,
+            source_type: None,
+            finalized: true,
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
         }
     }
-    if !domains.is_empty() {
-        out.push_str("\n---\n\nDomains: ");
-        let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
-        out.push_str(&names.join(", "));
-        out.push('\n');
+
+    fn item(atom: &Atom, score: f32) -> ScoredTextItem {
+        ScoredTextItem {
+            id: atom.id.to_string(),
+            slug: atom.slug.clone(),
+            name: atom.name.clone(),
+            text: atom.content.clone(),
+            score,
+        }
     }
-    out
+
+    fn domain(name: String) -> Domain {
+        Domain {
+            id: Uuid::from_u128(999),
+            namespace: "local".into(),
+            slug: "test-domain".into(),
+            name,
+            description: None,
+            tags: "[]".into(),
+            members: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        }
+    }
+
+    fn section(atom: &Atom, heading: &str, content: String, score: f32) -> ComposeSectionResult {
+        ComposeSectionResult {
+            section_id: Uuid::new_v4().to_string(),
+            atom_id: atom.id.to_string(),
+            section_type: "overview".into(),
+            heading: heading.into(),
+            content,
+            score,
+            score_breakdown: ScoreBreakdown {
+                section_cosine: score,
+                section_bm25: 0.0,
+                atom_cosine: score,
+                domain_score: 0.0,
+                type_weight: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn actual_markdown_budget_prices_query_domain_and_explain_in_both_modes() {
+        let query = "q".repeat(300);
+        let domains = vec![domain("long-domain-".repeat(15))];
+        let atom = atom(1, "Source Atom", "a".repeat(1_530));
+        let atoms = vec![atom.clone()];
+        let items = vec![item(&atom, 0.9)];
+        let whole = pack_compose_markdown(&query, &domains, &atoms, &items, &[], true, 2_000);
+        assert!(whole.markdown.len() <= 2_000);
+        assert!(
+            whole.included_atom_ids.is_empty(),
+            "long atom must not overflow"
+        );
+
+        let sections = vec![section(&atom, "Summary", "s".repeat(1_530), 0.9)];
+        let sectioned =
+            pack_compose_markdown(&query, &domains, &atoms, &items, &sections, true, 2_000);
+        assert!(sectioned.markdown.len() <= 2_000);
+        assert!(
+            sectioned.sections.is_empty(),
+            "long section must not overflow"
+        );
+
+        // Even a query longer than the entire budget has a bounded display;
+        // the response's structured `query` field still carries the full text.
+        let long_query = "é".repeat(1_500);
+        let bounded =
+            pack_compose_markdown(&long_query, &domains, &atoms, &items, &[], false, 2_000);
+        assert!(bounded.markdown.len() <= 2_000);
+        assert!(bounded.markdown.is_char_boundary(bounded.markdown.len()));
+    }
+
+    #[test]
+    fn atom_only_packing_skips_oversized_first_hit_and_keeps_smaller_hits() {
+        let atoms = vec![
+            atom(1, "Too Large", "x".repeat(3_000)),
+            atom(2, "Small Two", "y".repeat(300)),
+            atom(3, "Small Three", "z".repeat(300)),
+        ];
+        let items: Vec<_> = atoms
+            .iter()
+            .zip([0.9, 0.8, 0.7])
+            .map(|(a, s)| item(a, s))
+            .collect();
+        let packed = pack_compose_markdown("query", &[], &atoms, &items, &[], false, 2_000);
+        assert!(!packed.markdown.contains("Too Large"));
+        assert!(packed.markdown.contains("Small Two"));
+        assert!(packed.markdown.contains("Small Three"));
+        assert_eq!(packed.included_atom_ids.len(), 2);
+    }
+
+    #[test]
+    fn mixed_section_and_sectionless_atoms_both_survive() {
+        let atoms = vec![
+            atom(1, "Sectioned", "source body".into()),
+            atom(2, "Sectionless", "whole atom body".into()),
+        ];
+        let items = vec![item(&atoms[0], 0.9), item(&atoms[1], 0.8)];
+        let sections = vec![section(&atoms[0], "Overview", "section body".into(), 0.9)];
+        let packed = pack_compose_markdown("query", &[], &atoms, &items, &sections, true, 2_000);
+        assert!(packed.markdown.contains("section body"));
+        assert!(packed.markdown.contains("whole atom body"));
+        assert_eq!(packed.sections.len(), 1);
+        assert_eq!(packed.included_atom_ids.len(), 2);
+    }
+
+    #[test]
+    fn kg_tail_skips_oversized_hit_and_prices_heading_exactly() {
+        let hits = vec![
+            KgEntityHit {
+                id: "large".into(),
+                kind: "concept".into(),
+                name: "large".into(),
+                description: "x".repeat(3_000),
+                score: 0.9,
+            },
+            KgEntityHit {
+                id: "small".into(),
+                kind: "concept".into(),
+                name: "small".into(),
+                description: "short".into(),
+                score: 0.8,
+            },
+        ];
+        let kept = trim_kg_entities_to_budget(hits, 80);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "small");
+        assert!(format_kg_entities_markdown(&kept).len() <= 80);
+    }
 }
 
 // ─── handler impls ────────────────────────────────────────────────────────────
@@ -3744,7 +3983,7 @@ impl KnowledgeHandlers {
         let has_sections = !section_map.is_empty();
         try_or_finish!(timing.begin(Phase::Rerank));
 
-        let mut section_results = if has_sections {
+        let section_results = if has_sections {
             let domain_member_ids: HashSet<String> = member_slugs
                 .iter()
                 .filter_map(|slug| {
@@ -3793,36 +4032,20 @@ impl KnowledgeHandlers {
         let max_tokens = p.max_tokens.unwrap_or(8000).clamp(500, 100_000);
         let char_budget = max_tokens * CHARS_PER_TOKEN;
 
-        // Tracks characters consumed by the atom/section body so blended KG
-        // entities (below) trim against whatever budget is left over, never
-        // evicting an atom or section to make room for an entity.
-        let mut body_used = 0usize;
-
-        if !section_results.is_empty() {
-            section_results.retain(|s| {
-                let cost = compose_item_char_cost(&s.heading, &s.content);
-                if body_used + cost > char_budget {
-                    return false;
-                }
-                body_used += cost;
-                true
-            });
-        }
-
-        let (markdown, section_json, included_atom_ids) = if !section_results.is_empty() {
-            let included_atom_ids: HashSet<String> =
-                section_results.iter().map(|s| s.atom_id.clone()).collect();
-            let md = format_section_compose_markdown(
-                &raw_query,
-                &resolved_domains,
-                &ordered_atoms,
-                &section_results,
-                explain,
-            );
-            let sj: Vec<Value> = if explain {
-                section_results
-                    .iter()
-                    .map(|s| {
+        let packed = pack_compose_markdown(
+            &raw_query,
+            &resolved_domains,
+            &ordered_atoms,
+            &items,
+            &section_results,
+            explain,
+            char_budget,
+        );
+        let section_json: Vec<Value> = if explain {
+            packed
+                .sections
+                .iter()
+                .map(|s| {
                         json!({
                             "section_id": s.section_id,
                             "atom_id": s.atom_id,
@@ -3837,37 +4060,10 @@ impl KnowledgeHandlers {
                                 "type_weight": (s.score_breakdown.type_weight * 10000.0).round() / 10000.0,
                             },
                         })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            (md, sj, included_atom_ids)
+                })
+                .collect()
         } else {
-            let sorted_atoms: Vec<(&Atom, f32)> = items
-                .iter()
-                .filter_map(|item| {
-                    ordered_atoms
-                        .iter()
-                        .find(|a| a.id.to_string() == item.id)
-                        .map(|a| (a, item.score))
-                })
-                .take_while(|(a, _)| {
-                    let cost = compose_item_char_cost(&a.name, &a.content);
-                    if body_used + cost > char_budget {
-                        return false;
-                    }
-                    body_used += cost;
-                    true
-                })
-                .collect();
-            let included_atom_ids: HashSet<String> =
-                sorted_atoms.iter().map(|(a, _)| a.id.to_string()).collect();
-            (
-                format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms, explain),
-                Vec::new(),
-                included_atom_ids,
-            )
+            Vec::new()
         };
 
         // KG entity blend (ADR-051 Amendment 1): additive "Knowledge graph"
@@ -3881,11 +4077,12 @@ impl KnowledgeHandlers {
         // atoms (everything trimmed by `max_tokens`) has no floor to
         // calibrate against, so it blends no entities at all (ADR-051
         // Amendment 1, zero-atom edge case).
-        let entity_score_floor: Option<f32> = included_atom_ids
+        let entity_score_floor: Option<f32> = packed
+            .included_atom_ids
             .iter()
             .filter_map(|id| atom_cosine_scores.get(id).copied())
             .fold(None, |acc, s| Some(acc.map_or(s, |a: f32| a.min(s))));
-        let mut markdown = markdown;
+        let mut markdown = packed.markdown;
         let mut kg_entities_json: Vec<Value> = Vec::new();
         if blend_kg {
             if let Some(floor) = entity_score_floor {
@@ -3908,21 +4105,24 @@ impl KnowledgeHandlers {
                 .await
                 {
                     Ok(kg_hits) => {
-                        let remaining_budget = char_budget.saturating_sub(body_used);
+                        let remaining_budget = char_budget.saturating_sub(markdown.len());
                         let kg_hits = trim_kg_entities_to_budget(kg_hits, remaining_budget);
                         if !kg_hits.is_empty() {
-                            markdown.push_str(&format_kg_entities_markdown(&kg_hits));
-                            kg_entities_json = kg_hits
-                                .iter()
-                                .map(|e| {
-                                    json!({
-                                        "id": e.id,
-                                        "kind": e.kind,
-                                        "name": e.name,
-                                        "score": (e.score * 10000.0).round() / 10000.0,
+                            let kg_markdown = format_kg_entities_markdown(&kg_hits);
+                            if kg_markdown.len() <= remaining_budget {
+                                markdown.push_str(&kg_markdown);
+                                kg_entities_json = kg_hits
+                                    .iter()
+                                    .map(|e| {
+                                        json!({
+                                            "id": e.id,
+                                            "kind": e.kind,
+                                            "name": e.name,
+                                            "score": (e.score * 10000.0).round() / 10000.0,
+                                        })
                                     })
-                                })
-                                .collect();
+                                    .collect();
+                            }
                         }
                     }
                     Err(e) => {
@@ -3944,6 +4144,7 @@ impl KnowledgeHandlers {
 
         let atom_json: Vec<Value> = items
             .iter()
+            .filter(|item| packed.included_atom_ids.contains(&item.id))
             .map(|item| {
                 json!({
                     "id": item.id,
