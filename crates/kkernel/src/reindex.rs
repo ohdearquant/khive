@@ -217,7 +217,7 @@ pub struct ReindexArgs {
 /// ordinary single-backend `--db` behavior); `Some` with the validated target
 /// otherwise. Callers must open exactly the returned target's path — see
 /// [`open_validated_reindex_backend`].
-fn validate_declared_reindex_target(
+pub(crate) fn validate_declared_reindex_target(
     db: Option<&str>,
     config: Option<&std::path::Path>,
 ) -> Result<Option<khive_mcp::serve::ValidatedReindexTarget>> {
@@ -249,7 +249,7 @@ fn validate_declared_reindex_target(
 ///
 /// With no validated target (no `[[backends]]` declared), `cfg` is used
 /// unchanged — ordinary single-backend reindex behavior.
-fn open_validated_reindex_backend(
+pub(crate) fn open_validated_reindex_backend(
     mut cfg: khive_runtime::RuntimeConfig,
     validated: Option<&khive_mcp::serve::ValidatedReindexTarget>,
 ) -> Result<KhiveRuntime> {
