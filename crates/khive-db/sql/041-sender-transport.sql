@@ -1,4 +1,4 @@
-CREATE TABLE comm_sender_transport (
+CREATE TABLE IF NOT EXISTS comm_sender_transport (
     namespace TEXT NOT NULL,
     logical_message_id TEXT NOT NULL,
     outbound_note_id TEXT NOT NULL,
@@ -42,4 +42,4 @@ CREATE TABLE comm_sender_transport (
     CHECK(sender_key_epoch BETWEEN 1 AND 4294967295),
     CHECK(contact_generation BETWEEN 1 AND 4294967295)
 );
-CREATE INDEX idx_comm_sender_pending_route ON comm_sender_transport(namespace,kind,slug,state,next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_comm_sender_pending_route ON comm_sender_transport(namespace,kind,slug,state,next_retry_at);
