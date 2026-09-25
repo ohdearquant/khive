@@ -207,6 +207,38 @@ stage-based classification fails two of them:
 - A token-endpoint refusal of the configured client credentials is `Permanent` and terminal on the
   first occurrence, with no budget consumed.
 
+## Amendment 2 (2026-09-25): claim the outbound Message-ID before sending
+
+This amendment supersedes the Message-ID derivation in §3 and clarifies the
+property timing in §1 and the behavioral assertions in §5. The original §3
+describes UUIDv5 and names only `transport_message_id`; the implementation
+uses the outbound note's UUID directly. For note ID `note_id` and the
+configured sender mailbox's domain, the wire header is
+`<{note_id}@{domain}>` (using `localhost` if the mailbox has no domain).
+It is not a UUIDv5 value.
+
+Before the SMTP send, the outbox component claims that exact header value in
+the outbound message note's `external_id` property through the owner-only
+runtime path. A later attempt uses an existing nonempty `external_id` verbatim,
+including when the sender mailbox's domain has changed. The claim therefore survives
+a send that succeeds before the delivery stamp is persisted. A failed claim
+does not proceed to SMTP, and caller-facing note updates cannot set
+`external_id`.
+
+The §1 outcome table is amended for outbound email as follows:
+
+| Stage or outcome  | Properties written or retained                                                                                               |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Before send       | Claim `external_id = "<{note_id}@{domain}>"` while the note remains pending.                                                 |
+| Delivered         | Write `delivery = "delivered"`, `delivered_at` (RFC 3339), and `transport_message_id = external_id`; retain `external_id`.   |
+| Permanent failure | Write `delivery = "failed"`, `failed_at`, and `last_error`; retain any earlier `external_id` claim.                          |
+| Transient failure | Increment `delivery_attempts` and write `last_error` and `next_attempt_at`; retain `external_id` and leave the note pending. |
+
+Accordingly, §5's delivery and redelivery assertions must check that the
+SMTP `Message-ID` equals the claimed `external_id`, that a successful delivery
+stamps the same value in `transport_message_id`, and that redelivery reuses the
+claim rather than deriving a new ID.
+
 ## Consequences
 
 - Operator-configured-recipient email delivery works, including the backlog written
