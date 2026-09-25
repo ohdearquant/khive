@@ -2,7 +2,8 @@
 
 The GTD (Getting Things Done) verb pack for khive. Adds the `task` note kind
 and five task-management verbs (`assign`, `next`, `complete`, `tasks`, `transition`)
-over the notes substrate, plus the read-only `gtd.census` timestamp census.
+over the notes substrate, the read-only `gtd.census` timestamp census, and explicit
+`gtd.repair` for caller-specified historical corrections.
 
 ## Verbs
 
@@ -11,11 +12,12 @@ over the notes substrate, plus the read-only `gtd.census` timestamp census.
 | `gtd.census`     | Count task timestamp values by raw numeric magnitude without repair or unit inference |
 | `gtd.assign`     | Create a task (note with `kind=task`); defaults `status=inbox`, `priority=p2`         |
 | `gtd.next`       | List actionable tasks; optionally include blocked/broken dependency states            |
+| `gtd.repair`     | Preview or apply explicit timestamp and legacy-status corrections with observed-value checks |
 | `gtd.complete`   | Mark a task `done` (or `cancelled`) with an optional result note                      |
 | `gtd.tasks`      | Filtered task listing by status, assignee, priority                                   |
 | `gtd.transition` | Explicit lifecycle change, validated against the state machine below                  |
 
-All six verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
+All seven verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
 by `GtdPack::dispatch` (`src/pack.rs`).
 
 `gtd.complete` and `gtd.transition` are by-ID operations: a full UUID or a
@@ -32,10 +34,17 @@ lifecycle-audit append failed.
 
 `gtd.census()` reports counts for live task rows in the caller-visible namespaces
 on the bound runtime backend. An explicit `namespace` selects that query scope.
-It returns no task IDs or payloads, accepts no unit or repair option, and changes
-no stored values. Magnitude buckets are evidence for an operator to investigate;
+By default it returns only aggregate counts; `include_candidates=true` adds
+bounded IDs and exact source values for investigation. It accepts no unit or repair
+option and changes no stored values. Magnitude buckets are evidence to investigate;
 they do not identify the original units or a correct replacement date. See the
 [exact census contract](docs/api/task-timestamp-census.md).
+
+`gtd.repair` previews explicit replacements by default and writes only with
+`apply=true`. It never infers units or dates. Observed values must still match,
+and applied repairs preserve each field's first original value on the task.
+Full IDs resolve without a namespace filter; census scope affects discovery only.
+See [task repair](docs/api/task-repair.md) for the request and refusal contract.
 
 ## Task lifecycle
 

@@ -9,6 +9,7 @@ use syn::visit::Visit;
 const DB: &str = "khive-db/src/stores/note.rs";
 const EVENTS: &str = "khive-mcp/src/pending_events.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
+const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
 const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
 const CURATION: &str = "khive-runtime/src/curation.rs";
 const CREATE: &str = "khive-runtime/src/note_create.rs";
@@ -435,6 +436,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (EVENTS, "finalize_corrupt_receipt"),
         (EVENTS, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
+        (GTD_REPAIR, "UPDATE_SQL"),
         (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
@@ -551,6 +553,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"inbox"}"#,
         ),
+        (GTD_REPAIR, "UPDATE_SQL", "task", r#"{"status":"archived"}"#),
         (
             SCHEDULE,
             "cancel_pending_event",
@@ -592,6 +595,25 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     100_i64,
                     rusqlite::types::Null,
                     "inbox"
+                ],
+            ),
+            GTD_REPAIR => conn.execute(
+                sql,
+                params![
+                    ID,
+                    properties,
+                    1_i64,
+                    100_i64,
+                    100_i64,
+                    "integer",
+                    "integer",
+                    0_i64,
+                    rusqlite::types::Null,
+                    0_i64,
+                    rusqlite::types::Null,
+                    1_i64,
+                    "done",
+                    r#"{"originals":{}}"#,
                 ],
             ),
             SCHEDULE => conn.execute(sql, params!["2026-09-09T00:00:00Z", 200_i64, ID, "local"]),

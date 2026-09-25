@@ -30,6 +30,21 @@ pub(crate) use super::params::{
 
 // ---- Kind canonicalization ----
 
+pub(crate) fn validate_graph_read_kind(
+    raw: &str,
+    field: &str,
+    verb: &str,
+) -> Result<(), RuntimeError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "atom" | "domain") {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb} cannot serve {field}={raw:?}: knowledge {normalized}s live in the knowledge corpus; \
+             use `knowledge.search(kind={normalized:?}, ...)` or `knowledge.list(type={normalized:?}, ...)`"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn canonical_entity_kind(
     raw: &str,
     registry: &VerbRegistry,

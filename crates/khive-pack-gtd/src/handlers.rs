@@ -48,11 +48,13 @@ fn idempotency_conflict(key: &str, existing_id: Uuid) -> RuntimeError {
 
 /// Ensure `gtd_lifecycle_audit` and its index exist on the given runtime.
 ///
-/// Idempotent (`CREATE TABLE IF NOT EXISTS`). Applied lazily on the first
-/// `transition` or `complete` call, on every call rather than gated by a
-/// `OnceLock` (fresh in-memory test runtimes each need their own bootstrap).
-/// Logs a warning and continues if the DDL fails (e.g. read-only replica) —
-/// the audit is best-effort, not load-bearing. `pub`: also called from
+/// Idempotent (`CREATE TABLE IF NOT EXISTS`). Called by each real `transition`
+/// or `complete` and once before the first accepted `repair` application in a
+/// request; never gated by a `OnceLock` (fresh in-memory runtimes each need
+/// their own bootstrap).
+/// Logs a warning and continues if the DDL fails (e.g. read-only replica).
+/// Lifecycle audit remains best-effort; repair's mandatory audit insert fails
+/// its atomic commit if the schema is unavailable. `pub`: also called from
 /// `kkernel`'s ADR-099 `--atomic` seam. See
 /// `docs/api/lifecycle-audit.md#ensure_audit_schema--why-per-call-not-oncelock`.
 pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
@@ -925,7 +927,7 @@ async fn load_task(
     if !TASK_STATUSES.contains(&current.as_str()) {
         return Err(RuntimeError::InvalidInput(format!(
             "task {} has invalid stored status {current:?}; valid stored statuses: {}; \
-             legacy state requires reviewed repair, not a lifecycle transition",
+             legacy state requires explicit gtd.repair, not a lifecycle transition",
             short_id(note.id),
             TASK_STATUSES.join(", ")
         )));
@@ -1840,7 +1842,7 @@ impl GtdPack {
                     "hint": "no tasks matched, but the default filter excludes terminal and \
                               unrecognized stored statuses; pass status=\"done\" or \
                               status=\"cancelled\" for terminal tasks, or use list(kind=\"task\") \
-                              to inspect legacy records before a reviewed repair",
+                              to inspect legacy records before explicit gtd.repair",
                 });
                 if limit_clamped {
                     insert_limit_report(&mut response, requested_limit, limit);
