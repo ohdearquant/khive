@@ -652,3 +652,64 @@ backend's override continues to advertise its capabilities correctly.
 ADR-044 §1's commentary "SqliteVec is the correct label for the v1 backend" remains
 accurate. The amendment removes only the claim that the trait-level default should carry
 SQLite-specific values.
+
+## Amendment A3: operator commands and compliance tests as built (2026-09-25)
+
+**Status**: Proposed
+
+**Context.** The CLI Surface section adds two operator-only commands, `khive vec-capabilities`
+and `khive vec-sweep --substrate=<kinds> [--namespace=<ns>] [--max-delete=<N>] [--dry-run]`.
+The Implementation Notes table places them in `crates/khive-cli/src/vec.rs` (new) and the
+compliance test harness in `crates/khive-storage/src/tests/compliance/vector_filter_suite.rs`
+(new). Neither path has any history in this repository, and `vec-capabilities`, `vec-sweep`
+and `vector_filter_suite` have no match under `crates/`, `scripts/` or `tests/`. The trait and
+type rows of the same table resolve.
+
+What exists instead:
+
+- The operator commands are subcommands of the `kkernel` binary, added in commit 3db44e9e8:
+  `kkernel vector capabilities` and `kkernel vector sweep`, in `crates/kkernel/src/vector.rs`
+  (`VectorCommand::Capabilities`, `VectorCommand::Sweep`) and wired as `Command::Vector` in
+  `crates/kkernel/src/cli.rs`. Neither is an MCP verb.
+- `kkernel vector capabilities [--human] [--engine <label>]` prints the capability set of the
+  compiled sqlite-vec backend without opening a database. `--engine` only labels the report,
+  and `--db` is accepted for compatibility and not used. The ADR's command reports "for the
+  active backend".
+- `kkernel vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run] [--engine <name>]
+  [--db <path>]` calls `VectorStore::orphan_sweep` once per selected model store.
+  `--max-delete` defaults to 1000 and is one budget shared across the selected stores. There
+  is no `--substrate` flag: the command passes an empty `substrate_kinds`, which Section 5
+  defines as all kinds. `--engine` selects configured engines, which the ADR's command line
+  does not have.
+- The compliance tests live in `crates/khive-storage/tests/compliance.rs`, which describes
+  itself as the "Vector filter compliance suite (ADR-044 §2)" and provides helpers for
+  backends that set `supports_filter = true`, and in
+  `crates/khive-db/tests/contract/vector_filter.rs`, which checks that the SQLite store
+  returns `Unsupported` for a non-empty filter. `SqliteVecStore::capabilities()`
+  (`crates/khive-db/src/stores/vectors.rs`) reports `supports_filter: false` and
+  `supports_orphan_sweep: true`.
+
+**Decision (proposed).** The CLI Surface decision, two operator commands with no MCP
+exposure, stands and is implemented as `kkernel vector capabilities` and
+`kkernel vector sweep`. The `khive vec-*` command names and the Implementation Notes rows for
+the CLI file and the compliance harness are superseded by the locations above. The sweep
+command has no substrate-kind filter; selecting model stores with `--engine` is the shipped
+way to narrow it, and `OrphanSweepConfig.substrate_kinds` stays available to callers of the
+trait.
+
+**Alternatives considered.**
+
+- Add `khive vec-capabilities` and `khive vec-sweep` as specified. The operator binary is
+  `kkernel`, and ADR-043's engine commands already live there as `kkernel engine`. A second
+  name for the same two operations would add surface without adding capability.
+- Require a `--substrate` flag on `kkernel vector sweep`. The consumer this ADR names for the
+  kind filter is ADR-043's migration worker, which is deferred and would call
+  `orphan_sweep` directly with `substrate_kinds` set. No shipped operator workflow needs
+  the flag, so requiring it is a new feature rather than a correction.
+
+**Consequences.** `docs/operations.md` and `crates/kkernel/docs/design.md` already document the
+shipped commands; this amendment brings the ADR in line with them. No shipped backend sets
+`supports_filter = true`, so the pushdown half of the compliance suite applies to no backend
+until one does.
+
+**Refs.** Commit 3db44e9e8.
