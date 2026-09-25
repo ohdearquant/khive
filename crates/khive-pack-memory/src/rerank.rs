@@ -18,31 +18,54 @@ pub struct RerankFeatures {
     pub vector_match: bool,
 }
 
-/// Weighted feature-combination rerank score: `Σ(weight × feature) / Σ(positive_weight)`.
-/// Returns 0.0 when weights are empty or all unrecognized.
+/// Weighted feature-combination rerank score, normalized before accumulation.
+/// Returns 0.0 when weights are empty or all recognized weights are zero.
+/// RecallConfig::validate owns finite/non-negative weight validation.
+/// For finite features in [0, 1], scaling prevents intermediate overflow and
+/// avoids multiplying features by subnormal raw weights. Fixed feature order
+/// also removes HashMap iteration order from floating-point accumulation.
 pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>) -> f64 {
+    let weighted_features = [
+        (
+            weights.get("relevance").copied().unwrap_or(0.0),
+            features.relevance,
+        ),
+        (
+            weights.get("salience").copied().unwrap_or(0.0),
+            features.salience,
+        ),
+        (
+            weights.get("temporal").copied().unwrap_or(0.0),
+            features.temporal,
+        ),
+        (
+            weights.get("text_match").copied().unwrap_or(0.0),
+            f64::from(features.text_match),
+        ),
+        (
+            weights.get("vector_match").copied().unwrap_or(0.0),
+            f64::from(features.vector_match),
+        ),
+    ];
+    // Unknown feature names remain ignored, including in the scale.
+    let scale = weighted_features
+        .iter()
+        .map(|(w, _)| *w)
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 {
+        return 0.0;
+    }
     let mut numerator = 0.0_f64;
     let mut weight_sum = 0.0_f64;
-    for (name, &weight) in weights {
+    for (weight, feature_value) in weighted_features {
         if weight == 0.0 {
             continue;
         }
-        let feature_value = match name.as_str() {
-            "relevance" => features.relevance,
-            "salience" => features.salience,
-            "temporal" => features.temporal,
-            "text_match" => f64::from(features.text_match),
-            "vector_match" => f64::from(features.vector_match),
-            // Unknown feature names are silently ignored to allow forward-compat.
-            _ => continue,
-        };
-        numerator += weight * feature_value;
-        if weight > 0.0 {
-            weight_sum += weight;
+        let normalized_weight = weight / scale;
+        numerator += normalized_weight * feature_value;
+        if normalized_weight > 0.0 {
+            weight_sum += normalized_weight;
         }
-    }
-    if weight_sum == 0.0 {
-        return 0.0;
     }
     numerator / weight_sum
 }
@@ -204,6 +227,131 @@ mod tests {
                 "single weight={mag}: expected feature value {}, got {score}",
                 f.relevance
             );
+        }
+    }
+
+    fn extreme_weights(magnitude: f64) -> HashMap<String, f64> {
+        [
+            ("relevance".to_string(), magnitude),
+            ("salience".to_string(), magnitude),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn assert_close(got: f64, expected: f64) {
+        assert!(
+            got.is_finite() && (got - expected).abs() < 1e-12,
+            "expected {expected}, got {got}"
+        );
+    }
+
+    #[test]
+    fn ordinary_equal_weights_produce_expected_score() {
+        assert_close(weighted_rerank(&features(), &extreme_weights(1.0)), 0.7);
+    }
+
+    #[test]
+    fn finite_weights_with_overflowing_sum_stay_normalized() {
+        assert_close(weighted_rerank(&features(), &extreme_weights(1e308)), 0.7);
+    }
+
+    #[test]
+    fn finite_weights_with_overflowing_numerator_and_sum_stay_normalized() {
+        assert_close(
+            weighted_rerank(&features(), &extreme_weights(f64::MAX)),
+            0.7,
+        );
+    }
+
+    #[test]
+    fn smallest_subnormal_weights_stay_normalized() {
+        assert_close(
+            weighted_rerank(&features(), &extreme_weights(f64::from_bits(1))),
+            0.7,
+        );
+    }
+
+    #[test]
+    fn positive_weight_magnitudes_across_the_full_exponent_range_stay_normalized() {
+        for exponent in [-1074, -1000, -500, 0, 500, 1000, 1023] {
+            // Construct the subnormal boundary exactly rather than relying on
+            // powi underflow.
+            let magnitude = if exponent == -1074 {
+                f64::from_bits(1)
+            } else {
+                2.0_f64.powi(exponent)
+            };
+            assert_close(
+                weighted_rerank(&features(), &extreme_weights(magnitude)),
+                0.7,
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_weight_does_not_set_the_normalization_scale() {
+        let mut weights = extreme_weights(f64::from_bits(1));
+        weights.insert("future_feature_xyz".to_string(), f64::MAX);
+        assert_close(weighted_rerank(&features(), &weights), 0.7);
+    }
+
+    #[test]
+    fn zero_and_unknown_weights_only_remain_zero() {
+        assert_close(weighted_rerank(&features(), &HashMap::new()), 0.0);
+        let weights: HashMap<String, f64> =
+            [("future".to_string(), 42.0), ("salience".to_string(), 0.0)]
+                .into_iter()
+                .collect();
+        assert_close(weighted_rerank(&features(), &weights), 0.0);
+    }
+
+    #[test]
+    fn nan_in_an_unweighted_feature_does_not_contaminate_the_score() {
+        let mut f = features();
+        f.temporal = f64::NAN;
+        assert_close(weighted_rerank(&f, &extreme_weights(1.0)), 0.7);
+    }
+
+    #[test]
+    fn single_subnormal_weight_still_returns_its_feature_value() {
+        let weights: HashMap<String, f64> = [("relevance".to_string(), f64::from_bits(1))]
+            .into_iter()
+            .collect();
+        assert_close(weighted_rerank(&features(), &weights), 0.8);
+    }
+
+    /// The score is computed from fixed-order lookups into the weight map,
+    /// never by iterating it, so the order the caller inserted keys in must
+    /// not change the result's bit pattern.
+    #[test]
+    fn weight_map_insertion_order_does_not_change_the_score_bits() {
+        let mut f = features();
+        f.relevance = 1.0;
+        f.salience = 1e-16;
+        f.temporal = 1e-16;
+        let orders = [
+            ["relevance", "salience", "temporal"],
+            ["relevance", "temporal", "salience"],
+            ["salience", "relevance", "temporal"],
+            ["salience", "temporal", "relevance"],
+            ["temporal", "relevance", "salience"],
+            ["temporal", "salience", "relevance"],
+        ];
+        let mut reference: Option<u64> = None;
+        for order in orders {
+            let weights: HashMap<String, f64> = order
+                .into_iter()
+                .map(|key| (key.to_string(), 1.0))
+                .collect();
+            let bits = weighted_rerank(&f, &weights).to_bits();
+            match reference {
+                Some(expected) => assert_eq!(
+                    bits, expected,
+                    "insertion order {order:?} changed the score's bit pattern"
+                ),
+                None => reference = Some(bits),
+            }
         }
     }
 }

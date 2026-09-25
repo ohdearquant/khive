@@ -13,7 +13,7 @@
 
 ### What ships today
 
-`memory.recall` runs a multi-stage pipeline (ADR-033): FTS5 candidates and vector candidates are fused via RRF, then an optional weighted-feature reranker (`RecallConfig.reranker_weights`) replaces the default scoring when any weight is set. The shipped feature keys for `weighted_rerank` in `crates/khive-pack-memory/src/rerank.rs` (lines 29-37) are exactly five:
+`memory.recall` runs a multi-stage pipeline (ADR-033): FTS5 candidates and vector candidates are fused via RRF, then an optional weighted-feature reranker (`RecallConfig.reranker_weights`) replaces the default scoring when any weight is set. The shipped feature keys for `weighted_rerank` in `crates/khive-pack-memory/src/rerank.rs` (lines 28-49) are exactly five:
 
 | Key            | Source                                             |
 | -------------- | -------------------------------------------------- |
@@ -23,7 +23,7 @@
 | `text_match`   | Boolean: candidate appeared in FTS results         |
 | `vector_match` | Boolean: candidate appeared in vector results      |
 
-`graph_proximity` is listed as a planned built-in name in `crates/khive-pack-memory/src/config.rs:53`, but it is not a match arm in `rerank.rs`. A caller who sets `reranker_weights["graph_proximity"]` today gets the key silently ignored (falls through to `_ => continue`).
+`graph_proximity` is listed as a planned built-in name in `crates/khive-pack-memory/src/config.rs:53`, but it is not one of the five keys `weighted_rerank` looks up. A caller who sets `reranker_weights["graph_proximity"]` today gets the key silently ignored: it is absent from the fixed-order lookup array in `rerank.rs`, so it never contributes to the score or the normalization scale.
 
 The typed knowledge-graph edges, the substrate khive was designed around, are not consulted at all during flat recall.
 

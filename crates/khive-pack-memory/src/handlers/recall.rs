@@ -775,6 +775,14 @@ impl MemoryPack {
         }
 
         if scoring_cfg.mmr_penalty > 0.0 && scoring_cfg.mmr_prefix_len > 0 {
+            // Choose the duplicate keeper from the full composite score, not
+            // the fused retrieval order that populated `ranked`.
+            ranked.sort_by(|a, b| {
+                b.rank_score
+                    .partial_cmp(&a.rank_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.id.cmp(&b.id))
+            });
             let prefix_len = scoring_cfg.mmr_prefix_len;
             let prefixes: Vec<String> = ranked
                 .iter()

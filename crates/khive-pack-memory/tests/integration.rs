@@ -219,9 +219,8 @@ async fn test_recall_decay_ranking() {
     assert_eq!(backdated, 1, "backdate must touch exactly the old note row");
     drop(writer);
 
-    // Disable MMR penalty so identical-content notes are ranked purely by
-    // temporal decay. MMR would suppress the second hit (rank 2) by -0.1,
-    // which can invert the temporal ordering when scores are close.
+    // Disable MMR penalty so this assertion isolates temporal decay from the
+    // separate near-duplicate adjustment.
     let recall_result = registry
         .dispatch(
             "memory.recall",
@@ -269,10 +268,8 @@ async fn test_recall_salience_ranking() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
 
-    // Use non-identical content so MMR penalty does not affect the test.
-    // The rank_score difference between salience=0.9 and salience=0.1 is
-    // ~10% under the archive scoring model (1.18 vs 1.02 salience_boost), which
-    // would be eliminated by the MMR penalty (-0.1) on identical content.
+    // Use non-identical content so this assertion isolates salience from the
+    // separate near-duplicate adjustment.
     let high = registry
         .dispatch(
             "memory.remember",
@@ -331,6 +328,116 @@ async fn test_recall_salience_ranking() {
         high_entry.1,
         low_entry.1
     );
+}
+
+/// Identical content ties at retrieval. The MMR keeper must be selected by the
+/// composite score even when the higher-salience memory has the larger UUID.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn default_mmr_keeps_higher_composite_duplicate_in_both_id_orders() {
+    const CONTENT: &str = "Persistent semantic memory about reliable ranking of identical research observations across sessions, where salience must select the representative before a near duplicate penalty changes the displayed order.";
+
+    for high_id_is_lower in [true, false] {
+        let rt = make_runtime();
+        let registry = make_registry(rt.clone());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let remembered = registry
+                .dispatch(
+                    "memory.remember",
+                    json!({
+                        "content": CONTENT,
+                        "memory_type": "semantic",
+                        "salience": 0.5,
+                        "decay": 0.0
+                    }),
+                )
+                .await
+                .expect("create identical semantic memory");
+            ids.push(Uuid::parse_str(remembered["id"].as_str().unwrap()).unwrap());
+        }
+        ids.sort();
+        let (high_id, low_id) = if high_id_is_lower {
+            (ids[0], ids[1])
+        } else {
+            (ids[1], ids[0])
+        };
+
+        // Assign salience after IDs exist so both UUID tie-break directions
+        // are exercised instead of relying on the generator's order.
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer");
+        for (id, salience) in [(high_id, 1.0), (low_id, 0.0)] {
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET salience = ? WHERE id = ?".into(),
+                        params: vec![SqlValue::Float(salience), SqlValue::Text(id.to_string())],
+                        label: Some("test-mmr-salience-order".into()),
+                    })
+                    .await
+                    .expect("set valid salience"),
+                1
+            );
+        }
+        drop(writer);
+
+        let unpenalized = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": CONTENT,
+                    "limit": 2,
+                    // Fusion ranks can differ even for byte-identical text. Make
+                    // salience decisive so this tests MMR keeper selection, not
+                    // whichever UUID happened to win a retrieval tie.
+                    "config": { "scoring": {
+                        "weights": { "salience": 8.0 },
+                        "mmr_penalty": 0.0
+                    } }
+                }),
+            )
+            .await
+            .expect("unpenalized control recall");
+        let control_hits = unpenalized.as_array().expect("control hits");
+        assert_eq!(control_hits.len(), 2);
+        let high_id_text = high_id.to_string();
+        let low_id_text = low_id.to_string();
+        let control_score = |id: &str| {
+            control_hits
+                .iter()
+                .find(|hit| hit["id"].as_str() == Some(id))
+                .expect("control hit by ID")["rank_score"]
+                .as_f64()
+                .expect("control rank_score")
+        };
+        let high_control_score = control_score(&high_id_text);
+        assert!(
+            high_control_score > control_score(&low_id_text),
+            "fixture must give the high-salience copy a higher composite score"
+        );
+
+        let default = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": CONTENT,
+                    "limit": 2,
+                    "config": { "scoring": { "weights": { "salience": 8.0 } } }
+                }),
+            )
+            .await
+            .expect("default MMR recall");
+        let hits = default.as_array().expect("default hits");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["id"].as_str(), Some(high_id_text.as_str()));
+        let high_final_score = hits[0]["rank_score"].as_f64().expect("rank_score");
+        assert!(
+            (high_final_score - high_control_score).abs() < 1e-3,
+            "higher composite duplicate must not receive MMR penalty: \
+             high_id_is_lower={high_id_is_lower}, control={high_control_score}, final={high_final_score}"
+        );
+    }
 }
 
 #[tokio::test]

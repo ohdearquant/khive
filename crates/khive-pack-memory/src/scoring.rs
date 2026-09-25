@@ -495,7 +495,8 @@ pub struct ScoringConfig {
 
     // ── MMR diversity penalty ──────────────────────────────────────────────
     /// Score penalty applied to results whose first `mmr_prefix_len` characters
-    /// match an earlier result. Default: 0.1.
+    /// match a higher-ranked result in pre-penalty composite-score order.
+    /// Equal scores use the result ID as the keeper tie-break. Default: 0.1.
     pub mmr_penalty: f32,
     /// Character prefix length used for MMR duplicate detection. Default: 100.
     pub mmr_prefix_len: usize,
