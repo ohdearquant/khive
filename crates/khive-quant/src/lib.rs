@@ -5,8 +5,8 @@
 //! ## `Sq8Codec` — per-dimension affine, for dot product / cosine
 //!
 //! Each dimension is mapped to [0, 255] using its own observed min/max.
-//! Dot product and cosine require per-dim scale accuracy; the residual-corrected
-//! path (`approx_dot`, `approx_cosine_dist`) preserves ordinal ranking.
+//! Dot product and cosine use per-dimension weights accumulated in f64 before
+//! returning f32, preserving small dimensions beside a much wider one.
 //!
 //! ## `GsSq8Codec` — global-scale affine, for L2 (Vamana acquisition)
 //!
@@ -20,11 +20,11 @@
 //! proportionally fewer codes and proportionally less L2 signal — an honest trade-off
 //! documented in ADR-052.
 //!
-//! # Hot-loop NEON helpers (`u8_dot_u32`, `u8_l2sq_u32`)
+//! # Hot-loop NEON helper (`u8_l2sq_u32`)
 //!
-//! Both codecs share these inner functions:
-//! - `u8_dot_u32`: NEON `vmull_u8` (16-wide u8→u16→u32) or chunked portable fallback.
-//! - `u8_l2sq_u32`: NEON `vabdq_u8` + `vmull_u8` squaring or chunked portable fallback.
+//! `GsSq8Codec` uses `u8_l2sq_u32`: NEON `vabdq_u8` + `vmull_u8`
+//! squaring or a chunked portable fallback. The integer dot helper remains
+//! test-only; its shared-mean scaling loses small per-dimension weights.
 //!
 //! See `docs/api/codecs.md` for the full function-by-function reference and
 //! `docs/design.md` for the anisotropy-gating rationale behind `GsSq8Codec`.
@@ -37,7 +37,10 @@ use rayon::prelude::*;
 /// `Σ a_i * b_i` over equal-length `u8` slices as a `u32` accumulator (NEON on
 /// aarch64, chunked portable fallback elsewhere). See `docs/api/codecs.md`.
 ///
-/// Safety: both slices must have the same length.
+/// Safety: both slices must have the same length. Retained only to exercise
+/// the integer kernel independently; Sq8Codec no longer uses its lossy
+/// shared-mean scale split.
+#[cfg(test)]
 #[inline(always)]
 fn u8_dot_u32(a: &[u8], b: &[u8]) -> u32 {
     #[cfg(target_arch = "aarch64")]
@@ -329,9 +332,9 @@ pub struct Sq8Codec {
     pub scale: Vec<f32>,
     /// Per-dimension `scale²` precomputed for fast L2 and dot product.
     pub scale_sq: Vec<f32>,
-    /// Mean of `scale_sq` across all dimensions — used as the integer-pass multiplier.
+    /// Legacy mean of `scale_sq`; retained for public-field compatibility.
     pub mean_scale_sq: f32,
-    /// Residual: `scale_sq_i - mean_scale_sq` (zero-mean, small magnitude).
+    /// Legacy residual: `scale_sq_i - mean_scale_sq`; distance methods do not use it.
     pub scale_sq_residual: Vec<f32>,
     /// `Σ_i min_i²` precomputed for dot-product correction.
     pub offset_sq_sum: f32,
@@ -346,7 +349,7 @@ pub struct EncodedVector {
     pub norm: f32,
     /// `Σ_i scale_i * min_i * code_i` — per-vector correction term for dot product.
     pub soc_sum: f32,
-    /// `Σ_i scale_sq_residual_i * code_i` precomputed at encode time.
+    /// Legacy `Σ_i scale_sq_residual_i * code_i` precomputed at encode time.
     pub residual_dot_bias: f32,
 }
 
@@ -532,20 +535,19 @@ impl Sq8Codec {
     /// Full-precision correction identity (same min/scale for both):
     /// `dot(a, b) = Σ s²·a·b + soc_a + soc_b + offset_sq_sum`
     ///
-    /// The integer pass (`u8_dot_u32`) computes `raw = Σ a_i*b_i` as `u32` using
-    /// NEON (16-wide on aarch64). The scale correction then applies `mean_scale_sq`
-    /// plus a compact per-dim residual f32 pass for accuracy.
+    /// The per-dimension scale term is accumulated directly in f64. A shared
+    /// f32 mean plus residuals can cancel a small scale out entirely.
     #[inline]
     pub fn approx_dot(&self, a: &EncodedVector, b: &EncodedVector) -> f32 {
-        let raw = u8_dot_u32(&a.codes, &b.codes) as f32;
-        let residual_hot: f32 = self
-            .scale_sq_residual
+        let weighted: f64 = self
+            .scale_sq
             .iter()
             .zip(a.codes.iter())
             .zip(b.codes.iter())
-            .map(|((r, &ac), &bc)| r * (ac as f32) * (bc as f32))
+            .map(|((&weight, &ac), &bc)| f64::from(weight) * f64::from(ac) * f64::from(bc))
             .sum();
-        self.mean_scale_sq * raw + residual_hot + a.soc_sum + b.soc_sum + self.offset_sq_sum
+        (weighted + f64::from(a.soc_sum) + f64::from(b.soc_sum) + f64::from(self.offset_sq_sum))
+            as f32
     }
 
     /// Approximate cosine distance between two encoded vectors (same codec).
@@ -562,31 +564,30 @@ impl Sq8Codec {
         1.0 - cosine
     }
 
-    /// Approximate squared L2 distance — per-dim residual corrected.
+    /// Approximate squared L2 distance with direct per-dimension weights.
     ///
     /// Full-precision identity: `||a-b||² = Σ scale_sq_i * (a_i-b_i)²`.
     /// Offsets cancel because both vectors share the same codec.
     ///
-    /// The integer pass (`u8_l2sq_u32`) computes `raw = Σ (a_i-b_i)²` using NEON
-    /// `vabdq_u8` + `vmull_u8`. The residual correction keeps ordinal accuracy
-    /// across anisotropic corpora.
+    /// Nonnegative terms are accumulated in f64 and rounded to f32 once.
+    /// This avoids cancellation between a shared f32 mean and residuals in
+    /// strongly anisotropic corpora.
     ///
     /// For Vamana L2 acquisition use [`GsSq8Codec::l2_sq`] — algebraically exact
-    /// in code space and ~2× faster (no residual pass).
+    /// in code space and uses the integer NEON path.
     #[inline]
     pub fn approx_l2_sq(&self, a: &EncodedVector, b: &EncodedVector) -> f32 {
-        let raw = u8_l2sq_u32(&a.codes, &b.codes) as f32;
-        let residual_hot: f32 = self
-            .scale_sq_residual
+        let weighted: f64 = self
+            .scale_sq
             .iter()
             .zip(a.codes.iter())
             .zip(b.codes.iter())
-            .map(|((r, &ac), &bc)| {
-                let d = (ac as i32) - (bc as i32);
-                r * (d as f32) * (d as f32)
+            .map(|((&weight, &ac), &bc)| {
+                let delta = f64::from(ac) - f64::from(bc);
+                f64::from(weight) * delta * delta
             })
             .sum();
-        self.mean_scale_sq * raw + residual_hot
+        weighted as f32
     }
 
     /// Number of dimensions.
@@ -1082,6 +1083,32 @@ mod tests {
             max_rel_err < 0.15,
             "max relative L2² error {max_rel_err:.4} >= 0.15"
         );
+    }
+
+    #[test]
+    fn narrow_sq8_dimensions_survive_a_wide_training_dimension() {
+        for dims in [2, 17, 384, 768, 1536, 3072] {
+            let zero = vec![0.0_f32; dims];
+            let mut upper = vec![255.0_f32 / 16384.0; dims];
+            upper[0] = 255.0;
+            let mut narrow = upper.clone();
+            narrow[0] = 0.0;
+            let codec = Sq8Codec::train(&[zero.clone(), upper]);
+            let q = codec.encode(&zero);
+            let b = codec.encode(&narrow);
+            assert!(q.codes.iter().all(|&code| code == 0));
+            assert_eq!(b.codes[0], 0);
+            assert!(b.codes[1..].iter().all(|&code| code == 255));
+
+            let expected = ((dims - 1) as f64 * 65025.0 / 268435456.0) as f32;
+            let distance = codec.approx_l2_sq(&q, &b);
+            assert_eq!(distance, expected, "dims={dims}");
+            assert!(distance > codec.approx_l2_sq(&q, &q), "dims={dims}");
+            assert_eq!(codec.approx_dot(&b, &b), expected, "dims={dims}");
+            if dims == 2 {
+                assert!(codec.approx_cosine_dist(&b, &b) < 1e-6);
+            }
+        }
     }
 
     #[test]
