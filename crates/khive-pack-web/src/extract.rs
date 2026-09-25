@@ -451,12 +451,12 @@ async fn extract_links(
         }
         let site = identity::site_id(&canonical);
         let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
-        targets.push((canonical, site, target_id));
+        targets.push((request_url, canonical, site, target_id));
     }
 
     let processed = targets.len() as u32;
     let mut link_specs = Vec::with_capacity(targets.len() * 2);
-    for (canonical, site, target_id) in targets {
+    for (request_url, canonical, site, target_id) in targets {
         crate::entities::get_or_create(
             runtime,
             token,
