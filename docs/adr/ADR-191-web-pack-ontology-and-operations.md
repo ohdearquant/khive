@@ -280,16 +280,21 @@ invocation with two commits in a fixed order: the record's own backend commits t
 then the main backend deletes the attachment rows that named the record, and that second delete is
 idempotent (deleting rows that are already gone succeeds). A crash between the two commits leaves
 attachment rows whose record is gone; those rows root nothing that matters (the record they would
-keep alive no longer exists) but they keep the blob alive until something removes them.
-
-**Cross-document correction proposed by ADR-121 Amendment 1 (2026-09-25).** Scheduling the blob
-orphan sweep does not bound this leak: the sweep reclaims objects with no attachment row, and these
-rows still exist. Removing attachment rows whose record is gone from its own backend needs a
-reconciliation of its own, which this amendment records and does not discharge (tracked as issue
-#3178). A schedule is proposed in ADR-121 Amendment 1 (#3038), conditional on complete blob
-liveness and store-ownership gates. The reverse order is forbidden: a crash after the attachment
+keep alive no longer exists) but they keep the blob alive until something removes them. Today the
+attachment orphan sweep exists as a routine with no production caller, so this leak is unbounded
+in time until that sweep is scheduled; scheduling it, with a stated cadence and a count of rows
+reclaimed as its artifact, is an obligation this amendment records and does not discharge (tracked
+as issue #3038). The
+reverse order is forbidden: a crash after the attachment
 rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
 which is data loss, and this amendment exists to make stored bodies stay alive.
+
+**Proposed correction (2026-09-25; ADR-121 Amendment 1).** The preceding scheduling claim does not
+bound this leak: the blob orphan sweep counts a still-present attachment row as live even when its
+record no longer exists. Removing such rows requires its own reconciliation (#3178). ADR-121
+Amendment 1 proposes a scheduled object sweep (#3038) under complete liveness and store-binding
+gates; that sweep does not discharge the attachment-row reconciliation. The accepted wording above
+remains intact pending the proposed correction.
 
 Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
 attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the

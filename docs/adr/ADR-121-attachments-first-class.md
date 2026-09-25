@@ -300,7 +300,7 @@ for existing consumers; it does not claim the complete ADR-121 public verb rollo
 
 ## Amendment 1 (2026-09-25): the orphan sweep runs on a schedule and on demand
 
-**Status: Proposed; awaiting sign-off.** Refs #3038, #3178. This amendment also proposes to amend one sentence of
+**Status: Proposed.** Refs #3038, #3178. This amendment also proposes to amend one sentence of
 [ADR-111](ADR-111-blob-store.md) §8, named in item 3.
 
 ### Why
@@ -347,8 +347,8 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    database and root to pass the durable main-owner binding in item 8. An arbitrary SQLite secondary
    is never a GC-liveness authority, even when its schema is current. An unbound database/store pair
    means either side lacks that matching durable binding; `--db` alone, including with no declared
-   `[[backends]]`, never proves main ownership. The command refuses an unbound pair before walking
-   the blob root. It runs the same
+   `[[backends]]`, never proves main ownership. The command refuses an unbound pair before acquiring
+   any database/root ownership lock or starting a filesystem walk. It runs the same
    `transactional_orphan_sweep`, is a dry run unless `--live` is given, and prints the four counters
    and the mode. `--live` is the operator's opt-in for that pass;
    `KHIVE_BLOB_SWEEP_LIVE` does not apply to it. ADR-111 §8 says the orphan sweep is "an admin-side
@@ -369,9 +369,10 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    epoch refusal is returned as the error unchanged, and a backend without a transactional sweep
    returns its `Unsupported` error.
 4. **The counters are the artifact.** Every scheduled run logs one line with its mode and the four
-   counters, or the error when the sweep refuses. `deleted` is the reclaimed-object count; before the
-   correction in item 5, ADR-191 Amendment 1 asked a scheduled sweep to report it. A pass holds the
-   blob store's per-root write lock across its whole walk and every claim batch, dry run included, and
+   counters, or the error when the sweep refuses. `deleted` is the reclaimed-object count; the
+   earlier ADR-191 Amendment 1 asked a scheduled sweep to report a count of rows reclaimed, which
+   is a different quantity. A pass holds the blob store's per-root write lock across its whole walk
+   and every claim batch, dry run included, and
    `blob.put` takes the same lock, so uploads wait for the length of a pass. The log line therefore also
    reports the pass duration. The filesystem sweep's default publish grace is one hour; test orphans
    must have an observed age greater than the configured grace, rather than relying on a fresh put.
@@ -379,25 +380,31 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
 5. **Out of scope: rows whose record is gone.** The sweep counts every attachment row as live, whether
    or not its record still exists. It therefore cannot reclaim a blob whose attachment row outlived its
    record, which is the case ADR-191 A1.2 describes for an interrupted cross-backend hard delete.
-   Removing those rows is #3178. ADR-191 A1.2's sentence saying that scheduling this sweep bounds that
-   leak is corrected in the same change.
+   Removing those rows is #3178. A dated correction proposed alongside this amendment records why
+   ADR-191 A1.2's scheduling claim does not bound that leak.
 6. **Admit only a reviewed schema epoch.** ADR-160's Phase-4a gate admits only the exact completed
-   V21 migration ledger. The implementing change must explicitly add the reviewed, fully migrated
-   V40 epoch to `blob_gc_fencing_complete`, preserving the completed cutover marker, absent legacy
-   reference column, functional attachment claim fences, canonical migration names and contiguous
-   ledger. V40 is a reviewed _core-schema_ epoch, not by itself permission to sweep: the liveness
-   ownership rows and store binding in items 7 and 8 must also pass. The admission key is the
-   reviewed schema epoch **and** the recorded store identity, never an epoch alone. Core migrations
-   V22–V40 and the pack-owned schemas and blob-writing paths must be reviewed together; pack DDL outside
+   V21 migration ledger. Define one explicit `REVIEWED_SCHEMA_EPOCH = 41` for this amendment's
+   core-schema review, the terminal migration version at this package base. The implementing change
+   must use that named constant in the exact-epoch predicate and its fixtures, rather than repeat a
+   version literal or derive admission from the latest compiled migration. It must review the complete
+   V22-through-`REVIEWED_SCHEMA_EPOCH` core migration chain, including `sender_transport`, together
+   with pack-owned schemas and blob-writing paths. V40 is a historical baseline sub-predicate within
+   that review, not an admitted terminal epoch. The predicate adds the completed cutover marker,
+   absent legacy reference column, functional attachment claim fences, canonical migration-name
+   checks and contiguous ledger to the historical exact-V21 gate; the current gate checks only the
+   V21 name and leaves below-terminal name validation to boot. The liveness ownership rows and store
+   binding in items 7 and 8 must also pass before a full sweep. The admission key is the reviewed
+   schema epoch **and** the recorded store identity, never an epoch alone. Pack DDL outside
    `_schema_migrations` and references inside blob manifests cannot be inferred from the core
    ledger. A full-chain migration fixture and live-object retention controls must prove the gate.
-   V41 is already ahead of that reviewed epoch; V41 and any later epoch remain `Unsupported` until
-   individually reviewed and explicitly admitted. Do not replace the exact-V21 check with
-   `version >= 21` or automatically accept the latest compiled migration. An unknown or
+   The implementing change must compare the compiled migration tip with the named reviewed epoch so
+   adding a migration fails the gate until that migration is reviewed and the constant is updated in
+   the same change. Do not replace the exact-V21 check with `version >= 21`. An unknown or
    ahead-of-reviewed epoch refuses both modes before root locking, filesystem walking, or claim
-   cleanup. A new migration needed for items 7 or 8 likewise requires its own exact-epoch review;
-   it does not inherit V40 admission. Every change to core or pack-owned liveness schema, producer
-   code or manifest format repeats that review and updates the gate and tests in the same change.
+   cleanup. A new migration for items 7 or 8 also requires review through its new terminal epoch
+   and an update to the single named constant; it inherits no earlier full-sweep admission. Every
+   change to core or pack-owned liveness schema, producer code or manifest format repeats that review
+   and updates the gate and tests in the same change.
    ADR-160's exact-V21 rule remains the historical Phase-4a rollout contract.
 7. **Use pack-registered ownership as the complete liveness authority.** Choose option (a): every
    pack that writes to the shared runtime blob store must register each durable root in the canonical
@@ -426,11 +433,20 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    approved release rule exists. An owner row is removed only after its source record is no longer
    live under that pack's retention contract; an unknown release rule retains the row.
 
-   A test-time census enumerates every direct and wrapper `BlobStore` caller in every enabled pack.
-   Each call site is classified as read-only, an owner-registration path or an explicitly unowned
-   producer; this includes `put`, staged `commit`, tree helpers and paths that return an existing
-   ref. Adding an unclassified caller fails the gate. The census names all historically
-   co-resident pack backends, source tables and manifest formats during backfill; neither the core
+   A test-time census covers production source in every crate linked into the `kkernel` binary,
+   including non-pack crates and packs absent from a particular test configuration. It keys on the
+   resolved receiver type, not method names, helper names, file paths or grep patterns: every call
+   resolving to a `BlobStore` write method (`put`, `begin`, `put_part`, `commit` or any future write
+   method) and every function that reaches such a call transitively is in scope. The trace follows
+   `KhiveRuntime::blob_store()`, pack accessors such as `tree::blob_store`, wrappers taking
+   `&KhiveRuntime` or `&dyn BlobStore`, and paths that return an existing ref. Each reachable write
+   path is classified as main-backend attachment registration, `blob_pack_owners` registration or an
+   explicitly unowned producer; read-only paths are classified separately and cannot justify a
+   write. Adding an unclassified writer fails the gate. Must-fail controls plant production-shaped
+   paths in a linked-crate fixture: a newly named `f(rt: &KhiveRuntime)` that writes through
+   `rt.blob_store()?.put(...)` and `g(store: &dyn BlobStore)` that calls `store.put(...)`. Each alone
+   must trip the census. Backfill also inventories all historically co-resident pack backends, source
+   tables and manifest formats; neither the core
    migration ledger nor an attachment-only scan proves this coverage. The registered-row design
    is chosen over querying each pack's evolving receipt/property schema at sweep time because a
    missing or rerouted pack query would silently turn its live refs into orphans.
@@ -497,19 +513,20 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
 
 ### Acceptance
 
-- A database migrated through the real complete V40 chain, without hand-editing
-  `_schema_migrations`, passes the explicit V40 core-schema predicate but refuses a full sweep
-  until the ownership rows and binding in items 7–8 are complete. The separate migration that
-  adds `blob_pack_owners` needs its own exact-epoch review and admission; V40 admission does not
-  grandfather it. At that fully reviewed epoch, a bound store ID admits dry-run and live
-  transactional sweeps. A referenced object under every attachment role survives both; an object
+- A database migrated through the real complete chain to `REVIEWED_SCHEMA_EPOCH`, without
+  hand-editing `_schema_migrations`, passes the explicit current core-schema predicate but refuses a
+  full sweep until the ownership rows and binding in items 7–8 are complete. The separate migration
+  that adds `blob_pack_owners` needs review through its new terminal epoch and an update to the
+  named constant; the earlier core-schema predicate does not grandfather it. At that fully reviewed
+  epoch, a bound store ID admits dry-run and live transactional sweeps. A referenced object under
+  every attachment role survives both; an object
   absent from attachments, registered roots, legacy pins and manifest closure, created after the
   inventory cutover and older than the configured grace (one hour by default) is reported in dry run
-  and reclaimed only in live mode. Test objects
-  are backdated beyond that grace. A missing/corrupt ledger entry, V41 or any unreviewed later
-  migration refuses both modes before root locking or a filesystem walk. A missing or nonfunctional
-  claim fence refuses before new claims, claim cleanup or deletion. The historical exact-V21
-  control still passes its epoch predicate; without the inventory and binding, even a V21 full
+  and reclaimed only in live mode. Test objects are backdated beyond that grace. A missing/corrupt
+  ledger entry or any migration ahead of the
+  named reviewed epoch refuses both modes before root locking or a filesystem walk. A missing or
+  nonfunctional claim fence refuses before new claims, claim cleanup or deletion. The historical
+  exact-V21 control still passes its epoch predicate; without the inventory and binding, even a V21 full
   sweep refuses.
 - A live exec receipt's input and output trees, every tree entry, stdout, stderr, sandbox profile,
   and changed/base refs remain readable through `exec.receipt`, `exec.tree_get` and `blob.get`
@@ -522,8 +539,11 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   was `properties.blob_ref` is retained by backfill as well. Moodboard originals, model bundles and network
   bodies survive under every existing attachment role. The same objects are absent from
   `would_delete` in dry runs.
-- A test-time census fails if any enabled pack adds a direct or wrapper `BlobStore` caller without
-  a read-only, main-backend attachment, `blob_pack_owners` or explicit unowned classification.
+- A test-time census fails if any crate linked into `kkernel` adds a path to a `BlobStore` write
+  method without a main-backend attachment, `blob_pack_owners` or explicit unowned classification.
+  It resolves receiver types and follows runtime/pack accessors and transitive callers, regardless
+  of names or which packs a test enables. Synthetic writers through `f(rt: &KhiveRuntime)` and
+  `g(store: &dyn BlobStore)` each fail the census until classified.
   A planted older-than-grace exec tree and git checkout survive dry run and live sweep via their
   ownership rows, even when their source receipts are stored on secondary pack backends. Removing
   either row after the source becomes nonlive makes the ref eligible only under its approved release
