@@ -7,7 +7,7 @@
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
 a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`; and by its own
-Amendment 1 below (initial version accepted 2026-09-25; revised text pending sign-off), which schedules the attachment orphan sweep in the daemon,
+Amendment 1 below (proposed), which specifies a gated attachment orphan sweep in the daemon,
 adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI.\
 **Depends on**:
 
@@ -300,28 +300,31 @@ for existing consumers; it does not claim the complete ADR-121 public verb rollo
 
 ## Amendment 1 (2026-09-25): the orphan sweep runs on a schedule and on demand
 
-**Status: Revised text pending sign-off (initial version accepted 2026-09-25).** Refs #3038, #3178. This amendment also amends one sentence of
+**Status: Proposed; awaiting sign-off.** Refs #3038, #3178. This amendment also proposes to amend one sentence of
 [ADR-111](ADR-111-blob-store.md) §8, named in item 3.
 
 ### Why
 
 §5 and §6 rest on the ADR-111 sweep running. A hard delete removes a record's attachment rows in its
-own transaction, and "with their rows gone they become sweep-eligible orphans"; `detach` likewise
-says the blob "is reclaimed by the sweep once no references remain". Nothing in a serving process runs that sweep: every
+own transaction, and "with their rows gone they become sweep-eligible orphans"; the deferred `detach`
+verb likewise specifies reclamation after its last reference is removed. Nothing in a serving process runs that sweep: every
 caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed by a hard delete or a
 `detach` stays in the store indefinitely.
 
 ### Decision
 
-1. **Scheduled sweep, daemon only.** The warm daemon (`kkernel mcp --daemon`) runs
-   `transactional_orphan_sweep` against the main backend on a fixed cadence, set by
+1. **Scheduled sweep, daemon only.** After the admission checks in items 6–8, the warm daemon
+   (`kkernel mcp --daemon`) runs `transactional_orphan_sweep` against the canonical main backend
+   and its bound blob root on a fixed cadence, set by
    `KHIVE_BLOB_SWEEP_INTERVAL_SECS` (default 86400, one day; `0` disables the schedule). A
    session-mode process never schedules it. The first run starts one interval after the daemon starts,
    and each later run starts one interval after the previous run ended. A daemon restarted more often
    than its interval never reaches a scheduled run; the admin command in item 3 covers that case, and
    a deployment that restarts often sets a shorter interval.
 2. **Dry run first, live only by opt-in.** A scheduled run is a dry run unless `KHIVE_BLOB_SWEEP_LIVE=1`
-   is set. A deployment therefore starts in dry-run mode, and its first scheduled cycle reports
+   is set. Dry runs obey the same epoch, liveness-completeness and store-binding gates as live runs;
+   an incomplete inventory must refuse rather than report live objects as `would_delete`. A deployment
+   therefore starts in dry-run mode, and its first admitted scheduled cycle reports
    `would_delete` and deletes nothing. An operator enables live mode only after reading the counters of
    at least one dry-run cycle, from the log line in item 4 or from the `blob.sweep` verb. The daemon
    never switches modes on its own. The switch governs the scheduled pass only: no MCP request can
@@ -332,15 +335,20 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    No argument or switch makes an MCP request delete. A process-wide switch set for the schedule
    would otherwise let any caller the Gate (ADR-018) admits for writes delete on demand, so on-demand
    deletion sits behind the operator's own command instead of behind a Gate policy that every
-   deployment would have to narrow correctly. It reaches the main backend only. It is classified `Write` in the [ADR-129](ADR-129-fail-closed-gate-default.md) Amendment 3
+   deployment would have to narrow correctly. It uses the canonical main backend even when
+   `[packs.blob].backend` routes ordinary blob verbs to a secondary. It is classified `Write` in the [ADR-129](ADR-129-fail-closed-gate-default.md) Amendment 3
    operation table, as `gtd.repair` is, because a pass holds the blob store's write lock (item 4) and
-   blocks uploads for its length; a `deny_writes_for` restriction therefore denies it.
+   blocks uploads for its length; a `deny_writes_for` restriction therefore denies it. Adding this
+   explicit classification must bump the versioned classifier identity used in nonempty Gate policy
+   fingerprints.
    On-demand deletion is an operator action: `kkernel blob sweep [--live]` in the admin CLI, which
-   ADR-003 keeps apart from the MCP surface and ADR-109's gateway mode never exposes. It resolves the
-   database and configuration from the operator's selected profile, but refuses both modes unless
-   the resolved database is that profile's canonical main backend; an arbitrary SQLite secondary is
-   never a GC-liveness authority, even when its schema is current. If the command cannot prove main
-   backend identity, it refuses before walking the blob root. It runs the same
+   ADR-003 keeps apart from the MCP surface. It resolves the effective configuration (the loaded
+   `khive.toml`, if any, plus CLI and environment database/root overrides) and requires the selected
+   database and root to pass the durable main-owner binding in item 8. An arbitrary SQLite secondary
+   is never a GC-liveness authority, even when its schema is current. An unbound database/store pair
+   means either side lacks that matching durable binding; `--db` alone, including with no declared
+   `[[backends]]`, never proves main ownership. The command refuses an unbound pair before walking
+   the blob root. It runs the same
    `transactional_orphan_sweep`, is a dry run unless `--live` is given, and prints the four counters
    and the mode. `--live` is the operator's opt-in for that pass;
    `KHIVE_BLOB_SWEEP_LIVE` does not apply to it. ADR-111 §8 says the orphan sweep is "an admin-side
@@ -349,10 +357,14 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    verb or admin command, that finds another sweep holding ownership waits for it, bounded by its
    deadline (the verb's caller deadline; the admin command's `--timeout`), and the verb returns the
    retryable timeout error. A scheduled pass likewise uses a finite ownership-wait deadline, no
-   longer than 30 seconds, and cancels that wait on daemon shutdown; expiration or shutdown skips
-   that cycle without acquiring the lock later or deleting after the caller has gone. Ownership
-   includes ADR-111 §8's cross-process advisory lock, so an admin pass and a scheduled pass in the
-   daemon never run at once. A pass abandoned at its deadline stops
+   longer than 30 seconds. Daemon shutdown cancels an interval timer or ownership wait, so that
+   cycle cannot acquire the lock later. Filesystem enumeration is made cancellable in bounded
+   chunks; a pass already walking checks shutdown between chunks, and a pass deleting finishes and
+   releases its current bounded claim batch. Neither starts another chunk or batch after observing
+   cancellation. The supervisor waits for that cooperative stop and ownership release rather than
+   assuming aborting an async task cancels its blocking filesystem work. Ownership includes
+   ADR-111 §8's cross-process advisory lock, so an admin pass and a scheduled pass in the daemon
+   never run at once. A pass abandoned at its deadline stops
    there: it must not acquire ownership later and run on with no caller to report to. An ADR-111 §8
    epoch refusal is returned as the error unchanged, and a backend without a transactional sweep
    returns its `Unsupported` error.
@@ -361,37 +373,170 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    correction in item 5, ADR-191 Amendment 1 asked a scheduled sweep to report it. A pass holds the
    blob store's per-root write lock across its whole walk and every claim batch, dry run included, and
    `blob.put` takes the same lock, so uploads wait for the length of a pass. The log line therefore also
-   reports the pass duration; bounding the walk is follow-up work if that wait matters.
+   reports the pass duration. The filesystem sweep's default publish grace is one hour; test orphans
+   must have an observed age greater than the configured grace, rather than relying on a fresh put.
+   Bounding each walk and its upload wait remains follow-up work.
 5. **Out of scope: rows whose record is gone.** The sweep counts every attachment row as live, whether
    or not its record still exists. It therefore cannot reclaim a blob whose attachment row outlived its
    record, which is the case ADR-191 A1.2 describes for an interrupted cross-backend hard delete.
    Removing those rows is #3178. ADR-191 A1.2's sentence saying that scheduling this sweep bounds that
    leak is corrected in the same change.
-6. **Admit the current schema epoch before enabling any pass.** ADR-160's Phase-4a gate admits only
-   the exact completed V21 migration ledger. The serving binary on current main applies migrations
-   through V40, so that gate refuses dry runs as well as deletion on every current database. The
-   implementation of items 1–4 must extend `blob_gc_fencing_complete` in the same change: explicitly
-   admit the reviewed, fully migrated current epoch (V40 as of this revision), while preserving the
-   completed cutover marker, attachment-only schema, absent legacy reference column, functional
-   attachment claim fences, and canonical migration names and contiguous ledger. Review migrations
-   V22–V40 for changes to blob references, attachment liveness, and claim fencing; their current DDL
-   does not add another blob-reference authority, but the implementation must prove that with a
-   full-chain migration fixture and a live-object retention control. Do not replace the exact-V21
-   check with `version >= 21` or automatically accept the latest compiled migration: an unknown or
-   ahead-of-reviewed epoch remains `Unsupported` before root locking, filesystem walking, or claim
-   cleanup. Each future migration that advances the admitted epoch must repeat the liveness review
-   and update the gate and its tests in the same change. ADR-160's exact-V21 rule remains the
-   historical Phase-4a rollout contract; this is a later, separately reviewed extension.
+6. **Admit only a reviewed schema epoch.** ADR-160's Phase-4a gate admits only the exact completed
+   V21 migration ledger. The implementing change must explicitly add the reviewed, fully migrated
+   V40 epoch to `blob_gc_fencing_complete`, preserving the completed cutover marker, absent legacy
+   reference column, functional attachment claim fences, canonical migration names and contiguous
+   ledger. V40 is a reviewed _core-schema_ epoch, not by itself permission to sweep: the liveness
+   ownership rows and store binding in items 7 and 8 must also pass. The admission key is the
+   reviewed schema epoch **and** the recorded store identity, never an epoch alone. Core migrations
+   V22–V40 and the pack-owned schemas and blob-writing paths must be reviewed together; pack DDL outside
+   `_schema_migrations` and references inside blob manifests cannot be inferred from the core
+   ledger. A full-chain migration fixture and live-object retention controls must prove the gate.
+   V41 is already ahead of that reviewed epoch; V41 and any later epoch remain `Unsupported` until
+   individually reviewed and explicitly admitted. Do not replace the exact-V21 check with
+   `version >= 21` or automatically accept the latest compiled migration. An unknown or
+   ahead-of-reviewed epoch refuses both modes before root locking, filesystem walking, or claim
+   cleanup. A new migration needed for items 7 or 8 likewise requires its own exact-epoch review;
+   it does not inherit V40 admission. Every change to core or pack-owned liveness schema, producer
+   code or manifest format repeats that review and updates the gate and tests in the same change.
+   ADR-160's exact-V21 rule remains the historical Phase-4a rollout contract.
+7. **Use pack-registered ownership as the complete liveness authority.** Choose option (a): every
+   pack that writes to the shared runtime blob store must register each durable root in the canonical
+   main database, either as an `attachments.content_ref` row or in a new versioned
+   `blob_pack_owners` table. That table records at least `(store_id, content_ref, owner_pack,
+   owner_kind, owner_id, format_version)` with a unique owner/ref key. It is the ownership row, not
+   an ad hoc query over pack-specific JSON, that authorizes retention and release. This lets the
+   sweep and all pack writers use one fenced SQL authority even when pack records live on secondary
+   backends. Raw `blob.put`/`blob.commit` output with no durable owner is explicitly an unowned
+   candidate after the grace period; a pack that returns or persists a ref as durable must register
+   it before publication. The sweep's atomic candidate-claim anti-join reads every attachment
+   role, every live pack ownership row for the bound `store_id`, conservative legacy pins and
+   transitive manifest closure. Registration (including idempotent put of an older unowned ref) and
+   release serialize with claim/delete, so a newly published owner never points to deleted bytes.
+
+   Exec registers run receipts (`tree_in`, `tree_out`, stdout, stderr, sandbox profile and
+   changed/base refs) and receiptless `exec.tree`/`exec.tree_put` outputs; git registers input trees,
+   checkout trees and diffs; persisted web derived-text bodies and the existing moodboard and
+   network bodies use main-backend attachments. The web pack must root a derived-text resource
+   body as an attachment under ADR-191 A1.2; a `properties.blob_ref` alone does not keep it.
+   Every live `khive-tree/v1` manifest keeps its entry refs live recursively: registration
+   materializes a checked child-owner row for each transitive ref before publishing the root.
+   ADR-181's exec
+   receipts and ADR-182's git tree refs remain readable through `blob.get` while their owning
+   receipts are live; a returned receiptless tree and its entries stay pinned until a separately
+   approved release rule exists. An owner row is removed only after its source record is no longer
+   live under that pack's retention contract; an unknown release rule retains the row.
+
+   A test-time census enumerates every direct and wrapper `BlobStore` caller in every enabled pack.
+   Each call site is classified as read-only, an owner-registration path or an explicitly unowned
+   producer; this includes `put`, staged `commit`, tree helpers and paths that return an existing
+   ref. Adding an unclassified caller fails the gate. The census names all historically
+   co-resident pack backends, source tables and manifest formats during backfill; neither the core
+   migration ledger nor an attachment-only scan proves this coverage. The registered-row design
+   is chosen over querying each pack's evolving receipt/property schema at sweep time because a
+   missing or rerouted pack query would silently turn its live refs into orphans.
+
+   An existing root needs a one-time exhaustive backfill from every backend that wrote to it,
+   followed by a durable completion marker tied to that root, the backend roster and the producer
+   versions. The scan and marker commit run under a writer barrier: every pre-protocol writer is
+   drained and prevented from restarting, and every continuing writer validates the binding and
+   registers new durable refs in the main ownership authority before the marker can become valid.
+   A put racing the backfill is either included in the inventory or occurs through that protocol
+   after the marker; there is no unobserved interval. The backfill conservatively pins preexisting
+   objects whose provenance cannot be
+   established, including unrecorded `exec.tree` manifests and their child refs; such pins may leak
+   space until a separately reviewed retention rule exists. It never classifies an unknown old
+   object as collectible solely because its attachment row is absent. A missing or malformed
+   reachable manifest, unknown co-resident backend, incomplete backfill or unregistered blob writer
+   makes both modes `Unsupported` before sweep ownership or walk. In dry run these objects must not
+   appear as `would_delete`. New durable refs are registered on the main backend before a receipt,
+   entity property or returned durable tree ref exposes them; a failed registration fails that
+   publication. Deletion removes the owning record before its root, so a crash can retain bytes but
+   cannot expose a live record to collection. Every blob writer admitted to a bound root validates
+   its owner binding; a second database or pre-protocol binary cannot publish a durable ref there
+   outside the main ownership authority. Every owner-registration write shares the claim fence
+   (or stronger serialization) with the sweep, including writes from a pack routed to a secondary.
+   This item extends ADR-111 §8 and ADR-160 Phase 4's attachment-only liveness rule for these pack
+   objects while keeping the canonical main backend as the sole SQL authority.
+8. **Bind the root to its main database at cutover.** A filesystem blob root has one durable owning
+   main database. For a provably new empty root, a new attachment cutover first records a pending
+   store ID in the main database, then durably writes and verifies the matching anchored marker in
+   the canonical root. A populated root instead requires a separately invoked verified adoption
+   that establishes this same pending ID and marker before cutover can complete; daemon boot never
+   claims it automatically. Only then does one database transaction mark both the binding and
+   cutover complete with that same ID.
+   A crash before this final transaction leaves the cutover incomplete and sweeps refuse. Recovery
+   reuses and verifies the pending ID and any existing matching root marker; it never mints a new ID
+   for that attempt or overwrites a different owner's marker. A cutover completed under this rule implies a durable
+   verified root marker. A database already cut over before this rule obtains its store ID only
+   through the separate verified adoption action below; the
+   old V21 completion marker alone cannot mint one. The database binding and root marker identify
+   the same `store_id`, root and owner, including a durable database identity and canonical
+   database file identity; a copied database at another path cannot inherit ownership by copying
+   its rows. A completed attachment cutover, empty `attachments`, a database path supplied by
+   `--db`, or the path-derived GC claim key is not binding proof. `FsBlobStore` checks the binding
+   against the supplied `SqlAccess` for _both_ sweep modes before any database/root ownership lock
+   or filesystem walk, then rechecks after holding both the database GC owner and root write lock,
+   immediately before walking or deleting. A reviewed epoch with a missing or different `store_id`
+   is `Unsupported` just like an unreviewed epoch. Missing, corrupt, stale or mismatched evidence
+   returns a typed refusal with no fallback. An in-memory database cannot own a
+   durable filesystem root under this rule. Binding or rebinding a populated root is a separate
+   verified adoption action, never an automatic side effect of a sweep or boot. Adoption records a
+   pending database store ID, durably writes and verifies the root marker under the same owner/root
+   locks, and records binding completion only after they match. Recovery reuses that pending ID;
+   adoption cannot infer an ID from a path or silently overwrite another owner's marker.
+   Provisioning proves the selected database is the effective topology's canonical main (`KhiveRuntime::core()` in a
+   daemon); with no declared `[[backends]]`, a selected `--db` becomes main only through an existing
+   valid binding or this explicit provisioning action. It takes the affected
+   database GC owners in a deterministic order and then the root write lock, following the sweep's
+   database-before-root order, and holds them through the durable update and verification. The scheduler,
+   `blob.sweep` and the admin command all supply the canonical main backend irrespective of the
+   blob pack's routing, and all three refuse an unbound pair. Root resolution still follows
+   `KHIVE_BLOB_ROOT`, configured root, then `<db_dir>/blobs`; the resolved _canonical_ root is what
+   the binding names. A root shared with a second fully migrated database is refused for that
+   database, even if its attachment table is empty or its database UUID was copied.
 
 ### Acceptance
 
-- A database migrated through the real complete current migration chain (V40 at this revision),
-  without hand-editing `_schema_migrations`, admits both dry-run and live transactional sweeps. A
-  referenced object under every attachment role survives both; an older unreferenced object is
-  reported in dry run and reclaimed only in live mode. A missing/corrupt ledger entry or an
-  unreviewed later migration refuses both modes before root locking or a filesystem walk. A missing
-  or nonfunctional claim fence refuses before new claims, claim cleanup, or deletion. The historical
-  exact-V21 control still passes.
+- A database migrated through the real complete V40 chain, without hand-editing
+  `_schema_migrations`, passes the explicit V40 core-schema predicate but refuses a full sweep
+  until the ownership rows and binding in items 7–8 are complete. The separate migration that
+  adds `blob_pack_owners` needs its own exact-epoch review and admission; V40 admission does not
+  grandfather it. At that fully reviewed epoch, a bound store ID admits dry-run and live
+  transactional sweeps. A referenced object under every attachment role survives both; an object
+  absent from attachments, registered roots, legacy pins and manifest closure, created after the
+  inventory cutover and older than the configured grace (one hour by default) is reported in dry run
+  and reclaimed only in live mode. Test objects
+  are backdated beyond that grace. A missing/corrupt ledger entry, V41 or any unreviewed later
+  migration refuses both modes before root locking or a filesystem walk. A missing or nonfunctional
+  claim fence refuses before new claims, claim cleanup or deletion. The historical exact-V21
+  control still passes its epoch predicate; without the inventory and binding, even a V21 full
+  sweep refuses.
+- A live exec receipt's input and output trees, every tree entry, stdout, stderr, sandbox profile,
+  and changed/base refs remain readable through `exec.receipt`, `exec.tree_get` and `blob.get`
+  after an older-than-grace live scheduled pass and live admin pass. A receiptless `exec.tree` or
+  `exec.tree_put` manifest, including an edited entry and a pre-cutover tree with its child refs,
+  also survives both. A
+  live git checkout receipt's tree and entries and a git diff receipt's blob likewise remain
+  readable through the git receipt and `blob.get`. A persisted web extracted-text resource has a
+  main-backend content attachment and survives; a pre-cutover derived resource whose only old root
+  was `properties.blob_ref` is retained by backfill as well. Moodboard originals, model bundles and network
+  bodies survive under every existing attachment role. The same objects are absent from
+  `would_delete` in dry runs.
+- A test-time census fails if any enabled pack adds a direct or wrapper `BlobStore` caller without
+  a read-only, main-backend attachment, `blob_pack_owners` or explicit unowned classification.
+  A planted older-than-grace exec tree and git checkout survive dry run and live sweep via their
+  ownership rows, even when their source receipts are stored on secondary pack backends. Removing
+  either row after the source becomes nonlive makes the ref eligible only under its approved release
+  rule; an unclassified source never becomes eligible by default.
+- A populated root with no completed producer/backfill inventory, an unknown historically
+  co-resident backend, an unregistered writer, or an unreadable reachable tree manifest refuses
+  _both_ modes before ownership or walk. Backfill from all known pack backends pins old unknown
+  objects rather than deleting them by age. A new durable reference published concurrently with a
+  candidate claim either fences the claim or waits; it never returns a reference to a deleted blob.
+  A put during backfill is included or registered after the barrier, never lost between scan and
+  completion. A second database cannot publish a durable reference into the bound root and then
+  have that object collected by the owner. Rebinding races with an active pass without changing
+  ownership underneath its walk or deletion.
 - A daemon with a short interval and an orphan older than the grace period runs a dry-run cycle that
   logs `would_delete=1`, `deleted=0` and leaves the object in place. With `KHIVE_BLOB_SWEEP_LIVE=1` the
   next cycle deletes it and logs `deleted=1`.
@@ -401,12 +546,26 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   carrying a live flag is rejected as an unknown argument. A caller under a `deny_writes_for`
   restriction is denied `blob.sweep`.
 - `kkernel blob sweep` without `--live` deletes nothing; with `--live` it deletes an orphan older than
-  the grace period and prints `deleted=1`, whether or not `KHIVE_BLOB_SWEEP_LIVE` is set. A configured
-  secondary SQLite database with an empty attachments table is refused in both modes before the blob
-  root is walked; an unconfigured target is refused likewise.
+  the grace period and prints `deleted=1`, whether or not `KHIVE_BLOB_SWEEP_LIVE` is set. In a
+  two-backend daemon with `[packs.blob].backend` selecting a secondary, the schedule and
+  `blob.sweep` still use the bound main database; a direct sweep handed the fully migrated
+  secondary's empty-attachment SQL refuses in both modes before a lock or walk. A second migrated
+  database sharing that root, once through the default same-directory root and once through
+  `KHIVE_BLOB_ROOT`, refuses through `--db` and the direct API in both modes, even when it has a
+  copied database UUID. Crashes before the root marker, after that marker but before database
+  completion, and after completion are replayed: both sweep modes refuse before any lock or walk
+  until the final state has matching durable IDs, and replay preserves the pending `store_id`
+  without overwriting another owner's marker. A populated-root cutover without explicit adoption
+  also refuses; an already-completed cutover never silently mints or replaces an ID. The same
+  reviewed epoch with an absent or mismatched cutover `store_id`
+  refuses before a lock or walk. Missing, corrupt and stale binding markers, root relocation and an unbound
+  database/store pair refuse likewise. No command treats an arbitrary `--db` as proof of ownership.
 - `kkernel blob sweep --live` started while a scheduled run in the daemon holds ownership either
   completes after it or exits with the timeout error when `--timeout` passes first. Neither deletes an
   object whose attachment row committed while it waited, and a pass that timed out performs no
   deletion afterwards.
-- A scheduled pass waiting for ownership skips the cycle within 30 seconds, or sooner on daemon
-  shutdown, logs why it skipped and the elapsed wait, and never runs later after that cancellation.
+- A scheduled pass waiting for its interval or ownership skips the cycle within 30 seconds of an
+  ownership wait, or sooner on daemon shutdown, logs why it skipped and the elapsed wait, and never
+  runs later after cancellation. Shutdown during a walk or delete finishes at most the current
+  bounded enumeration chunk or claim/delete/release unit; no later unit starts, all guards are released, and a
+  replacement process can acquire ownership without inheriting an active blocking task.

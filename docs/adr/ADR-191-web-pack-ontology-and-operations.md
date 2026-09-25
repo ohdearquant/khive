@@ -280,12 +280,14 @@ invocation with two commits in a fixed order: the record's own backend commits t
 then the main backend deletes the attachment rows that named the record, and that second delete is
 idempotent (deleting rows that are already gone succeeds). A crash between the two commits leaves
 attachment rows whose record is gone; those rows root nothing that matters (the record they would
-keep alive no longer exists) but they keep the blob alive until something removes them. Scheduling the
-blob orphan sweep does not bound this leak: the sweep reclaims objects with no attachment row, and
-these rows still exist. Removing attachment rows whose record is gone from its own backend needs a
+keep alive no longer exists) but they keep the blob alive until something removes them.
+
+**Cross-document correction proposed by ADR-121 Amendment 1 (2026-09-25).** Scheduling the blob
+orphan sweep does not bound this leak: the sweep reclaims objects with no attachment row, and these
+rows still exist. Removing attachment rows whose record is gone from its own backend needs a
 reconciliation of its own, which this amendment records and does not discharge (tracked as issue
-#3178). The sweep itself is scheduled by ADR-121 Amendment 1 (#3038). The
-reverse order is forbidden: a crash after the attachment
+#3178). A schedule is proposed in ADR-121 Amendment 1 (#3038), conditional on complete blob
+liveness and store-ownership gates. The reverse order is forbidden: a crash after the attachment
 rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
 which is data loss, and this amendment exists to make stored bodies stay alive.
 
