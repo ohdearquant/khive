@@ -26,7 +26,7 @@ An always-machine-readable copy of this page is at
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
@@ -2536,7 +2536,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 4 verbs
+## `session` pack — 5 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2601,6 +2601,24 @@ Serialize one stored session as json or markdown.
 ```
 request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 ```
+
+### `session.search` — Assertive (dependency gated)
+
+Search mirrored message text within the request's resolved tenant scope. The
+public handler currently refuses until transcript deletion and resume/export
+continuity support are available. Serving multiple principals also requires
+authenticated connection identity.
+
+| Param    | Type    | Required | Notes                                                         |
+| -------- | ------- | -------- | ------------------------------------------------------------- |
+| `query`  | string  | yes      | Words to match in mirror text.                                |
+| `limit`  | integer | no       | 1–200, default 20.                                            |
+| `since`  | string  | no       | Inclusive RFC 3339 message creation lower bound.              |
+| `source` | string  | no       | Exact source; `unknown` returns migration orphans when named. |
+| `cwd`    | string  | no       | Exact session working directory.                              |
+
+The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
+specifies the scoped key, migration, and search result identity.
 
 ---
 

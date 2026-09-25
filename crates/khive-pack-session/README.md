@@ -1,6 +1,6 @@
 # khive-pack-session
 
-Session pack: registers the `session` note kind and four agent-facing verbs
+Session pack: registers the `session` note kind and five agent-facing verbs
 for storing and retrieving agent-session records (transcripts or summaries)
 over the notes substrate (ADR-083).
 
@@ -18,6 +18,9 @@ over the notes substrate (ADR-083).
   8+ hex short prefix.
 - `session.export(id, format?)` — serialize a session as `json` (default) or
   `markdown`.
+- `session.search(query, limit?, since?, source?, cwd?)` — tenant-scoped mirror
+  search. The public handler remains unavailable until transcript deletion and
+  resume/export continuity support are available.
 
 ```text
 request(ops="session.store(content=\"...\", provider=\"codex\", provider_session_id=\"abc\")")
@@ -29,12 +32,14 @@ request(ops="session.export(id=\"a1b2c3d4\", format=\"markdown\")")
 
 ## Storage
 
-Sessions are stored as `kind=session` notes on the shared `notes` substrate —
-no pack-private schema or migration. `notes.name` holds the optional title,
+Sessions stored through the four note verbs are `kind=session` notes on the
+shared `notes` substrate. `notes.name` holds the optional title,
 `notes.content` holds the verbatim payload, and `notes.properties` holds
 `provider`, `provider_session_id`, and `tags`. Handlers go through the public
 runtime seam (`runtime.core()`, `create_note`, `query_notes_filtered`,
-`resolve_prefix`, `resolve_primary`) rather than direct SQL.
+`resolve_prefix`, `resolve_primary`) rather than direct SQL. The separate
+session mirror has pack-owned SQL tables, a versioned identity migration,
+and an FTS5 index; see [ADR-117a mirror identity](docs/api/adr117a-identity.md).
 
 ## Out of scope for this slice
 
