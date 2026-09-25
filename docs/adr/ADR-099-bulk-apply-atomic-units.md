@@ -908,7 +908,7 @@ for every matched `UPDATE`, including equal-value assignments.
 
 ## Amendment 7 (2026-09-25) — a rolled-back unit exits non-zero
 
-Status: Proposed. Needs maintainer sign-off before it binds. Refs #3275.
+Status: Accepted (2026-09-25). Refs #3275.
 
 ### Context
 

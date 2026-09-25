@@ -144,9 +144,9 @@ documented limitation, consistent with hard-delete cascade semantics.
 - Deleting an anchor while its corpus remains live is surfaced to the caller
   instead of silently duplicated around.
 
-## Proposed rider: three anchor-resolution behaviours (2026-09-25)
+## Rider: three anchor-resolution behaviours (2026-09-25)
 
-Status: Proposed. Needs maintainer sign-off before it binds. Refs #3176. It adds to the resolution
+Status: Accepted (2026-09-25). Refs #3176. It adds to the resolution
 rules above and replaces none of them.
 
 ### Context

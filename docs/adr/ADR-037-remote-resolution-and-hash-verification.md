@@ -321,7 +321,7 @@ escape hatch for legitimate upstream updates.
 
 ## Amendment 1 (2026-09-25): cache publication is a two-rename directory swap
 
-Status: Proposed. Needs maintainer sign-off before it binds. Refs #3215, #475.
+Status: Accepted (2026-09-25). Refs #3215, #475.
 
 ### Context
 

@@ -613,7 +613,7 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
 
 ## Amendment 2 (2026-09-25): the issues Amendment 1 item 7 answers, and the blob writer census population
 
-**Status: Proposed.** Refs #3327, #3273, #3344, #3038, #3178. A follow-up to Amendment 1; it does not
+**Status: Accepted (2026-09-25).** Refs #3327, #3273, #3344, #3038, #3178. A follow-up to Amendment 1; it does not
 change Amendment 1's text or status, and it binds only together with Amendment 1.
 
 ### Why

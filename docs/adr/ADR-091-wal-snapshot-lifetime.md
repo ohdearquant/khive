@@ -1898,8 +1898,8 @@ untouched.
 
 ### 2026-09-25 amendment (Amendment 22): a single probe row is a backfill gap, and a busy result is neutral to the pinned-frame run
 
-**Status: Proposed.** Refs #3185, #3191, #1830. Needs maintainer sign-off before it binds. It does
-not edit Plank C or Amendment 21 in place; if accepted, it amends Plank C's reading of the probe row
+**Status: Accepted (2026-09-25).** Refs #3185, #3191, #1830. It does
+not edit Plank C or Amendment 21 in place; it amends Plank C's reading of the probe row
 and the busy clause of Amendment 21 item 2. Everything else in both stands.
 
 **Context.**

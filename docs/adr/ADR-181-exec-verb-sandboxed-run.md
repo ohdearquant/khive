@@ -388,7 +388,7 @@ and decoding an older receipt leaves the unknown cap absent.
 
 ## Amendment 9 (2026-09-25): what the version-control and `never` denial guarantees
 
-Status: Proposed. Needs maintainer sign-off before it binds. Refs #3303, #3304. This amendment
+Status: Accepted (2026-09-25). Refs #3303, #3304. This amendment
 changes no enforcement. It states the guarantee of Amendment 3 item 3 exactly, and says which part of
 the profile bounds what a run can do to a repository.
 
