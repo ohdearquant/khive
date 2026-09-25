@@ -780,8 +780,36 @@ fn bounded_retry_deadline() -> tokio::time::Instant {
         .map_or(deadline, |caller| caller.min(deadline))
 }
 
+fn pid_file_directory_is_trusted_if_present(pid_file: &std::path::Path) -> Result<bool, String> {
+    let parent = pid_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match std::fs::metadata(parent) {
+        // First startup may not have created the default rendezvous directory
+        // yet. No PID record exists to read; daemon startup checks the parent
+        // before it creates the PID file.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => daemon::ensure_pid_file_dir_is_trusted(pid_file)
+            .map(|()| true)
+            .map_err(|error| format!("{error:#}")),
+    }
+}
+
 fn recorded_daemon_is_alive() -> bool {
-    std::fs::read_to_string(pid_path())
+    let pid_file = pid_path();
+    match pid_file_directory_is_trusted_if_present(&pid_file) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "daemon PID-file directory is not trusted; skipping the recorded-process probe"
+            );
+            return false;
+        }
+    }
+    std::fs::read_to_string(pid_file)
         .ok()
         .and_then(|pid| pid.trim().parse::<u32>().ok())
         .is_some_and(process_is_alive)
@@ -1288,6 +1316,7 @@ const INCUMBENT_EXIT_POLL_MS: u64 = 25;
 enum RecoveryError {
     Spawn(std::io::Error),
     IncumbentStillAlive { pid: u32 },
+    PidFileDirectoryUntrusted(String),
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -1365,7 +1394,11 @@ async fn kill_stale_daemon_inner(
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let pid_file = pid_path();
-    let expected_snapshot = PidFileSnapshot::read(&pid_file);
+    let expected_snapshot = match pid_file_directory_is_trusted_if_present(&pid_file) {
+        Ok(true) => PidFileSnapshot::read(&pid_file),
+        Ok(false) => PidFileSnapshot::Missing,
+        Err(message) => return Err(RecoveryError::PidFileDirectoryUntrusted(message)),
+    };
     let expected_pid = expected_snapshot.pid();
 
     let wait_for_exit = if let Some(pid) = expected_pid {
@@ -1421,7 +1454,18 @@ fn remove_daemon_paths_if_still_stale(
     pid_file: &std::path::Path,
     expected_snapshot: &PidFileSnapshot,
 ) -> bool {
-    let current_snapshot = PidFileSnapshot::read(pid_file);
+    let (current_snapshot, pid_directory_trusted) =
+        match pid_file_directory_is_trusted_if_present(pid_file) {
+            Ok(true) => (PidFileSnapshot::read(pid_file), true),
+            Ok(false) => (PidFileSnapshot::Missing, false),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "daemon PID-file directory is not trusted; skipping stale-path cleanup"
+                );
+                return false;
+            }
+        };
     if matches!(expected_snapshot, PidFileSnapshot::Unreadable)
         || matches!(current_snapshot, PidFileSnapshot::Unreadable)
     {
@@ -1457,11 +1501,16 @@ fn remove_daemon_paths_if_still_stale(
         Err(_) => return false,
     }
 
-    for path in [pid_file, sock.as_path()] {
-        if let Err(error) = std::fs::remove_file(path) {
+    if pid_directory_trusted {
+        if let Err(error) = std::fs::remove_file(pid_file) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return false;
             }
+        }
+    }
+    if let Err(error) = std::fs::remove_file(&sock) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return false;
         }
     }
     true
@@ -2044,6 +2093,22 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
         format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
+}
+
+fn untrusted_pid_file_directory_error(message: String) -> McpError {
+    tracing::error!(
+        reason = "untrusted_pid_file_directory",
+        error = %message,
+        "daemon recovery refused because its PID-file directory is not trusted"
+    );
+    let mut data = serde_json::json!({
+        "reason": "untrusted_pid_file_directory",
+        "error": message,
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    daemon_mcp_error(format!("daemon recovery refused: {message}"), Some(data))
 }
 
 /// Build the caller-visible error for a socket-less rendezvous claimed by a
@@ -2842,6 +2907,9 @@ where
         Err(RecoveryError::IncumbentStillAlive { pid }) => {
             return Some(Err(incumbent_still_alive_error(pid)));
         }
+        Err(RecoveryError::PidFileDirectoryUntrusted(message)) => {
+            return Some(Err(untrusted_pid_file_directory_error(message)));
+        }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
         }
@@ -2987,6 +3055,19 @@ mod tests {
             .expect("memory runtime")
             .config()
             .clone()
+    }
+
+    #[test]
+    fn missing_pid_parent_is_treated_as_no_incumbent() {
+        let workspace = std::env::current_dir().expect("workspace directory");
+        let dir = tempfile::Builder::new()
+            .prefix("khive-missing-pid-parent-")
+            .tempdir_in(workspace)
+            .expect("workspace-local tempdir");
+        let pid_file = dir.path().join("not-created").join("khived.pid");
+
+        assert!(!pid_file_directory_is_trusted_if_present(&pid_file)
+            .expect("an absent PID parent is not an unsafe PID record"));
     }
 
     fn make_test_server() -> crate::server::KhiveMcpServer {
@@ -7222,7 +7303,7 @@ mod tests {
                 None
             }
             Ok(RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain)
-            | Err(RecoveryError::Spawn(_)) => None,
+            | Err(RecoveryError::Spawn(_) | RecoveryError::PidFileDirectoryUntrusted(_)) => None,
         };
         let live_pid_file_preserved = pid_file.exists();
         cleanup.kill_and_reap_child();

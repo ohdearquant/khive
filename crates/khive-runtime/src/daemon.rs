@@ -1861,6 +1861,44 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
     run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true, |_| {}).await
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RendezvousPathRole {
+    Socket,
+    PidFile,
+}
+
+#[cfg(unix)]
+impl RendezvousPathRole {
+    fn env_name(self) -> &'static str {
+        match self {
+            Self::Socket => SOCKET_PATH_ENV,
+            Self::PidFile => PID_PATH_ENV,
+        }
+    }
+
+    fn directory_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket directory",
+            Self::PidFile => "PID-file directory",
+        }
+    }
+
+    fn path_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket path",
+            Self::PidFile => "PID-file path",
+        }
+    }
+
+    fn path_component_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket-path",
+            Self::PidFile => "PID-file-path",
+        }
+    }
+}
+
 /// Vet the socket's parent directory, re-permissioning it only when it is the
 /// directory khive owns by convention.
 ///
@@ -1887,24 +1925,52 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
     // SAFETY: `geteuid` is always successful and takes no arguments.
     let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::Socket, daemon_euid, true)
+}
 
-    if parent == khive_dir() {
+/// Vet the parent directory of a PID file before reading, locking, or writing
+/// it. The file's lock only protects the inode currently named by its path;
+/// every directory component must therefore be as swap-resistant as the
+/// socket rendezvous.
+#[cfg(unix)]
+pub fn ensure_pid_file_dir_is_trusted(pid_file: &std::path::Path) -> anyhow::Result<()> {
+    let parent = pid_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::PidFile, daemon_euid, false)
+}
+
+#[cfg(unix)]
+fn ensure_rendezvous_dir_is_trusted(
+    parent: &std::path::Path,
+    role: RendezvousPathRole,
+    daemon_euid: u32,
+    repair_owned_default: bool,
+) -> anyhow::Result<()> {
+    let env_name = role.env_name();
+    let directory_name = role.directory_name();
+
+    if repair_owned_default && parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             anyhow::anyhow!(
                 "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
-                 owner-only — it is half of the same-uid guarantee this daemon enforces.",
+                 owner-only as the {directory_name} for {env_name}; it is part of the \
+                 same-uid guarantee this daemon enforces.",
                 parent.display()
             )
         })?;
-        return ensure_socket_path_is_swap_resistant(parent, daemon_euid);
+        return ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role);
     }
 
     // Fail closed on the stat itself: not being able to read the metadata is
     // not the same as the directory passing.
     let meta = std::fs::metadata(parent).map_err(|e| {
         anyhow::anyhow!(
-            "refusing to start: cannot stat {}: {e}. The socket directory gates \
-             socket-takeover safety, and unreadable metadata is not a passing state.",
+            "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
+             It gates rendezvous-path safety, and unreadable metadata is not a passing state.",
             parent.display()
         )
     })?;
@@ -1913,10 +1979,10 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     let owner = meta.uid();
     if owner != daemon_euid && owner != 0 {
         anyhow::bail!(
-            "refusing to start: socket directory {} is owned by uid {owner}, not this \
-             daemon's uid ({daemon_euid}) or root. A directory owner can replace the \
-             socket regardless of mode bits. Point KHIVE_SOCKET at a directory you own, \
-             or unset it for the default.",
+            "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
+             not this daemon's uid ({daemon_euid}) or root. A directory owner can replace \
+             the rendezvous path regardless of mode bits. Point {env_name} at a directory \
+             you own, or unset it for the default.",
             parent.display()
         );
     }
@@ -1924,18 +1990,26 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     let mode = meta.permissions().mode();
     if mode & 0o022 != 0 {
         anyhow::bail!(
-            "refusing to start: socket directory {} is mode {:04o} — writable by group or \
-             other, so another local user could bind their own listener at the socket path \
-             (before this daemon starts, the sticky bit does not prevent creating the \
-             path). Use a directory only you can write, or unset KHIVE_SOCKET for the \
-             default. This daemon is not changing the permissions of a directory it does \
-             not own.",
+            "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
+             by group or other, so another local user could replace the rendezvous path. \
+             Use a directory only you can write, or unset {env_name} for the default. \
+             This daemon is not changing the permissions of a directory it does not own.",
             parent.display(),
             mode & 0o7777
         );
     }
 
-    ensure_socket_path_is_swap_resistant(parent, daemon_euid)
+    ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role)
+}
+
+/// Socket-role form of [`ensure_rendezvous_path_is_swap_resistant`], used by the
+/// socket-path tests.
+#[cfg(all(unix, test))]
+fn ensure_socket_path_is_swap_resistant(
+    parent: &std::path::Path,
+    daemon_euid: u32,
+) -> anyhow::Result<()> {
+    ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, RendezvousPathRole::Socket)
 }
 
 /// Walk the socket directory path exactly as the kernel will traverse it at
@@ -1963,11 +2037,17 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
 /// (who could rename the entry, or chmod the directory first), is refused.
 /// Every stat failure fails closed.
 #[cfg(unix)]
-fn ensure_socket_path_is_swap_resistant(
+fn ensure_rendezvous_path_is_swap_resistant(
     parent: &std::path::Path,
     daemon_euid: u32,
+    role: RendezvousPathRole,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
+
+    let env_name = role.env_name();
+    let directory_name = role.directory_name();
+    let path_name = role.path_name();
+    let component_name = role.path_component_name();
 
     let absolute = if parent.is_absolute() {
         parent.to_path_buf()
@@ -1976,7 +2056,7 @@ fn ensure_socket_path_is_swap_resistant(
             .map_err(|e| {
                 anyhow::anyhow!(
                     "refusing to start: cannot resolve the working directory to absolutize \
-                     socket directory {}: {e}.",
+                     {directory_name} {} for {env_name}: {e}.",
                     parent.display()
                 )
             })?
@@ -2011,8 +2091,8 @@ fn ensure_socket_path_is_swap_resistant(
         let candidate = resolved.join(&component);
         let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
             anyhow::anyhow!(
-                "refusing to start: cannot stat socket-path component {}: {e}. An \
-                 unreadable component is not a passing one.",
+                "refusing to start: cannot stat {component_name} component {} for {env_name}: \
+                 {e}. An unreadable component is not a passing one.",
                 candidate.display()
             )
         })?;
@@ -2022,24 +2102,24 @@ fn ensure_socket_path_is_swap_resistant(
             symlinks_followed += 1;
             if symlinks_followed > 40 {
                 anyhow::bail!(
-                    "refusing to start: socket path resolves through more than 40 symlinks \
-                     at {} — treating this as a loop.",
+                    "refusing to start: {path_name} for {env_name} resolves through more than \
+                     40 symlinks at {} — treating this as a loop.",
                     candidate.display()
                 );
             }
             if owner != daemon_euid && owner != 0 {
                 anyhow::bail!(
-                    "refusing to start: socket-path symlink component {} is owned by uid \
-                     {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
-                     could retarget it after this check and re-root the socket path. Point \
-                     KHIVE_SOCKET somewhere trusted end to end, or unset it for the \
-                     default.",
+                    "refusing to start: {component_name} symlink component {} for {env_name} \
+                     is owned by uid {owner}, not this daemon's uid ({daemon_euid}) or root — \
+                     its owner could retarget it after this check and re-root the {path_name}. \
+                     Point {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
                 );
             }
             let target = std::fs::read_link(&candidate).map_err(|e| {
                 anyhow::anyhow!(
-                    "refusing to start: cannot read socket-path symlink component {}: {e}.",
+                    "refusing to start: cannot read {component_name} symlink component {} \
+                     for {env_name}: {e}.",
                     candidate.display()
                 )
             })?;
@@ -2052,19 +2132,19 @@ fn ensure_socket_path_is_swap_resistant(
             let sticky = mode & 0o1000 != 0;
             if owner != daemon_euid && owner != 0 {
                 anyhow::bail!(
-                    "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
-                     this daemon's uid ({daemon_euid}) or root — its owner could rename the \
-                     next path component and re-root the socket path. Point KHIVE_SOCKET \
-                     somewhere trusted end to end, or unset it for the default.",
+                    "refusing to start: {component_name} ancestor {} for {env_name} is owned by \
+                     uid {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
+                     could rename the next path component and re-root the {path_name}. Point \
+                     {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
                 );
             }
             if mode & 0o022 != 0 && !sticky {
                 anyhow::bail!(
-                    "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
-                     group or other without the sticky bit, so another local user could rename \
-                     the next path component and re-root the socket path. Point KHIVE_SOCKET \
-                     somewhere trusted end to end, or unset it for the default.",
+                    "refusing to start: {component_name} ancestor {} for {env_name} is mode \
+                     {:04o} — writable by group or other without the sticky bit, so another \
+                     local user could rename the next path component and re-root the {path_name}. \
+                     Point {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display(),
                     mode & 0o7777
                 );
@@ -2074,8 +2154,8 @@ fn ensure_socket_path_is_swap_resistant(
         }
 
         anyhow::bail!(
-            "refusing to start: socket-path component {} is neither a directory nor a \
-             symlink — the socket path cannot traverse it.",
+            "refusing to start: {component_name} component {} for {env_name} is neither a \
+             directory nor a symlink — the {path_name} cannot traverse it.",
             candidate.display()
         );
     }
@@ -2151,10 +2231,18 @@ where
 
     let sock = socket_path();
     let pid_file = pid_path();
+    let socket_parent = sock.parent();
+    let pid_parent = pid_file.parent();
 
-    if let Some(parent) = sock.parent() {
+    if let Some(parent) = socket_parent {
         std::fs::create_dir_all(parent)?;
         ensure_socket_dir_is_trusted(parent)?;
+    }
+    // Identical parent paths traverse the same components, so the socket
+    // check above also vets the PID-file parent. Aliased paths are checked
+    // independently because each original path is traversed by file access.
+    if pid_parent != socket_parent {
+        ensure_pid_file_dir_is_trusted(&pid_file)?;
     }
 
     // Hold the startup lock across cleanup → pid-claim → bind so a concurrent
@@ -4936,9 +5024,8 @@ mod tests {
     /// owner). On macOS these fixtures also implicitly exercise the
     /// symlink-accept arm, since the platform temp root itself resolves
     /// through root-owned symlinks. Foreign ownership of a directory is
-    /// refused by the same helper, but a non-root test cannot chown a
-    /// directory away from itself, so that arm is exercised by the mode
-    /// checks' shared fail-closed path rather than a dedicated fixture.
+    /// refused by the same helper; a separate simulated-euid test covers
+    /// foreign ownership without requiring a privileged chown operation.
     #[test]
     fn trusted_socket_dirs_are_accepted_unmodified() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4956,6 +5043,41 @@ mod tests {
                 "acceptance must not re-permission the directory either"
             );
         }
+    }
+
+    #[test]
+    fn pid_directory_owned_by_another_uid_is_refused() {
+        let workspace = std::env::current_dir().expect("workspace directory");
+        let dir = tempfile::Builder::new()
+            .prefix("khive-pid-owner-")
+            .tempdir_in(workspace)
+            .expect("workspace-local tempdir");
+        let parent = dir.path().join("private");
+        std::fs::create_dir(&parent).expect("create private directory");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("set private mode");
+
+        // A non-root test cannot chown its directory to another uid. Injecting
+        // an euid that does not own this directory exercises that same refusal.
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let daemon_euid = (unsafe { libc::geteuid() } as u32).wrapping_add(1);
+        let error = ensure_rendezvous_dir_is_trusted(
+            &parent,
+            RendezvousPathRole::PidFile,
+            daemon_euid,
+            false,
+        )
+        .expect_err("a PID parent owned by another uid must be refused");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("KHIVE_PID"),
+            "wrong variable in refusal: {message}"
+        );
+        assert!(
+            message.contains("PID-file directory") && message.contains("owned by uid"),
+            "refusal must identify foreign ownership of the PID parent: {message}"
+        );
     }
 
     /// Test 2: `wal_pages` reflects a real
