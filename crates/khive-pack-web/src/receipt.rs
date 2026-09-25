@@ -5,8 +5,8 @@
 //! contract's `note annotates *` row (ADR-002:503, note→any). D4: "every
 //! network action writes one observation note annotating the entity it
 //! touched (or standing alone for a search)" — `annotates` is therefore
-//! empty only for `web.search` without `persist`, never for `fetch`/
-//! `refresh`. Chained by `supersedes` (D2's receipt-chain row) is the
+//! empty for a transient `web.fetch` or a `web.search` without persisted
+//! hits. Chained by `supersedes` (D2's receipt-chain row) is the
 //! caller's job: `write_receipt` returns the new note's id so the caller can
 //! link it to the previous receipt for the same resource.
 
