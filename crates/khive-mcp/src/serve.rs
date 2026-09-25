@@ -2368,6 +2368,26 @@ pub async fn build_registry_for_multi_backend_with_db_anchor(
     cli_db_override: Option<&str>,
     db_anchor: Option<&std::path::Path>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+        None,
+    )
+    .await
+}
+
+/// Build a registry with a reader count fixed before any configured store opens.
+/// `None` retains normal sizing; callers selecting a forwarding default should
+/// use [`mcp_max_readers`] so explicit counts and direct hosts retain precedence.
+pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+    max_readers: Option<usize>,
+) -> anyhow::Result<MultiBackendRegistry> {
     // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
     // so it must agree with the canonical anchor for this same `--db` input.
     // This is the shared choke point both multi-backend boot paths funnel
@@ -2376,7 +2396,13 @@ pub async fn build_registry_for_multi_backend_with_db_anchor(
     // once instead of at each caller.
     khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
-    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override).await
+    build_registry_for_multi_backend_inner_with_max_readers(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        max_readers,
+    )
+    .await
 }
 
 /// One backend's schema result from [`migrate_configured_storage_topology`].
@@ -2569,7 +2595,7 @@ pub async fn migrate_configured_storage_topology(
             .find(|backend| backend.name == target)
             .expect("the planner validated the selected backend")
             .clone();
-        let backend = Arc::new(open_backend(&selected)?);
+        let backend = Arc::new(open_backend(&selected, None)?);
         prepare_core_schema_for_boot(Arc::clone(&backend), format!("backend {}", selected.name))
             .await?;
         crate::attachment_cutover::require_secondary_attachment_empty(
@@ -2594,6 +2620,7 @@ pub async fn migrate_configured_storage_topology(
         khive_cfg,
         cli_db_override,
         StorageTopologyPurpose::SchemaAdministration,
+        None,
     )
     .await?;
     let selected_target = target_backend
@@ -3054,6 +3081,7 @@ async fn prepare_configured_storage_topology(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
     purpose: StorageTopologyPurpose,
+    max_readers: Option<usize>,
 ) -> anyhow::Result<PreparedStorageTopology> {
     let force_memory =
         normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
@@ -3116,7 +3144,7 @@ async fn prepare_configured_storage_topology(
                 continue;
             }
         }
-        let backend = open_backend(backend_cfg)?;
+        let backend = open_backend(backend_cfg, max_readers)?;
         let arc = Arc::new(backend);
         if let Some(canon) = canonical {
             path_to_backend.insert(canon, arc.clone());
@@ -3264,6 +3292,21 @@ async fn build_registry_for_multi_backend_inner(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    build_registry_for_multi_backend_inner_with_max_readers(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        None,
+    )
+    .await
+}
+
+async fn build_registry_for_multi_backend_inner_with_max_readers(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    max_readers: Option<usize>,
+) -> anyhow::Result<MultiBackendRegistry> {
     let PreparedStorageTopology {
         base_config,
         backends,
@@ -3274,6 +3317,7 @@ async fn build_registry_for_multi_backend_inner(
         khive_cfg,
         cli_db_override,
         StorageTopologyPurpose::Serving,
+        max_readers,
     )
     .await?;
 
@@ -3541,6 +3585,33 @@ pub fn enforce_strict_actor_mode(
     Ok(())
 }
 
+/// Select the local pool size before an MCP host opens any store.
+///
+/// A forwarding client retains these pools for boot work, `save_to`, and local
+/// fallback. Counts are fixed for the process lifetime; daemon and direct hosts
+/// retain the ordinary default. An explicit reader count always wins.
+pub fn mcp_max_readers(
+    args: &Args,
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    explicit: Option<usize>,
+) -> Option<usize> {
+    let file_backed = if args.db.as_deref() == Some(":memory:") {
+        false
+    } else if backends.is_empty() {
+        config.db_path.is_some()
+    } else {
+        backends
+            .iter()
+            .any(|backend| backend.name == BackendId::MAIN && backend.kind == BackendKind::Sqlite)
+    };
+    #[cfg(unix)]
+    let forwarding = !args.daemon && !khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON");
+    #[cfg(not(unix))]
+    let forwarding = false;
+    explicit.or((forwarding && file_backed).then_some(1))
+}
+
 /// Build a fully-configured server from parsed args (without serving).
 ///
 /// This is the supported production boot path for a single-backend server. The
@@ -3557,18 +3628,18 @@ pub fn enforce_strict_actor_mode(
 /// re-resolved one (PR #782 — see
 /// `crates/khive-mcp/docs/api/pending-events.md`).
 ///
-/// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
-/// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
-/// this is the genuine `--actor`/`--namespace` CLI flag path, also treats
-/// that explicitness as a real actor override.
+/// Derives identity explicitness from a real CLI parse and selects the MCP
+/// pool policy before constructing stores. Native one-shot callers use
+/// [`build_server_with_explicit_namespace`] and retain default pool sizing.
 pub async fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
-    build_server_with_explicit_namespace(
+    build_server_inner(
         args,
         cli_namespace,
         cli_namespace_explicit,
         cli_namespace_explicit,
+        true,
     )
     .await
 }
@@ -3577,7 +3648,8 @@ pub async fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
 /// Like [`build_server`], this is an asynchronous host-boot boundary and returns
-/// only after the attachment cutover is complete.
+/// only after the attachment cutover is complete. This native one-shot builder
+/// retains default pool sizing rather than selecting an MCP forwarding policy.
 ///
 /// Extracted from [`build_server`] (PR #782) so non-interactive-CLI callers
 /// (e.g. the `--pending-events` one-shot drain wrapper) can supply a
@@ -3594,6 +3666,16 @@ pub async fn build_server_with_explicit_namespace(
     namespace: khive_runtime::Namespace,
     namespace_explicit: bool,
     actor_explicit: bool,
+) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
+    build_server_inner(args, namespace, namespace_explicit, actor_explicit, false).await
+}
+
+async fn build_server_inner(
+    args: &Args,
+    namespace: khive_runtime::Namespace,
+    namespace_explicit: bool,
+    actor_explicit: bool,
+    mcp_host: bool,
 ) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (config, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
         db: args.db.as_deref(),
@@ -3657,6 +3739,12 @@ pub async fn build_server_with_explicit_namespace(
         )?;
     }
 
+    let max_readers = if mcp_host {
+        mcp_max_readers(args, &config, &khive_cfg.backends, None)
+    } else {
+        None
+    };
+
     // Issue #1586: disclose the resolved database target once at startup so a
     // no-override invocation's silent default (`$HOME/.khive/khive.db`) is
     // visible in the operator's log alongside the other startup facts. The
@@ -3665,7 +3753,8 @@ pub async fn build_server_with_explicit_namespace(
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
-        let runtime = build_single_backend_runtime(config, &khive_cfg).await?;
+        let runtime =
+            build_single_backend_runtime_with_max_readers(config, &khive_cfg, max_readers).await?;
         #[cfg(feature = "bench-embedder")]
         {
             for name in runtime.registered_embedding_model_names() {
@@ -3703,11 +3792,12 @@ pub async fn build_server_with_explicit_namespace(
     }
 
     // Multi-backend path (ADR-028).
-    let multi = build_registry_for_multi_backend_with_db_anchor(
+    let multi = build_registry_for_multi_backend_with_db_anchor_and_max_readers(
         config,
         &khive_cfg,
         args.db.as_deref(),
         db_anchor.as_deref(),
+        max_readers,
     )
     .await?;
     let schedule_rt = writable_schedule_runtime(
@@ -4133,7 +4223,15 @@ pub async fn build_single_backend_runtime(
     config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<KhiveRuntime> {
-    let backend = Arc::new(open_single_backend(&config)?);
+    build_single_backend_runtime_with_max_readers(config, khive_cfg, None).await
+}
+
+async fn build_single_backend_runtime_with_max_readers(
+    config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    max_readers: Option<usize>,
+) -> anyhow::Result<KhiveRuntime> {
+    let backend = Arc::new(open_single_backend(&config, max_readers)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator =
@@ -4152,7 +4250,10 @@ pub async fn build_single_backend_runtime(
     Ok(runtime)
 }
 
-fn open_single_backend(config: &RuntimeConfig) -> anyhow::Result<StorageBackend> {
+fn open_single_backend(
+    config: &RuntimeConfig,
+    max_readers: Option<usize>,
+) -> anyhow::Result<StorageBackend> {
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4163,7 +4264,7 @@ fn open_single_backend(config: &RuntimeConfig) -> anyhow::Result<StorageBackend>
                     )
                 })?;
             }
-            StorageBackend::sqlite(path)
+            StorageBackend::sqlite_with_max_readers(path, max_readers)
                 .map_err(|error| anyhow::anyhow!("open single SQLite backend: {error}"))?
         }
         None => StorageBackend::memory()
@@ -4176,7 +4277,7 @@ async fn prepare_single_backend_for_schema_admin(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<Arc<StorageBackend>> {
-    let backend = Arc::new(open_single_backend(config)?);
+    let backend = Arc::new(open_single_backend(config, None)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
@@ -4258,7 +4359,7 @@ fn build_pack_runtime(
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.
-fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
+fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Result<StorageBackend> {
     match cfg.kind {
         BackendKind::Memory => StorageBackend::memory()
             .map_err(|e| anyhow::anyhow!("backend {}: memory open: {e}", cfg.name)),
@@ -4282,11 +4383,11 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                 }
             }
             if cfg.read_only {
-                StorageBackend::sqlite_read_only(&expanded).map_err(|e| {
-                    anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name)
-                })
+                StorageBackend::sqlite_read_only_with_max_readers(&expanded, max_readers).map_err(
+                    |e| anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name),
+                )
             } else {
-                let backend = StorageBackend::sqlite(&expanded)
+                let backend = StorageBackend::sqlite_with_max_readers(&expanded, max_readers)
                     .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
                 if backend.is_read_only() {
                     anyhow::bail!(
@@ -5541,6 +5642,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn resolve_project_actor_id_reads_cwd_anchored_project_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -5575,6 +5680,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn seat_shaped_project_actor_resolves_through_full_tier_chain() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         // The seat: a project directory with its own `[actor] id`.
@@ -5640,6 +5749,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn resolve_runtime_config_unset_db_discovers_cwd_config_over_home() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -5688,6 +5801,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn cli_actor_flag_wins_over_project_config_actor() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -5792,6 +5909,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn real_clap_path_khive_actor_env_no_longer_wins_over_project_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use clap::Parser;
         std::env::remove_var("KHIVE_ACTOR");
 
@@ -5850,6 +5971,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn real_clap_path_khive_actor_env_falls_back_to_tier3_actor_id() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use clap::Parser;
         std::env::remove_var("KHIVE_ACTOR");
 
@@ -5905,6 +6030,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         // The seat: a project directory with its own `[actor] id`.
@@ -5977,6 +6106,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn config_id_byte_identical_across_different_actor_ids() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
@@ -8694,7 +8827,7 @@ region = "us-east-1"
             "canonical backend identity must not create a missing read-only parent"
         );
 
-        let error = match open_backend(&config) {
+        let error = match open_backend(&config, None) {
             Ok(_) => panic!("missing read-only snapshot must fail"),
             Err(error) => error,
         };
@@ -8732,7 +8865,7 @@ region = "us-east-1"
             served_kinds: None,
             read_only: false,
         };
-        let error = match open_backend(&config) {
+        let error = match open_backend(&config, None) {
             Ok(_) => panic!("an undeclared multi-backend storage-mode change must fail closed"),
             Err(error) => error,
         };
@@ -9216,6 +9349,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn legacy_registry_rejects_unset_db_after_home_changes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let base_cfg = base_runtime_config_for_multi_backend();
@@ -9231,6 +9368,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn legacy_server_rejects_unset_db_after_home_changes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let base_cfg = base_runtime_config_for_multi_backend();
@@ -9297,6 +9438,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let config_path = first_home.path().join("config.toml");
@@ -9760,6 +9905,10 @@ region = "us-east-1"
     #[test]
     #[serial]
     fn config_id_matches_for_tilde_and_equivalent_absolute_db_override() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let original_home = std::env::var_os("HOME");
         let home_dir = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("HOME", home_dir.path());
@@ -10483,6 +10632,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10513,6 +10666,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_actor_identity() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10547,6 +10704,10 @@ region = "us-east-1"
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set(
     ) {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10574,6 +10735,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn default_read_only_server_omits_schedule_tick_and_warms_without_a_writer() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10631,6 +10796,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn multi_backend_schedule_tick_and_warm_use_each_assigned_backend_mode() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10821,6 +10990,10 @@ backend = "schedule-backend"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         // Regression for the exact "strict actor mode can make every tick
         // fail" scenario this fix addressed: before this fix, the
         // tick's separately-reconstructed `RuntimeConfig::default()` carried
@@ -10877,6 +11050,10 @@ backend = "schedule-backend"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
         // "schedule" pack is explicitly routed to its OWN backend, distinct
         // from "main". `build_server`'s returned schedule-tick runtime must
@@ -11010,6 +11187,10 @@ backend = "schedule-backend"
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
     ) {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -14423,3 +14604,7 @@ mod poll_timing_tests;
 #[cfg(all(test, feature = "channel-email"))]
 #[path = "serve_outbox_claim_tests.rs"]
 mod outbox_claim_tests;
+
+#[cfg(all(test, unix))]
+#[path = "serve_reader_pool_tests.rs"]
+mod reader_pool_tests;

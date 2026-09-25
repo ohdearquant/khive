@@ -6180,6 +6180,10 @@ mod tests {
         #[serial_test::serial]
         #[serial_test::serial(config_ledger)]
         async fn mixed_comm_batch_commits_once_when_its_daemon_response_is_lost() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             clear_daemon_env();
             let dir = tempfile::tempdir().expect("mixed batch socket directory");
             let socket = dir.path().join("khived.sock");
@@ -10388,6 +10392,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
         let project_a = tempfile::tempdir().expect("project a tempdir");
@@ -10847,6 +10855,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_db_override() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use khive_runtime::Namespace;
 
         let project_a = tempfile::tempdir().expect("project a tempdir");
@@ -11354,6 +11366,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn request_no_daemon_fallback_preserves_request_id_in_audit_event() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         std::env::set_var("KHIVE_NO_DAEMON", "1");
 
@@ -11395,6 +11411,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypass_preserves_request_id_in_audit_event() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
@@ -11455,6 +11475,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -11522,6 +11546,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn request_parse_error_stays_typed_with_warm_daemon_available() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -11590,6 +11618,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -11712,6 +11744,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1307,9 +1307,10 @@ impl KhiveRuntime {
     /// Sweep orphaned vector entries for all registered embedding models.
     ///
     /// A vector entry is orphaned when its `subject_id` no longer exists as a
-    /// live row in the entity or note tables (i.e. either the row is absent or
-    /// has `deleted_at IS NOT NULL`). Orphaned entries accumulate after
-    /// hard-deletes because the vector store and SQL substrate are decoupled.
+    /// live row in the entity, note, or knowledge-atom tables (i.e. either the
+    /// row is absent or has `deleted_at IS NOT NULL`). Orphaned entries
+    /// accumulate after hard-deletes because the vector store and SQL
+    /// substrate are decoupled.
     ///
     /// Iterates over every registered embedding model and calls
     /// [`khive_storage::VectorStore::orphan_sweep`] for the token's namespace. Models whose

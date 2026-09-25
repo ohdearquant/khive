@@ -129,15 +129,21 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 6 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### GTD pack — 7 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
-| Verb             | What it does                                            | When to use                              |
-| ---------------- | ------------------------------------------------------- | ---------------------------------------- |
-| `gtd.assign`     | Create a task (note with kind=task)                     | New work item, bug, follow-up            |
-| `gtd.next`       | List actionable tasks (status=next/active), by priority | "What should I work on?"                 |
-| `gtd.complete`   | Mark a task done or cancelled                           | Finishing work                           |
-| `gtd.tasks`      | Filtered task listing                                   | Browse tasks by status/assignee/priority |
-| `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)      | Moving a task through its lifecycle      |
+| Verb             | What it does                                                   | When to use                              |
+| ---------------- | -------------------------------------------------------------- | ---------------------------------------- |
+| `gtd.assign`     | Create a task (note with kind=task)                            | New work item, bug, follow-up            |
+| `gtd.next`       | List actionable tasks (status=next/active), by priority        | "What should I work on?"                 |
+| `gtd.complete`   | Mark a task done or cancelled                                  | Finishing work                           |
+| `gtd.tasks`      | Filtered task listing                                          | Browse tasks by status/assignee/priority |
+| `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)             | Moving a task through its lifecycle      |
+| `gtd.census`     | Count raw task timestamp evidence; optionally page candidates  | Inspect historical task rows             |
+| `gtd.repair`     | Preview or explicitly apply exact-observation task corrections | Repair historical task rows              |
+
+`gtd.repair` is dry-run by default. `apply=true` commits each accepted row with its
+mandatory audit entry; it never infers timestamp units or silently changes
+ordinary lifecycle state. See [explicit historical task repair](crates/khive-pack-gtd/docs/api/task-repair.md).
 
 `gtd.assign` accepts a full `context_entity_id` to anchor a task to a KG entity. Prefixes are
 rejected because this is an explicit stored reference; Agent responses retain its canonical UUID.
@@ -225,7 +231,7 @@ using either alias. Rank position never supplies a judgment.
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                               | Resolve an ambiguous atomic-write outcome                   |
 | `comm.inbox`     | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields | Triage inbox, wait for what's next, or inspect sent history |
 | `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                                       | Cheap unread check without listing                          |
-| `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`)                  | Acknowledge receipt (recipient action)                      |
+| `comm.read`      | Fetch one or more **inbound** messages and mark read; `body=false` keeps the acknowledgement-only shape                 | Read and acknowledge received messages                      |
 | `comm.mark_read` | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                            | Clear a supplied inbox set without naming ambiguity         |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
 | `comm.thread`    | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
@@ -256,8 +262,9 @@ re-run the same actor/status/sender/time/text-filtered query with the same offse
 and the paginated response shape is unchanged. Omit it (or pass `0`) for the
 snapshot behavior.
 
-**Mark-read is inbound-only.** `comm.read` is the compatibility surface; it marks a received message
-as read and does not retrieve content. Calling it on an outbound
+**Mark-read is inbound-only.** `comm.read` fetches a received message and marks it read;
+successful results include its subject, content and routing fields unless `body=false`.
+Calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
 marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
 or `comm.thread`. Pass exactly one of `id` or `ids`; the latter accepts 1-500 IDs and returns

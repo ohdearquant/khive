@@ -37,11 +37,16 @@ impl KhiveRuntime {
         selector: Option<&str>,
         args: &Value,
     ) -> RuntimeResult<MailboxView> {
-        if !matches!(verb, "comm.inbox" | "comm.thread") {
-            return Err(RuntimeError::InvalidInput(
-                "mailbox views are supported only by comm.inbox and comm.thread".into(),
-            ));
-        }
+        let selector_field = match verb {
+            "comm.inbox" | "comm.thread" => "mailbox_actor",
+            "comm.probe" => "actor",
+            _ => {
+                return Err(RuntimeError::InvalidInput(
+                    "mailbox views are supported only by comm.inbox, comm.thread and comm.probe"
+                        .into(),
+                ));
+            }
+        };
         let req = GateRequest::new(
             token.actor().clone(),
             token.gate_namespace().clone(),
@@ -49,10 +54,10 @@ impl KhiveRuntime {
             args.clone(),
         );
         validate_mailbox_request(&req)?;
-        if args.get("mailbox_actor").and_then(Value::as_str) != selector {
-            return Err(RuntimeError::InvalidInput(
-                "mailbox selector must match the original mailbox_actor argument".into(),
-            ));
+        if args.get(selector_field).and_then(Value::as_str) != selector {
+            return Err(RuntimeError::InvalidInput(format!(
+                "mailbox selector must match the original {selector_field} argument"
+            )));
         }
         match check_with_mailbox_policy(self.config().gate.as_ref(), &req) {
             Ok(GateDecision::Allow { .. }) => {
