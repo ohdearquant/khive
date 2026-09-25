@@ -1791,7 +1791,7 @@ reports what the documented checkpoint interface does give: the frame the pin si
 it has been held there.
 
 **Read marks are not snapshots.** This amendment relies on SQLite's read-mark behaviour as implemented
-in `walTryBeginRead` in SQLite 3.53.2, the amalgamation bundled by `libsqlite3-sys` 0.38.2. The WAL
+in `walTryBeginRead` in SQLite 3.53.2, the amalgamation bundled by `libsqlite3-sys` 0.38.1. The WAL
 index has five read-mark slots (`WAL_NREADER`); slot 0 is reserved for readers that ignore the WAL, so
 four slots can carry a frame. A connection starting a read selects the slot with the largest mark not
 greater than the WAL's current last frame. It writes a fresh mark equal to that frame only when it can
