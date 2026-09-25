@@ -209,13 +209,19 @@ def test_merge_entity_rewires_edges_unions_tags_drops_self_loops(
         f"removed_id mismatch: expected {gone['id']}, got {summary.get('removed_id')}"
     )
 
-    # from_id must not be gettable
-    envelope_gone = khive_session.request_batch([{"tool": "get", "args": {"id": gone["id"],
-                                                                            "namespace": temp_namespace}}])
-    first_gone = envelope_gone["results"][0]
-    assert not first_gone.get("ok", False), "Merged-away entity must not be gettable"
-    assert "not found" in error_text(first_gone).lower(), (
-        f"Expected not-found for merged-away entity: {first_gone.get('error')!r}"
+    # from_id reads through the merge redirect to kept_id
+    redirected = khive_session.verb("get", {"id": gone["id"], "namespace": temp_namespace})
+    assert redirected.get("id") == kept["id"], (
+        f"get on a merged-away id should return kept_id={kept['id']}, got {redirected.get('id')}"
+    )
+    assert redirected.get("redirected_from") == [gone["id"]], (
+        f"redirect marker should name the merged-away id: {redirected.get('redirected_from')!r}"
+    )
+    # include_deleted returns the tombstone itself, with its merged_into pointer
+    tombstone = khive_session.verb("get", {"id": gone["id"], "include_deleted": True,
+                                           "namespace": temp_namespace})
+    assert tombstone.get("id") == gone["id"] and tombstone.get("merged_into") == kept["id"], (
+        f"include_deleted should return the merged tombstone: {tombstone!r}"
     )
 
     # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.

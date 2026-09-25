@@ -8,9 +8,16 @@ Technical reference for `resolve` — turning a caller-supplied natural-language
 ## Handler shape
 
 `resolve`'s handler deserializes params, calls the runtime's `resolve_reference` capability
-once per ref, and renders each `ReferenceResolution` to its wire shape. The handler performs
-no mutation and no side effect beyond the ring reads/admissions `resolve_reference` and the
-dispatch boundary already make.
+once per ref, and renders each `ReferenceResolution` to its wire shape. The handler does not
+mutate graph records; redirected reads add one effective-target Gate consultation and its audit.
+
+For a merged entity id, the handler follows `merged_into` through the first live kept
+entity. A resolved result then carries that id plus the ordered
+`redirected_from: [old_id, ...]` chain. Live ids retain the ordinary response
+without a marker. The Gate checks the effective id before the handler returns it;
+the effective check gets its own audit event naming that id. `resolve` has no
+`include_deleted` parameter. A cycle fails with `redirect cycle detected` and
+an exceeded hop bound fails with `redirect chain too long`.
 
 `resolve`'s pipeline (id-string passthrough, ring, exact-name storage lookup, hybrid search)
 is entity-only, so `kind` follows the same substrate-or-granular discriminant as
@@ -25,7 +32,9 @@ filter every real match out (#849) — `entities.kind` only ever holds a granula
    the entity was ever touched through this registry's ring. Entity-only: a note's id-string
    is `NotFound` through `resolve`, even though `get` on the same id would succeed. The same
    boundary applies to edge and event UUIDs and hex prefixes under every `kind`: `resolve`
-   never resolves them, while `get` auto-detects their substrate.
+   never resolves them, while `get` auto-detects their substrate. A merged entity
+   UUID or unique hex prefix resolves to the kept live id at the same confidence,
+   with `redirected_from` naming the traversed merge tombstones.
 2. **Recently-referenced ring** — the dispatch boundary (`VerbRegistry::dispatch_with_identity`
    in `pack.rs`, not `KgPack::dispatch`) admits ids under their name whenever `create`/`get`/
    `update`/`delete`/`merge`/`link` runs through the registry. A later `resolve(refs=[name])`
