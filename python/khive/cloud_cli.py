@@ -98,7 +98,10 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 6
-        rendered = json.dumps(redacted_result, ensure_ascii=False)
+        # ASCII escapes survive non-UTF-8 stdout encodings after the request
+        # has already been dispatched; a print failure must not look like a
+        # pre-dispatch usage/configuration error that invites a write retry.
+        rendered = json.dumps(redacted_result, ensure_ascii=True)
         print(rendered)
         return 0
     except SystemExit as exc:

@@ -1,7 +1,9 @@
 """Cloud configuration and command-line contract against the offline REST fixture."""
 
 import importlib
+import io
 import json
+import sys
 import tomllib
 from pathlib import Path
 
@@ -270,6 +272,55 @@ def test_cli_connection_failure_exit_five(monkeypatch, capsys):
     monkeypatch.setenv("KHIVE_CLOUD_API_KEY", "example-value")
     assert cli(["whoami", "--url", "https://example.invalid"]) == 5
     assert "TransportError: connection unavailable" in capsys.readouterr().err
+
+
+def test_cli_malformed_url_is_one_line_configuration_error(monkeypatch, capsys):
+    monkeypatch.setenv("KHIVE_CLOUD_API_KEY", "example-value")
+    assert cli(["--url", "https://127.0.0.1:abc", "whoami"]) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert len(output.err.splitlines()) == 1
+    assert "invalid base URL" in output.err
+
+
+def test_cli_masks_reflected_credential_before_error_preview_cutoff(
+    rest_server, monkeypatch, capsys
+):
+    import conftest
+
+    secret = "sk-reflected-credential-0123456789-abcdef"
+    monkeypatch.setattr(conftest, "API_KEY", secret)
+    monkeypatch.setenv("KHIVE_CLOUD_API_KEY", secret)
+    monkeypatch.setattr(
+        conftest,
+        "_dispatch_ops",
+        lambda ops: (200, {"unexpected": "x" * 170 + secret + " tail"}),
+    )
+    assert cli(["--url", rest_server.url, "whoami"]) == 5
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "[REDACTED]" in output.err
+    assert secret[:15] not in output.err
+
+
+def test_cli_post_request_unicode_result_survives_legacy_stdout(
+    rest_server, api_key, monkeypatch
+):
+    import conftest
+
+    monkeypatch.setenv("KHIVE_CLOUD_API_KEY", api_key)
+    monkeypatch.setattr(
+        conftest,
+        "_dispatch_ops",
+        lambda ops: (200, {"results": [{"ok": True, "tool": "whoami", "result": "☃"}]}),
+    )
+    output_bytes = io.BytesIO()
+    output_stream = io.TextIOWrapper(output_bytes, encoding="cp1252")
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stdout", output_stream)
+        assert cli(["--url", rest_server.url, "whoami"]) == 0
+    output_stream.flush()
+    assert json.loads(output_bytes.getvalue().decode("cp1252"))["results"][0]["result"] == "☃"
 
 
 def test_cli_help_returns_zero(capsys):

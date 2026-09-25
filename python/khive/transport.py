@@ -233,11 +233,19 @@ def _parse_json_body(response: Any) -> Any:
         raise TransportError(f"malformed JSON body from {response.url}: {exc}") from exc
 
 
-def _parse_envelope(response: Any) -> dict[str, Any]:
+def _parse_envelope(response: Any, api_key: str) -> dict[str, Any]:
     payload = _parse_json_body(response)
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        # Mask the complete decoded body before applying the preview limit. If
+        # the limit cuts through a reflected key, masking the shortened text
+        # afterwards cannot recognize the credential prefix.
+        preview = json.dumps(payload, ensure_ascii=True)
+        if api_key:
+            preview = preview.replace(
+                json.dumps(api_key, ensure_ascii=True)[1:-1], "[REDACTED]"
+            )
         raise TransportError(
-            f"response from {response.url} is not a request envelope: {str(payload)[:200]}"
+            f"response from {response.url} is not a request envelope: {preview[:200]}"
         )
     return payload
 
@@ -361,11 +369,15 @@ class HttpTransport(Transport):
 
         _check_base_url_security(base_url, allow_insecure)
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.Client(
-            base_url=self._base_url,
-            headers={"Authorization": f"ApiKey {api_key}"},
-            timeout=timeout,
-        )
+        self._api_key = api_key
+        try:
+            self._client = httpx.Client(
+                base_url=self._base_url,
+                headers={"Authorization": f"ApiKey {api_key}"},
+                timeout=timeout,
+            )
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"invalid base URL: {exc}") from exc
 
     def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
         import httpx
@@ -401,7 +413,9 @@ class HttpTransport(Transport):
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        envelope = _stringify_op_errors(_parse_envelope(response), str(response.url))
+        envelope = _stringify_op_errors(
+            _parse_envelope(response, self._api_key), str(response.url)
+        )
         _validate_envelope_results(envelope, str(response.url))
         return {"ok": True, "result": envelope}
 
@@ -444,11 +458,15 @@ class AsyncHttpTransport:
 
         _check_base_url_security(base_url, allow_insecure)
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(
-            base_url=self._base_url,
-            headers={"Authorization": f"ApiKey {api_key}"},
-            timeout=timeout,
-        )
+        self._api_key = api_key
+        try:
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                headers={"Authorization": f"ApiKey {api_key}"},
+                timeout=timeout,
+            )
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"invalid base URL: {exc}") from exc
 
     async def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
         import httpx
@@ -473,7 +491,9 @@ class AsyncHttpTransport:
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        envelope = _stringify_op_errors(_parse_envelope(response), str(response.url))
+        envelope = _stringify_op_errors(
+            _parse_envelope(response, self._api_key), str(response.url)
+        )
         _validate_envelope_results(envelope, str(response.url))
         return {"ok": True, "result": envelope}
 
