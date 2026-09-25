@@ -582,13 +582,13 @@ all `false`, `supports_orphan_sweep: true`, `max_dimensions: 8192`,
 (`crates/kkernel/src/vector.rs`).
 
 `vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run] [--engine <name>] [--db <path>]`
-removes vector rows whose subject has no live entity or note. A soft-deleted entity or note
-does not protect its vector; live notes include memory records. The command uses the
-runtime-configured embedding models, with one sweep per distinct model store. `--engine`
-selects an exact `[[engines]].name` from the resolved configuration. When there are no configured
-engine entries, the available engine names are the runtime's canonical model names. Omitting
-`--engine` sweeps all configured model stores, grouping engine names that share a model so that
-each table is swept once.
+removes vector rows whose subject has no live entity, note, or knowledge atom. A soft-deleted
+entity, note, or knowledge atom does not protect its vector; live notes include memory records.
+The command uses the runtime-configured embedding models, with one sweep per distinct model
+store. `--engine` selects an exact `[[engines]].name` from the resolved configuration. When there
+are no configured engine entries, the available engine names are the runtime's canonical model
+names. Omitting `--engine` sweeps all configured model stores, grouping engine names that share a
+model so that each table is swept once.
 
 - Repeat `--namespace` to restrict vector rows to those namespaces. Omitting it sweeps all
   namespaces, independently of the runtime's default namespace.

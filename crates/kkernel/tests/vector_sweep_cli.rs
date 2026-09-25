@@ -123,6 +123,45 @@ impl Fixture {
         Self { root, db, runtime }
     }
 
+    async fn seed_atom_vectors(&self, model_name: &str) {
+        {
+            let writer = self.runtime.backend().pool().writer().expect("atom writer");
+            for (index, slug, deleted_at) in [
+                (6, "live-vector-atom", None),
+                (7, "deleted-vector-atom", Some(2_i64)),
+            ] {
+                writer
+                    .execute(
+                        "INSERT INTO knowledge_atoms \
+                         (id, namespace, slug, name, created_at, updated_at, deleted_at) \
+                         VALUES (?1, 'a', ?2, ?2, 1, 1, ?3)",
+                        (id(index).to_string(), slug, deleted_at),
+                    )
+                    .expect("seed live and soft-deleted knowledge atoms");
+            }
+        }
+
+        let model: EmbeddingModel = model_name.parse().expect("supported fixture model");
+        let canonical = model.to_string();
+        let store = self
+            .runtime
+            .backend()
+            .vectors(&model_key(&canonical), &canonical, model.dimensions())
+            .expect("open private model vector table");
+        for index in [6, 7] {
+            store
+                .insert(
+                    id(index),
+                    SubstrateKind::Entity,
+                    "a",
+                    "knowledge.atom",
+                    vec![vec![0.25_f32; model.dimensions()]],
+                )
+                .await
+                .expect("seed knowledge atom vector without embedding inference");
+        }
+    }
+
     fn run(&self, extra: &[&str]) -> Output {
         self.run_with_db(&self.db, extra)
     }
@@ -247,6 +286,36 @@ async fn vector_sweep_deletes_orphans_and_keeps_live_entities_and_notes() {
     assert_counts(store_report(&value, PRIMARY_MODEL), 5, 3, 3, false);
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 2);
     assert_eq!(fixture.rows(PRIMARY_MODEL), live_rows());
+}
+
+#[tokio::test]
+async fn vector_sweep_keeps_live_knowledge_atom_and_sweeps_deleted_atom() {
+    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    fixture.seed_atom_vectors(PRIMARY_MODEL).await;
+    let before = fixture.rows(PRIMARY_MODEL);
+    assert_eq!(before.len(), 7);
+
+    let dry = report(&fixture.run(&["--dry-run"]));
+    assert_eq!(
+        dry["would_delete"],
+        json!(4),
+        "VECTOR_SWEEP_LIVE_KNOWLEDGE_ATOM_PRESERVED"
+    );
+    assert_counts(&dry, 7, 0, 4, false);
+    assert_counts(store_report(&dry, PRIMARY_MODEL), 7, 0, 4, false);
+    assert_eq!(fixture.rows(PRIMARY_MODEL), before);
+
+    let real = report(&fixture.run(&[]));
+    assert_counts(&real, 7, 4, 4, false);
+    assert_counts(store_report(&real, PRIMARY_MODEL), 7, 4, 4, false);
+    let mut expected = live_rows();
+    expected.insert(id(6).to_string(), "a".into());
+    assert_eq!(
+        fixture.rows(PRIMARY_MODEL),
+        expected,
+        "VECTOR_SWEEP_LIVE_KNOWLEDGE_ATOM_PRESERVED"
+    );
+    assert_eq!(fixture.row_count(PRIMARY_MODEL), 3);
 }
 
 #[tokio::test]

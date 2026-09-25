@@ -114,7 +114,7 @@
   without opening a database; `--engine` only labels this capability report.
 - `kkernel vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run]
   [--engine <name>] [--db <path>]` calls the backend's orphan sweep for vectors whose subject
-  has no live entity or note. Soft-deleted subjects count as orphans.
+  has no live entity, note, or knowledge atom. Soft-deleted subjects count as orphans.
 - `--engine` selects an exact configured `[[engines]].name`; without configured engine entries,
   it selects a canonical runtime model name. Omitting it sweeps all configured model stores,
   once per distinct model even when several engine names share it.
