@@ -3637,12 +3637,25 @@ impl KnowledgeHandlers {
 
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut ordered_atoms: Vec<Atom> = Vec::new();
+        let mut omitted_members: Vec<String> = Vec::new();
 
         for slug in &member_slugs {
             try_or_finish!(khive_storage::ensure_request_read_active(
                 "knowledge.compose"
             ));
-            let atom = try_or_finish!(load_atom_by_id_or_slug(runtime, &ns, slug).await);
+            let atom = match load_atom_by_id_or_slug(runtime, &ns, slug).await {
+                Ok(atom) => atom,
+                // Domain membership is not rewritten when an atom is deleted.
+                // A stale member must not discard the remaining briefing.
+                Err(RuntimeError::NotFound(_)) => {
+                    omitted_members.push(slug.clone());
+                    continue;
+                }
+                Err(e) => {
+                    timing.finish(0);
+                    return Err(e);
+                }
+            };
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
             }
@@ -3681,6 +3694,9 @@ impl KnowledgeHandlers {
             });
             if suggest_ann_unavailable {
                 data["ann_unavailable"] = json!(true);
+            }
+            if !omitted_members.is_empty() {
+                data["omissions"] = json!(omitted_members);
             }
             attach_hydration_degradation(&mut data, suggest_hydration_failures);
             let response = json!({ "status": "ok", "data": data });
@@ -3977,6 +3993,9 @@ impl KnowledgeHandlers {
         }
         if suggest_ann_unavailable {
             data["ann_unavailable"] = json!(true);
+        }
+        if !omitted_members.is_empty() {
+            data["omissions"] = json!(omitted_members);
         }
         attach_hydration_degradation(&mut data, suggest_hydration_failures);
 

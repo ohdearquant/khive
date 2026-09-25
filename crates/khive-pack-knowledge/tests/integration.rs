@@ -3732,6 +3732,85 @@ async fn compose_returns_markdown_for_domain() {
     );
 }
 
+#[tokio::test]
+async fn compose_omits_deleted_domain_members_and_keeps_live_content() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({"atoms": [
+            {
+                "slug": "compose-surviving-member",
+                "name": "Surviving Member",
+                "content": "The surviving atom remains available in the composed briefing after another member of the same domain has been deleted, preserving useful and accurate context for subsequent requests."
+            },
+            {
+                "slug": "compose-deleted-member",
+                "name": "Deleted Member",
+                "content": "This atom is removed after domain membership is stored, leaving a stale member reference in the domain, while the surviving member should still compose normally afterward."
+            }
+        ]}),
+    )
+    .await
+    .expect("upsert atoms");
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({"domains": [{
+            "slug": "compose-mixed-domain",
+            "name": "Mixed Domain",
+            "description": "A domain with one live atom and one member that is later deleted, used to verify composed briefings retain surviving content while reporting stale membership accurately.",
+            "members": ["compose-surviving-member", "compose-deleted-member"]
+        }]}),
+    )
+    .await
+    .expect("upsert domain");
+    f.dispatch(
+        "knowledge.delete_atoms",
+        json!({"ids": ["compose-deleted-member"]}),
+    )
+    .await
+    .expect("delete member atom");
+
+    let response = f
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "surviving member", "domain_ids": ["compose-mixed-domain"]}),
+        )
+        .await
+        .expect("stale domain membership must not abort compose");
+    assert_eq!(response["status"], "ok", "got: {response}");
+    assert_eq!(response["data"]["count"], 1, "got: {response}");
+    assert_eq!(
+        response["data"]["atoms"][0]["slug"],
+        "compose-surviving-member"
+    );
+    assert!(
+        response["data"]["markdown"]
+            .as_str()
+            .expect("briefing markdown")
+            .contains("The surviving atom remains available"),
+        "live content must be rendered: {response}"
+    );
+    assert_eq!(
+        response["data"]["omissions"],
+        json!(["compose-deleted-member"]),
+        "stale domain member reference must be reported: {response}"
+    );
+
+    let explicit_missing = f
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "deleted member", "atom_ids": ["compose-deleted-member"]}),
+        )
+        .await;
+    assert!(
+        matches!(
+            &explicit_missing,
+            Err(khive_runtime::RuntimeError::NotFound(_))
+        ),
+        "an explicitly requested missing atom must still fail: {explicit_missing:?}"
+    );
+}
+
 /// PR #816: `knowledge.compose` accepts compact hex prefixes
 /// for domains but must normalize them (`hex_prefix_to_uuid_pattern`) before
 /// binding the `LIKE` pattern — a >8-char compact prefix could not match the
