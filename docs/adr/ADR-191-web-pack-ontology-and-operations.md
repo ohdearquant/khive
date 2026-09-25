@@ -213,7 +213,7 @@ Controls are stated before the arms run; an arm without its control is not evide
 
 ## Consequences
 
-Query-key sorting means documents such as `...?add=1&mul=2` and `...?mul=2&add=1`, differing only in query parameter order, resolve to one document; for an endpoint where parameter order is significant this is an accepted loss.
+Query-key sorting means documents such as `...?add=1&mul=2` and `...?mul=2&add=1`, differing only in the order of distinct query keys, resolve to one document; for an endpoint where parameter order is significant this is an accepted loss.
 
 The pack shrinks to what the web is: three subtypes, one new relation, two rules, five operations.
 Every application-level concept previously hosted here is expressible on top of it by a consumer pack
