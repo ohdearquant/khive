@@ -399,8 +399,10 @@ impl KgPack {
                                 .cleanup_deleted_entity_attachments(&target.runtime, token, id)
                                 .await?
                         {
+                            // The row is already absent, so this retry only
+                            // reports the attachment cleanup it performed.
                             return Ok(serde_json::json!({
-                                "deleted": true, "id": p.id, "kind": "entity",
+                                "deleted": false, "id": p.id, "kind": "entity",
                                 "attachment_cleanup": true,
                             }));
                         }
@@ -427,12 +429,14 @@ impl KgPack {
                     {
                         Some(entity) => entity,
                         None => {
+                            // Keep `deleted` false: this call only removes
+                            // attachments left after the entity row is gone.
                             if registry
                                 .cleanup_deleted_entity_attachments(&target.runtime, token, id)
                                 .await?
                             {
                                 return Ok(serde_json::json!({
-                                    "deleted": true, "id": p.id, "kind": "entity",
+                                    "deleted": false, "id": p.id, "kind": "entity",
                                     "attachment_cleanup": true,
                                 }));
                             }

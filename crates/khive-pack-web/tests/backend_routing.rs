@@ -492,7 +492,7 @@ async fn routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments()
             .dispatch("delete", json!({ "id": entity.id, "hard": true }))
             .await
             .unwrap();
-        assert_eq!(retry["deleted"], true);
+        assert_eq!(retry["deleted"], !fail_core);
         if fail_core {
             assert_eq!(retry["attachment_cleanup"], true);
         }
@@ -577,7 +577,7 @@ async fn routed_delete_cleanup_retry_keeps_indexes_and_event_consistent() {
         .dispatch("delete", json!({ "id": entity.id, "hard": true }))
         .await
         .unwrap();
-    assert_eq!(retry["deleted"], true);
+    assert_eq!(retry["deleted"], false);
     assert_eq!(retry["attachment_cleanup"], true);
     assert!(fixture
         .main
@@ -621,6 +621,149 @@ async fn routed_delete_cleanup_retry_keeps_indexes_and_event_consistent() {
         .unwrap()
         .items;
     assert_eq!(events.len(), 1);
+}
+
+async fn entity_is_indexed(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    id: uuid::Uuid,
+) -> bool {
+    runtime
+        .text(token)
+        .unwrap()
+        .search(TextSearchRequest {
+            query: "routed".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(TextFilter {
+                namespaces: vec!["local".to_string()],
+                ..Default::default()
+            }),
+            top_k: 10,
+            snippet_chars: 100,
+        })
+        .await
+        .unwrap()
+        .iter()
+        .any(|hit| hit.subject_id == id)
+}
+
+async fn entity_deleted_event_count(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    id: uuid::Uuid,
+) -> usize {
+    runtime
+        .events(token)
+        .unwrap()
+        .query_events(
+            EventFilter {
+                target_id: Some(id),
+                kinds: vec![EventKind::EntityDeleted],
+                ..Default::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .unwrap()
+        .items
+        .len()
+}
+
+#[tokio::test]
+async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
+    for explicit_kind in [false, true] {
+        let fixture = Fixture::new();
+        fixture.ingest().await;
+        let entity = fetched_entities(&fixture.routed)
+            .await
+            .into_iter()
+            .find(|entity| entity.entity_type.as_deref() == Some("page"))
+            .unwrap();
+        let token = fixture.main.authorize(Namespace::local()).unwrap();
+        assert!(entity_is_indexed(&fixture.routed, &token, entity.id).await);
+
+        let mut request = json!({ "id": entity.id, "hard": true });
+        if explicit_kind {
+            request["kind"] = json!("entity");
+        }
+        {
+            let writer = fixture.routed_backend.pool().try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_entity_deleted_event BEFORE INSERT ON events \
+                     WHEN NEW.kind = 'entity_deleted' AND NEW.target_id = '{}' \
+                     BEGIN SELECT RAISE(ABORT, 'entity deletion event write failed'); END;",
+                    entity.id
+                ))
+                .unwrap();
+        }
+
+        let first = fixture
+            .registry
+            .dispatch("delete", request.clone())
+            .await
+            .expect_err("the event write failure is returned after the row delete commits");
+        assert!(first
+            .to_string()
+            .contains("entity deletion event write failed"));
+        assert!(fixture
+            .routed
+            .entities(&token)
+            .unwrap()
+            .get_entity_including_deleted(entity.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!entity_is_indexed(&fixture.routed, &token, entity.id).await);
+        assert_eq!(
+            entity_deleted_event_count(&fixture.routed, &token, entity.id).await,
+            0
+        );
+        assert_eq!(
+            fixture
+                .main
+                .attachments()
+                .unwrap()
+                .list_attachments(entity.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the first error occurs before routed cleanup removes the core root"
+        );
+        {
+            let writer = fixture.routed_backend.pool().try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("DROP TRIGGER fail_entity_deleted_event")
+                .unwrap();
+        }
+
+        let retry = fixture
+            .registry
+            .dispatch("delete", request)
+            .await
+            .expect("retry cleans the remaining core attachment");
+        let index_entries_gone = !entity_is_indexed(&fixture.routed, &token, entity.id).await;
+        let deleted_events = entity_deleted_event_count(&fixture.routed, &token, entity.id).await;
+        assert!(
+            retry["deleted"] != json!(true) || (index_entries_gone && deleted_events == 1),
+            "retry must not claim deletion completed unless indexes are gone and exactly one deletion event exists"
+        );
+        assert_eq!(retry["deleted"], false);
+        assert_eq!(retry["attachment_cleanup"], true);
+        assert!(index_entries_gone);
+        assert_eq!(deleted_events, 0);
+        assert!(fixture
+            .main
+            .attachments()
+            .unwrap()
+            .list_attachments(entity.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }
 
 // Deletion must retain kind guards and attribute the caller without filtering record ownership.
