@@ -6956,31 +6956,22 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let fts_statements: Vec<SqlStatement> = if injected_failure_index == Some(index) {
-                    vec![SqlStatement {
-                        sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
-                            .to_string(),
-                        params: vec![],
-                        label: Some("fts-insert-injected-failure".to_string()),
-                    }]
-                } else {
-                    // Order-sensitive pair — see `insert_document_statements`'s
-                    // adjacency contract.
-                    insert_document_statements("fts_entities", &entity_fts_document(entity)).into()
-                };
-                let mut statements = vec![PlanStatement {
-                    statement: entity_upsert_statement(entity),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }];
-                statements.extend(fts_statements.into_iter().map(|statement| PlanStatement {
-                    statement,
-                    guard: None,
-                }));
-                AtomicOpPlan::AddEntity(AddEntityPlan {
-                    entity_id: entity.id,
-                    statements,
-                    post_commit: PostCommitEffect::None,
-                })
+                let mut plan = bulk_entity_plan(entity);
+                if injected_failure_index == Some(index) {
+                    // Keep the guarded row insert; replace its FTS pair with the fault.
+                    plan.statements.truncate(1);
+                    plan.statements.push(PlanStatement {
+                        statement: SqlStatement {
+                            sql:
+                                "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
+                                    .to_string(),
+                            params: vec![],
+                            label: Some("fts-insert-injected-failure".to_string()),
+                        },
+                        guard: None,
+                    });
+                }
+                AtomicOpPlan::AddEntity(plan)
             })
             .collect();
 
@@ -7045,7 +7036,7 @@ impl KhiveRuntime {
     }
 
     /// Validate and prepare one entity item for a bulk `create(items=[...])`
-    /// write: `create_many`'s per-item checks, then a row and FTS insert plan
+    /// write: the same admission and row/FTS plan as [`Self::create_many`],
     /// with no scheduled reindex, so the vector is deferred to a later
     /// `reindex` exactly as for `create_many`. The bulk create handler uses
     /// this for every entity item so entity and note plans can join one
@@ -7059,22 +7050,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
 
-        let mut statements = vec![PlanStatement {
-            statement: entity_upsert_statement(&entity),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }];
-        for statement in insert_document_statements("fts_entities", &entity_fts_document(&entity)) {
-            statements.push(PlanStatement {
-                statement,
-                guard: None,
-            });
-        }
-
-        let plan = AtomicOpPlan::AddEntity(AddEntityPlan {
-            entity_id: entity.id,
-            statements,
-            post_commit: PostCommitEffect::None,
-        });
+        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity));
         Ok((entity, plan))
     }
 
@@ -7134,6 +7110,27 @@ pub struct NoteCreateSpec {
     pub content: String,
     pub salience: Option<f64>,
     pub properties: Option<serde_json::Value>,
+}
+
+fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
+    let mut statements = vec![PlanStatement {
+        statement: entity_upsert_statement(entity),
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    // The FTS insert and rowid-map insert must remain adjacent on one connection.
+    statements.extend(
+        insert_document_statements("fts_entities", &entity_fts_document(entity))
+            .into_iter()
+            .map(|statement| PlanStatement {
+                statement,
+                guard: None,
+            }),
+    );
+    AddEntityPlan {
+        entity_id: entity.id,
+        statements,
+        post_commit: PostCommitEffect::None,
+    }
 }
 
 fn guarded_link_batch_failure(
@@ -14263,6 +14260,209 @@ mod tests {
     }
 
     // ── create_many: batch entity creation ───────────────────────────────────
+
+    #[tokio::test]
+    async fn create_many_empty_and_invalid_batches_preserve_pending_fts_failure() {
+        async fn assert_empty(rt: &KhiveRuntime, tok: &NamespaceToken) {
+            assert_eq!(rt.count_entities(tok, None).await.unwrap(), 0);
+            assert_eq!(
+                rt.text(tok)
+                    .unwrap()
+                    .count(TextFilter {
+                        namespaces: vec![tok.namespace().as_str().to_owned()],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+                0,
+                "BULK_ADMISSION_NO_FTS"
+            );
+        }
+
+        let rt = rt();
+        let ns = format!("bulk-admission-{}", Uuid::new_v4());
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+        let clean = |name: &str| EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: None,
+            name: name.into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        };
+        let _arm = arm_fts_fail_many_scoped(&ns);
+        assert!(rt.create_many(&tok, vec![]).await.unwrap().is_empty());
+        assert_empty(&rt, &tok).await;
+
+        let error = rt
+            .create_many(
+                &tok,
+                vec![
+                    clean("Clean first item"),
+                    clean("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                ],
+            )
+            .await
+            .expect_err("BULK_ADMISSION_INVALID");
+        let RuntimeError::SecretDetected(matched) = error else {
+            panic!("expected indexed secret refusal, got {error:?}");
+        };
+        assert_eq!(matched.location.as_deref(), Some("entity[1].name"));
+        assert_empty(&rt, &tok).await;
+
+        let error = rt
+            .create_many(&tok, vec![clean("Valid after refusal")])
+            .await
+            .expect_err("BULK_ADMISSION_FAULT_RETAINED");
+        assert!(
+            error.to_string().contains("atomic batch rolled back"),
+            "{error}"
+        );
+        assert_empty(&rt, &tok).await;
+
+        let entities = rt
+            .create_many(&tok, vec![clean("Valid after consumed fault")])
+            .await
+            .unwrap();
+        assert_eq!(entities.len(), 1, "BULK_ADMISSION_EFFECT_CONTROL");
+        assert!(rt
+            .text(&tok)
+            .unwrap()
+            .get_document(&ns, entities[0].id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn bulk_entity_paths_preserve_rows_fts_order_and_defer_embeddings() {
+        for batch in [true, false] {
+            let rt = rt();
+            let ns = format!("bulk-plan-{}", Uuid::new_v4());
+            let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            rt.register_embedder(CapturingVecProvider {
+                provider_name: "bulk-plan-test".into(),
+                dims: 4,
+                captured: Arc::clone(&captured),
+            });
+            rt.install_entity_type_validator(Arc::new(|kind, entity_type| {
+                if kind == "concept" && entity_type == Some("algo") {
+                    Ok(Some("algorithm".into()))
+                } else {
+                    Err(RuntimeError::InvalidInput("expected fixture alias".into()))
+                }
+            }));
+            let specs: Vec<_> = ["Zulu concept", "Alpha concept"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| EntityCreateSpec {
+                    kind: "concept".into(),
+                    entity_type: Some("algo".into()),
+                    name: name.into(),
+                    description: Some(format!("glimmerneedle{index}")),
+                    properties: Some(serde_json::json!({"ordinal":index,"enabled":true})),
+                    tags: vec![format!("tag-{index}")],
+                })
+                .collect();
+            let entities = if batch {
+                rt.create_many(&tok, specs.clone()).await.unwrap()
+            } else {
+                let mut entities = Vec::new();
+                let mut plans = Vec::new();
+                for spec in specs.clone() {
+                    let (entity, plan) = rt.prepare_bulk_entity_plan(&tok, spec).await.unwrap();
+                    entities.push(entity);
+                    plans.push(plan);
+                }
+                assert_eq!(rt.count_entities(&tok, None).await.unwrap(), 0);
+                match run_atomic_unit(rt.sql().as_ref(), plans).await.unwrap() {
+                    AtomicRunOutcome::Committed { post_commit } => {
+                        assert!(post_commit.as_slice().is_empty(), "BULK_PLAN_NO_REINDEX");
+                    }
+                    outcome => panic!("expected committed entity plans, got {outcome:?}"),
+                }
+                entities
+            };
+            assert_eq!(entities.len(), specs.len());
+            for (entity, spec) in entities.iter().zip(&specs) {
+                let stored = rt.get_entity(&tok, entity.id).await.unwrap();
+                assert_eq!(entity.name, spec.name, "BULK_PLAN_INPUT_ORDER");
+                assert_eq!(stored.namespace, ns);
+                assert_eq!(stored.kind, spec.kind);
+                assert_eq!(stored.name, spec.name);
+                assert_eq!(stored.description, spec.description);
+                assert_eq!(stored.properties, spec.properties);
+                assert_eq!(stored.tags, spec.tags);
+                assert_eq!(stored.entity_type.as_deref(), Some("algorithm"));
+                assert_eq!(stored.version, 1);
+                let document = rt
+                    .text(&tok)
+                    .unwrap()
+                    .get_document(&ns, entity.id)
+                    .await
+                    .unwrap()
+                    .expect("BULK_PLAN_FTS_VISIBLE");
+                assert_eq!(document.title.as_deref(), Some(spec.name.as_str()));
+                assert_eq!(
+                    document.body,
+                    format!("{} {}", spec.name, spec.description.as_deref().unwrap())
+                );
+                assert_eq!(document.tags, spec.tags);
+                assert_eq!(document.metadata, spec.properties);
+                assert_eq!(document.record_kind.as_deref(), Some("concept"));
+                assert_eq!(document.updated_at.timestamp_micros(), stored.updated_at);
+                let hits = rt
+                    .text(&tok)
+                    .unwrap()
+                    .search(TextSearchRequest {
+                        query: spec.description.clone().unwrap(),
+                        mode: TextQueryMode::Plain,
+                        filter: Some(TextFilter {
+                            namespaces: vec![ns.clone()],
+                            ..Default::default()
+                        }),
+                        top_k: 10,
+                        snippet_chars: 100,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    hits.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+                    vec![entity.id],
+                    "BULK_PLAN_SEARCH_VISIBLE"
+                );
+            }
+            assert!(
+                captured.lock().unwrap().is_empty(),
+                "BULK_PLAN_EMBEDDING_DEFERRED"
+            );
+            assert_eq!(
+                rt.vectors_for_model(&tok, "bulk-plan-test")
+                    .unwrap()
+                    .info()
+                    .await
+                    .unwrap()
+                    .entry_count,
+                0
+            );
+            rt.reindex_entity(&tok, &entities[0]).await.unwrap();
+            assert_eq!(
+                captured.lock().unwrap().len(),
+                1,
+                "BULK_PLAN_EMBEDDER_EFFECT_CONTROL"
+            );
+            assert_eq!(
+                rt.vectors_for_model(&tok, "bulk-plan-test")
+                    .unwrap()
+                    .info()
+                    .await
+                    .unwrap()
+                    .entry_count,
+                1
+            );
+        }
+    }
 
     #[tokio::test]
     async fn create_many_persists_all_entities() {

@@ -228,17 +228,20 @@ pub const REPO_SLUG_PROPERTY: &str = "repo_slug";
 /// its scheme and any `user[:pass]@` userinfo prefix stripped -- e.g.
 /// `github.com/owner/repo` from `https://github.com/owner/repo`, or
 /// `github.com/owner/repo` from the `host/owner/repo` remainder of an
-/// `ssh://user@host/owner/repo` URL. `rfind('@')` (not the first `@`) drops
-/// userinfo because a password component can itself contain `@`. Any port
-/// on the authority is stripped via `strip_port` -- the slug identity is
-/// host+path only, so `github.com:2222/org/repo` and `github.com/org/repo`
+/// `ssh://user@host/owner/repo` URL. The userinfo search is confined to the
+/// authority (everything before the first `/`): a path segment may itself
+/// contain `@`, and searching past the authority would replace the real host
+/// with text from the path. Within the authority, `rfind('@')` (not the first
+/// `@`) drops userinfo because a password component can itself contain `@`.
+/// Any port on the authority is stripped via `strip_port` -- the slug identity
+/// is host+path only, so `github.com:2222/org/repo` and `github.com/org/repo`
 /// must converge.
 fn split_host_path(rest: &str) -> Option<(String, String)> {
-    let after_userinfo = match rest.rfind('@') {
-        Some(pos) => &rest[pos + 1..],
-        None => rest,
+    let (authority, path) = rest.split_once('/')?;
+    let host = match authority.rfind('@') {
+        Some(pos) => &authority[pos + 1..],
+        None => authority,
     };
-    let (host, path) = after_userinfo.split_once('/')?;
     if host.is_empty() || path.is_empty() {
         return None;
     }
@@ -728,6 +731,31 @@ mod tests {
             remote_url_to_slug("https://gitlab.com/group/subgroup/other"),
             "two repos under one subgroup must not collapse onto one slug"
         );
+    }
+
+    #[test]
+    fn remote_url_to_slug_keeps_host_when_a_path_segment_contains_at() {
+        assert_eq!(
+            remote_url_to_slug("https://evil.example/x@github.com/org/repo").as_deref(),
+            Some("evil.example/x@github.com/org/repo")
+        );
+        assert_eq!(
+            remote_url_to_slug("ssh://git@evil.example/x@github.com/org/repo").as_deref(),
+            Some("evil.example/x@github.com/org/repo")
+        );
+        assert_eq!(
+            remote_url_to_slug("https://user:p@ss@github.com/org/repo").as_deref(),
+            Some("github.com/org/repo"),
+            "an '@' inside the password is still userinfo"
+        );
+    }
+
+    #[test]
+    fn parse_source_derives_no_github_slug_when_the_host_is_not_github() {
+        match parse_source("https://evil.example/x@github.com/org/repo").unwrap() {
+            DigestSource::Remote { gh_slug, .. } => assert_eq!(gh_slug, None),
+            other => panic!("expected Remote, got {other:?}"),
+        }
     }
 
     #[test]

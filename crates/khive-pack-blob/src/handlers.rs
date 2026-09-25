@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use khive_runtime::daemon::MAX_FRAME_BYTES;
@@ -76,33 +77,115 @@ fn blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeErr
     })
 }
 
-fn required_str<'a>(params: &'a Value, field: &str, verb: &str) -> Result<&'a str, RuntimeError> {
-    params
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            RuntimeError::InvalidInput(format!(
-                "{verb} requires a non-empty string field {field:?}"
-            ))
-        })
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutParams {
+    bytes: String,
 }
 
-fn parse_content_ref(params: &Value, verb: &str) -> Result<ContentRef, RuntimeError> {
-    let raw = required_str(params, "content_ref", verb)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetParams {
+    content_ref: String,
+    #[serde(default, deserialize_with = "deserialize_range")]
+    range: Option<RangeParams>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RangeParams {
+    #[serde(default, deserialize_with = "deserialize_range_offset")]
+    offset: u64,
+    #[serde(default, deserialize_with = "deserialize_range_length")]
+    length: Option<u64>,
+}
+
+fn deserialize_range_offset<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    value.as_u64().ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "range.offset must be a non-negative integer, got {value}"
+        ))
+    })
+}
+
+fn deserialize_range_length<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "range.length must be a non-negative integer, got {value}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn deserialize_range<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<RangeParams>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            if !value.is_object() {
+                return Err(serde::de::Error::custom(
+                    "range must be a JSON object with optional offset/length",
+                ));
+            }
+            serde_json::from_value(value).map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatParams {
+    content_ref: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BeginParams {
+    size: u64,
+    content_ref: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutPartParams {
+    upload_id: String,
+    index: u64,
+    bytes: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadParams {
+    upload_id: String,
+}
+
+fn parse_params<T: DeserializeOwned>(params: Value, verb: &str) -> Result<T, RuntimeError> {
+    if !params.is_object() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb} arguments must be a JSON object"
+        )));
+    }
+    serde_json::from_value(params)
+        .map_err(|error| RuntimeError::InvalidInput(format!("invalid {verb} arguments: {error}")))
+}
+
+fn parse_content_ref(raw: &str, verb: &str) -> Result<ContentRef, RuntimeError> {
     ContentRef::from_hex(raw)
         .map_err(|e| RuntimeError::InvalidInput(format!("{verb}: invalid content_ref: {e}")))
 }
 
-fn parse_upload_id(params: &Value, verb: &str) -> Result<UploadId, RuntimeError> {
-    UploadId::from_hex(required_str(params, "upload_id", verb)?)
-        .map_err(|error| RuntimeError::InvalidInput(format!("{verb}: {error}")))
-}
-
-fn required_u64(params: &Value, field: &str, verb: &str) -> Result<u64, RuntimeError> {
-    params.get(field).and_then(Value::as_u64).ok_or_else(|| {
-        RuntimeError::InvalidInput(format!("{verb}: {field} must be a non-negative integer"))
-    })
+fn parse_upload_id(raw: &str, verb: &str) -> Result<UploadId, RuntimeError> {
+    UploadId::from_hex(raw).map_err(|error| RuntimeError::InvalidInput(format!("{verb}: {error}")))
 }
 
 pub(crate) async fn handle_begin(
@@ -110,11 +193,11 @@ pub(crate) async fn handle_begin(
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let size = required_u64(&params, "size", "blob.begin")?;
-    let reference = match params.get("content_ref") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(parse_content_ref(&params, "blob.begin")?),
-    };
+    let BeginParams { size, content_ref } = parse_params(params, "blob.begin")?;
+    let reference = content_ref
+        .as_deref()
+        .map(|raw| parse_content_ref(raw, "blob.begin"))
+        .transpose()?;
     uploads
         .begin(
             size,
@@ -128,11 +211,12 @@ pub(crate) async fn handle_put_part(
     uploads: &UploadManager,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let id = parse_upload_id(&params, "blob.put_part")?;
-    let index = required_u64(&params, "index", "blob.put_part")?;
-    let b64 = params.get("bytes").and_then(Value::as_str).ok_or_else(|| {
-        RuntimeError::InvalidInput("blob.put_part requires \"bytes\" (base64)".into())
-    })?;
+    let PutPartParams {
+        upload_id,
+        index,
+        bytes: b64,
+    } = parse_params(params, "blob.put_part")?;
+    let id = parse_upload_id(&upload_id, "blob.put_part")?;
     let limit = max_request_part_raw_bytes();
     // Permit one extra decoded byte so the boundary is decided on raw
     // length; bound larger inputs before allocating a decoded buffer.
@@ -172,8 +256,9 @@ pub(crate) async fn handle_commit(
     uploads: &UploadManager,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let UploadParams { upload_id } = parse_params(params, "blob.commit")?;
     uploads
-        .commit(&parse_upload_id(&params, "blob.commit")?)
+        .commit(&parse_upload_id(&upload_id, "blob.commit")?)
         .await
 }
 
@@ -181,45 +266,10 @@ pub(crate) async fn handle_abort(
     uploads: &UploadManager,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let UploadParams { upload_id } = parse_params(params, "blob.abort")?;
     uploads
-        .abort(&parse_upload_id(&params, "blob.abort")?)
+        .abort(&parse_upload_id(&upload_id, "blob.abort")?)
         .await
-}
-
-/// Strictly parse an optional `range` field into `(offset, length)`.
-///
-/// `range`, when present and non-null, must be a JSON object. `offset` and
-/// `length`, when present, must each be a JSON unsigned integer — a string,
-/// a negative number, or a float is rejected by name rather than silently
-/// coerced or defaulted. Absent `range`/`offset`/`length` are the only
-/// permitted omissions (offset defaults to 0, length to "through the end").
-fn parse_range(params: &Value, verb: &str) -> Result<Option<(u64, Option<u64>)>, RuntimeError> {
-    let range = match params.get("range") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(range) => range,
-    };
-    let Value::Object(range) = range else {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{verb}: range must be a JSON object with optional offset/length, got {range}"
-        )));
-    };
-    let offset = match range.get("offset") {
-        None => 0,
-        Some(v) => v.as_u64().ok_or_else(|| {
-            RuntimeError::InvalidInput(format!(
-                "{verb}: range.offset must be a non-negative integer, got {v}"
-            ))
-        })?,
-    };
-    let length = match range.get("length") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_u64().ok_or_else(|| {
-            RuntimeError::InvalidInput(format!(
-                "{verb}: range.length must be a non-negative integer, got {v}"
-            ))
-        })?),
-    };
-    Ok(Some((offset, length)))
 }
 
 /// `blob.put` — store `bytes` (base64), returning the resulting `ContentRef`.
@@ -234,6 +284,7 @@ pub(crate) async fn handle_put(
     _token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let PutParams { bytes: b64 } = parse_params(params, "blob.put")?;
     if runtime.is_read_only() {
         return Err(RuntimeError::InvalidInput(
             "blob.put is unavailable because the blob pack runtime is read-only".to_string(),
@@ -241,9 +292,6 @@ pub(crate) async fn handle_put(
     }
     let store = blob_store(runtime)?;
 
-    let b64 = params.get("bytes").and_then(Value::as_str).ok_or_else(|| {
-        RuntimeError::InvalidInput("blob.put requires \"bytes\" (base64)".to_string())
-    })?;
     // Bound the decode before allocating: 4 base64 chars encode 3 bytes, so an
     // input longer than MAX_OBJECT_BYTES * 4/3 cannot fit under the ceiling. Reject
     // an oversized put here rather than materializing it in memory first.
@@ -286,10 +334,11 @@ pub(crate) async fn handle_get(
     _token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let GetParams { content_ref, range } = parse_params(params, "blob.get")?;
+    let content_ref = parse_content_ref(&content_ref, "blob.get")?;
+    let range = range.map(|range| (range.offset, range.length));
     let store = blob_store(runtime)?;
     let hydrator = blob_hydrator(runtime)?;
-    let content_ref = parse_content_ref(&params, "blob.get")?;
-    let range = parse_range(&params, "blob.get")?;
 
     let size = store.size(&content_ref).await?.ok_or_else(|| {
         RuntimeError::NotFound(format!(
@@ -380,8 +429,9 @@ pub(crate) async fn handle_stat(
     _token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let StatParams { content_ref } = parse_params(params, "blob.stat")?;
+    let content_ref = parse_content_ref(&content_ref, "blob.stat")?;
     let store = blob_store(runtime)?;
-    let content_ref = parse_content_ref(&params, "blob.stat")?;
 
     match store.size(&content_ref).await? {
         None => Ok(json!({ "content_ref": content_ref.to_string(), "exists": false })),

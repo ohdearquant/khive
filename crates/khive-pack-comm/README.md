@@ -11,7 +11,7 @@ delivery confirmation, and channel polling observability.
 | `comm.send`      | Send a message, optionally threaded                                                                                                                           |
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
 | `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
-| `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
+| `comm.read`      | Fetch one or up to 500 inbound messages and mark them read; `body=false` returns only the prior acknowledgement shape                                         |
 | `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
 | `comm.unread`    | Count the caller's unread inbound messages without payloads; exact below 1,000 with explicit cap/saturation metadata                                          |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
@@ -207,19 +207,21 @@ projection. Unknown names fail loudly; omitting `fields` preserves the complete
 message view. Stable property aliases such as `from_actor`, `to_actor`, and
 `sent_at` can be requested without returning the full body or `properties` map.
 
-`comm.read(id=...)` keeps the single-message response. The additive
+`comm.read(id=...)` keeps the single-message acknowledgement fields and, on a
+successful mark, also returns `subject`, `content`, `from`, `to`, `direction`, and
+`created_at`. Pass `body=false` to keep the previous acknowledgement-only shape.
+The additive
 `comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item
 outcomes with marked/failed/unknown counts. Each result carries
 `status=success|failed|unknown`, and the bulk result carries
 `status=success|partial|failed|unknown`, so a degraded mark is explicit
-alongside `read`/`mark_error`. `unknown` (`read: null`) means the write's
+alongside `read`/`mark_error`. Only successful items carry message fields;
+failed and unknown items add no body. `unknown` (`read: null`) means the write's
 execution seam terminated after the request was accepted, so the mark may
 already have landed; check the message's current state through `comm.inbox`
 before deciding whether to re-issue it — re-issuing is safe, since marking a
-message read is idempotent. Bulk updates are not one
-cross-message transaction. `comm.read` remains available
-for compatibility, but its name describes neither retrieval nor mutation
-clearly; retrieve message content through `comm.inbox` or `comm.thread`.
+message read is idempotent. Bulk updates are not one cross-message transaction.
+`comm.mark_read` remains the named bulk acknowledgement operation.
 
 Use `comm.mark_read(ids=[...])` as the canonical bulk mutation. It reuses the
 same best-effort behavior by default. Pass `atomic=true` when every unique
