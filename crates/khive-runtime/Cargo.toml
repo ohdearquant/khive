@@ -17,6 +17,7 @@ fault-injection = []
 test-internals = ["khive-db/test-support"]
 
 [dependencies]
+khive-channel = { version = "0.8.0", path = "../khive-channel" }
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde", "blake3"] }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }
 khive-score = { version = "0.8.0", path = "../khive-score" }
@@ -45,6 +46,7 @@ libc = { workspace = true }
 anyhow = { workspace = true }
 unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
+ring = "0.17.14"
 
 [dev-dependencies]
 khive-db = { version = "0.8.0", path = "../khive-db", features = ["test-support"] }

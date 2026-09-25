@@ -1,5 +1,7 @@
 //! SQL-backed `NoteStore` implementation.
 
+pub mod transport;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
