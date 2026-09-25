@@ -3160,9 +3160,10 @@ async fn dispatch_via_coordinator_inner(
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
-                        // entity_kind/note_kind), `name`, and `created_at`.
-                        // Entity hits: [{id, kind, entity_kind, name, score, source, title, snippet, created_at}]
-                        // Note hits:   [{id, kind, note_kind, name, score, source, title, snippet, created_at}]
+                        // entity_kind/note_kind), `name`, `created_at`, `updated_at`
+                        // and `version`.
+                        // Entity hits: [{id, kind, entity_kind, name, score, source, title, snippet, created_at, updated_at, version}]
+                        // Note hits:   [{id, kind, note_kind, name, score, source, title, snippet, created_at, updated_at, version}]
                         let result_val = if request.substrate() == SearchSubstrate::Note {
                             let items: Vec<Value> = coord_result
                                 .note_hits

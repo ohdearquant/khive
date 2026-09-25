@@ -232,6 +232,7 @@ mod search_text_reason_tests {
         use khive_runtime::EmbedderProvider;
         use khive_storage::{TextFilter, TextQueryMode, TextSearchRequest};
         use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::collections::BTreeSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct LocalEmbeddingService { dimensions: usize, calls: Arc<AtomicUsize> }
@@ -335,7 +336,46 @@ mod search_text_reason_tests {
                     assert!(hit["score"].as_f64().expect("numeric score") > 0.0);
                     assert!(hit["created_at"].is_string());
                     assert!(hit["snippet"].is_string());
-                    assert_eq!(hit.as_object().expect("hit object").len(), 9);
+                    let expected_keys = BTreeSet::from([
+                        "created_at",
+                        "entity_kind",
+                        "id",
+                        "kind",
+                        "name",
+                        "score",
+                        "snippet",
+                        "source",
+                        "title",
+                        "updated_at",
+                        "version",
+                    ]);
+                    let actual_keys = hit
+                        .as_object()
+                        .expect("hit object")
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>();
+                    let missing_keys = expected_keys
+                        .difference(&actual_keys)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let extra_keys = actual_keys
+                        .difference(&expected_keys)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual_keys,
+                        expected_keys,
+                        "{query}: entity hit keys mismatch; missing: {missing_keys:?}; extra: {extra_keys:?}"
+                    );
+                    assert!(
+                        hit["updated_at"].is_string() || hit["updated_at"].is_null(),
+                        "{query}: updated_at must be a string or null"
+                    );
+                    assert!(
+                        hit["version"].as_i64().is_some() || hit["version"].is_null(),
+                        "{query}: version must be an integer or null"
+                    );
                 }
                 legacy_arms(&arms, "ran", text_count, "ran", 3);
                 eprintln!("T5 legacy query={query:?}, text={text_count}, vector=3, hits={raw}");
