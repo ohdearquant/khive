@@ -65,6 +65,9 @@ own score contracts.
 
 ## khive-cloud
 
+See the [HTTP transport reference](docs/HTTP_TRANSPORT.md) for configuration,
+the `khive-cloud` command, transport interfaces, and error handling.
+
 The same `Khive` facade works against a remote khive-cloud deployment over
 `HttpTransport` — install the `cloud` extra first (`pip install
 'khive-py[cloud]'`, or `uv pip install -e '.[cloud]'` from a checkout):
