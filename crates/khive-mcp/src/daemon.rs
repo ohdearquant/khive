@@ -2967,6 +2967,11 @@ mod tests {
         let socket = dir.path().join("khived.sock");
         std::env::set_var("KHIVE_SOCKET", &socket);
         std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
         std::env::remove_var("KHIVE_NO_DAEMON");
         let daemon_server = server.clone();
         let daemon = tokio::spawn(async move {
