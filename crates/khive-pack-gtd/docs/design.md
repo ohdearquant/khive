@@ -39,6 +39,8 @@
 
 - Five task-management verbs: `gtd.assign`, `gtd.next`, `gtd.complete`, `gtd.tasks`, `gtd.transition`.
 - `gtd.census` is an additional read-only timestamp-magnitude census; it does not repair task data.
+- `gtd.repair` applies only explicit observed-value-checked historical corrections;
+  its default dry run changes nothing and it never infers timestamp units.
 - Lifecycle states: `inbox → next | waiting | someday | active | done | cancelled`.
 - `done` and `cancelled` are permanently terminal (no reopen; issue #273).
 - `complete()` validates its `done`/`cancelled` target against the same lifecycle table as
@@ -54,6 +56,7 @@
 ### Illocutionary verb classification (Searle 1976) (ADR-025)
 
 - `gtd.census` → Assertive (counts raw timestamp-value shapes without choosing units)
+- `gtd.repair` → Declaration (applies caller-specified historical corrections)
 - `gtd.assign` → Directive (directs an actor to perform work)
 - `gtd.next` → Assertive (retrieves actionable task state)
 - `gtd.tasks` → Assertive (retrieves filtered task listing)
