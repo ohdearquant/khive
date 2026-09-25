@@ -452,6 +452,10 @@ email channel loops NOT started: ingest namespace authorization failed (fail-clo
 
 If no daemon is running, mail is simply not polled until one starts. That is
 the intended behavior, not a silent failure.
+Once demand-mode retirement ([ADR-049](../adr/ADR-049-khived-daemon.md)
+Amendment 11) ships, a daemon that a client started automatically does not run
+these loops either; start it explicitly with `kkernel mcp --daemon` (or under a
+supervisor) to have mail polled and delivered.
 
 ## Limitations
 

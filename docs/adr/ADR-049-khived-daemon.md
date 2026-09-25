@@ -1198,7 +1198,8 @@ This amendment covers lifetime and drain only. Cross-request client ownership (#
 distinguishing two connections of one authenticated subject (#2792) are decided separately: the
 ownership contract is gated on an inventory of externally reachable retained state, and #2792
 requires measuring the actual conversation-to-session mapping first. Neither gate blocks this
-amendment.
+amendment, because until the ownership contract exists a demand daemon holds no credential-bearing
+background work at all (see Credential-bearing background work below).
 
 ### Launch mode
 
@@ -1218,6 +1219,41 @@ marker ownership nor starter arbitration. The mode, the daemon's instance genera
 effective idle interval, and its shutdown reason are exposed through the daemon's existing
 lifecycle diagnostics.
 
+The mode travels on the daemon's command line. `mcp --daemon` gains `--lifetime <demand|persistent>`;
+when the flag is absent the mode is persistent, so an explicit invocation and every supervisor
+configuration written before this amendment keep today's behavior. Automatic spawn has a single
+construction point, the argument builder in `crates/khive-mcp/src/daemon.rs` that both CLI and MCP
+forwarding reach, and that builder passes `--lifetime demand`; the bounded-takeover replacement
+spawns through the same builder when it is implemented. The mode is not read from the environment:
+a spawned daemon inherits its caller's environment, so a variable set for one client would silently
+change unrelated launches, while a command-line value is visible to operators and to the
+process-identity check. The daemon parses the value once at startup and never re-reads it.
+
+Conformance requires:
+
+1. a test on the argument builder asserting that the spawned command line carries
+   `--lifetime demand`;
+2. a test asserting that a daemon started without the flag reports persistent in its lifecycle
+   diagnostics and one started with `--lifetime demand` reports demand;
+3. the command-line identity check that recognizes a khive daemon (`argv_is_khive_daemon`) still
+   recognizing both forms, with a test for each;
+4. every future automatic-spawn path going through the same builder; a second place that
+   constructs a daemon command line is a defect against this amendment.
+
+### Credential-bearing background work
+
+A demand-mode daemon starts no background component that acts with credentials or an actor
+identity captured at startup: no channel loops (inbound polling or outbound delivery) and no
+schedule execution. Those run only under a persistent daemon, started explicitly with
+`mcp --daemon` or by a supervisor, until the client-ownership contract (#1933) defines who owns such
+work once the client that caused the spawn is gone. An automatically started daemon inherits its
+caller's environment and working directory, and later clients of the same user can reuse its socket,
+so without this rule background mail or schedule work could keep running under a departed client's
+credentials and identity. A user who wants an email channel or scheduled work therefore starts the
+daemon explicitly. A demand daemon whose configuration declares a channel or schedules logs each
+skipped component at startup and names it in its lifecycle diagnostics, so the difference is
+visible rather than silent.
+
 ### Idle eligibility
 
 A demand-mode daemon retires after 1,800 seconds (30 minutes) of quiescence, configurable to any
@@ -1233,8 +1269,9 @@ measurement exists, the value ships only as a configurable, clearly labeled plac
 amendment records no committed number.
 
 The idle clock starts at service readiness, not at process start. Service readiness is the point
-at which the daemon has bound its socket, published its pid file, started its background
-components (channel loops, schedule execution, events-daemon supervision), and installed its
+at which the daemon has bound its socket, published its pid file, started the background
+components its mode permits (events-daemon supervision in both modes; channel loops and schedule
+execution only in persistent mode), and installed its
 SIGTERM and SIGINT handlers. See Signal handling below for a gap in the current source between
 publishing the pid file and installing those handlers, and for the change that closes it; until
 that change lands, readiness as defined here is not yet reachable, and the idle clock would
@@ -1249,10 +1286,10 @@ retained read-write connection handle (which keeps its writer permit for its who
 lifetime under [ADR-005](ADR-005-storage-capability-traits.md)) all prevent quiescence.
 
 Background work must declare whether it is expendable cache maintenance or a service obligation
-before it can inhibit retirement. A scheduled delivery or an active inbound channel loop is a
-service obligation and keeps a demand daemon serving past its idle interval, with the diagnostic
-surface naming the obligation; a deployment that needs guaranteed continuous service should use
-persistent mode instead. Unknown component state does not count as idle: a configuration is
+before it can inhibit retirement. A declared service obligation keeps a demand daemon serving past
+its idle interval, with the diagnostic surface naming the obligation. Scheduled delivery and inbound
+channel loops never hold a demand daemon open, because a demand daemon does not run them; a
+deployment that needs them, or guaranteed continuous service, uses persistent mode. Unknown component state does not count as idle: a configuration is
 eligible for default idle retirement only once its component inventory is complete.
 
 ### Admission and drain
@@ -1329,9 +1366,10 @@ background work it originates, such as channel loops and schedule execution, fro
 directory tied to its working directory, the same resolution tier every process uses when no
 actor is set explicitly (`crates/khive-mcp/src/serve.rs`). A neutral working directory introduced
 without an explicit, equivalent actor selection would silently change which actor that background
-work runs as. This amendment does not change the auto-spawn working directory; it records this so
-a later change treats the daemon's own background-work identity as part of its scope, not only
-the client's.
+work runs as. Under this amendment a demand daemon runs no such work, so the question becomes live
+only when the client-ownership contract (#1933) admits it in demand mode. This amendment does not
+change the auto-spawn working directory; it records this so a later change treats the daemon's own
+background-work identity as part of its scope, not only the client's.
 
 ### Signal handling
 
@@ -1376,6 +1414,9 @@ daemon keeps serving. A quiescent demand daemon with no service obligation retir
 configured interval; an identical persistent daemon does not. Probe and empty-maintenance traffic
 do not restart the idle clock; an ordinary request does. A daemon with a declared service
 obligation stays serving past its idle interval and names the obligation in its diagnostics. A
+demand daemon whose configuration declares an email channel and schedules starts neither, reports
+both as skipped, and retires on its idle interval; the same configuration under a persistent daemon
+starts both. A
 request racing idle retirement either completes normally or receives a refusal before dispatch,
 with no request unaccounted for. A slow admitted write or an open explicit transaction is never
 interrupted by idle retirement, and a write that outlives the ordinary drain interval still
