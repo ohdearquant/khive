@@ -264,15 +264,75 @@ def main():
             "published verb/pack counts drifted from the live registry:\n"
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
-        # The default configuration exposes 138 public verbs across 14 packs.
-        # The session pack contributes five verbs, including transcript search,
-        # which remains unavailable until its required features are ready.
-        assert verbs_result["total"] == 138, (
-            f"expected 138 public verbs across the 14 default packs, including "
-            f"five session verbs with dependency-gated transcript search; "
+        # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
+        # unset) loads 14 production packs and exposes 139 MCP-callable verbs
+        # (count what verbs() returns, not internal dispatch arms). The session
+        # pack contributes five verbs: 4 agent-facing T1 verbs
+        # (store/list/resume/export), promoted from internal subhandlers to
+        # Visibility::Verb per ADR-083, and transcript search (ADR-117a), which
+        # stays unavailable until its required features are ready;
+        # brain.register_adapter (#354), context
+        # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
+        # draft ADR Slice 1, the 18th kg-substrate bare verb), whoami (caller
+        # identity introspection, the 19th kg-substrate bare verb), db_diagnostics
+        # (ADR-091 operator surface, the 20th kg-substrate bare verb), comm.health
+        # (#606, verified live 2026-07-04), comm.probe (#644 read-only
+        # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
+        # windowed event read) are included in the count; git contributes
+        # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
+        # git.push (ADR-108, three thin write verbs shelling to system git
+        # with hardened argv construction); code contributes exactly one
+        # verb, `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
+        # L1.5 import-scan tiers; its `finding` note kind and
+        # `findings.json` batch ingest remain reachable only via the
+        # `kkernel code-ingest` admin CLI, never this MCP verb surface);
+        # workspace (#873) contributes zero verbs, adding only the
+        # `workspace` entity kind and `contains` endpoint rules; blob
+        # contributes seven verbs (put/get/stat and begin/put_part/commit/abort, ADR-173)
+        # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
+        # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
+        # The kg pack also carries its one documented sub-namespace,
+        # stream.append / stream.batch / stream.read / stream.stat (ADR-174
+        # §2); git grew from four verbs to sixteen with the dev-loop surface
+        # (checkout, diff, gates, receipts, reconcile, status, log, init,
+        # pr_open, pr_review, pr_merge; ADR-182) plus git.ingest_cursor
+        # (ADR-088 Amendment 1, the persisted ingest cursor read);
+        # tool contributes fourteen verbs, including tool.policy_delete, and
+        # exec nine (the tool registry with use policy and sandboxed runs over trees).
+        # Update this number when the pack set or verb surface changes; a
+        # silent drift here is the bug this assertion exists to catch.
+        assert verbs_result["total"] == 139, (
+            f"expected 139 user-facing verbs from the 14 default packs "
+            f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
+            f"ADR-083 plus dependency-gated transcript search; "
+            f"context is the 17th kg-substrate bare verb per ADR-089; "
+            f"resolve is the 18th kg-substrate bare verb per the unified-verb "
+            f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "
+            f"(caller identity introspection); db_diagnostics is the 20th "
+            f"kg-substrate bare verb (ADR-091 read-only-by-intent operator "
+            f"diagnostics); scan is the kg-substrate bare verb answering the "
+            f"secret gate without a write; comm.health is #606; comm.probe is #644; "
+            f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
+            f"git.commit/git.branch/git.push (ADR-108); "
+            f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
+            f"workspace (#873) contributes zero verbs; "
+            f"blob contributes put/get/stat and begin/put_part/commit/abort per ADR-173; "
+            f"brain.mark_turn is the per-actor work-unit marker; "
+            f"comm.unread lists unread inbound messages; comm.mark_read is the "
+            f"named atomic-capable mark-read surface; comm.delivered confirms "
+            f"the internal inbound sibling after an ambiguous atomic write), "
+            f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
+            f"(ADR-174); "
+            f"git contributes sixteen verbs with the ADR-182 dev-loop surface "
+            f"and git.ingest_cursor; "
+            f"tool contributes fourteen verbs including tool.policy_delete "
+            f"(ADR-180 Amendment 3), and exec nine; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
+        assert "gtd.repair" in verb_names, (
+            f"'gtd.repair' (ADR-019 Amendment 7) must appear in verbs listing: {verb_names}"
+        )
         assert "tool.policy_delete" in verb_names, (
             f"'tool.policy_delete' must appear in verbs listing: {verb_names}"
         )

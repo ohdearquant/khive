@@ -129,15 +129,21 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 6 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### GTD pack — 7 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
-| Verb             | What it does                                            | When to use                              |
-| ---------------- | ------------------------------------------------------- | ---------------------------------------- |
-| `gtd.assign`     | Create a task (note with kind=task)                     | New work item, bug, follow-up            |
-| `gtd.next`       | List actionable tasks (status=next/active), by priority | "What should I work on?"                 |
-| `gtd.complete`   | Mark a task done or cancelled                           | Finishing work                           |
-| `gtd.tasks`      | Filtered task listing                                   | Browse tasks by status/assignee/priority |
-| `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)      | Moving a task through its lifecycle      |
+| Verb             | What it does                                                   | When to use                              |
+| ---------------- | -------------------------------------------------------------- | ---------------------------------------- |
+| `gtd.assign`     | Create a task (note with kind=task)                            | New work item, bug, follow-up            |
+| `gtd.next`       | List actionable tasks (status=next/active), by priority        | "What should I work on?"                 |
+| `gtd.complete`   | Mark a task done or cancelled                                  | Finishing work                           |
+| `gtd.tasks`      | Filtered task listing                                          | Browse tasks by status/assignee/priority |
+| `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)             | Moving a task through its lifecycle      |
+| `gtd.census`     | Count raw task timestamp evidence; optionally page candidates  | Inspect historical task rows             |
+| `gtd.repair`     | Preview or explicitly apply exact-observation task corrections | Repair historical task rows              |
+
+`gtd.repair` is dry-run by default. `apply=true` commits each accepted row with its
+mandatory audit entry; it never infers timestamp units or silently changes
+ordinary lifecycle state. See [explicit historical task repair](crates/khive-pack-gtd/docs/api/task-repair.md).
 
 `gtd.assign` accepts a full `context_entity_id` to anchor a task to a KG entity. Prefixes are
 rejected because this is an explicit stored reference; Agent responses retain its canonical UUID.

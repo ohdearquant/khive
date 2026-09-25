@@ -232,6 +232,15 @@ impl StorageBackend {
     /// 1 writer + N readers in WAL mode for concurrent access.
     /// No schema is applied — call `apply_schema()` for each service.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        Self::sqlite_with_max_readers(path, None)
+    }
+
+    /// Open SQLite with a reader count selected before any connections are opened.
+    /// `None` preserves the default pool size and filesystem read-only detection.
+    pub fn sqlite_with_max_readers(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
         let read_only =
@@ -241,6 +250,9 @@ impl StorageBackend {
             read_only,
             ..PoolConfig::default()
         };
+        if let Some(max_readers) = max_readers {
+            config.max_readers = max_readers;
+        }
         if read_only {
             config.write_queue_enabled = Some(false);
         }
@@ -264,14 +276,25 @@ impl StorageBackend {
     /// The database file must already exist — unlike `sqlite()` this constructor
     /// does not create a new file.
     pub fn sqlite_read_only(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_max_readers(path, None)
+    }
+
+    /// Open a read-only SQLite store with a construction-time reader count.
+    pub fn sqlite_read_only_with_max_readers(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
-        let config = PoolConfig {
+        let mut config = PoolConfig {
             path: Some(resolved.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
             ..PoolConfig::default()
         };
+        if let Some(max_readers) = max_readers {
+            config.max_readers = max_readers;
+        }
         // `ConnectionPool::new` opens the writer slot with `SQLITE_OPEN_READ_ONLY`
         // (no `SQLITE_OPEN_CREATE`) and sets `PRAGMA query_only = ON` on it, so a
         // missing path is rejected instead of created, and any write attempt is

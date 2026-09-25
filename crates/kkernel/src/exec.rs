@@ -4,6 +4,10 @@
 //! building an in-process runtime (ADR-049). Config and namespace are matched
 //! against the daemon's own fingerprint; a mismatch falls back to local
 //! dispatch, keeping behaviour identical to the in-process path.
+//! Accepted daemon results disclose that logging is configured separately:
+//! `--log` and `KHIVE_LOG` affect the client process, while the daemon's level
+//! is fixed at startup. The response protocol does not report a daemon PID
+//! or stderr destination, so this disclosure includes neither.
 //!
 //! ## Modes
 //!
@@ -2138,6 +2142,16 @@ fn disclose_resolved_actor(cfg: &RuntimeConfig) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
+#[cfg(unix)]
+fn disclose_daemon_execution() {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "execution: answered by daemon; --log and KHIVE_LOG set the client process log level only; \
+         the daemon log level is fixed at startup"
+    );
+}
+
 #[derive(Default)]
 struct ExecDbContext {
     raw: Option<String>,
@@ -2471,6 +2485,7 @@ async fn run_exec_inline_with_forward(
         let spawn_packs = cfg.packs.clone();
         if let Some(res) = forward_fn(&frame, spawn_config, spawn_db, spawn_packs).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            disclose_daemon_execution();
             let output = prepare_exec_output(&output, strict);
             println!("{output}");
             enforce_strict_batch_result(&output, strict)?;

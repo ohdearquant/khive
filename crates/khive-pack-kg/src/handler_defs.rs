@@ -255,7 +255,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       Entity, note, and edge cursor modes return \
                       {\"entities|notes|edges\": [...], \"next_after\": ...} with the same \
                       limit metadata. Caps are entity 500, note 200, edge 1000, event 1000, \
-                      and proposal 500.",
+                      and proposal 500. Unknown parameters are rejected. Filters that do not \
+                      apply to the requested kind are rejected even when null or empty.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -391,6 +392,62 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "string",
                 required: false,
                 description: "Filter events to a single EventKind (kind=\"event\" only). E.g. \"ProposalCreated\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "verb",
+                param_type: "string",
+                required: false,
+                description: "Events only: exact operation verb filter. Additive with verbs.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "verbs",
+                param_type: "array of string",
+                required: false,
+                description: "Events only: match any listed operation verb, including verb when supplied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "outcome",
+                param_type: "string",
+                required: false,
+                description: "Events only: success, denied, or error. A bounded scan applies this filter before result pagination; scan_incomplete discloses an exhausted scan budget.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Events only: exact stored actor filter. For proposals, filter by proposer actor (defaults to the caller; * selects all); explicit proposer takes precedence. Other kinds reject actor, including observation notes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "proposer",
+                param_type: "string",
+                required: false,
+                description: "Proposals only: exact proposer filter, overriding actor when both are supplied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "substrate",
+                param_type: "string",
+                required: false,
+                description: "Events only: filter by the stored substrate kind (note, entity, or event).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "since",
+                param_type: "integer",
+                required: false,
+                description: "Events only: exclusive created_at lower bound, in UTC epoch microseconds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "until",
+                param_type: "integer",
+                required: false,
+                description: "Events only: exclusive created_at upper bound, in UTC epoch microseconds.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
