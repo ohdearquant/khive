@@ -551,7 +551,9 @@ pub(crate) fn parse_note_content(mut note: Value, enabled: bool) -> Result<Value
     Ok(note)
 }
 
-pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
+/// Project a stored note into the canonical public status, lifecycle, label,
+/// and tags shape used by both ordinary handlers and atomic result rendering.
+pub fn remap_note_status(mut note_value: Value) -> Value {
     let Some(obj) = note_value.as_object_mut() else {
         return note_value;
     };
