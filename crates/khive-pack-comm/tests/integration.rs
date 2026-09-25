@@ -12392,6 +12392,80 @@ async fn create_refuses_transport_owned_quarantine_properties() {
     );
 }
 
+#[tokio::test]
+async fn generic_message_create_cannot_supply_external_id() {
+    let (registry, _rt) = build_registry();
+    let forged_id = "<caller-chosen@example.com>";
+    let error = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "outbound message with caller-chosen Message-ID",
+                "properties": {"direction": "outbound", "external_id": forged_id},
+            }),
+        )
+        .await
+        .expect_err("generic message create must refuse a caller-chosen external_id");
+    assert!(error.to_string().contains("external_id"), "{error}");
+
+    let messages = registry
+        .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+        .await
+        .expect("list after refused creates");
+    assert_eq!(messages["items"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn trusted_ingest_and_outbox_claim_still_establish_external_id() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let ingested = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:sender@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "inbound transport message",
+            "external_id": "imap:host:77:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+    assert_eq!(ingested["external_id"].as_str(), Some("imap:host:77:1"));
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "email:recipient@example.com",
+                "content": "outbound transport message",
+            }),
+        )
+        .await
+        .expect("outbound message send succeeds");
+    let outbound_id = sent["full_id"]
+        .as_str()
+        .expect("send returns full UUID")
+        .parse::<uuid::Uuid>()
+        .expect("outbound UUID parses");
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let claimed = rt
+        .claim_outbound_message_external_id(
+            &token,
+            outbound_id,
+            "<server-derived@example.com>".into(),
+        )
+        .await
+        .expect("internal outbox claim remains available");
+    assert_eq!(
+        claimed
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("external_id")),
+        Some(&serde_json::json!("<server-derived@example.com>"))
+    );
+}
+
 /// FORGE arm: a generic `create(kind="message", properties={from_actor:
 /// "forged"})` call under an authenticated token for actor X must store
 /// `from_actor == X` — the true caller — not the forged value. This is not a
@@ -13094,11 +13168,11 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
     );
 }
 
-/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's actual `comm.send`/`create` + `merge` verbs (not `count_new_property_keys` called directly — that unit-level coverage already lives in `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
+/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's actual `comm.send` + `merge` verbs and the trusted outbound claim (not `count_new_property_keys` called directly — that unit-level coverage already lives in `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
 #[tokio::test]
 async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_new_key_through_the_route(
 ) {
-    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let (registry, rt) = build_registry_with_owned_kinds_and_validator();
 
     let into_id = send_message_as(
         &registry,
@@ -13107,26 +13181,29 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
     )
     .await;
 
-    let from_created = registry
-        .dispatch_with_identity(
-            "create",
-            serde_json::json!({
-                "kind": "message",
-                "content": "from note, route-level restoration arm — has an external_id",
-                "properties": {"external_id": "wire-abc-123"},
-            }),
-            Some(RequestIdentity {
-                namespace: "local".to_string(),
-                actor_id: Some("lambda:y".to_string()),
-                ..Default::default()
-            }),
+    let from_id = send_message_as(
+        &registry,
+        "lambda:y",
+        "from note, route-level restoration arm — has an external_id",
+    )
+    .await;
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let claimed = rt
+        .claim_outbound_message_external_id(
+            &token,
+            uuid::Uuid::parse_str(&from_id).expect("send returns full UUID"),
+            "wire-abc-123".to_string(),
         )
         .await
-        .expect("create must succeed");
-    let from_id = from_created["id"]
-        .as_str()
-        .expect("create must return id")
-        .to_string();
+        .expect("trusted outbound claim must establish external_id");
+    assert_eq!(
+        claimed
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("external_id")),
+        Some(&serde_json::json!("wire-abc-123")),
+        "fixture invariant: the absorbed note must carry transport-established external_id"
+    );
 
     let before = registry
         .dispatch("get", serde_json::json!({"id": into_id}))
