@@ -10,6 +10,30 @@ struct Triple {
     object: Object,
 }
 
+/// A repeated SPARQL triple is conjunctive, not a last-write-wins map update.
+fn insert_string_property_constraint(
+    node_props: &mut HashMap<String, HashMap<String, ConditionValue>>,
+    subject: String,
+    name: String,
+    value: String,
+) -> Result<(), QueryError> {
+    let constraint = ConditionValue::String(value);
+    let props = node_props.entry(subject.clone()).or_default();
+    if let Some(existing) = props.get(&name) {
+        if existing != &constraint {
+            return Err(QueryError::Parse {
+                position: 0,
+                message: format!(
+                    "conflicting constraints on '?{subject} :{name}'; repeated predicates must agree"
+                ),
+            });
+        }
+    } else {
+        props.insert(name, constraint);
+    }
+    Ok(())
+}
+
 enum Predicate {
     Type,
     Relation {
@@ -331,7 +355,19 @@ fn triples_to_ast(
         match triple.predicate {
             Predicate::Type => {
                 if let Object::Kind(kind) = triple.object {
-                    node_kinds.insert(triple.subject, kind);
+                    if let Some(existing) = node_kinds.get(&triple.subject) {
+                        if existing != &kind {
+                            return Err(QueryError::Parse {
+                                position: 0,
+                                message: format!(
+                                    "conflicting kind constraints on '?{}'; repeated kinds must agree",
+                                    triple.subject
+                                ),
+                            });
+                        }
+                    } else {
+                        node_kinds.insert(triple.subject, kind);
+                    }
                 } else {
                     return Err(QueryError::Parse {
                         message: "'a' predicate requires a kind object (:concept, :paper, etc.)"
@@ -349,10 +385,7 @@ fn triples_to_ast(
                     edges.push((triple.subject, target, name, min_hops, max_hops));
                 }
                 Object::StringLiteral(val) => {
-                    node_props
-                        .entry(triple.subject)
-                        .or_default()
-                        .insert(name, ConditionValue::String(val));
+                    insert_string_property_constraint(&mut node_props, triple.subject, name, val)?;
                 }
                 Object::NumberLiteral(val) => {
                     where_cond_list.push(Condition {
@@ -363,10 +396,7 @@ fn triples_to_ast(
                     });
                 }
                 Object::Kind(val) => {
-                    node_props
-                        .entry(triple.subject)
-                        .or_default()
-                        .insert(name, ConditionValue::String(val));
+                    insert_string_property_constraint(&mut node_props, triple.subject, name, val)?;
                 }
             },
         }
@@ -656,6 +686,41 @@ mod tests {
         assert_eq!(
             nodes[0].properties.get("domain").unwrap(),
             &ConditionValue::String("attention".into())
+        );
+    }
+
+    #[test]
+    fn conflicting_repeated_kind_constraint_is_rejected() {
+        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a a :person . ?a :extends ?b . }")
+            .unwrap_err();
+        assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+        assert!(err.to_string().contains("conflicting kind"), "{err}");
+    }
+
+    #[test]
+    fn conflicting_repeated_string_or_kind_literal_is_rejected() {
+        for input in [
+            "SELECT ?a WHERE { ?a :name 'x' . ?a :name 'y' . ?a :extends ?b . }",
+            "SELECT ?a WHERE { ?a :domain :attention . ?a :domain 'vision' . ?a :extends ?b . }",
+        ] {
+            let err = parse(input).unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting constraints"), "{err}");
+        }
+    }
+
+    #[test]
+    fn identical_repeated_kind_and_string_constraints_are_idempotent() {
+        let query = parse(
+            "SELECT ?a WHERE { ?a a :concept . ?a a :concept . \
+             ?a :name 'x' . ?a :name 'x' . ?a :extends ?b . }",
+        )
+        .expect("identical repeated triples remain valid");
+        let start = query.pattern.nodes().next().expect("start node");
+        assert_eq!(start.kind.as_deref(), Some("concept"));
+        assert_eq!(
+            start.properties.get("name"),
+            Some(&ConditionValue::String("x".into()))
         );
     }
 

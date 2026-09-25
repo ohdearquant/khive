@@ -1378,6 +1378,8 @@ fn compile_variable_length(
                     e.id, e.relation, e.weight \
              FROM primary_nodes s \
              JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+             JOIN primary_nodes next_node ON next_node.id = ({seed_next}) \
+                    AND next_node.deleted_at IS NULL{next_node_ns_and} \
              WHERE {start_where} \
              UNION ALL \
              SELECT t.start_id, {recurse_next}, t.depth + 1, \
