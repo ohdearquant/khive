@@ -55,6 +55,7 @@ fn append_proof_uses_typed_finality_and_never_retryability_or_error_text() {
             StorageError::AdmissionTimeout {
                 operation: "append".into(),
                 timeout_ms: 9,
+                pool_identity: None,
             }
             .into(),
             NotCommitted,

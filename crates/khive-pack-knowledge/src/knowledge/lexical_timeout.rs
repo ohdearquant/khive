@@ -512,6 +512,7 @@ pub(super) mod tests {
                 Err(StorageError::AdmissionTimeout {
                     operation: "test.admission".into(),
                     timeout_ms: 5,
+                    pool_identity: None,
                 })
             })
             .await;
