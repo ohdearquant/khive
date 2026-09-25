@@ -786,10 +786,11 @@ fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
-/// Two servers produce the same id iff they can safely share one warm engine:
+/// Identical resolved configurations produce the same id. A daemon may also
+/// serve a compatible client with a different id when it has a superset of
+/// the client's requested extra embedders. Every other field must match:
 /// same pack set (order-independent), same storage target and effective access
-/// mode, same primary embedder, a daemon extra-embedder set that covers the
-/// client's requested set, same backend topology/routing, and same
+/// mode, same primary embedder, same backend topology/routing, and same
 /// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
 /// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried

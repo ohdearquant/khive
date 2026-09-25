@@ -44,7 +44,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -582,11 +582,12 @@ pub fn config_id_extra_embedder_exclusions(
     }
     let client = parse_config_id(client_id)?;
     let daemon = parse_config_id(daemon_id)?;
-    let client_extras = extra_embedder_set(client.extra);
+    let mut client_available = extra_embedder_set(client.extra);
+    client_available.insert(client.embed);
     let daemon_extras = extra_embedder_set(daemon.extra);
     Some(
         daemon_extras
-            .difference(&client_extras)
+            .difference(&client_available)
             .map(|name| {
                 serde_json::from_value::<lattice_embed::EmbeddingModel>(serde_json::Value::String(
                     (*name).to_string(),
@@ -611,8 +612,9 @@ pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
     };
 
     let client_extras = extra_embedder_set(client.extra);
-    let daemon_extras = extra_embedder_set(daemon.extra);
-    let daemon_has_requested_extras = client_extras.is_subset(&daemon_extras);
+    let mut daemon_available = extra_embedder_set(daemon.extra);
+    daemon_available.insert(daemon.embed);
+    let daemon_has_requested_extras = client_extras.is_subset(&daemon_available);
 
     client.packs == daemon.packs
         && client.db == daemon.db
@@ -641,7 +643,8 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         return "unknown";
     };
     let client_extras = extra_embedder_set(client.extra);
-    let daemon_extras = extra_embedder_set(daemon.extra);
+    let mut daemon_available = extra_embedder_set(daemon.extra);
+    daemon_available.insert(daemon.embed);
 
     if client.packs != daemon.packs {
         "packs"
@@ -649,7 +652,7 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         "db"
     } else if client.embed != daemon.embed {
         "embed"
-    } else if !client_extras.is_subset(&daemon_extras) {
+    } else if !client_extras.is_subset(&daemon_available) {
         "extra"
     } else if client.fresh_tail != daemon.fresh_tail {
         "fresh_tail"
@@ -673,6 +676,9 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         "backends"
     } else if client.pack_backends != daemon.pack_backends {
         "pack_backends"
+    } else if client.extra != daemon.extra {
+        // A pre-v8 daemon compared exact ids and could refuse a safe superset.
+        "extra"
     } else {
         "unknown"
     }
@@ -4711,6 +4717,36 @@ mod tests {
         );
     }
 
+    /// Pre-v8 bridges compare the served config id exactly and can replay a
+    /// successful write locally after a daemon accepts a compatible superset.
+    /// Reject their requests before dispatch so a rolling upgrade cannot write twice.
+    #[tokio::test]
+    async fn protocol_v7_frame_is_rejected_before_compatible_superset_dispatch() {
+        let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_id = config_id("p", "");
+        let daemon_id = config_id("p", "m");
+        assert!(super::config_ids_compatible(&client_id, &daemon_id));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: daemon_id,
+            dispatch_calls: Arc::clone(&dispatch_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut request = base_request_frame(&client_id);
+        request.protocol_version = 7;
+
+        let response = round_trip(dispatcher, &request).await;
+        assert!(!response.ok);
+        assert!(!response.version_mismatch);
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["code"],
+            "version_mismatch"
+        );
+        assert_eq!(response.daemon_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(dispatch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// A client above this protocol is answered with the explicit flag: that
     /// direction is the warm-old-daemon case, where the newer client's own
     /// handling replaces the daemon, and the implicit shape reserved for older
@@ -6103,6 +6139,50 @@ mod tests {
         let daemon = config_id("p", "b,a,c,b");
 
         assert!(super::config_ids_compatible(&client, &daemon));
+    }
+
+    #[test]
+    fn a_primary_repeated_as_an_extra_remains_available_to_the_client() {
+        let client = config_id("AllMiniLmL6V2", "");
+        let daemon = config_id("AllMiniLmL6V2", "AllMiniLmL6V2");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::config_id_extra_embedder_exclusions(&client, &daemon),
+            Some(vec![]),
+            "the request may still use its primary model"
+        );
+
+        let client_with_primary_extra = config_id("AllMiniLmL6V2", "AllMiniLmL6V2");
+        let daemon_without_extra = config_id("AllMiniLmL6V2", "");
+        assert!(super::config_ids_compatible(
+            &client_with_primary_extra,
+            &daemon_without_extra
+        ));
+    }
+
+    #[test]
+    fn a_daemon_extra_matching_the_primary_is_not_hidden_with_other_extras() {
+        let client = config_id("AllMiniLmL6V2", "BgeSmallEnV15");
+        let daemon = config_id("AllMiniLmL6V2", "AllMiniLmL6V2,BgeSmallEnV15");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::config_id_extra_embedder_exclusions(&client, &daemon),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn a_legacy_exact_match_refusal_names_an_extra_superset() {
+        let client = config_id("p", "");
+        let daemon = config_id("p", "m");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(&client, Some(&daemon)),
+            "extra"
+        );
     }
 
     /// The request-dispatch call site applies the superset rule, not only the
