@@ -453,7 +453,7 @@ are recorded here as distinct so that neither is read as having answered the oth
 
 ## Amendment 5 (2026-09-25): uniqueness by name is held by the store, not by a lookup
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-25).
 
 ### Context
 

@@ -1457,7 +1457,7 @@ the request is ambiguous and fails before writes instead of creating a duplicate
 
 ## Amendment (2026-09-25): a section vector follows its embedding input
 
-**Status: Proposed (2026-09-25).** It binds only after maintainer sign-off.
+**Status: Accepted (2026-09-25).**
 
 ### Context
 

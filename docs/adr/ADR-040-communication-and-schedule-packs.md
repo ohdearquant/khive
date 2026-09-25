@@ -1,16 +1,16 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21 and 2026-09-24)\
-**Date**: 2026-05-23 (last amended 2026-09-24)\
+**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24 and 2026-09-25)\
+**Date**: 2026-05-23 (last amended 2026-09-25)\
 **Authors**: khive maintainers
 
 **Proposed amendment**: [inbox and thread limit disclosure](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
 adds three fields to successful read payloads upon acceptance. Existing decisions
 remain accepted; this proposed addition requires acceptance before implementation merges.
 
-**Proposed amendment**: [monthly recurrence keeps its day of month](#amendment-proposed-monthly-recurrence-keeps-its-day-of-month-2026-09-25)
+**Accepted amendment**: [monthly recurrence keeps its day of month](#amendment-2026-09-25-monthly-recurrence-keeps-its-day-of-month)
 stores a monthly row's anchor so that a clamped short month no longer moves every later
-occurrence. It requires acceptance before implementation merges.
+occurrence.
 
 ## Context
 
@@ -955,9 +955,9 @@ with no new message fields, and an unchanged `comm.mark_read` response. A
 mutation that drops the body, ignores the opt-out, or leaks fields on failure
 must make a targeted control fail.
 
-## Amendment (proposed): monthly recurrence keeps its day of month (2026-09-25)
+## Amendment (2026-09-25): monthly recurrence keeps its day of month
 
-**Status**: proposed. Acceptance is required before dependent implementation merges.
+**Status**: accepted (2026-09-25).
 
 ### Context
 

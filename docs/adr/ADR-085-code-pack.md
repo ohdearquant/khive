@@ -1662,7 +1662,7 @@ Acceptance:
 
 ## Amendment 9 (2026-09-25): explicit map targets and the complete production deny set
 
-**Status**: Proposed. It binds only after maintainer sign-off.
+**Status**: Accepted (2026-09-25).
 
 ### Context
 
