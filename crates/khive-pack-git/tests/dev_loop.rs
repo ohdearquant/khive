@@ -1052,6 +1052,31 @@ async fn update_ref_unchanged_head_records_marker_and_reconciles_lost_terminal_r
 
     let f = Fixture::new(true, true).await;
     let head = f.base.clone();
+    let help = command(&f.git, &f.repo, &["reflog", "-h"], true)
+        .output()
+        .expect("probe Git reflog capabilities");
+    if !String::from_utf8_lossy(&help.stdout).contains("git reflog write ") {
+        // Ubuntu 24.04's Git lacks this newer capability. The test still
+        // checks the durable refusal receipt, then skips only the marker arm.
+        let error = f
+            .err(
+                "git.update_ref",
+                json!({"repo":f.repo,"branch":"work","to":head.clone(),"expected":head}),
+            )
+            .await;
+        assert!(error.contains("unsupported_toolchain"), "{error}");
+        let receipt = f.refusal_receipt(&error).await;
+        assert_eq!(
+            receipt["result"]["toolchain"]["missing_capability"],
+            "reflog write"
+        );
+        assert_eq!(
+            receipt["result"]["toolchain"]["git_version"],
+            f.git_text(&["--version"])
+        );
+        assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), f.base);
+        return;
+    }
     let result = f
         .call(
             "git.update_ref",
