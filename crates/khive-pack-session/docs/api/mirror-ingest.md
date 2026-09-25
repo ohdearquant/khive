@@ -16,8 +16,14 @@ resulting bounded chunk to the session mirror tables in a single transaction.
 A single call processes at most one bounded chunk — never the whole file at
 once — so the caller's polling loop advances the persisted cursor
 incrementally across multiple calls for large deltas. It is safe to call
-repeatedly on the same file; `INSERT OR IGNORE` keyed by the event UUID
-ensures idempotency.
+repeatedly on the same file; the unique
+`(namespace, source, session_id, id)` event key ensures idempotency while
+allowing equal provider identifiers from different sources.
+An idempotent replay compares the stored content hash with the newly parsed
+text and raw line. A changed payload leaves the original event unchanged,
+increments `MirrorStats.replay_mismatches`, and advances the cursor; the pass
+also emits one aggregate warning. This lets a post-migration replay recover
+later suppressed events even if an earlier provider event was edited.
 
 No single line, complete or partial, is ever buffered past
 `MirrorLimits::max_line_bytes` (see `read_line_bounded` below): a complete
@@ -177,7 +183,7 @@ name, and size environment variable at each public entry point.
 `write_events_and_cursor` is shared by `mirror_file`'s eventful line-tail
 path and both provider-export whole-file paths, so the
 session/message row construction and cursor semantics (create-only sessions,
-`INSERT OR IGNORE` message dedup, monotonic `last_seen_at`, cursor advances
+scoped message dedup, monotonic `last_seen_at`, cursor advances
 only on success) live in exactly one place.
 
 Its closure is verified suspension-free (it drives only `writer` with
@@ -201,8 +207,9 @@ entirely — this function must not, and does not, issue its own
   preserves valid zero-message conversations. Replays are a cheap no-op
   (`DO NOTHING`), so they do not rewrite existing session metadata;
   `last_seen_at` is advanced only when a genuinely new message lands.
-- **session_messages insert**: idempotent via `INSERT OR IGNORE` keyed by the
-  event UUID.
+- **session_messages insert**: idempotent via `ON CONFLICT(namespace, source,
+  session_id, id) DO NOTHING`. The provider event id remains unchanged; each
+  row also stores a SHA-256 content hash of framed parsed text and raw line.
 - **advance session metadata only when a new message landed**: keeps
   `last_seen_at` monotonic (`MAX`) so a timestamp-missing replay (whose
   `created_at` fell back to `now_us`) cannot move it forward, and backfills
@@ -344,11 +351,10 @@ transaction per file pass") both rest on the same underlying contract
 made in that pass — including the cursor upsert, which runs last, right
 before the closure returns `Ok`.
 
-The real ingest loop can't be driven into a mid-loop DB error through crafted
-event data: the `sessions` insert uses `ON CONFLICT(id) DO NOTHING` and the
-`session_messages` insert uses `INSERT OR IGNORE`, both of which swallow
-constraint violations by design (that's what makes re-ingest idempotent). So
-this test drives the same `atomic_unit`/`writer.execute`/`Err`-return path
+The ordinary ingest loop treats a replay of the same scoped identity as a
+no-op through targeted `ON CONFLICT ... DO NOTHING` clauses. Other constraint
+errors still propagate and roll back the atomic unit. This test drives the
+same `atomic_unit`/`writer.execute`/`Err`-return path
 directly — the exact machinery `write_events_and_cursor`'s `?`-propagated
 errors rely on (ADR-099 D5) — and forces a genuine, non-suppressed SQL error
 (a `prepare()` failure on a nonexistent table) after a session write AND a

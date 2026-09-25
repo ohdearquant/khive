@@ -4,7 +4,8 @@
 //! parses complete lines via the parser selected by [`LineTailSource`], and
 //! writes one bounded chunk (never the whole file at once) to the session
 //! mirror tables per call — callers poll repeatedly to drain large deltas.
-//! `INSERT OR IGNORE` keyed by the event UUID makes replays idempotent.
+//! The scoped `(namespace, source, session_id, event id)` key makes replays
+//! idempotent without conflating different providers' identifier spaces.
 //!
 //! See `crates/khive-pack-session/docs/api/mirror-ingest.md` for the full bounded
 //! tail-read algorithm, the oversized/unterminated-line handling
@@ -17,6 +18,7 @@ use chrono::Utc;
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlWriter;
+use sha2::{Digest, Sha256};
 
 use super::parse;
 
@@ -61,6 +63,26 @@ impl From<LineTailSource> for MirrorSource {
     }
 }
 
+/// SHA-256 of a framed optional parsed-text value and the exact raw line.
+/// Framing distinguishes absent text from empty text and avoids ambiguity
+/// when either field contains a delimiter. The same framing is used by the
+/// versioned backfill in `khive-db`.
+fn content_hash(text: Option<&str>, raw: &str) -> String {
+    let mut hash = Sha256::new();
+    match text {
+        Some(value) => {
+            hash.update([1]);
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.update((raw.len() as u64).to_be_bytes());
+    hash.update(raw.as_bytes());
+    let digest = hash.finalize();
+    format!("{digest:x}")
+}
+
 /// Identifies which CLI produced the JSONL file being mirrored, for the
 /// purpose of selecting `mirror_file`'s per-line parser.
 ///
@@ -82,6 +104,9 @@ pub enum LineTailSource {
 pub struct MirrorStats {
     /// Number of new message rows inserted (0 if all were already present).
     pub inserted: u64,
+    /// Existing scoped event ids whose persisted content hash differs on replay.
+    /// The insert-once row is retained and the cursor may still advance.
+    pub replay_mismatches: u64,
     /// Number of complete lines or whole-file events scanned (including duplicates).
     pub scanned: u64,
     /// Byte offset advanced to. Ordinary partial lines are excluded; a known
@@ -481,6 +506,7 @@ async fn mirror_file_inner(
         // line was seen) — there is no advanced cursor to persist.
         return Ok(MirrorStats {
             inserted: 0,
+            replay_mismatches: 0,
             scanned: 0,
             new_offset: chunk.new_offset,
             skipped_oversized_bytes: false,
@@ -506,6 +532,7 @@ async fn mirror_file_inner(
         }
         return Ok(MirrorStats {
             inserted: 0,
+            replay_mismatches: 0,
             scanned: chunk.scanned,
             new_offset: chunk.new_offset,
             skipped_oversized_bytes: chunk.skipped_oversized_bytes,
@@ -666,6 +693,7 @@ async fn mirror_whole_file_export(
     if file_len <= start_offset {
         return Ok(MirrorStats {
             inserted: 0,
+            replay_mismatches: 0,
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
@@ -683,6 +711,7 @@ async fn mirror_whole_file_export(
         );
         return Ok(MirrorStats {
             inserted: 0,
+            replay_mismatches: 0,
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
@@ -794,16 +823,15 @@ async fn ensure_session_on_writer(
 
     writer
         .execute(SqlStatement {
-            sql: format!(
-                "INSERT INTO sessions \
+            sql: "INSERT INTO sessions \
                   (id, provider_session_id, source, cwd, git_branch, slug, \
                    message_count, first_seen_at, last_seen_at, namespace) \
-                  VALUES(?1, ?1, '{}', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
-                  ON CONFLICT(id) DO NOTHING",
-                source_value
-            ),
+                  VALUES(?1, ?1, ?2, ?3, ?4, ?5, 0, ?6, ?6, 'local') \
+                  ON CONFLICT(namespace, source, provider_session_id) DO NOTHING"
+                .into(),
             params: vec![
                 SqlValue::Text(session_id.to_string()),
+                SqlValue::Text(source_value.to_string()),
                 cwd.map(|s| SqlValue::Text(s.to_string()))
                     .unwrap_or(SqlValue::Null),
                 git_branch
@@ -852,6 +880,7 @@ async fn write_events_and_cursor_on_writer(
         now_us,
     } = progress;
     let mut inserted: u64 = 0;
+    let mut replay_mismatches: u64 = 0;
     let mut last_session_id: Option<String> = None;
     let mut ensured_session_ids = std::collections::HashSet::new();
 
@@ -881,6 +910,7 @@ async fn write_events_and_cursor_on_writer(
         } else {
             now_us
         };
+        let event_hash = content_hash(ev.text.as_deref(), &ev.raw);
 
         // sessions row: create-only (see docs guide — replay is a no-op via
         // `DO NOTHING`; `last_seen_at` advances below only on a new message).
@@ -898,19 +928,23 @@ async fn write_events_and_cursor_on_writer(
             .await?;
         }
 
-        // session_messages insert, idempotent via INSERT OR IGNORE.
+        // session_messages insert, idempotent only on the full scoped event
+        // identity. Unrelated constraint failures must remain visible.
         let affected = writer
             .execute(SqlStatement {
-                sql: "INSERT OR IGNORE INTO session_messages \
+                sql: "INSERT INTO session_messages \
                       (id, session_id, seq, parent_uuid, is_sidechain, role, \
-                       msg_type, text, raw, created_at, namespace) \
+                       msg_type, text, raw, created_at, namespace, source, content_hash) \
                       VALUES(?1, ?2, \
-                        (SELECT COALESCE(MAX(seq),-1)+1 FROM session_messages WHERE session_id=?2), \
-                        ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'local')"
+                        (SELECT COALESCE(MAX(seq),-1)+1 FROM session_messages \
+                         WHERE namespace='local' AND source=?3 AND session_id=?2), \
+                        ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'local', ?3, ?11) \
+                      ON CONFLICT(namespace, source, session_id, id) DO NOTHING"
                     .into(),
                 params: vec![
                     SqlValue::Text(ev.uuid.clone()),
                     SqlValue::Text(ev.session_id.clone()),
+                    SqlValue::Text(source_value.to_string()),
                     ev.parent_uuid
                         .as_deref()
                         .map(|s| SqlValue::Text(s.to_string()))
@@ -927,6 +961,7 @@ async fn write_events_and_cursor_on_writer(
                         .unwrap_or(SqlValue::Null),
                     SqlValue::Text(ev.raw.clone()),
                     SqlValue::Integer(created_at),
+                    SqlValue::Text(event_hash.clone()),
                 ],
                 label: Some("session_mirror_insert_message".into()),
             })
@@ -939,6 +974,40 @@ async fn write_events_and_cursor_on_writer(
                 )
             })?;
 
+        if affected == 0 {
+            let stored_hash = writer
+                .query_scalar(SqlStatement {
+                    sql: "SELECT content_hash FROM session_messages \
+                          WHERE namespace='local' AND source=?1 AND session_id=?2 AND id=?3"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(source_value.to_string()),
+                        SqlValue::Text(ev.session_id.clone()),
+                        SqlValue::Text(ev.uuid.clone()),
+                    ],
+                    label: Some("session_mirror_replay_hash".into()),
+                })
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "mirror: replay hash lookup",
+                        e,
+                    )
+                })?;
+            match stored_hash {
+                Some(SqlValue::Text(hash)) if hash == event_hash => {}
+                Some(SqlValue::Text(_)) => replay_mismatches += 1,
+                _ => {
+                    return Err(khive_storage::StorageError::Conflict {
+                        capability: khive_storage::StorageCapability::Sql,
+                        operation: "mirror: message replay".into(),
+                        message: "duplicate scoped event id has no stored content hash".into(),
+                    });
+                }
+            }
+        }
+
         // Advance session metadata only when a new message landed — keeps
         // last_seen_at monotonic (MAX) and backfills NULL metadata; a pure
         // replay (affected == 0) touches nothing (see docs guide).
@@ -950,7 +1019,7 @@ async fn write_events_and_cursor_on_writer(
                             cwd=COALESCE(cwd, ?3), \
                             git_branch=COALESCE(git_branch, ?4), \
                             slug=COALESCE(slug, ?5) \
-                          WHERE id=?1"
+                          WHERE namespace='local' AND source=?6 AND provider_session_id=?1"
                         .into(),
                     params: vec![
                         SqlValue::Text(ev.session_id.clone()),
@@ -967,6 +1036,7 @@ async fn write_events_and_cursor_on_writer(
                             .as_deref()
                             .map(|s| SqlValue::Text(s.to_string()))
                             .unwrap_or(SqlValue::Null),
+                        SqlValue::Text(source_value.to_string()),
                     ],
                     label: Some("session_mirror_touch_session".into()),
                 })
@@ -999,10 +1069,14 @@ async fn write_events_and_cursor_on_writer(
             writer
                 .execute(SqlStatement {
                     sql: "UPDATE sessions SET message_count=\
-                          (SELECT COUNT(*) FROM session_messages WHERE session_id=?1) \
-                          WHERE id=?1"
+                          (SELECT COUNT(*) FROM session_messages \
+                           WHERE namespace='local' AND source=?2 AND session_id=?1) \
+                          WHERE namespace='local' AND source=?2 AND provider_session_id=?1"
                         .into(),
-                    params: vec![SqlValue::Text(sid.clone())],
+                    params: vec![
+                        SqlValue::Text(sid.clone()),
+                        SqlValue::Text(source_value.to_string()),
+                    ],
                     label: Some("session_mirror_refresh_count".into()),
                 })
                 .await
@@ -1017,11 +1091,20 @@ async fn write_events_and_cursor_on_writer(
     }
 
     upsert_cursor_on_writer(writer, path, last_session_id.as_deref(), new_offset, now_us).await?;
+    if replay_mismatches > 0 {
+        tracing::warn!(
+            source = source_value,
+            path = %path.display(),
+            replay_mismatches,
+            "session mirror retained changed-content replay under an existing scoped event id"
+        );
+    }
 
     // No explicit COMMIT: `atomic_unit` owns the transaction boundary and
     // commits on `Ok` / rolls back the whole unit on `Err`.
     Ok(MirrorStats {
         inserted,
+        replay_mismatches,
         scanned,
         new_offset,
         skipped_oversized_bytes: false,
