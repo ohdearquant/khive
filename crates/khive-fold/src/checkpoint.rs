@@ -112,6 +112,10 @@ pub trait CheckpointStore<S> {
         S: Clone + Serialize;
 
     /// Load the most recently created checkpoint whose `id` starts with `prefix`.
+    ///
+    /// Verify the selected checkpoint's integrity hash as in [`Self::load`].
+    /// A verification or serialization error is returned, not replaced by an
+    /// older matching checkpoint. Shared state may still mutate after the check.
     fn load_latest(&self, prefix: &str) -> Result<Option<Checkpoint<S>>, FoldError>
     where
         S: Clone + Serialize;
@@ -141,6 +145,20 @@ impl<S> Default for InMemoryCheckpointStore<S> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Verify the selected clone without changing selection or falling back.
+fn verify_checkpoint<S: Serialize>(checkpoint: Checkpoint<S>) -> Result<Checkpoint<S>, FoldError> {
+    let bytes = serde_json::to_vec(&checkpoint.state)?;
+    let computed = Hash32::from_blake3(&bytes);
+    if !checkpoint.hash.eq_ct(&computed) {
+        return Err(FoldError::IntegrityMismatch {
+            id: checkpoint.id.clone(),
+            stored: checkpoint.hash.to_string(),
+            computed: computed.to_string(),
+        });
+    }
+    Ok(checkpoint)
 }
 
 impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
@@ -176,18 +194,7 @@ impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
             return Ok(None);
         };
 
-        // Verify integrity: recompute hash from state and compare.
-        let bytes = serde_json::to_vec(&checkpoint.state)?;
-        let computed = Hash32::from_blake3(&bytes);
-        if !checkpoint.hash.eq_ct(&computed) {
-            return Err(FoldError::IntegrityMismatch {
-                id: id.to_owned(),
-                stored: checkpoint.hash.to_string(),
-                computed: computed.to_string(),
-            });
-        }
-
-        Ok(Some(checkpoint))
+        Ok(Some(verify_checkpoint(checkpoint)?))
     }
 
     fn load_latest(&self, prefix: &str) -> Result<Option<Checkpoint<S>>, FoldError>
@@ -205,7 +212,7 @@ impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
             // Tiebreak on uuid for determinism when created_at is equal.
             .max_by_key(|c| (c.created_at, c.uuid));
 
-        Ok(latest.cloned())
+        latest.cloned().map(verify_checkpoint).transpose()
     }
 
     fn delete(&self, id: &str) -> Result<(), FoldError> {
@@ -240,6 +247,161 @@ pub fn sort_checkpoint_keys(mut keys: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Clone keeps the handles shared, exposing post-save changes through the
+    // public state API without changing the store's private map or saved hash.
+    #[derive(Clone, Debug)]
+    struct MutableCheckpointState {
+        value: Arc<AtomicU64>,
+        fail_serialization: Arc<AtomicBool>,
+        serializations: Arc<AtomicU64>,
+    }
+
+    impl MutableCheckpointState {
+        fn new(value: u64) -> Self {
+            Self {
+                value: Arc::new(AtomicU64::new(value)),
+                fail_serialization: Arc::new(AtomicBool::new(false)),
+                serializations: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl Serialize for MutableCheckpointState {
+        fn serialize<T>(&self, serializer: T) -> Result<T::Ok, T::Error>
+        where
+            T: serde::Serializer,
+        {
+            self.serializations.fetch_add(1, Ordering::SeqCst);
+            if self.fail_serialization.load(Ordering::SeqCst) {
+                return Err(serde::ser::Error::custom(
+                    "test checkpoint serialization disabled",
+                ));
+            }
+            serializer.serialize_u64(self.value.load(Ordering::SeqCst))
+        }
+    }
+
+    fn mutable_checkpoint(
+        id: &str,
+        state: &MutableCheckpointState,
+        uuid: u128,
+    ) -> Checkpoint<MutableCheckpointState> {
+        Checkpoint::new(
+            id,
+            state.clone(),
+            Uuid::from_u128(uuid),
+            1,
+            FoldContext::new(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn mismatch_fields(error: FoldError) -> (String, String, String) {
+        match error {
+            FoldError::IntegrityMismatch {
+                id,
+                stored,
+                computed,
+            } => (id, stored, computed),
+            other => panic!("expected IntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_latest_rejects_shared_state_change() {
+        let store = InMemoryCheckpointStore::new();
+        let state = MutableCheckpointState::new(7);
+        store
+            .save(mutable_checkpoint("shared:one", &state, 1))
+            .unwrap();
+        assert_eq!(store.load("shared:one").unwrap().unwrap().id, "shared:one");
+        assert_eq!(
+            store.load_latest("shared:").unwrap().unwrap().id,
+            "shared:one"
+        );
+
+        state.value.store(8, Ordering::SeqCst);
+        assert!(store.load_latest("absent:").unwrap().is_none());
+        let exact = mismatch_fields(store.load("shared:one").unwrap_err());
+        // RED on the base: latest returns Ok(Some(_)) without verifying.
+        let latest = mismatch_fields(store.load_latest("shared:").unwrap_err());
+        assert_eq!(latest, exact);
+        assert_eq!(latest.0, "shared:one");
+        assert_ne!(latest.1, latest.2);
+
+        state.value.store(7, Ordering::SeqCst);
+        assert_eq!(
+            store.load_latest("shared:").unwrap().unwrap().id,
+            "shared:one"
+        );
+    }
+
+    #[test]
+    fn load_latest_rejects_corrupt_uuid_winner_without_fallback() {
+        let store = InMemoryCheckpointStore::new();
+        let older = MutableCheckpointState::new(10);
+        let winner = MutableCheckpointState::new(20);
+        let unrelated = MutableCheckpointState::new(30);
+        // Same epoch timestamps; UUID, not insertion order or sleep, breaks ties.
+        store
+            .save(mutable_checkpoint("tie:winner", &winner, 2))
+            .unwrap();
+        store
+            .save(mutable_checkpoint("tie:older", &older, 1))
+            .unwrap();
+        let mut other = mutable_checkpoint("other:one", &unrelated, 3);
+        other.created_at += chrono::Duration::seconds(1);
+        store.save(other).unwrap();
+        unrelated.fail_serialization.store(true, Ordering::SeqCst);
+        assert_eq!(store.load_latest("tie:").unwrap().unwrap().id, "tie:winner");
+
+        winner.value.store(21, Ordering::SeqCst);
+        let old_count = older.serializations.load(Ordering::SeqCst);
+        let winner_count = winner.serializations.load(Ordering::SeqCst);
+        let unrelated_count = unrelated.serializations.load(Ordering::SeqCst);
+        // RED on the base: a corrupt winner is returned, not an error.
+        let error = store.load_latest("tie:").unwrap_err();
+        let (id, stored, computed) = mismatch_fields(error);
+        assert_eq!(id, "tie:winner");
+        assert_ne!(stored, computed);
+        assert_eq!(
+            winner.serializations.load(Ordering::SeqCst),
+            winner_count + 1
+        );
+        assert_eq!(older.serializations.load(Ordering::SeqCst), old_count);
+        assert_eq!(
+            unrelated.serializations.load(Ordering::SeqCst),
+            unrelated_count
+        );
+        assert_eq!(store.load("tie:older").unwrap().unwrap().id, "tie:older");
+    }
+
+    #[test]
+    fn load_latest_propagates_selected_state_serialization_error() {
+        let store = InMemoryCheckpointStore::new();
+        let state = MutableCheckpointState::new(42);
+        store
+            .save(mutable_checkpoint("serialize:one", &state, 1))
+            .unwrap();
+        state.fail_serialization.store(true, Ordering::SeqCst);
+        let exact_error = store.load("serialize:one").unwrap_err();
+        assert!(matches!(exact_error, FoldError::Serialization(_)));
+        let before = state.serializations.load(Ordering::SeqCst);
+        // RED on the base: latest does not call the serializer at all.
+        let latest_error = store.load_latest("serialize:").unwrap_err();
+        assert!(matches!(latest_error, FoldError::Serialization(_)));
+        assert_eq!(latest_error.to_string(), exact_error.to_string());
+        assert_eq!(state.serializations.load(Ordering::SeqCst), before + 1);
+        state.fail_serialization.store(false, Ordering::SeqCst);
+        assert_eq!(
+            store.load_latest("serialize:").unwrap().unwrap().id,
+            "serialize:one"
+        );
+    }
 
     fn sample_checkpoint(id: &str, entries: usize) -> Checkpoint<String> {
         Checkpoint::new(
