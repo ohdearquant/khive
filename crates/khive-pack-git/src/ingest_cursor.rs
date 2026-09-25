@@ -41,6 +41,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.ingest_cursor", params)?;
         let params: CursorParams = serde_json::from_value(params).map_err(|_| {
             RuntimeError::InvalidInput(
                 "git.ingest_cursor requires a full project UUID and source_kind commits, issues, or pull_requests".into(),
