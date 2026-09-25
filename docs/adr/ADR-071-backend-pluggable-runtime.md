@@ -32,7 +32,7 @@ ADR-009 §architecture states:
 
 > "The runtime and packs depend on traits, not on any specific backend crate."
 
-A storage-layer drift audit conducted 2026-06-25 (`docs/audits/20260625/storage-backend-drift.md`)
+A storage-layer drift audit conducted 2026-06-25 (`docs/audits/20260625/storage-backend-drift.md`, not in this repository)
 found that the current `khive-runtime` crate violates both specifications. The breach is
 not incremental erosion — it has been present since the initial commit (`16d75d9a`). Seven
 gaps were identified, ordered by severity:
@@ -606,4 +606,95 @@ attribution lands together with the Gate-key auth model, never before it.
 - [ADR-028](ADR-028-pack-scoped-backends.md) — pack-scoped backends; amended to reference `BackendHandle`
 - [ADR-043](ADR-043-embedding-model-migration.md) — amended to note `EmbeddingModelRecord` type change
 - [ADR-044](ADR-044-vector-store-extensions.md) — amended to note `capabilities()` default correction
-- Drift audit: `docs/audits/20260625/storage-backend-drift.md`
+- Drift audit: `docs/audits/20260625/storage-backend-drift.md` (not in this repository)
+
+---
+
+## Amendment A1: `BackendMigrator` is superseded; `BackendHandle` and `EmbeddingModelRecord` are unbuilt (2026-09-25)
+
+**Status**: Proposed
+
+### Context
+
+Three things this ADR names are not in the codebase. `BackendHandle` (§1, Phase 4,
+`crates/khive-runtime/src/backend_handle.rs`), the `BackendMigrator` trait with its
+`SqliteMigrator` implementation (§2, Phase 2, `crates/khive-storage/src/migrations.rs`), and
+`EmbeddingModelRecord` / `EmbeddingModelStatus` (§5, Phase 5,
+`crates/khive-runtime/src/embedding.rs`) have no definition anywhere in the tree, and none of the
+three files exists. The code uses these instead:
+
+- `KhiveRuntime` (`crates/khive-runtime/src/runtime.rs`) holds `backend: Arc<StorageBackend>` and
+  `core_backend: Option<Arc<StorageBackend>>`. Secondary runtimes are wired with
+  `KhiveRuntime::with_core_backend(Arc<StorageBackend>)`, and the `KhiveRuntime::backend()`
+  accessor that §1 removes is still public. `crates/khive-runtime/Cargo.toml` keeps `khive-db` and
+  `rusqlite` as production dependencies. `RuntimeError` carries `Storage(#[from] StorageError)`
+  beside a `Sqlite(khive_db::SqliteError)` variant (`crates/khive-runtime/src/error.rs`).
+- Schema preparation is the concrete `StorageBackend::prepare_core_schema`
+  (`crates/khive-db/src/backend.rs`), not a trait object. Production boot and `kkernel db migrate`
+  both reach it through the async host coordinator's `prepare_core_schema_for_boot`
+  (`crates/khive-mcp/src/serve.rs`); the admin command gets there through
+  `khive_mcp::serve::migrate_configured_storage_topology`, called from `cmd_db_migrate` in
+  `crates/kkernel/src/cli.rs`. The direct constructor
+  `KhiveRuntime::new` also calls it, for fresh or current single-backend databases, in-memory
+  runtimes and tests, and refuses a database that still needs the host's application-assisted V21
+  cutover. `KhiveRuntime::from_prepared_backend` never runs migrations itself.
+- `KhiveRuntime::list_embedding_models` returns
+  `RuntimeResult<Vec<khive_db::EmbeddingModelRegistryRecord>>`; the record type is defined in
+  `crates/khive-db/src/migrations.rs`.
+
+[ADR-015](ADR-015-schema-migrations.md) already records the migrator outcome. Its "2026-08-16
+implementation amendment — coordinated host boot" supersedes "the boot portion of Amendment A1".
+The implementation-status note at the head of its Amendment A1 says the `BackendMigrator` /
+`BackendHandle::boot()` shape "is retained as historical design context but is not the current
+production boot surface", and the body of that amendment concludes that "the proposed trait did
+not become the current host surface". This ADR still presents §2 as the decided dispatch ("A `BackendMigrator` trait in `khive-storage`
+replaces the direct function call") and lists `migrator` in the required core of `BackendHandle`
+(§1, and §Rationale "Why `BackendHandle` over a single `Arc<dyn Backend>` supertrait"). The two
+accepted ADRs therefore give different answers to how the runtime reaches migrations.
+
+### Decision
+
+1. §2 is superseded by ADR-015's 2026-08-16 implementation amendment. Migration dispatch is owned
+   by the host boot path and `kkernel db migrate` as ADR-015 specifies, through
+   `StorageBackend::prepare_core_schema` and the async host coordinator; this ADR no longer
+   specifies a migration trait, a `SqliteMigrator`, or the file-backed and in-memory boot bullets
+   of §2. The `migrator` slot and the `migrator()` accessor are removed from the §1
+   `BackendHandle` design, whose required core becomes `entity`, `note`, `graph`, `event` and
+   `sql`. Phase 2 keeps only its `RuntimeError` half (G4); this amendment does not change that
+   half.
+2. §1 (`BackendHandle`, Phase 4) and §5 (`EmbeddingModelRecord`, Phase 5) remain the target
+   design and are not implemented. Until a change implements them, the types listed under Context
+   are the current surface, and a reference in another ADR to `BackendHandle`, `from_handle`,
+   `with_core_handle`, `core_handle` or `EmbeddingModelRecord` describes that target rather than
+   shipped code.
+
+### Alternatives considered
+
+- **Build `BackendMigrator` as a thin wrapper over `prepare_core_schema` and keep the slot.**
+  Rejected. The documentation of `prepare_core_schema` says "this method alone is not a serving
+  boot gate": a legacy V20 database stays at V20 for the async host's application-assisted
+  attachment cutover. A migrator
+  held by the runtime could not complete that cutover, so it would be a second entry point that
+  has to refuse the case its name promises to handle, and ADR-015 would still be the real
+  contract.
+- **Withdraw §1 and §5 as well.** Not proposed here. No later ADR rejects the `BackendHandle`
+  seam or the runtime-owned record type; they are unfinished, and ADR-028, ADR-043, ADR-073,
+  ADR-080 and ADR-083 are written against them. Withdrawing them is a separate decision that
+  would need those ADRs amended with it.
+- **Leave the text as it is.** Rejected. Two accepted ADRs keep contradicting each other on
+  migration dispatch, and a reader of this ADR looks for three files that do not exist.
+
+### Consequences
+
+- ADR-015 is the single normative source for migration dispatch.
+- A future Phase 4 implementation of `BackendHandle` does not need a migration slot, so an
+  alternate backend supplies its own schema preparation to the host boot path rather than to the
+  runtime handle.
+- The amendments this ADR made to ADR-028 (A1), ADR-043 (A1) and ADR-044 (A2), and the
+  sequencing text in ADR-073 §6, ADR-080 and ADR-083, are not changed by this amendment.
+- No code change follows from this amendment.
+
+### Refs
+
+- #330 (this ADR and its companion amendments to ADR-015, ADR-028, ADR-043 and ADR-044)
+- #2113 (ADR-015's 2026-08-16 implementation amendment and `KhiveRuntime::from_prepared_backend`)

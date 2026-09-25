@@ -952,3 +952,55 @@ values, including on multi-note pages; AUTO uses JSON result text for these opt-
 TABLE serializes parsed objects and arrays to JSON strings for display only, preserving scalar
 values. A get record's parsed content array is never selected as the response's record table.
 Existing response depth and size guards still apply.
+
+## Amendment 8 (2026-09-25): the Agent-mode savings figures are unreproduced estimates
+
+**Status: Proposed.**
+
+### Context
+
+§7 states: "On synthetic 10-item task listings with full timestamps and UUIDs, the
+Agent transform reduced response JSON byte length by ~55–60%. On smaller responses (single
+record, few fields), savings are proportionally lower (~20–30%). Benchmark in
+`tests/presentation_savings.rs` (to be added)." Consequences, Positive, repeats the range as
+"Agent token budget cuts ~20–60% on list-heavy responses".
+
+The benchmark was never added. No commit in the repository history touches a path named
+`presentation_savings`, and no bench target under `crates/*/benches/` refers to presentation.
+The transform lives in `crates/khive-runtime/src/presentation.rs` (`present`,
+`present_with_policy`). It has also changed since the figures were written: Amendment 1
+(2026-08-08, in §7), Amendment 3, Amendment 4 and Amendment 5 each keep fields that the original
+drop rule removed, and ADR-078 added a redundancy-reduction pass that Agent mode also applies
+when the output format is prepared (`prepare_format_value`). The figures therefore describe the transform as first designed and cannot be reproduced
+from the tree.
+
+### Decision
+
+The percentages in §7 and in Consequences are design-time estimates. They are not a
+performance contract and not an acceptance criterion for any change to the Agent transform. The
+"(to be added)" note in §7 is not an outstanding obligation of this ADR. A later statement of
+Agent-mode savings, in this ADR or elsewhere, cites a committed reproducer and the commit it was
+measured at.
+
+### Alternatives considered
+
+- **Keep the note and add `tests/presentation_savings.rs`.** A benchmark is useful, but it is
+  implementation work and does not need this ADR to promise it. Leaving the note in force keeps an
+  unfulfilled obligation in an accepted ADR, and a benchmark written now would measure the
+  amended transform, so it would not confirm the original numbers.
+- **Withdraw the figures entirely.** This would remove the only statement of the size motivation
+  behind Agent mode. Marking them as estimates keeps that rationale and removes the implied
+  guarantee.
+
+### Consequences
+
+- No test or benchmark is required by this ADR for the savings figures.
+- Changes to the Agent transform are judged by the transformation rules and the amendments
+  above, not by whether they preserve a savings percentage.
+- No code change follows from this amendment.
+
+### Refs
+
+- There is no tracking issue for the benchmark.
+- Transform changes made after the figures were written: #1995 and #2211 (Amendment 3), #2679
+  (Amendment 5).
