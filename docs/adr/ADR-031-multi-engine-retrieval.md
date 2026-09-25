@@ -1026,7 +1026,7 @@ This amendment changes no code and does not restate or change D3's `[[engines]]`
 
 ---
 
-## Amendment 3 (2026-09-25): a configured `fusion_weight` loads and is reported as not applied
+## Amendment 3 (2026-09-25): a configured `fusion_weight` is refused until retrieval applies it
 
 Status: Proposed
 
@@ -1056,34 +1056,34 @@ says it is applied (#3246).
 
 ### Decision
 
-1. Validation is unchanged. A finite `fusion_weight` greater than zero loads; any other value
-   fails with `ConfigError::InvalidFusionWeight`.
-2. While no retrieval path applies the value, loading a config in which any engine sets
-   `fusion_weight` emits one warning that names those engines and states that the weight is not
-   applied. Loading does not fail.
+1. Validation keeps its existing first step: a non-finite or non-positive `fusion_weight` fails with
+   `ConfigError::InvalidFusionWeight`.
+2. While no retrieval path applies the value, a finite positive `fusion_weight` on any engine is
+   then refused at load with `ConfigError::UnsupportedFusionWeight`, which names the engine and
+   states that per-engine weights are not wired into retrieval. A configuration that omits the
+   key loads as before.
 3. The `EngineConfig::fusion_weight` doc comment and `docs/khive-config-example.toml` state that
-   the value is accepted and not yet applied.
-4. The change that wires per-engine weights into multi-engine fusion (D5) removes the warning and
+   the key is refused until it is applied, and the example config no longer sets it.
+4. The change that wires per-engine weights into multi-engine fusion (D5) removes the refusal and
    records the applied semantics in a further amendment.
 
 ### Alternatives considered
 
-- **Refuse a configured `fusion_weight` at load.** This fails closed, but every config that is
-  valid under the accepted validation list and sets the key stops loading after an upgrade,
-  including a copy of `docs/khive-config-example.toml`. The ignored weight grants no access and
-  changes no stored data; its only effect is a ranking that differs from what the operator asked
-  for. A boot failure costs more than that defect, so this option is rejected.
+- **Load the value and warn that it is not applied.** Nothing breaks on upgrade, but a key that
+  loads and then does nothing tells the operator the ranking follows their weights when it does
+  not. A warning in a log is easy to miss; a refusal at load is not. Rejected.
 - **Apply the weights now (D5).** Carry per-engine weights into `RuntimeConfig` and fuse
   multi-engine results with them. This is the intended end state and stays open, but it is a
-  larger change than the reporting defect and is not needed to make today's behaviour visible.
+  larger change than the reporting defect.
 - **Keep accepting the value silently.** This leaves #3246 in place.
 
 ### Consequences
 
-- No configuration that loads today stops loading, and rankings do not change.
-- Operators who set weights learn at load time that the weights have no effect.
-- Deployments that copied the example config see the warning until they remove the key or the
-  weights are wired.
+- A configuration that sets `fusion_weight` on any engine, including a copy of the previous
+  `docs/khive-config-example.toml`, stops loading after the upgrade until the key is removed. The
+  error names the first engine found that sets it.
+- Rankings do not change: the value was never applied.
+- Wiring the weights (D5) lifts the refusal; no stored data depends on this rule.
 
 ### Refs
 
