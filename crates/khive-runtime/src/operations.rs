@@ -1701,14 +1701,14 @@ impl KhiveRuntime {
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
-                join_set.spawn(async move {
+                join_set.spawn(crate::runtime::inherit_request_embedder_scope(async move {
                     let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
                     };
                     (idx, result)
-                });
+                }));
             }
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
@@ -4023,7 +4023,7 @@ impl KhiveRuntime {
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
-                join_set.spawn(async move {
+                join_set.spawn(crate::runtime::inherit_request_embedder_scope(async move {
                     let fut = rt.embed_document_with_model_outcome_for_token(
                         &token,
                         &name,
@@ -4034,7 +4034,7 @@ impl KhiveRuntime {
                         None => fut.await,
                     };
                     (idx, result)
-                });
+                }));
             }
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
