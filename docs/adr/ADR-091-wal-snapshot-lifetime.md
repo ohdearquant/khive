@@ -1755,3 +1755,24 @@ independent bound on SQLite execution time.
 
 Basis: source review through the commit/refusal edges. Native compilation, first-poll
 and behavioral Rust gates remain unverified under the owner's source-only hold.
+
+### 2026-09-24 amendment (Amendment 20): GTD explicit repair write scope
+
+This inventory entry records `khive-pack-gtd::repair::commit_prepared` under Amendment 11's review guard.
+
+| Transaction owner              | Production scopes/callers                 | Work inside the transaction                                                                                                                                          | Verdict  |
+| ------------------------------ | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| GTD explicit historical repair | `khive-pack-gtd::repair::commit_prepared` | One prebuilt snapshot-guarded task UPDATE and, only when it affects one row, one prebuilt lifecycle-audit INSERT; bounded affected-row checks and result bookkeeping | SQL-only |
+
+**GTD repair boundary.** Raw evidence reads, exact observed-source
+comparison, eligibility validation, timestamp/actor capture, provenance JSON
+construction and both SQL statements' bindings precede `SqlAccess::atomic_unit`.
+Each accepted task gets a separate transaction. Within `repair::commit_prepared`,
+the closure only executes the prepared UPDATE, checks its affected-row count,
+executes the prepared audit INSERT when that count is one, and returns a bounded
+result. A zero-row UPDATE reports a concurrent change without an audit; unexpected
+row counts or an audit failure roll back the row transaction. It performs no
+non-SQL await, service call, filesystem/process/network I/O or unbounded computation
+while holding the writer. This adds no migration, batch-wide atomicity or stronger
+guarantee for other callers' previously prepared writes. The domain contract
+remains in ADR-019 Amendment 7.

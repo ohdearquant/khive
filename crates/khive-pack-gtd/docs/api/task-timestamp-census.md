@@ -113,3 +113,6 @@ The status portion of #2394 was already covered by ADR-019 Amendment 2. This
 census supplies evidence for investigation and does not claim that historical
 data has been repaired. Original row provenance and independently established
 source timestamps are still required before any correction.
+
+For explicit caller-specified corrections, use [task repair](task-repair.md).
+The census itself remains read-only and never infers a replacement value.
