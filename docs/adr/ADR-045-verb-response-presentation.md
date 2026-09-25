@@ -955,7 +955,7 @@ Existing response depth and size guards still apply.
 
 ## Amendment 8 (2026-09-25): the Agent-mode savings figures are unreproduced estimates
 
-**Status: Proposed.**
+**Status: Accepted (2026-09-25).**
 
 ### Context
 

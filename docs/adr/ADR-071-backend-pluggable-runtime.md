@@ -612,7 +612,7 @@ attribution lands together with the Gate-key auth model, never before it.
 
 ## Amendment A1: `BackendMigrator` is superseded; `BackendHandle` and `EmbeddingModelRecord` are unbuilt (2026-09-25)
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 ### Context
 

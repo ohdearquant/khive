@@ -743,7 +743,7 @@ a future diagnostic should compare persisted bindings to the registry aggregate 
 
 ### Amendment (2026-09-25): the `change_counter` weights cache was not built
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 #### Context
 
