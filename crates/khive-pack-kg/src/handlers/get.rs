@@ -21,6 +21,7 @@ use super::common::{
     remap_note_status, resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, to_json,
     GetParams,
 };
+use super::redirect::{followed_entity, reject_live_redirect};
 use crate::sql::sql;
 use crate::KgPack;
 
@@ -32,7 +33,7 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let p: GetParams = deser(params)?;
+        let p: GetParams = deser(params.clone())?;
         if let Some(key) = &p.key {
             if p.id.is_some() || p.include_deleted == Some(true) {
                 return Err(RuntimeError::InvalidInput(
@@ -81,9 +82,7 @@ impl KgPack {
         // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
         // Live rows resolve first so ambiguity semantics are unchanged; the
         // including-deleted fallback lets a short prefix reach soft-deleted
-        // rows — required both for `include_deleted=true` and for the
-        // merged_into disclosure below (absorbed entities are soft-deleted, so
-        // a live-only prefix scan would miss them before the hint could fire).
+        // rows, including merge tombstones that carry a redirect.
         let resolved_id = if let Ok(id) = Uuid::parse_str(id_ref) {
             Some(id)
         } else if id_ref.len() >= 8 && id_ref.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -135,7 +134,11 @@ impl KgPack {
         };
         match resolved {
             Some(Resolved::Entity(entity)) => {
-                return flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?))
+                reject_live_redirect(&entity)?;
+                return flatten_get_result(
+                    "entity",
+                    normalize_entity_timestamps(to_json(&entity)?),
+                );
             }
             Some(Resolved::Note(note)) => {
                 return flatten_get_result(
@@ -149,55 +152,21 @@ impl KgPack {
             _ => {}
         }
 
-        // Interim merged_into disclosure (data-integrity, precedes the full
-        // ADR-113 redirect chase): `get_entity` names the kept id in its
-        // NotFound message when `id` was consumed by `merge`. Captured here
-        // so it can stand in for the generic not-found built below once
-        // every other substrate (note/edge/event/pack-resolver) also misses
-        // — the marker string is one we control on the write side above.
-        let mut merge_redirect_hint: Option<String> = None;
-
-        match self.runtime.get_entity(graph_token, id).await {
-            Ok(entity) => {
-                return flatten_get_result(
-                    "entity",
-                    normalize_entity_timestamps(to_json(&entity)?),
-                );
-            }
-            Err(RuntimeError::NotFound(msg)) => {
-                if msg.contains("was merged into") {
-                    merge_redirect_hint = Some(msg);
+        if !include_deleted {
+            if let Some((entity, redirected_from)) =
+                followed_entity(&self.runtime, registry, graph_token, id).await?
+            {
+                let mut value = normalize_entity_timestamps(to_json(&entity)?);
+                if !redirected_from.is_empty() {
+                    let mut effective_args = params.clone();
+                    effective_args["id"] = Value::String(entity.id.to_string());
+                    registry
+                        .authorize_effective_kg_read(graph_token, "get", effective_args, entity.id)
+                        .await?;
+                    value["redirected_from"] = to_json(&redirected_from)?;
                 }
-                if include_deleted {
-                    if let Some(deleted) = self
-                        .runtime
-                        .get_entity_including_deleted(graph_token, id)
-                        .await?
-                        .filter(|deleted| deleted.namespace == graph_token.namespace().as_str())
-                    {
-                        return flatten_get_result(
-                            "entity",
-                            normalize_entity_timestamps(to_json(&deleted)?),
-                        );
-                    }
-                }
+                return flatten_get_result("entity", value);
             }
-            Err(RuntimeError::NamespaceMismatch { .. }) => {
-                if include_deleted {
-                    if let Some(deleted) = self
-                        .runtime
-                        .get_entity_including_deleted(graph_token, id)
-                        .await?
-                        .filter(|deleted| deleted.namespace == graph_token.namespace().as_str())
-                    {
-                        return flatten_get_result(
-                            "entity",
-                            normalize_entity_timestamps(to_json(&deleted)?),
-                        );
-                    }
-                }
-            }
-            Err(e) => return Err(e),
         }
 
         // PR-A1: by-ID get returns the note regardless of namespace (UUID v4 is globally unique).
@@ -267,10 +236,6 @@ impl KgPack {
 
         if let Some(payload_val) = self.try_get_proposal_payload(token, id_ref).await? {
             return Ok(payload_val);
-        }
-
-        if let Some(hint) = merge_redirect_hint {
-            return Err(RuntimeError::NotFound(hint));
         }
 
         Err(RuntimeError::NotFound(id_ref.to_string()))
