@@ -27,11 +27,20 @@ retryable starting error instead of starting another process.
 If the bound expires while the marker remains and the socket still does not
 answer, the client may bootstrap a daemon. It logs “supervisor present, daemon
 absent” with the job, PID and liveness, marker age, and elapsed wait. This is
-degraded supervision: the bootstrap daemon can win the rendezvous and cause a
-later supervisor start to refuse. The marker does not permit killing or
-replacing a responsive incumbent, bypassing configuration checks, or replaying
-an ambiguous mutation. No permanent “not yours to start” refusal remains on
-this path. An unreadable marker is still a claim; it is not treated as absent.
+degraded supervision: the client-started daemon may hold the socket until the
+next supervisor launch replaces it. A spawning client holds
+`<marker>.lock` through its daemon's readiness wait; the launcher holds that
+same lock through publication and exec. A client blocked on the lock returns
+`supervised_daemon_starting` with `retryable: true` if its caller deadline or
+the bounded lock wait ends before dispatch. The client cannot kill or replace
+a responsive incumbent, bypass configuration checks, or replay an ambiguous
+mutation. No permanent “not yours to start” refusal remains on this path. An
+unreadable marker is still a claim; it is not treated as absent.
+
+The launcher probes the socket while holding the lock. If a same-uid
+client-started khive daemon answers, the launcher sends it SIGTERM, waits up
+to one restart interval for it to leave, and then execs the supervised daemon.
+It never signals an unidentified or foreign-uid socket holder.
 
 Only a launcher with the marker's own label can replace or release it. A
 foreign label causes refusal without modifying the marker. Publication uses

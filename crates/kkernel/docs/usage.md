@@ -92,6 +92,14 @@ environment. Set `--restart-interval-secs` to the supervisor's restart interval
 configuration, publishes its marker, then execs the daemon without changing
 PID. Non-Unix platforms refuse this launcher explicitly.
 
+A client that starts a daemon holds `<marker>.lock` until that daemon answers
+or its startup wait ends. The launcher holds the same lock through publication,
+handover, and exec. If a same-uid client-started khive daemon already answers
+on the socket, `supervisor launch` sends it SIGTERM, waits up to one restart
+interval for it to leave, then starts the supervised daemon. A client waiting
+on the lock receives a retryable `supervised_daemon_starting` error if its
+deadline or the bounded lock wait ends before dispatch.
+
 A configuration refusal removes the launcher's own marker and exits zero.
 A marker owned by another job is a configuration conflict and is left alone.
 For a deliberate stop, stop the supervised job first, then release its claim:

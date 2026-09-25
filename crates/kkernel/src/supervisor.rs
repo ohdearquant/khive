@@ -532,7 +532,7 @@ mod tests {
             "--pack",
             "comm",
             "--actor",
-            "lambda:fixture",
+            "test:fixture",
             "--no-embed",
         ])
         .unwrap();
@@ -549,7 +549,7 @@ mod tests {
             "--pack",
             "comm",
             "--actor",
-            "lambda:fixture",
+            "test:fixture",
             "--no-embed",
         ]
         .into_iter()

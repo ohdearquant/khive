@@ -2409,6 +2409,29 @@ fn supervised_daemon_error(marker: &SupervisorMarker) -> McpError {
     )
 }
 
+/// No request bytes were sent while another launcher or client held the
+/// marker lock. Retrying cannot duplicate dispatch.
+fn supervisor_marker_lock_wait_error() -> McpError {
+    let mut data = serde_json::json!({
+        "reason": "supervised_daemon_starting",
+        "retryable": true,
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    daemon_mcp_error(
+        "daemon startup ownership is in progress; the marker lock wait ended before dispatch; retry",
+        Some(data),
+    )
+}
+
+fn daemon_reconnect_expired_before_dispatch_error() -> McpError {
+    daemon_mcp_error(
+        "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
+        Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+    )
+}
+
 // ── bridge self-heal: re-exec in place on ProtocolMismatch (#714) ───────────
 //
 // A long-lived stdio bridge process keeps running the OLD on-disk binary
@@ -3145,10 +3168,7 @@ where
                     .deadline()
                     .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at()))
         {
-            return Some(Err(daemon_mcp_error(
-                "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
-                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
-            )));
+            return Some(Err(daemon_reconnect_expired_before_dispatch_error()));
         }
         match first {
             ForwardOutcome::Response(resp) => {
@@ -3201,15 +3221,11 @@ where
         let guard = match acquire_supervisor_marker_lock().await {
             Ok(guard) => guard,
             Err(error) => {
-                if khive_storage::request_read_is_cancelled()
-                    || khive_storage::capture_request_read_context()
-                        .deadline()
-                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at())
-                {
-                    return Some(Err(daemon_mcp_error(
-                        "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
-                        Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
-                    )));
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                ) {
+                    return Some(Err(supervisor_marker_lock_wait_error()));
                 }
                 tracing::warn!(error = %error, "supervisor marker lock unavailable; suppressing lifecycle recovery");
                 return Some(Err(daemon_mcp_error(
@@ -3223,10 +3239,7 @@ where
                 .deadline()
                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at())
         {
-            return Some(Err(daemon_mcp_error(
-                "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
-                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
-            )));
+            return Some(Err(daemon_reconnect_expired_before_dispatch_error()));
         }
         if let Some(marker) = read_supervisor_marker() {
             if !degraded_bootstrap {
@@ -3309,15 +3322,30 @@ where
     // retrying. Only the explicit read policy may replay a lost response;
     // every other post-write outcome is terminal and returned immediately.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut boot_fence_confirmed = false;
     loop {
+        if khive_storage::request_read_is_cancelled()
+            || khive_storage::capture_request_read_context()
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at())
+        {
+            return Some(Err(daemon_reconnect_expired_before_dispatch_error()));
+        }
         if tokio::time::Instant::now() >= deadline {
+            if boot_fence_confirmed {
+                return Some(Err(daemon_reconnect_expired_before_dispatch_error()));
+            }
             // #667: a bare timeout here does not mean "no daemon" — it may
             // mean "daemon is still inside cold-boot schema init". Wait for
             // that boot (if any) to quiesce and re-probe before deciding.
             match wait_for_boot_quiescence_then_reprobe(frame).await {
                 BootFenceOutcome::DaemonReady => {
-                    // The real frame still has not been written; fall through
-                    // and send it now that boot has quiesced.
+                    // This 500 ms identity probe already confirmed readiness.
+                    // Release the launcher's marker lock before dispatch;
+                    // repeating the shorter 100 ms probe can otherwise loop
+                    // forever after the five-second retry bound.
+                    drop(marker_guard.take());
+                    boot_fence_confirmed = true;
                 }
                 BootFenceOutcome::SafeLocalFallback => {
                     // #898: only now — after the full connect-retry window AND
@@ -3344,6 +3372,13 @@ where
                 }
                 BootFenceOutcome::HardError(err) => return Some(Err(err)),
             }
+        }
+        if khive_storage::request_read_is_cancelled()
+            || khive_storage::capture_request_read_context()
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at())
+        {
+            return Some(Err(daemon_reconnect_expired_before_dispatch_error()));
         }
         if spawned_child.is_some() && marker_guard.is_some() {
             // The launcher may be waiting for this marker lock. Release it as
@@ -3398,6 +3433,9 @@ where
                 os_error_code,
             } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
             ForwardOutcome::NoSocket => {
+                if boot_fence_confirmed {
+                    return Some(Err(daemon_reconnect_expired_before_dispatch_error()));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }

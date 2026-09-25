@@ -56,6 +56,42 @@ fn assert_starting(result: Option<Result<String, McpError>>, job: &str) {
     assert_eq!(data["retryable"], true);
 }
 
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn client_blocked_on_marker_lock_returns_retryable_starting() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let held_lock = acquire_supervisor_marker_lock().await.unwrap();
+    let spawn_calls = AtomicUsize::new(0);
+    let spawn = || -> std::io::Result<std::process::Child> {
+        spawn_calls.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::ErrorKind::NotFound.into())
+    };
+    let frame = request("stats()");
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        khive_storage::scope_request_read_deadline(
+            Duration::from_millis(250),
+            forward_or_spawn_with(&frame, &spawn),
+        ),
+    )
+    .await
+    .expect("marker lock wait is bounded")
+    .expect("no local fallback")
+    .expect_err("no daemon answered before the lock wait ended");
+    let data = result.data.expect("retry data");
+    assert_eq!(data["reason"], "supervised_daemon_starting");
+    assert_eq!(data["retryable"], true);
+    assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+    assert!(!pid_path().exists());
+    drop(held_lock);
+}
+
 #[test]
 #[serial]
 fn supervisor_marker_parses_interval_and_bounds_legacy_or_invalid_values() {
