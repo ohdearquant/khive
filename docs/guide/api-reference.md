@@ -297,10 +297,18 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
+When an entity id was consumed by a merge, default `get` follows `merged_into` to the
+first live kept entity. Its response adds `redirected_from`, an ordered array of the
+merged ids traversed; a live id has no such field. `include_deleted=true` takes
+precedence and returns the requested tombstone with its `merged_into` pointer.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long` respectively. The kept id is checked by the Gate before
+its entity is returned.
+
 | Param             | Type | Required | Notes                                                                                                                                     |
 | ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
-| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix.                    |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge without chasing a merge redirect (default false); accepts a full UUID or unique 8+ hex prefix. |
 | `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
 
 ```
@@ -979,6 +987,12 @@ actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.
 (4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+A resolved id consumed by an entity merge follows the transitive `merged_into`
+chain. Its result contains the live kept `id` and `redirected_from: [old_id, ...]`;
+an unredirected result has no marker. `resolve` has no `include_deleted` option.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long`. The kept id is checked by the Gate before return.
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
