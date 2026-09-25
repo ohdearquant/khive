@@ -306,7 +306,7 @@ pub fn client_for(socket_path: &Path) -> crate::error::RuntimeResult<Arc<EventsS
 /// The process-wide direct (embedded-mode) backend for `db_path`, opened
 /// read-write on first use.
 pub fn direct_backend_for(db_path: &Path) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
-    direct_backend(db_path, false)
+    direct_backend_with_max_readers(db_path, false, None)
 }
 
 /// The process-wide direct backend for `db_path`, opened READ-ONLY on first
@@ -316,12 +316,13 @@ pub fn direct_backend_for(db_path: &Path) -> crate::error::RuntimeResult<Arc<Sto
 pub fn direct_backend_read_only_for(
     db_path: &Path,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
-    direct_backend(db_path, true)
+    direct_backend_with_max_readers(db_path, true, None)
 }
 
-fn direct_backend(
+pub(crate) fn direct_backend_with_max_readers(
     db_path: &Path,
     read_only: bool,
+    max_readers: Option<usize>,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
     let mut registry = direct_backend_registry()
         .lock()
@@ -395,9 +396,9 @@ fn direct_backend(
             .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
     let backend = Arc::new(if read_only {
-        StorageBackend::sqlite_read_only(db_path)?
+        StorageBackend::sqlite_read_only_with_max_readers(db_path, max_readers)?
     } else {
-        StorageBackend::sqlite(db_path)?
+        StorageBackend::sqlite_with_max_readers(db_path, max_readers)?
     });
     registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
