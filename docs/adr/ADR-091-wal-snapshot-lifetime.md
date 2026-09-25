@@ -1776,3 +1776,87 @@ non-SQL await, service call, filesystem/process/network I/O or unbounded computa
 while holding the writer. This adds no migration, batch-wide atomicity or stronger
 guarantee for other callers' previously prepared writes. The domain contract
 remains in ADR-019 Amendment 7.
+
+### 2026-09-25 amendment (Amendment 21): the oldest pinned frame, and when its pin was first observed
+
+**Status: Accepted (2026-09-25).** Refs #1830. Amends the Amendment 2 census report; Amendment 2's
+census rules, the Plank C probe and the Amendment 15 reconciliation are otherwise unchanged.
+
+**Motivation.** When a checkpoint stops advancing, the operator's question is which holder pins the
+oldest frame. The census names the holders but not the pin, so the only next step has been to stop
+candidates one at a time and re-measure: a destructive probe that returns one bit per attempt.
+Per-holder read marks are not reachable through a documented SQLite interface (the read-mark slots
+live in the `-shm` WAL-index, whose layout Amendment 2 already struck from scope), so this amendment
+reports what the documented checkpoint interface does give: the frame the pin sits at, and a time
+bound that rules holders out.
+
+**Decision.**
+
+1. **`oldest_pinned_frame`.** `db_diagnostics` reports, beside the Plank C probe row, the probe's
+   `checkpointed_frames` as `oldest_pinned_frame` when that row has `busy = 0`,
+   `checkpointed_frames >= 0` and `log_frames > checkpointed_frames`. A PASSIVE checkpoint backfills
+   as many frames as it can without waiting for a reader or writer, so no frame past this one could
+   be backfilled at the moment of the probe. The value comes from the same probe row as the existing
+   counters, never from a separate call, so the two can never disagree. It is null, with a stated
+   reason, when the probe errored, returned `busy = 1`, returned `-1`, or found nothing pinned
+   (`log_frames == checkpointed_frames`).
+2. **When the pin was first observed.** The checkpoint task keeps, per backend, one run: the frame
+   `N` and the time of the first checkpoint result in an unbroken sequence of results that each show
+   `busy = 0`, `checkpointed_frames == N < log_frames`, and `log_frames` no smaller than the previous
+   result's. Any other result ends the run: a full backfill, a busy or failed checkpoint, a different
+   ceiling, or a smaller `log_frames`. Every `wal_checkpoint` the process issues feeds this rule,
+   including the TRUNCATE path and the `db_diagnostics` probe, so a full backfill the process performs
+   is never missed. `db_diagnostics` reports the run (`frame`, `first_observed_at_unix_ms`) when its
+   frame equals `oldest_pinned_frame`, and null with a reason otherwise. State is one run per backend,
+   with no sample history. A process without the checkpoint task (sessions, one-shot CLI) reports
+   null with that reason.
+3. **Holders started after the pin.** A reader whose snapshot ends at frame `N` began its read before
+   frame `N+1` was committed, so before the run's first observation. For each PID in the OS census,
+   `db_diagnostics` reads the process start time through the platform interface the walpin module
+   already uses for beacon identity. That interface returns whole epoch seconds, each truncated: the
+   start time on macOS, the boot time plus the ticks since boot on Linux (two truncations), and the
+   creation time on Windows. The resolution this item uses is therefore 1 second on macOS and
+   Windows and 2 seconds on Linux; on any other platform no start time is read and no holder is
+   excluded. The report states the value used as `start_time_resolution_secs`. A holder whose start
+   time is later than `first_observed_at_unix_ms` by more than that resolution is listed in
+   `holders_started_after_pin` and cannot be the pin. Holders whose start time cannot be read, and
+   uninspectable PIDs, are never excluded. The report keeps every holder: this list narrows the
+   search, and nothing else in the census changes. Beside the list the report carries
+   `exclusion_assumes_no_foreign_wal_restart: true`, stating the assumption below, because a reader
+   of the report does not open this ADR and this list's error direction is to exclude the real pin.
+4. **The reporting process.** The census reports `reporting_pid` and `reporting_process_is_holder`.
+   The census already treats its own absence as incomplete (the self-canary); these fields make it
+   visible, so "no internal pin" and "did not look" read differently.
+
+**What the time bound assumes.** Frame numbers restart when the WAL restarts, and no documented
+SQLite interface exposes the WAL generation. Item 2's bound is therefore sound only if no WAL restart
+fell between the run's first observation and the probe. A restart needs a full backfill, which ends
+the reader at `N`. The process sees every full backfill it performs itself (item 2). The
+case it cannot see is a full backfill by another process: a session or one-shot CLI with Amendment
+10's bounded autocheckpoint, or a non-khive client. That backfill would have to be followed, before
+the next observation, by a restart and by a new reader pinned at exactly the same frame `N`. Only
+then does the run appear continuous across two different pins, making the bound too early and
+item 3 exclude a holder it should not. The report states this assumption beside the list (item 3)
+rather than presenting the bound as unconditional.
+
+**Non-goals.** No per-holder frame: probing `-shm` read-lock bytes is rejected (undocumented and
+version-fragile). If per-holder attribution is needed later, it comes through the heartbeat carrying
+its own snapshot identity via a documented interface, as a separate amendment. No enforcement or
+checkpoint-policy change. The Amendment 13 connection census is a different population and is
+untouched.
+
+**Acceptance.**
+
+- A second process holds a read snapshot while the writer appends frames. `db_diagnostics` reports
+  `oldest_pinned_frame` equal to the `checkpointed_frames` of its own probe row, and a run with that
+  frame. After the reader ends and a tick fully backfills, `oldest_pinned_frame` is null and the run
+  is gone.
+- A process started after the run's first observation, and holding the database open, is listed in
+  `holders_started_after_pin`. The process holding the pinning snapshot is never listed there. That
+  second assertion is the control, and it holds when the pinning process is the reporting process
+  itself. The report carries `start_time_resolution_secs` for the platform and
+  `exclusion_assumes_no_foreign_wal_restart: true`.
+- A probe returning `busy = 1` or an error yields null with the reason, never the last good value.
+- A full backfill between two pins ends the first run. The second pin, at a different frame, starts a
+  new run with a later `first_observed_at_unix_ms`.
+- The daemon's report shows `reporting_process_is_holder = true`.
