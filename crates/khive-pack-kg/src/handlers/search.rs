@@ -12,8 +12,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, SearchSource, VerbRegistry,
+    micros_to_iso, KhiveRuntime, NamespaceToken, RankScoreKind, RuntimeError, SearchSignals,
+    SearchSource, VerbRegistry,
 };
+use khive_score::DeterministicScore;
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
@@ -23,6 +25,29 @@ use super::common::{
     validate_graph_read_kind, KindSpec, SearchParams,
 };
 use crate::KgPack;
+
+/// Canonical search ranking fields shared by KG and coordinated search.
+/// These floats are wire projections only, never inputs to rank decisions.
+pub fn search_rank_fields(
+    score: DeterministicScore,
+    kind: RankScoreKind,
+    signals: SearchSignals,
+) -> Value {
+    let rank_score = score.to_f64();
+    let mut evidence = serde_json::Map::new();
+    if let Some(score) = signals.vector_similarity {
+        evidence.insert("vector_similarity".to_string(), json!(score.to_f64()));
+    }
+    if let Some(score) = signals.keyword_score {
+        evidence.insert("keyword_score".to_string(), json!(score.to_f64()));
+    }
+    json!({
+        "rank_score": rank_score,
+        "score": rank_score,
+        "rank_score_kind": kind.as_str(),
+        "signals": evidence,
+    })
+}
 
 /// Search substrate after the public `kind` discriminator and compatibility
 /// filters have been reconciled against the loaded pack registry.
@@ -97,12 +122,23 @@ pub struct ValidatedSearchRequest {
     tags: Vec<String>,
     source: Option<SearchSource>,
     min_score: f64,
+    min_rank_score: DeterministicScore,
     order_by: SearchOrder,
 }
 
 impl ValidatedSearchRequest {
     /// Parse and validate the canonical KG search wire contract.
     pub fn from_value(params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
+        if params.get("min_rank_score").is_some() && params.get("min_score").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "supply only min_rank_score; min_score is its deprecated alias".to_string(),
+            ));
+        }
+        let floor_name = if params.get("min_rank_score").is_some() {
+            "min_rank_score"
+        } else {
+            "min_score"
+        };
         let p: SearchParams = deser(params)?;
         super::common::require_object_param(p.properties.as_ref(), "properties")?;
         let kind_raw = p
@@ -121,20 +157,16 @@ impl ValidatedSearchRequest {
         };
         let tags = p.tags.unwrap_or_default();
         let limit = p.limit.unwrap_or(10).min(100);
-        // The declared range is 0.0 to 1.0 and neither end was enforced. A floor
-        // above 1.0 was honoured and returned an empty result, which a caller cannot
-        // tell from no such record; a negative floor was silently clamped to 0.0, so
-        // the value the caller passed was not the value that ran. Refuse both and
-        // name the range, the way the other input refusals on this surface do.
-        let min_score = match p.min_score {
+        let min_score = match p.min_rank_score.or(p.min_score) {
             None => 0.0,
             Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
             Some(value) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "min_score must be between 0.0 and 1.0; got {value}"
+                    "{floor_name} must be between 0.0 and 1.0; got {value}"
                 )))
             }
         };
+        let min_rank_score = DeterministicScore::from_f64(min_score);
         let source = match p.source.as_deref() {
             None => None,
             Some("text") => Some(SearchSource::Text),
@@ -199,6 +231,7 @@ impl ValidatedSearchRequest {
                     tags,
                     source,
                     min_score,
+                    min_rank_score,
                     order_by,
                 })
             }
@@ -230,6 +263,7 @@ impl ValidatedSearchRequest {
                     tags,
                     source,
                     min_score,
+                    min_rank_score,
                     order_by,
                 })
             }
@@ -293,9 +327,15 @@ impl ValidatedSearchRequest {
         self.source
     }
 
-    /// Non-negative result-score floor.
+    /// Original validated wire floor, retained for compatibility callers.
+    /// New ranking decisions should use [`Self::min_rank_score`] directly.
     pub fn min_score(&self) -> f64 {
         self.min_score
+    }
+
+    /// Inclusive strategy-local floor, quantized once from validated input.
+    pub fn min_rank_score(&self) -> DeterministicScore {
+        self.min_rank_score
     }
 
     /// Order applied to hits before the caller limit is imposed.
@@ -352,7 +392,7 @@ impl KgPack {
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let source_filter = request.source();
-                let hits = self
+                let mut hits = self
                     .runtime
                     .hybrid_search(
                         token,
@@ -365,6 +405,7 @@ impl KgPack {
                         props_filter,
                     )
                     .await?;
+                hits.retain(|hit| hit.score >= request.min_rank_score());
 
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
                 let entity_meta: HashMap<Uuid, EntityMeta> = if candidate_ids.is_empty() {
@@ -448,27 +489,34 @@ impl KgPack {
 
                 let result: Vec<Value> = filtered_hits
                     .iter()
-                    .filter(|h| h.score.to_f64() >= request.min_score())
                     .map(|h| {
                         let meta = entity_meta.get(&h.entity_id);
                         let entity_kind = meta.map(|m| m.kind.as_str());
                         let created_at = meta.map(|m| micros_to_iso(m.created_at));
                         let updated_at = meta.map(|m| micros_to_iso(m.updated_at));
-                        serde_json::json!({
+                        let mut row = serde_json::json!({
                             "id": h.entity_id.to_string(),
                             // `kind`/`name` match the list()/get() row shape (#1174);
                             // `entity_kind`/`title` are kept for compatibility.
                             "kind": entity_kind,
                             "entity_kind": entity_kind,
                             "name": h.title,
-                            "score": h.score.to_f64(),
                             "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
                             "created_at": created_at,
                             "updated_at": updated_at,
                             "version": meta.map(|m| m.version),
-                        })
+                        });
+                        row.as_object_mut()
+                            .expect("search row is an object")
+                            .extend(
+                                search_rank_fields(h.score, h.rank_score_kind, h.signals)
+                                    .as_object()
+                                    .expect("ranking fields are an object")
+                                    .clone(),
+                            );
+                        row
                     })
                     .collect();
                 self.track_search_serve(
@@ -484,7 +532,7 @@ impl KgPack {
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let source_filter = request.source();
-                let hits = self
+                let mut hits = self
                     .runtime
                     .search_notes(
                         token,
@@ -497,6 +545,7 @@ impl KgPack {
                         props_filter,
                     )
                     .await?;
+                hits.retain(|hit| hit.score >= request.min_rank_score());
 
                 // Batch-fetch all candidate notes in one IN(...) query instead of
                 // N individual gets. Notes absent from the batch result (deleted
@@ -569,28 +618,35 @@ impl KgPack {
 
                 let result: Vec<Value> = filtered_hits
                     .iter()
-                    .filter(|h| h.score.to_f64() >= request.min_score())
                     .filter_map(|h| {
                         let note = note_meta.get(&h.note_id)?;
                         let note_kind = note.kind.as_str();
                         let name = &note.name;
                         let created_at = micros_to_iso(note.created_at);
                         let updated_at = micros_to_iso(note.updated_at);
-                        Some(serde_json::json!({
+                        let mut row = serde_json::json!({
                             "id": h.note_id.to_string(),
                             // `kind`/`name` match the list()/get() row shape (#1174);
                             // `note_kind`/`title` are kept for compatibility.
                             "kind": note_kind,
                             "note_kind": note_kind,
                             "name": name,
-                            "score": h.score.to_f64(),
                             "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
                             "created_at": created_at,
                             "updated_at": updated_at,
                             "version": note.version,
-                        }))
+                        });
+                        row.as_object_mut()
+                            .expect("search row is an object")
+                            .extend(
+                                search_rank_fields(h.score, h.rank_score_kind, h.signals)
+                                    .as_object()
+                                    .expect("ranking fields are an object")
+                                    .clone(),
+                            );
+                        Some(row)
                     })
                     .collect();
                 self.track_search_serve(

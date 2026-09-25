@@ -19,6 +19,7 @@ fn fixture(entities: &str, edges: &str, notes: Option<&str>) -> TempDir {
 
 fn validate(tmp: &TempDir, format: &str, extra: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kkernel"))
+        .env("HOME", tmp.path())
         .args(["kg", "validate", "--repo"])
         .arg(tmp.path())
         .args(["--format", format, "--no-rules"])

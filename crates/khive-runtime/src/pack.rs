@@ -1698,9 +1698,9 @@ impl RequestIdentity {
     /// the registry's construction-baked identity would silently replace a
     /// warm daemon request's actor and visibility (ADR-096). This projection
     /// preserves the token's exact primary namespace, actor, and read-visible
-    /// namespaces, and the origin's process provenance rider. A
-    /// `NamespaceToken` does not carry the ingress correlation id, so nested
-    /// calls intentionally use `request_id: None`; `process_ref` IS carried by
+    /// namespaces, and the origin's process provenance rider. Nested calls
+    /// intentionally use `request_id: None` even when the token retains the
+    /// ingress id for audit rows within its originating dispatch; `process_ref` IS carried by
     /// the token (ADR-096: an absent value stays absent, a present origin
     /// rider survives nested dispatch without reading the daemon
     /// environment).
@@ -1926,6 +1926,83 @@ impl VerbRegistry {
             Some(resolver) => resolver.by_id(token, id, include_deleted).await,
             None if include_deleted => runtime.resolve_by_id_including_deleted(token, id).await,
             None => runtime.resolve_by_id(token, id).await,
+        }
+    }
+
+    /// Recheck a merged-entity read against the kept id before returning it.
+    /// The submitted argument shape is the verb's ordinary shape with the
+    /// effective id substituted. The dispatch's original check remains its
+    /// own audit row; this consultation records the effective target as a
+    /// second row without changing the public GateRequest schema.
+    pub async fn authorize_effective_kg_read(
+        &self,
+        token: &NamespaceToken,
+        verb: &str,
+        mut effective_args: Value,
+        effective_id: uuid::Uuid,
+    ) -> Result<(), RuntimeError> {
+        if let Some(namespace) = token.gate_explicit_namespace() {
+            effective_args["namespace"] = Value::String(namespace.to_owned());
+        }
+        let gate_req = GateRequest::new(
+            token.actor().clone(),
+            token.gate_namespace().clone(),
+            verb,
+            effective_args,
+        );
+        let decision = khive_gate::check_with_mailbox_policy(self.gate.as_ref(), &gate_req);
+        match decision {
+            Ok(decision) => {
+                let audit = masked_audit_event(&gate_req, &decision, self.gate.impl_name());
+                tracing::info!(
+                    audit_event = %serde_json::to_string(&audit)
+                        .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
+                    effective_target_id = %effective_id,
+                    "gate.check"
+                );
+                let denied = matches!(&decision, GateDecision::Deny { .. });
+                let receipt = if let Some(store) = &self.event_store {
+                    let event = build_audit_storage_event(
+                        &gate_req,
+                        &audit,
+                        if denied {
+                            EventOutcome::Denied
+                        } else {
+                            EventOutcome::Success
+                        },
+                        Some(crate::cost_unit::base_resource_payload(token.request_id())),
+                    )
+                    .with_target(effective_id);
+                    if denied {
+                        self.append_gate_denied_row(store, event, verb).await
+                    } else {
+                        let outcome = append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            event,
+                            verb,
+                            crate::audit_batch::AuditProducer::EffectiveTargetCheck,
+                            false,
+                        )
+                        .await;
+                        fold_audit_obligation(Ok(()), outcome, |_| Value::Null)?;
+                        crate::error::DenialReceipt::no_store()
+                    }
+                } else {
+                    crate::error::DenialReceipt::no_store()
+                };
+                match decision {
+                    GateDecision::Allow { .. } => Ok(()),
+                    GateDecision::Deny { reason } => Err(RuntimeError::PermissionDenied {
+                        verb: verb.to_string(),
+                        reason,
+                        receipt: Box::new(receipt),
+                    }),
+                }
+            }
+            Err(error) => Err(self
+                .gate_unavailable_error(&gate_req, &error, token.request_id(), Some(effective_id))
+                .await),
         }
     }
 
@@ -2188,6 +2265,7 @@ impl VerbRegistry {
         ("session", "session.list"),
         ("session", "session.resume"),
         ("session", "session.export"),
+        ("session", "session.search"),
         // tool (registry, grant and policy reads; tool.suggest runs the same
         // hybrid search as the kg search and context verbs above)
         ("tool", "tool.suggest"),
@@ -2555,7 +2633,7 @@ impl VerbRegistry {
             }
             Err(err) => {
                 return Err(DispatchError::before_dispatch(
-                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                    self.gate_unavailable_error(&gate_req, &err, request_id, None)
                         .await,
                 ));
             }
@@ -2755,6 +2833,7 @@ impl VerbRegistry {
         gate_req: &GateRequest,
         error: &khive_gate::GateError,
         request_id: Option<u64>,
+        effective_target: Option<uuid::Uuid>,
     ) -> RuntimeError {
         let audit = AuditEvent::gate_unavailable(gate_req, self.gate.impl_name())
             .with_operation_attribution(
@@ -2771,12 +2850,15 @@ impl VerbRegistry {
             "gate check failed (fail-closed)"
         );
         if let Some(store) = &self.event_store {
-            let event = build_audit_storage_event(
+            let mut event = build_audit_storage_event(
                 gate_req,
                 &audit,
                 EventOutcome::Error,
                 Some(crate::cost_unit::base_resource_payload(request_id)),
             );
+            if let Some(target) = effective_target {
+                event = event.with_target(target);
+            }
             let _ = append_audit_event_best_effort(
                 self.audit_batch.as_ref(),
                 store,
@@ -2999,7 +3081,7 @@ impl VerbRegistry {
             }
             Err(err) => {
                 return Err(DispatchError::before_dispatch(
-                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                    self.gate_unavailable_error(&gate_req, &err, request_id, None)
                         .await,
                 ));
             }
@@ -3082,6 +3164,13 @@ impl VerbRegistry {
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
         }
         .with_gate_namespace(ns.clone())
+        .with_gate_explicit_namespace(
+            params
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+        .with_request_id(request_id)
         .with_process_ref(match identity.as_ref() {
             Some(id) => id.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
@@ -15920,12 +16009,14 @@ mod help_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("read_only_schema_collision.db");
         {
-            let writable = khive_db::StorageBackend::sqlite(&path).expect("writable backend");
+            let writable =
+                khive_db::StorageBackend::sqlite_for_test(&path).expect("writable backend");
             writable.prepare_core_schema().expect("current schema");
         }
         #[cfg(unix)]
         khive_storage::test_support::freeze_snapshot_sidecars(&path);
-        let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
+        let backend =
+            khive_db::StorageBackend::sqlite_read_only_for_test(&path).expect("read-only backend");
         let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
 
         let mut builder = VerbRegistryBuilder::new();
@@ -16064,13 +16155,13 @@ mod help_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_column_schema.db");
         {
-            let writable = khive_db::StorageBackend::sqlite(&path).unwrap();
+            let writable = khive_db::StorageBackend::sqlite_for_test(&path).unwrap();
             writable.prepare_core_schema().unwrap();
             seed_column_schema(&writable);
         }
         #[cfg(unix)]
         khive_storage::test_support::freeze_snapshot_sidecars(&path);
-        let backend = khive_db::StorageBackend::sqlite_read_only(&path).unwrap();
+        let backend = khive_db::StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let registry = column_schema_registry();
         let writes_before = backend.pool().writer_acquisition_snapshot();
 

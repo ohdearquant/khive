@@ -104,6 +104,20 @@ pub(crate) fn oid(value: &str) -> Result<(), Failure> {
     }
 }
 
+fn lowercase_oid(value: &str) -> Result<(), Failure> {
+    if value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(Failure::invalid(
+            "expected must be a 40-character lowercase hexadecimal object id",
+        ))
+    }
+}
+
 fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
     crate::params::parse(verb, params.clone())
         .map_err(|error| Failure::invalid(error.to_string()))?;
@@ -111,6 +125,15 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
         "git.checkout" => &["repo", "ref", "session_id"],
         "git.diff" => &["repo", "input_kind", "base", "head", "session_id"],
         "git.branch" => &["repo", "name", "from", "expected", "session_id"],
+        "git.update_ref" => &[
+            "repo",
+            "branch",
+            "to",
+            "expected",
+            "require_fast_forward",
+            "reason",
+            "session_id",
+        ],
         "git.commit" => &[
             "repo",
             "branch",
@@ -143,6 +166,27 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
         return Ok(());
     }
     let repo = Path::new(required(params, "repo")?);
+    if verb == "git.update_ref" {
+        if !repo.is_absolute() {
+            return Err(Failure::refused("invalid_params"));
+        }
+        validate_ref_name("branch", required(params, "branch")?)
+            .map_err(|_| Failure::refused("invalid_params"))?;
+        let to = required(params, "to")?;
+        oid(to)?;
+        if to == "0000000000000000000000000000000000000000" {
+            return Err(Failure::refused("invalid_params"));
+        }
+        lowercase_oid(required(params, "expected")?)?;
+        if params
+            .get("require_fast_forward")
+            .is_some_and(|value| !value.is_boolean())
+            || params.get("reason").is_some_and(|value| !value.is_string())
+        {
+            return Err(Failure::refused("invalid_params"));
+        }
+        return Ok(());
+    }
     validate_repo_path(repo).map_err(|_| Failure::refused("invalid_params"))?;
     match verb {
         "git.checkout" => {
@@ -181,6 +225,7 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
         "git.diff" => &["input_kind", "base", "head"],
         "git.checkout" => &["ref"],
         "git.branch" => &["name", "from", "expected"],
+        "git.update_ref" => &["branch", "to", "expected", "reason"],
         "git.commit" => &["branch", "tree", "message", "expected_head"],
         "git.reconcile" => &["receipt"],
         "git.init" => &["branch"],
@@ -190,6 +235,11 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
     for key in keys {
         if let Some(value) = params.get(*key).and_then(Value::as_str) {
             inputs.insert((*key).into(), Value::String(value.into()));
+        }
+    }
+    if let Some(value @ Value::Bool(_)) = params.get("require_fast_forward") {
+        if verb == "git.update_ref" {
+            inputs.insert("require_fast_forward".into(), value.clone());
         }
     }
     Value::Object(inputs)
@@ -252,6 +302,55 @@ pub(crate) async fn checked_policy(
         return Err(RuntimeError::Internal("policy_unavailable".into()));
     }
     Ok(json!({"decision":decision,"source":source,"id":id}))
+}
+
+async fn update_ref_ancestry(
+    program: &Path,
+    repo: &Path,
+    branch: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool, Failure> {
+    let fast_forward = local_git::is_ancestor(program, repo, from, to).await?;
+    #[cfg(not(test))]
+    let _ = branch;
+    #[cfg(test)]
+    run_update_ref_race_hook(repo, branch);
+    Ok(fast_forward)
+}
+
+#[cfg(test)]
+type UpdateRefRaceHook = std::sync::Arc<dyn Fn(&Path, &str) + Send + Sync>;
+
+#[cfg(test)]
+static UPDATE_REF_RACE_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<UpdateRefRaceHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn update_ref_race_hook_slot() -> &'static std::sync::Mutex<Option<UpdateRefRaceHook>> {
+    UPDATE_REF_RACE_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn run_update_ref_race_hook(repo: &Path, branch: &str) {
+    let hook = update_ref_race_hook_slot()
+        .lock()
+        .expect("update-ref race hook mutex")
+        .clone();
+    if let Some(hook) = hook {
+        assert!(
+            repo_write_lock(repo).try_lock().is_err(),
+            "ancestry answer was not protected by the repository write lock"
+        );
+        hook(repo, branch);
+    }
+}
+
+#[cfg(test)]
+fn set_update_ref_race_hook(hook: Option<UpdateRefRaceHook>) {
+    *update_ref_race_hook_slot()
+        .lock()
+        .expect("update-ref race hook mutex") = hook;
 }
 
 impl GitPack {
@@ -325,8 +424,40 @@ impl GitPack {
         let branch = match verb {
             "git.commit" => params["branch"].as_str(),
             "git.branch" => params["name"].as_str(),
+            "git.update_ref" => params["branch"].as_str(),
             _ => None,
         };
+        let check_policy_before_gate = verb == "git.update_ref";
+        if check_policy_before_gate {
+            match checked_policy(registry, token, verb).await {
+                Ok(decision) => receipt.policy = decision,
+                Err(_) => {
+                    receipt.policy =
+                        json!({"decision":"deny", "source":"policy_unavailable", "id":null});
+                    self.require_receipt_storage(
+                        token,
+                        &receipt,
+                        receipts::insert(self.runtime(), &receipt).await,
+                    )
+                    .await?;
+                    return self
+                        .finish_local(token, receipt, Err(Failure::refused("policy_unavailable")))
+                        .await;
+                }
+            }
+            if receipt.policy["decision"] != "allow" {
+                self.require_receipt_storage(
+                    token,
+                    &receipt,
+                    receipts::insert(self.runtime(), &receipt).await,
+                )
+                .await?;
+                return self
+                    .finish_local(token, receipt, Err(Failure::refused("policy_denied")))
+                    .await;
+            }
+        }
+
         let allowlist = GitWritePolicy::from_config(&self.runtime().config().git_write);
         let canonical = match allowlist.match_entry(Path::new(&receipt.repo), branch) {
             Ok((repo, index)) => {
@@ -349,12 +480,8 @@ impl GitPack {
                 return self.finish_local(token, receipt, Err(failure)).await;
             }
         };
-        // No receipt writer or repository lock is held across the nested decision.
-        match checked_policy(registry, token, verb).await {
-            Ok(decision) => receipt.policy = decision,
-            Err(_) => {
-                receipt.policy =
-                    json!({"decision":"deny", "source":"policy_unavailable", "id":null});
+        if verb == "git.update_ref" {
+            if let Err(error) = validate_repo_path(&canonical) {
                 self.require_receipt_storage(
                     token,
                     &receipt,
@@ -362,8 +489,27 @@ impl GitPack {
                 )
                 .await?;
                 return self
-                    .finish_local(token, receipt, Err(Failure::refused("policy_unavailable")))
+                    .finish_local(token, receipt, Err(Failure::invalid(error.to_string())))
                     .await;
+            }
+        }
+        // No receipt writer or repository lock is held across the nested decision.
+        if !check_policy_before_gate {
+            match checked_policy(registry, token, verb).await {
+                Ok(decision) => receipt.policy = decision,
+                Err(_) => {
+                    receipt.policy =
+                        json!({"decision":"deny", "source":"policy_unavailable", "id":null});
+                    self.require_receipt_storage(
+                        token,
+                        &receipt,
+                        receipts::insert(self.runtime(), &receipt).await,
+                    )
+                    .await?;
+                    return self
+                        .finish_local(token, receipt, Err(Failure::refused("policy_unavailable")))
+                        .await;
+                }
             }
         }
         self.require_receipt_storage(
@@ -391,7 +537,12 @@ impl GitPack {
         receipt: &Receipt,
         stored: Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError> {
-        if stored.is_err() && matches!(receipt.verb.as_str(), "git.branch" | "git.commit") {
+        if stored.is_err()
+            && matches!(
+                receipt.verb.as_str(),
+                "git.branch" | "git.commit" | "git.update_ref"
+            )
+        {
             self.emit_write_audit(
                 token,
                 &receipt.verb,
@@ -484,6 +635,66 @@ impl GitPack {
                 .await?;
                 Ok(result)
             }
+            "git.update_ref" => {
+                let branch = required(params, "branch")?;
+                let expected = required(params, "expected")?;
+                let from = local_git::branch_head(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                )
+                .await?;
+                if !from.eq_ignore_ascii_case(expected) {
+                    return Err(Failure::refused("expected_head_mismatch"));
+                }
+                let to = local_git::resolve_commit_object_id(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    required(params, "to")?,
+                )
+                .await?;
+                let fast_forward = update_ref_ancestry(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                    &from,
+                    &to,
+                )
+                .await?;
+                let require_fast_forward = params
+                    .get("require_fast_forward")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if require_fast_forward && !fast_forward {
+                    return Err(Failure::refused("non_fast_forward"));
+                }
+                let result = json!({
+                    "repo":repo.display().to_string(),
+                    "ref":format!("refs/heads/{branch}"),
+                    "from":from,
+                    "to":to,
+                    "fast_forward":fast_forward,
+                    "receipt_id":receipt.id
+                });
+                receipt.result = result.clone();
+                receipts::persist(self.runtime(), receipt).await?;
+                let moved = local_git::update_branch(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                    &to,
+                    &expected.to_ascii_lowercase(),
+                    &receipt.id,
+                )
+                .await;
+                if let Err(error) = moved {
+                    if error.code() == "not_committed" {
+                        return Err(Failure::refused("expected_head_mismatch"));
+                    }
+                    return Err(error.into());
+                }
+                Ok(result)
+            }
             "git.commit" => {
                 let branch = required(params, "branch")?;
                 let expected = required(params, "expected_head")?.to_ascii_lowercase();
@@ -549,7 +760,10 @@ impl GitPack {
                     self.reconcile_remote(repo, &mut prior).await?;
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
-                if !matches!(prior.verb.as_str(), "git.branch" | "git.commit") {
+                if !matches!(
+                    prior.verb.as_str(),
+                    "git.branch" | "git.commit" | "git.update_ref"
+                ) {
                     return Err(Failure::refused("local_receipt_required"));
                 }
                 if prior.disposition == Disposition::Unknown {
@@ -558,7 +772,14 @@ impl GitPack {
                         .get("ref")
                         .and_then(Value::as_str)
                         .and_then(|r| r.strip_prefix("refs/heads/"));
-                    let sha = prior.result.get("sha").and_then(Value::as_str);
+                    let sha = prior
+                        .result
+                        .get(if prior.verb == "git.update_ref" {
+                            "to"
+                        } else {
+                            "sha"
+                        })
+                        .and_then(Value::as_str);
                     if let (Some(branch), Some(sha)) = (branch, sha) {
                         // Settlement requires both the operation marker and current reachability.
                         // Missing/pruned evidence or a rewound ref leaves the prior row unknown.
@@ -617,6 +838,7 @@ impl GitPack {
             receipt.verb.as_str(),
             "git.branch"
                 | "git.commit"
+                | "git.update_ref"
                 | "git.push"
                 | "git.pr_open"
                 | "git.pr_review"
@@ -639,7 +861,11 @@ impl GitPack {
                 } else {
                     EventOutcome::Error
                 },
-                receipt.result.get("sha").and_then(Value::as_str),
+                receipt
+                    .result
+                    .get("sha")
+                    .or_else(|| receipt.result.get("to"))
+                    .and_then(Value::as_str),
             )
             .await;
         }
@@ -894,4 +1120,195 @@ pub(crate) fn policy_check_count(actor: &str) -> usize {
         .get(actor)
         .copied()
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod update_ref_tests {
+    use super::{
+        policy_check_count, set_update_ref_race_hook, validate_operation, UpdateRefRaceHook,
+    };
+    use khive_pack_kg::KgPack;
+    use khive_pack_tool::ToolPack;
+    use khive_runtime::engine_config::{GitWriteEntryConfig, GitWriteSectionConfig};
+    use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
+    use serde_json::json;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn registry(repo: Option<&Path>, actor: &str) -> (KhiveRuntime, VerbRegistry) {
+        let git_write = GitWriteSectionConfig {
+            allowed: repo
+                .map(|repo| {
+                    vec![GitWriteEntryConfig {
+                        repo: repo.display().to_string(),
+                        branches: vec!["*".into()],
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            git_write,
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some(actor.into()));
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(ToolPack::new(rt.clone()));
+        builder.register(crate::GitPack::new(rt.clone()));
+        builder.with_runtime_event_store(&rt).expect("audit store");
+        let registry = builder.build().expect("registry");
+        registry.apply_schema_plans(rt.backend());
+        rt.install_edge_rules(registry.all_edge_rules());
+        (rt, registry)
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("start git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn update_ref_expected_requires_lowercase_sha_before_repo_validation() {
+        let repo = "/path/that/is/not/a/repository";
+        for expected in ["abc".to_string(), "A".repeat(40), "g".repeat(40)] {
+            let failure = validate_operation(
+                "git.update_ref",
+                &json!({
+                    "repo":repo,
+                    "branch":"main",
+                    "to":"a".repeat(40),
+                    "expected":expected,
+                }),
+            )
+            .expect_err("invalid expected value must be rejected before repository validation");
+            assert_eq!(failure.reason, "invalid_params");
+            assert_eq!(
+                failure.detail.as_deref(),
+                Some("expected must be a 40-character lowercase hexadecimal object id")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_ref_checks_use_policy_before_repository_validation() {
+        let directory = tempfile::tempdir().expect("repository path");
+        let actor = format!("update-ref-policy:{}", uuid::Uuid::new_v4());
+        let (_rt, registry) = registry(Some(directory.path()), &actor);
+        let before = policy_check_count(&actor);
+        let error = registry
+            .dispatch(
+                "git.update_ref",
+                json!({
+                    "repo":directory.path(),
+                    "branch":"main",
+                    "to":"a".repeat(40),
+                    "expected":"b".repeat(40),
+                }),
+            )
+            .await
+            .expect_err("an absent use policy must deny the operation")
+            .to_string();
+        assert!(error.contains("policy_denied"), "{error}");
+        assert_eq!(policy_check_count(&actor), before + 1);
+    }
+
+    #[tokio::test]
+    async fn update_ref_ancestry_and_compare_swap_share_the_repo_lock() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let repo = directory.path().join("repo");
+        std::fs::create_dir(&repo).expect("repository directory");
+        git(&repo, &["init", "-q", "-b", "work"]);
+        git(&repo, &["config", "user.name", "Fixture"]);
+        git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(repo.join("file.txt"), "initial\n").expect("fixture file");
+        git(&repo, &["add", "--", "file.txt"]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        let expected = git(&repo, &["rev-parse", "HEAD"]);
+        let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let to = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &expected, "-m", "candidate"],
+        );
+        let rival = git(
+            &repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &expected,
+                "-m",
+                "concurrent update",
+            ],
+        );
+
+        let actor = format!("update-ref-race:{}", uuid::Uuid::new_v4());
+        let (_rt, registry) = registry(Some(&repo), &actor);
+        registry
+            .dispatch(
+                "tool.policy",
+                json!({"actor":actor,"tool":"git.update_ref","decision":"allow"}),
+            )
+            .await
+            .expect("allow the write operation");
+
+        let race_repo = std::fs::canonicalize(&repo).expect("canonical repository");
+        let moved_to = rival.clone();
+        let compare_from = expected.clone();
+        let hook: UpdateRefRaceHook = std::sync::Arc::new(move |hook_repo, branch| {
+            if hook_repo != race_repo {
+                return;
+            }
+            assert_eq!(branch, "work");
+            let output = Command::new("git")
+                .current_dir(hook_repo)
+                .args(["update-ref", "refs/heads/work", &moved_to, &compare_from])
+                .output()
+                .expect("start competing ref update");
+            assert!(
+                output.status.success(),
+                "competing ref update failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+        set_update_ref_race_hook(Some(hook));
+        struct ResetRaceHook;
+        impl Drop for ResetRaceHook {
+            fn drop(&mut self) {
+                set_update_ref_race_hook(None);
+            }
+        }
+        let _reset_hook = ResetRaceHook;
+
+        let error = registry
+            .dispatch(
+                "git.update_ref",
+                json!({
+                    "repo":repo,
+                    "branch":"work",
+                    "to":to,
+                    "expected":expected,
+                }),
+            )
+            .await
+            .expect_err("the compare-and-swap must reject the intervening ref move")
+            .to_string();
+        assert!(error.contains("expected_head_mismatch"), "{error}");
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/work"]), rival);
+    }
 }

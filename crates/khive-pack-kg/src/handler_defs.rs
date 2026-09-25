@@ -205,7 +205,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         description: "Fetch any record by UUID. Returns the bare record, no envelope: `kind` is \
                       the granular kind (concept, task, observation, ...), `entity_type` is the \
                       governed subtype when one is set, and an entity's vocabulary type lives \
-                      at `properties.type`.",
+                      at `properties.type`. A merged entity id returns the live kept entity with \
+                      `redirected_from` listing the traversed ids; include_deleted=true returns \
+                      the requested tombstone instead. Redirect cycles and excessive chains fail \
+                      with distinct errors, and the Gate checks the effective kept id.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -233,7 +236,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "boolean",
                 required: false,
                 description:
-                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated). Default false. \
+                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated), without following a merge redirect. Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
                      to soft-deleted records when no live record matches.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -776,7 +779,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -851,10 +854,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "min_rank_score",
+                param_type: "number",
+                required: false,
+                description: "Inclusive strategy-local rank floor (0.0–1.0, default 0), applied after fusion, exact-title boosts and note salience weighting, before the final limit for every order. Not a similarity or probability threshold. Cannot be supplied together with min_score, even if either value is null.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Optional caller-supplied score floor (0.0–1.0). Results below this threshold are discarded. No server default is applied; RRF rank-1 scores are typically 0.013–0.033 on small corpora. Pass e.g. 0.02 to suppress near-zero noise hits.",
+                description: "Deprecated exact alias of min_rank_score (0.0–1.0). Uses the same deterministic ordering score, never a component signal. Supplying both spellings is invalid, even with equal or null values.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1403,7 +1413,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                        -> Resolved; several identically-named entities -> \
                        Ambiguous over exactly that set); (4) hybrid search over \
                        the namespace, discarding vector hits with raw cosine similarity \
-                       below 0.3 before RRF fusion. Returns one of Resolved{id,confidence} | \
+                       below 0.3 before RRF fusion. A merged entity id resolves to the live kept \
+                       id with an ordered `redirected_from` chain after an effective-id Gate check; \
+                       cycles and excessive chains fail with distinct errors. Returns one of Resolved{id,confidence} | \
                        Ambiguous{candidates} | NotFound per ref — never a silent \
                        pick among close candidates. For a non-exact ref that \
                        stays ambiguous, `candidates` is a bounded sample capped \

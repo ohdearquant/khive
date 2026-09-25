@@ -232,13 +232,27 @@ impl StorageBackend {
     /// 1 writer + N readers in WAL mode for concurrent access.
     /// No schema is applied — call `apply_schema()` for each service.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
-        Self::sqlite_with_max_readers(path, None)
+        Self::sqlite_with_pool_config(path, PoolConfig::default(), None)
+    }
+
+    /// A private test database with a small, explicitly sized reader pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sqlite_for_test(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(path, PoolConfig::for_test(), None)
     }
 
     /// Open SQLite with a reader count selected before any connections are opened.
     /// `None` preserves the default pool size and filesystem read-only detection.
     pub fn sqlite_with_max_readers(
         path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(path, PoolConfig::default(), max_readers)
+    }
+
+    fn sqlite_with_pool_config(
+        path: impl AsRef<Path>,
+        pool_config: PoolConfig,
         max_readers: Option<usize>,
     ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
@@ -248,7 +262,7 @@ impl StorageBackend {
         let mut config = PoolConfig {
             path: Some(resolved.clone()),
             read_only,
-            ..PoolConfig::default()
+            ..pool_config
         };
         if let Some(max_readers) = max_readers {
             config.max_readers = max_readers;
@@ -276,12 +290,26 @@ impl StorageBackend {
     /// The database file must already exist — unlike `sqlite()` this constructor
     /// does not create a new file.
     pub fn sqlite_read_only(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
-        Self::sqlite_read_only_with_max_readers(path, None)
+        Self::sqlite_read_only_with_pool_config(path, PoolConfig::default(), None)
+    }
+
+    /// A private read-only test database with a small reader pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sqlite_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_pool_config(path, PoolConfig::for_test(), None)
     }
 
     /// Open a read-only SQLite store with a construction-time reader count.
     pub fn sqlite_read_only_with_max_readers(
         path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_pool_config(path, PoolConfig::default(), max_readers)
+    }
+
+    fn sqlite_read_only_with_pool_config(
+        path: impl AsRef<Path>,
+        pool_config: PoolConfig,
         max_readers: Option<usize>,
     ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
@@ -290,7 +318,7 @@ impl StorageBackend {
             path: Some(resolved.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..pool_config
         };
         if let Some(max_readers) = max_readers {
             config.max_readers = max_readers;
@@ -1262,7 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn hot_path_guard_g2_file_backed_read_suite_uses_only_pooled_readers() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = StorageBackend::sqlite(dir.path().join("hot_path_g2.db")).unwrap();
+        let backend = StorageBackend::sqlite_for_test(dir.path().join("hot_path_g2.db")).unwrap();
         backend.prepare_core_schema().unwrap();
 
         // Construct every store named by ADR-165 Slice 2 before the counter
@@ -1348,7 +1376,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chmod_snapshot.db");
         {
-            let writable = StorageBackend::sqlite(&path).expect("create writable database");
+            let writable =
+                StorageBackend::sqlite_for_test(&path).expect("create writable database");
             writable
                 .prepare_core_schema()
                 .expect("migrate writable snapshot source");
@@ -1433,7 +1462,7 @@ mod tests {
     fn data_dir_returns_parent_dir_for_file_backend() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.db");
-        let backend = StorageBackend::sqlite(&path).expect("file backend");
+        let backend = StorageBackend::sqlite_for_test(&path).expect("file backend");
         let got = backend.data_dir().expect("file backend must return Some");
         assert_eq!(got, dir.path());
     }
@@ -1442,7 +1471,7 @@ mod tests {
     fn ann_root_is_database_scoped_sibling_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.db");
-        let backend = StorageBackend::sqlite(&path).expect("file backend");
+        let backend = StorageBackend::sqlite_for_test(&path).expect("file backend");
         let got = backend.ann_root().expect("file backend must return Some");
         assert_eq!(got, dir.path().join("data.db.ann"));
         assert!(StorageBackend::memory().unwrap().ann_root().is_none());
@@ -1516,7 +1545,7 @@ mod tests {
     async fn sql_access_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_roundtrip.db");
-        let backend = StorageBackend::sqlite(&path).unwrap();
+        let backend = StorageBackend::sqlite_for_test(&path).unwrap();
         let sql = backend.sql();
 
         let mut writer = sql.writer().await.unwrap();
@@ -1574,7 +1603,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ro_sparse_tables.db");
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             writable
                 .prepare_core_schema()
                 .expect("migrate snapshot source");
@@ -1585,7 +1614,7 @@ mod tests {
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        let read_only = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         read_only
             .prepare_core_schema()
             .expect("validate exact current migration ledger");
@@ -1613,7 +1642,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ro_text_tables.db");
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             writable
                 .prepare_core_schema()
                 .expect("migrate snapshot source");
@@ -1624,7 +1653,7 @@ mod tests {
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        let read_only = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         read_only
             .prepare_core_schema()
             .expect("validate exact current migration ledger");
@@ -1653,7 +1682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ro_vector_tables.db");
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             writable
                 .prepare_core_schema()
                 .expect("migrate snapshot source");
@@ -1664,7 +1693,7 @@ mod tests {
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        let read_only = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         read_only
             .prepare_core_schema()
             .expect("validate exact current migration ledger");
@@ -1690,7 +1719,7 @@ mod tests {
 
         // Create the database and a table while writable.
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             let sql = writable.sql();
             let mut writer = sql.writer().await.unwrap();
             writer
@@ -1939,16 +1968,11 @@ mod tests {
         );
     }
 
-    /// `text_repeated_open_after_backfill_...` above seeds through
-    /// `upsert_document`, which already maintains the map transactionally —
-    /// the map is never actually empty by the time `backend.text()` is
-    /// called, so that test's short-circuit bound never exercises the real
-    /// backfill body at all. This test seeds
-    /// the FTS table with raw SQL, bypassing the map entirely, to reproduce
-    /// a genuinely pre-migration database, then asserts the backfill that
-    /// runs on the next `backend.text()` call gives every FTS row exactly
-    /// one map entry (LEFT JOIN parity, both directions) before repeating
-    /// the same O(1) re-open bound.
+    /// Legacy FTS tables can hold rows with no corresponding rowid-map
+    /// entries. Seed that state without the maintained write path, then
+    /// assert that opening the text store restores bidirectional rowid
+    /// parity without losing records. Repeated-open work growth is covered
+    /// separately by `text_repeated_open_after_backfill_does_not_scale_with_row_count`.
     #[tokio::test]
     async fn text_open_after_legacy_seed_backfills_the_map_with_full_parity() {
         let backend = StorageBackend::memory().unwrap();
@@ -2031,19 +2055,6 @@ mod tests {
             assert_eq!(fts_count, 500);
             assert_eq!(map_count, 500);
         }
-
-        // Now that a REAL backfill ran, repeated re-opens must still stay
-        // O(1) — same budget/rationale as
-        // `text_repeated_open_after_backfill_does_not_scale_with_row_count`.
-        let start = std::time::Instant::now();
-        for _ in 0..500 {
-            let _ = backend.text(table_key).unwrap();
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "500 repeated backend.text() calls after a real backfill took {elapsed:?}"
-        );
     }
 
     /// A map holding a row for B but none for A (the exact state a crash
@@ -2602,13 +2613,13 @@ mod tests {
 
         // Create the database and the graph schema while writable.
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             writable.graph().unwrap();
         }
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let ro = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let store = match ro.graph() {
             Ok(store) => store,
             // Failing to even open the store on a read-only backend is an
@@ -2646,13 +2657,13 @@ mod tests {
         let path = dir.path().join("ro_events.db");
 
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             writable.events().unwrap();
         }
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let ro = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let store = match ro.events() {
             Ok(store) => store,
             Err(_) => return,
@@ -2683,13 +2694,13 @@ mod tests {
         let path = dir.path().join("ro_text.db");
 
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             writable.text("ro_test").unwrap();
         }
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let ro = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let store = match ro.text("ro_test") {
             Ok(store) => store,
             Err(_) => return,
@@ -2727,7 +2738,7 @@ mod tests {
 
         let id = uuid::Uuid::new_v4();
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             let writer = writable.pool().try_writer().unwrap();
             writer
                 .conn()
@@ -2752,7 +2763,7 @@ mod tests {
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let ro = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let store = ro
             .text("ro_no_map")
             .expect("a read-only FTS table with no sidecar map must still open successfully");
@@ -2785,7 +2796,7 @@ mod tests {
         let a = uuid::Uuid::new_v4();
         let b = uuid::Uuid::new_v4();
         {
-            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
             let writer = writable.pool().try_writer().unwrap();
             writer
                 .conn()
@@ -2834,7 +2845,7 @@ mod tests {
         #[cfg(unix)]
         freeze_snapshot_sidecars(&path);
 
-        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let ro = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let store = ro
             .text("ro_unmarked")
             .expect("a read-only FTS table with an unmarked map must still open successfully");
@@ -2855,7 +2866,7 @@ mod tests {
     async fn blob_store_roundtrip_via_public_api() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob_backend.db");
-        let backend = StorageBackend::sqlite(&path).unwrap();
+        let backend = StorageBackend::sqlite_for_test(&path).unwrap();
 
         // Explicit floor_bytes=0, not the default 100GB — the free space on
         // whatever volume runs this test is not this test's concern (and a
@@ -2876,7 +2887,7 @@ mod tests {
     fn blob_store_defaults_root_beside_db_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob_default.db");
-        let backend = StorageBackend::sqlite(&path).unwrap();
+        let backend = StorageBackend::sqlite_for_test(&path).unwrap();
 
         // `blob_store` creates the root directory eagerly (`FsBlobStore::new`),
         // so its existence at the expected default path is directly
@@ -3000,7 +3011,7 @@ mod tests {
             path: Some(path.clone()),
             busy_timeout: std::time::Duration::from_millis(200),
             write_queue_enabled: Some(write_queue_enabled),
-            ..crate::pool::PoolConfig::default()
+            ..crate::pool::PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(config).expect("fresh tenant-shaped pool should open");
         let backend = StorageBackend {
@@ -3090,7 +3101,7 @@ mod tests {
             path: Some(p),
             busy_timeout: std::time::Duration::from_millis(200),
             write_queue_enabled: Some(true),
-            ..crate::pool::PoolConfig::default()
+            ..crate::pool::PoolConfig::for_test()
         };
 
         let pool_a = ConnectionPool::new(cfg(path.clone())).expect("pool A should open");

@@ -90,6 +90,7 @@ test-forward-seam = []
 test-channel-timing = ["channel-telegram", "khive-channel-telegram/test-support"]
 
 [dev-dependencies]
+khive-score = { version = "0.8.0", path = "../khive-score" }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }

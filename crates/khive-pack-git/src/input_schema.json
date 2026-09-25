@@ -54,6 +54,44 @@
     ],
     "additionalProperties": false
   },
+  "git.update_ref": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "branch": {
+        "type": "string",
+        "minLength": 1
+      },
+      "to": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "expected": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{40}$"
+      },
+      "require_fast_forward": {
+        "type": "boolean"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "branch",
+      "to",
+      "expected"
+    ],
+    "additionalProperties": false
+  },
   "git.commit": {
     "type": "object",
     "properties": {

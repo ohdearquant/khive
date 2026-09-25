@@ -3,6 +3,9 @@
 //! Tests cover entity CRUD, graph operations, note memory, GQL query,
 //! and namespace isolation using an in-memory runtime.
 
+#[path = "../src/test_process.rs"]
+mod test_process;
+
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::blob::ContentRef;
 use khive_storage::types::{Direction, PageRequest, TraversalOptions, TraversalRequest};
@@ -1961,7 +1964,7 @@ async fn file_backed_runtime_persists() {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).unwrap();
+        let rt = KhiveRuntime::new_for_test(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
         rt.create_entity(&tok, "concept", None, "Persistent", None, None, vec![])
             .await
@@ -1992,7 +1995,7 @@ async fn file_backed_runtime_persists() {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).unwrap();
+        let rt = KhiveRuntime::new_for_test(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
         let entities = rt.list_entities(&tok, None, None, 50, 0).await.unwrap();
         assert_eq!(entities.len(), 1);
@@ -4436,6 +4439,10 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
 #[test]
 #[serial_test::serial]
 fn test_harness_refuses_runtime_default_store() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     struct HomeGuard(Option<std::ffi::OsString>);
 
     impl Drop for HomeGuard {

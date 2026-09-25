@@ -23,6 +23,7 @@
 //! | `git.digest` | `source`, `project?`, `max_items?`, `include?` | Ingest commit/issue/PR provenance from a local path or `https://` URL, bounded and cursor-resumable |
 //! | `git.commit` | `repo`, `message`, `paths?`, `author?` | Stage and commit against a local repo; returns the resulting SHA |
 //! | `git.branch` | `repo`, `name`, `from?` | Create a branch, optionally from a named ref/SHA |
+//! | `git.update_ref` | `repo`, `branch`, `to`, `expected`, `require_fast_forward?`, `reason?` | Move an existing branch to an existing commit with an exact expected-head compare |
 //! | `git.push` | `repo`, `branch`, `expected_local`, `expected_remote` | Compare both heads and push to the configured remote; null remote means absent |
 //! | `git.pr_open` | `repo`, `head`, `base`, `title`, `body`, `expected_head` | Open a pull request after checking repository identity and head |
 //! | `git.pr_review` | `repo`, `number`, `verdict`, `body`, `expected_head` | Review the expected commit; self-approval refuses |

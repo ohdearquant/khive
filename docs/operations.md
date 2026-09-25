@@ -18,27 +18,27 @@ explicitly and describes what the code does.
 
 `kkernel` is one binary with a clap subcommand tree (`crates/kkernel/src/main.rs:34-88`):
 
-| Subcommand                           | Mutates data?                          | Purpose                                                                                 |
-| ------------------------------------ | -------------------------------------- | --------------------------------------------------------------------------------------- |
-| `sync`                               | yes (target DB)                        | Rebuild a SQLite DB from `.khive/kg/{entities,edges}.ndjson`                            |
-| `pack list` / `pack handler <name>`  | no                                     | Introspect registered packs (verbs, note/entity kinds)                                  |
-| `kg validate`                        | no (mutates only with `--fix`)         | Structural + rule-based lint of tracked `.khive/kg/*.ndjson`                            |
-| `kg init`                            | yes (repo scaffolding)                 | Create `.khive/kg/`, `khive.toml`, pre-commit hook, optional CI workflow                |
-| `kg hook install\|uninstall\|status` | yes (`.git/hooks/`)                    | Wire/unwire the pre-commit hook                                                         |
-| `kg fetch` (alias `kg sync`)         | yes (cache dir)                        | Pull a remote KG archive with SHA-256 pin verification                                  |
-| `kg export`                          | no (writes an output file, not the DB) | Dump a namespace's entities+edges to one JSON archive                                   |
-| `kg import`                          | yes (target DB)                        | Load an archive/JSON/NDJSON file into a DB                                              |
-| `kg status`                          | no                                     | Compare DB content hash against tracked NDJSON content hash                             |
-| `kg commit`                          | yes (a separate local-only git repo)   | Validate + git-commit a staged tier-2 change-set (ADR-102 Amendment to ADR-020)         |
-| `db migrate` / `db check`            | `migrate` yes, `check` no              | Apply or report pending schema migrations                                               |
-| `engine list` / `status`             | no                                     | Inspect the `_embedding_models` table                                                   |
-| `engine migrate` / `drift-check`     | n/a                                    | **Not implemented**, always return an error (see §3)                                    |
-| `vector capabilities`                | no                                     | Print the sqlite-vec backend's static capability set                                    |
-| `vector sweep`                       | n/a                                    | **Not implemented**, always returns an error (see §3)                                   |
-| `reindex`                            | yes (vectors + FTS)                    | Re-embed entities/notes/knowledge, fanning out across configured engines                |
-| `exec`                               | depends on the ops given               | Run a verb DSL expression, or drain due `scheduled_event` notes with `--pending-events` |
-| `mcp`                                | yes (serves writes)                    | Serve the MCP `request` surface (stdio/daemon/transport)                                |
-| `backend list` / `info`              | yes (see caveat below)                 | Enumerate configured backends                                                           |
+| Subcommand                           | Mutates data?                              | Purpose                                                                                 |
+| ------------------------------------ | ------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `sync`                               | yes (target DB)                            | Rebuild a SQLite DB from `.khive/kg/{entities,edges}.ndjson`                            |
+| `pack list` / `pack handler <name>`  | no                                         | Introspect registered packs (verbs, note/entity kinds)                                  |
+| `kg validate`                        | no (mutates only with `--fix`)             | Structural + rule-based lint of tracked `.khive/kg/*.ndjson`                            |
+| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `khive.toml`, pre-commit hook, optional CI workflow                |
+| `kg hook install\|uninstall\|status` | yes (`.git/hooks/`)                        | Wire/unwire the pre-commit hook                                                         |
+| `kg fetch` (alias `kg sync`)         | yes (cache dir)                            | Pull a remote KG archive with SHA-256 pin verification                                  |
+| `kg export`                          | no (writes an output file, not the DB)     | Dump a namespace's entities+edges to one JSON archive                                   |
+| `kg import`                          | yes (target DB)                            | Load an archive/JSON/NDJSON file into a DB                                              |
+| `kg status`                          | no                                         | Compare DB content hash against tracked NDJSON content hash                             |
+| `kg commit`                          | yes (a separate local-only git repo)       | Validate + git-commit a staged tier-2 change-set (ADR-102 Amendment to ADR-020)         |
+| `db migrate` / `db check`            | `migrate` yes, `check` no                  | Apply or report pending schema migrations                                               |
+| `engine list` / `status`             | no                                         | Inspect the `_embedding_models` table                                                   |
+| `engine migrate` / `drift-check`     | n/a                                        | **Not implemented**, always return an error (see §3)                                    |
+| `vector capabilities`                | no                                         | Print the sqlite-vec backend's static capability set                                    |
+| `vector sweep`                       | yes (no vector deletions with `--dry-run`) | Remove orphan vectors from the selected engines' model stores (see §3)                  |
+| `reindex`                            | yes (vectors + FTS)                        | Re-embed entities/notes/knowledge, fanning out across configured engines                |
+| `exec`                               | depends on the ops given                   | Run a verb DSL expression, or drain due `scheduled_event` notes with `--pending-events` |
+| `mcp`                                | yes (serves writes)                        | Serve the MCP `request` surface (stdio/daemon/transport)                                |
+| `backend list` / `info`              | yes (see caveat below)                     | Enumerate configured backends                                                           |
 
 Read-only vs. mutating is a useful mental split when deciding what's safe to run against a
 production database without a backup first: `kg status`, `kg validate` (no `--fix`), `pack list`,
@@ -569,20 +569,55 @@ are accepted by clap and even mutually validated (`--to`/`--resume`/`--abort` ar
 `conflicts_with`), but the handlers do nothing: no DB mutation, no re-embedding, no drift
 computation happens today. Do not script against these as if they perform work.
 
-### `kkernel vector`: capabilities is live, sweep is a stub
+### `kkernel vector`: capabilities and orphan cleanup
 
 `vector capabilities [--human] [--engine <name>] [--db <path>]` prints a **static** capability
 record matching the sqlite-vec backend's compiled-in `OnceLock` (`supports_filter` /
-`supports_batch_search` / `supports_quantization` / `supports_update` / `supports_orphan_sweep` /
-`supports_multi_field` all `false`, `max_dimensions: 8192`, `index_kinds: ["sqlite_vec"]`). It does
-**not** open the database named by `--db` or inspect the configured backend at all; the output is
-identical regardless of which `--db`/`--engine` you pass, so treat it as a reference for the
-current sqlite-vec baseline, not a live probe (`vector.rs:95-136`).
+`supports_batch_search` / `supports_quantization` / `supports_update` / `supports_multi_field`
+all `false`, `supports_orphan_sweep: true`, `max_dimensions: 8192`,
+`index_kinds: ["sqlite_vec"]`). Every capability field is pinned to the backend's
+`capabilities()` value by a comparison test. The command does not open the database named by
+`--db` or inspect the configured engines; `--engine` only sets the report's `engine_name` label
+(default `"default"`). The capability values describe the compiled sqlite-vec backend
+(`crates/kkernel/src/vector.rs`).
 
 `vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run] [--engine <name>] [--db <path>]`
-parses all its flags but **always returns an error**: "not yet implemented (backend orphan-sweep
-deferred to follow-up #2874)". No orphan detection, dry-run behavior, or deletion happens today;
-none of its flags do anything yet.
+removes vector rows whose subject has no live entity, note, or knowledge atom. A soft-deleted
+entity, note, or knowledge atom does not protect its vector; live notes include memory records.
+The command uses the runtime-configured embedding models, with one sweep per distinct model
+store. `--engine` selects an exact `[[engines]].name` from the resolved configuration. When there
+are no configured engine entries, the available engine names are the runtime's canonical model
+names. Omitting `--engine` sweeps all configured model stores, grouping engine names that share a
+model so that each table is swept once.
+
+- Repeat `--namespace` to restrict vector rows to those namespaces. Omitting it sweeps all
+  namespaces, independently of the runtime's default namespace.
+- `--max-delete` defaults to `1000` and limits deletions across the entire command, shared by all
+  selected model stores. Zero deletes no vectors. Values above `4294967295` are rejected before
+  the database is opened.
+- `--dry-run` counts orphan rows without deleting vectors. It still uses the backend's writer
+  transaction. The deletion limit does not cap the rows scanned or the time spent counting.
+- `--db` selects the database to maintain.
+
+```bash
+kkernel vector sweep --db /path/to/khive.db --dry-run
+kkernel vector sweep --db /path/to/khive.db --namespace research --max-delete 100
+```
+
+The command prints JSON containing `namespaces` (an empty array means all), `dry_run`,
+`max_delete`, aggregate result fields, and a `stores` array. Each store report identifies
+`engine_names`, `model`, and `namespaces`, and includes the same result fields:
+
+| Field            | Meaning                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------ |
+| `scanned`        | Vector rows matching the namespace filter, including live subjects                   |
+| `deleted`        | Vectors removed; zero during a dry run                                               |
+| `would_delete`   | All orphan vectors found, before applying the deletion limit, including on real runs |
+| `max_delete_hit` | Orphans exceeded the available deletion budget                                       |
+
+Store reports use the remaining shared budget at that store; aggregate counts cover all selected
+stores. A dry run accounts for the same shared budget while leaving `deleted` at zero
+(`crates/kkernel/src/vector.rs`, `crates/khive-db/src/stores/vectors.rs`).
 
 ---
 
