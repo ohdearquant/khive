@@ -328,7 +328,12 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
 3. **Verb.** `blob.sweep(dry_run?)` runs one pass on demand. `dry_run` defaults to true, so a call
    without arguments deletes nothing. It returns the four counters of `BlobOrphanSweepResult`
    (`scanned`, `would_delete`, `deleted`, `grace_period_skipped`) and the mode it ran in. It reaches the
-   main backend only, and it is subject to the Gate like any verb (ADR-018). ADR-111 §8 says the orphan
+   main backend only, and it is subject to the Gate like any verb (ADR-018). It is classified `Write` in
+   the [ADR-129](ADR-129-fail-closed-gate-default.md) Amendment 3 operation table, its default dry run
+   included, as `gtd.repair` is, because the same verb can delete; a `deny_writes_for` restriction
+   therefore denies it. A call with `dry_run` false is refused, and deletes nothing, unless the serving
+   process runs with `KHIVE_BLOB_SWEEP_LIVE=1`, so the operator switch in item 2 governs every deletion,
+   scheduled or on demand. ADR-111 §8 says the orphan
    sweep is "an admin-side operation, not an MCP verb"; that sentence is amended to apply to the
    caller-snapshot `orphan_sweep` only, which stays admin-side and, on the filesystem backend,
    disabled. A pass that finds another sweep holding ownership waits for it, bounded by the caller's
@@ -337,7 +342,10 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    verb's error unchanged, and a backend without a transactional sweep returns its `Unsupported` error.
 4. **The counters are the artifact.** Every scheduled run logs one line with its mode and the four
    counters, or the error when the sweep refuses. `deleted` is the reclaimed-object count; before the
-   correction in item 5, ADR-191 Amendment 1 asked a scheduled sweep to report it.
+   correction in item 5, ADR-191 Amendment 1 asked a scheduled sweep to report it. A pass holds the
+   blob store's per-root write lock across its whole walk and every claim batch, dry run included, and
+   `blob.put` takes the same lock, so uploads wait for the length of a pass. The log line therefore also
+   reports the pass duration; bounding the walk is follow-up work if that wait matters.
 5. **Out of scope: rows whose record is gone.** The sweep counts every attachment row as live, whether
    or not its record still exists. It therefore cannot reclaim a blob whose attachment row outlived its
    record, which is the case ADR-191 A1.2 describes for an interrupted cross-backend hard delete.
@@ -352,6 +360,9 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
 - A session-mode process, and a daemon with `KHIVE_BLOB_SWEEP_INTERVAL_SECS=0`, start no schedule.
 - `blob.sweep()` without arguments deletes nothing, and its `would_delete` equals the `deleted` of a
   live pass over the same store.
-- `blob.sweep(dry_run=false)` issued while a scheduled run holds ownership either completes after it
+- With `KHIVE_BLOB_SWEEP_LIVE` unset, `blob.sweep(dry_run=false)` is refused and deletes nothing. A
+  caller under a `deny_writes_for` restriction is denied `blob.sweep` with or without `dry_run`.
+- With `KHIVE_BLOB_SWEEP_LIVE=1`, `blob.sweep(dry_run=false)` issued while a scheduled run holds
+  ownership either completes after it
   or returns the timeout error when its deadline passes first. Neither deletes an object whose
   attachment row committed while it waited, and a pass that timed out performs no deletion afterwards.
