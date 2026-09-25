@@ -7,8 +7,8 @@
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
 a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`; and by its own
-Amendment 1 below (accepted 2026-09-25), which schedules the attachment orphan sweep in the daemon
-and adds the `blob.sweep` verb.\
+Amendment 1 below (accepted 2026-09-25), which schedules the attachment orphan sweep in the daemon,
+adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI.\
 **Depends on**:
 
 - [ADR-111](ADR-111-blob-store.md) — BlobStore (the content-addressed storage capability,
@@ -318,28 +318,38 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    `KHIVE_BLOB_SWEEP_INTERVAL_SECS` (default 86400, one day; `0` disables the schedule). A
    session-mode process never schedules it. The first run starts one interval after the daemon starts,
    and each later run starts one interval after the previous run ended. A daemon restarted more often
-   than its interval never reaches a scheduled run; the verb in item 3 covers that case, and a
-   deployment that restarts often sets a shorter interval.
+   than its interval never reaches a scheduled run; the admin command in item 3 covers that case, and
+   a deployment that restarts often sets a shorter interval.
 2. **Dry run first, live only by opt-in.** A scheduled run is a dry run unless `KHIVE_BLOB_SWEEP_LIVE=1`
    is set. A deployment therefore starts in dry-run mode, and its first scheduled cycle reports
    `would_delete` and deletes nothing. An operator enables live mode only after reading the counters of
-   at least one dry-run cycle, from the log line in item 4 or from the verb with `dry_run` true. The
-   daemon never switches modes on its own.
-3. **Verb.** `blob.sweep(dry_run?)` runs one pass on demand. `dry_run` defaults to true, so a call
-   without arguments deletes nothing. It returns the four counters of `BlobOrphanSweepResult`
-   (`scanned`, `would_delete`, `deleted`, `grace_period_skipped`) and the mode it ran in. It reaches the
-   main backend only, and it is subject to the Gate like any verb (ADR-018). It is classified `Write` in
-   the [ADR-129](ADR-129-fail-closed-gate-default.md) Amendment 3 operation table, its default dry run
-   included, as `gtd.repair` is, because the same verb can delete; a `deny_writes_for` restriction
-   therefore denies it. A call with `dry_run` false is refused, and deletes nothing, unless the serving
-   process runs with `KHIVE_BLOB_SWEEP_LIVE=1`, so the operator switch in item 2 governs every deletion,
-   scheduled or on demand. ADR-111 §8 says the orphan
-   sweep is "an admin-side operation, not an MCP verb"; that sentence is amended to apply to the
-   caller-snapshot `orphan_sweep` only, which stays admin-side and, on the filesystem backend,
-   disabled. A pass that finds another sweep holding ownership waits for it, bounded by the caller's
-   deadline, which returns the retryable timeout error. A pass abandoned at its deadline stops
-   there: it must not acquire ownership later and run on with no caller to report to. An ADR-111 §8 epoch refusal is returned as the
-   verb's error unchanged, and a backend without a transactional sweep returns its `Unsupported` error.
+   at least one dry-run cycle, from the log line in item 4 or from the `blob.sweep` verb. The daemon
+   never switches modes on its own. The switch governs the scheduled pass only: no MCP request can
+   make a pass delete (item 3).
+3. **On demand: a dry-run verb and an admin command.** `blob.sweep()` runs one dry-run pass on demand
+   and returns the four counters of `BlobOrphanSweepResult` (`scanned`, `would_delete`, `deleted`,
+   `grace_period_skipped`; `deleted` is always 0) and the mode it ran in. The verb has no live mode.
+   No argument or switch makes an MCP request delete. A process-wide switch set for the schedule
+   would otherwise let any caller the Gate (ADR-018) admits for writes delete on demand, so on-demand
+   deletion sits behind the operator's own command instead of behind a Gate policy that every
+   deployment would have to narrow correctly. It reaches the main backend only. It is classified `Write` in the [ADR-129](ADR-129-fail-closed-gate-default.md) Amendment 3
+   operation table, as `gtd.repair` is, because a pass holds the blob store's write lock (item 4) and
+   blocks uploads for its length; a `deny_writes_for` restriction therefore denies it.
+   On-demand deletion is an operator action: `kkernel blob sweep [--live]` in the admin CLI, which
+   ADR-003 keeps apart from the MCP surface and ADR-109's gateway mode never exposes. It resolves the
+   database and configuration the way `kkernel vector sweep` does, runs the same
+   `transactional_orphan_sweep` against the main backend, is a dry run unless `--live` is given, and
+   prints the four counters and the mode. `--live` is the operator's opt-in for that pass;
+   `KHIVE_BLOB_SWEEP_LIVE` does not apply to it. ADR-111 §8 says the orphan sweep is "an admin-side
+   operation, not an MCP verb"; that sentence is amended to apply to the caller-snapshot
+   `orphan_sweep` only, which stays admin-side and, on the filesystem backend, disabled. Either pass,
+   verb or admin command, that finds another sweep holding ownership waits for it, bounded by its
+   deadline (the verb's caller deadline; the admin command's `--timeout`), and the verb returns the
+   retryable timeout error. Ownership includes ADR-111 §8's cross-process advisory lock, so an admin
+   pass and a scheduled pass in the daemon never run at once. A pass abandoned at its deadline stops
+   there: it must not acquire ownership later and run on with no caller to report to. An ADR-111 §8
+   epoch refusal is returned as the error unchanged, and a backend without a transactional sweep
+   returns its `Unsupported` error.
 4. **The counters are the artifact.** Every scheduled run logs one line with its mode and the four
    counters, or the error when the sweep refuses. `deleted` is the reclaimed-object count; before the
    correction in item 5, ADR-191 Amendment 1 asked a scheduled sweep to report it. A pass holds the
@@ -358,11 +368,13 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   logs `would_delete=1`, `deleted=0` and leaves the object in place. With `KHIVE_BLOB_SWEEP_LIVE=1` the
   next cycle deletes it and logs `deleted=1`.
 - A session-mode process, and a daemon with `KHIVE_BLOB_SWEEP_INTERVAL_SECS=0`, start no schedule.
-- `blob.sweep()` without arguments deletes nothing, and its `would_delete` equals the `deleted` of a
-  live pass over the same store.
-- With `KHIVE_BLOB_SWEEP_LIVE` unset, `blob.sweep(dry_run=false)` is refused and deletes nothing. A
-  caller under a `deny_writes_for` restriction is denied `blob.sweep` with or without `dry_run`.
-- With `KHIVE_BLOB_SWEEP_LIVE=1`, `blob.sweep(dry_run=false)` issued while a scheduled run holds
-  ownership either completes after it
-  or returns the timeout error when its deadline passes first. Neither deletes an object whose
-  attachment row committed while it waited, and a pass that timed out performs no deletion afterwards.
+- `blob.sweep()` deletes nothing, with or without `KHIVE_BLOB_SWEEP_LIVE=1` set on the serving
+  process, and its `would_delete` equals the `deleted` of a live pass over the same store. A request
+  carrying a live flag is rejected as an unknown argument. A caller under a `deny_writes_for`
+  restriction is denied `blob.sweep`.
+- `kkernel blob sweep` without `--live` deletes nothing; with `--live` it deletes an orphan older than
+  the grace period and prints `deleted=1`, whether or not `KHIVE_BLOB_SWEEP_LIVE` is set.
+- `kkernel blob sweep --live` started while a scheduled run in the daemon holds ownership either
+  completes after it or exits with the timeout error when `--timeout` passes first. Neither deletes an
+  object whose attachment row committed while it waited, and a pass that timed out performs no
+  deletion afterwards.

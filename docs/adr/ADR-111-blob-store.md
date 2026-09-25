@@ -259,7 +259,8 @@ everything not in that set.
 
 > Amended by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (2026-09-25): the "not an MCP
 > verb" sentence above applies to the caller-snapshot `orphan_sweep` only, which stays admin-side.
-> `transactional_orphan_sweep` runs on a daemon schedule and on demand through the `blob.sweep` verb.
+> `transactional_orphan_sweep` runs on a daemon schedule, as a dry run on demand through the `blob.sweep`
+> verb, and live on demand only through the `kkernel blob sweep --live` admin command.
 
 This is deliberately the _only_ deletion path a consumer has besides an explicit
 `BlobStore::delete(content_ref)` call (SPEC-gate ruling, 2026-07-12): a future doc/file pack never
