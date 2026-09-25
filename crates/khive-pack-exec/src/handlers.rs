@@ -19,7 +19,7 @@ use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
-use crate::capture::{drain, walk, Tail};
+use crate::capture::{drain, walk, CaptureRead, Tail};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
@@ -368,6 +368,10 @@ struct Receipt {
     pids: Option<Value>,
     started_at: Option<i64>,
     finished_at: Option<i64>,
+    // Set after materialization to the canonical root used for the run.
+    // A pre-existing UUID root is not ours to delete.
+    #[cfg(unix)]
+    owned_run_dir: Option<PathBuf>,
 }
 
 impl Receipt {
@@ -415,6 +419,14 @@ impl Receipt {
             },
         })
     }
+}
+
+fn append_failure_reason(receipt: &mut Receipt, detail: String) {
+    receipt.success = false;
+    receipt.reason = Some(match receipt.reason.take() {
+        Some(existing) => format!("{existing}; {detail}"),
+        None => detail,
+    });
 }
 
 /// Parsed and validated run request, before any policy decision.
@@ -566,11 +578,33 @@ pub async fn run(
         pids: None,
         started_at: None,
         finished_at: None,
+        #[cfg(unix)]
+        owned_run_dir: None,
     };
 
     match preflight(rt, token, cfg, &req, &mut receipt).await {
         Ok(ready) => {
-            execute(rt, &ns, cfg, &req, ready, &mut receipt).await?;
+            if let Err(error) = execute(rt, &ns, cfg, &req, ready, &mut receipt).await {
+                // Hydration, profile/blob writes and spawn can fail after
+                // policy allowed the call. They still need a durable receipt.
+                receipt.success = false;
+                receipt.tree_out = None;
+                receipt.changed.clear();
+                receipt.undeclared.clear();
+                // Unconfigured is a wire error category whose Display suffix
+                // ("is not set") is misleading for filesystem failures.
+                let detail = match error {
+                    RuntimeError::Unconfigured(detail) => detail,
+                    other => other.to_string(),
+                };
+                append_failure_reason(&mut receipt, detail);
+                receipt.finished_at.get_or_insert_with(receipts::now_micros);
+                #[cfg(unix)]
+                if let Some(run_dir) = receipt.owned_run_dir.clone() {
+                    let profile_path = run_dir.with_extension("sb");
+                    finish_cleanup(&mut receipt, &run_dir, &profile_path, false);
+                }
+            }
             let mut value = receipt.to_json();
             let seq = receipts::insert(rt, &ns, &value).await?;
             value["seq"] = seq.map_or(Value::Null, Value::from);
@@ -708,12 +742,21 @@ fn materialize(
 ) -> std::io::Result<()> {
     std::fs::create_dir(run_dir)?;
     let result = materialize_entries(run_dir, entries, bytes);
-    if result.is_err() {
+    if let Err(error) = result {
         // Remove only the fresh root we own, never a pre-existing root whose
         // create_dir failed. A partial input tree is not a keepable run.
-        let _ = std::fs::remove_dir_all(run_dir);
+        if let Err(cleanup) = std::fs::remove_dir_all(run_dir) {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; cleanup of partially materialized {} failed: {cleanup}",
+                    run_dir.display()
+                ),
+            ));
+        }
+        return Err(error);
     }
-    result
+    Ok(())
 }
 
 fn materialize_entries(
@@ -833,20 +876,23 @@ async fn execute(
     })?;
     let run_dir = root.join(&receipt.id);
     if let Err(error) = materialize(&run_dir, &ready.entries, &bytes) {
-        receipt.success = false;
-        receipt.reason = Some(format!("materialize {}: {error}", run_dir.display()));
-        receipt.finished_at = Some(receipts::now_micros());
-        // No profile or child exists yet. Return through run's receipt insertion.
-        return Ok(());
+        return Err(RuntimeError::Unconfigured(format!(
+            "materialize {}: {error}",
+            run_dir.display()
+        )));
     }
-    receipts::event(
+    receipt.owned_run_dir = Some(run_dir.clone());
+    if let Err(error) = receipts::event(
         rt,
         ns,
         &receipt.id,
         "materialized",
         json!({ "run_dir": run_dir.to_string_lossy(), "entries": ready.entries.len() }),
     )
-    .await?;
+    .await
+    {
+        append_failure_reason(receipt, format!("materialized event write failed: {error}"));
+    }
 
     // Profile: rendered per run, stored as a blob, written beside the run
     // directory for sandbox-exec to read, removed with it.
@@ -968,7 +1014,6 @@ async fn execute(
             unsafe {
                 libc::close(limit_reader);
             }
-            cleanup(&run_dir, &profile_path, cfg.keep);
             return Err(RuntimeError::Unconfigured(format!(
                 "spawning sandbox-exec for {}: {e}",
                 ready.registered
@@ -979,14 +1024,17 @@ async fn execute(
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
     let pid = child.id().unwrap_or_default() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
-    receipts::event(
+    if let Err(error) = receipts::event(
         rt,
         ns,
         &receipt.id,
         "launched",
         json!({ "pid": pid, "pgid": pid, "argv": receipt.argv }),
     )
-    .await?;
+    .await
+    {
+        append_failure_reason(receipt, format!("launched event write failed: {error}"));
+    }
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -1020,14 +1068,17 @@ async fn execute(
     let out: Tail = out_task.await.unwrap_or_else(|_| Tail::new(cap));
     let err: Tail = err_task.await.unwrap_or_else(|_| Tail::new(cap));
     receipt.finished_at = Some(receipts::now_micros());
-    receipts::event(
+    if let Err(error) = receipts::event(
         rt,
         ns,
         &receipt.id,
         "exited",
         json!({ "pid": pid, "timed_out": receipt.timed_out, "elapsed_ms": started.elapsed().as_millis() as u64 }),
     )
-    .await?;
+    .await
+    {
+        append_failure_reason(receipt, format!("exited event write failed: {error}"));
+    }
 
     if let Some(status) = status {
         use std::os::unix::process::ExitStatusExt;
@@ -1066,11 +1117,39 @@ async fn execute(
         let mut out_entries: Vec<TreeEntry> = Vec::new();
         let mut changes: Vec<Change> = Vec::new();
         let mut undeclared: BTreeSet<String> = BTreeSet::new();
+        let mut refused_count = 0usize;
+        let mut first_refusal: Option<String> = None;
         for (path, file) in &found {
-            let data = file
-                .read_content()
+            // A host filename can contain a backslash even though a tree
+            // path cannot. Do not publish an output tree that its own load
+            // path will reject; retain the input entry if there was one.
+            if let Err(error) = tree::validate_relative_path(path, "capture entry") {
+                receipt.skipped.push(path.clone());
+                refused_count += 1;
+                first_refusal.get_or_insert_with(|| error.to_string());
+                if let Some(old) = input.get(path.as_str()) {
+                    out_entries.push((*old).clone());
+                }
+                continue;
+            }
+            let captured = file
+                .read_content_bounded(khive_storage::MAX_BLOB_WHOLE_BYTES)
                 .map_err(|e| RuntimeError::Unconfigured(format!("capture entry {path:?}: {e}")))?;
-            let digest = digest_hex(&data);
+            let (data, digest) = match captured {
+                CaptureRead::Complete(content) => (content.bytes, content.digest),
+                CaptureRead::TooLarge { observed_at_least } => {
+                    receipt.skipped.push(path.clone());
+                    refused_count += 1;
+                    first_refusal.get_or_insert_with(|| format!(
+                        "capture entry {path:?} exceeds the {}-byte whole-blob limit (observed at least {observed_at_least} bytes)",
+                        khive_storage::MAX_BLOB_WHOLE_BYTES
+                    ));
+                    if let Some(old) = input.get(path.as_str()) {
+                        out_entries.push((*old).clone());
+                    }
+                    continue;
+                }
+            };
             match input.get(path.as_str()) {
                 Some(old) if old.content_ref == digest && old.mode == file.mode => {
                     out_entries.push((*old).clone());
@@ -1131,32 +1210,62 @@ async fn execute(
         receipt.changed = changes;
         receipt.undeclared = undeclared.into_iter().collect();
         receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
-        receipt.success =
-            !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+        receipt.success = !receipt.timed_out
+            && receipt.exit_code == Some(0)
+            && receipt.undeclared.is_empty()
+            && refused_count == 0
+            && receipt.reason.is_none();
+        if let Some(first) = first_refusal {
+            let detail = format!("capture refused {refused_count} output path(s); first: {first}");
+            append_failure_reason(receipt, detail);
+        }
 
         Ok(())
     }
     .await;
     if let Err(error) = captured {
-        receipt.success = false;
-        receipt.reason = Some(error.to_string());
+        append_failure_reason(receipt, error.to_string());
         receipt.tree_out = None;
         receipt.changed.clear();
         receipt.undeclared.clear();
         // A partial capture is never retained as a purported output tree,
         // including when successful runs would otherwise be kept.
-        cleanup(&run_dir, &profile_path, false);
+        finish_cleanup(receipt, &run_dir, &profile_path, false);
         return Ok(());
     }
 
-    cleanup(&run_dir, &profile_path, cfg.keep);
+    finish_cleanup(receipt, &run_dir, &profile_path, cfg.keep);
     Ok(())
 }
 
-fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) {
-    let _ = std::fs::remove_file(profile_path);
+#[cfg(unix)]
+fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Err(error) = std::fs::remove_file(profile_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            failures.push(format!(
+                "remove profile {}: {error}",
+                profile_path.display()
+            ));
+        }
+    }
     if !keep {
-        let _ = std::fs::remove_dir_all(run_dir);
+        if let Err(error) = std::fs::remove_dir_all(run_dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failures.push(format!(
+                    "remove run directory {}: {error}",
+                    run_dir.display()
+                ));
+            }
+        }
+    }
+    failures
+}
+
+#[cfg(unix)]
+fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, keep: bool) {
+    for failure in cleanup(run_dir, profile_path, keep) {
+        append_failure_reason(receipt, format!("exec cleanup failed: {failure}"));
     }
 }
 
