@@ -36,9 +36,9 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its sixteen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
-stored ingest cursor and checkpoint for one project and source kind), the three
-write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
+`kkernel git-ingest` CLI drive. Its seventeen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+stored ingest cursor and checkpoint for one project and source kind), the four
+write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
@@ -2762,7 +2762,7 @@ snapshot. Values are exact opaque strings, not a completion receipt or a guarant
 resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor
 writes (ADR-088 Amendment 1).
 
-### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
+### `git.commit` / `git.branch` / `git.update_ref` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell
 interpolation). Branch/ref names, remotes, messages, and authors are validated before they
@@ -2773,7 +2773,7 @@ Unicode, and caller text such as `:(top)` remain literal filename text. `force` 
 force-push through this surface.
 
 The handler-level `[git_write]` allowlist is mandatory and independent of Gate policy
-(ADR-018). With no `[[git_write.allowed]]` entries, all three write verbs deny every request,
+(ADR-018). With no `[[git_write.allowed]]` entries, all four write verbs deny every request,
 including under `AllowAllGate`. Repository paths are compared after canonicalization, so an
 entry names exactly one real repository; branch patterns are exact names or a glob containing
 at most one `*` wildcard.
@@ -2803,6 +2803,28 @@ request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.p
 ```
 
 ---
+
+### `git.update_ref` — Commissive
+
+Move an existing branch to an existing commit with an exact expected-head compare. The
+`[git_write]` repository and branch allowlist and Gate policy apply before the repository is touched.
+`expected` is required and must be the exact 40-hex current head; either hex case is accepted.
+`to` must be the full object id of an existing commit; branch names, tags, trees, unknown ids,
+and the zero object id refuse. `require_fast_forward`
+defaults to true. The expected-head compare, ancestry check, and ref
+compare-and-swap run while holding the same per-repository write lock. The result includes the
+observed `from`, requested `to`, whether the move was a fast-forward, and `receipt_id`. An optional
+`reason` is stored with the receipt.
+
+| Param | Type | Required | Notes |
+| ----- | ---- | -------- | ----- |
+| `repo` | string | yes | Absolute local path to an allowlisted git repository. |
+| `branch` | string | yes | Existing branch to move. |
+| `to` | string | yes | Full 40-hex object id of an existing commit. |
+| `expected` | string | yes | Exact 40-hex current branch head. |
+| `require_fast_forward` | boolean | no | Defaults to true. |
+| `reason` | string | no | Operator note stored with the receipt. |
+| `session_id` | string | no | Session label copied to the receipt. |
 
 ## `code` pack — 1 verb
 

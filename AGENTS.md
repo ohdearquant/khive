@@ -18,7 +18,7 @@ khive gives your agent:
 Production packs load by default; discover the exact loaded surface with
 `request(ops="verbs()")`. The `git` pack contributes the `git.digest` verb plus the
 commit/issue/pull_request provenance note kinds
-and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
+and a batch ingester, and four write verbs, `git.commit` / `git.branch` / `git.update_ref` / `git.push`
 (ADR-108), that shell to system git with hardened, allowlisted argv construction — no
 tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
 pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion

@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  138 public verbs (see the verb-catalog paragraph below       │
+│  139 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
@@ -117,7 +117,7 @@ not shipped.
 | `crates/khive-pack-schedule`    | Schedule pack: `schedule.remind`/`schedule`/`agenda`/`cancel` over `scheduled_event` notes                                                                                                                                                                                                                                                                                        |
 | `crates/khive-pack-knowledge`   | Knowledge pack: domain/atom corpus verbs, search, compose, suggest                                                                                                                                                                                                                                                                                                                |
 | `crates/khive-pack-session`     | Session pack: session storage/list/resume/export verbs                                                                                                                                                                                                                                                                                                                            |
-| `crates/khive-pack-git`         | Git pack: commit/issue/pull_request note kinds, `git.digest`, and write verbs `git.commit`/`git.branch`/`git.push` ([ADR-088](docs/adr/ADR-088-git-lifecycle-pack.md), [ADR-108](docs/adr/ADR-108-git-write-surface.md))                                                                                                                                                          |
+| `crates/khive-pack-git`         | Git pack: commit/issue/pull_request note kinds, `git.digest`, and write verbs `git.commit`/`git.branch`/`git.update_ref`/`git.push` ([ADR-088](docs/adr/ADR-088-git-lifecycle-pack.md), [ADR-108](docs/adr/ADR-108-git-write-surface.md))                                                                                                                                                          |
 | `crates/khive-pack-code`        | Code pack: code concept vocabulary, finding-note lifecycle, `code.ingest` ([ADR-085](docs/adr/ADR-085-code-pack.md))                                                                                                                                                                                                                                                              |
 | `crates/khive-pack-workspace`   | Workspace pack: `workspace` entity vocabulary and membership rules; zero verbs                                                                                                                                                                                                                                                                                                    |
 | `crates/khive-pack-tool`        | Tool pack: capability registry (`tool.register`/`describe`/`list`/`suggest`/`ingest`) and use policy (`tool.check`/`policy`/`request`/`grant`/`deny`/`revoke`) ([ADR-180](docs/adr/ADR-180-tool-pack.md))                                                                                                                                                                         |
@@ -210,8 +210,8 @@ dedicated map database); its `finding` note kind and `findings.json` batch inges
 still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment
 3), never the MCP verb surface; git contributes
 commit/issue/pull_request note kinds, a batch ingester, the git.digest verb (ADR-088
-Amendment 1), and three write verbs — git.commit / git.branch / git.push — that shell to
-system git with hardened, allowlisted argv construction and unconditional force-push denial
+Amendment 1), and four write verbs — git.commit / git.branch / git.update_ref / git.push — that
+shell to system git with hardened, allowlisted argv construction and unconditional force-push denial
 (ADR-108); comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
 Ask A) added 2026-07-08; kg.resolve added 2026-07-09; workspace (#873) contributes zero verbs,
 adding only the `workspace` entity kind and `contains` endpoint rules to git/gtd/session notes;
