@@ -3046,9 +3046,9 @@ async fn test_inbox_limit_200_succeeds() {
     );
 }
 
-/// inbox(limit=201) clamps silently to 200 and succeeds — no InvalidInput.
+/// inbox(limit=201) must refuse rather than silently change the requested page.
 #[tokio::test]
-async fn test_inbox_limit_201_clamps_to_200() {
+async fn test_inbox_limit_201_is_rejected() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
@@ -3070,11 +3070,12 @@ async fn test_inbox_limit_201_clamps_to_200() {
             serde_json::json!({ "limit": 201, "status": "all" }),
         )
         .await;
+    let error = result.expect_err("inbox(limit=201) must be rejected");
     assert!(
-        result.is_ok(),
-        "inbox(limit=201) must clamp silently to 200, not return an error; got err={:?}",
-        result.unwrap_err()
+        matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "inbox(limit=201) must return InvalidInput; got {error}"
     );
+    assert!(error.to_string().contains("at most 200"), "{error}");
 }
 
 /// inbox(status="banana") must return InvalidInput — unknown status values are rejected.
