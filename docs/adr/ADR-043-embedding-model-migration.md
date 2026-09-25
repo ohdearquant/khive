@@ -502,7 +502,7 @@ API method changes.
 
 ## Amendment A2: Amendment A1's `EmbeddingModelRecord` is not implemented (2026-09-25)
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** Amendment A1 says that "ADR-071 §5 introduces a runtime-owned type,
 `EmbeddingModelRecord`, in `crates/khive-runtime/src/embedding.rs`" and that
@@ -522,7 +522,7 @@ made:
 ADR-071 §5 and Phase 5 of its Boundary-Repair Plan specify the type change, and ADR-071 owns
 it. A1 records the effect on this ADR in the past tense, so it reads as completed.
 
-**Decision (proposed).** A1 describes a deferred change owned by ADR-071 §5 and is not yet
+**Decision (accepted).** A1 describes a deferred change owned by ADR-071 §5 and is not yet
 implemented. Until ADR-071 Phase 5 lands, the shipped contract of the Implementation section
 is the sentence A1 quotes: the runtime exposes read access through
 `KhiveRuntime::list_embedding_models`, whose element type is

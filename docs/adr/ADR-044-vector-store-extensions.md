@@ -655,7 +655,7 @@ SQLite-specific values.
 
 ## Amendment A3: operator commands and compliance tests as built (2026-09-25)
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** The CLI Surface section adds two operator-only commands, `khive vec-capabilities`
 and `khive vec-sweep --substrate=<kinds> [--namespace=<ns>] [--max-delete=<N>] [--dry-run]`.
@@ -689,7 +689,7 @@ What exists instead:
   (`crates/khive-db/src/stores/vectors.rs`) reports `supports_filter: false` and
   `supports_orphan_sweep: true`.
 
-**Decision (proposed).** The CLI Surface decision, two operator commands with no MCP
+**Decision (accepted).** The CLI Surface decision, two operator commands with no MCP
 exposure, stands and is implemented as `kkernel vector capabilities` and
 `kkernel vector sweep`. The `khive vec-*` command names and the Implementation Notes rows for
 the CLI file and the compliance harness are superseded by the locations above. The sweep

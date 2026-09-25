@@ -809,7 +809,7 @@ usable by those consumers without changing the message's backend or namespace.
 
 ## Amendment A6: configuration types and boot path as built (2026-09-25)
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** Section 2 specifies the target configuration types as `AppConfig`,
 `BackendConfig`, `BackendKind` and `PackConfig` in `crates/khive-config/src/lib.rs` "(or in
@@ -847,7 +847,7 @@ Amendment A4 already records that `[[backends]]` and `[packs.<name>]` are shippe
 readers to `engine_config.rs`. It does not touch Sections 2 and 8 or Open Question 1, which
 still name `AppConfig` at a path that has never existed.
 
-**Decision (proposed).** Section 2's target types are realized as `KhiveConfig`,
+**Decision (accepted).** Section 2's target types are realized as `KhiveConfig`,
 `BackendConfig`, `BackendKind` and `PackConfig` in `crates/khive-runtime/src/engine_config.rs`.
 `AppConfig` is no longer a target type, and this ADR plans no `khive-config` crate. Open
 Question 1 is closed by that placement: the types live in `khive-runtime` with the rest of

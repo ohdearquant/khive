@@ -380,7 +380,7 @@ wraps.
 
 ## Amendment 1 (2026-09-25): the formal proofs are not in this repository
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** The "Formal proofs" section says proof files "relocate from the internal
 implementation to `khive/proofs/Retrieval/` and `khive/proofs/Scoring/`", that
@@ -409,7 +409,7 @@ The repository history shows what was built and what was removed:
   `// Formal proof: khive.Retrieval.HNSW.checkpoint_correctness`, which names one of the
   deleted placeholders.
 
-**Decision (proposed).** The formal-proof part of this ADR is unimplemented in this
+**Decision (accepted).** The formal-proof part of this ADR is unimplemented in this
 repository and deferred. The "Formal proofs" section and Phase 2 describe a target with no
 artifact here. The sentences that say khive ships formal proofs, and the "(verified)" labels
 in the capability table, do not describe the current release and are not to be cited as

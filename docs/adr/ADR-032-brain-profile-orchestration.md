@@ -1394,7 +1394,7 @@ events. Profile attribution, fold weights, and replay interpretation are unchang
 
 ## Amendment 4 — Entity-posterior cache eviction order (2026-09-25, #3319)
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** Section 5a says: "Entity posteriors use a bounded LRU cache (10K entries default,
 configurable per namespace). Old entries evict on capacity. The eviction order is
@@ -1417,7 +1417,7 @@ updates reach the cache through `get_or_insert` (`BalancedRecallState::apply_sig
 per-namespace setting, which Open Question 5 still lists as open. #3319 reports the
 first-in, first-out behaviour as a defect.
 
-**Decision (proposed).** The entity-posterior cache is least-recently-used, where a use is a
+**Decision (accepted).** The entity-posterior cache is least-recently-used, where a use is a
 posterior update through the write path (`get_or_insert`). A read through `get` does not
 change the order. Eviction removes the least recently updated entity, and when a restored
 snapshot holds more entries than the capacity, the entries dropped are the least recently
@@ -1450,7 +1450,7 @@ refresh positions from there.
 
 ## Amendment 5 — `ModuleName` and LoRA profile state are not implemented (2026-09-25)
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 **Context.** Section 6.1 ("Versioned `ModuleName` enum") says "khive defines a closed
 `ModuleName` enum in `khive-types`" and gives its source location as
@@ -1469,7 +1469,7 @@ profile record writes `"Bayesian"`; no verb parameter sets it. The brain-native
 `AdapterRecord` of Section 6.4 does exist (`crates/khive-brain-core/src/brain_state.rs`), so
 adapter registration records are present while the adapter state they would key is not.
 
-**Decision (proposed).** Section 6.1 and the `LoraProfileState` shape in Section 5b are target
+**Decision (accepted).** Section 6.1 and the `LoraProfileState` shape in Section 5b are target
 architecture on the same footing as the types Section 2 lists: they are not shipped v1 API,
 and `crates/khive-types/src/lora.rs` does not exist. The design rule of Section 6.1 (a closed
 enum keyed by stable serde names, extended by adding variants and never renamed or removed
