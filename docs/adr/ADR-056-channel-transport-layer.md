@@ -27,6 +27,129 @@ statement; its SessionStore design was not carried forward\
 by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
 #1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment)
 
+## Amendment 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication
+
+**Status**: Proposed
+
+**Context.** The Telegram amendment (2026-07-05) states at-least-once delivery only for inbound
+updates, where the `tg:{chat_id}:{update_id}` key deduplicates a re-delivered update. ADR-122 §3 and
+its Consequences state at-least-once delivery for outbound email and name the duplicate window,
+which a deterministic Message-ID makes harmless at the receiver. Nothing states the outbound
+Telegram guarantee. In the shared outbox loop (`crates/khive-mcp/src/serve_outbox.rs`,
+`outbox_once`) a note is stamped delivered only after `send` returns success, and the Telegram
+envelope carries no external id. The Bot API's `sendMessage` takes no idempotency key.
+`crates/khive-channel-telegram/src/connector.rs` maps a failed request or an unreadable response to
+`ChannelError::Transport`, and a 408, 429 or 5xx answer to the same error, and that error is retried.
+
+**Decision.** Outbound Telegram delivery is at-least-once with no receiver-side deduplication. A send
+whose outcome the adapter cannot observe (a timeout or reset after the request was written, an
+unreadable response, a 5xx from an intermediary), or a failure between a successful `sendMessage` and
+the delivered stamp, leaves the note pending, and a later pass sends the same text again. The chat
+can then show the message twice. A note is never stamped delivered before `sendMessage` succeeds, so
+a message is not lost to avoid a duplicate.
+
+**Alternatives considered.**
+
+- Stamp before sending (at-most-once). A lost request silently drops the message, the loss mode
+  ADR-122 rejects for email ("Exactly-once via stamp-before-send").
+- Treat a timeout after the request was written as outcome-unknown and hold the note instead of
+  retrying it. This narrows the duplicate window but needs a new delivery state and an operator path
+  to settle it. Not decided here.
+
+**Consequences.** Duplicates are visible in the chat and nothing in khive removes them. The adapter's
+design notes and the communication guide should carry the same statement. How the loop paces
+retries after a 429 is a separate question (#3201).
+
+**Refs.** #3278; ADR-122 §3 and Consequences.
+
+## Amendment 2026-09-25 -- `external_id` on a message note is transport-owned at creation
+
+**Status**: Proposed
+
+**Context.** The 2026-08-09 amendment says "Generic `message` create and update paths MUST refuse
+caller-supplied `channel_kind`, `channel_slug`, and `quarantined`; only the trusted `comm.ingest`
+path establishes that transport provenance and disposition." `external_id` carries more weight than
+those three keys. It is the dedup key of §10 and §11 (the unique index over `(namespace, kind,
+external_id)`, written with `INSERT OR IGNORE`, where a collision is reported as deduplicated), the
+key reply threading matches `correlation_external_id` against (§5a), and, on a pending outbound
+email note, the value the delivery loop sends as the Message-ID, which it claims only when the
+property is absent (ADR-122; `crates/khive-mcp/src/serve_outbox.rs`).
+
+Every create-time refusal list names the three keys only: the comm pack's validator
+(`TRANSPORT_OWNED_MESSAGE_PROPERTIES` in `crates/khive-pack-comm/src/pack.rs`), the runtime's copy
+guarding `try_create_note` (`crates/khive-runtime/src/operations.rs`), and the kind-owned list the
+note-store accessor guard reads (`KIND_OWNED_PROPERTIES` in `crates/khive-runtime/src/curation.rs`,
+used by `note_store_guard`). `external_id` is in `OWNER_ESTABLISHED_PROPERTIES`, which governs
+updates of existing records only; its comment says introducing those keys at creation "is a separate
+question". So a caller can create a `message` note carrying any `external_id`. The value then decides
+which later transport message deduplicates against the note, which inbound replies thread to it, and,
+for outbound email, the Message-ID khive sends (#3350).
+
+**Decision.** `external_id` joins the transport-owned message properties of the 2026-08-09
+amendment at creation. Every path that creates a `message` note, other than the two owner paths
+below, refuses a caller-supplied `external_id` by key presence and names the key. Today those paths
+are generic create and its validator, proposal add-note, the runtime's `try_create_note`, and the
+note-store accessor; a path added later joins by creating `message` notes, not by being listed. Two
+owner paths establish the value: `comm.ingest` for inbound messages, through the trusted ingest
+path, and the outbound delivery claim of ADR-122 on an existing outbound note. Update and merge
+already treat `external_id` as owner-established; that is unchanged.
+
+**Alternatives considered.**
+
+- Refuse it on the create verb only. The runtime's `try_create_note` and the note-store accessor
+  stay open to in-process callers, while the three sibling keys are refused on all of them.
+- Have the outbox accept only a value equal to `<{note_id}@{domain}>`. That protects the outbound
+  Message-ID but not inbound deduplication or threading, and it breaks reuse of a claimed value after
+  the sender mailbox's domain changes. It remains possible as defence in depth.
+- Document the property as caller-writable. Inbound deduplication and threading would then depend on
+  callers never choosing a transport's id.
+
+**Consequences.** Rows created before the rule keep their values. [ADR-125](ADR-125-reserved-property-keys.md)'s
+`OwnerOnly` class is the general form of this rule; this amendment does not depend on it. Acceptance:
+creating a `message` note with `external_id` is refused on each path named above, naming the key;
+controls, `comm.ingest` stores the `external_id` it is given, and the outbound claim writes one on a
+pending note.
+
+**Refs.** #3350, #3202; ADR-122 (outbound Message-ID claim).
+
+## Amendment 2026-09-25 -- Inbound email has a per-message byte cap
+
+**Status**: Proposed
+
+**Context.** The IMAP poll fetches every selected message whole
+(`uid_fetch(..., "RFC822")` in `crates/khive-channel-email/src/connector/imap.rs`), up to
+`IMAP_PAGE_LIMIT` (50) messages a page (`crates/khive-channel-email/src/channel.rs`), holds the page
+in memory, and parses each message before sender attribution runs. No byte bound exists anywhere in
+the crate. The polled mailbox accepts mail from any sender, so the bytes held and parsed per poll are
+bounded only by the provider's maximum message size times 50. This record bounds the iMessage
+helper's response in bytes (Amendment 2026-07-17) and names no bound for an inbound email message.
+
+**Decision.** Inbound email has a per-message byte cap: operator configuration with a finite
+default. The poll reads each selected message's size as the mailbox server reports it
+(`RFC822.SIZE`) before fetching bodies. A message over the cap is not fetched and takes the
+poison-UID disposition of the 2026-07-09 amendment: a quarantine envelope carrying the stable
+`imap:{host}:{uidvalidity}:{uid}` dedup key and a third reason, `oversize`, with the reported size,
+stored whatever `quarantine_store` says, so the cursor advances past it. A fetched body larger than
+the cap is discarded before parsing and takes the same disposition. The size comes from the mailbox
+provider, not from the sender.
+
+**Alternatives considered.**
+
+- Record the provider's maximum message size times the page limit as the bound. That bound belongs
+  to the provider, not the deployment, and parsing runs before attribution, so an unauthenticated
+  sender chooses how many bytes are parsed.
+- Bound bytes per page only. Memory is bounded, but a single message larger than the page budget
+  either blocks the page or is dropped with no record.
+- Skip an oversized message without a record. The operator loses the quarantine count that
+  2026-08-09 made observable.
+
+**Consequences.** Legitimate mail over the cap is quarantined, not ingested, and shows in the
+quarantine counts. Each page costs one extra size fetch. Acceptance: a mailbox fixture with one
+message over the cap quarantines it with reason `oversize` without fetching its body, the rest of the
+page ingests and the cursor advances; control, a message at the cap ingests.
+
+**Refs.** #3200.
+
 ## Amendment 2026-08-09 -- Quarantine health and recovery
 
 Quarantining is a successful terminal disposition for one transport item, not

@@ -276,7 +276,7 @@ therefore writes its entity and receipt rows there and its attachment rows on th
 through the core accessor, which is also how the pack keeps its bodies alive under one sweep. A9 is
 amended below to say exactly that. Because the record and its attachment row live in different
 databases, ADR-121's same-transaction delete cascade does not reach across, and
-[ADR-073](ADR-073-multi-backend-storage.md) grants no atomicity across backends and asks handlers
+[ADR-073](ADR-073-pack-core-backend-accessor.md) grants no atomicity across backends and asks handlers
 for idempotent or compensating writes. So hard-deleting a routed `page` or `resource` is one verb
 invocation with two commits in a fixed order: the record's own backend commits the delete first,
 then the main backend deletes the attachment rows that named the record, and that second delete is
@@ -309,3 +309,177 @@ A9 reads "with two backends configured, web writes land in the web backend only"
 that is true of entity, note and edge rows and false of attachment rows by design, so A9 is amended
 to: with two backends configured, a web pack's entity, note and edge rows land in the web backend
 only, and its attachment rows land on the main backend only (ADR-160); the arm asserts both halves.
+
+## Amendment 2 (2026-09-25): which resolved addresses egress refuses, and no ambient proxy
+
+**Status**: Proposed
+
+**Context.** D3 carries the egress rules of ADR-175 Amendment 1 over "on their own merits", naming
+"address classification after resolution (loopback, link-local, private, and metadata ranges
+refused)", and A6 keeps "the egress arms of ADR-175 Amendment 1, renumbered, unchanged in substance".
+The rule carried over is ADR-175 A1.2 rule 2: every resolved address is checked, "a loopback,
+link-local, private, unique-local, multicast, broadcast or unspecified address refuses; the shared
+address space 100.64.0.0/10 counts as private", and "the connection is then made to an address that
+passed, never to a fresh resolution of the name". ADR-175 is superseded and is not edited; additions
+to the carried-over rule belong here.
+
+Two gaps in the implementation of that rule:
+
+- `classify_address` in `crates/khive-pack-web/src/egress.rs` classifies the embedded IPv4 address
+  of an IPv4-mapped IPv6 address (`::ffff:0:0/96`) and of no other IPv6 form. IPv6 addresses that
+  reach an IPv4 destination through a translator or a tunnel therefore classify as public whatever
+  IPv4 address they carry (#3280).
+- `pinned_client` in the same file pins the checked address with `resolve` but does not disable
+  proxies, and the HTTP client it builds takes a proxy from the process environment or system
+  configuration by default. With a proxy configured, the request goes to the proxy and the checked
+  address governs nothing (#3279).
+
+**Decision.**
+
+1. The refused classes are unchanged: loopback, link-local (which includes the metadata address
+   169.254.169.254), private, the shared address space 100.64.0.0/10 (as private), unique-local,
+   multicast, broadcast and unspecified, checked on every resolved address and on every redirect
+   hop.
+2. IPv6 addresses that carry an IPv4 destination are classified by that destination where the
+   standard fixes its position, and refused as a whole where it does not:
+   - IPv4-mapped, `::ffff:0:0/96`: the embedded IPv4 address is classified by the IPv4 rules
+     (current behaviour, recorded here).
+   - The NAT64 well-known prefix `64:ff9b::/96` (RFC 6052): the embedded IPv4 address, which RFC 6052
+     places in the low 32 bits for a /96 prefix, is classified by the IPv4 rules. The IPv6 address
+     refuses exactly when that IPv4 address would. RFC 6052 section 3.1 already forbids the
+     well-known prefix for non-global IPv4 addresses, so this refuses only addresses the standard
+     says should not appear.
+   - The local-use translation prefix `64:ff9b:1::/48` (RFC 8215): refused as a whole. The network
+     chooses the prefix length inside it, so the position of the embedded IPv4 address cannot be
+     read from the address.
+   - 6to4, `2002::/16` (RFC 3056): refused as a whole. Its embedded IPv4 address names the relay
+     router that decapsulates the packet, not the destination, so classifying it would certify the
+     relay and say nothing about where the request lands.
+
+   A refusal names the resolved IPv6 address and, for `64:ff9b::/96`, the embedded IPv4 address and
+   its class.
+3. The fetch client uses no ambient proxy. The pin in rule 2 is the connection itself, so a client
+   never takes a proxy from the process environment or system configuration. Proxied egress is not
+   supported; a deployment that needs it needs its own rule stating how the address check still
+   binds the destination.
+
+**Alternatives considered.**
+
+- Refuse all of `64:ff9b::/96`. Simplest and fail-closed, but on an IPv6-only host behind DNS64 and
+  NAT64 (RFC 6147) every IPv4-only origin resolves only to synthesized `64:ff9b::/96` addresses, and
+  one refused address refuses the whole host (`resolve_and_pin` in `egress.rs`). Every IPv4-only site
+  would be unreachable on that deployment shape, to avoid a check that is exact for this prefix.
+- Decode the IPv4 address embedded in 6to4 as well. It certifies the relay, not the destination
+  (Decision 2). 6to4 relaying through the anycast prefix is deprecated (RFC 7526), so the cost of the
+  whole-prefix refusal is the few hosts that still publish a 6to4 address, refused as a whole under
+  the any-address rule.
+- Classify against the full IANA special-purpose address registries, admitting only addresses
+  marked globally reachable. Broader: it would also refuse documentation, benchmarking and reserved
+  ranges absent from the list above. It changes refusals beyond #3280 and needs its own acceptance
+  arms; it is not decided here.
+- Honour an operator-configured proxy. Out of scope; see Decision 3.
+
+**Consequences.**
+
+- Newly refused, relative to the implementation: `64:ff9b::/96` addresses whose embedded IPv4
+  address is in a refused class, and all of `64:ff9b:1::/48` and `2002::/16`. A process with a proxy
+  configured now connects directly to the pinned address. Nothing refused today becomes allowed.
+- Not covered by address classification: a network-specific NAT64 prefix (RFC 6052 section 2.3) is
+  indistinguishable from ordinary global unicast by address, so on such a network the operator
+  allow-list (ADR-175 A1.2 rule 3) is the control. Teredo (`2001::/32`) and the deprecated
+  IPv4-compatible form (`::/96`) are not decoded by this rule and classify as ordinary IPv6
+  addresses.
+- A6 gains arms, controls stated first. Must refuse: `64:ff9b::7f00:1` (127.0.0.1),
+  `64:ff9b::a9fe:a9fe` (169.254.169.254), `64:ff9b::a00:1` (10.0.0.1), `64:ff9b::6440:1`
+  (100.64.0.1), `64:ff9b:1::1`, `2002:808:808::1`, and a resolver answer carrying one of these beside
+  a public address. Must allow: `64:ff9b::808:808` (8.8.8.8) and `2001:4860:4860::8888`. Proxy: with
+  a proxy variable set in the process environment the request reaches the pinned address; control, a
+  client built without the proxy exclusion sends it to the proxy.
+
+**Refs.** #3280, #3279; ADR-175 Amendment 1, A1.2 rules 2 and 3.
+
+## Amendment 3 (2026-09-25): a HEAD receipt records no digest and no size
+
+**Status**: Proposed
+
+**Context.** D4, as amended by A1.2, says "a request that stores no body, `persist` false or a HEAD,
+writes a receipt with no blob reference and records the content digest, size, final URL and fetch
+time". A HEAD response has no body. ADR-175 A1.1, carried over by D3, says "`HEAD` reads no body and
+writes no blob; its reply has `content_ref: null`, `bytes: 0` and `truncated: false`, regardless of a
+response's advertised content length". So D4 asks a HEAD receipt for a digest that cannot exist.
+
+The implementation (`crates/khive-pack-web/src/fetch.rs`, `settle`) takes the no-body arm with zero
+bytes and no reference, falls back to the absent reference for the digest, and writes
+`content_digest: null` and `size: 0` into the receipt. A HEAD that mints a row with no stored body
+writes the same pair into the row through `representation_patch`. A size of 0 states that the body
+is empty, which the request never observed (#3199).
+
+**Decision.** D4's "content digest and size" applies to a GET with `persist` false. A HEAD writes a
+receipt with no blob reference, no content digest and no size (both absent or null), with the final
+URL, status, fetch time and the allow-listed response headers, which carry the origin's advertised
+`Content-Length` when it sent one. `bytes` in the reply and the receipt stays 0, as ADR-175 A1.1
+specifies: it counts bytes read. A HEAD that mints or updates a row with no stored body leaves that
+row's `content_digest` and `size` unset. A row that already holds a GET body keeps its body metadata,
+as the implementation does today.
+
+**Alternatives considered.**
+
+- Record the advertised `Content-Length` as `size`. Everywhere else `size` counts decompressed bytes
+  the pack read (ADR-175 A1.2 rule 5). An advertised length is the origin's claim, and the fetch
+  client removes it from responses it decompresses (the HTTP client's documented behaviour for
+  transparent decompression), so `size` would be a count for one method, a claim for another, and
+  missing for compressed responses. The claim is already in the receipt's response headers.
+- Keep D4 as written and change the code: impossible for the digest.
+- Keep `size: 0`: it reports an empty body that was never read.
+
+**Consequences.** The receipt and row writes for a HEAD change from `size: 0` to no size. Readers of
+`size` see either a count of bytes read or nothing. Acceptance: a HEAD receipt carries neither
+`content_digest` nor `size` and its response headers carry the advertised `content-length`; control,
+a GET receipt with `persist` false carries both.
+
+**Refs.** #3199, #3160.
+
+## Amendment 4 (2026-09-25): deterministic identity is per namespace
+
+**Status**: Proposed
+
+**Context.** D1 says "Identities are deterministic (UUIDv5 over the identity tuple under the pack
+namespace) so repeated fetches and independent ingests converge on the same rows", and D3 says
+"every write lands in the caller's namespace through the runtime's create seam". Entity ids are
+global: by-id resolution carries no namespace check (ADR-007 Rule 2). In
+`crates/khive-pack-web/src/identity.rs`, `site_id` is UUIDv5 over the site key alone, `document_id`
+keys on the site id and the path and query, and `derived_text_id` keys on the document id; no
+namespace enters. Two namespaces that fetch one URL therefore compute one id. `get_or_create` in
+`crates/khive-pack-web/src/entities.rs` refuses a row owned by another namespace as not found
+(`require_entity_namespace`, whose comment calls it an interim safeguard while namespace-aware
+deterministic identity is pending). Today the first namespace to fetch a URL holds it, and every
+other namespace's fetch of that URL is refused (#3037).
+
+**Decision.** The identity tuple gains the namespace the rows are written to. `site` identity is
+UUIDv5 under the pack namespace over (write namespace, scheme, host, port); `page`, `resource` and
+derived-text identities key on the site or document id as they do now, and inherit the namespace
+through it. Convergence in D1 and A5 holds within a namespace: repeated fetches and independent
+ingests in one namespace converge on the same rows, and two namespaces hold two rows. Bodies still
+deduplicate across namespaces in the content-addressed blob store.
+
+**Alternatives considered.**
+
+- Keep URL-only ids and the refusal (the implementation today). A URL can be persisted by one
+  namespace for the life of the store; every other namespace loses the pack for that URL.
+- Keep URL-only ids and share one row across namespaces. A second namespace's writes would land on
+  a row attributed to the first, contrary to D3's "every write lands in the caller's namespace".
+- Make the namespace part of a composite storage key instead of the id. Entity ids are global and
+  single-column; this changes storage for one pack's convenience.
+
+**Consequences.**
+
+- Rows stored under the URL-only derivation are not re-keyed by this amendment. Once it is
+  implemented, fetch, ingest and refresh derive the namespaced id, so a URL fetched again gets a new
+  row; the earlier row stays readable by id and by search until removed. Whether stored rows warrant
+  a re-keying migration depends on how many exist and is not decided here.
+- `require_entity_namespace` no longer triggers for ids derived under this rule and stays as a guard.
+- Acceptance: the same URL fetched in two namespaces yields two `page` rows with different ids and
+  one blob; control, the same URL fetched twice in one namespace yields one row. A5 runs within one
+  namespace.
+
+**Refs.** #3037.

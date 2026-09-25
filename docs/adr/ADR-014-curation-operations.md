@@ -575,8 +575,10 @@ note of the right kind.
   `update_edge`, `merge_note` (new), `update_note` (new).
 - `crates/khive-runtime/src/operations.rs`: `get_edge`, `list_edges`,
   `delete_edge`, `count_edges`, `delete_entity`, `delete_note`.
-- `crates/khive-runtime/src/audit.rs`: event emission helpers for each curation
-  operation.
+- `crates/khive-runtime/src/curation.rs` and `crates/khive-runtime/src/operations.rs`: each
+  curation event is appended inline by the operation that writes it (`EntityUpdated`,
+  `EntityMerged` and `NoteMerged` in `curation.rs`; `EdgeUpdated`, `EntityDeleted`,
+  `NoteDeleted` and `EdgeDeleted` in `operations.rs`); there is no separate event-helper module.
 - `EntityDedupMergePolicy` type lives in `khive-runtime` (curation policy, not a
   substrate type).
 - Cross-backend merge guard: SubstrateCoordinator checks that
@@ -730,3 +732,66 @@ The following do not satisfy the curation contract and are rejected:
 
 No open design question remains within this curation amendment. The intended patch and merge
 semantics remain fixed; only stale full-row persistence becomes explicitly refusable.
+
+## Amendment — Merge event committed with the merge (#3262)
+
+**Status**: Proposed (2026-09-25)
+
+This amendment would qualify steps 9 to 11 of `merge_entity` semantics, step 6 of `merge_note`
+semantics, and the transaction-boundary paragraph after "Reversible edge-conflict resolution". The
+accepted text above is left as written until it is accepted.
+
+### Context
+
+The accepted steps read "10. Commit transaction." and then "11. Emit MergeEvent for audit trail ...
+Skipped when `dry_run` is true", and the edge-conflict paragraph says the preimages are kept so that
+"restoring the dropped edge followed by that list reconstructs the destroyed subgraph". The
+transaction-boundary paragraph defers durable retry for the post-commit vector re-insert only.
+
+In `crates/khive-runtime/src/curation.rs`, `merge_entity_with_validation` mints `merge_event_id`
+before the transaction, writes it into the tombstone inside the transaction, commits, runs
+`reindex_entity_with_plan` (which returns early on error), and only then builds the `EntityMerged`
+payload holding `self_loop_edge_preimages` and `edge_conflict_preimages` and appends it with
+`append_event`. The note merge appends `NoteMerged` after its commit the same way, before its reindex.
+The event payload is the only durable copy of those preimages. A process exit, or for the entity
+merge a reindex or append error, between the commit and the append leaves the merge applied, the
+tombstone naming an event that does not exist, and the hard-deleted edges unrecoverable (#3262).
+
+### Decision
+
+The `EntityMerged` or `NoteMerged` event row, keyed by the pre-minted `merge_event_id` and carrying
+the preimages, is inserted inside the merge's own backend transaction, with the namespace and actor
+stamping the event store applies on append. The merge commits only if that insert succeeds; if the
+insert fails, the merge rolls back and the caller receives the error. `dry_run` writes no event, as
+now. The vector re-insert stays after commit, as the transaction-boundary paragraph says.
+
+This is consistent with [ADR-170](ADR-170-events-daemon-split.md): plain `append_event` rows already
+stay on the domain store ("Plain appends (`append_event`/`append_events`) stay on the domain store
+unchanged"), trait reads merge both stores, and its compliance note says an audit class with non-loss
+requirements "must ride the domain store's transaction". A merge event whose payload is the only copy
+of destroyed rows is such a class.
+
+### Alternatives considered
+
+- Keep the post-commit append and add a durable outbox row written inside the transaction, replayed
+  idempotently by `merge_event_id`. It closes the window too, with a second table, a replay path and
+  a period in which the preimages exist only in the outbox.
+- Keep the post-commit append and make its failure non-fatal. That fixes the reported error but not
+  the loss (#3219 names the crash window as out of its reach).
+
+### Consequences
+
+- A new caller-visible failure: an event insert failure aborts the merge instead of following a
+  committed one.
+- The tombstone's `merge_event_id` always names an existing event.
+- #3219's lost-event case after a reindex error no longer arises for the event. Reporting a
+  post-commit reindex error on the summary (`post_commit_reindex_error`) instead of failing a
+  committed merge, as the note merge already does, remains compatible with this amendment.
+- Acceptance: with a file-backed store, a process that exits right after the merge commits leaves an
+  event whose id equals the tombstone's `merge_event_id` and whose payload holds the dropped self-loop
+  edge's preimage, for an entity merge and for a note merge; control, an exit before the commit leaves
+  neither the merge nor the event.
+
+### Refs
+
+#3262, #3219, #3174.
