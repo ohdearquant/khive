@@ -260,7 +260,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: each result carries status=success|failed|unknown (unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
+        description: "Fetch one or up to 500 inbound messages and mark them read. Successful results include subject, content, and routing fields by default; body=false keeps the existing acknowledgement-only response. Mark writes are best-effort: each result carries status=success|failed|unknown (failed and unknown results add no message body; unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -276,6 +276,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 param_type: "array of string",
                 required: false,
                 description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; all targets are validated before mutation and duplicate resolved ids are updated once.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "body",
+                param_type: "boolean",
+                required: false,
+                description: "Defaults to true. Set false to retain the prior acknowledgement-only response without top-level subject, content, or routing fields; the read mark is still attempted.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -628,6 +635,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "comm.probe",
         description: "Read-only poll for new inbound message metadata and stale unread count. \
+                      Probing your own mailbox needs no read grant; any other mailbox requires \
+                      the same mailbox read grant as comm.inbox(mailbox_actor=...). \
                       Selects the earliest 100 unseen messages by commit sequence, then displays \
                       that page by created_at ascending. cursor_us advances only through rows \
                       actually returned and never below the honored caller cursor; an empty page \

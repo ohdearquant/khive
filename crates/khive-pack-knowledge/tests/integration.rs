@@ -2226,6 +2226,7 @@ async fn list_cursor_walk_has_no_gaps_or_duplicates_during_concurrent_inserts() 
             .expect("insert concurrent rows");
     }
 
+    let mut terminated = false;
     for _ in 0..10 {
         let page = f
             .dispatch(
@@ -2246,10 +2247,17 @@ async fn list_cursor_walk_has_no_gaps_or_duplicates_during_concurrent_inserts() 
         }
         match page["next_after"].as_str() {
             Some(next) => after = next.to_string(),
-            None => break,
+            None => {
+                terminated = true;
+                break;
+            }
         }
     }
 
+    assert!(
+        terminated,
+        "cursor walk must terminate with null next_after"
+    );
     let unique: std::collections::HashSet<String> = seen.iter().cloned().collect();
     assert_eq!(
         unique.len(),
@@ -7100,3 +7108,183 @@ include!("support/project_origin.rs");
 
 #[path = "integration/refusal_events.rs"]
 mod refusal_events;
+
+#[path = "../src/knowledge/cursor_query.rs"]
+mod cursor_query;
+
+#[tokio::test]
+async fn cursor_indexes_cover_order_and_walk_terminates() {
+    use khive_db::{migrations::MIGRATIONS, StorageBackend};
+    use khive_runtime::RuntimeConfig;
+    use std::collections::HashSet;
+
+    for migrated in [false, true] {
+        let backend = Arc::new(StorageBackend::memory().unwrap());
+        if migrated {
+            let mut writer = backend.pool().writer().unwrap();
+            let conn = writer.conn_mut();
+            conn.execute_batch(include_str!(
+                "../../khive-db/sql/schema-migrations-table.sql"
+            ))
+            .unwrap();
+            // Rebuild the actual parent migration prefix, without the new indexes.
+            for migration in MIGRATIONS.iter().filter(|m| m.version <= 38) {
+                conn.execute_batch(migration.up).unwrap();
+                conn.execute(
+                    "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+                    rusqlite::params![migration.version, migration.name],
+                )
+                .unwrap();
+            }
+        } else {
+            backend.prepare_core_schema().unwrap();
+        }
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            let tx = writer.conn_mut().transaction().unwrap();
+            for (kind, table) in [(0, "knowledge_atoms"), (1, "knowledge_domains")] {
+                for (ns_number, namespace) in [(0, "local"), (1, "foreign")] {
+                    for n in (1..=1020).rev() {
+                        // 1000 live rows, ten tombstones, ten atom-only domain mirrors.
+                        if kind == 1 && n > 1010 {
+                            continue;
+                        }
+                        let id = format!("{kind:08x}-{ns_number:04x}-4000-8000-{n:012x}");
+                        let tags = if n > 1010 { "[\"type:domain\"]" } else { "[]" };
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO {table} \
+                                (id, namespace, slug, name, tags, created_at, \
+                                updated_at, deleted_at) \
+                                VALUES (?1, ?2, ?3, 'cursor row', ?4, ?5, ?5, ?6)"
+                            ),
+                            rusqlite::params![
+                                id,
+                                namespace,
+                                format!("row-{n}"),
+                                tags,
+                                n / 25,
+                                if (1001..=1010).contains(&n) {
+                                    Some(1)
+                                } else {
+                                    None
+                                }
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            tx.commit().unwrap();
+        }
+        if migrated {
+            let writer = backend.pool().writer().unwrap();
+            let count: i64 = writer
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'idx_knowledge_%_cursor'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "historical fixture must lack cursor indexes");
+            drop(writer);
+            backend.prepare_core_schema().unwrap();
+        }
+        let runtime = KhiveRuntime::from_backend(backend, RuntimeConfig::no_embeddings());
+        let fixture = pack(runtime.clone());
+        for (kind, list_type, table) in [
+            (0, "atom", "knowledge_atoms"),
+            (1, "domain", "knowledge_domains"),
+        ] {
+            let index = format!("idx_{table}_cursor");
+            {
+                let writer = runtime.backend().pool().writer().unwrap();
+                let conn = writer.conn();
+                let columns: Vec<String> = conn
+                    .prepare(&format!("PRAGMA index_info('{index}')"))
+                    .unwrap()
+                    .query_map([], |r| r.get(2))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(
+                    columns,
+                    ["namespace", "created_at", "id"],
+                    "cursor index must cover tie-breaker"
+                );
+                for subsequent in [false, true] {
+                    let clause = if kind == 0 {
+                        " AND (status IS NULL OR status != 'deprecated')"
+                    } else {
+                        ""
+                    };
+                    let sql = cursor_query::cursor_query(table, "id, slug", subsequent, clause);
+                    let mut params = vec![rusqlite::types::Value::Text("local".into())];
+                    if subsequent {
+                        params.push(rusqlite::types::Value::Integer(0));
+                        params.push(rusqlite::types::Value::Text(format!(
+                            "{kind:08x}-0000-4000-8000-000000000001"
+                        )));
+                    }
+                    params.push(rusqlite::types::Value::Integer(74));
+                    let plan: Vec<String> = conn
+                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                        .unwrap()
+                        .query_map(rusqlite::params_from_iter(params), |r| r.get(3))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    eprintln!("migrated={migrated} subsequent={subsequent} {table}: {plan:?}");
+                    assert!(
+                        plan.iter().any(|p| p.contains(&index)),
+                        "cursor plan must use compound index: {plan:?}"
+                    );
+                    assert!(
+                        !plan.iter().any(|p| p.contains("TEMP B-TREE")),
+                        "cursor ordering must not sort: {plan:?}"
+                    );
+                }
+            }
+            for (ns_number, namespace) in [(0, "local"), (1, "foreign")] {
+                let expected: HashSet<String> = (1..=1000)
+                    .map(|n| format!("{kind:08x}-{ns_number:04x}-4000-8000-{n:012x}"))
+                    .collect();
+                let mut seen = HashSet::new();
+                let mut after = String::new();
+                let mut terminated = false;
+                for _ in 0..20 {
+                    let page = fixture
+                        .dispatch(
+                            "knowledge.list",
+                            json!({
+                                "type": list_type, "namespace": namespace, "after": after,
+                                "limit": 73, "fields": ["id", "slug"],
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    for row in page["results"].as_array().unwrap() {
+                        assert!(
+                            seen.insert(row["id"].as_str().unwrap().to_string()),
+                            "cursor walk must not repeat rows"
+                        );
+                    }
+                    if page["next_after"].is_null() {
+                        terminated = true;
+                        break;
+                    }
+                    after = page["next_after"].as_str().unwrap().to_string();
+                }
+                assert!(
+                    terminated,
+                    "cursor walk must terminate with null next_after"
+                );
+                assert_eq!(
+                    seen, expected,
+                    "cursor walk must return exact live namespace set"
+                );
+            }
+        }
+    }
+}

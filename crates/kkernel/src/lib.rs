@@ -2,6 +2,9 @@
 
 mod sql;
 
+#[cfg(test)]
+mod test_process;
+
 mod atomic_apply;
 pub mod cli;
 pub mod code_audit;

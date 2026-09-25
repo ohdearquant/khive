@@ -87,6 +87,21 @@ refused text, and multiple input rows can share a slug. Correct the identified r
 and retry the batch, or submit selected rows separately; the batch verb does not
 return per-record partial commits.
 
+Use `knowledge.upsert_atoms(atoms=[...], dry_run=true)` to check every item
+without writing atoms, indexes, or refusal events. The response contains ordered `results`
+with each submitted slug or ID, `index`, `would_refuse`, and a refusal reason and
+message when applicable; `would_refuse_batch` summarizes the batch. Secret
+refusals also include `detector`, `trigger`, `masked`, and `location`, as in `scan`.
+Secret-bearing slugs are masked and set `identity_masked=true`; ordinary
+identities retain their resolved spelling. Host dispatch auditing remains separate
+and may still record the call. See the [dry-run API](docs/api/upsert-atoms.md).
+
+Dry run checks input validation and the current read-only target checks, including
+missing, deleted, and domain targets. It does not predict concurrent changes that
+can only be decided during a later write. Omitting `dry_run` or setting it to
+`false` retains the ordinary atomic write and refusal-event behavior. The verb
+keeps its write permission requirement in both modes.
+
 Programmatic embedding is exposed via a small Rust API for the `kkernel reindex`
 binary, independent of the MCP surface:
 

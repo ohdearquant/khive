@@ -533,6 +533,13 @@ mod help_tests {
             !ids.required,
             "read.ids is conditionally required with read.id"
         );
+        let body = h
+            .params
+            .iter()
+            .find(|p| p.name == "body")
+            .expect("read must describe the body opt-out");
+        assert_eq!(body.param_type, "boolean");
+        assert!(!body.required);
     }
 
     #[test]
