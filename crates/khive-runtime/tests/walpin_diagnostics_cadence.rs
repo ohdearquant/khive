@@ -51,7 +51,8 @@ async fn runtime_forecast_uses_compiled_session_fallback_and_preserves_evidence(
     );
 
     let root = tempfile::tempdir().expect("fixture root");
-    let backend = Arc::new(StorageBackend::sqlite(root.path().join("forecast.db")).unwrap());
+    let backend =
+        Arc::new(StorageBackend::sqlite_for_test(root.path().join("forecast.db")).unwrap());
     let pool = backend.pool_arc();
     let runtime = KhiveRuntime::from_backend(backend, RuntimeConfig::no_embeddings());
     let path = pool.canonical_path().expect("canonical fixture path");

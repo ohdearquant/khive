@@ -3712,7 +3712,7 @@ mod tests {
     async fn completed_v21_gc_gate_requires_new_indexes_and_absent_legacy_column() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -3818,7 +3818,7 @@ mod tests {
         for (case, mutation_sql) in cases {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("khive.db");
-            let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+            let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
             {
                 let mut writer = backend.pool().writer().unwrap();
                 prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -3937,7 +3937,7 @@ mod tests {
     async fn gate_rejects_ledger_ahead_of_binary_latest() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -3980,7 +3980,7 @@ mod tests {
     async fn gate_rejects_incomplete_ledger_behind_v21() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -4034,7 +4034,7 @@ mod tests {
     async fn completed_v21_gate_fails_closed_when_marker_read_errors() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -4112,7 +4112,7 @@ mod tests {
     async fn database_gc_owner_holds_process_and_advisory_fences_until_drop() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("owner.db");
-        let backend = crate::StorageBackend::sqlite(&database).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&database).unwrap();
         let owner = acquire_database_gc_owner(backend.sql().as_ref())
             .await
             .unwrap();
@@ -4962,7 +4962,7 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_v20_before_root_or_claim_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_v20_gc_fixture(writer.conn_mut());
@@ -5053,7 +5053,7 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_incomplete_v21_marker_without_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         let abandoned_ref = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         {
             let mut writer = backend.pool().writer().unwrap();
@@ -5125,7 +5125,7 @@ mod tests {
         for incomplete_v21 in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("khive.db");
-            let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+            let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
             {
                 let mut writer = backend.pool().writer().unwrap();
                 if incomplete_v21 {
@@ -5247,7 +5247,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5327,7 +5327,7 @@ mod tests {
     async fn transactional_orphan_sweep_accepts_completed_v21_attachment_liveness() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5392,7 +5392,8 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_without_the_blob_gc_claims_migration() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         backend.entities().unwrap();
         {
             let reader = backend.pool().reader().unwrap();
@@ -5438,7 +5439,8 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_an_incomplete_cutover_marker() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5478,7 +5480,8 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_with_incomplete_fencing_triggers() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5547,7 +5550,8 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_same_named_noop_fencing_triggers() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5607,7 +5611,8 @@ mod tests {
     async fn fence_probe_refuses_id_collision_and_preserves_the_colliding_attachment() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5665,7 +5670,8 @@ mod tests {
     async fn fence_probe_does_not_touch_an_unrelated_retained_entity_sequence() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5738,7 +5744,7 @@ mod tests {
     async fn blob_gc_evidence_rejects_a_nul_embedded_claim_ref() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5770,7 +5776,7 @@ mod tests {
     async fn blob_gc_evidence_rejects_a_nul_embedded_attachment_ref() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5814,7 +5820,7 @@ mod tests {
     async fn fence_probe_refuses_a_digest_restricted_trigger_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5875,7 +5881,7 @@ mod tests {
     async fn fence_probe_refuses_a_shape_restricted_trigger_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -5941,7 +5947,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
         initialize_utf16le_database(&db_path);
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             let encoding: String = writer
@@ -5989,7 +5995,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
         initialize_utf16le_database(&db_path);
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             let encoding: String = writer
@@ -6025,7 +6031,8 @@ mod tests {
     async fn transactional_orphan_sweep_preserves_put_started_after_liveness_mark() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6080,7 +6087,8 @@ mod tests {
     async fn transactional_orphan_sweep_releases_sqlite_writer_before_physical_delete() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6177,7 +6185,8 @@ mod tests {
     async fn cancelling_sweep_during_delete_keeps_owner_locks_until_blocking_work_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6258,7 +6267,7 @@ mod tests {
     async fn transactional_orphan_sweep_recovers_stale_claims_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6322,7 +6331,7 @@ mod tests {
     async fn transactional_orphan_sweep_recovers_claims_after_root_relocation() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6387,7 +6396,7 @@ mod tests {
         let bytes = b"claim copied in an online database backup".to_vec();
         let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
         {
-            let source = crate::StorageBackend::sqlite(&source_path).unwrap();
+            let source = crate::StorageBackend::sqlite_for_test(&source_path).unwrap();
             let mut writer = source.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
             writer
@@ -6405,7 +6414,7 @@ mod tests {
         }
         std::fs::copy(&source_path, &restored_path).unwrap();
 
-        let restored = crate::StorageBackend::sqlite(&restored_path).unwrap();
+        let restored = crate::StorageBackend::sqlite_for_test(&restored_path).unwrap();
         let restored_root = dir.path().join("restored-blobs");
         let store = FsBlobStore::new(restored_root, 0)
             .unwrap()
@@ -6432,7 +6441,8 @@ mod tests {
     async fn transactional_orphan_sweep_bounds_each_durable_claim_batch() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6487,7 +6497,7 @@ mod tests {
     async fn abandoned_claim_recovery_deletes_at_most_one_batch_per_writer_hold() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             crate::run_migrations(writer.conn_mut()).unwrap();
@@ -6521,7 +6531,7 @@ mod tests {
     async fn transactional_orphan_sweep_refuses_corrupt_liveness_and_claim_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6610,7 +6620,8 @@ mod tests {
     async fn transactional_orphan_sweep_republishes_deduplicated_external_put() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6675,7 +6686,7 @@ mod tests {
     async fn transactional_orphan_sweep_uses_all_attachment_refs_as_live() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6750,7 +6761,7 @@ mod tests {
         // commit a `content_ref` to nothing.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6832,7 +6843,7 @@ mod tests {
         // race end to end and proves the mtime refresh closes it.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6921,7 +6932,7 @@ mod tests {
         // than assumed.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -6954,7 +6965,7 @@ mod tests {
         // proving the fix bounds the exposure rather than papering over it.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -7050,7 +7061,8 @@ mod tests {
         // mtime never reaches the sweep's counts.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        let backend =
+            std::sync::Arc::new(crate::StorageBackend::sqlite_for_test(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
@@ -7150,7 +7162,7 @@ mod tests {
         // orphan detection itself.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
-        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());

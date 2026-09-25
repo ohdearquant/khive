@@ -49,6 +49,7 @@ async fn target_query_rejects_pre_filter_protocol_before_opening_a_store() {
 #[tokio::test]
 async fn exact_target_filter_crosses_socket_and_merges_both_event_stores() {
     let dir = tempfile::tempdir().unwrap();
+    let _registry_guard = TestRegistryGuard::new(dir.path());
     let (_db, socket) = boot_daemon(&dir).await;
     let client = EventsSplitClient::new(socket).unwrap();
     let lane: Arc<dyn EventStore> =

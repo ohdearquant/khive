@@ -217,6 +217,8 @@ fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
     SearchHit {
         entity_id,
         score: DeterministicScore::from_f64(1.0),
+        rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+        signals: khive_runtime::SearchSignals::default(),
         source,
         title: None,
         snippet: None,
@@ -227,6 +229,8 @@ fn note_search_hit(note_id: Uuid, source: SearchSource) -> NoteSearchHit {
     NoteSearchHit {
         note_id,
         score: DeterministicScore::from_f64(1.0),
+        rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+        signals: khive_runtime::SearchSignals::default(),
         source,
         title: None,
         snippet: None,

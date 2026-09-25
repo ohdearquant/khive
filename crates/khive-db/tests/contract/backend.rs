@@ -30,7 +30,7 @@ fn memory_backend() -> StorageBackend {
 }
 
 fn file_backend(dir: &tempfile::TempDir, name: &str) -> StorageBackend {
-    let backend = StorageBackend::sqlite(dir.path().join(name)).expect("file backend");
+    let backend = StorageBackend::sqlite_for_test(dir.path().join(name)).expect("file backend");
     backend.prepare_core_schema().expect("prepare file schema");
     backend
 }
