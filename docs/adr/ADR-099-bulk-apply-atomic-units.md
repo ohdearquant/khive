@@ -905,3 +905,78 @@ transition note. This extends the DML-only statement contract, not the admissibl
 set: other plan statements retain affected-row guards and no external work may suspend inside
 the writer transaction. ADR-172's unconditional version trigger still advances the version
 for every matched `UPDATE`, including equal-value assignments.
+
+## Amendment 7 (2026-09-25) — a rolled-back unit exits non-zero
+
+Status: Proposed. Needs maintainer sign-off before it binds. Refs #3275.
+
+### Context
+
+D4 pins the `--atomic` envelope (`results`, `summary` and the additive `atomic` object) and says
+nothing about the process exit status. The CLI's behaviour today:
+
+- `kkernel exec --ops-file --atomic` (`crates/kkernel/src/exec.rs`, `run_exec_ops_file`) prints the
+  rollback envelope, with `summary.succeeded = 0`, `summary.failed = <total>`, `atomic.committed = false`
+  and `atomic.rolled_back = true`, and returns success. This holds with and without `--strict`.
+  Admissibility, prepare and seam errors print their envelope and exit non-zero. A `--save-file`
+  publication failure after a commit exits non-zero (Amendment 2). A committed unit with a post-commit
+  degradation exits zero (Amendment 2).
+- Every other `exec` mode exits non-zero when no op succeeded, with or without `--strict` (#1339):
+  the inline path and the non-atomic ops-file path both bail with "every op failed". The `--strict`
+  help text opens with "Exit non-zero when any op in the batch fails" and then exempts `--atomic`.
+- `docs/operations.md` states that a plan-level rollback "currently exits zero even with `--strict`".
+  The zero exit was preserved from the first atomic implementation; no decision record chose it. It is
+  pinned by `atomic_rollback_preserves_zero_exit_with_or_without_save_and_strict` in
+  `crates/kkernel/src/exec.rs`, by `atomic_strict_rollback_classifies_each_not_committed_operation` in
+  `crates/kkernel/tests/exec_refusal_reasons.rs`, and by two assertions in
+  `crates/kkernel/tests/gtd_context_update_atomic.rs`.
+
+A caller that checks only the exit status therefore reads a unit that applied nothing as a success.
+
+### Decision
+
+A unit that rolls back (`atomic.committed = false`, `atomic.rolled_back = true`) exits non-zero, with
+or without `--strict`. The rollback envelope is written to stdout first, unchanged, and with
+`--save-file` the manifest is published first, as the non-atomic path already does before its policy
+exits. The envelope, not the exit status, still distinguishes the cause: a rollback carries
+`rolled_back = true` and `failed_op_index`, while an admissibility or prepare refusal carries
+`rolled_back = false`. No new exit code is introduced; the value is the one the CLI returns for its
+other failures.
+
+The rule follows from the envelope D4 already pins. A rollback reports every op as failed, so it is
+the all-failed case #1339 made non-zero in every mode, and it is also a batch in which an op failed,
+which `--strict` promises to report as non-zero. `--strict` keeps its additive `strict-op-failure`
+classification of not-committed rows.
+
+Exit statuses that do not change: full success exits zero; a committed unit with a post-commit
+degradation exits zero, because its mutation is durable and must not be replayed (Amendment 2); a
+`--save-file` publication failure after a commit, and every pre-commit refusal, exit non-zero as today.
+
+### Alternatives considered
+
+- _Record the current behaviour: a rollback exits zero and `atomic.committed` is the only signal._
+  Rejected: it keeps `--atomic` as the one `exec` mode where an all-failed batch exits zero, and it
+  contradicts the first sentence of the `--strict` help text.
+- _Exit non-zero only under `--strict`._ Rejected: the default invocation would still report an
+  all-failed unit as success, which is the case #1339 closed for every other mode.
+- _A distinct exit code for a rollback._ Rejected: `exec` has no exit-code taxonomy, and the envelope
+  already carries the cause.
+
+### Consequences
+
+- A script that treats exit zero as "the unit ran" and then reads `atomic.committed` keeps working if
+  it reads stdout on a non-zero exit; a script that discards stdout on a non-zero exit loses the
+  envelope and must change.
+- The code change sits in `run_exec_ops_file` after the envelope or manifest is printed. The tests
+  named above invert, and `docs/operations.md`, `crates/kkernel/docs/design.md` and the `--strict`
+  help text are updated in the same change.
+- The MCP `request` wire envelope is unaffected; this is the CLI contract only.
+
+Acceptance:
+
+1. A unit whose second op fails its guard prints the rollback envelope and exits non-zero, with and
+   without `--strict`; the database is unchanged.
+2. The same unit with `--save-file` publishes the manifest with the copied `atomic` object, then exits
+   non-zero.
+3. Controls: a fully committed unit exits zero; a committed unit with an injected post-commit reindex
+   failure exits zero with `status = "committed_degraded"`.

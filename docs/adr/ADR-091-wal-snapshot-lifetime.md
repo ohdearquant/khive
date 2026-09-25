@@ -1895,3 +1895,100 @@ untouched.
 - A full backfill between two pins ends the first run. The second pin, at a different frame, starts a
   new run with a later `first_observed_at_unix_ms`.
 - The daemon's report shows `reporting_process_is_holder = true`.
+
+### 2026-09-25 amendment (Amendment 22): a single probe row is a backfill gap, and a busy result is neutral to the pinned-frame run
+
+**Status: Proposed.** Refs #3185, #3191, #1830. Needs maintainer sign-off before it binds. It does
+not edit Plank C or Amendment 21 in place; if accepted, it amends Plank C's reading of the probe row
+and the busy clause of Amendment 21 item 2. Everything else in both stands.
+
+**Context.**
+
+- Plank C (Amendment 2) says: "report pin depth as `log` minus `checkpointed` from its 3-column return
+  row — the number of frames pinned behind the backfill boundary. Equivalent signal to reader-mark
+  introspection". Amendment 21 item 1 has since measured that one such row does not establish a pin:
+  a connection committing between the checkpoint's header read and its end, or restarting the WAL in
+  that interval, leaves `checkpointed` short of `log` with no connection reading. The code follows
+  Plank C's wording. `crates/khive-db/src/checkpoint.rs` `log_wal_pin_depth` logs
+  `wal_pin_depth = (log - checkpointed).max(0)` after a TRUNCATE no-progress event, from the PASSIVE
+  row `query_wal_pin_depth` returns, and `crates/khive-db/src/diagnostics.rs`
+  `CheckpointProbe::pin_depth` returns the same difference for the `db_diagnostics` probe.
+- Amendment 21 item 2 ends the run on "a busy or failed checkpoint". In the bundled SQLite (3.53.2,
+  `sqlite3WalCheckpoint` and `OP_Checkpoint`), a PASSIVE checkpoint reports `busy = 1` when it cannot
+  take the checkpoint lock or read the WAL-index header, typically because another connection is
+  checkpointing at that moment, and its `log` and `checkpointed` columns are then `-1`: the row carries
+  no reading of the ceiling at all. A TRUNCATE checkpoint that stops short of the end of the WAL also
+  reports `busy = 1`, with the columns filled in. The TRUNCATE path runs when WAL pressure has crossed
+  its high-water mark, which a held pin produces, and the `db_diagnostics` probe can collide with the
+  task's own tick. Both feed item 2, so both can restart the one-second clock on a pin that was never
+  released. #3191 measured this with a reader holding one snapshot for 2.5 s: at a tight checkpoint
+  cadence no run reached one second, and 150 of 1,166 run endings were busy results. At the 500 ms
+  default the same harness produced a 1,517 ms run. The error runs in the fail-safe direction (a real
+  pin reads as younger than one second), so this is a precision defect, not a false report.
+
+**Decision.**
+
+1. **One row's difference is a backfill gap, not a pin depth.** `log_frames - checkpointed_frames`
+   from a single probe row is named the backfill gap and reported only under that name: the TRUNCATE
+   no-progress log field and the `CheckpointProbe` accessor carry it as `backfill_gap_frames`, and
+   the "pin depth" wording is removed from both. The sentence "Equivalent signal to reader-mark
+   introspection" in Plank C is withdrawn. The rest of Plank C is unchanged: the PASSIVE probe still
+   runs on a TRUNCATE no-progress event, and shm parsing is still excluded.
+2. **Pin depth exists only where Amendment 21 reports a pin.** A report that names a pin depth
+   computes it as `log_frames - oldest_pinned_frame` from the same probe row, and only when that row's
+   `oldest_pinned_frame` is non-null under Amendment 21 item 1. Otherwise pin depth is null with
+   Amendment 21's reason. Until Amendment 21's run is implemented (#1830), no surface reports a pin
+   depth.
+3. **A busy result is neutral to the run.** A checkpoint result with `busy = 1` neither extends nor
+   ends the run of Amendment 21 item 2, whatever its other columns hold. The next result with
+   `busy = 0` is compared with the run's frame `N` and with the `log_frames` of the last `busy = 0`
+   result, so a WAL restart that fell inside a busy span is still caught when it shrinks `log_frames`.
+   A full backfill, a different ceiling, a smaller `log_frames` and a failed checkpoint (an error
+   rather than a busy row) still end the run.
+4. **The neutral span is bounded.** When a `busy = 0` result arrives more than two checkpoint
+   intervals (`KHIVE_CHECKPOINT_INTERVAL_MS`, one second at the 500 ms default) after the run's last
+   `busy = 0` result, and at least one busy result fell between them, the run ends before that result
+   is applied, and the result starts a new run if it qualifies. The bound keeps the interval in which a
+   pin could be released and a new one taken at the same frame unobserved to at most two checkpoint
+   intervals, instead of however long a busy span lasts.
+5. **The probe row's own nulls are unchanged.** Amendment 21 item 1 still reports
+   `backfill_ceiling` and `oldest_pinned_frame` as null, with a reason, when the probe row itself is
+   busy; item 3 above governs only the run that item 2 keeps.
+
+**Alternatives considered.**
+
+- _Keep "pin depth" as the name and correct only the documentation._ Rejected: the name is the claim.
+  An operator reading `wal_pin_depth` in a WARN acts on it as a pin, and the same value appears under a
+  commit loop with no reader.
+- _Stop running the probe on a TRUNCATE no-progress event._ Rejected: the gap is still a useful
+  measure of how far the backfill is behind the log, and it costs one PASSIVE checkpoint.
+- _Keep "busy ends the run" (Amendment 21 as accepted)._ Rejected on the measurement above: it never
+  reports a pin wrongly, but at checkpoint cadences above the default it can fail to report a pin at
+  all, and the TRUNCATE path produces busy results precisely while a pin holds.
+- _Treat a busy TRUNCATE row whose `checkpointed` equals `N` as extending the run._ Rejected for now:
+  whether a busy row carries columns depends on which lock or stage produced it, and a neutral rule
+  needs no such distinction.
+- _No bound on the neutral span._ Rejected: a long busy span, which is also the signature of another
+  process checkpointing, would let a release and a same-frame re-pin read as one run for as long as the
+  span lasts.
+
+**Consequences.**
+
+- Code that must change with this amendment: `log_wal_pin_depth` and `query_wal_pin_depth` in
+  `crates/khive-db/src/checkpoint.rs` (log field name and message), `CheckpointProbe::pin_depth` and
+  the module and type documentation in `crates/khive-db/src/diagnostics.rs`, and their tests. The log
+  field rename changes what an operator's log query matches.
+- The widened unobserved interval is the same exposure Amendment 21's "What the run assumes" section
+  already describes (a full backfill by another process, a WAL restart and a new read mark at exactly
+  `N`), now bounded at two checkpoint intervals rather than one result interval. Its only effect is
+  still that `oldest_pinned_frame` can be reported for a pin held less than one second.
+- Amendment 21's acceptance arms stand. Arms added:
+  - A reader holds one snapshot for longer than one second while PASSIVE checkpoints are issued faster
+    than the default cadence and a second connection checkpoints concurrently so that some results are
+    busy. The run reaches one second and `oldest_pinned_frame` is non-null.
+  - A span of busy results longer than two checkpoint intervals, followed by a `busy = 0` result at
+    the same frame, ends the run: the new run's `first_observed_at_unix_ms` is later than the old one.
+  - With several writer connections committing and no reader, at the tight and the default cadence,
+    no run reaches one second, and no report carries a pin depth.
+  - A TRUNCATE no-progress event under a commit loop with no reader logs `backfill_gap_frames` and no
+    field named as a pin depth.

@@ -682,6 +682,33 @@ without it says nothing about the property the verb exists for.
 
 Not in scope: deleting a ref, moving a tag, moving `HEAD`, and any ref outside `refs/heads/`.
 
+### A11.2 Correction (2026-09-25): the marker for a move to the current head
+
+Status: Proposed. Needs maintainer sign-off before it binds. Refs #3209, #3272. This corrects one
+sentence of A11.1 and leaves the rest of Amendment 11 as accepted.
+
+**The sentence corrected.** A11.1 says "`update_branch_sync` already writes the marker into the
+reflog, so `git.reconcile`'s `operation_recorded` path works unchanged". That holds for a move. It does
+not hold when `to` equals the branch's current head: the expected-value check passes, the fast-forward
+test passes because a commit is its own ancestor, and `update-ref` with identical old and new values
+appends no reflog entry, as Amendment 6 item 2 already records for the push marker. The receipt is
+persisted as `unknown` before the swap, so if its terminal write is then lost, reconcile never finds a
+marker and the row stays `unknown` although the ref is correct.
+
+**The rule.** For a `git.update_ref` whose `to` equals the current head, the marker is written with
+`git reflog write refs/heads/<branch> <sha> <sha> khive-receipt:<receipt-id>` after the swap succeeds,
+the mechanism Amendment 6 item 2 made normative for the push marker. The capability probe runs before
+the swap on that path, and a git that does not advertise `reflog write` refuses
+`unsupported_toolchain` with a receipt naming the missing capability, as Amendment 6 item 2 and
+Amendment 12 already specify. A move to a different commit keeps the `update-ref` marker.
+
+**Alternative considered.** Answer a move to the current head without a write, persisting its receipt
+as already settled. Not chosen here: it would need a second receipt path for one case, while the
+`reflog write` rule reuses a mechanism the pack already probes for and tests.
+
+**Acceptance arm added.** 8. A call with `to` equal to the current head, whose receipt is then reset to
+`unknown` to simulate a lost terminal write, is settled to `committed` by `git.reconcile`.
+
 ## Amendment 12 (2026-09-11): the git program the write surface runs is configuration
 
 The write surface spawns `git` by name and lets the process PATH resolve it. That is a decision
