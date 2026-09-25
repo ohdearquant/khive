@@ -60,24 +60,32 @@ store, content-addressed; storing byte-identical content again is a no-op. `pers
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 
-### `web.extract(id | url, kinds?)`
+### `web.extract(id | url, kinds?, namespace?, link_limit?)`
 
 Parse an already-fetched body — never fetches one itself. `kinds` is a subset of
 `{text, links, sitemap, feed}`, defaulting to whatever applies to the stored content-type.
 `links` yields `page links_to page|resource` edges to targets minted (if absent) as unfetched
-`resource` rows. `sitemap`/`feed` yield `site contains resource` edges for each entry, under the
-_publishing_ site. `text` mints a `resource` holding the tag-stripped body, linked
+`resource` rows. `link_limit` caps link targets processed from one page. It defaults to 100 and accepts integers
+from 0 through 1,000. Once the ceiling is reached, remaining matched `<a href>` attributes are
+left unresolved and their count is returned as `result.links.skipped`;
+`result.links.edges_created` reports the processed targets. `sitemap`/`feed` yield
+`site contains resource` edges for each entry under the _publishing_ site. `text` mints a
+`resource` holding the tag-stripped body, linked
 `derived_from` back to the original — keyed by the original document's id, so repeated
 extraction converges on one row rather than minting duplicates. Refuses `not_fetched` on a
 document with no stored body.
 
-### `web.ingest(source, origin?, depth?, limit?)`
+### `web.ingest(source, origin?, depth?, limit?, namespace?, extract_links?)`
 
 Fetch and extract over a single URL, a JSON array of URLs, or — with `origin` given — a
 directory on disk laid out as `origin` would serve it (`origin` then supplies the `site`
 identity for every file in the tree, and no network request is made for the disk case).
 `depth` bounds how many hops of `links`-extracted targets are followed beyond the seed URLs
-(default `0`: seeds only). `limit` bounds the total number of documents ingested in one call
+(default `0`: seeds only). In URL mode, depth zero does not extract links by default; set
+`extract_links=true` to record the page's links without following them. Positive depth extracts
+links only on pages below the requested depth so their targets can be followed. Across the whole
+call, link targets processed are capped by `limit`, and each page also uses the `web.extract`
+default ceiling of 100. `limit` bounds the total number of documents ingested in one call
 (default 100).
 
 The disk-mode `source` directory is confined to the operator's configured `[web] read_roots`

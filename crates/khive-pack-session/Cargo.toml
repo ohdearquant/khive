@@ -16,6 +16,7 @@ khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"]
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 inventory = { workspace = true }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-score = { version = "0.8.0", path = "../khive-score" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,6 +24,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

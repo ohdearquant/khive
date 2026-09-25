@@ -85,8 +85,8 @@ impl fmt::Display for GitArgError {
 impl std::error::Error for GitArgError {}
 
 /// Validates a branch/ref-shaped identifier: `name` (git.branch), `from`
-/// (git.branch's optional start point), and `branch` (git.push's target
-/// ref). Deliberately more restrictive than git's own `check-ref-format` --
+/// (git.branch's optional start point), and `branch` (the git.push and
+/// git.update_ref targets). Deliberately more restrictive than git's own `check-ref-format` --
 /// this only needs to admit the identifiers a legitimate caller would ever
 /// pass, not the full ref grammar.
 pub fn validate_ref_name(field: &'static str, value: &str) -> Result<(), GitArgError> {
@@ -235,8 +235,8 @@ pub fn reject_force(force: Option<bool>) -> Result<(), GitArgError> {
     Ok(())
 }
 
-/// Validates the `repo` argument shared by all three write verbs: must be an
-/// absolute local path containing a `.git` entry (mirrors `git.digest`'s
+/// Validates the `repo` argument for repository write operations: it must be
+/// an absolute local path containing a `.git` entry (mirrors `git.digest`'s
 /// local-source validation in `src/source.rs`).
 pub fn validate_repo_path(path: &Path) -> Result<(), GitArgError> {
     if !path.is_absolute() {
