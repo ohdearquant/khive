@@ -435,6 +435,14 @@ request(ops="comm.inbox(mailbox_actor=\"channel:email\")")
 
 The request must resolve to one of the configured reader actor labels.
 
+Sender labels are not proof of origin. Ingested mail is stored with the sender
+label `email:<address>`, but a local caller chooses its own actor label, and
+that label becomes `from_actor` on what it sends. A `comm.send` run with
+`KHIVE_ACTOR=email:forged@example.com` is stored with `from_actor`
+`email:forged@example.com`, and `comm.inbox(from_prefix="email:")` returns it
+beside ingested mail. Use `from_prefix="email:"` to filter by sender label; it
+does not show that a message arrived through the email channel.
+
 ### Feature gating
 
 `channel-email` is an optional Cargo feature
