@@ -1,6 +1,6 @@
 # ADR-154: SQLite Disk-Reserve Admission Before Logical Writes
 
-**Status**: proposed\
+**Status**: accepted (2026-09-23)\
 **Date**: 2026-08-11\
 **Authors**: khive maintainers\
 **Tracking**: Refs #1844\
@@ -47,6 +47,11 @@ The implementation is one storage-safety slice, not part of the single-owner top
 It must work in the present cooperative multi-process topology and in ADR-150's future owner
 topology. It does not change queue defaults, checkpoint modes, or writer ownership.
 
+This ADR addresses #1844's disk-admission floor. It does not satisfy #1876's WAL-ceiling
+requirement; that requirement is decided separately in ADR-194. Its own implementation covers
+every writer surface listed in §4, including compatibility and standalone routes; merging a
+strict-routing change alone is not proof of complete coverage.
+
 ### 2. Reserve configuration and daemon coherence
 
 Every writable SQLite backend resolves two independent values:
@@ -58,11 +63,13 @@ Every writable SQLite backend resolves two independent values:
   `KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then **2,000 ms**, validated in
   `[100, 10,000]` without clamping.
 
-An explicit zero disables refusal for that backend and must emit a startup warning. Zero exists for
-small scratch/test filesystems and deliberate operator override; it is never the implicit default.
+An explicit `disk_reserve_bytes=0` disables floor refusal for that backend and must emit a startup
+warning; `disk_guard_deadline_ms=0` is invalid, never a disable value. Zero reserve exists for small
+scratch/test filesystems and deliberate operator override; it is never the implicit default.
 Invalid or overflowing TOML/environment values are configuration errors, not silent fallback.
 Memory and read-only backends do not create a guard; specifying a non-zero SQLite reserve for a
-memory backend is a configuration error.
+memory backend is a configuration error. Disabling the floor does not disable an independently
+configured WAL ceiling; see ADR-194.
 
 The warm-daemon `config_id` fingerprints the effective reserve bytes and guard deadline for the
 implicit main backend and for every named SQLite backend in the same deterministic backend order as
@@ -139,6 +146,10 @@ may run after space is recovered. A failed rollback retains the existing
 | Migration/schema transactions          | Lease before each transaction, probe after `BEGIN`, before its first DDL/DML                                                                                                                       |
 | Top-level maintenance such as `VACUUM` | Lease and probe immediately before execution; retain it until the call returns                                                                                                                     |
 
+`TopLevelMaintenance::WalCheckpointTruncate` is a checkpoint operation, not a copy-sized
+maintenance operation like `VACUUM`: it follows §5's checkpoint bypass, never this table's
+top-level-maintenance admission row, and never requires the volume lease or the capacity probe.
+
 Normal store modules do not each implement their own probe. After #1911 they inherit the
 writer-task seam. Pool, SQL-bridge, migration, and explicitly top-level/standalone entry points are
 the central enforcement boundary.
@@ -161,13 +172,23 @@ This is deliberately a bounded claim. The guard proves that a new cooperating lo
 start from inside the configured emergency reserve. It cannot prove that an arbitrarily large
 already-admitted transaction will not cross the floor, nor can it reserve bytes against unrelated
 processes. Callers and diagnostics must not render the floor as a filesystem quota or hard
-reservation.
+reservation. The sampled floor is neither reserved capacity nor guaranteed recovery headroom: the
+bypasses in §5 mean this policy does not itself refuse a recovery operation, not that space for
+that operation has been set aside. An already-admitted transaction or another filesystem consumer
+may still consume the sampled headroom before recovery runs.
 
 ### 5. Recovery bypasses
 
 The guard is applied once at the logical-write boundary. It is never inserted into generic
 statement execution or transaction terminators, because doing so could admit a body and then block
-the operation needed to make its outcome safe.
+the operation needed to make its outcome safe. COMMIT and ROLLBACK bypass disk-floor admission for
+that reason; that exemption does not disable a separately enacted, narrower storage-capacity limit,
+and a capacity failure under such a limit must still preserve real transaction settlement and
+native error attribution. ADR-194 introduces exactly that limit, and its own refusal at
+`COMMIT`/`ROLLBACK` is deliberately permitted: unlike a floor re-probed at the terminator, it never
+blocks the terminator from running, and it always completes the terminator through a proven
+whole-transaction rollback before returning a result, so no caller ever observes an unresolved
+outcome, which is the property this rejection protects.
 
 The following bypass disk-refusal admission:
 
@@ -260,8 +281,9 @@ suite remains mandatory everywhere.
 ## Consequences
 
 **Benefits.** New logical writes stop before entering a known emergency floor; rollback,
-checkpoint, diagnostics, and holder release remain operable; errors distinguish prevention from
-actual exhaustion; and multiple khive databases on one volume coordinate against one sampled pool.
+checkpoint, diagnostics, and holder release remain operable (this policy does not block those
+operations; it does not reserve space for them); errors distinguish prevention from actual
+exhaustion; and multiple khive databases on one volume coordinate against one sampled pool.
 
 **Costs.** Writes to otherwise independent databases on one volume serialize for the duration of
 their transactions. The default changes absent-configuration behavior and can refuse writes on a
@@ -296,3 +318,4 @@ not evidence that the typed refusal path ran.
 - [ADR-135](ADR-135-write-scaling-demand-before-ownership.md) — writer stages and ownership limits
 - [ADR-136](ADR-136-fair-write-admission-default.md) — strict writer routing and exemptions
 - [ADR-150](ADR-150-single-write-owner-topology.md) — future write-owner topology
+- [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md): bounded WAL extent ceiling under a pinned reader

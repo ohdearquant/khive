@@ -3157,8 +3157,9 @@ pub(crate) async fn handle_probe(
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let p: ProbeParams = deser(params)?;
+    let p: ProbeParams = deser(params.clone())?;
     validate_actor_label("probe", &p.actor, "actor")?;
+    runtime.authorize_mailbox_view(token, "comm.probe", Some(&p.actor), &params)?;
     if p.stale_minutes <= 0 {
         return Err(RuntimeError::InvalidInput(
             "probe: `stale_minutes` must be positive".into(),

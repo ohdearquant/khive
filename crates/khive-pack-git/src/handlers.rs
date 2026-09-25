@@ -148,6 +148,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.digest", params)?;
         let source_raw = params
             .get("source")
             .and_then(Value::as_str)
@@ -2202,6 +2203,7 @@ mod tests {
             khive_storage::StorageError::AdmissionTimeout {
                 operation: "sql_bridge.writer_handle".into(),
                 timeout_ms: 30_000,
+                pool_identity: None,
             },
         ));
         let recovered = digest_failure_to_runtime(admission);
@@ -2211,6 +2213,7 @@ mod tests {
                 RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
                     operation,
                     timeout_ms: 30_000,
+                    pool_identity: None,
                 }) if operation.as_ref() == "sql_bridge.writer_handle"
             ),
             "storage-class ingest failure must stay typed; got {recovered:?}"
