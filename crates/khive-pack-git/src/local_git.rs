@@ -855,6 +855,19 @@ fn update_branch_sync(
         None,
         true,
     )?;
+    if new == expected {
+        // Git accepts a compare-and-swap to the current head without writing
+        // a reflog entry. Keep the receipt observable for reconciliation even
+        // when the successful operation leaves the ref unchanged.
+        run_git(
+            program,
+            repo,
+            &["reflog", "write", &reference, new, new, &marker],
+            None,
+            None,
+            false,
+        )?;
+    }
     Ok(())
 }
 

@@ -649,9 +649,12 @@ git.update_ref(repo, branch, to, expected, require_fast_forward?, reason?)
   to the other write verbs. `tool.check` is consulted on `git.update_ref` before the repository is
   touched, as Amendment 4 requires of every write verb.
 - The receipt settles the way `git.branch` and `git.commit` receipts settle. `update_branch_sync`
-  already writes the marker into the reflog, so `git.reconcile`'s `operation_recorded` path works
-  unchanged once this verb is added to the two-verb match that guards it. That match is the one place
-  where forgetting this verb fails silently rather than loudly.
+  writes the marker through `update-ref` for a ref move. When `to` equals the current head, Git
+  suppresses that reflog entry, so a successful compare-and-swap is followed by an explicit
+  `reflog write` marker with identical old and new shas. `git.reconcile`'s `operation_recorded`
+  path then works unchanged for both cases once this verb is added to the two-verb match that
+  guards it. That match is the one place where forgetting this verb fails silently rather than
+  loudly.
 
 ### Acceptance
 
