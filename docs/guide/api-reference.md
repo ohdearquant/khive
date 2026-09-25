@@ -305,11 +305,11 @@ Cycles and overlong chains fail with `redirect cycle detected` and
 `redirect chain too long` respectively. The kept id is checked by the Gate before
 its entity is returned.
 
-| Param             | Type | Required | Notes                                                                                                                                     |
-| ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
+| Param             | Type | Required | Notes                                                                                                                                                   |
+| ----------------- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                                            |
 | `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge without chasing a merge redirect (default false); accepts a full UUID or unique 8+ hex prefix. |
-| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
+| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records.               |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
