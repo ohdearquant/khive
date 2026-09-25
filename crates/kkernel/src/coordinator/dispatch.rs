@@ -13,7 +13,7 @@ use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, RuntimeError, SearchHit,
     SearchSource,
 };
-use khive_score::DeterministicScore;
+use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::EdgeRelation;
 use khive_types::{namespace::Namespace, SubstrateKind};
 
@@ -603,8 +603,9 @@ impl SubstrateCoordinator {
     // ---- D4: Fan-out search ----
 
     /// Broadcast a validated KG search request to all registered backends in
-    /// parallel and merge results via RRF (k=60). Every filter in the request
-    /// reaches the matching runtime search method on every backend.
+    /// parallel. One selected backend passes its ranking evidence through;
+    /// multiple selected backends use outer RRF (k=60). Every filter in the
+    /// request reaches the matching runtime search method on every backend.
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
@@ -640,6 +641,20 @@ impl SubstrateCoordinator {
         namespace: &Namespace,
         extra_visible: &[Namespace],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        let (mut entity_hits, mut note_hits, per_backend) = self
+            .fan_out_search_candidates_with_visibility(request, namespace, extra_visible)
+            .await;
+        self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, namespace)
+            .await;
+        (entity_hits, note_hits, per_backend)
+    }
+
+    async fn fan_out_search_candidates_with_visibility(
+        &self,
+        request: &ValidatedSearchRequest,
+        namespace: &Namespace,
+        extra_visible: &[Namespace],
+    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
         let requested_substrate = if search_notes {
             SubstrateKind::Note
@@ -647,7 +662,6 @@ impl SubstrateCoordinator {
             SubstrateKind::Entity
         };
         let search_limit = rrf_fanout_search_limit(request);
-        let limit = request.limit();
         let props_filter_owned = request.properties().cloned();
         let tags_owned = request.tags().to_vec();
         let kind_filter_owned = request.kind_filter().map(str::to_string);
@@ -736,7 +750,6 @@ impl SubstrateCoordinator {
                                     .source()
                                     .is_none_or(|expected| hit.source == expected)
                             })
-                            .take(limit as usize)
                             .cloned()
                             .collect();
                         let backend_result = BackendSearchResult {
@@ -810,7 +823,6 @@ impl SubstrateCoordinator {
                                     .source()
                                     .is_none_or(|expected| hit.source == expected)
                             })
-                            .take(limit as usize)
                             .cloned()
                             .collect();
                         let backend_result = BackendSearchResult {
@@ -972,7 +984,8 @@ impl SubstrateCoordinator {
                         // truncating to the caller's limit per backend (MAJ-4)
                         // would remove candidates the RRF merge needs to fairly
                         // rank a hit that only places #2+ on any single backend.
-                        // `rrf_merge_note_hits` applies `limit` once, after merge.
+                        // Finalization applies the floor and requested order
+                        // before imposing the caller's limit.
                         Ok(outcome) => (
                             backend_id,
                             Ok(vec![]),
@@ -1116,9 +1129,9 @@ impl SubstrateCoordinator {
         }
 
         let merged_entities =
-            rrf_merge_entity_hits_filtered(entity_ranked_lists, limit as usize, request.source());
+            rrf_merge_entity_hits_filtered(entity_ranked_lists, usize::MAX, request.source());
         let merged_notes =
-            rrf_merge_note_hits_filtered(note_ranked_lists, limit as usize, request.source());
+            rrf_merge_note_hits_filtered(note_ranked_lists, usize::MAX, request.source());
         (merged_entities, merged_notes, per_backend)
     }
 }
@@ -1156,8 +1169,8 @@ fn backend_search_timeout_ms() -> u64 {
 /// `request.candidate_limit()` already widens the per-backend fetch for
 /// request-filter recall; this widens further (bounded) so unfiltered
 /// fan-out searches get the same fairness. The caller's `limit` is applied
-/// exactly once, after the RRF merge (`rrf_merge_entity_hits` /
-/// `rrf_merge_note_hits`).
+/// exactly once in `finalize_search_hits`, after fusion, the score floor and
+/// the requested ordering.
 const RRF_FANOUT_MULTIPLIER: u32 = 10;
 /// Same cap shape as `FILTERED_SCAN_CAP` in khive-pack-kg's search handler,
 /// applied to the fan-out-wide candidate window.
@@ -1174,7 +1187,10 @@ fn rrf_fanout_search_limit(request: &ValidatedSearchRequest) -> u32 {
 
 #[derive(Default)]
 struct RrfMergeBucket {
-    score: f64,
+    score: DeterministicScore,
+    // Ranked lists follow backend ID order; equal ranks retain the earlier backend.
+    evidence_rank: Option<usize>,
+    signals: khive_runtime::SearchSignals,
     source: Option<SearchSource>,
     title: Option<String>,
     snippet: Option<String>,
@@ -1191,16 +1207,18 @@ fn rrf_merge_entity_hits_filtered(
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<SearchHit> {
-    const K: f64 = 60.0;
+    const K: usize = 60;
 
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
     for list in &lists {
         for (i, hit) in list.iter().enumerate() {
-            let rank = (i + 1) as f64;
-            let rrf = 1.0 / (K + rank);
             let entry = scores.entry(hit.entity_id).or_default();
-            entry.score += rrf;
+            entry.score = entry.score + rrf_score(i + 1, K);
+            if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
+                entry.evidence_rank = Some(i);
+                entry.signals = hit.signals;
+            }
             entry.source = Some(match entry.source {
                 Some(source) => source.union(hit.source),
                 None => hit.source,
@@ -1221,10 +1239,11 @@ fn rrf_merge_entity_hits_filtered(
             if source_filter.is_some_and(|expected| source != expected) {
                 return None;
             }
-            let det_score = DeterministicScore::from_f64(bucket.score);
             Some(SearchHit {
                 entity_id: id,
-                score: det_score,
+                score: bucket.score,
+                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+                signals: bucket.signals,
                 source,
                 title: bucket.title,
                 snippet: bucket.snippet,
@@ -1251,16 +1270,18 @@ fn rrf_merge_note_hits_filtered(
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<NoteSearchHit> {
-    const K: f64 = 60.0;
+    const K: usize = 60;
 
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
     for list in &lists {
         for (i, hit) in list.iter().enumerate() {
-            let rank = (i + 1) as f64;
-            let rrf = 1.0 / (K + rank);
             let entry = scores.entry(hit.note_id).or_default();
-            entry.score += rrf;
+            entry.score = entry.score + rrf_score(i + 1, K);
+            if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
+                entry.evidence_rank = Some(i);
+                entry.signals = hit.signals;
+            }
             entry.source = Some(match entry.source {
                 Some(source) => source.union(hit.source),
                 None => hit.source,
@@ -1281,10 +1302,11 @@ fn rrf_merge_note_hits_filtered(
             if source_filter.is_some_and(|expected| source != expected) {
                 return None;
             }
-            let det_score = DeterministicScore::from_f64(bucket.score);
             Some(NoteSearchHit {
                 note_id: id,
-                score: det_score,
+                score: bucket.score,
+                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+                signals: bucket.signals,
                 source,
                 title: bucket.title,
                 snippet: bucket.snippet,

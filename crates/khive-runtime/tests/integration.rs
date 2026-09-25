@@ -1964,7 +1964,7 @@ async fn file_backed_runtime_persists() {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).unwrap();
+        let rt = KhiveRuntime::new_for_test(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
         rt.create_entity(&tok, "concept", None, "Persistent", None, None, vec![])
             .await
@@ -1995,7 +1995,7 @@ async fn file_backed_runtime_persists() {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).unwrap();
+        let rt = KhiveRuntime::new_for_test(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
         let entities = rt.list_entities(&tok, None, None, 50, 0).await.unwrap();
         assert_eq!(entities.len(), 1);
