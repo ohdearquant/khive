@@ -215,7 +215,7 @@ fn read_only_pool_does_not_claim_sink_and_later_writable_pool_can() {
         path: Some(read_only_path.clone()),
         read_only: true,
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     })
     .expect("read-only inspection pool must open");
     let count: i64 = read_only_pool
@@ -248,7 +248,7 @@ fn read_only_pool_does_not_claim_sink_and_later_writable_pool_can() {
     let _writable_pool = ConnectionPool::new(PoolConfig {
         path: Some(writable_path.clone()),
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     })
     .expect("later writable pool must open");
     let sink_path = dir
@@ -291,7 +291,7 @@ fn writer_admission_timeout_emits_ndjson_row() {
     let cfg = PoolConfig {
         path: Some(db_path.clone()),
         checkout_timeout: Duration::from_millis(50),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"));
 
@@ -345,7 +345,7 @@ async fn sql_bridge_busy_standalone_writer_emits_ndjson_row() {
         // exercising the `standalone:sql_bridge` busy site regardless of
         // the file-backed write-queue default.
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -417,7 +417,7 @@ async fn graph_busy_standalone_writer_emits_ndjson_row() {
         // exercising the `standalone:graph` busy site regardless of the
         // file-backed write-queue default.
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -489,7 +489,7 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
         // exercising the `standalone:event` busy site regardless of the
         // file-backed write-queue default.
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -653,7 +653,7 @@ async fn slow_queued_write_emits_slow_write_row() {
         let cfg = PoolConfig {
             path: Some(db_path.clone()),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         let handle = pool
@@ -709,7 +709,7 @@ async fn slow_write_disabled_by_zero_threshold_emits_nothing() {
         let cfg = PoolConfig {
             path: Some(db_path.clone()),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         let handle = pool

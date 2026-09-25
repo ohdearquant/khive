@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- KG and coordinated search publish `rank_score`, `rank_score_kind`, and retained
+  component `signals`. The deprecated `score` field is an exact compatibility
+  alias. `min_rank_score` applies an inclusive fixed-point floor before the final
+  result limit, including time ordering; `min_score` remains a deprecated alias,
+  and supplying both names is rejected. Agent presentation rounds the new score
+  fields after filtering and omits an empty evidence object. Knowledge search
+  and memory recall keep their existing scoring contracts.
+- **Breaking**: runtime `SearchHit` and `NoteSearchHit` values now include
+  `rank_score_kind` and typed `signals`. Struct constructors must identify the
+  ordering strategy and explicitly retain available component scores; an absent
+  signal uses `None`. `FusionExecutor` implementers must add
+  `rank_score_kind()`, choosing `rrf`, `vector`, `keyword`, `weighted`, or `union`
+  according to the executor's ordering strategy. The existing `score` field
+  remains the canonical deterministic ordering value. Note search computes its
+  salience weight with fixed-point arithmetic, so rounding at the smallest score
+  increment can differ from the previous floating-point calculation.
 - **Breaking**: the `web` pack no longer reads a `.well-known` application manifest or emits
   `machine_view`/`agent_tool`/`agent_skill` entities — see the `web.*` entries above and
   `docs/packs/web.md`.

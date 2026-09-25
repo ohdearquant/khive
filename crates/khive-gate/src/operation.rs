@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v4";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v5";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +162,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("session.export", OperationAccess::Read),
     ("session.list", OperationAccess::Read),
     ("session.resume", OperationAccess::Read),
+    ("session.search", OperationAccess::Read),
     ("session.store", OperationAccess::Write),
     ("stats", OperationAccess::Read),
     ("stream.append", OperationAccess::Write),

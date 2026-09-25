@@ -2339,6 +2339,17 @@ where
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),
         }
+        // Tokio retains its process-wide handlers after the streams are dropped.
+        // This daemon cannot restart without exec; a repeat signal must terminate
+        // even if shutdown is blocked in synchronous recovery-lock acquisition.
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            // SAFETY: setting SIG_DFL for these valid signals needs no handler
+            // pointer or shared Rust state and applies to the whole process.
+            if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok::<(), std::io::Error>(())
     };
 
     // SAFETY: `geteuid` is always successful and takes no arguments.
@@ -2399,7 +2410,7 @@ where
                 }
             }
         } => {}
-        _ = shutdown => {}
+        result = shutdown => result?,
     }
 
     // A listening backlog is not admitted work. Close it before draining so
@@ -2859,6 +2870,9 @@ pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, di
 #[cfg(all(test, unix))]
 mod tests {
     include!("daemon/plan_tests.rs");
+    mod shutdown_signals {
+        include!("daemon/shutdown_signal_tests.rs");
+    }
     use super::*;
     use serial_test::serial;
 
@@ -2987,7 +3001,7 @@ mod tests {
             });
         let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
         let secondary_backend =
-            khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
+            khive_db::StorageBackend::sqlite_for_test(secondary_dir.path().join("secondary.db"))
                 .expect("file-backed secondary backend");
 
         let mut tasks = checkpoint_task_specs(
@@ -3052,8 +3066,9 @@ mod tests {
         );
 
         let file_main_dir = tempfile::tempdir().expect("file-backed main tempdir");
-        let file_main = khive_db::StorageBackend::sqlite(file_main_dir.path().join("main.db"))
-            .expect("file-backed main backend");
+        let file_main =
+            khive_db::StorageBackend::sqlite_for_test(file_main_dir.path().join("main.db"))
+                .expect("file-backed main backend");
         let tasks = checkpoint_task_specs(
             Some(file_main.pool_arc()),
             vec![secondary_backend.pool_arc()],
@@ -4760,7 +4775,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5014,7 +5029,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5119,7 +5134,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_enabled.db")),
                 write_queue_enabled: Some(true),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5141,7 +5156,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_disabled.db")),
                 write_queue_enabled: Some(false),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );

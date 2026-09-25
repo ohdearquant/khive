@@ -2,11 +2,13 @@
 //! `docs/api/resolve-verb.md#handler-shape`.
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use khive_runtime::{NamespaceToken, ReferenceResolution, RuntimeError, VerbRegistry};
 
 use super::common::{deser, resolve_kind_spec, KindSpec};
 use super::params::ResolveParams;
+use super::redirect::followed_entity;
 use crate::KgPack;
 
 const DEFAULT_LIMIT: u32 = 5;
@@ -19,7 +21,7 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let p: ResolveParams = deser(params)?;
+        let p: ResolveParams = deser(params.clone())?;
         if p.refs.is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "resolve requires a non-empty `refs` array".into(),
@@ -43,8 +45,8 @@ impl KgPack {
         };
 
         let mut results = Vec::with_capacity(p.refs.len());
-        for nl_ref in &p.refs {
-            let resolution = khive_runtime::resolve_reference(
+        for (index, nl_ref) in p.refs.iter().enumerate() {
+            let mut resolution = khive_runtime::resolve_reference(
                 &self.runtime,
                 ring,
                 token,
@@ -53,7 +55,60 @@ impl KgPack {
                 entity_kind.as_deref(),
             )
             .await?;
-            results.push(render_resolution(nl_ref, resolution));
+            let mut redirected_from = Vec::new();
+            if matches!(&resolution, ReferenceResolution::NotFound) {
+                let id = if let Ok(id) = Uuid::parse_str(nl_ref.trim()) {
+                    Some(id)
+                } else if nl_ref.trim().len() >= 8
+                    && nl_ref.trim().chars().all(|ch| ch.is_ascii_hexdigit())
+                {
+                    registry
+                        .resolve_kg_read_prefix(&self.runtime, token, nl_ref.trim(), true)
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(id) = id {
+                    if let Some((entity, chain)) =
+                        followed_entity(&self.runtime, registry, token, id).await?
+                    {
+                        if !chain.is_empty() {
+                            resolution = ReferenceResolution::Resolved {
+                                id: entity.id,
+                                confidence: 1.0,
+                            };
+                            redirected_from = chain;
+                        }
+                    }
+                }
+            } else if let ReferenceResolution::Resolved { id, confidence } = &resolution {
+                resolution = match followed_entity(&self.runtime, registry, token, *id).await? {
+                    Some((entity, chain)) => {
+                        redirected_from = chain;
+                        ReferenceResolution::Resolved {
+                            id: entity.id,
+                            confidence: *confidence,
+                        }
+                    }
+                    None => ReferenceResolution::NotFound,
+                };
+            }
+            let mut result = render_resolution(nl_ref, resolution);
+            if !redirected_from.is_empty() {
+                let effective_id = result["id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("resolved redirect has no entity id".into())
+                    })?;
+                let mut effective_args = params.clone();
+                effective_args["refs"][index] = json!(effective_id.to_string());
+                registry
+                    .authorize_effective_kg_read(token, "resolve", effective_args, effective_id)
+                    .await?;
+                result["redirected_from"] = json!(redirected_from);
+            }
+            results.push(result);
         }
 
         Ok(json!({ "results": results }))
