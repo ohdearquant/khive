@@ -69,6 +69,340 @@ def step_block(job, step_name):
     return job.split(f"- name: {step_name}", 1)[1].split("\n      - name: ", 1)[0]
 
 
+class MinioStorageChangeWorkflowTests(unittest.TestCase):
+    """Execute the shipped path gate with real, private shallow repositories."""
+
+    def setUp(self):
+        self.git = shutil.which("git")
+        self.bash = shutil.which("bash")
+        self.assertIsNotNone(self.git, "GIT_FIXTURE_TOOL_REQUIRED")
+        self.assertIsNotNone(self.bash, "BASH_FIXTURE_TOOL_REQUIRED")
+
+    def _gate_script(self):
+        job = indented_block(workflow_text("ci.yml"), "minio-blob-compat", 2)
+        step = step_block(job, "Determine whether storage crates changed")
+        lines = step.splitlines()
+        start = lines.index("        run: |") + 1
+        script_lines = []
+        for line in lines[start:]:
+            if line.strip() and not line.startswith("          "):
+                break
+            script_lines.append(line)
+        script = textwrap.dedent("\n".join(script_lines))
+        self.assertTrue(script.strip(), "WORKFLOW_BASH_EXTRACTED")
+        return script
+
+    def _git(self, cwd, env, *args, check=True):
+        result = subprocess.run(
+            [self.git, *args],
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if check:
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"GIT_FIXTURE_SETUP: {args!r}\n{result.stdout}\n{result.stderr}",
+            )
+        return result
+
+    def _shallow_fixture(self, changed_path="README.md"):
+        temporary = tempfile.TemporaryDirectory(prefix="minio-workflow-")
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        home = root / "home"
+        hooks = root / "empty-hooks"
+        home.mkdir()
+        hooks.mkdir()
+        # No inherited Git config, signing, hooks, credentials, or shell startup
+        # files may affect this fixture. Only its private file:// remote is used.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("GIT_", "BASH_FUNC_")) and key not in {"BASH_ENV", "ENV"}
+        }
+        env.update(
+            HOME=str(home),
+            XDG_CONFIG_HOME=str(home / "config"),
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_SYSTEM=os.devnull,
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_TERMINAL_PROMPT="0",
+            GIT_ALLOW_PROTOCOL="file",
+        )
+        config = {
+            "user.name": "MinIO workflow fixture",
+            "user.email": "minio-workflow@example.invalid",
+            "commit.gpgsign": "false",
+            "tag.gpgsign": "false",
+            "core.hooksPath": str(hooks),
+            "core.autocrlf": "false",
+            "core.quotePath": "true",
+        }
+        env["GIT_CONFIG_COUNT"] = str(len(config))
+        for index, (key, value) in enumerate(config.items()):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
+
+        source = root / "source"
+        remote = root / "remote.git"
+        checkout = root / "checkout"
+        self._git(root, env, "init", "--bare", str(remote))
+        self._git(root, env, "init", "--initial-branch=main", str(source))
+        (source / "crates").mkdir()
+        (source / "crates" / ".keep").write_text("fixture working directory\n")
+        (source / "README.md").write_text("base revision\n")
+        self._git(source, env, "add", "--all")
+        self._git(source, env, "commit", "-m", "base fixture")
+        base = self._git(source, env, "rev-parse", "HEAD").stdout.strip()
+        changed = source / changed_path
+        changed.parent.mkdir(parents=True, exist_ok=True)
+        changed.write_text("changed revision\n")
+        self._git(source, env, "add", "--all")
+        self._git(source, env, "commit", "-m", "change fixture")
+        head = self._git(source, env, "rev-parse", "HEAD").stdout.strip()
+        remote_url = remote.as_uri()
+        self._git(source, env, "push", remote_url, "HEAD:refs/heads/main")
+        self._git(
+            root, env, "clone", "--depth=1", "--no-local", "--branch", "main",
+            remote_url, str(checkout),
+        )
+        self.assertEqual(
+            self._git(checkout, env, "rev-parse", "HEAD").stdout.strip(),
+            head,
+            "SHALLOW_CHECKOUT_IS_CHANGED_REVISION",
+        )
+        self.assertEqual(
+            self._git(checkout, env, "rev-parse", "--is-shallow-repository").stdout.strip(),
+            "true",
+            "FIXTURE_IS_DEPTH_ONE_CLONE",
+        )
+        self.assertNotEqual(
+            self._git(checkout, env, "cat-file", "-e", f"{base}^{{commit}}", check=False).returncode,
+            0,
+            "SHALLOW_PARENT_INITIALLY_ABSENT",
+        )
+        return checkout, base, env
+
+    def _run_gate(self, checkout, env, *, event="pull_request", pr_base="", push_before=""):
+        output = checkout.parent / "github-output"
+        gate_env = {
+            **env,
+            "EVENT_NAME": event,
+            "PR_BASE_SHA": pr_base,
+            "PUSH_BEFORE_SHA": push_before,
+            "GITHUB_OUTPUT": str(output),
+        }
+        result = subprocess.run(
+            [self.bash, "--noprofile", "--norc", "-c", self._gate_script()],
+            cwd=checkout / "crates",
+            env=gate_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"WORKFLOW_BASH_SUCCEEDED\n{result.stdout}\n{result.stderr}",
+        )
+        self.assertTrue(output.is_file(), "WORKFLOW_OUTPUT_WAS_WRITTEN")
+        return output.read_text()
+
+    def _assert_base_fetched(self, checkout, base, env):
+        self.assertEqual(
+            self._git(checkout, env, "cat-file", "-e", f"{base}^{{commit}}", check=False).returncode,
+            0,
+            "COMPARISON_BASE_WAS_FETCHED",
+        )
+
+    def test_pull_request_nonstorage_change_fetches_missing_base(self):
+        checkout, base, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=false\n",
+            "PR_BASE_FETCH_SKIPS_NONSTORAGE",
+        )
+        self._assert_base_fetched(checkout, base, env)
+
+    def test_push_nonstorage_change_fetches_missing_base(self):
+        checkout, base, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, event="push", push_before=base),
+            "run=false\n",
+            "PUSH_BASE_FETCH_SKIPS_NONSTORAGE",
+        )
+        self._assert_base_fetched(checkout, base, env)
+
+    def _assert_protected_path(self, path, marker):
+        checkout, base, env = self._shallow_fixture(path)
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base), "run=true\n", marker,
+        )
+        self._assert_base_fetched(checkout, base, env)
+
+    def test_database_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/khive-db/src/fixture.rs", "DATABASE_PATH_RUNS_MINIO")
+
+    def _assert_quoted_database_path(self, path, marker):
+        checkout, base, env = self._shallow_fixture(path)
+        self.assertEqual(self._run_gate(checkout, env, pr_base=base), "run=true\n", marker)
+        self._assert_base_fetched(checkout, base, env)
+        listed = self._git(checkout, env, "diff", "--name-only", base, "HEAD").stdout
+        self.assertTrue(
+            listed.startswith('"'),
+            f"{marker}: fixture must expose Git's C-quoted name: {listed!r}",
+        )
+
+    def test_nonascii_database_path_runs_minio_after_fetching_base(self):
+        self._assert_quoted_database_path(
+            "crates/khive-db/tests/é.rs", "NONASCII_DATABASE_PATH_RUNS_MINIO",
+        )
+
+    def test_tab_in_database_path_runs_minio_after_fetching_base(self):
+        self._assert_quoted_database_path(
+            "crates/khive-db/tests/a\tb.rs", "TAB_DATABASE_PATH_RUNS_MINIO",
+        )
+
+    def test_storage_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/khive-storage/src/fixture.rs", "STORAGE_PATH_RUNS_MINIO")
+
+    def test_blob_contract_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("docs/adr/ADR-111-fixture.md", "BLOB_CONTRACT_PATH_RUNS_MINIO")
+
+    def test_ci_workflow_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path(".github/workflows/ci.yml", "CI_WORKFLOW_PATH_RUNS_MINIO")
+
+    def test_workspace_manifest_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/Cargo.toml", "WORKSPACE_MANIFEST_PATH_RUNS_MINIO")
+
+    def test_workspace_lockfile_path_runs_minio_after_fetching_base(self):
+        self._assert_protected_path("crates/Cargo.lock", "WORKSPACE_LOCKFILE_PATH_RUNS_MINIO")
+
+    def test_renaming_database_conformance_to_unprotected_crate_runs_minio(self):
+        protected = "crates/khive-db/tests/blob_conformance.rs"
+        unprotected = "crates/khive-types/tests/blob_conformance.rs"
+        checkout, _, env = self._shallow_fixture(protected)
+        base = self._git(checkout, env, "rev-parse", "HEAD").stdout.strip()
+        (checkout / unprotected).parent.mkdir(parents=True)
+        self._git(checkout, env, "mv", protected, unprotected)
+        self._git(checkout, env, "commit", "-m", "move conformance out of database crate")
+        # Pin the fixture to the behavior that hid the protected old path.
+        # The shipped script must override this with --no-renames.
+        self._git(checkout, env, "config", "diff.renames", "true")
+        self.assertEqual(
+            self._git(checkout, env, "diff", "--name-status", base, "HEAD").stdout,
+            f"R100\t{protected}\t{unprotected}\n",
+            "FIXTURE_IS_PROTECTED_TO_UNPROTECTED_RENAME",
+        )
+        self.assertEqual(
+            self._git(checkout, env, "diff", "--name-only", base, "HEAD").stdout,
+            f"{unprotected}\n",
+            "DEFAULT_RENAME_DIFF_HIDES_PROTECTED_SOURCE",
+        )
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=true\n",
+            "RENAMED_DATABASE_SOURCE_RUNS_MINIO",
+        )
+
+    def test_missing_base_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env), "run=true\n", "MISSING_BASE_RUNS_MINIO",
+        )
+
+    def test_new_branch_zero_push_base_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, event="push", push_before="0" * 40),
+            "run=true\n",
+            "ZERO_PUSH_BASE_RUNS_MINIO",
+        )
+
+    def test_unresolvable_base_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base="f" * 40),
+            "run=true\n",
+            "UNRESOLVABLE_BASE_RUNS_MINIO",
+        )
+
+    def test_non_sha_local_ref_runs_minio(self):
+        checkout, _, env = self._shallow_fixture()
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base="HEAD"),
+            "run=true\n",
+            "NON_SHA_BASE_RUNS_MINIO",
+        )
+
+    def test_manual_event_runs_minio_even_with_comparable_payload_bases(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self.assertEqual(
+            self._run_gate(
+                checkout, env, event="workflow_dispatch", pr_base=base, push_before=base,
+            ),
+            "run=true\n",
+            "MANUAL_EVENT_RUNS_MINIO",
+        )
+
+    def test_scheduled_event_runs_minio_even_with_comparable_payload_bases(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self.assertEqual(
+            self._run_gate(
+                checkout, env, event="schedule", pr_base=base, push_before=base,
+            ),
+            "run=true\n",
+            "SCHEDULED_EVENT_RUNS_MINIO",
+        )
+
+    def test_locally_present_base_skips_nonstorage_without_remote(self):
+        checkout, base, env = self._shallow_fixture()
+        self._git(checkout, env, "fetch", "--no-tags", "--depth=1", "origin", base)
+        self._git(checkout, env, "remote", "remove", "origin")
+        self.assertEqual(
+            self._run_gate(checkout, env, pr_base=base),
+            "run=false\n",
+            "LOCAL_BASE_NEEDS_NO_REMOTE",
+        )
+
+    def test_diff_failure_runs_minio(self):
+        checkout, base, env = self._shallow_fixture()
+        wrappers = checkout.parent / "wrappers"
+        wrappers.mkdir()
+        trace = checkout.parent / "diff-failure-trace"
+        wrapper = wrappers / "git"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "diff" ]; then\n'
+            '  printf "%s\\n" "forced diff failure" >> "$CI_DIFF_FAILURE_TRACE"\n'
+            "  exit 73\n"
+            "fi\n"
+            f"exec {shlex.quote(self.git)} \"$@\"\n"
+        )
+        wrapper.chmod(0o700)
+        gate_env = {
+            **env,
+            "PATH": f"{wrappers}{os.pathsep}{env.get('PATH', os.defpath)}",
+            "CI_DIFF_FAILURE_TRACE": str(trace),
+        }
+        self.assertEqual(
+            self._run_gate(checkout, gate_env, pr_base=base),
+            "run=true\n",
+            "DIFF_FAILURE_RUNS_MINIO",
+        )
+        self.assertTrue(trace.is_file(), "DIFF_FAILURE_WAS_EXERCISED")
+        self.assertEqual(trace.read_text(), "forced diff failure\n", "ONLY_DIFF_WAS_FORCED_TO_FAIL")
+        self._assert_base_fetched(checkout, base, env)
+
+
 class CoverageRatchetWorkflowTests(unittest.TestCase):
     def test_measurement_job_reports_compute_unavailability(self):
         workflow = workflow_text("ci.yml")

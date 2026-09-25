@@ -14,6 +14,9 @@
 
 #![cfg(unix)]
 
+#[path = "../src/test_process.rs"]
+mod test_process;
+
 use async_trait::async_trait;
 use khive_runtime::daemon::run_daemon_in_process_test;
 use khive_runtime::{DaemonDispatch, RequestIdentity};
@@ -57,6 +60,10 @@ impl DaemonDispatch for NeverDispatch {
 #[tokio::test]
 #[serial]
 async fn second_daemon_boot_refuses_loudly_while_first_is_live() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
     std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));

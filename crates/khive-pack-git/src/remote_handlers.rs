@@ -92,6 +92,8 @@ fn number(params: &Value) -> Result<u64, Failure> {
 }
 
 fn validate(verb: &str, params: &Value) -> Result<(), Failure> {
+    crate::params::parse(verb, params.clone())
+        .map_err(|error| Failure::invalid(error.to_string()))?;
     validate_keys(params, keys(verb))?;
     validate_repo_path(Path::new(required(params, "repo")?))
         .map_err(|_| Failure::invalid("repo must be an absolute repository path"))?;

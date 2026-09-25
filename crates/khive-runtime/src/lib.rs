@@ -2,6 +2,9 @@
 //!
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
+#[cfg(test)]
+mod test_process;
+
 pub mod actor_identity;
 pub mod agent_lifecycle;
 pub mod ann_registry;

@@ -265,10 +265,9 @@ def main():
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 12 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git, code, workspace, blob), so verbs() returns exactly
-        # 91 user-facing MCP-callable verbs (count what verbs() returns, not internal
-        # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
+        # unset) loads 14 production packs and exposes 138 MCP-callable verbs
+        # (count what verbs() returns, not internal dispatch arms). The session
+        # pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
@@ -300,8 +299,8 @@ def main():
         # exec nine (the tool registry with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 137, (
-            f"expected 137 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 138, (
+            f"expected 138 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -328,6 +327,9 @@ def main():
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
+        assert "gtd.repair" in verb_names, (
+            f"'gtd.repair' (ADR-019 Amendment 7) must appear in verbs listing: {verb_names}"
+        )
         assert "tool.policy_delete" in verb_names, (
             f"'tool.policy_delete' must appear in verbs listing: {verb_names}"
         )

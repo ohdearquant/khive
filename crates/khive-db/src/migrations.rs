@@ -167,7 +167,8 @@ const V35_UP: &str = include_str!("../sql/035-notes-unread-probe-recipient-type-
 const V36_UP: &str = include_str!("../sql/036-events-operation-attribution.sql");
 const V37_UP: &str = include_str!("../sql/037-entity-versions.sql");
 const V38_UP: &str = include_str!("../sql/038-entities-legacy-type-index.sql");
-const V39_UP: &str = include_str!("../sql/039-sender-transport.sql");
+const V39_UP: &str = include_str!("../sql/039-knowledge-cursor-indexes.sql");
+const V40_UP: &str = include_str!("../sql/040-sender-transport.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -416,8 +417,13 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 39,
-        name: "sender_transport",
+        name: "knowledge_cursor_indexes",
         up: V39_UP,
+    },
+    VersionedMigration {
+        version: 40,
+        name: "sender_transport",
+        up: V40_UP,
     },
 ];
 

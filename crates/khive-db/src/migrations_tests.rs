@@ -4812,7 +4812,7 @@ fn issue2673_v37_initializes_and_guards_entity_versions() {
 
 #[test]
 fn sender_transport_migration_fresh_and_previous_tail() {
-    for previous in [0, 38] {
+    for previous in [0, 39] {
         let mut conn = open_memory();
         if previous != 0 {
             migrate_through(&mut conn, previous);

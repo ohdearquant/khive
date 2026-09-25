@@ -1188,6 +1188,7 @@ async fn acquire_handle_slot(
             SlotTimeoutClass::Admission => StorageError::AdmissionTimeout {
                 operation: operation.into(),
                 timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                pool_identity: None,
             },
             SlotTimeoutClass::ReaderContract => StorageError::Timeout {
                 operation: operation.into(),
