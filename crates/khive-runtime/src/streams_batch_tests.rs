@@ -513,8 +513,8 @@ fn file_fixture() -> (
         db_path: Some(dir.path().join("stream-batch.db")),
         ..crate::RuntimeConfig::no_embeddings()
     };
-    let runtime = KhiveRuntime::new(config.clone()).unwrap();
-    let peer = KhiveRuntime::new(config).unwrap();
+    let runtime = KhiveRuntime::new_for_test(config.clone()).unwrap();
+    let peer = KhiveRuntime::new_for_test(config).unwrap();
     runtime.install_kind_registry(vec![], vec!["head".into(), "observation".into()]);
     peer.install_kind_registry(vec![], vec!["head".into(), "observation".into()]);
     let token = runtime.authorize(Namespace::local()).unwrap();

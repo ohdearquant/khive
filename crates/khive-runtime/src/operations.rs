@@ -11419,7 +11419,7 @@ mod tests {
         } else {
             std::env::remove_var("KHIVE_WRITE_QUEUE");
         }
-        let rt = KhiveRuntime::new(crate::config::RuntimeConfig {
+        let rt = KhiveRuntime::new_for_test(crate::config::RuntimeConfig {
             db_path: Some(path),
             packs: vec!["kg".to_string()],
             brain_profile: None,
@@ -15101,7 +15101,7 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("deleted-entity-ids-saturation.db");
-        let rt = KhiveRuntime::new(crate::config::RuntimeConfig {
+        let rt = KhiveRuntime::new_for_test(crate::config::RuntimeConfig {
             db_path: Some(db_path),
             ..crate::config::RuntimeConfig::no_embeddings()
         })
