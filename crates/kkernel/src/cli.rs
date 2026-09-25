@@ -444,6 +444,9 @@ pub async fn cli_main() -> Result<()> {
                     base_cfg
                 };
 
+                let max_readers =
+                    khive_mcp::serve::mcp_max_readers(&a, &base_cfg, &khive_cfg.backends, None);
+
                 // #667: acquire the boot/recovery lock before building the
                 // coordinator server — that construction runs migrations and
                 // applies pack schema plans (FTS DDL included) — and hold it
@@ -466,11 +469,12 @@ pub async fn cli_main() -> Result<()> {
                 let boot_guard: Option<std::fs::File> = None;
 
                 let (server, schedule_rt) =
-                    build_multi_backend_server_with_coordinator_and_db_anchor(
+                    build_multi_backend_server_with_coordinator_and_pool_size(
                         base_cfg,
                         &khive_cfg,
                         a.db.as_deref(),
                         db_anchor.as_deref(),
+                        max_readers,
                     )
                     .await?;
 
@@ -567,17 +571,36 @@ async fn build_multi_backend_server_with_coordinator(
     .await
 }
 
+#[cfg(test)]
 async fn build_multi_backend_server_with_coordinator_and_db_anchor(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
     db_anchor: Option<&std::path::Path>,
 ) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
-    let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor(
+    build_multi_backend_server_with_coordinator_and_pool_size(
         base_cfg,
         khive_cfg,
         cli_db_override,
         db_anchor,
+        None,
+    )
+    .await
+}
+
+async fn build_multi_backend_server_with_coordinator_and_pool_size(
+    base_cfg: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+    max_readers: Option<usize>,
+) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
+    let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+        base_cfg,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+        max_readers,
     )
     .await?;
 
