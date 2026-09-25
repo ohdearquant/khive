@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use bytemuck::cast_slice;
@@ -860,13 +860,51 @@ impl VamanaIndex {
     }
 
     /// Persist the index to `path` (a directory); writes `metadata.bin`, `graph.bin`, `vectors.bin`.
+    /// Each replacement is staged in a fresh inode and renamed into place, so
+    /// an existing mmap reader keeps its original vectors even across an overwrite.
+    /// The v1 format has no tombstone state, so deleted indexes must use
+    /// [`Self::save_atomic`] instead.
     #[cfg(feature = "mmap")]
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.reject_lossy_legacy_export()?;
+        let vectors: &[u8] = cast_slice(self.vectors()?);
+        let graph = encode_graph(&self.graph, self.config.max_degree)?;
+        let metadata = encode_metadata(self);
+
         fs::create_dir_all(path)?;
-        write_metadata(&path.join("metadata.bin"), self)?;
-        write_graph(&path.join("graph.bin"), &self.graph, self.config.max_degree)?;
-        write_vectors(&path.join("vectors.bin"), self.vectors()?)?;
-        Ok(())
+        let publication_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.join(".checkpoint.lock"))?;
+        publication_lock.lock()?;
+
+        // Stage every payload before replacing any canonical name. The lock
+        // coordinates with load/save_atomic; already-returned mmap readers do
+        // not need to hold it because rename leaves their old inode intact.
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(3);
+        let result = (|| -> Result<()> {
+            for (name, bytes) in [
+                ("vectors.bin", vectors),
+                ("graph.bin", graph.as_slice()),
+                ("metadata.bin", metadata.as_slice()),
+            ] {
+                let destination = path.join(name);
+                let temporary = stage_legacy_replacement(&destination, bytes)?;
+                staged.push((temporary, destination));
+            }
+            // The v1 metadata is not a checksum-bearing commit record, but
+            // publishing it last keeps the format marker behind both segments.
+            for (temporary, destination) in &staged {
+                fs::rename(temporary, destination)?;
+            }
+            Ok(())
+        })();
+        for (temporary, _) in staged {
+            let _ = fs::remove_file(temporary);
+        }
+        result
     }
 
     /// Load an index from a directory previously written by [`VamanaIndex::save`]
@@ -894,9 +932,9 @@ impl VamanaIndex {
     /// amplifier. Taking a shared lock on the same file the writer holds exclusively
     /// puts the whole rename sequence outside anything a reader can observe.
     ///
-    /// A directory with no lock file — a v1 layout, or a segment no `save_atomic` has
-    /// ever written — loads unlocked, because there is no writer using this protocol to
-    /// exclude. The lock releases when the guard drops at the end of the load; an mmap
+    /// A directory with no lock file — a historical v1 layout, or a segment no
+    /// locking writer has ever published — loads unlocked. The lock releases
+    /// when the guard drops at the end of the load; an mmap
     /// taken during the load holds its own inode open, so a rename landing afterwards
     /// cannot change what was loaded.
     #[cfg(feature = "mmap")]
@@ -909,8 +947,9 @@ impl VamanaIndex {
     }
 
     /// Open `path`'s `.checkpoint.lock` and hand it to `acquire_lock`. `None` means the
-    /// directory has no lock file, which is not a failure: a v1 layout, or a segment no
-    /// `save_atomic` has ever written, has no writer using this protocol to exclude.
+    /// directory has no lock file, which is not a failure: an older v1 layout,
+    /// or a segment no locking writer has ever published, has no writer using
+    /// this protocol to exclude.
     #[cfg(feature = "mmap")]
     fn open_publication_lock(
         path: &Path,
@@ -1522,6 +1561,8 @@ impl VamanaIndex {
     }
 
     /// Serialise this index into a self-validating `VamanaSnapshot`.
+    /// This v1 snapshot cannot represent tombstones; use [`Self::to_bytes`]
+    /// for an index with deletions.
     pub fn to_snapshot(
         &self,
         namespace: impl Into<String>,
@@ -1529,6 +1570,7 @@ impl VamanaIndex {
         fingerprint: CorpusFingerprint,
         external_ids: Vec<String>,
     ) -> Result<VamanaSnapshot> {
+        self.reject_lossy_legacy_export()?;
         if external_ids.len() != self.num_vectors {
             return Err(VamanaError::invalid_format(format!(
                 "external_ids length {} != num_vectors {}",
@@ -1582,6 +1624,16 @@ impl VamanaIndex {
             },
             external_ids,
         })
+    }
+
+    fn reject_lossy_legacy_export(&self) -> Result<()> {
+        if self.tombstone_count > 0 {
+            return Err(VamanaError::invalid_format(
+                "v1 save/to_snapshot cannot represent tombstones; use save_atomic or to_bytes"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reconstruct a `VamanaIndex` from a `VamanaSnapshot`.
@@ -3500,7 +3552,7 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
 }
 
 #[cfg(feature = "mmap")]
-fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
+fn encode_metadata(index: &VamanaIndex) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(METADATA_MAGIC);
     buf.extend_from_slice(&(index.num_vectors as u64).to_le_bytes());
@@ -3508,8 +3560,31 @@ fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
     buf.extend_from_slice(&(index.config.max_degree as u64).to_le_bytes());
     buf.extend_from_slice(&(index.config.search_list_size as u64).to_le_bytes());
     buf.extend_from_slice(&index.config.alpha.to_le_bytes());
-    fs::write(path, &buf)?;
-    Ok(())
+    buf
+}
+
+#[cfg(feature = "mmap")]
+fn stage_legacy_replacement(destination: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let filename = destination
+        .file_name()
+        .expect("legacy segment has a fixed filename")
+        .to_string_lossy();
+    let temporary =
+        destination.with_file_name(format!(".{filename}.legacy-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(temporary)
 }
 
 #[cfg(feature = "mmap")]
