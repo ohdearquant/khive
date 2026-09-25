@@ -62,6 +62,7 @@ CRATES=(
     khive-query
     khive-gate
     khive-gate-rego
+    khive-channel          # no khive-* deps; transport abstraction; dep of khive-runtime
     khive-runtime
     khive-request
     khive-retrieval
@@ -87,7 +88,6 @@ CRATES=(
     khive-pack-template
     khive-pack-blob        # needs khive-runtime/storage/types (all above); dep of khive-mcp
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
-    khive-channel          # no khive-* deps; transport abstraction
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
     khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
     khive-mcp

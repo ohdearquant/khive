@@ -15,6 +15,7 @@ pub mod atomic_runner;
 pub mod audit_batch;
 pub mod blob;
 pub mod build_info;
+pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
