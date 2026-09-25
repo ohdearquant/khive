@@ -20,9 +20,10 @@ blockers are reported as `invalid` with a `broken` dependency state.
 
 `gtd.transition` and `gtd.complete`, including atomic preparation, reject unknown
 stored string states with an explicit invalid-stored-status error. Repair needs
-reviewed source evidence, preserving `archived_at` and transition history. The
-timestamp repair sub-request is deferred: the original units/replacement dates
-are unverified and storage uses microseconds. The separate read-only
+explicit source evidence, preserving `archived_at` and transition history.
+[`gtd.repair`](task-repair.md) previews caller-specified replacements and applies
+them only when the supplied observed values still match. It infers no timestamp
+units or replacement dates. The separate read-only
 [`gtd.census`](task-timestamp-census.md) reports raw value magnitudes; it neither
 changes these status filters nor claims the historical timestamp units. There
 is no `gtd.stats` verb.

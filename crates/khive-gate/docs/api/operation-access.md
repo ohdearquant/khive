@@ -9,6 +9,8 @@ and explicit maintenance. Speech-act categories do not determine access.
 
 `gtd.census` performs an aggregate SQL read on the bound notes backend and does
 not acquire a writer, repair timestamps, or infer their units.
+`gtd.repair` is classified as `Write`, including its default dry run, because
+the same verb can explicitly apply caller-specified repairs.
 
 Only an explicit `Read` permits an enrolled, pattern-matched caller. Unknown,
 unloaded, dynamically mounted, or third-party names without a classification are
@@ -19,7 +21,7 @@ when that feature is not built. Workspace and formal declare no handlers.
 
 The implementation is [operation.rs](../../src/operation.rs). Its classifier
 version is part of every nonempty restriction's policy fingerprint.
-Revision `domain-effects-v3` explicitly classifies `tool.policy_delete` as
+Revision `domain-effects-v4` explicitly classifies `gtd.repair` as
 `Write`. Adding this classification changes that identity even though unknown
 operations were already denied. Empty restrictions retain their enrollment-only
 fingerprint.
@@ -108,6 +110,7 @@ fingerprint.
 | `gtd.census`                 | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.complete`               | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)              |
 | `gtd.next`                   | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L191)              |
+| `gtd.repair`                 | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs)                   |
 | `gtd.tasks`                  | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L271)              |
 | `gtd.transition`             | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L353)              |
 | `knowledge.adjudicate`       | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L578)  |
