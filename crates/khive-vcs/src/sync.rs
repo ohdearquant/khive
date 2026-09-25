@@ -5,6 +5,7 @@
 //! fetch with SHA-256 pin verification via [`run_sync_remote`].
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -265,9 +266,9 @@ pub async fn run_sync_remote(
         let entities_path = staging_path.join(".khive/kg/entities.ndjson");
         let edges_path = staging_path.join(".khive/kg/edges.ndjson");
 
-        entities_ndjson = read_entities(&entities_path)
+        entities_ndjson = read_remote_entities(&entities_path)
             .with_context(|| format!("reading staged {}", entities_path.display()))?;
-        edges_ndjson = read_edges(&edges_path)
+        edges_ndjson = read_remote_edges(&edges_path)
             .with_context(|| format!("reading staged {}", edges_path.display()))?;
     }
     // `staging` tempdir is still alive here — we drop it after moving files.
@@ -900,6 +901,10 @@ fn read_entities(path: &Path) -> Result<Vec<NdjsonEntity>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path)?;
+    parse_entities(&text)
+}
+
+fn parse_entities(text: &str) -> Result<Vec<NdjsonEntity>> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -918,6 +923,10 @@ fn read_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path)?;
+    parse_edges(&text)
+}
+
+fn parse_edges(text: &str) -> Result<Vec<NdjsonEdge>> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -929,6 +938,173 @@ fn read_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
         out.push(e);
     }
     Ok(out)
+}
+
+/// A checked-out remote member is untrusted. Keep the read bound to an opened
+/// regular file, without traversing links in the clone-controlled path.
+fn read_remote_regular_file(path: &Path) -> Result<Option<String>> {
+    let Some(mut file) = open_remote_member(path)? else {
+        return Ok(None);
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading remote NDJSON member {}", path.display()))?;
+    Ok(Some(text))
+}
+
+#[cfg(unix)]
+fn open_remote_member(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn open_component(
+        parent_fd: RawFd,
+        name: &CStr,
+        path: &Path,
+        directory: bool,
+    ) -> Result<Option<File>> {
+        // Each clone-controlled component is opened relative to the already
+        // opened parent, so a link swap cannot redirect a later component.
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || error.raw_os_error() == Some(libc::ENOTDIR)
+            {
+                bail!(
+                    "remote NDJSON {} {} is not a regular {}",
+                    if directory { "directory" } else { "member" },
+                    path.display(),
+                    if directory { "directory" } else { "file" }
+                );
+            }
+            return Err(error).with_context(|| format!("opening remote path {}", path.display()));
+        }
+        // SAFETY: openat returned a newly owned descriptor, transferred once to File.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("stat opened remote path {}", path.display()))?;
+        if directory && !metadata.is_dir() {
+            bail!(
+                "remote NDJSON directory {} is not a regular directory",
+                path.display()
+            );
+        }
+        if !directory && !metadata.is_file() {
+            bail!(
+                "remote NDJSON member {} is not a regular file",
+                path.display()
+            );
+        }
+        Ok(Some(file))
+    }
+
+    let kg = path
+        .parent()
+        .context("remote NDJSON member has no parent")?;
+    let khive = kg.parent().context("remote NDJSON kg has no parent")?;
+    let staging = khive
+        .parent()
+        .context("remote NDJSON .khive has no parent")?;
+    if kg.file_name() != Some(std::ffi::OsStr::new("kg"))
+        || khive.file_name() != Some(std::ffi::OsStr::new(".khive"))
+    {
+        bail!(
+            "remote NDJSON member {} is outside .khive/kg",
+            path.display()
+        );
+    }
+    let staging_name = CString::new(staging.as_os_str().as_bytes())?;
+    let khive_name = CString::new(".khive")?;
+    let kg_name = CString::new("kg")?;
+    let member_name = CString::new(
+        path.file_name()
+            .context("remote NDJSON member has no name")?
+            .as_bytes(),
+    )?;
+
+    // The staging directory is a private TempDir; all clone-controlled path
+    // components below it are opened by dirfd with O_NOFOLLOW.
+    let Some(staging_dir) = open_component(libc::AT_FDCWD, &staging_name, staging, true)? else {
+        return Ok(None);
+    };
+    let Some(khive_dir) = open_component(staging_dir.as_raw_fd(), &khive_name, khive, true)? else {
+        return Ok(None);
+    };
+    let Some(kg_dir) = open_component(khive_dir.as_raw_fd(), &kg_name, kg, true)? else {
+        return Ok(None);
+    };
+    open_component(kg_dir.as_raw_fd(), &member_name, path, false)
+}
+
+#[cfg(not(unix))]
+fn open_remote_member(path: &Path) -> Result<Option<std::fs::File>> {
+    // The portable fallback checks every clone-controlled component before
+    // opening the member. Unix uses dirfds above to bind those checks to opens.
+    let kg = path
+        .parent()
+        .context("remote NDJSON member has no parent")?;
+    let khive = kg.parent().context("remote NDJSON kg has no parent")?;
+    for directory in [khive, kg] {
+        let metadata = match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", directory.display()))
+            }
+        };
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "remote NDJSON directory {} is not a regular directory",
+                directory.display()
+            );
+        }
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "remote NDJSON member {} is not a regular file",
+            path.display()
+        );
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening remote NDJSON member {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!(
+            "remote NDJSON member {} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(Some(file))
+}
+
+fn read_remote_entities(path: &Path) -> Result<Vec<NdjsonEntity>> {
+    match read_remote_regular_file(path)? {
+        Some(text) => parse_entities(&text),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn read_remote_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
+    match read_remote_regular_file(path)? {
+        Some(text) => parse_edges(&text),
+        None => Ok(Vec::new()),
+    }
 }
 
 async fn checkpoint_wal(runtime: &KhiveRuntime) -> Result<()> {
@@ -2484,6 +2660,100 @@ mod tests {
             cache.join("meta.json").exists(),
             "meta.json must be written even when pin is absent"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_fetch_rejects_symlinked_ndjson_members_before_publish() {
+        use std::os::unix::fs::symlink;
+
+        let entities = r#"{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","kind":"concept","name":"Outside","properties":{},"tags":[]}"#;
+        for member in ["entities.ndjson", "edges.ndjson"] {
+            let source = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let bare_parent = TempDir::new().unwrap();
+            let client = TempDir::new().unwrap();
+            make_git_remote(source.path(), entities, "");
+
+            let outside_file = outside.path().join(member);
+            std::fs::write(
+                &outside_file,
+                if member == "entities.ndjson" {
+                    entities
+                } else {
+                    ""
+                },
+            )
+            .unwrap();
+            let member_path = source.path().join(".khive/kg").join(member);
+            std::fs::remove_file(&member_path).unwrap();
+            symlink(&outside_file, &member_path).unwrap();
+            run_git(source.path(), &["add", "-A"]);
+            run_git(source.path(), &["commit", "-m", "link remote member"]);
+
+            let bare = bare_parent.path().join("remote.git");
+            run_git(
+                source.path(),
+                &["clone", "--bare", ".", bare.to_str().unwrap()],
+            );
+            let remote = RemoteConfig {
+                name: RemoteName::parse("outside").unwrap(),
+                url: format!("file://{}", bare.display()),
+                git_ref: "main".to_string(),
+                namespace: "remote-ns".to_string(),
+                pin: None,
+            };
+
+            let err = run_sync_remote(client.path(), &remote, false)
+                .await
+                .expect_err("a checked-out symlink must not be read");
+            assert!(
+                format!("{err:#}").contains("not a regular file"),
+                "{member}: {err:#}"
+            );
+            assert!(
+                !client.path().join(".khive/kg/remotes/outside").exists(),
+                "{member} must not publish an external file"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_reader_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let entity =
+            r#"{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","kind":"concept","name":"Outside"}"#;
+        for ancestor in [".khive", ".khive/kg"] {
+            let staging = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let outside_kg = if ancestor == ".khive" {
+                outside.path().join("kg")
+            } else {
+                outside.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&outside_kg).unwrap();
+            std::fs::write(outside_kg.join("entities.ndjson"), entity).unwrap();
+            if ancestor == ".khive/kg" {
+                std::fs::create_dir(staging.path().join(".khive")).unwrap();
+            }
+            let link = staging.path().join(ancestor);
+            symlink(outside.path(), &link).unwrap();
+
+            let member = staging.path().join(".khive/kg/entities.ndjson");
+            let err =
+                read_remote_entities(&member).expect_err("a symlinked ancestor must be refused");
+            assert!(
+                format!("{err:#}").contains("not a regular directory"),
+                "{ancestor}: {err:#}"
+            );
+
+            std::fs::remove_file(&link).unwrap();
+            std::fs::create_dir_all(staging.path().join(".khive/kg")).unwrap();
+            std::fs::write(&member, entity).unwrap();
+            assert_eq!(read_remote_entities(&member).unwrap().len(), 1);
+        }
     }
 
     /// F201-4: `--repin` skips pin comparison and returns the actual hash,
