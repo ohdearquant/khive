@@ -3380,6 +3380,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn live_foreign_pid_does_not_block_daemon_startup() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -3462,6 +3466,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn second_start_refuses_while_pid_file_is_locked_before_bind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");

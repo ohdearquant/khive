@@ -3573,21 +3573,26 @@ mod tests {
         // Poll for BOTH effects: the row landing daemon-side and the
         // forwarder's own counter — the row can be visible a beat before the
         // forwarder task is rescheduled to record the delivery.
-        let mut count = 0;
-        let mut metrics = client.metrics();
-        for _ in 0..100 {
-            count = store
-                .count_events(EventFilter::default())
-                .await
-                .expect("count over socket");
-            metrics = client.metrics();
-            if count == 1 && metrics.forwarded_events >= 1 {
-                break;
+        let (count, metrics) = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let count = store
+                    .count_events(EventFilter::default())
+                    .await
+                    .expect("count over socket");
+                let metrics = client.metrics();
+                if (count == 1 && metrics.forwarded_events >= 1) || metrics.dropped_events > 0 {
+                    break (count, metrics);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("forwarder must deliver or report a drop within 30 seconds");
+        assert_eq!(
+            metrics.dropped_events, 0,
+            "forwarder dropped an event before it reached the daemon store"
+        );
         assert_eq!(count, 1, "forwarded event must land in the daemon store");
-        assert_eq!(metrics.dropped_events, 0);
         assert!(metrics.forwarded_events >= 1, "delivery must be counted");
     }
 
