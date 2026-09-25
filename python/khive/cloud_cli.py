@@ -31,11 +31,20 @@ def _redact_result(value: Any, secrets: list[str]) -> Any:
     if isinstance(value, list):
         return [_redact_result(item, secrets) for item in value]
     if isinstance(value, dict):
-        return {
-            _redact_result(key, secrets): _redact_result(item, secrets)
-            for key, item in value.items()
-        }
+        return {key: _redact_result(item, secrets) for key, item in value.items()}
     return value
+
+
+def _contains_secret_key(value: Any, secrets: list[str]) -> bool:
+    if isinstance(value, list):
+        return any(_contains_secret_key(item, secrets) for item in value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and any(secret and secret in key for secret in secrets):
+                return True
+            if _contains_secret_key(item, secrets):
+                return True
+    return False
 
 
 def _error(exc: Exception, code: int, secrets: list[str]) -> int:
@@ -82,7 +91,14 @@ def main(argv: list[str] | None = None) -> int:
         with HttpTransport(url, api_key, allow_insecure=options.allow_insecure) as transport:
             ops = "whoami()" if options.command == "whoami" else options.ops
             result = transport.send_dsl(ops, timeout=30.0)["result"]
-        rendered = json.dumps(_redact_result(result, secrets), ensure_ascii=False)
+        redacted_result = _redact_result(result, secrets)
+        if _contains_secret_key(redacted_result, secrets):
+            print(
+                "Response carried a credential in a field name; result withheld.",
+                file=sys.stderr,
+            )
+            return 6
+        rendered = json.dumps(redacted_result, ensure_ascii=False)
         print(rendered)
         return 0
     except SystemExit as exc:

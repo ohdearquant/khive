@@ -160,6 +160,64 @@ def test_cli_insecure_forwarded_and_transport_closed(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out) == {"results": []}
 
 
+def test_cli_redaction_withholds_response_key_matching_credential(monkeypatch, capsys):
+    module = importlib.import_module("khive.cloud_cli")
+    monkeypatch.setenv("KHIVE_CLOUD_URL", "https://example.invalid")
+    monkeypatch.setenv("KHIVE_CLOUD_API_KEY", "results")
+
+    class ResultsTransport:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def send_dsl(self, ops, *, timeout):
+            return {
+                "ok": True,
+                "result": {"results": [{"tool": "whoami", "result": {"results": "results"}}]},
+            }
+
+    monkeypatch.setattr(module, "HttpTransport", ResultsTransport)
+    assert cli(["whoami"]) == 6
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == ("Response carried a credential in a field name; result withheld.\n")
+    assert "results" not in output.err
+
+
+def test_cli_preserves_safe_keys_and_redacts_credential_values(monkeypatch, capsys):
+    module = importlib.import_module("khive.cloud_cli")
+    secret = "sk-test-credential-0123456789"
+    monkeypatch.setenv("KHIVE_CLOUD_URL", "https://example.invalid")
+    monkeypatch.setenv("KHIVE_CLOUD_API_KEY", secret)
+
+    class ValuesTransport:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def send_dsl(self, ops, *, timeout):
+            return {
+                "ok": True,
+                "result": {"results": [{"credential": f"received {secret}"}]},
+            }
+
+    monkeypatch.setattr(module, "HttpTransport", ValuesTransport)
+    assert cli(["whoami"]) == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out) == {"results": [{"credential": "received [REDACTED]"}]}
+    assert secret not in output.out + output.err
+
+
 def test_cli_entry_point():
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
     assert project["project"]["scripts"]["khive-cloud"] == "khive.cloud_cli:main"
@@ -253,17 +311,16 @@ def test_cli_redacts_nested_results_and_escaped_errors(secret, error, monkeypatc
             }
 
     monkeypatch.setattr(module, "HttpTransport", EchoTransport)
-    assert cli(["whoami"]) == (3 if error else 0)
+    assert cli(["whoami"]) == (3 if error else 6)
     output = capsys.readouterr()
     text = output.out + output.err
-    assert "[REDACTED]" in text
     assert secret not in text
     assert json.dumps(secret)[1:-1] not in text
-    if not error:
-        assert json.loads(output.out) == {
-            "nested": {"[REDACTED]": ["[REDACTED]", {"echo": "prefix [REDACTED]"}]},
-            "untouched": [3, True, None],
-        }
+    if error:
+        assert "[REDACTED]" in text
+    else:
+        assert output.out == ""
+        assert output.err == ("Response carried a credential in a field name; result withheld.\n")
 
 
 @pytest.mark.parametrize("args", [["--api-key", "abc"], ["--api-key=abc"]])

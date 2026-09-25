@@ -69,9 +69,11 @@ khive-cloud --url https://example.invalid whoami
 The credential comes only from `KHIVE_CLOUD_API_KEY`. `--url` overrides `KHIVE_CLOUD_URL`;
 `--allow-insecure` permits non-loopback HTTP. Options may precede or follow the
 command. `whoami` sends `whoami()`; `exec` sends its argument unchanged. Both print
-the REST result envelope as JSON. Credentials are redacted from CLI output,
-including reflected server text. Errors print one line to stderr with the
-exception class and message.
+the REST result envelope as JSON. Credential strings are redacted from result
+values and reflected server text. Dictionary keys are preserved verbatim. If any
+field name contains a configured credential, the CLI withholds the entire result
+and exits with code 6. Errors print one line to stderr with the exception class
+and message.
 
 | Exit code | Meaning                                                       |
 | --------- | ------------------------------------------------------------- |
@@ -80,3 +82,4 @@ exception class and message.
 | 3         | `AuthError`                                                   |
 | 4         | `RateLimited`                                                 |
 | 5         | Other `HttpError` or `TransportError`                         |
+| 6         | Result withheld because a field name contains a credential    |
