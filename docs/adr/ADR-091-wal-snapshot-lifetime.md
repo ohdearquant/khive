@@ -1792,14 +1792,27 @@ bound that rules holders out.
 
 **Decision.**
 
-1. **`oldest_pinned_frame`.** `db_diagnostics` reports, beside the Plank C probe row, the probe's
-   `checkpointed_frames` as `oldest_pinned_frame` when that row has `busy = 0`,
-   `checkpointed_frames >= 0` and `log_frames > checkpointed_frames`. A PASSIVE checkpoint backfills
-   as many frames as it can without waiting for a reader or writer, so no frame past this one could
-   be backfilled at the moment of the probe. The value comes from the same probe row as the existing
-   counters, never from a separate call, so the two can never disagree. It is null, with a stated
+1. **`backfill_ceiling` and `oldest_pinned_frame`.** `db_diagnostics` reports, beside the Plank C
+   probe row, the probe's `checkpointed_frames` as `backfill_ceiling` when that row has `busy = 0`,
+   `checkpointed_frames >= 0` and `log_frames > checkpointed_frames`. One such row does not establish
+   a pin. `log_frames` is the WAL size in the header the checkpoint read when it started, and
+   `checkpointed_frames` is read after it finished. A connection committing in between holds the
+   read snapshot its transaction began with until the transaction ends, after its new frames already
+   count in the log, and a connection that restarts the WAL in between resets the counter to 0.
+   Either leaves the row short of its log although no connection is reading. Measured with one
+   connection committing in a loop, one running PASSIVE checkpoints and no reading connection: such
+   rows appeared in each of three four-second runs, 529 to 15,853 of 37,167 to 71,278 results, and
+   consecutive results repeated one ceiling while the log did not grow. A snapshot that
+   pins the WAL holds its ceiling for as long as it is held, while a commit holds it only until its
+   transaction ends: in six three-second runs of that loop, no run of results at one ceiling spanned
+   more than 0.16 ms. `oldest_pinned_frame` is therefore the ceiling only when item 2's run is at
+   that frame and was first observed at least one second before this probe, two checkpoint intervals
+   at the 500 ms default. A connection that holds one frame that long pins the WAL whether it is
+   reading or committing, and its process is in the census either way. Both values come from the same
+   probe row as the existing counters, never from a separate call. Both are null, with a stated
    reason, when the probe errored, returned `busy = 1`, returned `-1`, or found nothing pinned
-   (`log_frames == checkpointed_frames`).
+   (`log_frames == checkpointed_frames`), and `oldest_pinned_frame` is also null, with its reason,
+   when the run at the ceiling is younger than one second.
 2. **When the pin was first observed.** The checkpoint task keeps, per backend, one run: the frame
    `N` and the time of the first checkpoint result in an unbroken sequence of results that each show
    `busy = 0`, `checkpointed_frames == N < log_frames`, and `log_frames` no smaller than the previous
@@ -1820,7 +1833,9 @@ bound that rules holders out.
    excluded. The report states the value used as `start_time_resolution_secs`. A holder whose start
    time is later than `first_observed_at_unix_ms` by more than that resolution is listed in
    `holders_started_after_pin` and cannot be the pin. Holders whose start time cannot be read, and
-   uninspectable PIDs, are never excluded. The report keeps every holder: this list narrows the
+   uninspectable PIDs, are never excluded. When the run's frame is 0 the list is empty, with that
+   reason: a WAL restart during a checkpoint leaves a row at 0 (item 1), so a run at frame 0 can begin
+   before the snapshot that pins it. The report keeps every holder: this list narrows the
    search, and nothing else in the census changes. Beside the list the report carries
    `exclusion_assumes_no_foreign_wal_restart: true`, stating the assumption below, because a reader
    of the report does not open this ADR and this list's error direction is to exclude the real pin.
@@ -1847,10 +1862,15 @@ untouched.
 
 **Acceptance.**
 
-- A second process holds a read snapshot while the writer appends frames. `db_diagnostics` reports
-  `oldest_pinned_frame` equal to the `checkpointed_frames` of its own probe row, and a run with that
-  frame. After the reader ends and a tick fully backfills, `oldest_pinned_frame` is null and the run
-  is gone.
+- A second process holds a read snapshot while the writer appends frames. Within the first second of
+  the run, `db_diagnostics` reports `backfill_ceiling` with `oldest_pinned_frame` null and its reason;
+  after it, `oldest_pinned_frame` equal to the `checkpointed_frames` of its own probe row, and a run
+  with that frame. After the reader ends and a tick fully backfills, both are null and the run is
+  gone.
+- One connection commits in a loop while the checkpoint task and repeated `db_diagnostics` probes
+  run, and no connection reads. Probes report `backfill_ceiling` values, and none reports an
+  `oldest_pinned_frame`.
+- A run at frame 0 lists no holder in `holders_started_after_pin` and states the reason.
 - A process started after the run's first observation, and holding the database open, is listed in
   `holders_started_after_pin`. The process holding the pinning snapshot is never listed there. That
   second assertion is the control, and it holds when the pinning process is the reporting process
