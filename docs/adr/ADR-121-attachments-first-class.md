@@ -7,7 +7,7 @@
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
 a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`; and by its own
-Amendment 1 below (accepted 2026-09-25), which schedules the attachment orphan sweep in the daemon,
+Amendment 1 below (initial version accepted 2026-09-25; revised text pending sign-off), which schedules the attachment orphan sweep in the daemon,
 adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI.\
 **Depends on**:
 
@@ -300,7 +300,7 @@ for existing consumers; it does not claim the complete ADR-121 public verb rollo
 
 ## Amendment 1 (2026-09-25): the orphan sweep runs on a schedule and on demand
 
-**Status: Accepted (2026-09-25).** Refs #3038, #3178. This amendment also amends one sentence of
+**Status: Revised text pending sign-off (initial version accepted 2026-09-25).** Refs #3038, #3178. This amendment also amends one sentence of
 [ADR-111](ADR-111-blob-store.md) §8, named in item 3.
 
 ### Why
@@ -337,16 +337,22 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    blocks uploads for its length; a `deny_writes_for` restriction therefore denies it.
    On-demand deletion is an operator action: `kkernel blob sweep [--live]` in the admin CLI, which
    ADR-003 keeps apart from the MCP surface and ADR-109's gateway mode never exposes. It resolves the
-   database and configuration the way `kkernel vector sweep` does, runs the same
-   `transactional_orphan_sweep` against the main backend, is a dry run unless `--live` is given, and
-   prints the four counters and the mode. `--live` is the operator's opt-in for that pass;
+   database and configuration from the operator's selected profile, but refuses both modes unless
+   the resolved database is that profile's canonical main backend; an arbitrary SQLite secondary is
+   never a GC-liveness authority, even when its schema is current. If the command cannot prove main
+   backend identity, it refuses before walking the blob root. It runs the same
+   `transactional_orphan_sweep`, is a dry run unless `--live` is given, and prints the four counters
+   and the mode. `--live` is the operator's opt-in for that pass;
    `KHIVE_BLOB_SWEEP_LIVE` does not apply to it. ADR-111 §8 says the orphan sweep is "an admin-side
    operation, not an MCP verb"; that sentence is amended to apply to the caller-snapshot
    `orphan_sweep` only, which stays admin-side and, on the filesystem backend, disabled. Either pass,
    verb or admin command, that finds another sweep holding ownership waits for it, bounded by its
    deadline (the verb's caller deadline; the admin command's `--timeout`), and the verb returns the
-   retryable timeout error. Ownership includes ADR-111 §8's cross-process advisory lock, so an admin
-   pass and a scheduled pass in the daemon never run at once. A pass abandoned at its deadline stops
+   retryable timeout error. A scheduled pass likewise uses a finite ownership-wait deadline, no
+   longer than 30 seconds, and cancels that wait on daemon shutdown; expiration or shutdown skips
+   that cycle without acquiring the lock later or deleting after the caller has gone. Ownership
+   includes ADR-111 §8's cross-process advisory lock, so an admin pass and a scheduled pass in the
+   daemon never run at once. A pass abandoned at its deadline stops
    there: it must not acquire ownership later and run on with no caller to report to. An ADR-111 §8
    epoch refusal is returned as the error unchanged, and a backend without a transactional sweep
    returns its `Unsupported` error.
@@ -361,9 +367,31 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    record, which is the case ADR-191 A1.2 describes for an interrupted cross-backend hard delete.
    Removing those rows is #3178. ADR-191 A1.2's sentence saying that scheduling this sweep bounds that
    leak is corrected in the same change.
+6. **Admit the current schema epoch before enabling any pass.** ADR-160's Phase-4a gate admits only
+   the exact completed V21 migration ledger. The serving binary on current main applies migrations
+   through V40, so that gate refuses dry runs as well as deletion on every current database. The
+   implementation of items 1–4 must extend `blob_gc_fencing_complete` in the same change: explicitly
+   admit the reviewed, fully migrated current epoch (V40 as of this revision), while preserving the
+   completed cutover marker, attachment-only schema, absent legacy reference column, functional
+   attachment claim fences, and canonical migration names and contiguous ledger. Review migrations
+   V22–V40 for changes to blob references, attachment liveness, and claim fencing; their current DDL
+   does not add another blob-reference authority, but the implementation must prove that with a
+   full-chain migration fixture and a live-object retention control. Do not replace the exact-V21
+   check with `version >= 21` or automatically accept the latest compiled migration: an unknown or
+   ahead-of-reviewed epoch remains `Unsupported` before root locking, filesystem walking, or claim
+   cleanup. Each future migration that advances the admitted epoch must repeat the liveness review
+   and update the gate and its tests in the same change. ADR-160's exact-V21 rule remains the
+   historical Phase-4a rollout contract; this is a later, separately reviewed extension.
 
 ### Acceptance
 
+- A database migrated through the real complete current migration chain (V40 at this revision),
+  without hand-editing `_schema_migrations`, admits both dry-run and live transactional sweeps. A
+  referenced object under every attachment role survives both; an older unreferenced object is
+  reported in dry run and reclaimed only in live mode. A missing/corrupt ledger entry or an
+  unreviewed later migration refuses both modes before root locking or a filesystem walk. A missing
+  or nonfunctional claim fence refuses before new claims, claim cleanup, or deletion. The historical
+  exact-V21 control still passes.
 - A daemon with a short interval and an orphan older than the grace period runs a dry-run cycle that
   logs `would_delete=1`, `deleted=0` and leaves the object in place. With `KHIVE_BLOB_SWEEP_LIVE=1` the
   next cycle deletes it and logs `deleted=1`.
@@ -373,8 +401,12 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   carrying a live flag is rejected as an unknown argument. A caller under a `deny_writes_for`
   restriction is denied `blob.sweep`.
 - `kkernel blob sweep` without `--live` deletes nothing; with `--live` it deletes an orphan older than
-  the grace period and prints `deleted=1`, whether or not `KHIVE_BLOB_SWEEP_LIVE` is set.
+  the grace period and prints `deleted=1`, whether or not `KHIVE_BLOB_SWEEP_LIVE` is set. A configured
+  secondary SQLite database with an empty attachments table is refused in both modes before the blob
+  root is walked; an unconfigured target is refused likewise.
 - `kkernel blob sweep --live` started while a scheduled run in the daemon holds ownership either
   completes after it or exits with the timeout error when `--timeout` passes first. Neither deletes an
   object whose attachment row committed while it waited, and a pass that timed out performs no
   deletion afterwards.
+- A scheduled pass waiting for ownership skips the cycle within 30 seconds, or sooner on daemon
+  shutdown, logs why it skipped and the elapsed wait, and never runs later after that cancellation.

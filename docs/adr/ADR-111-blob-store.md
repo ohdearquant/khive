@@ -10,8 +10,9 @@ accepted 2026-07-17; Amendment 4 accepted 2026-07-19; Amendment 5 accepted 2026-
 backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
 ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
 mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
-cutover. Also amended by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (accepted
-2026-09-25), which scopes §8's "not an MCP verb" sentence to the caller-snapshot `orphan_sweep`.
+cutover. Also amended by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (initial
+version accepted 2026-09-25; revised text pending sign-off), which scopes §8's "not an MCP verb"
+sentence to the caller-snapshot `orphan_sweep`.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
@@ -257,8 +258,8 @@ and passes it in `BlobOrphanSweepConfig`;
 `FsBlobStore` walks its shard tree and reports (`dry_run: true`) or deletes (`dry_run: false`)
 everything not in that set.
 
-> Amended by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (2026-09-25): the "not an MCP
-> verb" sentence above applies to the caller-snapshot `orphan_sweep` only, which stays admin-side.
+> Revised by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (pending sign-off): the "not
+> an MCP verb" sentence above applies to the caller-snapshot `orphan_sweep` only, which stays admin-side.
 > `transactional_orphan_sweep` runs on a daemon schedule, as a dry run on demand through the `blob.sweep`
 > verb, and live on demand only through the `kkernel blob sweep --live` admin command.
 

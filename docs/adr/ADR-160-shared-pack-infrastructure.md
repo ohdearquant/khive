@@ -287,6 +287,9 @@ ahead-of-V21 epochs return typed `Unsupported` before root locking, filesystem w
 abandoned-claim cleanup. Malformed schema/evidence and nonfunctional named fences also fail closed
 before claim cleanup or deletion, though their validation/probe may occur after ownership and the
 filesystem walk. There is no fallback to caller-snapshot sweep or unconditional delete.
+This exact-V21 rule describes the Phase-4a rollout binary; [ADR-121 Amendment 1](ADR-121-attachments-first-class.md#amendment-1-2026-09-25-the-orphan-sweep-runs-on-a-schedule-and-on-demand)
+item 6 separately requires a reviewed extension for the current migrated epoch before scheduled
+or on-demand sweeps are enabled.
 
 Phase 4a must converge on every process that can share the database/blob root, and every
 pre-Phase-4a process must then be drained and prevented from restarting, before any Phase-4b binary
