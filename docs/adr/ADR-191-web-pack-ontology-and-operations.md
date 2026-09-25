@@ -126,7 +126,17 @@ allow-list, and a receipt written after the body's blob is stored.
 | `web.extract(id \| url, kinds?)`                 | parse a stored body; `kinds` ⊆ {`text`, `links`, `sitemap`, `feed`}, default all applicable                                                                                                                              | text `resource` (`derived_from`), `links_to` edges to targets minted as unfetched `resource` rows (`status` null), `contains` edges from sitemap/feed entries |
 | `web.ingest(source, origin?, depth?, limit?)`    | fetch + extract over a URL, a list of URLs, or a served tree on disk (a directory laid out as an origin serves it; `origin` is then required and supplies the `site` identity); `depth` bounds link following, default 0 | as fetch + extract                                                                                                                                            |
 | `web.search(query, provider?, limit?, persist?)` | an operator-configured search provider; `persist` defaults false                                                                                                                                                         | hits; a receipt note; with `persist`, each hit's URL as an unfetched `resource` under its site                                                                |
-| `web.refresh(id)`                                | conditional re-fetch using `etag` / `last_modified`; unchanged digest writes a receipt only                                                                                                                              | receipt; new blob and updated properties when the body changed                                                                                                |
+| `web.refresh(id)`                                | conditional re-fetch using stored negotiation and `etag` / `last_modified`; unchanged digest retains the body and updates changed representation metadata                                                                | receipt; changed representation metadata; new blob and updated properties when the body changed                                                               |
+
+Refresh applies changed allow-listed representation metadata (`Content-Type`, status, `ETag`,
+`Last-Modified`) even when the body digest is unchanged. A 304 applies only supplied header fields
+and retains the cached representation status; its actual response status is recorded in the receipt.
+A same-body 200 applies supplied `Content-Type` and replaces its validators, clearing stale `ETag`
+or `Last-Modified` values absent from the response. Metadata-only changes retain the body reference,
+blob and content attachment; `changed` describes a body/reference change. A 304 with no changed
+metadata writes only a receipt. The document retains the fetched body's request `Accept` and
+`Accept-Language` for subsequent refresh; fetch and refresh receipts record that allow-listed
+negotiation and allow-listed response headers. HEAD does not replace the cached GET body's negotiation.
 
 An unfetched target is minted as `resource` with `status` null. When `fetch` (directly, or through
 `ingest` or `refresh`) later retrieves it and the body is HTML, `fetch` updates the row's `entity_type`
@@ -150,8 +160,9 @@ for a search): method, final URL, redirect chain, status, content type, negotiat
 timing, egress classification, and the stored reference when `persist` is true, else the content
 digest and size (amended by A1.2: a request that stores no body, `persist` false or a HEAD, writes a
 receipt with no blob reference and records the content digest, size, final URL and fetch time). Receipts chain by `supersedes`,
-so the fetch history of a resource is a note chain, and content that did not change produces a receipt
-and nothing else.
+so the fetch history of a resource is a note chain. An unchanged body retains its blob and content
+attachment while changed representation metadata is updated as specified in D3; unchanged body and
+metadata produce a receipt and nothing else.
 
 ### D5. Deletions against the superseded revision
 
@@ -197,8 +208,10 @@ Controls are stated before the arms run; an arm without its control is not evide
 - A2 `extract(links)` on a page with N distinct hrefs yields N `links_to` edges whose targets are
   resources under their own sites; control: a page with no hrefs yields none.
 - A3 a 301 chain yields `new supersedes old`; a 302 yields no edge and a receipt naming the hop.
-- A4 `refresh` on an unchanged `etag` writes no entity or blob change; control: changed body updates
-  `blob_ref` and `content_digest`.
+- A4 `refresh` with unchanged body and representation metadata writes no entity or blob change;
+  controls: changed body updates `blob_ref` and `content_digest`, while same-body or 304 changed
+  response metadata updates supplied fields without changing the content attachment. A changed ETag
+  is sent on the next conditional request, and stored Accept/Accept-Language are resent.
 - A5 `ingest` of a served tree on disk under a declared `origin` produces the same graph as live
   ingest of the same tree served under that origin over HTTP: the arm asserts id equality row by row
   and edge-set equality.

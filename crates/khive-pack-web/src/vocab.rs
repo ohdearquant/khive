@@ -240,8 +240,9 @@ web_verbs! {
     RefreshParams => HandlerDef {
         name: "web.refresh",
         description: "Conditionally re-fetch a previously fetched document using its stored \
-                      etag/last_modified. An unchanged body writes a receipt only; a changed \
-                      body updates the stored blob and properties. Every refresh's receipt \
+                      etag/last_modified and Accept/Accept-Language. An unchanged body keeps \
+                      its blob and attachment; changed response metadata still updates the \
+                      document. A changed body updates the stored blob and properties. Every refresh's receipt \
                       supersedes the previous one for the same document.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,

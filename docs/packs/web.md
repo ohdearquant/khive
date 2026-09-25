@@ -86,6 +86,12 @@ aggregate multiple operations.
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 
+Fetch and refresh receipts include allow-listed response `headers` and negotiation `request_headers`.
+The document stores `request_headers` for its cached GET body: lowercase `accept`/`accept-language`
+keys map to arrays retaining repeated values in their sent order. Credentials, conditional validators
+and other request headers are excluded. A later GET replaces this negotiation, including clearing it
+when absent; HEAD records its own request in the receipt and preserves cached GET negotiation.
+
 ### `web.extract(id | url, kinds?)`
 
 Parse an already-fetched body — never fetches one itself. `kinds` is a subset of
@@ -140,9 +146,12 @@ BLAKE3 digest over it. `persist` defaults to `false`; `true` mints each hit's UR
 ### `web.refresh(id)`
 
 Conditionally re-fetch an already-fetched document using its stored `etag`/`last_modified` as
-`If-None-Match`/`If-Modified-Since`. A `304`, or a `200` whose body content-addresses to the
-_same_ reference already stored, writes a receipt only — no entity or blob change. A genuinely
-changed body puts the new blob and patches the entity in place. Every refresh's receipt
+`If-None-Match`/`If-Modified-Since`, together with the fetched body's `Accept`/`Accept-Language`.
+Same-byte responses update changed Content-Type, status and validators while retaining the blob
+and content attachment. A same-body 200 clears stale validators omitted by the response. A 304
+applies only supplied headers and retains the cached representation status; with no metadata
+change it writes only a receipt. `changed` reports body/reference changes. A changed body puts
+the new blob and patches the entity in place. Every refresh's receipt
 supersedes the immediately prior receipt for the same document, so the note history is the
 resource's refresh timeline. Follows the same bounded redirect chain `fetch` does, through the
 same egress checks on every hop: identity is by address, so the terminal address's own row
