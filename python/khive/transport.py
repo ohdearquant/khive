@@ -241,9 +241,7 @@ def _parse_envelope(response: Any, api_key: str) -> dict[str, Any]:
         # afterwards cannot recognize the credential prefix.
         preview = json.dumps(payload, ensure_ascii=True)
         if api_key:
-            preview = preview.replace(
-                json.dumps(api_key, ensure_ascii=True)[1:-1], "[REDACTED]"
-            )
+            preview = preview.replace(json.dumps(api_key, ensure_ascii=True)[1:-1], "[REDACTED]")
         raise TransportError(
             f"response from {response.url} is not a request envelope: {preview[:200]}"
         )
@@ -413,9 +411,7 @@ class HttpTransport(Transport):
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        envelope = _stringify_op_errors(
-            _parse_envelope(response, self._api_key), str(response.url)
-        )
+        envelope = _stringify_op_errors(_parse_envelope(response, self._api_key), str(response.url))
         _validate_envelope_results(envelope, str(response.url))
         return {"ok": True, "result": envelope}
 
@@ -491,9 +487,7 @@ class AsyncHttpTransport:
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        envelope = _stringify_op_errors(
-            _parse_envelope(response, self._api_key), str(response.url)
-        )
+        envelope = _stringify_op_errors(_parse_envelope(response, self._api_key), str(response.url))
         _validate_envelope_results(envelope, str(response.url))
         return {"ok": True, "result": envelope}
 

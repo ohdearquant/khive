@@ -303,9 +303,7 @@ def test_cli_masks_reflected_credential_before_error_preview_cutoff(
     assert secret[:15] not in output.err
 
 
-def test_cli_post_request_unicode_result_survives_legacy_stdout(
-    rest_server, api_key, monkeypatch
-):
+def test_cli_post_request_unicode_result_survives_legacy_stdout(rest_server, api_key, monkeypatch):
     import conftest
 
     monkeypatch.setenv("KHIVE_CLOUD_API_KEY", api_key)
