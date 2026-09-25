@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::io::Write as _;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -2022,7 +2022,7 @@ where
 /// frames until SIGTERM/SIGINT.
 ///
 /// Fatally acquires its own startup lock, which only protects
-/// cleanup→bind→pid-write — `dispatcher` has already run migrations and
+/// cleanup→pid-claim→bind — `dispatcher` has already run migrations and
 /// applied pack schema plans while constructing itself, unguarded. Production
 /// boot must go through [`run_daemon_with_boot_guard`] instead, which extends
 /// the same lock back over construction. This entry point is for callers
@@ -2055,6 +2055,44 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
     run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true, |_| {}).await
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RendezvousPathRole {
+    Socket,
+    PidFile,
+}
+
+#[cfg(unix)]
+impl RendezvousPathRole {
+    fn env_name(self) -> &'static str {
+        match self {
+            Self::Socket => SOCKET_PATH_ENV,
+            Self::PidFile => PID_PATH_ENV,
+        }
+    }
+
+    fn directory_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket directory",
+            Self::PidFile => "PID-file directory",
+        }
+    }
+
+    fn path_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket path",
+            Self::PidFile => "PID-file path",
+        }
+    }
+
+    fn path_component_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket-path",
+            Self::PidFile => "PID-file-path",
+        }
+    }
+}
+
 /// Vet the socket's parent directory, re-permissioning it only when it is the
 /// directory khive owns by convention.
 ///
@@ -2081,24 +2119,52 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
     // SAFETY: `geteuid` is always successful and takes no arguments.
     let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::Socket, daemon_euid, true)
+}
 
-    if parent == khive_dir() {
+/// Vet the parent directory of a PID file before reading, locking, or writing
+/// it. The file's lock only protects the inode currently named by its path;
+/// every directory component must therefore be as swap-resistant as the
+/// socket rendezvous.
+#[cfg(unix)]
+pub fn ensure_pid_file_dir_is_trusted(pid_file: &std::path::Path) -> anyhow::Result<()> {
+    let parent = pid_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::PidFile, daemon_euid, false)
+}
+
+#[cfg(unix)]
+fn ensure_rendezvous_dir_is_trusted(
+    parent: &std::path::Path,
+    role: RendezvousPathRole,
+    daemon_euid: u32,
+    repair_owned_default: bool,
+) -> anyhow::Result<()> {
+    let env_name = role.env_name();
+    let directory_name = role.directory_name();
+
+    if repair_owned_default && parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             anyhow::anyhow!(
                 "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
-                 owner-only — it is half of the same-uid guarantee this daemon enforces.",
+                 owner-only as the {directory_name} for {env_name}; it is part of the \
+                 same-uid guarantee this daemon enforces.",
                 parent.display()
             )
         })?;
-        return ensure_socket_path_is_swap_resistant(parent, daemon_euid);
+        return ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role);
     }
 
     // Fail closed on the stat itself: not being able to read the metadata is
     // not the same as the directory passing.
     let meta = std::fs::metadata(parent).map_err(|e| {
         anyhow::anyhow!(
-            "refusing to start: cannot stat {}: {e}. The socket directory gates \
-             socket-takeover safety, and unreadable metadata is not a passing state.",
+            "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
+             It gates rendezvous-path safety, and unreadable metadata is not a passing state.",
             parent.display()
         )
     })?;
@@ -2107,10 +2173,10 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     let owner = meta.uid();
     if owner != daemon_euid && owner != 0 {
         anyhow::bail!(
-            "refusing to start: socket directory {} is owned by uid {owner}, not this \
-             daemon's uid ({daemon_euid}) or root. A directory owner can replace the \
-             socket regardless of mode bits. Point KHIVE_SOCKET at a directory you own, \
-             or unset it for the default.",
+            "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
+             not this daemon's uid ({daemon_euid}) or root. A directory owner can replace \
+             the rendezvous path regardless of mode bits. Point {env_name} at a directory \
+             you own, or unset it for the default.",
             parent.display()
         );
     }
@@ -2118,18 +2184,26 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     let mode = meta.permissions().mode();
     if mode & 0o022 != 0 {
         anyhow::bail!(
-            "refusing to start: socket directory {} is mode {:04o} — writable by group or \
-             other, so another local user could bind their own listener at the socket path \
-             (before this daemon starts, the sticky bit does not prevent creating the \
-             path). Use a directory only you can write, or unset KHIVE_SOCKET for the \
-             default. This daemon is not changing the permissions of a directory it does \
-             not own.",
+            "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
+             by group or other, so another local user could replace the rendezvous path. \
+             Use a directory only you can write, or unset {env_name} for the default. \
+             This daemon is not changing the permissions of a directory it does not own.",
             parent.display(),
             mode & 0o7777
         );
     }
 
-    ensure_socket_path_is_swap_resistant(parent, daemon_euid)
+    ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role)
+}
+
+/// Socket-role form of [`ensure_rendezvous_path_is_swap_resistant`], used by the
+/// socket-path tests.
+#[cfg(all(unix, test))]
+fn ensure_socket_path_is_swap_resistant(
+    parent: &std::path::Path,
+    daemon_euid: u32,
+) -> anyhow::Result<()> {
+    ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, RendezvousPathRole::Socket)
 }
 
 /// Walk the socket directory path exactly as the kernel will traverse it at
@@ -2157,11 +2231,17 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
 /// (who could rename the entry, or chmod the directory first), is refused.
 /// Every stat failure fails closed.
 #[cfg(unix)]
-fn ensure_socket_path_is_swap_resistant(
+fn ensure_rendezvous_path_is_swap_resistant(
     parent: &std::path::Path,
     daemon_euid: u32,
+    role: RendezvousPathRole,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
+
+    let env_name = role.env_name();
+    let directory_name = role.directory_name();
+    let path_name = role.path_name();
+    let component_name = role.path_component_name();
 
     let absolute = if parent.is_absolute() {
         parent.to_path_buf()
@@ -2170,7 +2250,7 @@ fn ensure_socket_path_is_swap_resistant(
             .map_err(|e| {
                 anyhow::anyhow!(
                     "refusing to start: cannot resolve the working directory to absolutize \
-                     socket directory {}: {e}.",
+                     {directory_name} {} for {env_name}: {e}.",
                     parent.display()
                 )
             })?
@@ -2205,8 +2285,8 @@ fn ensure_socket_path_is_swap_resistant(
         let candidate = resolved.join(&component);
         let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
             anyhow::anyhow!(
-                "refusing to start: cannot stat socket-path component {}: {e}. An \
-                 unreadable component is not a passing one.",
+                "refusing to start: cannot stat {component_name} component {} for {env_name}: \
+                 {e}. An unreadable component is not a passing one.",
                 candidate.display()
             )
         })?;
@@ -2216,24 +2296,24 @@ fn ensure_socket_path_is_swap_resistant(
             symlinks_followed += 1;
             if symlinks_followed > 40 {
                 anyhow::bail!(
-                    "refusing to start: socket path resolves through more than 40 symlinks \
-                     at {} — treating this as a loop.",
+                    "refusing to start: {path_name} for {env_name} resolves through more than \
+                     40 symlinks at {} — treating this as a loop.",
                     candidate.display()
                 );
             }
             if owner != daemon_euid && owner != 0 {
                 anyhow::bail!(
-                    "refusing to start: socket-path symlink component {} is owned by uid \
-                     {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
-                     could retarget it after this check and re-root the socket path. Point \
-                     KHIVE_SOCKET somewhere trusted end to end, or unset it for the \
-                     default.",
+                    "refusing to start: {component_name} symlink component {} for {env_name} \
+                     is owned by uid {owner}, not this daemon's uid ({daemon_euid}) or root — \
+                     its owner could retarget it after this check and re-root the {path_name}. \
+                     Point {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
                 );
             }
             let target = std::fs::read_link(&candidate).map_err(|e| {
                 anyhow::anyhow!(
-                    "refusing to start: cannot read socket-path symlink component {}: {e}.",
+                    "refusing to start: cannot read {component_name} symlink component {} \
+                     for {env_name}: {e}.",
                     candidate.display()
                 )
             })?;
@@ -2246,19 +2326,19 @@ fn ensure_socket_path_is_swap_resistant(
             let sticky = mode & 0o1000 != 0;
             if owner != daemon_euid && owner != 0 {
                 anyhow::bail!(
-                    "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
-                     this daemon's uid ({daemon_euid}) or root — its owner could rename the \
-                     next path component and re-root the socket path. Point KHIVE_SOCKET \
-                     somewhere trusted end to end, or unset it for the default.",
+                    "refusing to start: {component_name} ancestor {} for {env_name} is owned by \
+                     uid {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
+                     could rename the next path component and re-root the {path_name}. Point \
+                     {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
                 );
             }
             if mode & 0o022 != 0 && !sticky {
                 anyhow::bail!(
-                    "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
-                     group or other without the sticky bit, so another local user could rename \
-                     the next path component and re-root the socket path. Point KHIVE_SOCKET \
-                     somewhere trusted end to end, or unset it for the default.",
+                    "refusing to start: {component_name} ancestor {} for {env_name} is mode \
+                     {:04o} — writable by group or other without the sticky bit, so another \
+                     local user could rename the next path component and re-root the {path_name}. \
+                     Point {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display(),
                     mode & 0o7777
                 );
@@ -2268,8 +2348,8 @@ fn ensure_socket_path_is_swap_resistant(
         }
 
         anyhow::bail!(
-            "refusing to start: socket-path component {} is neither a directory nor a \
-             symlink — the socket path cannot traverse it.",
+            "refusing to start: {component_name} component {} for {env_name} is neither a \
+             directory nor a symlink — the {path_name} cannot traverse it.",
             candidate.display()
         );
     }
@@ -2285,7 +2365,7 @@ fn ensure_socket_path_is_swap_resistant(
 /// advisory boot lock to hold in the first place; every unix daemon-mode
 /// caller passes `Some`.
 ///
-/// The guard is held across cleanup → bind → pid-write, then dropped. The
+/// The guard is held across cleanup → pid-claim → bind, then dropped. The
 /// caller must not still be holding a *different* handle to the same lock
 /// file when this function is entered — see the "Deadlock note" on the
 /// `_startup_lock` binding below for why that would self-deadlock on `flock`.
@@ -2345,17 +2425,25 @@ where
 
     let sock = socket_path();
     let pid_file = pid_path();
+    let socket_parent = sock.parent();
+    let pid_parent = pid_file.parent();
 
-    if let Some(parent) = sock.parent() {
+    if let Some(parent) = socket_parent {
         std::fs::create_dir_all(parent)?;
         ensure_socket_dir_is_trusted(parent)?;
     }
+    // Identical parent paths traverse the same components, so the socket
+    // check above also vets the PID-file parent. Aliased paths are checked
+    // independently because each original path is traversed by file access.
+    if pid_parent != socket_parent {
+        ensure_pid_file_dir_is_trusted(&pid_file)?;
+    }
 
-    // Hold the startup lock across cleanup → bind → pid-write so a concurrent
-    // client's kill_and_respawn (which also holds this lock) cannot unlink the
-    // socket between our bind and our pid-write.  The lock is released once the
-    // listener is bound and the PID file is written — at that point any racing
-    // client will find a live socket+pid and skip the stale-cleanup path.
+    // Hold the startup lock across cleanup → pid-claim → bind so a concurrent
+    // client's kill_and_respawn (which also holds this lock) cannot remove the
+    // rendezvous paths during setup. The PID file's own lock is retained after
+    // this shared startup lock is released, including while the listener drains
+    // during shutdown.
     //
     // Deadlock note: the client holds this lock only during kill+spawn and
     // releases it before the spawned daemon process starts (the lock guard is
@@ -2366,10 +2454,8 @@ where
     // same process, which would self-deadlock on `flock`.
     let _startup_lock = boot_guard;
 
-    // #1874: a second daemon must refuse loudly (non-zero exit, pid named) rather
-    // than exit `Ok(())` — a silent success here is what let two detached daemons
-    // coexist on one store with neither side nor its caller ever noticing. Both
-    // live outcomes below refuse; only the message differs.
+    // A second daemon must refuse loudly rather than exit successfully while
+    // another daemon owns this rendezvous. Only `Stale` lets the caller proceed.
     match cleanup_stale_daemon(
         &sock,
         &pid_file,
@@ -2406,37 +2492,11 @@ where
         Incumbent::Stale => {}
     }
 
-    let listener = UnixListener::bind(&sock)?;
-    // Fail closed, same reason as the directory above. If this chmod fails the
-    // socket is world-reachable in a way the accepted design never covered, so
-    // the bound listener is dropped and the entry removed rather than served.
-    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
-        drop(listener);
-        let _ = std::fs::remove_file(&sock);
-        return Err(anyhow::anyhow!(
-            "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
-             — it is half of the single-principal guarantee this daemon enforces.",
-            sock.display()
-        ));
-    }
-    // Captured while still holding the startup lock, immediately after
-    // bind, so shutdown cleanup can later prove "this is still the same socket
-    // I bound" rather than trusting the path alone.
-    let bound_identity = socket_identity(&sock);
-
-    if let Err(e) = write_pid_file_exclusive(&pid_file) {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            // A PID file appeared between our own `cleanup_stale_daemon`
-            // removing it and this write — only possible if the boot lock did
-            // not actually exclude a concurrent booter (e.g. `acquire_recovery_lock`
-            // failed for one side). Never touch the winner's files: drop only
-            // the socket entry we ourselves just bound (proven via identity,
-            // not path), then decide by checking whether the PID now on disk
-            // names a live, reachable daemon.
-            if bound_identity.is_some() && socket_identity(&sock) == bound_identity {
-                drop(listener);
-                let _ = std::fs::remove_file(&sock);
-            }
+    let pid_file_guard = match write_pid_file_exclusive(&pid_file) {
+        Ok(guard) => guard,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A PID file appeared between cleanup and our claim. Never touch
+            // the winner's files; defer only if it already answers as khived.
             if pid_file_names_a_reachable_daemon(
                 &pid_file,
                 &sock,
@@ -2455,13 +2515,38 @@ where
                  and does not name a reachable daemon"
             );
         }
-        return Err(e.into());
+        Err(e) => return Err(e.into()),
+    };
+
+    let listener = match UnixListener::bind(&sock) {
+        Ok(listener) => listener,
+        Err(e) => {
+            remove_pid_file_if_owned(&pid_file, &pid_file_guard);
+            return Err(e.into());
+        }
+    };
+    // Fail closed, same reason as the directory above. If this chmod fails the
+    // socket is world-reachable in a way the accepted design never covered, so
+    // the bound listener is dropped and the entry removed rather than served.
+    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        remove_pid_file_if_owned(&pid_file, &pid_file_guard);
+        return Err(anyhow::anyhow!(
+            "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
+             — it is half of the single-principal guarantee this daemon enforces.",
+            sock.display()
+        ));
     }
+    // Captured while still holding the startup lock, immediately after
+    // bind, so shutdown cleanup can later prove "this is still the same socket
+    // I bound" rather than trusting the path alone.
+    let bound_identity = socket_identity(&sock);
+
     start(&dispatcher);
 
-    // Release the startup lock now: the listener is bound and the PID file is
-    // written.  Any concurrent client or daemon startup will observe a live
-    // socket+pid and take the non-recovery path.
+    // Release the shared startup lock now that the listener is bound. The
+    // locked PID file continues to identify this daemon through shutdown.
     drop(_startup_lock);
     tracing::info!(
         socket = ?sock,
@@ -2832,6 +2917,19 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
             .is_some_and(|served| config_ids_compatible(expected_config_id, served))
 }
 
+/// Whether connecting to an existing socket path is definitely unreachable.
+/// Timeouts and other errors remain ambiguous so cleanup fails closed.
+#[cfg(unix)]
+async fn socket_is_unreachable(sock: &std::path::Path) -> bool {
+    match tokio::time::timeout(DUPLICATE_PROBE_TIMEOUT, UnixStream::connect(sock)).await {
+        Ok(Err(error)) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        _ => false,
+    }
+}
+
 /// What owns the daemon PID file, from the point of view of a process that wants
 /// to start. A live owner is never cleaned up: a draining incumbent closes its
 /// listener before it releases writers, so an unanswered socket is ambiguous and
@@ -2840,7 +2938,7 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
 enum Incumbent {
     /// A live process that answered the khived protocol on the socket.
     Serving(u32),
-    /// A live process owns the PID file and nothing answered. Nothing removed.
+    /// A live PID still has an active or ambiguous rendezvous. Nothing removed.
     Live(u32),
     /// Nothing live owns the store; the socket and PID file were removed.
     Stale,
@@ -2849,10 +2947,9 @@ enum Incumbent {
 /// Check whether `pid_file`/`sock` already name a live daemon and, if not,
 /// remove the stale rendezvous files so the caller may bind fresh.
 ///
-/// Both live outcomes mean the caller must not bind and must refuse to start
-/// rather than silently deferring (#1874: a quiet `Ok(())` here is exactly what
-/// let two detached daemons coexist on one store). Only `Stale` clears the
-/// rendezvous and lets the caller proceed.
+/// A live protocol responder, reachable socket, or live holder of the PID-file
+/// lock means the caller must refuse to start. An unlocked PID with no listener
+/// is a reused PID and may be reclaimed.
 #[cfg(unix)]
 async fn cleanup_stale_daemon(
     sock: &std::path::Path,
@@ -2860,6 +2957,7 @@ async fn cleanup_stale_daemon(
     allow_same_process_incumbent: bool,
     expected_config_id: &str,
 ) -> Incumbent {
+    let mut stale_pid_file_guard = None;
     if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
@@ -2868,7 +2966,21 @@ async fn cleanup_stale_daemon(
                 if sock.exists() && socket_speaks_khived_protocol(sock, expected_config_id).await {
                     return Incumbent::Serving(pid);
                 }
-                return Incumbent::Live(pid);
+                if sock.exists() && !socket_is_unreachable(sock).await {
+                    return Incumbent::Live(pid);
+                }
+                match try_acquire_pid_file_lock(pid_file) {
+                    Ok(Some(guard)) => stale_pid_file_guard = Some(guard),
+                    Ok(None) => return Incumbent::Live(pid),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = ?pid_file,
+                            "cannot check daemon PID-file lock"
+                        );
+                        return Incumbent::Live(pid);
+                    }
+                }
             }
         }
     }
@@ -2882,28 +2994,70 @@ async fn cleanup_stale_daemon(
             tracing::warn!(error = %e, path = ?pid_file, "failed to remove stale PID file");
         }
     }
+    drop(stale_pid_file_guard);
     Incumbent::Stale
 }
 
-/// Create `pid_file` exclusively (`O_EXCL`) and write this process's PID.
+/// Create and lock `pid_file` exclusively (`O_EXCL`) and write this process's PID.
 ///
 /// Uses `create_new(true)` rather than `create(true).truncate(true)` so
 /// this can never silently overwrite a PID file another process created —
-/// under normal operation the boot lock already serializes cleanup → bind →
-/// pid-write across processes, but that guarantee depends on
-/// `acquire_recovery_lock` succeeding for every party. Exclusive creation is
-/// the defense that holds even if the lock itself is unavailable to one side:
-/// the loser observes `ErrorKind::AlreadyExists` instead of clobbering the
-/// winner's PID out from under it.
+/// the held file lock also identifies a starting or draining daemon when its
+/// socket is not yet reachable.
 #[cfg(unix)]
-fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<()> {
+fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     let mut f = opts.open(pid_file)?;
+    // SAFETY: flock is a POSIX advisory lock with no memory side effects.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     f.write_all(std::process::id().to_string().as_bytes())?;
-    Ok(())
+    Ok(f)
+}
+
+/// Try to lock an existing PID file without creating it. `Some(file)` means
+/// there is no daemon lock holder; `None` means a daemon still owns the file.
+#[cfg(unix)]
+fn try_acquire_pid_file_lock(pid_file: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pid_file)?;
+    // SAFETY: flock is a POSIX advisory lock with no memory side effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == Some(libc::EWOULDBLOCK)
+    {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// Remove the PID file on setup failure only while its path still names the
+/// file this start attempt created.
+#[cfg(unix)]
+fn remove_pid_file_if_owned(pid_file: &std::path::Path, guard: &std::fs::File) {
+    let Ok(owned) = guard.metadata() else {
+        return;
+    };
+    let Ok(current) = std::fs::metadata(pid_file) else {
+        return;
+    };
+    if owned.dev() == current.dev() && owned.ino() == current.ino() {
+        if let Err(e) = std::fs::remove_file(pid_file) {
+            tracing::warn!(error = %e, path = ?pid_file, "failed to remove unbound PID file");
+        }
+    }
 }
 
 /// Return `true` if `pid_file` currently names an eligible live process that
@@ -3401,7 +3555,8 @@ mod tests {
                 }
             );
             let live_pid = std::process::id().to_string();
-            std::fs::write(&pid_file, &live_pid).expect("write live incumbent PID");
+            let _pid_file_guard = write_pid_file_exclusive(&pid_file)
+                .expect("claim and lock the live incumbent PID file");
 
             // Harness eligibility makes our own stable PID an incumbent;
             // ordinary same-PID rejection is covered separately above.
@@ -3418,6 +3573,142 @@ mod tests {
             );
             assert!(socket_identity(&sock) == identity);
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn live_foreign_pid_does_not_block_daemon_startup() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let stale_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("create stale socket path");
+        drop(stale_listener);
+
+        let mut foreign = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn live unrelated process");
+        std::fs::write(&pid_file, foreign.id().to_string()).expect("write unrelated PID");
+
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "foreign-pid-start-test".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let daemon = tokio::spawn(run_daemon_in_process_test(dispatcher));
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = UnixStream::connect(&sock).await {
+                    break Some(stream);
+                }
+                if daemon.is_finished() {
+                    break None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let response = if let Ok(Some(mut stream)) = connected {
+            let mut request = base_request_frame("foreign-pid-start-test");
+            request.probe_only = true;
+            let payload = serde_json::to_vec(&request).expect("encode probe request");
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                write_frame(&mut stream, &payload).await.ok()?;
+                let raw = read_frame(&mut stream).await.ok()?;
+                serde_json::from_slice::<DaemonResponseFrame>(&raw).ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let foreign_survived_start = foreign
+            .try_wait()
+            .expect("query unrelated process state")
+            .is_none();
+
+        daemon.abort();
+        let _ = daemon.await;
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_LOCK");
+
+        assert!(
+            response.is_some_and(|response| {
+                response.ok
+                    && response.served_config_id.as_deref() == Some("foreign-pid-start-test")
+            }),
+            "daemon must start and answer its identity probe"
+        );
+        assert!(
+            foreign_survived_start,
+            "starting khived must leave the unrelated live process running"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn second_start_refuses_while_pid_file_is_locked_before_bind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let _incumbent_startup_guard = write_pid_file_exclusive(&pid_file)
+            .expect("incumbent claims and locks its PID file before binding");
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "startup-lock-test".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_daemon_in_process_test(dispatcher),
+        )
+        .await;
+        let refused = matches!(second, Ok(Err(_)));
+        let pid_file_survived = pid_file.exists();
+        let socket_was_not_bound = !sock.exists();
+
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_LOCK");
+
+        assert!(
+            refused,
+            "a second start must refuse while an incumbent holds its pre-bind PID lock"
+        );
+        assert!(
+            pid_file_survived,
+            "the incumbent PID file must remain in place"
+        );
+        assert!(
+            socket_was_not_bound,
+            "the second start must not bind the socket"
+        );
     }
 
     #[test]
@@ -4969,9 +5260,8 @@ mod tests {
     /// owner). On macOS these fixtures also implicitly exercise the
     /// symlink-accept arm, since the platform temp root itself resolves
     /// through root-owned symlinks. Foreign ownership of a directory is
-    /// refused by the same helper, but a non-root test cannot chown a
-    /// directory away from itself, so that arm is exercised by the mode
-    /// checks' shared fail-closed path rather than a dedicated fixture.
+    /// refused by the same helper; a separate simulated-euid test covers
+    /// foreign ownership without requiring a privileged chown operation.
     #[test]
     fn trusted_socket_dirs_are_accepted_unmodified() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4989,6 +5279,41 @@ mod tests {
                 "acceptance must not re-permission the directory either"
             );
         }
+    }
+
+    #[test]
+    fn pid_directory_owned_by_another_uid_is_refused() {
+        let workspace = std::env::current_dir().expect("workspace directory");
+        let dir = tempfile::Builder::new()
+            .prefix("khive-pid-owner-")
+            .tempdir_in(workspace)
+            .expect("workspace-local tempdir");
+        let parent = dir.path().join("private");
+        std::fs::create_dir(&parent).expect("create private directory");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("set private mode");
+
+        // A non-root test cannot chown its directory to another uid. Injecting
+        // an euid that does not own this directory exercises that same refusal.
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let daemon_euid = (unsafe { libc::geteuid() } as u32).wrapping_add(1);
+        let error = ensure_rendezvous_dir_is_trusted(
+            &parent,
+            RendezvousPathRole::PidFile,
+            daemon_euid,
+            false,
+        )
+        .expect_err("a PID parent owned by another uid must be refused");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("KHIVE_PID"),
+            "wrong variable in refusal: {message}"
+        );
+        assert!(
+            message.contains("PID-file directory") && message.contains("owned by uid"),
+            "refusal must identify foreign ownership of the PID parent: {message}"
+        );
     }
 
     /// Test 2: `wal_pages` reflects a real
