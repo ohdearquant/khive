@@ -495,6 +495,163 @@ pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
 
 // ── wire types ────────────────────────────────────────────────────────────────
 
+struct ConfigIdFields<'a> {
+    packs: &'a str,
+    db: &'a str,
+    embed: &'a str,
+    extra: &'a str,
+    fresh_tail: &'a str,
+    blob_hydration_bytes: &'a str,
+    backend: &'a str,
+    outbound: &'a str,
+    gate: &'a str,
+    git_write: &'a str,
+    brain: &'a str,
+    telemetry: &'a str,
+    display_timezone: &'a str,
+    backends: Option<&'a str>,
+    pack_backends: Option<&'a str>,
+}
+
+fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
+    let (base, backends, pack_backends) =
+        if let Some((before_routing, routing)) = config_id.rsplit_once("];pack_backends=[") {
+            let pack_backends = routing.strip_suffix(']')?;
+            let (base, backends) = before_routing.rsplit_once(";backends=[")?;
+            (base, Some(backends), Some(pack_backends))
+        } else {
+            (config_id, None, None)
+        };
+
+    let base = base.strip_prefix("packs=[")?;
+    let (packs, rest) = base.split_once("];db=")?;
+    let (rest, display_timezone) = rest
+        .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, telemetry) = rest
+        .rsplit_once(";telemetry=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, brain) = rest
+        .rsplit_once(";brain=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, git_write) = rest.rsplit_once(";git_write=")?;
+    let (rest, gate) = rest
+        .rsplit_once(";gate=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
+    let outbound = outbound.strip_suffix(']')?;
+    let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, blob_hydration_bytes) = rest
+        .rsplit_once(";blob_hydration_bytes=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
+    let (rest, extra) = rest.rsplit_once(";extra=[")?;
+    let extra = extra.strip_suffix(']')?;
+    let (db, embed) = rest.rsplit_once(";embed=")?;
+
+    Some(ConfigIdFields {
+        packs,
+        db,
+        embed,
+        extra,
+        fresh_tail,
+        blob_hydration_bytes,
+        backend,
+        outbound,
+        gate,
+        git_write,
+        brain,
+        telemetry,
+        display_timezone,
+        backends,
+        pack_backends,
+    })
+}
+
+fn extra_embedder_set(extra: &str) -> std::collections::BTreeSet<&str> {
+    extra.split(',').filter(|name| !name.is_empty()).collect()
+}
+
+/// Whether a daemon configuration can serve a client's requested runtime.
+/// Every fingerprint field must match except that the daemon may have more
+/// configured extra embedding models than the client requested.
+pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
+    if client_id == daemon_id {
+        return true;
+    }
+    let (Some(client), Some(daemon)) = (parse_config_id(client_id), parse_config_id(daemon_id))
+    else {
+        return false;
+    };
+
+    let client_extras = extra_embedder_set(client.extra);
+    let daemon_extras = extra_embedder_set(daemon.extra);
+    let daemon_has_requested_extras = client_extras.is_subset(&daemon_extras);
+
+    client.packs == daemon.packs
+        && client.db == daemon.db
+        && client.embed == daemon.embed
+        && daemon_has_requested_extras
+        && client.fresh_tail == daemon.fresh_tail
+        && client.blob_hydration_bytes == daemon.blob_hydration_bytes
+        && client.backend == daemon.backend
+        && client.outbound == daemon.outbound
+        && client.gate == daemon.gate
+        && client.git_write == daemon.git_write
+        && client.brain == daemon.brain
+        && client.telemetry == daemon.telemetry
+        && client.display_timezone == daemon.display_timezone
+        && client.backends == daemon.backends
+        && client.pack_backends == daemon.pack_backends
+}
+
+/// Name the first differing configuration component for diagnostics.
+pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> &'static str {
+    let Some(daemon_id) = daemon_id else {
+        return "unknown";
+    };
+    let (Some(client), Some(daemon)) = (parse_config_id(client_id), parse_config_id(daemon_id))
+    else {
+        return "unknown";
+    };
+    let client_extras = extra_embedder_set(client.extra);
+    let daemon_extras = extra_embedder_set(daemon.extra);
+
+    if client.packs != daemon.packs {
+        "packs"
+    } else if client.db != daemon.db {
+        "db"
+    } else if client.embed != daemon.embed {
+        "embed"
+    } else if !client_extras.is_subset(&daemon_extras) {
+        "extra"
+    } else if client.fresh_tail != daemon.fresh_tail {
+        "fresh_tail"
+    } else if client.blob_hydration_bytes != daemon.blob_hydration_bytes {
+        "blob_hydration_bytes"
+    } else if client.backend != daemon.backend {
+        "backend"
+    } else if client.outbound != daemon.outbound {
+        "outbound"
+    } else if client.gate != daemon.gate {
+        "gate"
+    } else if client.git_write != daemon.git_write {
+        "git_write"
+    } else if client.brain != daemon.brain {
+        "brain"
+    } else if client.telemetry != daemon.telemetry {
+        "telemetry"
+    } else if client.display_timezone != daemon.display_timezone {
+        "display_tz"
+    } else if client.backends != daemon.backends {
+        "backends"
+    } else if client.pack_backends != daemon.pack_backends {
+        "pack_backends"
+    } else {
+        "unknown"
+    }
+}
+
 /// Request frame sent from a client to the daemon.
 #[derive(Serialize, Deserialize, Default)]
 pub struct DaemonRequestFrame {
@@ -537,9 +694,9 @@ pub struct DaemonRequestFrame {
     /// Fingerprint of the client's engine-coherence config: packs, db target,
     /// embedders, backend routing, and construction-baked outbound policy.
     /// Identity fields are carried separately in this frame. The daemon rejects
-    /// a request whose `config_id` differs from its own so a restricted client
-    /// (e.g. `--pack kg`, `--db :memory:`) never dispatches through the broader
-    /// default daemon. See ADR-027 / ADR-049 / ADR-096.
+    /// requests whose configuration differs, except when its extra-embedder set
+    /// is a superset of the client's and every other field matches. See
+    /// ADR-027 / ADR-049 / ADR-096.
     #[serde(default)]
     pub config_id: String,
     /// IPC protocol version sent by the client. Pre-versioning clients omit
@@ -1594,10 +1751,9 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     // `RequestIdentity` below) over its one shared warm registry, rather
     // than rejecting a differently-attributed same-uid connection to a cold
     // local-dispatch fallback. `config_id`: which governs packs/db/embed
-    // coherence for the shared warm engine: remains a hard reject; it is
-    // not an identity field and softening it would let a restricted client
-    // dispatch through an incompatible broader daemon.
-    } else if frame.config_id != dispatcher.config_id() {
+    // coherence for the shared warm engine: remains a hard reject for every
+    // field other than a daemon-side superset of the client's extra embedders.
+    } else if !config_ids_compatible(&frame.config_id, dispatcher.config_id()) {
         DaemonResponseFrame {
             ok: false,
             result: None,
@@ -2569,8 +2725,8 @@ fn pid_can_name_incumbent(pid: u32, current_pid: u32, allow_same_process_incumbe
 const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Whether the listener at `sock` actually speaks the khived wire protocol
-/// **as the same khived this process would defer to** — identified by
-/// `expected_config_id`.
+/// **as a khived this process can defer to** — identified by a configuration
+/// compatible with `expected_config_id`.
 ///
 /// A live PID plus an accepting Unix socket is not proof of khived: any
 /// unrelated process that happens to have bound the same path also answers
@@ -2585,7 +2741,7 @@ const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// is distinguished only by carrying `metrics: Some(...)`. This sends a
 /// bounded `probe_only` frame (the same identity probe the client-side
 /// recovery path uses, `crates/khive-mcp/src/daemon.rs::probe_daemon_identity`)
-/// carrying this process's own `config_id`, and requires the exact
+/// carrying this process's own `config_id`, and requires a compatible
 /// probe-branch shape back: `ok=true`, `result=None`, `error=None`,
 /// `metrics=None`, `request_id=None` (this probe frame never sets one), no
 /// mismatch flags, matching protocol version, and matching
@@ -2632,7 +2788,10 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
         && !resp.namespace_mismatch
         && !resp.config_mismatch
         && resp.daemon_protocol_version == PROTOCOL_VERSION
-        && resp.served_config_id.as_deref() == Some(expected_config_id)
+        && resp
+            .served_config_id
+            .as_deref()
+            .is_some_and(|served| config_ids_compatible(expected_config_id, served))
 }
 
 /// What owns the daemon PID file, from the point of view of a process that wants
@@ -5878,5 +6037,96 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(background_task_count(), before);
+    }
+
+    fn config_id(primary: &str, extra: &str) -> String {
+        format!(
+            "packs=[kg];db=:memory:;embed={primary};extra=[{extra}];fresh_tail=true;blob_hydration_bytes=268435456;backend=Sqlite;outbound=[];git_write=policy;brain=readers;telemetry=default;display_tz=UTC"
+        )
+    }
+
+    #[test]
+    fn an_available_extra_embedder_does_not_block_daemon_reuse() {
+        let client = config_id("p", "");
+        let daemon = config_id("p", "m");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+    }
+
+    #[test]
+    fn a_missing_requested_extra_embedder_is_named_and_refused() {
+        let client = config_id("p", "m");
+        let daemon = config_id("p", "");
+
+        assert!(!super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(&client, Some(&daemon)),
+            "extra"
+        );
+    }
+
+    #[test]
+    fn extra_embedder_order_and_duplicates_do_not_block_daemon_reuse() {
+        let client = config_id("p", "a,b,a");
+        let daemon = config_id("p", "b,a,c,b");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+    }
+
+    /// The request-dispatch call site applies the superset rule, not only the
+    /// comparison helper: a daemon holding an extra embedder serves a client
+    /// that declares none, and a client requesting an extra the daemon lacks
+    /// is refused before dispatch.
+    #[tokio::test]
+    async fn dispatch_serves_a_client_whose_extra_embedders_the_daemon_covers() {
+        let covering_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let covering = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: config_id("p", "m"),
+            dispatch_calls: Arc::clone(&covering_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let served = round_trip(covering, &base_request_frame(&config_id("p", ""))).await;
+        assert!(
+            served.ok && !served.config_mismatch,
+            "a daemon extra-embedder superset must be served: {served:?}"
+        );
+        assert_eq!(
+            covering_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the covered request must reach dispatch"
+        );
+
+        let lacking_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lacking = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: config_id("p", ""),
+            dispatch_calls: Arc::clone(&lacking_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let refused = round_trip(lacking, &base_request_frame(&config_id("p", "m"))).await;
+        assert!(
+            !refused.ok && refused.config_mismatch,
+            "a requested extra the daemon lacks must be refused: {refused:?}"
+        );
+        assert_eq!(
+            lacking_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused request must not reach dispatch"
+        );
+    }
+
+    #[test]
+    fn a_different_primary_embedder_is_refused_even_with_extra_superset() {
+        let client = config_id("p", "a");
+        let daemon = config_id("q", "a,b");
+
+        assert!(!super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(&client, Some(&daemon)),
+            "embed"
+        );
     }
 }

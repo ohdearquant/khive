@@ -231,123 +231,8 @@ pub(crate) fn reset_fallback_counters() {
     FALLBACK_STRICT_VIOLATIONS.store(0, SeqCst);
 }
 
-struct ConfigIdFields<'a> {
-    packs: &'a str,
-    db: &'a str,
-    embed: &'a str,
-    extra: &'a str,
-    fresh_tail: &'a str,
-    blob_hydration_bytes: &'a str,
-    backend: &'a str,
-    outbound: &'a str,
-    gate: &'a str,
-    git_write: &'a str,
-    brain: &'a str,
-    telemetry: &'a str,
-    display_timezone: &'a str,
-    backends: Option<&'a str>,
-    pack_backends: Option<&'a str>,
-}
-
-fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
-    let (base, backends, pack_backends) =
-        if let Some((before_routing, routing)) = config_id.rsplit_once("];pack_backends=[") {
-            let pack_backends = routing.strip_suffix(']')?;
-            let (base, backends) = before_routing.rsplit_once(";backends=[")?;
-            (base, Some(backends), Some(pack_backends))
-        } else {
-            (config_id, None, None)
-        };
-
-    let base = base.strip_prefix("packs=[")?;
-    let (packs, rest) = base.split_once("];db=")?;
-    let (rest, display_timezone) = rest
-        .rsplit_once(";display_tz=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, telemetry) = rest
-        .rsplit_once(";telemetry=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, brain) = rest
-        .rsplit_once(";brain=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, git_write) = rest.rsplit_once(";git_write=")?;
-    let (rest, gate) = rest
-        .rsplit_once(";gate=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
-    let outbound = outbound.strip_suffix(']')?;
-    let (rest, backend) = rest.rsplit_once(";backend=")?;
-    // Parse pre-ADR-160 fingerprints too so an incumbent from the preceding
-    // release reports the newly construction-baked budget as the mismatch,
-    // rather than degrading an otherwise recognizable identity to `unknown`.
-    let (rest, blob_hydration_bytes) = rest
-        .rsplit_once(";blob_hydration_bytes=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
-    let (rest, extra) = rest.rsplit_once(";extra=[")?;
-    let extra = extra.strip_suffix(']')?;
-    let (db, embed) = rest.rsplit_once(";embed=")?;
-
-    Some(ConfigIdFields {
-        packs,
-        db,
-        embed,
-        extra,
-        fresh_tail,
-        blob_hydration_bytes,
-        backend,
-        outbound,
-        gate,
-        git_write,
-        brain,
-        telemetry,
-        display_timezone,
-        backends,
-        pack_backends,
-    })
-}
-
 fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static str {
-    let Some(daemon) = daemon else {
-        return "unknown";
-    };
-    let (Some(client), Some(daemon)) = (parse_config_id(client), parse_config_id(daemon)) else {
-        return "unknown";
-    };
-
-    if client.packs != daemon.packs {
-        "packs"
-    } else if client.db != daemon.db {
-        "db"
-    } else if client.embed != daemon.embed {
-        "embed"
-    } else if client.extra != daemon.extra {
-        "extra"
-    } else if client.fresh_tail != daemon.fresh_tail {
-        "fresh_tail"
-    } else if client.blob_hydration_bytes != daemon.blob_hydration_bytes {
-        "blob_hydration_bytes"
-    } else if client.backend != daemon.backend {
-        "backend"
-    } else if client.outbound != daemon.outbound {
-        "outbound"
-    } else if client.gate != daemon.gate {
-        "gate"
-    } else if client.git_write != daemon.git_write {
-        "git_write"
-    } else if client.brain != daemon.brain {
-        "brain"
-    } else if client.telemetry != daemon.telemetry {
-        "telemetry"
-    } else if client.display_timezone != daemon.display_timezone {
-        "display_tz"
-    } else if client.backends != daemon.backends {
-        "backends"
-    } else if client.pack_backends != daemon.pack_backends {
-        "pack_backends"
-    } else {
-        "unknown"
-    }
+    khive_runtime::daemon::first_config_mismatch_field(client, daemon)
 }
 
 fn opaque_config_id(config_id: &str) -> String {
@@ -891,7 +776,9 @@ async fn try_forward_with_read_replay(
             ForwardOutcome::Response(response)
                 if response.config_mismatch
                     || response.namespace_mismatch
-                    || response.served_config_id.as_deref() != Some(frame.config_id.as_str()) =>
+                    || !response.served_config_id.as_deref().is_some_and(|served| {
+                        khive_runtime::daemon::config_ids_compatible(&frame.config_id, served)
+                    }) =>
             {
                 // A later identity rejection cannot erase the first dispatch
                 // or permit map_response to select local fallback.
@@ -976,9 +863,11 @@ fn map_response(
         );
     }
     // Fail closed: only trust a result the daemon positively confirms it served
-    // under our exact config. A legacy daemon omits `served_config_id` (→ None)
-    // and a config-drifted daemon echoes a different id — both fall back local.
-    if resp.served_config_id.as_deref() != Some(expected_config_id) {
+    // under a compatible config. A legacy daemon omits `served_config_id` (→ None)
+    // and a daemon with any incompatible field echoes a different id — both fall back local.
+    if !resp.served_config_id.as_deref().is_some_and(|served| {
+        khive_runtime::daemon::config_ids_compatible(expected_config_id, served)
+    }) {
         return fallback_or_reject(
             FallbackReason::ConfigMismatch,
             expected_config_id,
@@ -1553,7 +1442,9 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
                 && !resp.namespace_mismatch
                 && !resp.config_mismatch
                 && resp.daemon_protocol_version == PROTOCOL_VERSION
-                && resp.served_config_id.as_deref() == Some(config_id)
+                && resp.served_config_id.as_deref().is_some_and(|served| {
+                    khive_runtime::daemon::config_ids_compatible(config_id, served)
+                })
             {
                 tracing::debug!("under-lock probe: live matching daemon confirmed; skipping kill");
                 ProbeOutcome::Alive
