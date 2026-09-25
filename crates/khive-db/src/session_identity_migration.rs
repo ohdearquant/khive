@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::error::SqliteError;
 
 const AUDIT_NAME: &str = "adr117a_source_scoped_identity";
-const STAGE_SQL: &str = include_str!("../sql/039a-session-source-scope-stage.sql");
-const SWAP_SQL: &str = include_str!("../sql/039b-session-source-scope-swap.sql");
-const FINALIZE_SQL: &str = include_str!("../sql/039c-session-source-scope-finalize.sql");
+const STAGE_SQL: &str = include_str!("../sql/040a-session-source-scope-stage.sql");
+const SWAP_SQL: &str = include_str!("../sql/040b-session-source-scope-swap.sql");
+const FINALIZE_SQL: &str = include_str!("../sql/040c-session-source-scope-finalize.sql");
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool, SqliteError> {
     Ok(conn.query_row(

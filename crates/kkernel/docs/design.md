@@ -109,9 +109,24 @@
 ### Vector store capabilities and orphan sweep (ADR-044)
 
 - `kkernel vector capabilities` emits the sqlite-vec baseline capability flags.
-  Values match `SqliteVecStore::capabilities()` in `khive-db`.
-- `kkernel vector sweep` is deferred to follow-up #2874; `SqliteVecStore` returns
-  `Unsupported` for the orphan-sweep operation.
+  A comparison test pins every field to `SqliteVecStore::capabilities()` in `khive-db`,
+  including `supports_orphan_sweep: true`. It prints JSON by default or text with `--human`
+  without opening a database; `--engine` only labels this capability report.
+- `kkernel vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run]
+  [--engine <name>] [--db <path>]` calls the backend's orphan sweep for vectors whose subject
+  has no live entity, note, or knowledge atom. Soft-deleted subjects count as orphans.
+- `--engine` selects an exact configured `[[engines]].name`; without configured engine entries,
+  it selects a canonical runtime model name. Omitting it sweeps all configured model stores,
+  once per distinct model even when several engine names share it.
+- Repeated `--namespace` flags restrict the sweep; omitting them includes all namespaces.
+  `--max-delete` defaults to `1000` and is a shared deletion budget across selected stores.
+  Zero deletes no vectors, and values above `4294967295` fail before opening the database.
+- `--dry-run` reports orphan counts without deleting vectors. Counting still runs under the
+  backend's writer transaction; the deletion budget does not limit scanning.
+- JSON output contains `namespaces`, `dry_run`, `max_delete`, aggregate `scanned`, `deleted`,
+  `would_delete`, and `max_delete_hit`, plus a `stores` array. Each store identifies its
+  `engine_names`, `model`, and `namespaces` with those four result fields. `would_delete` counts
+  all orphans before the cap; `max_delete_hit` means that count exceeded the available budget.
 
 ### Proposal lifecycle (ADR-046)
 

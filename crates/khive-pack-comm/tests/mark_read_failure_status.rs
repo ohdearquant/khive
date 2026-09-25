@@ -103,6 +103,20 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
     assert!(single["mark_error"]
         .as_str()
         .is_some_and(|error| error.contains("locked")));
+    assert!(single.get("content").is_none());
+    assert!(single.get("subject").is_none());
+
+    let bulk_read = registry
+        .dispatch("comm.read", serde_json::json!({ "ids": ids.clone() }))
+        .await
+        .expect("best-effort bulk read returns degraded rows");
+    assert_eq!(bulk_read["status"], "failed");
+    assert_eq!(bulk_read["failed_count"], 2);
+    assert!(bulk_read["results"]
+        .as_array()
+        .expect("bulk read result array")
+        .iter()
+        .all(|result| result.get("content").is_none() && result.get("subject").is_none()));
 
     let bulk = registry
         .dispatch("comm.mark_read", serde_json::json!({ "ids": ids }))

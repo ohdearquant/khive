@@ -173,6 +173,7 @@ fn kg_commit_lands_a_clean_changeset_with_provenance_trailers() {
     std::fs::write(&rules, "").expect("write empty rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -245,6 +246,7 @@ fn kg_commit_refuses_repo_with_configured_remote() {
     std::fs::write(&rules, "").expect("write empty rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -297,6 +299,7 @@ fn kg_commit_refuses_changeset_with_error_severity_finding() {
     std::fs::write(&rules, "").expect("write empty rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -349,6 +352,7 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
     std::fs::write(&rules, "").expect("write empty rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -415,6 +419,7 @@ fn kg_commit_lands_formal_typed_endpoint_with_edge_endpoint_types_enabled() {
     .expect("write rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -467,6 +472,7 @@ fn kg_commit_lands_changeset_with_description_satisfying_require_field_rule() {
     .expect("write rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -522,6 +528,7 @@ fn kg_commit_refuses_malformed_dangling_refs_severity() {
     .expect("write rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",
@@ -587,6 +594,7 @@ fn kg_commit_refuses_generic_rule_named_dangling_refs() {
     .expect("write rules.toml");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", stage.path())
         .args([
             "kg",
             "commit",

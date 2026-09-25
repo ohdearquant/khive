@@ -93,6 +93,7 @@ fn kg_validate_end_to_end_exercises_all_five_builtin_rule_classes() {
     let tmp = write_fixture();
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", tmp.path())
         .args([
             "kg",
             "validate",
@@ -176,6 +177,7 @@ fn kg_validate_no_rules_flag_skips_all_builtin_rule_classes() {
     let tmp = write_fixture();
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", tmp.path())
         .args([
             "kg",
             "validate",
@@ -222,6 +224,7 @@ fn kg_validate_fails_when_a_mandatory_input_file_is_missing() {
     std::fs::write(kg_dir.join("edges.ndjson"), "").expect("write edges.ndjson");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", tmp.path())
         .args([
             "kg",
             "validate",
@@ -267,6 +270,7 @@ fn kg_validate_fails_when_present_optional_notes_are_not_utf8() {
         .expect("write invalid UTF-8 notes.ndjson");
 
     let output = Command::new(kkernel_bin())
+        .env("HOME", tmp.path())
         .args([
             "kg",
             "validate",

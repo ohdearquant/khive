@@ -3105,6 +3105,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn no_marker_reaches_the_bootstrap_spawn_attempt() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             let dir = tempfile::tempdir().unwrap();
             isolate(dir.path());
@@ -3140,6 +3144,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn stale_marker_with_dead_pid_fails_loud_without_spawning_or_waiting() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             let dir = tempfile::tempdir().unwrap();
             isolate(dir.path());
@@ -3184,6 +3192,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn live_marker_bounded_waits_then_fails_loud_without_spawning() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             let dir = tempfile::tempdir().unwrap();
             isolate(dir.path());
@@ -3231,6 +3243,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn reconnect_waits_for_live_owner_socket_gap_without_recovery() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             for refused in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
@@ -3272,6 +3288,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn read_response_loss_replays_only_with_explicit_policy_and_keeps_identity() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             for enabled in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
@@ -3325,6 +3345,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn read_replay_attempt_cap_and_identity_drift_stay_terminal() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             for drift in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
@@ -3368,6 +3392,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn replay_deadline_never_converts_lost_response_to_no_socket() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             let dir = tempfile::tempdir().unwrap();
             isolate(dir.path());
@@ -3387,6 +3415,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn reconnect_deadline_and_cancellation_prevent_fresh_recovery() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             for cancel in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
@@ -3427,6 +3459,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn malformed_protocol_and_exhausted_deadlines_are_not_replayed() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             let _cleanup = RecoveryTestGuard::new();
             for kind in ["malformed", "timeout", "protocol"] {
                 let dir = tempfile::tempdir().unwrap();
@@ -3493,6 +3529,10 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn recovery_releases_boot_lock_for_graceful_exit_and_rechecks_owner() {
+            if crate::test_isolation::rerun_with_private_home() {
+                return;
+            }
+
             for successor_wins in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
                 let mut cleanup = RecoveryTestGuard::new();
@@ -4399,6 +4439,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_returns_none_when_no_daemon_set() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4498,6 +4542,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn permission_denied_socket_fails_without_lifecycle_or_local_fallback() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         reset_fallback_counters();
@@ -4551,6 +4599,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn stale_socket_connection_refused_remains_safe_to_recover() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -4595,6 +4647,133 @@ mod tests {
         path
     }
 
+    /// Exercise the same default lock and stderr producers as daemon recovery.
+    /// The outer sentinel is also owned by this test, so isolation controls can
+    /// fail before a writer is reached without ever touching the caller's HOME.
+    #[test]
+    #[serial]
+    fn private_home_child_contains_real_daemon_artifacts() {
+        const WITNESS: &str = "KHIVE_MCP_PRIVATE_HOME_WITNESS";
+        if std::env::var_os(WITNESS).is_none() {
+            let sentinel = tempfile::tempdir().expect("outer sentinel home");
+            let marker = sentinel.path().join("sentinel");
+            std::fs::write(&marker, b"parent home unchanged").expect("sentinel marker");
+            let thread = std::thread::current();
+            let test_name = thread.name().expect("named witness test");
+            let command = || {
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("witness executable"),
+                );
+                command
+                    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                    .env("HOME", sentinel.path())
+                    .env("USERPROFILE", sentinel.path())
+                    .env(WITNESS, "1")
+                    .env_remove("KHIVE_MCP_PRIVATE_HOME_TEST")
+                    .env_remove("KHIVE_MCP_PRIVATE_HOME_PATH")
+                    .env_remove("KHIVE_MCP_PRIVATE_HOME_PARENT_PID")
+                    .env_remove(crate::test_isolation::PARENT_HOME)
+                    .current_dir(sentinel.path());
+                command
+            };
+            let output = command().output().expect("run private-home witness");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "MCP_ISOLATION_WITNESS_SUCCEEDS: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+                "MCP_ISOLATION_WITNESS_EXACTLY_ONE_TEST: {stdout}\n{stderr}"
+            );
+            // A marker alone must never authorize running a producer in the
+            // outer process/home. The exact-name check precedes every writer.
+            let forged = command()
+                .env("KHIVE_MCP_PRIVATE_HOME_TEST", "not_this_test")
+                .output()
+                .expect("run forged-marker witness");
+            assert!(
+                !forged.status.success()
+                    && String::from_utf8_lossy(&forged.stderr).contains("MCP_CHILD_EXACT_TEST"),
+                "MCP_FORGED_CHILD_MARKER_REJECTED"
+            );
+            assert_eq!(
+                std::fs::read(&marker).expect("read sentinel marker"),
+                b"parent home unchanged",
+                "MCP_OUTER_SENTINEL_BYTES_UNCHANGED"
+            );
+            assert_eq!(
+                std::fs::read_dir(sentinel.path())
+                    .expect("read outer home")
+                    .count(),
+                1,
+                "MCP_OUTER_SENTINEL_HAS_NO_DAEMON_ARTIFACTS"
+            );
+            return;
+        }
+
+        // Refuse an unisolated process before any filesystem writes.
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+        let expected_home = std::path::PathBuf::from(
+            std::env::var_os("KHIVE_MCP_PRIVATE_HOME_PATH").expect("MCP_ISOLATION_CHILD_REQUIRED"),
+        );
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        let parent_home = std::path::PathBuf::from(
+            std::env::var_os(crate::test_isolation::PARENT_HOME).expect("outer sentinel HOME"),
+        );
+        assert_eq!(home, expected_home, "MCP_ISOLATION_HOME_IS_PRIVATE");
+        assert_ne!(
+            home, parent_home,
+            "MCP_ISOLATION_HOME_DIFFERS_FROM_SENTINEL"
+        );
+        assert!(
+            parent_home.join("sentinel").is_file(),
+            "MCP_ISOLATION_OUTER_SENTINEL_EXISTS"
+        );
+        clear_daemon_env();
+        let recovery_path = khive_runtime::daemon::lock_path();
+        let recoverer_path = khive_runtime::daemon::recoverer_lock_path();
+        assert_eq!(recovery_path, home.join(".khive/khived.recovery.lock"));
+        assert_eq!(recoverer_path, home.join(".khive/khived.recoverer.lock"));
+        drop(khive_runtime::daemon::acquire_daemon_boot_guard().expect("real recovery lock"));
+        drop(
+            khive_runtime::daemon::try_acquire_recoverer_lock_until(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect("real recoverer lock acquisition")
+            .expect("uncontended recoverer lock"),
+        );
+        let fixture = tempfile::tempdir().expect("writer executable fixture");
+        let exe = daemon_script_fixture(
+            &fixture,
+            "write-stderr.sh",
+            "#!/bin/sh\nprintf 'MCP_PRIVATE_LOG_WITNESS\\n' >&2\n",
+        );
+        let status = spawn_daemon_with_exe(&exe)
+            .expect("spawn real daemon log writer")
+            .wait()
+            .expect("reap daemon log writer");
+        assert!(status.success(), "MCP_PRIVATE_LOG_WRITER_SUCCEEDS");
+        assert!(recovery_path.is_file(), "MCP_PRIVATE_RECOVERY_LOCK_EXISTS");
+        assert!(
+            recoverer_path.is_file(),
+            "MCP_PRIVATE_RECOVERER_LOCK_EXISTS"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(".khive/logs/khived.log"))
+                .expect("read real daemon log"),
+            "MCP_PRIVATE_LOG_WITNESS\n",
+            "MCP_PRIVATE_DAEMON_LOG_CONTAINS_REAL_STDERR"
+        );
+        assert!(
+            !parent_home.join(".khive").exists(),
+            "MCP_OUTER_SENTINEL_HAS_NO_DAEMON_ARTIFACTS"
+        );
+    }
+
     /// The config path threaded through `forward_or_spawn_with_config_and_packs` must
     /// actually appear on the spawned daemon's command line; a script
     /// fixture records its argv so the assertion observes the real child
@@ -4603,6 +4782,10 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_daemon_with_exe_and_config_appends_config_flag_to_command_line() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
         let exe = daemon_script_fixture(
@@ -4633,6 +4816,10 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
         let exe = daemon_script_fixture(
@@ -4662,6 +4849,10 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
         let exe = daemon_script_fixture(
@@ -4690,6 +4881,10 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_daemon_with_exe_and_config_appends_memory_db_flag_to_command_line() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
         let exe = daemon_script_fixture(
@@ -4730,6 +4925,10 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
         let exe = daemon_script_fixture(
@@ -4758,6 +4957,10 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_daemon_retries_a_transient_executable_file_busy_error() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = daemon_script_fixture(&dir, "temporarily-busy.sh", "#!/bin/sh\nexit 0\n");
         let writer = std::fs::OpenOptions::new()
@@ -5168,6 +5371,10 @@ mod tests {
     #[test]
     #[serial]
     fn respawn_disclosure_fixture_restores_absent_home() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let home = std::env::var_os("HOME").expect("test process has HOME");
         std::env::remove_var("HOME");
         {
@@ -5182,6 +5389,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_non_strict() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5243,6 +5454,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_strict() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5301,6 +5516,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_with_injected_exe_sanitizes_spawn_error_without_local_fallback() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5361,6 +5580,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_with_injected_exe_falls_back_when_child_stays_alive() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5386,6 +5609,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn daemon_round_trip_dispatches_and_enforces_config_id() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -5613,6 +5840,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5703,6 +5934,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn daemon_serves_per_request_identity_over_one_warm_registry() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -5857,6 +6092,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn daemon_config_id_ignores_actor_folded_visibility_but_frame_visibility_isolated() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6014,6 +6253,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn local_dispatch_without_identity_context_uses_baked_actor() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
 
         let server = make_comm_test_server(Some("baked-actor"));
@@ -6052,6 +6295,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn daemon_round_trip_honors_from_wire_for_subhandlers() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6209,6 +6456,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_rejects_old_daemon_and_returns_protocol_mismatch_error() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6320,6 +6571,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_behind_a_newer_daemon_returns_the_error_and_arms_reexec() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         clear_pending_self_heal();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6437,6 +6692,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_returns_response_lost_when_daemon_closes_without_response() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6525,6 +6784,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6658,6 +6921,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6745,6 +7012,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_normal_response_within_ceiling_still_succeeds() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6891,6 +7162,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_requires_incumbent_exit_before_spawning() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let mut cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         reset_counters();
@@ -7000,6 +7275,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn recovery_replaces_stale_pid_without_waiting_on_live_foreign_process() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let mut cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         reset_counters();
@@ -7095,6 +7374,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn concurrent_recovery_second_client_skips_kill_when_daemon_alive() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7260,6 +7543,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn oversized_daemon_response_sends_error_frame_not_kills_daemon() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7438,6 +7725,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn recovery_path_dispatches_real_request_exactly_once() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7618,6 +7909,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn confirm_genuinely_dead_waits_for_peer_to_release_boot_guard() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7720,6 +8015,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn confirm_genuinely_dead_is_sticky_uncertain_after_earlier_contention() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7810,6 +8109,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
     #[serial]
     async fn parallel_no_socket_recovery_converges_to_one_usable_daemon() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         const CLIENTS: usize = 8;
 
         let _cleanup = RecoveryTestGuard::new();
@@ -7967,6 +8270,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
     #[serial]
     async fn parallel_parse_failure_is_terminal_and_never_recovers() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         const CLIENTS: usize = 8;
 
         let _cleanup = RecoveryTestGuard::new();
@@ -8142,6 +8449,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn probe_classifier_dead_when_same_protocol_daemon_lacks_probe_support() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8249,6 +8560,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn dispatch_error_propagates_as_non_empty_client_message() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -8359,6 +8674,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn current_client_rejects_warm_v3_daemon_before_accepting_result() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         const {
             assert!(
@@ -8430,6 +8749,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn try_forward_inner_behind_a_newer_daemon_yields_protocol_mismatch() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -8503,6 +8826,10 @@ mod tests {
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -8615,6 +8942,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_dispatches_real_frame_exactly_once_end_to_end() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8709,6 +9040,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_dispatches_real_frame_exactly_once_on_success() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8851,6 +9186,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9078,6 +9417,10 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_removes_when_pid_unchanged() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let _cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9106,6 +9449,10 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_skips_when_socket_probe_is_uncertain() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let _cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9134,6 +9481,10 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_skips_when_pid_file_changed() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("khived.pid");
@@ -9163,6 +9514,10 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_skips_when_socket_has_a_live_listener() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("khived.pid");
@@ -9193,6 +9548,10 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_compares_malformed_pid_bytes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let _cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");

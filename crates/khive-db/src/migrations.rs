@@ -170,7 +170,8 @@ const V35_UP: &str = include_str!("../sql/035-notes-unread-probe-recipient-type-
 const V36_UP: &str = include_str!("../sql/036-events-operation-attribution.sql");
 const V37_UP: &str = include_str!("../sql/037-entity-versions.sql");
 const V38_UP: &str = include_str!("../sql/038-entities-legacy-type-index.sql");
-const SESSION_IDENTITY_UP: &str = include_str!("../sql/039-session-source-scope.sql");
+const V39_UP: &str = include_str!("../sql/039-knowledge-cursor-indexes.sql");
+const SESSION_IDENTITY_UP: &str = include_str!("../sql/040-session-source-scope.sql");
 const SESSION_IDENTITY_MIGRATION_NAME: &str = "session_source_scoped_identity";
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
@@ -420,6 +421,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 39,
+        name: "knowledge_cursor_indexes",
+        up: V39_UP,
+    },
+    VersionedMigration {
+        version: 40,
         name: SESSION_IDENTITY_MIGRATION_NAME,
         up: SESSION_IDENTITY_UP,
     },

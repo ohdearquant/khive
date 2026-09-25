@@ -1919,8 +1919,10 @@ request(ops="comm.unread()")
 
 ### `comm.read` — Declaration
 
-Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
-content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
+Fetch and mark one or more inbound messages. Successful results return `subject`, `content`,
+`from`, `to`, `direction`, and `created_at` alongside the existing acknowledgement fields.
+Pass `body=false` for the prior acknowledgement-only shape. Failed or indeterminate marks do
+not add message fields. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
 remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
 `mark_error`. A write whose execution seam terminated after being accepted (so it may already
@@ -1929,14 +1931,16 @@ message's current state through `comm.inbox` before re-issuing; re-issuing is sa
 a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
 re-issue failures (or unresolved unknowns) later.
 
-| Param | Type            | Required    | Notes                                                                   |
-| ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
-| `id`  | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
-| `ids` | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
+| Param  | Type            | Required    | Notes                                                                   |
+| ------ | --------------- | ----------- | ----------------------------------------------------------------------- |
+| `id`   | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
+| `ids`  | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
+| `body` | bool            | no          | Defaults to true; false omits top-level message fields.                 |
 
 ```
 request(ops="comm.read(id=\"<message-id>\")")
 request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
+request(ops="comm.read(id=\"<message-id>\", body=false)")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
@@ -1949,7 +1953,8 @@ item's `read` and optional `mark_error`.
 ### `comm.mark_read` — Declaration
 
 Canonical named bulk mark-read. It accepts the same inbound targets and returns the same bulk
-summary shape as `comm.read(ids=[...])`, while adding an all-or-nothing mutation mode.
+summary and acknowledgement fields as `comm.read(ids=[...])`, while adding an all-or-nothing
+mutation mode. It does not add message fields.
 
 | Param    | Type            | Required | Notes                                                                                            |
 | -------- | --------------- | -------- | ------------------------------------------------------------------------------------------------ |

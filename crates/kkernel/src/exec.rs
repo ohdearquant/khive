@@ -3043,13 +3043,14 @@ mod tests {
         }
     }
 
-    const DAEMON_SPAWN_TEST_ENV_VARS: [&str; 7] = [
+    const DAEMON_SPAWN_TEST_ENV_VARS: [&str; 8] = [
         "KHIVE_EMBEDDING_MODEL",
         "KHIVE_ADDITIONAL_EMBEDDING_MODELS",
         "KHIVE_ACTOR",
         "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
         "KHIVE_DB",
         "KHIVE_PACKS",
+        "KHIVE_LOCK",
         "HOME",
     ];
 
@@ -3085,6 +3086,10 @@ mod tests {
     #[test]
     #[serial]
     fn daemon_spawn_env_guard_restores_every_mutated_variable() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _restore_machine_env = EnvAndCwdGuard::capture();
         for name in DAEMON_SPAWN_TEST_ENV_VARS {
             std::env::set_var(name, format!("sentinel-{name}"));
@@ -3108,8 +3113,12 @@ mod tests {
     // ── acquire_local_construction_guard: in-memory dbs skip the guard ────────
 
     #[test]
-    #[serial(local_exec_boot_guard)]
+    #[serial]
     fn acquire_local_construction_guard_is_noop_for_in_memory_db() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
 
@@ -3139,15 +3148,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial(local_exec_boot_guard)]
+    #[serial]
     fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl();
     }
 
     #[cfg(not(unix))]
     #[test]
-    #[serial(local_exec_boot_guard)]
+    #[serial]
     fn acquire_local_construction_guard_serializes_concurrent_file_backed_callers_nonunix() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         acquire_local_construction_guard_serializes_concurrent_file_backed_callers_impl();
     }
 
@@ -3200,6 +3217,10 @@ mod tests {
     #[test]
     #[serial]
     fn khive_db_env_binds_to_db_arg() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         // clap reads KHIVE_DB for `--db` (parity with `kkernel mcp`).
         std::env::set_var("KHIVE_DB", "/tmp/kkernel-exec-env.db");
         let args = ExecArgs::parse_from(["exec", "stats()"]);
@@ -3210,6 +3231,10 @@ mod tests {
     #[test]
     #[serial]
     fn config_flag_and_env_bind_with_flag_precedence() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let previous = std::env::var_os("KHIVE_CONFIG");
         std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-exec-env-config.toml");
 
@@ -3267,6 +3292,10 @@ mod tests {
     #[test]
     #[serial]
     fn khive_actor_env_does_not_bind_to_explicit_actor_arg() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let previous = std::env::var("KHIVE_ACTOR").ok();
         std::env::set_var("KHIVE_ACTOR", "lambda:env");
         let args = ExecArgs::parse_from(["exec", "stats()"]);
@@ -3373,6 +3402,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn authorized_explicit_actor_is_used_for_write_attribution() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let (previous_home, _home_dir) = isolate_home_for_test();
         let mut cfg = RuntimeConfig {
             db_path: None,
@@ -3962,6 +3995,10 @@ id = "lambda:fallback"
     #[test]
     #[serial]
     fn namespace_explicit_changes_actor_id_fill_but_not_config_id() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -4038,6 +4075,10 @@ id = "lambda:fallback"
     #[test]
     #[serial]
     fn exec_config_id_matches_serve_config_id_for_multi_backend_topology() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use khive_runtime::{BackendConfig, BackendKind, PackConfig};
 
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
@@ -4161,7 +4202,15 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn build_local_fallback_server_routes_through_multi_backend_when_backends_declared() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use khive_runtime::{BackendConfig, BackendKind, PackConfig};
+
+        let lock_dir = tempfile::tempdir().expect("private construction lock");
+        let _env = EnvAndCwdGuard::capture();
+        std::env::set_var("KHIVE_LOCK", lock_dir.path().join("khived.recovery.lock"));
 
         let main_db = NamedTempFile::new().expect("main db tempfile");
         let secondary_db = NamedTempFile::new().expect("secondary db tempfile");
@@ -4229,6 +4278,7 @@ id = "lambda:fallback"
         let server = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref())
             .await
             .expect("multi-backend local fallback must build");
+        assert!(lock_dir.path().join("khived.recovery.lock").is_file());
 
         let send = server
             .dispatch_request_local(RequestParams {
@@ -4305,6 +4355,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn build_local_fallback_server_uses_captured_anchor_after_home_changes() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let (previous_home, _first_home) = isolate_home_for_test();
         let cfg = RuntimeConfig {
             db_path: khive_runtime::resolve_db_anchor(None),
@@ -4354,8 +4408,15 @@ id = "lambda:fallback"
     // back to `<db_dir>/blobs` — that directory existing after construction
     // is proof the install call ran.
     #[tokio::test]
+    #[serial]
     async fn build_local_fallback_server_installs_blob_store_single_backend() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
+        let _env = EnvAndCwdGuard::capture();
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
         let db_path = dir.path().join("exec_blob.db");
         let cfg = RuntimeConfig {
             db_path: Some(db_path),
@@ -4369,6 +4430,7 @@ id = "lambda:fallback"
         let _server = build_local_fallback_server(cfg, &khive_cfg, None, None)
             .await
             .expect("single-backend local-exec construction must succeed");
+        assert!(dir.path().join("khived.recovery.lock").is_file());
 
         assert!(
             dir.path().join("blobs").is_dir(),
@@ -4502,8 +4564,12 @@ id = "lambda:fallback"
     // never acquires anything, so it isn't blocked by our held lock).
     #[cfg(unix)]
     #[test]
-    #[serial(local_exec_boot_guard)]
+    #[serial]
     fn build_local_fallback_server_blocks_while_recovery_lock_is_held() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -4581,8 +4647,12 @@ id = "lambda:fallback"
     // on those other env vars.
     #[cfg(unix)]
     #[test]
-    #[serial(local_exec_boot_guard)]
+    #[serial]
     fn local_exec_construction_races_guarded_daemon_boot_without_fts_corruption() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5096,6 +5166,10 @@ id = "lambda:fallback"
 
     #[tokio::test]
     async fn serial_typed_preflight_rejects_later_prev_before_first_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use std::io::Write as _;
 
         let db_file = NamedTempFile::new().expect("temp db");
@@ -5152,6 +5226,10 @@ id = "lambda:fallback"
 
     #[tokio::test]
     async fn serial_whole_snapshot_preflight_does_not_change_default_chunk_commit_parity() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use std::io::Write as _;
 
         let mut source = NamedTempFile::new().expect("ops source");
@@ -5277,6 +5355,10 @@ id = "lambda:fallback"
     /// path around it.
     #[tokio::test]
     async fn ops_file_write_leaves_no_wal_sidecar_after_return() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use std::io::Write as _;
 
         let db_dir = tempfile::tempdir().expect("db dir");
@@ -6060,6 +6142,10 @@ id = "lambda:fallback"
 
     #[tokio::test]
     async fn ops_file_dry_run_writes_nothing() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -6140,6 +6226,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn unauthorized_explicit_actor_is_not_retried_as_fallback() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let previous_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         std::env::set_var("KHIVE_NO_DAEMON", "1");
         let (previous_home, _home_dir) = isolate_home_for_test();
@@ -6193,6 +6283,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
 
@@ -6250,6 +6344,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn strict_mode_allows_exec_when_comm_and_actor_configured() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -6297,6 +6395,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn strict_mode_off_exec_inline_passes_with_comm_no_actor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -6357,6 +6459,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn resolved_pack_list_reaches_real_exec_adapter_boundary() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let (prev_home, _home_dir) = isolate_home_for_test();
 
         khive_mcp::daemon::test_forward_seam::arm();
@@ -6439,6 +6545,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn strict_mode_spy_confirms_enforce_fires_before_forward() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         // Deliberately do NOT set KHIVE_NO_DAEMON — the spy must be reachable
         // if the enforce call is in the wrong place.
@@ -6495,6 +6605,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn strict_mode_spy_forward_reached_when_actor_configured() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
         let (prev_home, _home_dir) = isolate_home_for_test();
@@ -6607,6 +6721,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn explicit_config_reaches_daemon_spawn_seam() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6661,6 +6779,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn memory_db_override_reaches_daemon_spawn_seam() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6722,6 +6844,10 @@ id = "lambda:fallback"
     #[tokio::test]
     #[serial]
     async fn force_memory_exec_frame_matches_opened_read_only_topology_runtime() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6890,6 +7016,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn multi_backend_main_chmod_refuses_before_daemon_forward() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
@@ -6933,6 +7063,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn multi_backend_secondary_chmod_refuses_before_daemon_forward() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
@@ -6976,6 +7110,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn force_memory_skips_declared_chmod_preflight_and_forwards() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
@@ -7026,6 +7164,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn single_backend_concrete_db_override_reaches_daemon_spawn_seam() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -7090,6 +7232,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn env_khive_packs_reaches_daemon_spawn_seam() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = EnvAndCwdGuard::capture();
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
@@ -7149,6 +7295,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn no_env_control_forwards_built_in_default_packs_to_spawn_seam() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         // Declared first so it drops LAST (reverse declaration order):
         // constructing the guard here, before either tempdir is created and
         // before any process-global mutation, means every panic from this
@@ -7252,6 +7402,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn redundant_db_override_forwards_discovered_config_to_spawn_seam() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -7420,6 +7574,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn explicit_config_is_loaded_for_exec_forward_frame() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -7504,6 +7662,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -7632,6 +7794,10 @@ backend = "sessions"
     #[tokio::test]
     #[serial]
     async fn declared_topology_exec_fallback_updates_omitted_db_anchor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let fixture = tempfile::tempdir().expect("config fixture");
         let unused_home = fixture.path().join("unused-home");
         let anchor = unused_home.join(".khive/khive.db");
@@ -7690,6 +7856,10 @@ backend = "sessions"
     #[tokio::test]
     #[serial]
     async fn inline_db_override_guard_normalizes_main_config_id_and_rejects_conflict() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -7954,6 +8124,10 @@ backend = "sessions"
 
     #[tokio::test]
     async fn atomic_kg_only_config_keeps_gtd_hook_and_lifecycle_execution() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
@@ -8028,6 +8202,10 @@ backend = "sessions"
     /// op as one unit and the results are visible afterward.
     #[tokio::test]
     async fn atomic_ops_file_success_commits_all_ops() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -8084,6 +8262,10 @@ backend = "sessions"
 
     #[tokio::test]
     async fn atomic_post_commit_reindex_failure_returns_committed_non_retryable_envelope() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let entity_id = {
@@ -8141,6 +8323,10 @@ backend = "sessions"
 
     #[tokio::test]
     async fn atomic_result_read_failure_keeps_later_committed_delete_non_retryable() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let entity_id = {
@@ -8213,6 +8399,10 @@ backend = "sessions"
     /// so `x`'s deletion is undone too.
     #[tokio::test]
     async fn atomic_ops_file_mid_unit_failure_rolls_back_whole_unit() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -8275,6 +8465,10 @@ backend = "sessions"
 
     #[tokio::test]
     async fn atomic_rollback_preserves_zero_exit_with_or_without_save_and_strict() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let (x_id, y_id) = {
@@ -8406,6 +8600,10 @@ backend = "sessions"
 
     #[tokio::test]
     async fn atomic_invalid_save_directory_is_rejected_before_commit() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let mut file = NamedTempFile::new().unwrap();
@@ -8456,6 +8654,10 @@ backend = "sessions"
 
     #[tokio::test]
     async fn atomic_preflighted_save_keeps_prior_file_on_execution_error() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let mut file = NamedTempFile::new().unwrap();
@@ -8512,6 +8714,10 @@ backend = "sessions"
     /// for both authoritative dependency stores.
     #[tokio::test]
     async fn atomic_ops_file_rejects_same_unit_gtd_dependency_cycles() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -8679,6 +8885,10 @@ backend = "sessions"
     /// natural-key lookup).
     #[tokio::test]
     async fn atomic_symmetric_update_absorbs_into_same_unit_link_and_renders_correct_id() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -8787,6 +8997,10 @@ backend = "sessions"
     #[tokio::test]
     async fn atomic_symmetric_update_absorbs_into_pre_existing_tombstoned_survivor_and_renders_it()
     {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -8885,6 +9099,10 @@ backend = "sessions"
     /// empty (zero entities created).
     #[tokio::test]
     async fn atomic_cli_boundary_rejections_happen_before_any_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let khive_cfg = KhiveConfig::default();
 
         // (a) embedding-bearing verb.
@@ -9082,6 +9300,10 @@ backend = "sessions"
     /// current value, bumped `updated_at`, and reported `ok:true`.
     #[tokio::test]
     async fn atomic_update_entity_unknown_field_is_rejected_and_does_not_mutate_row() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -9136,6 +9358,10 @@ backend = "sessions"
     /// succeeds (parity boundary — don't over-reject).
     #[tokio::test]
     async fn atomic_update_note_unknown_field_rejected_well_formed_succeeds() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -9201,6 +9427,10 @@ backend = "sessions"
     /// any write; a well-formed delete still succeeds.
     #[tokio::test]
     async fn atomic_delete_unknown_field_rejected_well_formed_succeeds() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -9261,6 +9491,10 @@ backend = "sessions"
     /// scope here.)
     #[tokio::test]
     async fn atomic_link_unknown_field_rejected_well_formed_succeeds() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -9330,6 +9564,10 @@ backend = "sessions"
     /// still succeeds.
     #[tokio::test]
     async fn atomic_gtd_transition_unknown_field_rejected_well_formed_succeeds() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -9393,6 +9631,10 @@ backend = "sessions"
     /// complete still succeeds.
     #[tokio::test]
     async fn atomic_gtd_complete_unknown_field_rejected_well_formed_succeeds() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
 
@@ -9458,6 +9700,10 @@ backend = "sessions"
     /// still succeed.
     #[tokio::test]
     async fn atomic_delete_rejects_kind_mismatch_and_accepts_matching_or_omitted_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
@@ -9541,6 +9787,10 @@ backend = "sessions"
     /// behavior. See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
     #[tokio::test]
     async fn atomic_update_null_and_type_semantics_match_canonical_no_op_behavior() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
@@ -9636,6 +9886,10 @@ backend = "sessions"
     /// prepare under `--atomic`.
     #[tokio::test]
     async fn atomic_update_and_gtd_transition_accept_8_hex_prefix_ids() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();
@@ -9720,6 +9974,10 @@ backend = "sessions"
     /// gtd verbs.
     #[tokio::test]
     async fn atomic_success_results_carry_canonical_shaped_result_per_op() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let khive_cfg = KhiveConfig::default();

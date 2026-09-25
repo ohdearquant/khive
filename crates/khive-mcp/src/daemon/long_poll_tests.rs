@@ -15,6 +15,10 @@ async fn real_response(server: crate::server::KhiveMcpServer, request_bytes: &[u
 #[serial]
 #[serial_test::serial(config_ledger)]
 async fn long_poll_ceiling_returns_empty_pages_over_real_transport_including_one_replay() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -103,6 +107,10 @@ async fn long_poll_ceiling_returns_empty_pages_over_real_transport_including_one
 #[serial]
 #[serial_test::serial(config_ledger)]
 async fn cli_forward_replays_classified_reads_once_but_never_mutations_unknown_or_mixed() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     for (ops, replay, creates_message) in [
         ("comm.inbox(limit=20)", true, false),
