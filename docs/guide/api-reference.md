@@ -27,7 +27,7 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
@@ -2664,7 +2664,7 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 16 verbs
+## `git` pack — 17 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
@@ -2834,15 +2834,15 @@ compare-and-swap run while holding the same per-repository write lock. The resul
 observed `from`, requested `to`, whether the move was a fast-forward, and `receipt_id`. An optional
 `reason` is stored with the receipt.
 
-| Param | Type | Required | Notes |
-| ----- | ---- | -------- | ----- |
-| `repo` | string | yes | Absolute local path to an allowlisted git repository. |
-| `branch` | string | yes | Existing branch to move. |
-| `to` | string | yes | Full 40-hex object id of an existing commit. |
-| `expected` | string | yes | Exact 40-hex current branch head. |
-| `require_fast_forward` | boolean | no | Defaults to true. |
-| `reason` | string | no | Operator note stored with the receipt. |
-| `session_id` | string | no | Session label copied to the receipt. |
+| Param                  | Type    | Required | Notes                                                 |
+| ---------------------- | ------- | -------- | ----------------------------------------------------- |
+| `repo`                 | string  | yes      | Absolute local path to an allowlisted git repository. |
+| `branch`               | string  | yes      | Existing branch to move.                              |
+| `to`                   | string  | yes      | Full 40-hex object id of an existing commit.          |
+| `expected`             | string  | yes      | Exact 40-hex current branch head.                     |
+| `require_fast_forward` | boolean | no       | Defaults to true.                                     |
+| `reason`               | string  | no       | Operator note stored with the receipt.                |
+| `session_id`           | string  | no       | Session label copied to the receipt.                  |
 
 ## `code` pack — 1 verb
 
