@@ -212,6 +212,7 @@ async fn telegram_inflight_poll_cancels_without_ack_and_restart_ingests_once() {
             channel.clone(),
             registry.clone(),
             "local".into(),
+            "local".into(),
             token,
         ))
     };

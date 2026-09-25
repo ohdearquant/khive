@@ -21,7 +21,9 @@ directly, without a Telegram SDK.
 
 The adapter requires `KHIVE_TELEGRAM_BOT_TOKEN` and a numeric
 `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`. `KHIVE_TELEGRAM_MAINTAINER_SLUG` defaults to `maintainer`, and
-`KHIVE_TELEGRAM_INGEST_NAMESPACE` defaults to `local`. No filesystem configuration is read.
+`KHIVE_TELEGRAM_INGEST_NAMESPACE` and `KHIVE_TELEGRAM_DEFAULT_ACTOR` both default to `local`. Set
+`KHIVE_TELEGRAM_DEFAULT_ACTOR=telegram:bot` to keep routing uncorrelated messages to the bot actor.
+No filesystem configuration is read.
 
 ## Invariants
 

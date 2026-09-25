@@ -433,6 +433,7 @@ agent and never stored in any khive store.
 | `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID` | no       | chat id\*    | The numeric Telegram account (`message.from.id`) authorized to send inbound messages. Positive integer. \*Defaults to `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` only when that id is positive (a private chat); required explicitly otherwise. |
 | `KHIVE_TELEGRAM_MAINTAINER_SLUG`      | no       | `maintainer` | The slug in `telegram:<slug>` that maps to the maintainer chat id.                                                                                                                                                                       |
 | `KHIVE_TELEGRAM_INGEST_NAMESPACE`     | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                                                                                                                                                 |
+| `KHIVE_TELEGRAM_DEFAULT_ACTOR`        | no       | `local`      | Actor that receives uncorrelated inbound messages (passed as `default_inbound_actor` to `comm.ingest`).                                                                                                                                  |
 
 When any required variable is absent, `TelegramChannelConfig::from_env()` returns
 `ChannelError::Config`; the server logs a warning and skips the Telegram adapter
