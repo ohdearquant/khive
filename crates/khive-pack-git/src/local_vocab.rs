@@ -21,6 +21,27 @@ pub(crate) const SESSION: ParamDef = param(
     "Optional session label copied to the durable receipt.",
 );
 pub(crate) const EXPECTED: ParamDef = param("expected", false, "Optional 40-hex SHA that from must resolve to. Null is refused. The new branch must not exist regardless of this parameter.");
+pub(crate) const UPDATE_REF: HandlerDef = HandlerDef {
+    name: "git.update_ref",
+    description: "Move an existing branch to an existing commit with an exact expected-head compare. Fast-forward moves are required by default; symbolic refs and stale expected heads refuse. Returns the previous and new commit ids, fast_forward, and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        REPO,
+        param("branch", true, "Existing branch to move; the configured git-write branch allowlist applies."),
+        param("to", true, "Full 40-hex object id of an existing commit. Refs, tags, trees, unknown ids and the zero object id refuse."),
+        param("expected", true, "Required exact 40-hex current branch head. Omission and null refuse."),
+        ParamDef {
+            name: "require_fast_forward",
+            param_type: "boolean",
+            required: false,
+            description: "Require the current head to be an ancestor of to; defaults to true.",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        },
+        param("reason", false, "Optional operator note stored with the receipt."),
+        SESSION,
+    ],
+};
 const REPO: ParamDef = param(
     "repo",
     true,

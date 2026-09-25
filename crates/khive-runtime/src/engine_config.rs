@@ -463,7 +463,7 @@ pub struct BrainSectionConfig {
 
 /// One `[[git_write.allowed]]` entry: a repo this operator has declared
 /// trusted for khive-mediated git writes, plus the branches on it a write
-/// verb (`git.commit`/`git.branch`/`git.push`) may target.
+/// verb (`git.commit`/`git.branch`/`git.update_ref`/`git.push`) may target.
 ///
 /// ```toml
 /// [[git_write.allowed]]

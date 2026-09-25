@@ -2302,6 +2302,7 @@ impl VerbRegistry {
         ("session", "session.list"),
         ("session", "session.resume"),
         ("session", "session.export"),
+        ("session", "session.search"),
         // tool (registry, grant and policy reads; tool.suggest runs the same
         // hybrid search as the kg search and context verbs above)
         ("tool", "tool.suggest"),
@@ -16045,12 +16046,14 @@ mod help_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("read_only_schema_collision.db");
         {
-            let writable = khive_db::StorageBackend::sqlite(&path).expect("writable backend");
+            let writable =
+                khive_db::StorageBackend::sqlite_for_test(&path).expect("writable backend");
             writable.prepare_core_schema().expect("current schema");
         }
         #[cfg(unix)]
         khive_storage::test_support::freeze_snapshot_sidecars(&path);
-        let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
+        let backend =
+            khive_db::StorageBackend::sqlite_read_only_for_test(&path).expect("read-only backend");
         let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
 
         let mut builder = VerbRegistryBuilder::new();
@@ -16189,13 +16192,13 @@ mod help_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_column_schema.db");
         {
-            let writable = khive_db::StorageBackend::sqlite(&path).unwrap();
+            let writable = khive_db::StorageBackend::sqlite_for_test(&path).unwrap();
             writable.prepare_core_schema().unwrap();
             seed_column_schema(&writable);
         }
         #[cfg(unix)]
         khive_storage::test_support::freeze_snapshot_sidecars(&path);
-        let backend = khive_db::StorageBackend::sqlite_read_only(&path).unwrap();
+        let backend = khive_db::StorageBackend::sqlite_read_only_for_test(&path).unwrap();
         let registry = column_schema_registry();
         let writes_before = backend.pool().writer_acquisition_snapshot();
 

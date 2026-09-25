@@ -594,7 +594,7 @@ turns the both-absent arm red without touching any other arm.
 
 ## Amendment 11 (2026-09-11): moving a ref to a commit that already exists
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-25, implemented by `git.update_ref`).
 
 ### The gap
 

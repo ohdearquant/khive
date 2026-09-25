@@ -9,11 +9,10 @@ pub(crate) const VALID_EXPORT_FORMATS: &[&str] = &["json", "markdown"];
 
 /// Pack-auxiliary schema for the session mirror tables.
 ///
-/// Three tables + three indexes, all idempotent (`CREATE TABLE/INDEX IF NOT EXISTS`).
-/// Applied at boot via the `schema_plan` hook and lazily in tests via `execute_script`.
-pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
+/// Scoped mirror tables, identity constraints, and FTS5 index.
+pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 10] = [
     "CREATE TABLE IF NOT EXISTS sessions (\
-        id                  TEXT PRIMARY KEY,\
+        id                  TEXT NOT NULL,\
         provider_session_id TEXT NOT NULL,\
         source              TEXT NOT NULL DEFAULT 'claude_code',\
         cwd                 TEXT,\
@@ -22,11 +21,13 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
         message_count       INTEGER NOT NULL DEFAULT 0,\
         first_seen_at       INTEGER NOT NULL,\
         last_seen_at        INTEGER NOT NULL,\
-        namespace           TEXT\
+        namespace           TEXT NOT NULL,\
+        UNIQUE (namespace, source, provider_session_id)\
     )",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(namespace, last_seen_at DESC)",
     "CREATE TABLE IF NOT EXISTS session_messages (\
-        id              TEXT PRIMARY KEY,\
+        mirror_rowid    INTEGER PRIMARY KEY,\
+        id              TEXT NOT NULL,\
         session_id      TEXT NOT NULL,\
         seq             INTEGER NOT NULL,\
         parent_uuid     TEXT,\
@@ -36,10 +37,26 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
         text            TEXT,\
         raw             TEXT NOT NULL,\
         created_at      INTEGER NOT NULL,\
-        namespace       TEXT\
+        namespace       TEXT NOT NULL,\
+        source          TEXT NOT NULL,\
+        content_hash    TEXT NOT NULL,\
+        UNIQUE (namespace, source, session_id, id)\
     )",
-    "CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id, seq)",
-    "CREATE INDEX IF NOT EXISTS idx_session_messages_parent  ON session_messages(parent_uuid)",
+    "CREATE INDEX IF NOT EXISTS idx_session_messages_session \
+      ON session_messages(namespace, source, session_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_session_messages_parent \
+      ON session_messages(namespace, source, parent_uuid)",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts \
+      USING fts5(text, content='session_messages', content_rowid='mirror_rowid')",
+    "CREATE TRIGGER IF NOT EXISTS session_messages_fts_ai AFTER INSERT ON session_messages BEGIN \
+       INSERT INTO session_messages_fts(rowid, text) VALUES(new.mirror_rowid, new.text); END",
+    "CREATE TRIGGER IF NOT EXISTS session_messages_fts_ad AFTER DELETE ON session_messages BEGIN \
+       INSERT INTO session_messages_fts(session_messages_fts, rowid, text) \
+       VALUES('delete', old.mirror_rowid, old.text); END",
+    "CREATE TRIGGER IF NOT EXISTS session_messages_fts_au AFTER UPDATE OF text ON session_messages BEGIN \
+       INSERT INTO session_messages_fts(session_messages_fts, rowid, text) \
+       VALUES('delete', old.mirror_rowid, old.text); \
+       INSERT INTO session_messages_fts(rowid, text) VALUES(new.mirror_rowid, new.text); END",
     "CREATE TABLE IF NOT EXISTS session_mirror_cursor (\
         file_path   TEXT PRIMARY KEY,\
         session_id  TEXT,\
@@ -49,9 +66,9 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
 ];
 
 /// Speech-act categories follow ADR-025: `session.store` is a Directive
-/// (requests storage of content); `session.list`, `session.resume`, and
-/// `session.export` are Assertive (retrieve state).
-pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
+/// (requests storage of content); `session.list`, `session.resume`,
+/// `session.export`, and `session.search` are Assertive (retrieve state).
+pub(crate) static SESSION_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "session.store",
         description: "Persist an agent-session record as a session note",
@@ -169,6 +186,51 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: false,
                 description: "json | markdown; default json.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "session.search",
+        description:
+            "Search mirrored transcript text and return matching sessions within the caller's resolved tenant scope.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "Words to match in mirrored message text.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum sessions from 1 to 200; default 20.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "since",
+                param_type: "string",
+                required: false,
+                description: "Inclusive RFC 3339 lower bound on message creation time.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: false,
+                description:
+                    "Exact mirror source; unknown selects migration orphans only when explicit.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "cwd",
+                param_type: "string",
+                required: false,
+                description: "Exact session working-directory filter.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
