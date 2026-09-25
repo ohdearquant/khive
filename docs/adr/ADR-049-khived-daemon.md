@@ -109,6 +109,7 @@ Warm becomes **non-blocking**, benefiting both modes:
   exact collapse the amendment forbids. On SIGTERM/SIGINT, stop accepting, drain
   in-flight requests (`KHIVE_DRAIN_TIMEOUT_SECS`, default 10), remove socket +
   PID, exit.
+  When first-signal shutdown starts, this process-lifetime daemon restores the default SIGTERM and SIGINT dispositions, so a second signal during drain or cleanup terminates with that signal's status and abandons unfinished drain and cleanup.
 
 ### Scope boundary (what this ADR deliberately excludes)
 

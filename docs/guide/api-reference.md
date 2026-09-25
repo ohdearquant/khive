@@ -297,11 +297,19 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                                                                                     |
-| ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
-| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix.                    |
-| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
+When an entity id was consumed by a merge, default `get` follows `merged_into` to the
+first live kept entity. Its response adds `redirected_from`, an ordered array of the
+merged ids traversed; a live id has no such field. `include_deleted=true` takes
+precedence and returns the requested tombstone with its `merged_into` pointer.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long` respectively. The kept id is checked by the Gate before
+its entity is returned.
+
+| Param             | Type | Required | Notes                                                                                                                                                   |
+| ----------------- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                                            |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge without chasing a merge redirect (default false); accepts a full UUID or unique 8+ hex prefix. |
+| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records.               |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -979,6 +987,12 @@ actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.
 (4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+A resolved id consumed by an entity merge follows the transitive `merged_into`
+chain. Its result contains the live kept `id` and `redirected_from: [old_id, ...]`;
+an unredirected result has no marker. `resolve` has no `include_deleted` option.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long`. The kept id is checked by the Gate before return.
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
@@ -1919,8 +1933,10 @@ request(ops="comm.unread()")
 
 ### `comm.read` — Declaration
 
-Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
-content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
+Fetch and mark one or more inbound messages. Successful results return `subject`, `content`,
+`from`, `to`, `direction`, and `created_at` alongside the existing acknowledgement fields.
+Pass `body=false` for the prior acknowledgement-only shape. Failed or indeterminate marks do
+not add message fields. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
 remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
 `mark_error`. A write whose execution seam terminated after being accepted (so it may already
@@ -1929,14 +1945,16 @@ message's current state through `comm.inbox` before re-issuing; re-issuing is sa
 a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
 re-issue failures (or unresolved unknowns) later.
 
-| Param | Type            | Required    | Notes                                                                   |
-| ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
-| `id`  | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
-| `ids` | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
+| Param  | Type            | Required    | Notes                                                                   |
+| ------ | --------------- | ----------- | ----------------------------------------------------------------------- |
+| `id`   | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
+| `ids`  | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
+| `body` | bool            | no          | Defaults to true; false omits top-level message fields.                 |
 
 ```
 request(ops="comm.read(id=\"<message-id>\")")
 request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
+request(ops="comm.read(id=\"<message-id>\", body=false)")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
@@ -1949,7 +1967,8 @@ item's `read` and optional `mark_error`.
 ### `comm.mark_read` — Declaration
 
 Canonical named bulk mark-read. It accepts the same inbound targets and returns the same bulk
-summary shape as `comm.read(ids=[...])`, while adding an all-or-nothing mutation mode.
+summary and acknowledgement fields as `comm.read(ids=[...])`, while adding an all-or-nothing
+mutation mode. It does not add message fields.
 
 | Param    | Type            | Required | Notes                                                                                            |
 | -------- | --------------- | -------- | ------------------------------------------------------------------------------------------------ |

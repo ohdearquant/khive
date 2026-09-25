@@ -773,10 +773,18 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
         f"removed_id mismatch: expected {gone['id']}, got {summary['removed_id']}"
     )
 
-    # ---- from_id is gone (RPC-level not-found) ----
-    err_gone = _expect_rpc_error(proc, "get", {"id": gone["id"]})
-    assert ("not found" in err_gone.lower()), (
-        f"Merged-away entity should not be gettable: {err_gone!r}"
+    # ---- from_id reads through the merge redirect to kept_id ----
+    redirected = _tool(proc, "get", {"id": gone["id"]})
+    assert redirected["id"] == kept["id"], (
+        f"get on a merged-away id should return kept_id={kept['id']}, got {redirected['id']}"
+    )
+    assert redirected.get("redirected_from") == [gone["id"]], (
+        f"redirect marker should name the merged-away id: {redirected.get('redirected_from')!r}"
+    )
+    # include_deleted returns the tombstone itself, with its merged_into pointer
+    tombstone = _tool(proc, "get", {"id": gone["id"], "include_deleted": True})
+    assert tombstone["id"] == gone["id"] and tombstone.get("merged_into") == kept["id"], (
+        f"include_deleted should return the merged tombstone: {tombstone!r}"
     )
 
     # ---- Inbound edge now points to kept_id (rewired) ----

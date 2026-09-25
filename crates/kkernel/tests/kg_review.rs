@@ -89,7 +89,9 @@ fn write_case(dir: &Path, family: &str, ops: &[String]) -> (PathBuf, PathBuf) {
 }
 
 fn run_review(changeset: &Path, rules: &Path, reviewer_model_family: Option<&str>) -> Output {
+    let home = TempDir::new().expect("private child HOME");
     let mut command = Command::new(kkernel_bin());
+    command.env("HOME", home.path());
     command.args([
         "kg",
         "review",
@@ -102,7 +104,13 @@ fn run_review(changeset: &Path, rules: &Path, reviewer_model_family: Option<&str
     if let Some(family) = reviewer_model_family {
         command.args(["--reviewer-model-family", family]);
     }
-    command.output().expect("run kkernel kg review")
+    let output = command.output().expect("run kkernel kg review");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("warning: failed to load"),
+        "private child HOME must not load an invoking-user dotenv file: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn parse_stdout(output: &Output) -> serde_json::Value {

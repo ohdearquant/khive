@@ -911,3 +911,37 @@ particular grammar, is what this ADR guarantees.
 
 Missed-occurrence advancement for the new forms is specified in
 [ADR-106 Amendment G](ADR-106-schedule-pack-executor.md#amendment-g-interval-and-cron-recurrence-2026-09-21).
+
+## Amendment (2026-09-24): `comm.read` returns the message on a successful mark
+
+This amendment addresses #1797 and supersedes the older `comm.read` descriptions
+above that call it acknowledgement-only. The existing mark operation, including
+single and 1–500 ID forms, complete prevalidation, duplicate resolution, guarded
+patch, per-item best-effort degradation, and aggregate counts, is unchanged.
+
+`comm.read(id=...)` and `comm.read(ids=[...])` accept an optional boolean `body`
+that defaults to true. When the mark for a validated inbound message succeeds,
+its result retains every existing acknowledgement field and adds the message's
+top-level `subject`, `content`, `from`, `to`, `direction`, and `created_at` fields.
+These use the same value conventions as `comm.inbox`; a missing subject is JSON
+null. Each successful unique bulk result receives its own fields, in the same
+order as its existing result row. The body comes from the note fetched during
+prevalidation; the guarded mark must succeed before those fields are exposed.
+Because the body is that prevalidation snapshot, a concurrent edit can leave the
+returned content older than the message at the moment of the mark.
+
+`body=false` retains the prior single or bulk response shape while still
+attempting the mark. In particular it adds no top-level message fields; the
+existing `properties` field is not altered. A failed or indeterminate mark adds
+no top-level message fields regardless of `body`, and a validation or permission
+failure remains an error without a message result. This does not change
+`comm.mark_read`, which remains acknowledgement-only in both best-effort and
+atomic modes. `comm.inbox` and `comm.thread` retain their current payload and
+projection behavior; changing their defaults is outside this amendment.
+
+Acceptance requires a default single read with subject/body and routing, a
+successful bulk read with distinct bodies and a duplicate ID, the `body=false`
+single and bulk opt-outs, an actor refusal with no content, degraded mark rows
+with no new message fields, and an unchanged `comm.mark_read` response. A
+mutation that drops the body, ignores the opt-out, or leaks fields on failure
+must make a targeted control fail.

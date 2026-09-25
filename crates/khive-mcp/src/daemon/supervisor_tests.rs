@@ -59,6 +59,10 @@ fn assert_starting(result: Option<Result<String, McpError>>, job: &str) {
 #[test]
 #[serial]
 fn supervisor_marker_parses_interval_and_bounds_legacy_or_invalid_values() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -88,6 +92,10 @@ fn supervisor_marker_parses_interval_and_bounds_legacy_or_invalid_values() {
 #[tokio::test]
 #[serial]
 async fn no_marker_reaches_the_bootstrap_spawn_attempt() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -112,6 +120,10 @@ async fn no_marker_reaches_the_bootstrap_spawn_attempt() {
 #[tokio::test]
 #[serial]
 async fn client_holds_launcher_marker_lock_through_spawn_admission() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -187,18 +199,30 @@ async fn assert_marker_eventually_bootstraps(pid: u32) {
 #[tokio::test]
 #[serial]
 async fn dead_supervisor_marker_waits_three_intervals_then_bootstraps() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     assert_marker_eventually_bootstraps(reaped_pid()).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn live_or_reused_supervisor_pid_cannot_suppress_bootstrap_forever() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     assert_marker_eventually_bootstraps(std::process::id()).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn supervisor_caller_deadline_returns_retryable_starting_without_recovery() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     for pid in [reaped_pid(), std::process::id()] {
         let dir = tempfile::tempdir().unwrap();
@@ -221,6 +245,10 @@ async fn supervisor_caller_deadline_returns_retryable_starting_without_recovery(
 #[tokio::test]
 #[serial]
 async fn supervisor_caller_cancellation_prevents_recovery() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -248,6 +276,10 @@ async fn supervisor_caller_cancellation_prevents_recovery() {
 #[tokio::test]
 #[serial]
 async fn disappearing_supervisor_marker_resumes_unmanaged_bootstrap() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -279,6 +311,10 @@ async fn disappearing_supervisor_marker_resumes_unmanaged_bootstrap() {
 #[tokio::test]
 #[serial]
 async fn supervisor_respawn_gap_and_serving_incumbent_forward_without_spawning() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     for (pid, bind_delay) in [
         (reaped_pid(), Duration::from_millis(150)),
@@ -332,6 +368,10 @@ async fn supervisor_respawn_gap_and_serving_incumbent_forward_without_spawning()
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn legacy_two_line_dead_pid_marker_waits_default_three_intervals() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -359,6 +399,10 @@ async fn legacy_two_line_dead_pid_marker_waits_default_three_intervals() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn unreadable_supervisor_marker_has_a_finite_default_budget() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -388,6 +432,10 @@ async fn unreadable_supervisor_marker_has_a_finite_default_budget() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn supervisor_budget_is_anchored_before_marker_discovery() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -432,6 +480,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SupervisorLogBuffer {
 #[tokio::test]
 #[serial]
 async fn crash_loop_marker_rewrites_cannot_reset_bound_and_log_latest_owner() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -503,6 +555,10 @@ async fn crash_loop_marker_rewrites_cannot_reset_bound_and_log_latest_owner() {
 #[test]
 #[serial]
 fn supervisor_fifo_marker_is_unreadable_without_a_writer() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     use std::os::unix::ffi::OsStrExt;
 
     let _cleanup = RecoveryTestGuard::new();
@@ -521,6 +577,10 @@ fn supervisor_fifo_marker_is_unreadable_without_a_writer() {
 #[test]
 #[serial]
 fn supervisor_symlink_marker_is_unreadable_even_with_a_valid_target() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -613,6 +673,10 @@ fn assert_late_supervisor_waited(
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn supervisor_published_during_unmanaged_retry_owns_caller_deadline() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -647,6 +711,10 @@ async fn supervisor_published_during_unmanaged_retry_owns_caller_deadline() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn supervisor_published_at_recovery_boundary_prevents_bootstrap() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     for recorded_owner in [true, false] {
         let dir = tempfile::tempdir().unwrap();
@@ -683,6 +751,10 @@ async fn supervisor_published_at_recovery_boundary_prevents_bootstrap() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn supervisor_published_after_last_read_before_recovery_admission_prevents_spawn() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());
@@ -724,6 +796,10 @@ async fn supervisor_published_after_last_read_before_recovery_admission_prevents
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn supervisor_republished_after_disappearance_before_admission_prevents_spawn() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+
     let _cleanup = RecoveryTestGuard::new();
     let dir = tempfile::tempdir().unwrap();
     isolate(dir.path());

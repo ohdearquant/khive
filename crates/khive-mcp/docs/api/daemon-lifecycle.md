@@ -100,6 +100,24 @@ An async-only peer separately exercises MCP admission with manually advanced
 Tokio time and an earlier outer deadline. These fixtures make no production
 latency guarantee beyond the finite configured allowance.
 
+## Local reader pools in forwarding clients
+
+A Unix, file-backed MCP client that permits daemon forwarding selects one SQLite
+reader per local store before opening its pools. This includes declared pack
+backends and the direct events sidecar. The default daemon and an explicitly
+daemonless client (`KHIVE_NO_DAEMON=1`) retain the normal CPU-based pool size,
+clamped to one through eight readers. In-memory and non-Unix hosts retain their
+existing sizing. A hosting application's explicit reader count takes precedence
+over the forwarding default; no new CLI or environment setting is introduced.
+
+This is a startup policy based on forwarding eligibility, not a connection probe:
+the client still constructs its local stores and registry. They perform schema
+and pack initialization, serve `save_to`, and remain available for permitted local
+fallback. A client that later loses its daemon continues with the same one-reader
+pools. Reads queue under the existing admission and timeout rules; there is no
+pool rebuild, lazy store construction, or automatic growth. The ordinary daemon
+fallback and refusal rules are unchanged.
+
 ## Recoverer lock — mutual exclusion across concurrent recoverers (#838)
 
 `kill_and_respawn` kills a stale daemon and spawns a fresh one. It implements
