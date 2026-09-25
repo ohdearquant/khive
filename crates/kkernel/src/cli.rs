@@ -307,7 +307,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Kg(k) => kg::run_kg(k).await,
         Command::Repo(r) => repo::run_repo(r).await,
         Command::Db(d) => cmd_db(d).await,
-        Command::Supervisor(command) => crate::supervisor::run(command, &args.log),
+        Command::Supervisor(command) => crate::supervisor::run(command, &args.log).await,
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,

@@ -890,6 +890,62 @@ fn read_supervisor_marker() -> Option<SupervisorMarker> {
     })
 }
 
+fn supervisor_marker_lock_path(marker: &std::path::Path) -> std::path::PathBuf {
+    let mut lock_path = marker.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    std::path::PathBuf::from(lock_path)
+}
+
+/// Serialize the client's last ownership decision with launcher publication.
+/// The launcher locks this same permanent `<marker>.lock` inode through publish
+/// and exec. A bounded nonblocking retry keeps a stalled launcher from pinning
+/// a request worker; failure must never authorize a competing spawn.
+async fn acquire_supervisor_marker_lock() -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let marker = daemon::supervisor_marker_path();
+    if let Some(parent) = marker.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(supervisor_marker_lock_path(&marker))?;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(RECOVERER_LOCK_TIMEOUT_MS);
+    let deadline = khive_storage::capture_request_read_context()
+        .deadline()
+        .map(khive_storage::RequestReadDeadline::async_at)
+        .map_or(deadline, |caller| caller.min(deadline));
+    loop {
+        if khive_storage::request_read_is_cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                tokio::time::sleep_until((now + HANDOVER_RETRY_INTERVAL).min(deadline)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+struct SupervisorWaitResult {
+    outcome: ForwardOutcome,
+    /// Only true when the first marker's grace actually expired while a marker
+    /// remained. Marker disappearance alone cannot authorize degraded bootstrap.
+    degraded_bootstrap: bool,
+}
+
 /// Wait under the first observed restart interval, anchored to request entry.
 /// Rewrites (including a fresh PID or interval) update diagnostics, not the
 /// bound. A socket response, marker removal, or caller termination wins early.
@@ -898,7 +954,7 @@ async fn wait_for_supervisor(
     replay: &mut ReadReplayBudget,
     request_started: tokio::time::Instant,
     initial_marker: SupervisorMarker,
-) -> Result<ForwardOutcome, McpError> {
+) -> Result<SupervisorWaitResult, McpError> {
     #[cfg(test)]
     supervisor_discovery_hook(SupervisorDiscoveryPoint::SupervisorWait);
     let supervisor_deadline = initial_marker.wait_deadline(request_started);
@@ -909,7 +965,10 @@ async fn wait_for_supervisor(
         caller_deadline.map_or(supervisor_deadline, |d| d.min(supervisor_deadline));
     loop {
         let Some(marker) = read_supervisor_marker() else {
-            return Ok(ForwardOutcome::NoSocket);
+            return Ok(SupervisorWaitResult {
+                outcome: ForwardOutcome::NoSocket,
+                degraded_bootstrap: false,
+            });
         };
         let now = tokio::time::Instant::now();
         if khive_storage::request_read_is_cancelled()
@@ -927,7 +986,10 @@ async fn wait_for_supervisor(
                 time_waited_secs = request_started.elapsed().as_secs_f64(),
                 "supervisor present, daemon absent; proceeding with guarded client bootstrap"
             );
-            return Ok(ForwardOutcome::NoSocket);
+            return Ok(SupervisorWaitResult {
+                outcome: ForwardOutcome::NoSocket,
+                degraded_bootstrap: true,
+            });
         }
         sleep_until_retry(retry_deadline).await;
         if tokio::time::Instant::now() >= retry_deadline
@@ -937,7 +999,10 @@ async fn wait_for_supervisor(
         }
         let outcome = try_forward_with_read_replay(frame, replay, Some(retry_deadline)).await;
         if !matches!(outcome, ForwardOutcome::NoSocket) {
-            return Ok(outcome);
+            return Ok(SupervisorWaitResult {
+                outcome,
+                degraded_bootstrap: false,
+            });
         }
     }
 }
@@ -1593,6 +1658,174 @@ enum ProbeOutcome {
     /// outcome either: an unconfirmed peer boot is exactly the ambiguity
     /// `confirm_genuinely_dead` exists to resolve safely.
     LockContended,
+}
+
+/// The kernel identity of a socket holder that returned a decoded khived
+/// identity response. A mismatching configuration or protocol still names a
+/// daemon for the supervisor's handover; unlike client recovery, the launcher
+/// must not require this incumbent to match its own configuration.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct SupervisorDaemonPeer {
+    pub pid: Option<u32>,
+    pub uid: Option<u32>,
+    pub protocol_version: u32,
+    pub served_config_id: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum SupervisorSocketProbe {
+    Absent,
+    Daemon(SupervisorDaemonPeer),
+    Unidentified {
+        pid: Option<u32>,
+        uid: Option<u32>,
+        reason: &'static str,
+    },
+}
+
+/// Probe the launcher rendezvous without trusting a PID file or demanding an
+/// identity match. Only a decoded daemon frame that explicitly reports its
+/// protocol and served configuration authorizes a later peer-PID handover.
+/// Connect, write, and read share one timeout; an accepting silent/foreign
+/// socket is never classified as absent.
+#[cfg(unix)]
+pub async fn probe_supervisor_socket(timeout: std::time::Duration) -> SupervisorSocketProbe {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stream =
+        match tokio::time::timeout_at(deadline, UnixStream::connect(socket_path())).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return SupervisorSocketProbe::Absent;
+            }
+            Err(_) => {
+                return SupervisorSocketProbe::Unidentified {
+                    pid: None,
+                    uid: None,
+                    reason: "socket connection timed out",
+                };
+            }
+            Ok(Err(_)) => {
+                return SupervisorSocketProbe::Unidentified {
+                    pid: None,
+                    uid: None,
+                    reason: "socket connection failed",
+                };
+            }
+        };
+    let credentials = stream.peer_cred().ok();
+    let pid = credentials
+        .as_ref()
+        .and_then(|credentials| credentials.pid())
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0);
+    let uid = credentials.as_ref().map(|credentials| credentials.uid());
+    let probe = DaemonRequestFrame {
+        probe_only: true,
+        protocol_version: PROTOCOL_VERSION,
+        // A mismatch is expected and useful: the answer still reports the
+        // incumbent's real served configuration, without dispatching a verb.
+        config_id: String::new(),
+        ..Default::default()
+    };
+    let Ok(payload) = serde_json::to_vec(&probe) else {
+        return SupervisorSocketProbe::Unidentified {
+            pid,
+            uid,
+            reason: "identity probe could not be encoded",
+        };
+    };
+    if !matches!(
+        tokio::time::timeout_at(deadline, write_frame(&mut stream, &payload)).await,
+        Ok(Ok(()))
+    ) {
+        return SupervisorSocketProbe::Unidentified {
+            pid,
+            uid,
+            reason: "identity probe write failed",
+        };
+    }
+    let raw = match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
+        Ok(Ok(raw)) => raw,
+        _ => {
+            return SupervisorSocketProbe::Unidentified {
+                pid,
+                uid,
+                reason: "identity probe received no daemon response",
+            };
+        }
+    };
+    let decoded: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            return SupervisorSocketProbe::Unidentified {
+                pid,
+                uid,
+                reason: "identity probe response did not decode",
+            };
+        }
+    };
+    let reported_protocol = decoded
+        .get("daemon_protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
+    let reported_config = decoded
+        .get("served_config_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let frame = serde_json::from_value::<DaemonResponseFrame>(decoded);
+    match (frame, reported_protocol, reported_config) {
+        (Ok(_frame), Some(protocol_version), Some(served_config_id)) => {
+            SupervisorSocketProbe::Daemon(SupervisorDaemonPeer {
+                pid,
+                uid,
+                protocol_version,
+                served_config_id,
+            })
+        }
+        _ => SupervisorSocketProbe::Unidentified {
+            pid,
+            uid,
+            reason: "identity probe response omitted daemon identity",
+        },
+    }
+}
+
+/// Signal only the positive peer PID captured from a decoded daemon probe.
+/// ESRCH means the holder left after the probe and needs no signal.
+#[cfg(unix)]
+pub fn supervisor_sigterm(pid: u32) -> std::io::Result<()> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `pid` is positive and came from kernel peer credentials.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+pub fn supervisor_pid_is_alive(pid: u32) -> bool {
+    process_is_alive(pid)
+}
+
+#[cfg(unix)]
+pub fn supervisor_effective_uid() -> u32 {
+    // SAFETY: `geteuid` reads the process's kernel credential.
+    unsafe { libc::geteuid() }
 }
 
 /// Send a `probe_only` frame to the daemon and return whether a live,
@@ -2798,6 +3031,7 @@ where
 enum SupervisorDiscoveryPoint {
     UnmanagedRetry,
     BeforeRecovery,
+    RecoveryAdmission,
     SupervisorWait,
 }
 
@@ -2840,14 +3074,18 @@ where
         replay_read_only && crate::request_policy::read_replay_safe(&frame.ops),
     );
     let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
-    let mut supervisor_waited = false;
+    let mut initial_supervisor_marker: Option<SupervisorMarker> = None;
+    let mut degraded_bootstrap = false;
     if matches!(first, ForwardOutcome::NoSocket) {
         if let Some(marker) = read_supervisor_marker() {
-            supervisor_waited = true;
-            first = match wait_for_supervisor(frame, &mut replay, request_started, marker).await {
-                Ok(outcome) => outcome,
-                Err(error) => return Some(Err(error)),
-            };
+            let budget = initial_supervisor_marker.get_or_insert(marker).clone();
+            let waited =
+                match wait_for_supervisor(frame, &mut replay, request_started, budget).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => return Some(Err(error)),
+                };
+            degraded_bootstrap |= waited.degraded_bootstrap;
+            first = waited.outcome;
         } else if recorded_daemon_is_alive() {
             // Unmanaged daemon handover retains its existing reconnect grace.
             let deadline = bounded_retry_deadline();
@@ -2859,13 +3097,20 @@ where
                 #[cfg(test)]
                 supervisor_discovery_hook(SupervisorDiscoveryPoint::UnmanagedRetry);
                 if let Some(marker) = read_supervisor_marker() {
-                    supervisor_waited = true;
-                    first = match wait_for_supervisor(frame, &mut replay, request_started, marker)
-                        .await
+                    let budget = initial_supervisor_marker.get_or_insert(marker).clone();
+                    let waited = match wait_for_supervisor(
+                        frame,
+                        &mut replay,
+                        request_started,
+                        budget,
+                    )
+                    .await
                     {
                         Ok(outcome) => outcome,
                         Err(error) => return Some(Err(error)),
                     };
+                    degraded_bootstrap |= waited.degraded_bootstrap;
+                    first = waited.outcome;
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline
@@ -2879,71 +3124,130 @@ where
     }
     // A claim may arrive at the end of unmanaged grace or without a PID file.
     // Never restart a supervisor budget already consumed by this request.
-    if matches!(first, ForwardOutcome::NoSocket) && !supervisor_waited {
+    if matches!(first, ForwardOutcome::NoSocket) && !degraded_bootstrap {
         #[cfg(test)]
         supervisor_discovery_hook(SupervisorDiscoveryPoint::BeforeRecovery);
         if let Some(marker) = read_supervisor_marker() {
-            first = match wait_for_supervisor(frame, &mut replay, request_started, marker).await {
-                Ok(outcome) => outcome,
-                Err(error) => return Some(Err(error)),
-            };
+            let budget = initial_supervisor_marker.get_or_insert(marker).clone();
+            let waited =
+                match wait_for_supervisor(frame, &mut replay, request_started, budget).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => return Some(Err(error)),
+                };
+            degraded_bootstrap |= waited.degraded_bootstrap;
+            first = waited.outcome;
         }
     }
-    if matches!(first, ForwardOutcome::NoSocket)
-        && (khive_storage::request_read_is_cancelled()
-            || khive_storage::capture_request_read_context()
-                .deadline()
-                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at()))
-    {
-        return Some(Err(daemon_mcp_error(
-            "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
-            Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
-        )));
-    }
-    match first {
-        ForwardOutcome::Response(resp) => {
-            return map_response(*resp, &frame.config_id, &frame.namespace)
-        }
-        ForwardOutcome::NoSocket => {
-            // No marker, or its bounded startup grace expired: nothing was
-            // written, so use the existing guarded spawn/recovery path.
-        }
-        ForwardOutcome::Unreachable {
-            kind,
-            os_error_code,
-        } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
-        ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
-            let config_id = opaque_config_id(&frame.config_id);
-            tracing::warn!(
-                config_id = %config_id,
-                namespace = %frame.namespace,
-                retry_suppressed = true,
-                "daemon connection lost after the request was fully written — \
-                 not retrying or falling back locally to avoid duplicate dispatch"
-            );
-            return Some(Err(ambiguous_forward_error()));
-        }
-        ForwardOutcome::ProtocolMismatch {
-            daemon_protocol_version,
-        } => {
-            let config_id = opaque_config_id(&frame.config_id);
-            tracing::warn!(
-                config_id = %config_id,
-                namespace = %frame.namespace,
-                retry_suppressed = true,
-                "daemon protocol mismatch discovered after the request was fully \
-                 written — not retrying or falling back locally to avoid duplicate dispatch"
-            );
-            // #714: the daemon is fine (it just rejected us) — this bridge
-            // process itself is the stale one. Trigger self-heal alongside
-            // the hard error below, never in place of it.
-            trigger_bridge_self_heal();
-            return Some(Err(protocol_mismatch_error(
-                protocol_mismatch_message(daemon_protocol_version),
-                None,
+    let marker_guard = loop {
+        if matches!(first, ForwardOutcome::NoSocket)
+            && (khive_storage::request_read_is_cancelled()
+                || khive_storage::capture_request_read_context()
+                    .deadline()
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at()))
+        {
+            return Some(Err(daemon_mcp_error(
+                "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
+                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
             )));
         }
-    }
+        match first {
+            ForwardOutcome::Response(resp) => {
+                return map_response(*resp, &frame.config_id, &frame.namespace)
+            }
+            ForwardOutcome::NoSocket => {
+                // No claim yet, or its bounded startup grace expired.
+            }
+            ForwardOutcome::Unreachable {
+                kind,
+                os_error_code,
+            } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
+            ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
+                let config_id = opaque_config_id(&frame.config_id);
+                tracing::warn!(
+                    config_id = %config_id,
+                    namespace = %frame.namespace,
+                    retry_suppressed = true,
+                    "daemon connection lost after the request was fully written — \
+                     not retrying or falling back locally to avoid duplicate dispatch"
+                );
+                return Some(Err(ambiguous_forward_error()));
+            }
+            ForwardOutcome::ProtocolMismatch {
+                daemon_protocol_version,
+            } => {
+                let config_id = opaque_config_id(&frame.config_id);
+                tracing::warn!(
+                    config_id = %config_id,
+                    namespace = %frame.namespace,
+                    retry_suppressed = true,
+                    "daemon protocol mismatch discovered after the request was fully \
+                     written — not retrying or falling back locally to avoid duplicate dispatch"
+                );
+                // #714: the daemon is fine (it just rejected us) — this bridge
+                // process itself is the stale one. Trigger self-heal alongside
+                // the hard error below, never in place of it.
+                trigger_bridge_self_heal();
+                return Some(Err(protocol_mismatch_error(
+                    protocol_mismatch_message(daemon_protocol_version),
+                    None,
+                )));
+            }
+        }
+
+        // This is after the last unlocked marker read and inside recovery
+        // admission. A launcher that publishes first holds the same lock.
+        #[cfg(test)]
+        supervisor_discovery_hook(SupervisorDiscoveryPoint::RecoveryAdmission);
+        let guard = match acquire_supervisor_marker_lock().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                if khive_storage::request_read_is_cancelled()
+                    || khive_storage::capture_request_read_context()
+                        .deadline()
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at())
+                {
+                    return Some(Err(daemon_mcp_error(
+                        "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
+                        Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+                    )));
+                }
+                tracing::warn!(error = %error, "supervisor marker lock unavailable; suppressing lifecycle recovery");
+                return Some(Err(daemon_mcp_error(
+                    "supervisor marker ownership could not be established; retry the request",
+                    Some(serde_json::json!({"reason": "supervisor_marker_lock_unavailable"})),
+                )));
+            }
+        };
+        if khive_storage::request_read_is_cancelled()
+            || khive_storage::capture_request_read_context()
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at())
+        {
+            return Some(Err(daemon_mcp_error(
+                "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
+                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+            )));
+        }
+        if let Some(marker) = read_supervisor_marker() {
+            if !degraded_bootstrap {
+                drop(guard);
+                let budget = initial_supervisor_marker.get_or_insert(marker).clone();
+                let waited =
+                    match wait_for_supervisor(frame, &mut replay, request_started, budget).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => return Some(Err(error)),
+                    };
+                degraded_bootstrap |= waited.degraded_bootstrap;
+                first = waited.outcome;
+                continue;
+            }
+        }
+        // The first supervisor's bounded grace has elapsed, or the locked
+        // read found no declaration. Rewrites never restart that first bound.
+        // Keep the lock through this client's spawn and readiness wait, never
+        // through a supervisor wait (whose launcher must reacquire it).
+        break guard;
+    };
 
     // NoSocket: nothing has been written yet. Establish a live daemon — either
     // this is the first-ever spawn or a stale one needs replacing — under the
@@ -2957,7 +3261,12 @@ where
     // attempt already exited — never polled eagerly, never used to cut the
     // connect-retry window or the #667 boot-quiescence wait short.
     let mut spawned_child: Option<std::process::Child> = None;
-    match kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await {
+    // Only a client that actually spawns keeps the marker lock through its
+    // ADR-049 readiness wait. A skipped/uncertain recovery did not acquire a
+    // child to protect and must let a waiting launcher publish immediately.
+    let mut marker_guard = Some(marker_guard);
+    let recovery = kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await;
+    match recovery {
         Err(RecoveryError::Spawn(e)) => {
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
@@ -2971,6 +3280,7 @@ where
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
+            drop(marker_guard.take());
         }
         Ok(RecoveryOutcome::Spawned(child)) => {
             // Give the kernel a moment to release the socket path and let the
@@ -2979,6 +3289,7 @@ where
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(RecoveryOutcome::Uncertain) => {
+            drop(marker_guard.take());
             // Could not positively confirm the daemon's state within the
             // deadline (#838) — behave like `Skipped` (never
             // kill on an unconfirmed state) and let the forward loop below
@@ -3032,6 +3343,20 @@ where
                     );
                 }
                 BootFenceOutcome::HardError(err) => return Some(Err(err)),
+            }
+        }
+        if spawned_child.is_some() && marker_guard.is_some() {
+            // The launcher may be waiting for this marker lock. Release it as
+            // soon as our daemon answers an identity probe, before the real
+            // request is dispatched (which may run for much longer).
+            if matches!(
+                probe_daemon_identity(&frame.config_id, &frame.namespace, 100).await,
+                ProbeOutcome::Alive
+            ) {
+                drop(marker_guard.take());
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
             }
         }
         match try_forward_with_read_replay(frame, &mut replay, None).await {

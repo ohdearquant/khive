@@ -16,6 +16,24 @@ fn write_marker(path: &std::path::Path, job: &str, pid: u32, interval: Option<u6
     std::fs::rename(temporary, path).expect("publish supervision marker");
 }
 
+fn publish_marker_with_launcher_lock(
+    path: &std::path::Path,
+    job: &str,
+    pid: u32,
+    interval: Option<u64>,
+) {
+    let launcher_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(supervisor_marker_lock_path(path))
+        .unwrap();
+    launcher_lock.lock().unwrap();
+    write_marker(path, job, pid, interval);
+    drop(launcher_lock);
+}
+
 fn reaped_pid() -> u32 {
     let mut child = std::process::Command::new("/bin/sh")
         .args(["-c", "exit 0"])
@@ -76,6 +94,39 @@ async fn no_marker_reaches_the_bootstrap_spawn_attempt() {
     let attempts = AtomicUsize::new(0);
     let spawn = || -> std::io::Result<std::process::Child> {
         attempts.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::ErrorKind::NotFound.into())
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        forward_or_spawn_with(&request("stats()"), &spawn),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.unwrap().unwrap_err().data.unwrap()["reason"],
+        "respawn_failed"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn client_holds_launcher_marker_lock_through_spawn_admission() {
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let attempts = AtomicUsize::new(0);
+    let spawn = || -> std::io::Result<std::process::Child> {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        let competing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(supervisor_marker_lock_path(&marker_path()))
+            .unwrap();
+        assert!(
+            matches!(competing.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "SPAWN_ADMISSION_HOLDS_LAUNCHER_LOCK: launcher cannot publish before spawn decision"
+        );
         Err(std::io::ErrorKind::NotFound.into())
     };
     let result = tokio::time::timeout(
@@ -298,7 +349,8 @@ async fn legacy_two_line_dead_pid_marker_waits_default_three_intervals() {
     .await
     .unwrap()
     .unwrap();
-    assert!(matches!(outcome, ForwardOutcome::NoSocket));
+    assert!(matches!(outcome.outcome, ForwardOutcome::NoSocket));
+    assert!(outcome.degraded_bootstrap);
     assert_eq!(started.elapsed(), Duration::from_secs(30));
     assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
     assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
@@ -327,7 +379,8 @@ async fn unreadable_supervisor_marker_has_a_finite_default_budget() {
     .await
     .unwrap()
     .unwrap();
-    assert!(matches!(outcome, ForwardOutcome::NoSocket));
+    assert!(matches!(outcome.outcome, ForwardOutcome::NoSocket));
+    assert!(outcome.degraded_bootstrap);
     assert_eq!(started.elapsed(), Duration::from_secs(30));
     assert!(marker_path().is_dir());
 }
@@ -349,7 +402,8 @@ async fn supervisor_budget_is_anchored_before_marker_discovery() {
     )
     .await
     .unwrap();
-    assert!(matches!(outcome, ForwardOutcome::NoSocket));
+    assert!(matches!(outcome.outcome, ForwardOutcome::NoSocket));
+    assert!(outcome.degraded_bootstrap);
     assert_eq!(started.elapsed(), Duration::from_secs(3));
 }
 
@@ -512,7 +566,7 @@ impl LateMarkerHookGuard {
             assert!(!path.exists(), "marker must be absent on the initial probe");
             assert!(process_is_alive(pid), "the fixture's old owner must still be alive");
             assert!(!socket_path().exists(), "the socket must remain unbound");
-            write_marker(&path, "late.supervisor", pid, Some(10));
+            publish_marker_with_launcher_lock(&path, "late.supervisor", pid, Some(10));
             *SUPERVISOR_DISCOVERY_HOOK.lock().unwrap() = Some((
                 SupervisorDiscoveryPoint::SupervisorWait,
                 Box::new(move || { *observed.lock().unwrap() = Some(tokio::time::Instant::now()); }),
@@ -523,6 +577,14 @@ impl LateMarkerHookGuard {
 }
 
 impl Drop for LateMarkerHookGuard {
+    fn drop(&mut self) {
+        SUPERVISOR_DISCOVERY_HOOK.lock().unwrap().take();
+    }
+}
+
+struct DiscoveryHookCleanup;
+
+impl Drop for DiscoveryHookCleanup {
     fn drop(&mut self) {
         SUPERVISOR_DISCOVERY_HOOK.lock().unwrap().take();
     }
@@ -616,4 +678,107 @@ async fn supervisor_published_at_recovery_boundary_prevents_bootstrap() {
         assert!(owner.0.try_wait().unwrap().is_none());
         assert_eq!(pid_path().exists(), recorded_owner);
     }
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn supervisor_published_after_last_read_before_recovery_admission_prevents_spawn() {
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let mut owner = LateMarkerOwner::spawn();
+    assert!(owner.0.try_wait().unwrap().is_none());
+    let _hook = LateMarkerHookGuard::publish_at(
+        SupervisorDiscoveryPoint::RecoveryAdmission,
+        marker_path(),
+        owner.id(),
+    );
+    let spawn_calls = AtomicUsize::new(0);
+    let spawn = || -> std::io::Result<std::process::Child> {
+        spawn_calls.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::ErrorKind::NotFound.into())
+    };
+    let frame = request("stats()");
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        khive_storage::scope_request_read_deadline(
+            Duration::from_millis(250),
+            forward_or_spawn_with(&frame, &spawn),
+        ),
+    )
+    .await;
+    assert!(
+        marker_path().exists(),
+        "RECOVERY_ADMISSION_LOCKED_REREAD: launcher publication seam reached"
+    );
+    assert_late_supervisor_waited(result, "RECOVERY_ADMISSION_LOCKED_REREAD");
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        0,
+        "RECOVERY_ADMISSION_LOCKED_REREAD: no unmanaged child admitted"
+    );
+    assert!(!pid_path().exists());
+    assert!(!socket_path().exists());
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn supervisor_republished_after_disappearance_before_admission_prevents_spawn() {
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    let mut owner = LateMarkerOwner::spawn();
+    assert!(owner.0.try_wait().unwrap().is_none());
+    let marker = marker_path();
+    write_marker(&marker, "first.supervisor", owner.id(), Some(10));
+    let republished = marker.clone();
+    let owner_pid = owner.id();
+    let _hook_cleanup = DiscoveryHookCleanup;
+    {
+        let mut hook = SUPERVISOR_DISCOVERY_HOOK.lock().unwrap();
+        assert!(hook.is_none(), "isolated discovery hook");
+        *hook = Some((SupervisorDiscoveryPoint::SupervisorWait, Box::new(move || {
+            std::fs::remove_file(&marker).unwrap();
+            *SUPERVISOR_DISCOVERY_HOOK.lock().unwrap() = Some((
+                SupervisorDiscoveryPoint::RecoveryAdmission,
+                Box::new(move || {
+                    assert!(!republished.exists(), "first declaration was removed");
+                    publish_marker_with_launcher_lock(
+                        &republished,
+                        "second.supervisor",
+                        owner_pid,
+                        Some(10),
+                    );
+                }),
+            ));
+        })));
+    }
+    let spawn_calls = AtomicUsize::new(0);
+    let spawn = || -> std::io::Result<std::process::Child> {
+        spawn_calls.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::ErrorKind::NotFound.into())
+    };
+    let frame = request("stats()");
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        khive_storage::scope_request_read_deadline(
+            Duration::from_millis(250),
+            forward_or_spawn_with(&frame, &spawn),
+        ),
+    )
+    .await
+    .expect("REPUBLISH_LOCKED_REREAD: caller deadline must finish the request")
+    .expect("REPUBLISH_LOCKED_REREAD: no local fallback")
+    .expect_err("REPUBLISH_LOCKED_REREAD: no supervisor socket has been bound");
+    assert_eq!(
+        result.data.as_ref().and_then(|data| data.get("reason")),
+        Some(&serde_json::json!("supervised_daemon_starting"))
+    );
+    assert!(result.message.contains("second.supervisor"));
+    assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
+    assert!(!pid_path().exists());
+    assert!(!socket_path().exists());
+    assert!(marker_path().exists());
 }

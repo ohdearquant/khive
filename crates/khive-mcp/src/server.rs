@@ -1332,6 +1332,7 @@ pub struct KhiveMcpServer {
 /// Failure reason inside a [`PackRegError`].
 pub enum PackRegFailure {
     UnknownPack(String),
+    DuplicatePack(String),
     MissingDependency { pack: String, dep: String },
     NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
@@ -1350,6 +1351,7 @@ impl std::fmt::Debug for PackRegError {
         let mut dbg = f.debug_struct("PackRegError");
         match &self.failure {
             PackRegFailure::UnknownPack(unknown) => dbg.field("unknown", unknown),
+            PackRegFailure::DuplicatePack(pack) => dbg.field("duplicate_pack", pack),
             PackRegFailure::MissingDependency { pack, dep } => {
                 dbg.field("pack", pack).field("missing_dep", dep)
             }
@@ -1370,6 +1372,7 @@ impl std::fmt::Display for PackRegError {
                 unknown,
                 builtin_pack_names().join(", ")
             ),
+            PackRegFailure::DuplicatePack(pack) => write!(f, "duplicate pack {pack:?}"),
             PackRegFailure::MissingDependency { pack, dep } => write!(
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
@@ -1646,6 +1649,7 @@ impl KhiveMcpServer {
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {
                 PackLoadError::UnknownPack(name) => PackRegFailure::UnknownPack(name),
+                PackLoadError::DuplicatePack(name) => PackRegFailure::DuplicatePack(name),
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }

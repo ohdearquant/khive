@@ -35,10 +35,10 @@ pub(crate) struct ReleaseArgs {
 }
 
 #[cfg(unix)]
-pub(crate) fn run(command: SupervisorCommand, log: &str) -> Result<()> {
+pub(crate) async fn run(command: SupervisorCommand, log: &str) -> Result<()> {
     let marker = khive_runtime::daemon::supervisor_marker_path();
     match command {
-        SupervisorCommand::Launch(args) => unix::launch(args, log, &marker),
+        SupervisorCommand::Launch(args) => unix::launch(args, log, &marker).await,
         SupervisorCommand::Release(args) => {
             unix::validate_label(&args.label)?;
             unix::MarkerGuard::acquire(&marker)?.release(&args.label)
@@ -47,7 +47,7 @@ pub(crate) fn run(command: SupervisorCommand, log: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn run(_command: SupervisorCommand, _log: &str) -> Result<()> {
+pub(crate) async fn run(_command: SupervisorCommand, _log: &str) -> Result<()> {
     anyhow::bail!("supervisor launch/release requires Unix (same-process daemon exec)")
 }
 
@@ -58,9 +58,14 @@ mod unix {
     use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use anyhow::{bail, Context, Result};
     use clap::Parser;
+    use khive_mcp::daemon::{
+        probe_supervisor_socket, supervisor_effective_uid, supervisor_pid_is_alive,
+        supervisor_sigterm, SupervisorSocketProbe,
+    };
     use khive_mcp::serve::{
         config_discovery_db_anchor, reject_conflicting_db_override_with_source,
         resolve_runtime_config_with_db_anchor, RuntimeConfigInputs,
@@ -120,7 +125,7 @@ mod unix {
             })
         }
 
-        fn owner(&self) -> Result<Option<String>> {
+        fn read_marker(&self) -> Result<Option<String>> {
             match fs::symlink_metadata(&self.path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error).context("inspect supervisor marker"),
@@ -132,9 +137,15 @@ mod unix {
                 Ok(_) => {}
             }
             let body = fs::read_to_string(&self.path).context("read supervisor marker owner")?;
+            Ok(Some(body))
+        }
+
+        fn owner(&self) -> Result<Option<String>> {
             // Only the label confers ownership. A prior launcher can be dead,
             // and a legacy two-line marker is still that label's declaration.
-            Ok(Some(body.lines().next().unwrap_or_default().to_owned()))
+            Ok(self
+                .read_marker()?
+                .map(|body| body.lines().next().unwrap_or_default().to_owned()))
         }
 
         fn require_owner(&self, label: &str) -> Result<bool> {
@@ -199,18 +210,23 @@ mod unix {
             brain_profile: args.brain_profile.clone(),
         })?;
         khive_runtime::PackRegistry::validate_pack_selection(&resolved.packs)?;
-        // Resolution ends before runtime/store construction: no database,
-        // migration, model, transport, or incumbent-daemon probe is opened.
+        // Resolution itself opens no database, migration, model, transport,
+        // or incumbent-daemon probe. The launcher's separate own-job probe
+        // may already have run while holding the marker lock.
         Ok(())
     }
 
-    pub(super) fn launch(args: LaunchArgs, log: &str, marker: &Path) -> Result<()> {
+    pub(super) async fn launch(args: LaunchArgs, log: &str, marker: &Path) -> Result<()> {
         if let Err(error) = validate_label(&args.label) {
             eprintln!("CONFIG: {error:#}");
             return Ok(());
         }
         let guard = MarkerGuard::acquire(marker)?;
-        if let Some(owner) = guard.owner()? {
+        let prior_marker = guard.read_marker()?;
+        if let Some(owner) = prior_marker
+            .as_deref()
+            .map(|body| body.lines().next().unwrap_or_default())
+        {
             if owner != args.label {
                 eprintln!(
                     "CONFIG: supervisor marker {} belongs to {owner:?}, not {:?}; refusing launch",
@@ -218,6 +234,37 @@ mod unix {
                     args.label
                 );
                 return Ok(());
+            }
+        }
+        // A second launch of an already-serving job must leave its declaration
+        // byte-identical, even if the second launch supplied bad configuration.
+        // A stale/reused marker PID alone does not prove this: the same PID
+        // must answer on the socket as a daemon.
+        if let Some(prior_pid) = prior_marker
+            .as_deref()
+            .and_then(|body| body.lines().nth(1))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        {
+            match probe_supervisor_socket(Duration::from_millis(500)).await {
+                SupervisorSocketProbe::Daemon(peer) if peer.pid == Some(prior_pid) => {
+                    bail!(
+                        "duplicate supervisor launch for {:?}: job pid {prior_pid} already serves the socket",
+                        args.label
+                    );
+                }
+                SupervisorSocketProbe::Unidentified { pid, uid, reason } => {
+                    bail!(
+                        "own-job incumbent could not be identified; preserving marker: marker_pid={prior_pid} peer_pid={pid:?} uid={uid:?}: {reason}"
+                    );
+                }
+                SupervisorSocketProbe::Daemon(peer) if peer.pid.is_none() => {
+                    bail!(
+                        "own-job incumbent has no peer pid; preserving marker: marker_pid={prior_pid} uid={:?}",
+                        peer.uid
+                    );
+                }
+                SupervisorSocketProbe::Absent | SupervisorSocketProbe::Daemon(_) => {}
             }
         }
         let prepared = (|| -> Result<u64> {
@@ -240,6 +287,65 @@ mod unix {
         };
         let executable = std::env::current_exe().context("resolve current kkernel executable")?;
         guard.publish(&args.label, interval)?;
+        // The client may have won the marker lock first and started an
+        // unmanaged daemon. The launcher owns the lock through this handover
+        // and exec, so no new client can race into the old socket afterwards.
+        let probe_started = Instant::now();
+        match probe_supervisor_socket(Duration::from_millis(500)).await {
+            SupervisorSocketProbe::Absent => {}
+            SupervisorSocketProbe::Unidentified { pid, uid, reason } => {
+                bail!(
+                    "incumbent is not a khive daemon: pid={pid:?} uid={uid:?} waited={:?}: {reason}",
+                    probe_started.elapsed()
+                );
+            }
+            SupervisorSocketProbe::Daemon(peer) => {
+                let pid = peer.pid;
+                let uid = peer.uid;
+                let Some(incumbent_pid) = pid.filter(|pid| *pid != std::process::id()) else {
+                    bail!(
+                        "incumbent did not yield: pid={pid:?} uid={uid:?} waited={:?}: no usable peer pid",
+                        probe_started.elapsed()
+                    );
+                };
+                if uid != Some(supervisor_effective_uid()) {
+                    bail!(
+                        "incumbent did not yield: pid={pid:?} uid={uid:?} waited={:?}: foreign uid",
+                        probe_started.elapsed()
+                    );
+                }
+                if let Err(error) = supervisor_sigterm(incumbent_pid) {
+                    bail!(
+                        "incumbent did not yield: pid={pid:?} uid={uid:?} waited={:?}: SIGTERM failed: {error}",
+                        probe_started.elapsed()
+                    );
+                }
+                let wait = Duration::from_secs(interval);
+                let wait_started = Instant::now();
+                loop {
+                    let remaining = wait.saturating_sub(wait_started.elapsed());
+                    let socket_absent = matches!(
+                        probe_supervisor_socket(remaining.min(Duration::from_millis(200))).await,
+                        SupervisorSocketProbe::Absent
+                    );
+                    if socket_absent && !supervisor_pid_is_alive(incumbent_pid) {
+                        break;
+                    }
+                    if wait_started.elapsed() >= wait {
+                        bail!(
+                            "incumbent did not yield: pid={pid:?} uid={uid:?} waited={:?}",
+                            wait_started.elapsed()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                eprintln!(
+                    "supervisor replaced client-started incumbent: pid={incumbent_pid} uid={} waited={:?}",
+                    uid.unwrap_or_default(),
+                    wait_started.elapsed()
+                );
+            }
+        }
         let error = Command::new(executable)
             .args(["--log", log, "mcp", "--daemon"])
             .args(&args.mcp_args)
@@ -377,8 +483,8 @@ mod unix {
             assert_eq!(interval_seconds("10").unwrap(), 10);
         }
 
-        #[test]
-        fn config_refusal_releases_only_the_launchers_own_label() {
+        #[tokio::test]
+        async fn config_refusal_releases_only_the_launchers_own_label() {
             let root = tempfile::tempdir().unwrap();
             let marker = root.path().join("khived.supervisor");
             let args = || LaunchArgs {
@@ -387,12 +493,12 @@ mod unix {
                 mcp_args: vec![],
             };
             fs::write(&marker, "job\n123\n10\n").unwrap();
-            launch(args(), "warn", &marker).unwrap();
+            launch(args(), "warn", &marker).await.unwrap();
             assert!(!marker.exists());
 
             let foreign = "other-job\n456\n10\n";
             fs::write(&marker, foreign).unwrap();
-            launch(args(), "warn", &marker).unwrap();
+            launch(args(), "warn", &marker).await.unwrap();
             assert_eq!(fs::read_to_string(&marker).unwrap(), foreign);
         }
     }

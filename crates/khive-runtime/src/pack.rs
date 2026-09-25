@@ -4402,6 +4402,8 @@ inventory::collect!(PackRegistration);
 pub enum PackLoadError {
     /// The requested pack name was not found in the inventory.
     UnknownPack(String),
+    /// The requested pack name occurs more than once.
+    DuplicatePack(String),
     /// A pack was requested but a declared dependency is absent from the list.
     MissingDependency {
         /// The pack that declared the dependency.
@@ -4421,6 +4423,7 @@ impl std::fmt::Display for PackLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PackLoadError::UnknownPack(name) => write!(f, "unknown pack {name:?}"),
+            PackLoadError::DuplicatePack(name) => write!(f, "duplicate pack {name:?}"),
             PackLoadError::MissingDependency { pack, dep } => write!(
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
@@ -4507,9 +4510,12 @@ impl PackRegistry {
         names: &[String],
     ) -> Result<(), PackLoadError> {
         let factory_for = |name: &str| factories.iter().copied().find(|f| f.name() == name);
-        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        let mut requested = std::collections::HashSet::new();
         for name in names {
             factory_for(name).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
+            if !requested.insert(name.as_str()) {
+                return Err(PackLoadError::DuplicatePack(name.clone()));
+            }
         }
         for name in names {
             let factory = factory_for(name).unwrap(); // All names were validated above.
@@ -4536,7 +4542,7 @@ impl PackRegistry {
     ///
     /// Returns `Ok(())` when all names are recognised and all declared
     /// dependencies are satisfied; returns `Err(PackLoadError)` with a
-    /// distinct variant for unknown pack vs missing dependency.
+    /// distinct variants for unknown or duplicate packs and missing dependencies.
     pub fn register_packs(
         names: &[String],
         runtime: KhiveRuntime,

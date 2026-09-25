@@ -4,6 +4,7 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -91,6 +92,16 @@ impl Fixture {
     }
 
     fn launch_command_with_packs(&self, config: &Path, packs: &[&str]) -> Command {
+        self.launch_command_options(config, packs, "10", true)
+    }
+
+    fn launch_command_options(
+        &self,
+        config: &Path,
+        packs: &[&str],
+        interval: &str,
+        no_embed: bool,
+    ) -> Command {
         let mut command = self.command();
         command
             .args([
@@ -99,15 +110,54 @@ impl Fixture {
                 "--label",
                 LABEL,
                 "--restart-interval-secs",
-                "10",
+                interval,
                 "--",
                 "--config",
             ])
             .arg(config)
-            .args(["--no-embed", "--actor", LABEL]);
+            .args(["--actor", LABEL]);
+        if no_embed {
+            command.arg("--no-embed");
+        }
         for pack in packs {
             command.args(["--pack", pack]);
         }
+        command
+    }
+
+    fn exec_command(&self) -> Command {
+        let mut command = self.command();
+        command
+            .args(["exec", "stats()", "--config"])
+            .arg(&self.config)
+            .args(["--actor", LABEL]);
+        command
+    }
+
+    fn plan_command(&self) -> Command {
+        let mut command = self.command();
+        command
+            .args(["exec", "--plan", "stats()", "--config"])
+            .arg(&self.config);
+        command
+    }
+
+    fn direct_daemon_command(&self) -> Command {
+        let mut command = self.command();
+        command
+            .args(["mcp", "--daemon", "--config"])
+            .arg(&self.config)
+            .args(["--actor", LABEL, "--pack", "kg"]);
+        command
+    }
+
+    fn stub_command(&self, mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "supervisor_socket_stub_child", "--nocapture"])
+            .env("KHIVE_SUPERVISOR_STUB_MODE", mode)
+            .env("KHIVE_SUPERVISOR_STUB_SOCKET", &self.socket)
+            .stdin(Stdio::null());
         command
     }
 
@@ -329,6 +379,21 @@ fn supervisor_unknown_cli_pack_refuses_before_publish_and_releases_prior_marker(
 }
 
 #[test]
+fn supervisor_duplicate_cli_pack_refuses_before_publish_and_releases_prior_marker() {
+    for prior_marker in [false, true] {
+        let fixture = Fixture::new();
+        if prior_marker {
+            std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
+        }
+        assert_pack_refusal(
+            &fixture,
+            &mut fixture.launch_command_with_packs(&fixture.config, &["kg", "kg"]),
+            "duplicate pack \"kg\"",
+        );
+    }
+}
+
+#[test]
 fn supervisor_unknown_environment_pack_releases_prior_marker() {
     let fixture = Fixture::new();
     std::fs::write(&fixture.marker, format!("{LABEL}\n1\n10\n")).unwrap();
@@ -363,4 +428,482 @@ fn supervisor_missing_pack_dependency_releases_prior_marker() {
         &mut fixture.launch_command_with_packs(&fixture.config, &["git"]),
         "requires",
     );
+}
+
+async fn socket_holder_pid(fixture: &Fixture) -> Option<u32> {
+    let stream = tokio::net::UnixStream::connect(&fixture.socket)
+        .await
+        .ok()?;
+    stream
+        .peer_cred()
+        .ok()?
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+async fn wait_for_holder(fixture: &Fixture, expected: Option<u32>) -> u32 {
+    let deadline = tokio::time::Instant::now() + START_LIMIT;
+    loop {
+        if let Some(pid) = socket_holder_pid(fixture).await {
+            if expected.is_none_or(|expected| expected == pid)
+                && std::fs::read_to_string(&fixture.pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    == Some(pid)
+            {
+                return pid;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "socket holder did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_pid_gone(pid: u32) {
+    let deadline = tokio::time::Instant::now() + START_LIMIT;
+    while khive_mcp::daemon::supervisor_pid_is_alive(pid) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pid {pid} did not leave"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn wait_child_exit(child: &mut OwnedChild, log_path: &Path) -> (ExitStatus, String) {
+    let deadline = Instant::now() + START_LIMIT;
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return (status, std::fs::read_to_string(log_path).unwrap());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child did not exit: {}",
+            std::fs::read_to_string(log_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn is_handover_interrupted_stats(log: &str) -> bool {
+    // A client already reading from the unmanaged daemon may receive its
+    // cancelled read when the launcher drains that daemon. Accept only the
+    // observed one-op stats response, never an arbitrary CLI failure.
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|response| {
+            if response["status"] != "partial"
+                || response["summary"]["total"] != 1
+                || response["summary"]["failed"] != 1
+                || response["summary"]["succeeded"] != 0
+                || response["summary"]["aborted"] != 0
+            {
+                return false;
+            }
+            let Some(results) = response["results"].as_array() else {
+                return false;
+            };
+            if results.len() != 1
+                || results[0]["tool"] != "stats"
+                || results[0]["ok"] != false
+                || results[0]["error"]["kind"] != "runtime_error"
+            {
+                return false;
+            }
+            matches!(
+                results[0]["error"]["message"].as_str(),
+                Some("storage: timeout during count_entities")
+                    | Some("storage: timeout during count_notes_in_namespaces")
+            )
+        })
+}
+
+/// This test body also serves as a subprocess-only Unix socket holder. The
+/// parent launches the exact test name with an environment-selected mode.
+#[test]
+fn supervisor_socket_stub_child() {
+    let Ok(mode) = std::env::var("KHIVE_SUPERVISOR_STUB_MODE") else {
+        return;
+    };
+    let socket = PathBuf::from(std::env::var_os("KHIVE_SUPERVISOR_STUB_SOCKET").unwrap());
+    if mode == "ignore-term" {
+        // SAFETY: this subprocess is the isolated test stub and intentionally
+        // ignores TERM to exercise the launcher's bounded refusal.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    for incoming in listener.incoming() {
+        let Ok(mut stream) = incoming else { continue };
+        let mode = mode.clone();
+        std::thread::spawn(move || {
+            if mode == "silent" {
+                std::thread::sleep(Duration::from_secs(60));
+                return;
+            }
+            let mut length = [0_u8; 4];
+            if stream.read_exact(&mut length).is_err() {
+                return;
+            }
+            let mut frame = vec![0_u8; u32::from_be_bytes(length) as usize];
+            if stream.read_exact(&mut frame).is_err() {
+                return;
+            }
+            let response = serde_json::json!({
+                "ok": false,
+                "result": null,
+                "error": "stub configuration mismatch",
+                "namespace_mismatch": false,
+                "config_mismatch": true,
+                "served_config_id": "stub-config",
+                "version_mismatch": false,
+                "daemon_protocol_version": khive_runtime::daemon::PROTOCOL_VERSION
+            });
+            let response = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+    }
+}
+
+fn wait_stub_socket(fixture: &Fixture, stub: &mut OwnedChild, log_path: &Path) {
+    let deadline = Instant::now() + START_LIMIT;
+    while !fixture.socket.exists() {
+        assert!(
+            stub.0.try_wait().unwrap().is_none(),
+            "stub exited: {}",
+            std::fs::read_to_string(log_path).unwrap_or_default()
+        );
+        assert!(Instant::now() < deadline, "stub did not bind");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// MUST-FAIL: removing the post-publish handover leaves the client-started
+// daemon holding the socket and the supervised job refused by first writer.
+#[tokio::test]
+async fn supervisor_client_first_handover_and_legacy_control() {
+    let fixture = Fixture::new();
+    let (status, log) = fixture.completed(&mut fixture.exec_command(), "client-first.log");
+    assert!(status.success(), "client auto-spawn failed: {log}");
+    let old_pid = wait_for_holder(&fixture, None).await;
+    let (mut launcher, launcher_log) = fixture.spawn(
+        &mut fixture.launch_command_options(&fixture.config, &["kg"], "10", false),
+        "handover.log",
+    );
+    let job_pid = launcher.0.id();
+    assert_ne!(old_pid, job_pid);
+    assert_eq!(wait_for_holder(&fixture, Some(job_pid)).await, job_pid);
+    wait_pid_gone(old_pid).await;
+    assert_eq!(
+        std::fs::read_to_string(&fixture.marker).unwrap(),
+        format!("{LABEL}\n{job_pid}\n10\n")
+    );
+    let (status, log) = fixture.completed(&mut fixture.exec_command(), "client-again.log");
+    assert!(
+        status.success(),
+        "next request was not served by supervised configuration: {log}"
+    );
+    let (status, log) = fixture.completed(&mut fixture.plan_command(), "client-plan.log");
+    assert!(
+        status.success(),
+        "supervised config did not answer a daemon-only plan: {log}"
+    );
+    assert_eq!(socket_holder_pid(&fixture).await, Some(job_pid));
+    assert!(
+        launcher.0.try_wait().unwrap().is_none(),
+        "supervised daemon exited: {}",
+        std::fs::read_to_string(launcher_log).unwrap_or_default()
+    );
+    assert!(
+        std::fs::read_to_string(&launcher_log)
+            .unwrap_or_default()
+            .contains("supervisor replaced client-started incumbent"),
+        "launcher did not log the replacement"
+    );
+
+    // Pre-A2 control in this same test file: publish the declaration, then
+    // start the old direct daemon path without the launcher's handover.
+    let control = Fixture::new();
+    let (status, log) = control.completed(&mut control.exec_command(), "control-client.log");
+    assert!(status.success(), "control client auto-spawn failed: {log}");
+    let control_holder = wait_for_holder(&control, None).await;
+    let (mut legacy_job, legacy_log) =
+        control.spawn(&mut control.direct_daemon_command(), "legacy-job.log");
+    let legacy_pid = legacy_job.0.id();
+    std::fs::write(&control.marker, format!("{LABEL}\n{legacy_pid}\n10\n")).unwrap();
+    let (status, log) = wait_child_exit(&mut legacy_job, &legacy_log);
+    assert!(
+        !status.success(),
+        "pre-handover job unexpectedly served: {log}"
+    );
+    assert!(
+        log.contains("already serving this socket"),
+        "wrong first-writer refusal: {log}"
+    );
+    assert_ne!(socket_holder_pid(&control).await, Some(legacy_pid));
+    assert_eq!(socket_holder_pid(&control).await, Some(control_holder));
+    // SAFETY: this PID came from the fixture's own socket peer credentials.
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(control_holder).unwrap(), libc::SIGTERM) },
+        0
+    );
+    wait_pid_gone(control_holder).await;
+}
+
+// Run explicitly in the hosted gate: cargo test -p kkernel --test
+// supervisor_lifecycle supervisor_started_together_twenty_offsets -- --ignored --exact
+// Each isolated fixture draws a fresh offset in [0, 1s), including both
+// launch-first and client-first orders.
+#[tokio::test]
+#[ignore]
+async fn supervisor_started_together_twenty_offsets() {
+    for run in 0_u64..20 {
+        let fixture = Fixture::new();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64;
+        let offset = Duration::from_millis((nanos.wrapping_mul(791) + run * 53) % 1000);
+        let mut launcher_command =
+            fixture.launch_command_options(&fixture.config, &["kg"], "10", false);
+        let (mut launcher, log_path) = if run % 2 == 0 {
+            let (launcher, log_path) = fixture.spawn(&mut launcher_command, "together-launch.log");
+            tokio::time::sleep(offset).await;
+            let (status, log) =
+                fixture.completed(&mut fixture.exec_command(), "together-client.log");
+            assert!(status.success(), "run {run}: client failed: {log}");
+            (launcher, log_path)
+        } else {
+            let (mut client, client_log) =
+                fixture.spawn(&mut fixture.exec_command(), "together-client.log");
+            tokio::time::sleep(offset).await;
+            let overlapped = client.0.try_wait().unwrap().is_none();
+            let (launcher, log_path) = fixture.spawn(&mut launcher_command, "together-launch.log");
+            let (status, log) = wait_child_exit(&mut client, &client_log);
+            assert!(
+                status.success() || (overlapped && is_handover_interrupted_stats(&log)),
+                "run {run}: client failed outside handover: {log}"
+            );
+            (launcher, log_path)
+        };
+        let job_pid = launcher.0.id();
+        assert_eq!(
+            wait_for_holder(&fixture, Some(job_pid)).await,
+            job_pid,
+            "run {run}"
+        );
+        let (status, log) =
+            fixture.completed(&mut fixture.exec_command(), "together-fresh-client.log");
+        assert!(
+            status.success(),
+            "run {run}: fresh request was not served by supervised daemon: {log}"
+        );
+        assert_eq!(
+            socket_holder_pid(&fixture).await,
+            Some(job_pid),
+            "run {run}"
+        );
+        assert!(
+            launcher.0.try_wait().unwrap().is_none(),
+            "run {run}: launcher exited: {}",
+            std::fs::read_to_string(log_path).unwrap_or_default()
+        );
+    }
+}
+
+// MUST-FAIL: removing the own-job guard overwrites the marker and sends TERM
+// to the daemon already serving this same supervisor job.
+#[tokio::test]
+async fn supervisor_second_launch_leaves_own_job_and_marker_unchanged() {
+    let fixture = Fixture::new();
+    let (mut first, log_path) = fixture.spawn(
+        &mut fixture.launch_command(&fixture.config),
+        "own-first.log",
+    );
+    let first_pid = first.0.id();
+    assert_eq!(wait_for_holder(&fixture, Some(first_pid)).await, first_pid);
+    let marker = std::fs::read(&fixture.marker).unwrap();
+    let (status, log) = fixture.completed(
+        &mut fixture.launch_command(&fixture.config),
+        "own-second.log",
+    );
+    assert!(!status.success(), "duplicate launcher must refuse: {log}");
+    assert!(
+        log.contains("duplicate supervisor launch"),
+        "wrong duplicate refusal: {log}"
+    );
+    assert_eq!(std::fs::read(&fixture.marker).unwrap(), marker);
+    assert_eq!(socket_holder_pid(&fixture).await, Some(first_pid));
+    assert!(
+        first.0.try_wait().unwrap().is_none(),
+        "first job was disturbed: {}",
+        std::fs::read_to_string(log_path).unwrap_or_default()
+    );
+    let bad_config = fixture.root.path().join("invalid.toml");
+    std::fs::write(&bad_config, "not valid [toml").unwrap();
+    let (status, log) =
+        fixture.completed(&mut fixture.launch_command(&bad_config), "own-invalid.log");
+    assert!(
+        !status.success(),
+        "live own job must win before config refusal: {log}"
+    );
+    assert!(
+        log.contains("duplicate supervisor launch"),
+        "wrong own-job refusal: {log}"
+    );
+    assert_eq!(std::fs::read(&fixture.marker).unwrap(), marker);
+}
+
+// MUST-FAIL: an accepted but silent socket does not grant permission to
+// signal its peer, even though the peer is under the same uid.
+#[test]
+fn supervisor_silent_same_uid_stub_is_not_signalled() {
+    let fixture = Fixture::new();
+    let (mut stub, stub_log) =
+        fixture.spawn(&mut fixture.stub_command("silent"), "silent-stub.log");
+    wait_stub_socket(&fixture, &mut stub, &stub_log);
+    let (status, log) = fixture.completed(
+        &mut fixture.launch_command(&fixture.config),
+        "silent-launch.log",
+    );
+    assert!(!status.success(), "silent socket must refuse: {log}");
+    assert!(
+        log.contains("incumbent is not a khive daemon"),
+        "wrong refusal: {log}"
+    );
+    assert!(
+        log.contains(&stub.0.id().to_string()),
+        "missing peer pid: {log}"
+    );
+    assert!(log.contains("uid="), "missing uid: {log}");
+    assert!(log.contains("waited="), "missing elapsed time: {log}");
+    assert!(
+        fixture.marker.exists(),
+        "failed handover must retain marker"
+    );
+    assert!(
+        stub.0.try_wait().unwrap().is_none(),
+        "silent stub was signalled"
+    );
+
+    // Preserve an own-label declaration if its socket accepts but cannot
+    // complete an identity response right now.
+    let own = Fixture::new();
+    let (mut own_stub, own_log) = own.spawn(&mut own.stub_command("silent"), "own-silent-stub.log");
+    wait_stub_socket(&own, &mut own_stub, &own_log);
+    let marker = format!("{LABEL}\n{}\n1\n", own_stub.0.id());
+    std::fs::write(&own.marker, &marker).unwrap();
+    let (status, log) = own.completed(
+        &mut own.launch_command(&own.config),
+        "own-silent-launch.log",
+    );
+    assert!(
+        !status.success(),
+        "unidentified own socket must refuse: {log}"
+    );
+    assert!(
+        log.contains("preserving marker"),
+        "wrong own-job refusal: {log}"
+    );
+    assert_eq!(std::fs::read_to_string(&own.marker).unwrap(), marker);
+    assert!(
+        own_stub.0.try_wait().unwrap().is_none(),
+        "unidentified own stub was signalled"
+    );
+}
+
+// MUST-FAIL: replacing the peer PID with the PID-file PID in the handover
+// branch would signal the unrelated decoy, not the answering socket holder.
+#[test]
+fn supervisor_pid_file_decoy_never_selects_signal_target() {
+    let fixture = Fixture::new();
+    let mut unrelated = OwnedChild(Command::new("sleep").arg("60").spawn().unwrap());
+    std::fs::write(&fixture.pid_file, format!("{}\n", unrelated.0.id())).unwrap();
+    let (status, log) = fixture.completed(
+        &mut fixture.launch_command(&fixture.config),
+        "pid-only-launch.log",
+    );
+    assert!(
+        !status.success(),
+        "daemon should conservatively refuse live PID-file owner: {log}"
+    );
+    assert!(
+        log.contains("live process owns the PID file"),
+        "launcher did not reach daemon exec: {log}"
+    );
+    assert!(
+        unrelated.0.try_wait().unwrap().is_none(),
+        "unrelated PID-file process was signalled"
+    );
+
+    // Separate poison subcase: a probe-answering daemon-like stub owns the
+    // socket while the PID file still names an unrelated live process.
+    let poison = Fixture::new();
+    let mut decoy = OwnedChild(Command::new("sleep").arg("60").spawn().unwrap());
+    std::fs::write(&poison.pid_file, format!("{}\n", decoy.0.id())).unwrap();
+    let (mut holder, holder_log) =
+        poison.spawn(&mut poison.stub_command("answer"), "answer-stub.log");
+    wait_stub_socket(&poison, &mut holder, &holder_log);
+    let (status, log) = poison.completed(
+        &mut poison.launch_command_options(&poison.config, &["kg"], "1", true),
+        "poison-launch.log",
+    );
+    assert!(
+        !status.success(),
+        "runtime must refuse decoy PID-file owner: {log}"
+    );
+    assert!(
+        log.contains("live process owns the PID file"),
+        "holder was not handed over before daemon exec: {log}"
+    );
+    assert!(
+        decoy.0.try_wait().unwrap().is_none(),
+        "decoy PID-file process was signalled"
+    );
+    let deadline = Instant::now() + START_LIMIT;
+    while holder.0.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "socket holder did not receive SIGTERM: {log}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// MUST-FAIL: SIGTERM is bounded to one interval and never escalates to KILL.
+#[tokio::test]
+async fn supervisor_probe_answering_sigterm_ignoring_holder_stays_alive() {
+    let fixture = Fixture::new();
+    let (mut holder, holder_log) =
+        fixture.spawn(&mut fixture.stub_command("ignore-term"), "ignore-stub.log");
+    wait_stub_socket(&fixture, &mut holder, &holder_log);
+    let start = Instant::now();
+    let (status, log) = fixture.completed(
+        &mut fixture.launch_command_options(&fixture.config, &["kg"], "1", true),
+        "ignore-launch.log",
+    );
+    assert!(!status.success(), "ignoring holder must block exec: {log}");
+    assert!(
+        start.elapsed() >= Duration::from_secs(1),
+        "launcher did not wait one interval: {log}"
+    );
+    assert!(
+        log.contains("incumbent did not yield"),
+        "wrong refusal: {log}"
+    );
+    assert!(
+        log.contains(&holder.0.id().to_string()),
+        "missing peer pid: {log}"
+    );
+    assert!(
+        fixture.marker.exists(),
+        "failed handover must retain marker"
+    );
+    assert!(holder.0.try_wait().unwrap().is_none(), "holder was killed");
+    assert_eq!(socket_holder_pid(&fixture).await, Some(holder.0.id()));
 }
