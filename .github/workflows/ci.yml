@@ -1126,14 +1126,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
           cache-on-failure: true
-          key: msrv-1.93
+          key: msrv-1.95
       - name: Check workspace on the declared minimum Rust version
-        run: cargo +1.93.0 check --workspace --locked
+        run: cargo +1.95.0 check --workspace --locked
 
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
