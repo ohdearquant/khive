@@ -1,4 +1,5 @@
 name: CI
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && format('CI replay {0}', inputs.main_sha) || '' }}
 
 on:
   push:
@@ -10,6 +11,12 @@ on:
   # and a base retarget after the parent merges does not re-fire the workflow.
   pull_request:
   workflow_dispatch:
+    inputs:
+      main_sha:
+        description: "Full 40-hex main commit to replay; empty uses the dispatch revision"
+        required: false
+        type: string
+        default: ""
   schedule:
     - cron: "17 6 * * *"
 
@@ -33,6 +40,68 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Replay uses the current workflow against historical source, without a temporary ref:
+  # gh workflow run ci.yml --ref main -f main_sha=<full-main-commit-sha>
+  resolve-revision:
+    name: Resolve CI revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      checkout_sha: ${{ steps.resolve.outputs.checkout_sha }}
+    steps:
+      - name: Validate replay input
+        id: request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPLAY_SHA: ${{ inputs.main_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "workflow_dispatch" || -z "$REPLAY_SHA" ]]; then
+            printf 'replay=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$REPLAY_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "main_sha must be exactly 40 hexadecimal characters" >&2
+            exit 1
+          fi
+          printf 'replay=true\n' >> "$GITHUB_OUTPUT"
+      - name: Checkout trusted revision metadata
+        if: steps.request.outputs.replay == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate main ancestry
+        if: steps.request.outputs.replay == 'true'
+        id: resolve
+        env:
+          REPLAY_SHA: ${{ inputs.main_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          object_type=$(git cat-file -t "$REPLAY_SHA" 2>/dev/null || true)
+          if [[ "$object_type" != "commit" ]]; then
+            echo "main_sha must identify a commit object" >&2
+            exit 1
+          fi
+          candidate=$(git rev-parse --verify "${REPLAY_SHA}^{commit}")
+          if ! git merge-base --is-ancestor "$candidate" refs/remotes/origin/main; then
+            echo "main_sha must be reachable from origin/main" >&2
+            exit 1
+          fi
+          printf 'checkout_sha=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016
+          {
+            printf '### CI replay revision\n\n'
+            printf 'Requested: `%s`\n\n' "$REPLAY_SHA"
+            printf 'Validated checkout: `%s`\n\n' "$candidate"
+            printf 'Main tip: `%s`\n' "$(git rev-parse refs/remotes/origin/main)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
   automerge-push-guard:
@@ -113,7 +182,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   ci:
-    name: CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
+    needs: resolve-revision
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -164,6 +234,8 @@ jobs:
       LATTICE_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       # ubuntu-latest runners start with ~21GB free on /. The workspace's
       # check + clippy + test + release passes exceed that, and ld's mmap'd
       # writes turn ENOSPC into SIGBUS. Purge preinstalled toolchains this
@@ -363,7 +435,8 @@ jobs:
         run: ../scripts/ci.sh contract-suite
 
   khive-py:
-    name: Python client tests
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -375,6 +448,8 @@ jobs:
       LATTICE_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
@@ -431,7 +506,8 @@ jobs:
         run: uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' --with 'blake3>=1' pytest python/tests
 
   kg-editor:
-    name: KG Studio (Next.js)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -442,6 +518,8 @@ jobs:
         working-directory: apps/kg-editor
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -513,11 +591,14 @@ jobs:
         run: npx playwright test
 
   supply-chain:
-    name: Supply-chain (cargo-deny)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       # cargo-deny 0.19.9+ parses CVSS 4.0 entries in the 2026 RustSec DB;
       # 0.18.x fails to load the DB entirely. One pinned binary runs every check
       # class so the supply-chain gate cannot drift between two implementations.
@@ -537,23 +618,28 @@ jobs:
           cargo deny --manifest-path crates/Cargo.toml --all-features check bans licenses sources advisories
 
   data-leak-guard:
-    name: JSON/JSONL data-leak guard
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}JSON/JSONL data-leak guard
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - name: Scan whole tree for corpus files
         run: bash scripts/check-json-data.sh --all
       - name: Guard fixture test (staged blobs judged from the index)
         run: bash scripts/tests/check-json-data-test.sh
 
   secret-scan:
-    name: Secret scan (gitleaks)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
           fetch-depth: 0
       - name: Install gitleaks
         run: |
@@ -576,10 +662,16 @@ jobs:
       # narrowing must be reverted in the same change.
       - name: Resolve scan scope
         id: scope
+        env:
+          REPLAY_SHA: ${{ needs.resolve-revision.outputs.checkout_sha }}
         run: |
           set -euo pipefail
           range=""
           case "${{ github.event_name }}" in
+            workflow_dispatch)
+              # Historical replay judges only history reachable from its validated commit.
+              range="$REPLAY_SHA"
+              ;;
             pull_request)
               # actions/checkout resolves refs/pull/N/merge, whose first parent
               # is the base and whose second parent is the pull request head.
@@ -626,11 +718,14 @@ jobs:
           fi
 
   docs:
-    name: Docs lint
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Docs lint
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -638,11 +733,14 @@ jobs:
         run: scripts/ci.sh docs-fmt
 
   marketplace:
-    name: Marketplace example validator
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Marketplace example validator
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -650,7 +748,8 @@ jobs:
         run: python3 marketplace/_validators/check_examples.py
 
   doc-build:
-    name: Doc build (-D warnings)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -658,6 +757,8 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -667,7 +768,10 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
   dependency-review:
-    name: Dependency review
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
+    needs: resolve-revision
+    # Admit the job so GitHub evaluates its check name even when no PR work applies.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -675,12 +779,23 @@ jobs:
     # No pull-requests:write — comment-summary-in-pr is not enabled.
     permissions:
       contents: read
-    # This action only works on pull_request events — it diffs the dependency
-    # graph between the base and head commits.  Skip on push to main/integration.
-    if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v7
+      - name: Refuse unvalidated dependency review revision
+        if: needs.resolve-revision.result != 'success'
+        run: |
+          echo "CI revision validation did not succeed; dependency review did not run." >&2
+          exit 1
+      - name: Report dependency review not applicable
+        if: needs.resolve-revision.result == 'success' && github.event_name != 'pull_request'
+        run: |
+          echo "Dependency review applies only to pull requests; no dependency comparison was run."
+      - name: Checkout dependency review revision
+        if: needs.resolve-revision.result == 'success' && github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - name: Dependency review
+        if: needs.resolve-revision.result == 'success' && github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
         with:
           # Fail on high or critical vulnerabilities only; low/moderate are
@@ -710,7 +825,8 @@ jobs:
           allow-dependencies-licenses: pkg:pypi/typing-extensions, pkg:cargo/sqlite-vec
 
   wasm-parity:
-    name: wasm-parity (khive-changeset)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -720,6 +836,8 @@ jobs:
       WASMTIME_VERSION: v46.0.1
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: wasm32-unknown-unknown,wasm32-wasip1
@@ -804,7 +922,8 @@ jobs:
           echo "native and wasm32-wasip1: $(wc -l < /tmp/native.sorted) tests, identical pass/fail results"
 
   vamana-portability:
-    name: vamana portability (ADR-110 Layer A)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -812,6 +931,8 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: wasm32-unknown-unknown
@@ -825,7 +946,8 @@ jobs:
         run: cargo test -p khive-quant -p khive-vamana --no-default-features
 
   minio-blob-compat:
-    name: MinIO BlobStore compatibility (ADR-111 Amendment 2)
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
+    needs: resolve-revision
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -833,6 +955,8 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       # Gate on storage-layer changes only: the MinIO leg (server build and
       # start) is the slowest part of this job, and most PRs never touch the
       # blob store. A change to this workflow file also runs it, so an edit to
@@ -988,7 +1112,8 @@ jobs:
           fi
 
   check-windows:
-    name: Windows compile check
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
+    needs: resolve-revision
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -996,6 +1121,8 @@ jobs:
         working-directory: crates
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1038,7 +1165,8 @@ jobs:
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/issue2149-windows.log" 1
 
   coverage-measurement:
-    name: Coverage measurement
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
+    needs: resolve-revision
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -1054,6 +1182,8 @@ jobs:
       LATTICE_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       # `cargo llvm-cov --workspace` is the disk-heaviest command in CI: it
       # instruments every crate and emits per-object profraw files on top of the
       # normal target dir, overflowing the ubuntu runner's ~21GB and surfacing as
@@ -1177,9 +1307,10 @@ jobs:
           exit 1
 
   coverage-ratchet:
-    name: Coverage ratchet
-    needs: coverage-measurement
-    if: needs.coverage-measurement.outputs.available == 'true'
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
+    needs: [resolve-revision, coverage-measurement]
+    # Missing inputs must produce a named failure, not an unevaluated skipped name.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1187,8 +1318,18 @@ jobs:
     # baseline is raised only by an explicit PR that edits coverage-baseline.txt,
     # so every change to main (the floor included) goes through the gate wall.
     steps:
-      - uses: actions/checkout@v7
+      - name: Refuse unavailable coverage input
+        if: needs.resolve-revision.result != 'success' || needs.coverage-measurement.result != 'success' || needs.coverage-measurement.outputs.available != 'true'
+        run: |
+          echo "CI revision validation or coverage measurement is unavailable; no coverage-regression judgment was made." >&2
+          exit 1
+      - name: Checkout coverage baseline revision
+        if: needs.resolve-revision.result == 'success' && needs.coverage-measurement.result == 'success' && needs.coverage-measurement.outputs.available == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
       - name: Check coverage does not regress
+        if: needs.resolve-revision.result == 'success' && needs.coverage-measurement.result == 'success' && needs.coverage-measurement.outputs.available == 'true'
         env:
           CURRENT_COVERAGE: ${{ needs.coverage-measurement.outputs.current }}
         run: |
@@ -1213,10 +1354,11 @@ jobs:
   # named in the aggregation below may skip; every other dependency must
   # succeed. Failures and cancellations always fail the gate.
   ci-gate:
-    name: CI gate
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
+      - resolve-revision
       - automerge-push-guard
       - ci
       - khive-py
@@ -1240,14 +1382,11 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          # These jobs have job-level conditions: the push guard only applies
-          # to qualifying PR synchronizations, and dependency review only to
-          # PRs. The coverage ratchet is NOT on that list: it skips exactly when
-          # the measurement it needs did not arrive, which is the state this
-          # gate exists to report, and forgiving the skip is what let five
-          # consecutive main pushes report a coverage gate that never ran.
+          # Only the push guard may skip on run shape. Dependency review now
+          # completes an explicit no-work step outside PRs; missing coverage
+          # inputs fail the ratchet. An unexpected skip must not pass the gate.
           bad=$(echo "$NEEDS" | jq -r '
-            ["automerge-push-guard", "dependency-review"] as $allowed_skips
+            ["automerge-push-guard"] as $allowed_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
                 (.value.result != "skipped" or ($allowed_skips | index($job) | not)))
