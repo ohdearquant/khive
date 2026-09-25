@@ -4,13 +4,14 @@
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
 accepted 2026-07-17; Amendment 4 accepted 2026-07-19; Amendment 5 accepted 2026-09-24; attachment-GC compatibility epoch added
-2026-08-16 by ADR-160)
+2026-08-16 by ADR-160; §8 verb sentence scoped 2026-09-25 by ADR-121 Amendment 1)
 **Authors**: khive maintainers
 **Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
 backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
 ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
 mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
-cutover.
+cutover. Also amended by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (accepted
+2026-09-25), which scopes §8's "not an MCP verb" sentence to the caller-snapshot `orphan_sweep`.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
@@ -255,6 +256,10 @@ assembles the set of live `content_ref`s — e.g. `SELECT DISTINCT content_ref F
 and passes it in `BlobOrphanSweepConfig`;
 `FsBlobStore` walks its shard tree and reports (`dry_run: true`) or deletes (`dry_run: false`)
 everything not in that set.
+
+> Amended by [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (2026-09-25): the "not an MCP
+> verb" sentence above applies to the caller-snapshot `orphan_sweep` only, which stays admin-side.
+> `transactional_orphan_sweep` runs on a daemon schedule and on demand through the `blob.sweep` verb.
 
 This is deliberately the _only_ deletion path a consumer has besides an explicit
 `BlobStore::delete(content_ref)` call (SPEC-gate ruling, 2026-07-12): a future doc/file pack never

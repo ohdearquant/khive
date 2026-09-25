@@ -6,7 +6,9 @@
 **Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), whose moodboard migration
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
-a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`.\
+a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`; and by its own
+Amendment 1 below (accepted 2026-09-25), which schedules the attachment orphan sweep in the daemon
+and adds the `blob.sweep` verb.\
 **Depends on**:
 
 - [ADR-111](ADR-111-blob-store.md) — BlobStore (the content-addressed storage capability,
@@ -295,3 +297,61 @@ a secondary is rejected.
 The agent-facing `kg` verbs in rollout step 2 (`attach`, `detach`, `export`, create-with-attach,
 and selective hydration) remain deferred. Phase 4 adds internal runtime/storage publication seams
 for existing consumers; it does not claim the complete ADR-121 public verb rollout.
+
+## Amendment 1 (2026-09-25): the orphan sweep runs on a schedule and on demand
+
+**Status: Accepted (2026-09-25).** Refs #3038, #3178. This amendment also amends one sentence of
+[ADR-111](ADR-111-blob-store.md) §8, named in item 3.
+
+### Why
+
+§5 and §6 rest on the ADR-111 sweep running. A hard delete removes a record's attachment rows in its
+own transaction, and "with their rows gone they become sweep-eligible orphans"; `detach` likewise
+says the blob "is reclaimed by the sweep once no references remain". Nothing in a serving process runs that sweep: every
+caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed by a hard delete or a
+`detach` stays in the store indefinitely.
+
+### Decision
+
+1. **Scheduled sweep, daemon only.** The warm daemon (`kkernel mcp --daemon`) runs
+   `transactional_orphan_sweep` against the main backend on a fixed cadence, set by
+   `KHIVE_BLOB_SWEEP_INTERVAL_SECS` (default 86400, one day; `0` disables the schedule). A
+   session-mode process never schedules it. The first run starts one interval after the daemon starts,
+   and each later run starts one interval after the previous run ended. A daemon restarted more often
+   than its interval never reaches a scheduled run; the verb in item 3 covers that case, and a
+   deployment that restarts often sets a shorter interval.
+2. **Dry run first, live only by opt-in.** A scheduled run is a dry run unless `KHIVE_BLOB_SWEEP_LIVE=1`
+   is set. A deployment therefore starts in dry-run mode, and its first scheduled cycle reports
+   `would_delete` and deletes nothing. An operator enables live mode only after reading the counters of
+   at least one dry-run cycle, from the log line in item 4 or from the verb with `dry_run` true. The
+   daemon never switches modes on its own.
+3. **Verb.** `blob.sweep(dry_run?)` runs one pass on demand. `dry_run` defaults to true, so a call
+   without arguments deletes nothing. It returns the four counters of `BlobOrphanSweepResult`
+   (`scanned`, `would_delete`, `deleted`, `grace_period_skipped`) and the mode it ran in. It reaches the
+   main backend only, and it is subject to the Gate like any verb (ADR-018). ADR-111 §8 says the orphan
+   sweep is "an admin-side operation, not an MCP verb"; that sentence is amended to apply to the
+   caller-snapshot `orphan_sweep` only, which stays admin-side and, on the filesystem backend,
+   disabled. A pass that finds another sweep holding ownership waits for it, bounded by the caller's
+   deadline, which returns the retryable timeout error. A pass abandoned at its deadline stops
+   there: it must not acquire ownership later and run on with no caller to report to. An ADR-111 §8 epoch refusal is returned as the
+   verb's error unchanged, and a backend without a transactional sweep returns its `Unsupported` error.
+4. **The counters are the artifact.** Every scheduled run logs one line with its mode and the four
+   counters, or the error when the sweep refuses. `deleted` is the reclaimed-object count; before the
+   correction in item 5, ADR-191 Amendment 1 asked a scheduled sweep to report it.
+5. **Out of scope: rows whose record is gone.** The sweep counts every attachment row as live, whether
+   or not its record still exists. It therefore cannot reclaim a blob whose attachment row outlived its
+   record, which is the case ADR-191 A1.2 describes for an interrupted cross-backend hard delete.
+   Removing those rows is #3178. ADR-191 A1.2's sentence saying that scheduling this sweep bounds that
+   leak is corrected in the same change.
+
+### Acceptance
+
+- A daemon with a short interval and an orphan older than the grace period runs a dry-run cycle that
+  logs `would_delete=1`, `deleted=0` and leaves the object in place. With `KHIVE_BLOB_SWEEP_LIVE=1` the
+  next cycle deletes it and logs `deleted=1`.
+- A session-mode process, and a daemon with `KHIVE_BLOB_SWEEP_INTERVAL_SECS=0`, start no schedule.
+- `blob.sweep()` without arguments deletes nothing, and its `would_delete` equals the `deleted` of a
+  live pass over the same store.
+- `blob.sweep(dry_run=false)` issued while a scheduled run holds ownership either completes after it
+  or returns the timeout error when its deadline passes first. Neither deletes an object whose
+  attachment row committed while it waited, and a pass that timed out performs no deletion afterwards.
