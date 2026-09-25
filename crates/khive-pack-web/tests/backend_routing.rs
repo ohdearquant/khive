@@ -67,7 +67,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let tree = dir.path().join("served");
+        let tree = dir.path().canonicalize().unwrap().join("served");
         std::fs::create_dir(&tree).unwrap();
         std::fs::write(
             tree.join("index.html"),
