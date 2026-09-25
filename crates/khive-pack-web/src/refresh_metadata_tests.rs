@@ -669,3 +669,126 @@ async fn head_preserves_cached_get_negotiation_and_unnegotiated_get_clears_it() 
         "a later unnegotiated GET must clear stale negotiation"
     );
 }
+
+#[tokio::test]
+async fn overlapping_refresh_keeps_validators_with_the_settled_body() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/overlapping").unwrap();
+    let id = seed(&runtime, &token, &url, &[]).await;
+    let initial = entity(&runtime, &token, id).await;
+    let initial_properties = initial.properties.unwrap();
+    let initial_ref = initial_properties["blob_ref"].as_str().unwrap().to_owned();
+    let first_request_headers = refresh_request_headers(&initial_properties).unwrap();
+
+    let mut first_headers = response_headers();
+    first_headers.insert("etag", "response-a-etag".parse().unwrap());
+    first_headers.insert(
+        "last-modified",
+        "Tue, 22 Sep 2026 12:00:00 GMT".parse().unwrap(),
+    );
+    let first_outcome = HopOutcome {
+        status: 200,
+        final_url: url.clone(),
+        headers: first_headers,
+        redirect_to: None,
+        body: Some((b"response A body".to_vec(), false)),
+    };
+
+    let (body_settled_tx, body_settled_rx) = tokio::sync::oneshot::channel();
+    let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+    let first_runtime = runtime.clone();
+    let first_token = token.clone();
+    let first_url = url.clone();
+    let first = tokio::spawn(async move {
+        settle_refresh_with_request_headers_after_body_settlement(
+            &first_runtime,
+            &first_token,
+            id,
+            first_url.as_str(),
+            &initial_ref,
+            first_outcome,
+            &[],
+            &first_request_headers,
+            async move {
+                body_settled_tx
+                    .send(())
+                    .expect("the test is waiting for the first body settlement");
+                continue_rx
+                    .await
+                    .expect("the test releases the first refresh after the second completes");
+            },
+        )
+        .await
+    });
+
+    body_settled_rx
+        .await
+        .expect("the first refresh settles its body before pausing");
+    let after_first_body = entity(&runtime, &token, id).await;
+    let second_request_headers =
+        refresh_request_headers(after_first_body.properties.as_ref().unwrap()).unwrap();
+    let mut second_headers = response_headers();
+    second_headers.insert("etag", "response-b-etag".parse().unwrap());
+    second_headers.insert(
+        "last-modified",
+        "Wed, 23 Sep 2026 12:00:00 GMT".parse().unwrap(),
+    );
+    let second_reply = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        url.as_str(),
+        after_first_body.properties.as_ref().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap(),
+        HopOutcome {
+            status: 200,
+            final_url: url.clone(),
+            headers: second_headers,
+            redirect_to: None,
+            body: Some((b"response B body".to_vec(), false)),
+        },
+        &[],
+        &second_request_headers,
+    )
+    .await
+    .unwrap();
+    let after_second = entity(&runtime, &token, id).await;
+
+    continue_tx
+        .send(())
+        .expect("the first refresh is waiting after body settlement");
+    let first_reply = first.await.unwrap().unwrap();
+    let final_entity = entity(&runtime, &token, id).await;
+    let final_properties = final_entity.properties.as_ref().unwrap();
+    let second_properties = after_second.properties.as_ref().unwrap();
+
+    assert_eq!(
+        final_properties["blob_ref"], second_properties["blob_ref"],
+        "the later completed response must retain its stored body"
+    );
+    assert!(
+        final_properties["etag"] == second_properties["etag"],
+        "validators must describe the response that supplied the stored body"
+    );
+    assert!(
+        final_properties["last_modified"] == second_properties["last_modified"],
+        "validators must describe the response that supplied the stored body"
+    );
+    let body_ref =
+        khive_storage::ContentRef::from_hex(final_properties["blob_ref"].as_str().unwrap())
+            .unwrap();
+    let stored_body = crate::blob_store(&runtime)
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(stored_body, b"response B body");
+    assert_eq!(final_properties["etag"], "response-b-etag");
+    assert_eq!(
+        final_properties["last_modified"],
+        "Wed, 23 Sep 2026 12:00:00 GMT"
+    );
+    assert_eq!(first_reply["lost_race"], true);
+    assert_eq!(second_reply["lost_race"], false);
+}

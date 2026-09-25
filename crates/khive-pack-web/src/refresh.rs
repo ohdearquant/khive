@@ -73,16 +73,20 @@ async fn apply_refresh_metadata(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
+    expected_content_ref: &str,
     status: u16,
     headers: &reqwest::header::HeaderMap,
     request_headers: &[(String, String)],
-) -> Result<(), RuntimeError> {
+) -> Result<bool, RuntimeError> {
     let entity = runtime
         .entities(token)?
         .get_entity(id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
-    let properties = entity.properties.unwrap_or(Value::Null);
+    let properties = entity.properties.clone().unwrap_or(Value::Null);
+    if properties.get("blob_ref").and_then(Value::as_str) != Some(expected_content_ref) {
+        return Ok(false);
+    }
     let mut patch = serde_json::Map::new();
     let mut entity_type = None;
     for (header, property) in [
@@ -116,9 +120,27 @@ async fn apply_refresh_metadata(
         patch.insert("request_headers".to_string(), json!(negotiation));
     }
     if !patch.is_empty() || entity_type.is_some() {
-        crate::entities::patch(runtime, token, id, entity_type, Value::Object(patch)).await?;
+        match runtime
+            .update_entity_if_unchanged(
+                token,
+                &entity,
+                khive_runtime::EntityPatch {
+                    entity_type: entity_type.map(|entity_type| Some(entity_type.to_string())),
+                    properties: Some(Value::Object(patch)),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
@@ -231,9 +253,35 @@ async fn settle_refresh_with_request_headers(
     id: Uuid,
     url_str: &str,
     stored_content_ref: &str,
+    outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
+    request_headers: &[(String, String)],
+) -> Result<Value, RuntimeError> {
+    settle_refresh_with_request_headers_after_body_settlement(
+        runtime,
+        token,
+        id,
+        url_str,
+        stored_content_ref,
+        outcome,
+        redirect_hops,
+        request_headers,
+        std::future::ready(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_refresh_with_request_headers_after_body_settlement(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    url_str: &str,
+    stored_content_ref: &str,
     mut outcome: HopOutcome,
     redirect_hops: &[crate::fetch::RedirectHop],
     request_headers: &[(String, String)],
+    after_body_settlement: impl std::future::Future<Output = ()>,
 ) -> Result<Value, RuntimeError> {
     let previous_receipt = latest_receipt(runtime, token, id).await?;
 
@@ -264,6 +312,9 @@ async fn settle_refresh_with_request_headers(
                     .map(str::to_owned)
             })
     };
+    let mut response_content_ref = final_stored_content_ref
+        .clone()
+        .unwrap_or_else(|| stored_content_ref.to_owned());
 
     // A redirected 304 validates the representation whose conditional
     // headers were sent, not an unfetched placeholder at the terminal URL.
@@ -327,6 +378,7 @@ async fn settle_refresh_with_request_headers(
 
     let mut changed = false;
     if let Some((source, content_ref, size)) = validated_cache {
+        response_content_ref = content_ref.to_string();
         let properties = source
             .properties
             .as_ref()
@@ -375,6 +427,7 @@ async fn settle_refresh_with_request_headers(
             let store = crate::blob_store(runtime)?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
+            response_content_ref = content_ref_str.clone();
             if Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref() {
                 changed = true;
                 let content_type = outcome
@@ -443,15 +496,18 @@ async fn settle_refresh_with_request_headers(
         }
     }
 
-    apply_refresh_metadata(
+    after_body_settlement.await;
+    let metadata_applied = apply_refresh_metadata(
         runtime,
         token,
         final_id,
+        &response_content_ref,
         outcome.status,
         &outcome.headers,
         request_headers,
     )
     .await?;
+    let lost_race = !metadata_applied;
 
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()
@@ -468,6 +524,7 @@ async fn settle_refresh_with_request_headers(
         "headers": crate::fetch::extract_allowed_headers(&outcome.headers),
         "request_headers": crate::fetch::negotiation_headers(request_headers),
         "changed": changed,
+        "lost_race": lost_race,
         "content_ref": new_content_ref,
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
@@ -500,6 +557,7 @@ async fn settle_refresh_with_request_headers(
         "id": id.to_string(),
         "status": outcome.status,
         "changed": changed,
+        "lost_race": lost_race,
         "receipt_id": receipt_id.to_string(),
         "redirects": redirect_hops.len() as u32,
         "final_id": final_id.to_string(),
