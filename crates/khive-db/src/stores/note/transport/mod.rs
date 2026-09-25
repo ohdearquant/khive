@@ -140,6 +140,7 @@ pub struct SenderRecord {
     pub receipt: Option<Value>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub admitted_at: Option<i64>,
 }
 
 fn invalid(message: &str) -> StorageError {
@@ -217,7 +218,7 @@ const COLUMNS: &str = concat!(
     "recipient_device_id, recipient_key_epoch, contact_generation, sender_key_epoch, ",
     "recipient_key_fingerprint, enc, ciphertext, state, attempt_count, next_retry_at, ",
     "last_failure_class, hold_reason, receipt, created_at, updated_at, envelope_seq, ",
-    "policy_mode, policy_revision, sender_assurance",
+    "policy_mode, policy_revision, sender_assurance, admitted_at",
 );
 fn unsigned_column(value: i64, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|error| {
@@ -288,6 +289,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SenderRecord> {
         envelope_seq: read_unsigned(row, 25)?,
         created_at: row.get(23)?,
         updated_at: row.get(24)?,
+        admitted_at: row.get(29)?,
     })
 }
 fn load(conn: &rusqlite::Connection, key: EnvelopeKey) -> rusqlite::Result<Option<SenderRecord>> {
@@ -354,6 +356,12 @@ const FAILURE_SQL: &str = concat!(
     "policy_revision=CASE WHEN ?4='pending' THEN policy_revision ELSE NULL END ",
     "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND ",
     "recipient_key_epoch=?3",
+);
+
+const ADMISSION_SQL: &str = concat!(
+    "UPDATE comm_sender_transport SET admitted_at=?4,next_retry_at=?5,updated_at=?6 ",
+    "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3 ",
+    "AND state='pending' AND hold_reason IS NULL",
 );
 
 const HOLD_SQL: &str = concat!(
@@ -575,6 +583,40 @@ impl SenderTransportStore {
                         sql_integer(attempts)?,
                         retry,
                         encode(&class),
+                        chrono::Utc::now().timestamp_micros()
+                    ],
+                )
+                .map_err(|e| map_err(e, op))?;
+                Ok(())
+            })
+            .await
+    }
+    /// Record a successful service admission and schedule resubmission 600 seconds later.
+    /// Re-admission of the same pending envelope replaces both timestamps.
+    pub async fn record_admission(&self, key: EnvelopeKey, admitted_at: i64) -> StorageResult<()> {
+        self.notes
+            .with_writer_tx_storage("sender_transport_admission", move |conn| {
+                let op = "sender_transport_admission";
+                let row = load(conn, key)
+                    .map_err(|e| map_err(e, op))?
+                    .ok_or_else(|| invalid("unknown sender record"))?;
+                if row.state != TransportState::Pending {
+                    return Err(invalid("sender record is not pending"));
+                }
+                if row.hold_reason.is_some() {
+                    return Err(invalid("sender record is held"));
+                }
+                let next_retry_at = admitted_at
+                    .checked_add(600_000_000)
+                    .ok_or_else(|| invalid("admission deadline exceeds SQLite integer range"))?;
+                conn.execute(
+                    ADMISSION_SQL,
+                    params![
+                        key.logical_message_id.to_string(),
+                        key.recipient_device_id.to_string(),
+                        sql_integer(key.recipient_key_epoch)?,
+                        admitted_at,
+                        next_retry_at,
                         chrono::Utc::now().timestamp_micros()
                     ],
                 )

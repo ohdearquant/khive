@@ -66,6 +66,178 @@ async fn idempotent_create_and_retry_preserve_bytes() {
 }
 
 #[tokio::test]
+async fn admission_sets_and_replaces_the_resubmission_deadline() {
+    let (backend, envelope) = fixture();
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(envelope.clone(), false).await.unwrap();
+
+    let admitted_at = 10_000_000;
+    let deadline = admitted_at + 600_000_000;
+    store
+        .record_admission(envelope.key(), admitted_at)
+        .await
+        .unwrap();
+    let record = store.get(envelope.key()).await.unwrap().unwrap();
+    assert_eq!(record.admitted_at, Some(admitted_at));
+    assert_eq!(record.next_retry_at, Some(deadline));
+    assert!(store
+        .list_pending("local", "khive", "local-device", deadline - 1, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_pending("local", "khive", "local-device", deadline, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let readmitted_at = 20_000_000;
+    let readmitted_deadline = readmitted_at + 600_000_000;
+    store
+        .record_admission(envelope.key(), readmitted_at)
+        .await
+        .unwrap();
+    let readmitted = store.get(envelope.key()).await.unwrap().unwrap();
+    assert_eq!(readmitted.admitted_at, Some(readmitted_at));
+    assert_eq!(readmitted.next_retry_at, Some(readmitted_deadline));
+    assert!(store
+        .list_pending("local", "khive", "local-device", deadline, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_pending("local", "khive", "local-device", readmitted_deadline, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn admission_time_survives_reopening_the_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sender-transport.sqlite3");
+    let admitted_at = 900_000_000;
+    let deadline = admitted_at + 600_000_000;
+    let envelope = {
+        let backend = crate::StorageBackend::sqlite(&path).unwrap();
+        crate::run_migrations(backend.pool().writer().unwrap().conn_mut()).unwrap();
+        let store = SenderTransportStore::new(backend.pool_arc());
+        let envelope = fixture().1;
+        store.create(envelope.clone(), false).await.unwrap();
+        store
+            .record_admission(envelope.key(), admitted_at)
+            .await
+            .unwrap();
+        drop(store);
+        drop(backend);
+        envelope
+    };
+
+    let reopened = crate::StorageBackend::sqlite(&path).unwrap();
+    crate::run_migrations(reopened.pool().writer().unwrap().conn_mut()).unwrap();
+    let store = SenderTransportStore::new(reopened.pool_arc());
+    let record = store.get(envelope.key()).await.unwrap().unwrap();
+    assert_eq!(record.admitted_at, Some(admitted_at));
+    assert_eq!(record.next_retry_at, Some(deadline));
+    assert!(store
+        .list_pending("local", "khive", "local-device", deadline - 1, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_pending("local", "khive", "local-device", deadline, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn admission_refuses_held_and_receipted_rows_without_mutation() {
+    let (backend, held_envelope) = fixture();
+    let held_store = SenderTransportStore::new(backend.pool_arc());
+    held_store
+        .create(held_envelope.clone(), false)
+        .await
+        .unwrap();
+    held_store
+        .record_admission(held_envelope.key(), 10_000_000)
+        .await
+        .unwrap();
+    held_store
+        .hold(held_envelope.key(), Some(HoldReason::InsufficientCredit))
+        .await
+        .unwrap();
+    let held_before = held_store.get(held_envelope.key()).await.unwrap().unwrap();
+    assert!(held_store
+        .record_admission(held_envelope.key(), 30_000_000)
+        .await
+        .is_err());
+    assert_eq!(
+        held_store.get(held_envelope.key()).await.unwrap(),
+        Some(held_before)
+    );
+
+    let (backend, receipted_envelope) = fixture();
+    let receipted_store = SenderTransportStore::new(backend.pool_arc());
+    receipted_store
+        .create(receipted_envelope.clone(), false)
+        .await
+        .unwrap();
+    receipted_store
+        .record_admission(receipted_envelope.key(), 10_000_000)
+        .await
+        .unwrap();
+    receipted_store
+        .accept_receipt(
+            receipted_envelope.key(),
+            TransportState::RecipientStored,
+            serde_json::json!({
+                "binding": {
+                    "protocol_version": receipted_envelope.protocol_version,
+                    "logical_message_id": receipted_envelope.logical_message_id,
+                    "sender_agent_id": receipted_envelope.sender_agent_id,
+                    "recipient_agent_id": receipted_envelope.recipient_agent_id,
+                    "recipient_device_id": receipted_envelope.recipient_device_id,
+                    "recipient_key_epoch": receipted_envelope.recipient_key_epoch,
+                    "contact_generation": receipted_envelope.contact_generation,
+                    "delivery_attempt_id": Uuid::new_v4(),
+                },
+                "disposition": "stored",
+                "signature": "test"
+            }),
+        )
+        .await
+        .unwrap();
+    let receipted_before = receipted_store
+        .get(receipted_envelope.key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(receipted_store
+        .record_admission(receipted_envelope.key(), 30_000_000)
+        .await
+        .is_err());
+    assert_eq!(
+        receipted_store.get(receipted_envelope.key()).await.unwrap(),
+        Some(receipted_before)
+    );
+    assert!(receipted_store
+        .list_pending("local", "khive", "local-device", i64::MAX, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn exact_slug_and_auth_hold_pending() {
     let (backend, envelope) = fixture();
     let store = SenderTransportStore::new(backend.pool_arc());

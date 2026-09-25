@@ -4812,14 +4812,18 @@ fn issue2673_v37_initializes_and_guards_entity_versions() {
 
 #[test]
 fn sender_transport_migration_fresh_and_previous_tail() {
-    for previous in [0, 39] {
+    for previous in [0, 40] {
         let mut conn = open_memory();
         if previous != 0 {
             migrate_through(&mut conn, previous);
         }
         run_migrations(&mut conn).unwrap();
         assert!(table_exists(&conn, "comm_sender_transport"));
-        for (name, kind) in [("policy_mode", "TEXT"), ("policy_revision", "INTEGER")] {
+        for (name, kind) in [
+            ("policy_mode", "TEXT"),
+            ("policy_revision", "INTEGER"),
+            ("admitted_at", "INTEGER"),
+        ] {
             let column: (String, i64) = conn
                 .query_row(
                     concat!(

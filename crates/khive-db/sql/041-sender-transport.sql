@@ -29,6 +29,7 @@ CREATE TABLE comm_sender_transport (
     receipt TEXT CHECK(receipt IS NULL OR json_valid(receipt)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    admitted_at INTEGER,
     CHECK((hold_reason IS 'policy_denied' AND policy_mode IS NOT NULL
            AND policy_revision IS NOT NULL)
        OR (hold_reason IS NOT 'policy_denied' AND policy_mode IS NULL

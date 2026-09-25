@@ -46,6 +46,7 @@ libc = { workspace = true }
 anyhow = { workspace = true }
 unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
+ring = "0.17.14"
 
 [dev-dependencies]
 khive-db = { version = "0.8.0", path = "../khive-db", features = ["test-support"] }

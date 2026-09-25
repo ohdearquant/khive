@@ -1295,6 +1295,7 @@ dependencies = [
  "lattice-embed",
  "libc",
  "parking_lot",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

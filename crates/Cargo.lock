@@ -2725,6 +2725,7 @@ dependencies = [
  "parking_lot",
  "proc-macro2",
  "quote",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
