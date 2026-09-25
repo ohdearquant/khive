@@ -1455,6 +1455,100 @@ slug already exists updates that row and preserves its UUID. If a different live
 namespace already claims the normalized identity through `source_uri` or an identity property,
 the request is ambiguous and fails before writes instead of creating a duplicate.
 
+## Amendment (2026-09-25): a section vector follows its embedding input
+
+**Status: Proposed (2026-09-25).** It binds only after maintainer sign-off.
+
+### Context
+
+"Sections as a dedicated table" defines the section embedding input as
+"`{atom_name}\n{heading}\n\n{content}`", and `embed_sections` in
+`crates/khive-pack-knowledge/src/knowledge/sections_index.rs` builds exactly that text. The same
+record promises the vector survives changes to two of those three inputs:
+
+- Governance: "Byte-identical content is an idempotent metadata refresh (status and embedding
+  preserved)".
+- Sections as a dedicated table: "Byte-identical sections retain their prior embedding (they were
+  updated via the `UNIQUE(atom_id, content_hash)` hit path, which does not clear `embedding`)".
+- The same section and Stage 4: "`knowledge.upsert_atoms` remains batch-only and does not perform
+  inline re-embed" and "`knowledge.upsert_atoms` is not changed".
+- The embedding-strategy table gives the section source text as "section body content", updated when
+  "that section's content edited".
+
+The code keeps those promises. When `knowledge.edit` resubmits unchanged content under a new
+heading, the content-hash hit branch in `crates/khive-pack-knowledge/src/knowledge/sections.rs`
+updates `heading`, `tokens`, `sort_order` and `updated_at` and keeps `embedding`. The inline pass that
+follows is non-forced and selects only rows whose `embedding IS NULL`, so it skips that row. An atom
+rename through `knowledge.upsert_atoms` (`crates/khive-pack-knowledge/src/knowledge/crud.rs`)
+rewrites `knowledge_atoms.name` and touches no section row. In both cases the stored vector keeps
+encoding the old heading or name until a forced `kkernel reindex` (#3237). The record contradicts
+itself: it cannot embed the heading and the atom name and also keep the vector when they change.
+
+### Decision
+
+1. A section's embedding input is `{atom_name}\n{heading}\n\n{content}`, truncated as this record
+   already specifies, and a stored vector is valid only for the input it was computed from.
+   `section_type`, `sort_order`, `status` and `tokens` are not inputs.
+2. Any write that changes a section's heading or content, or the name of its atom, clears that
+   section's `embedding` (sets it NULL) in the same transaction as the change. A write that leaves all
+   three inputs unchanged preserves the vector. Content changes already behave this way, because new
+   content is a new row whose embedding starts NULL.
+3. `knowledge.edit`: the content-hash hit branch clears the embedding when the stored heading differs
+   from the submitted one, and keeps it otherwise. The existing inline, atom-scoped pass then embeds
+   the cleared row in the same call, so an edit returns with a vector for its new heading whenever an
+   embedder is configured.
+4. Atom rename: whichever writer changes `knowledge_atoms.name` for an existing atom,
+   `knowledge.upsert_atoms` included, clears the embedding of every section of that atom in the same
+   transaction as the rename. `knowledge.upsert_atoms` stays batch-only and does not embed. The
+   cleared rows are filled by the next non-forced pass that reaches them: a `knowledge.edit` of that
+   atom, or a `kkernel reindex` of sections in its keep-existing mode.
+5. Until it is filled, a cleared section scores `section_cosine = 0.0`, the partial-coverage rule of
+   [ADR-051](ADR-051-section-embeddings-hybrid-compose.md). Its full-text row is maintained by the
+   section triggers and is not affected.
+6. The embedding-strategy table's section row reads accordingly: the source text is the input in
+   item 1, and the vector is invalidated when the section's heading or content, or its atom's name,
+   changes.
+
+Acceptance, stated before any implementation runs, with a deterministic test embedder:
+
+1. Edit a section with content X under heading H1 and record its vector; edit again with X under
+   H2. The stored vector equals the embedding of the H2 input, not the H1 input.
+2. Edit again with X under H2. The vector is unchanged and the embedder is not called for that row,
+   so arm 1 cannot pass by always re-embedding.
+3. Rename an atom through `knowledge.upsert_atoms`. Every section of that atom has a NULL embedding
+   after the call, and the embedder is not called during it. A following non-forced section reindex,
+   or a `knowledge.edit` of the atom, writes vectors equal to the embedding of the renamed input.
+4. A `knowledge.upsert_atoms` call that leaves the name unchanged leaves section vectors untouched.
+
+### Alternatives considered
+
+- **Re-embed inline in `knowledge.upsert_atoms`.** Reverses "batch-only, no inline re-embed", puts
+  embedder latency and embedder failures into a batch verb that does not call the embedder today, and
+  makes one rename cost one embedding per section of the atom.
+- **Keep the text and the stale vectors.** Contradicts this record's own embedding input and leaves
+  #3237 without a fix short of a forced reindex. A stale vector is worse than a missing one: ADR-051
+  defines what a missing vector scores, while a stale one scores on text the section no longer
+  carries and nothing marks it.
+- **Embed content only**, dropping the heading and the atom name from the input. The preservation
+  promises would then hold as written, but every stored vector would change meaning, which needs a
+  forced re-embed of the whole corpus, and the breadcrumb context this record adopted with ADR-051
+  phase 1 would be lost.
+- **Store a hash of the embedding input beside the vector and compare it at read time.** Detects a
+  stale vector whichever writer caused it, but needs a schema migration and a comparison on every
+  section-cosine read. Worth revisiting if per-model section vectors (#1511) make clearing one column
+  too coarse.
+
+### Consequences
+
+- The idempotent-refresh sentence under Governance and "Byte-identical sections retain their prior
+  embedding" narrow to byte-identical content under the same heading, with the atom name unchanged.
+- An atom rename leaves that atom's sections without vectors until the next edit or reindex. Their
+  section-cosine contribution falls to ADR-051's partial-coverage value in the meantime, instead of
+  being computed on the old name.
+- Atom-level vectors, built from the atom template, are outside this amendment.
+
+Refs: #3237, #11, #1511.
+
 ## References
 
 - [ADR-032](ADR-032-brain-profile-orchestration.md): Brain pack — profiles, posteriors, feedback

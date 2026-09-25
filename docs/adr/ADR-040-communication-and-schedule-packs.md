@@ -1,12 +1,16 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-07 — executable schedule recurrence)\
-**Date**: 2026-05-23 (amended 2026-08-07)\
+**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21 and 2026-09-24)\
+**Date**: 2026-05-23 (last amended 2026-09-24)\
 **Authors**: khive maintainers
 
 **Proposed amendment**: [inbox and thread limit disclosure](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
 adds three fields to successful read payloads upon acceptance. Existing decisions
 remain accepted; this proposed addition requires acceptance before implementation merges.
+
+**Proposed amendment**: [monthly recurrence keeps its day of month](#amendment-proposed-monthly-recurrence-keeps-its-day-of-month-2026-09-25)
+stores a monthly row's anchor so that a clamped short month no longer moves every later
+occurrence. It requires acceptance before implementation merges.
 
 ## Context
 
@@ -182,7 +186,7 @@ new response-level fields from either `comm.inbox` or `comm.thread`.
 paginated scan path. The scan reads the note store in 200-row pages (newest-first) and applies
 in-memory filters until `limit` matches are collected. To bound worst-case cost on very large
 stores (e.g. 1 M+ messages), the scan stops after at most **10 000 unfiltered rows**
-(`MAX_SCAN_TOTAL` in `khive-pack-kg/src/handlers.rs`).
+(`MAX_SCAN_TOTAL` in `khive-pack-kg/src/handlers/list.rs`).
 
 Callers with deep mailboxes should prefer the dedicated comm verbs, which are not subject to
 this cap:
@@ -387,6 +391,11 @@ delayed execution does not grant access to internal subhandlers.
 The pack returns `RuntimeError::InvalidInput` for every other expression. In particular,
 five-field cron is rejected because the pending-events executor cannot compute its next
 occurrence; accepted recurrence must never degrade silently to a one-shot.
+
+This subsection is superseded, first by the 2026-08-07 amendment and then by the
+[2026-09-21 amendment](#amendment-2026-09-21-interval-and-cron-recurrence-through-one-parser),
+whose table is the accepted grammar: it admits interval and five-field cron forms and states
+`monthly` as the previous trigger plus one calendar month, with month-end clamping.
 
 #### Trigger evaluation and execution
 
@@ -655,8 +664,8 @@ standard `delete(id)` path.
   impls.
 - `crates/khive-pack-schedule/src/handlers.rs`: `remind`, `schedule`, `agenda`, `cancel`
   handlers; executable recurrence validation; trigger-time payload storage.
-- `crates/khive-pack-schedule/src/schema.rs`: `idx_schedule_trigger` DDL.
-- `crates/kkernel/src/server.rs` (or pack registration): conditional `CommPack` and
+- `crates/khive-pack-schedule/src/vocab.rs`: `idx_schedule_trigger` DDL.
+- `crates/khive-mcp/src/serve.rs` (pack registration in `build_registry_for_multi_backend*`): conditional `CommPack` and
   `SchedulePack` registration from `RuntimeConfig::packs`.
 
 ## References
@@ -945,3 +954,91 @@ single and bulk opt-outs, an actor refusal with no content, degraded mark rows
 with no new message fields, and an unchanged `comm.mark_read` response. A
 mutation that drops the body, ignores the opt-out, or leaks fields on failure
 must make a targeted control fail.
+
+## Amendment (proposed): monthly recurrence keeps its day of month (2026-09-25)
+
+**Status**: proposed. Acceptance is required before dependent implementation merges.
+
+### Context
+
+The 2026-09-21 amendment states `monthly` as "The previous trigger plus one calendar month, with
+month-end clamping", and the code does exactly that. `Repeat::next_after` in
+`crates/khive-pack-schedule/src/repeat.rs` computes `current.checked_add_months(Months::new(1))`,
+`Repeat::first_after` steps through the same function for missed occurrences, and the executor
+(`next_trigger_at` and `advance_repeat_past_missed` in `crates/khive-mcp/src/pending_events.rs`)
+stores the result back as the row's `trigger_at`. The clamped date becomes the base of the next step,
+so a series created for the 31st runs Jan 31, Feb 28, Mar 28, Apr 28 and stays on the 28th from then
+on (#3322). Nothing on the row remembers the requested day: creation stores `trigger_at` and `repeat`
+(`crates/khive-pack-schedule/src/handlers.rs`), the executor overwrites `trigger_at` on every
+advance, and the creator provenance event records the event type but not the trigger.
+
+The base text of this record defined `monthly` as "Repeat on the same day-of-month each month", and
+the schedule pack's design document still does. The 2026-09-21 amendment was written to record that
+creation and the executor share one parser and to widen the grammar; its `monthly` row describes the
+implementation and gives no reason for the drift. This amendment decides the question on its merits.
+
+### Decision
+
+1. **`monthly` keeps its anchor's day of month.** The occurrences of a `monthly` row are its anchor
+   plus n calendar months, for n = 1, 2, ..., each clamped to the last day of its own month. A clamped
+   date is never the base of the next step: a row anchored on Jan 31 runs Feb 28 (29 in a leap year),
+   Mar 31, Apr 30, May 31. Time of day is the anchor's, and month arithmetic stays in UTC as today.
+2. **The anchor is stored.** Creating a `monthly` row records its creation `trigger_at` in a
+   schedule-managed property, `repeat_anchor`, beside `trigger_at`. It is written once and never
+   advanced. Generic update and merge already refuse schedule-managed notes, so it has the same
+   protection as `trigger_at`.
+3. **Advancement reads the anchor.** Normal advancement arms the first anchored occurrence strictly
+   after the row's current `trigger_at`. Missed-occurrence advancement arms the first anchored
+   occurrence strictly after `now`, stepping one occurrence at a time as ADR-106 Amendment G
+   specifies for the calendar aliases, and the missed occurrence itself is recorded as missed and
+   never dispatched. Both are computed from the row's own stored data; the tick's observed time is a
+   bound, never a base.
+4. **Rows without an anchor.** A `monthly` row created before this amendment has no
+   `repeat_anchor`. Its current `trigger_at` is used as the anchor, and the executor writes that
+   value as `repeat_anchor` in the same finalization that advances the row. A row that has not yet
+   clamped keeps its day from then on. A row that already clamped cannot be restored, because the
+   requested day is recorded nowhere on it; it stays on its current day, which is what it does today,
+   and does not drift further.
+5. **The other forms are unchanged.** `daily`, `weekly` and `every:` are fixed durations with nothing
+   to clamp, and cron occurrences are absolute positions of the pattern. None of them reads or writes
+   `repeat_anchor`.
+
+Acceptance, stated before any implementation runs:
+
+1. A row anchored on Jan 31 advances through Feb 28, Mar 31 and Apr 30 under normal advancement.
+2. A row whose Jan 31 occurrence is missed until a `now` in mid-March records Jan 31 as missed and
+   arms Mar 31. Mutation control: advancing from the previous `trigger_at` instead of the anchor turns
+   arms 1 and 2 red at Mar 28.
+3. A legacy row without `repeat_anchor` whose `trigger_at` is Jan 31 advances to Feb 28 and then to
+   Mar 31, and carries `repeat_anchor` after its first advance. A legacy row whose `trigger_at` is
+   Feb 28 advances to Mar 28.
+4. A generic `update` that tries to change `repeat_anchor` is refused as schedule-managed.
+5. `daily`, `weekly`, `every:` and cron fixtures advance exactly as before.
+
+### Alternatives considered
+
+- **Keep chained clamping** and align the design document with it. No stored field and no executor
+  change. It keeps a behaviour that no calendar convention uses: after the first short month the
+  requested day is lost for good, the row carries no record of it, and the person the reminder is for
+  cannot tell from the reminder that it moved.
+- **Skip months that lack the anchor day** (the iCalendar `BYMONTHDAY` reading). Nothing needs
+  clamping, but a series on the 31st fires in seven months of the year, and a `monthly` row stops
+  meaning one occurrence per month.
+- **Derive the anchor instead of storing it.** `created_at` is when the row was written, not the
+  requested trigger, and the provenance event does not carry the trigger, so no existing field holds
+  the value.
+
+### Consequences
+
+- One new schedule-managed property on `monthly` rows. It lives in the note's properties, so there
+  is no schema migration.
+- The 2026-09-21 amendment's `monthly` row and ADR-106 §7 ("computed from the row's own stored
+  `trigger_at`") read together with this amendment: the anchor becomes part of the stored data the
+  calendar step uses. ADR-106 Amendment F derives an occurrence's identity from the event id and the
+  scheduled instant, so each occurrence still has exactly one deterministic identity; an anchored
+  occurrence has a different instant (Mar 31) from the chained one (Mar 28).
+- The schedule pack's design document already describes `monthly` as "same day-of-month", which this
+  amendment makes accurate.
+- Rows that clamped before the change keep their clamped day.
+
+Refs: #3322.
