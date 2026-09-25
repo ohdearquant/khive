@@ -690,9 +690,9 @@ fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
 
 /// Full ADR-020 structural validation of parsed NDJSON records (#476).
 ///
-/// Checks entity kind validity, entity/edge timestamp validity, entity/edge
+/// Checks canonical entity kind and reserved property validity, entity/edge timestamp validity, entity/edge
 /// sort order (matching `write_sorted_entities`/`write_sorted_edges`), duplicate
-/// entity ids, duplicate edge ids, duplicate semantic edge triples
+/// entity ids, duplicate edge ids, duplicate canonical semantic edge triples
 /// (source, target, relation), dangling edge endpoints, and edge relation/weight
 /// validity. Called before any temp DB is created so a violation here leaves
 /// the existing target DB completely untouched.
@@ -700,8 +700,23 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
     let mut entity_ids: HashSet<Uuid> = HashSet::with_capacity(entities.len());
     let mut prev_entity_key: Option<String> = None;
     for (i, e) in entities.iter().enumerate() {
-        EntityKind::from_str(&e.kind)
+        let kind = EntityKind::from_str(&e.kind)
             .map_err(|_| anyhow!("entity {i} ({}): unknown kind {:?}", e.id, e.kind))?;
+        // The parser accepts aliases for interactive callers, but NDJSON is a
+        // canonical archive. Persisting an alias verbatim makes kind filters
+        // and the post-sync snapshot disagree with runtime-owned records.
+        if e.kind != kind.name() {
+            bail!(
+                "entity {i} ({}): non-canonical kind {:?}; use {:?}",
+                e.id,
+                e.kind,
+                kind.name()
+            );
+        }
+        // ADR-115 Amendment 1 §3 reserves this runtime-owned key on every
+        // properties-bearing write path, including NDJSON sync.
+        khive_runtime::secret_gate::reject_reserved_secret_gate_property(e.properties.as_ref())
+            .map_err(|error| anyhow!("entity {i} ({}) properties rejected: {error}", e.id))?;
         if e.name.trim().is_empty() {
             bail!("entity {i} ({}): name must be a non-blank name", e.id);
         }
@@ -766,7 +781,12 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
                 .map_err(|e| anyhow!("edge {i} ({}) properties rejected: {e}", r.edge_id))?;
         }
 
-        if !triples.insert((r.source, r.target, relation)) {
+        let (source, target) = if relation.is_symmetric() && r.target < r.source {
+            (r.target, r.source)
+        } else {
+            (r.source, r.target)
+        };
+        if !triples.insert((source, target, relation)) {
             bail!(
                 "edge {i} ({}): duplicate edge triple (source={}, target={}, relation={:?})",
                 r.edge_id,
@@ -1550,6 +1570,39 @@ mod tests {
         assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "unknown kind").await;
     }
 
+    /// The normal parser accepts aliases, but sync must not store one as the
+    /// base kind: kind-filtered reads and a subsequent export use canonical
+    /// names. Both the subtype alias and a case variant failed open before.
+    #[tokio::test]
+    async fn sync_rejects_noncanonical_entity_kind_before_db_write() {
+        let id = "11111111-1111-1111-1111-111111111111";
+        for (input, canonical) in [("Paper", "document"), ("Concept", "concept")] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path();
+            let db_path = repo.join(".khive/state/working.db");
+            let entities = format!(
+                r#"{{"id":"{id}","kind":"{input}","name":"Alias","properties":{{}},"tags":[]}}"#
+            );
+            let expected = format!("non-canonical kind {input:?}; use {canonical:?}");
+            assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", &expected).await;
+        }
+    }
+
+    /// ADR-115 Amendment 1 §3 applies to entity properties as well as edge
+    /// properties. The sentinel proves this is rejected before DB replacement.
+    #[tokio::test]
+    async fn sync_rejects_entity_with_reserved_secret_gate_property_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities = format!(
+            r#"{{"id":"{id}","kind":"concept","name":"A","properties":{{"khive:secret_gate":"exempted:content-sha256-manifest-v1"}},"tags":[]}}"#
+        );
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "khive:secret_gate")
+            .await;
+    }
+
     #[tokio::test]
     async fn sync_rejects_whitespace_only_entity_name_before_db_write() {
         let tmp = TempDir::new().unwrap();
@@ -1658,6 +1711,39 @@ mod tests {
             "duplicate edge triple",
         )
         .await;
+    }
+
+    /// Both lateral relations are symmetric in storage. A reversed pair is
+    /// therefore the same semantic triple even when edge IDs differ.
+    #[tokio::test]
+    async fn sync_rejects_reversed_symmetric_edge_triples_before_db_write() {
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id_1 = "33333333-3333-3333-3333-333333333333";
+        let edge_id_2 = "44444444-4444-4444-4444-444444444444";
+        for relation in ["competes_with", "composed_with"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path();
+            let db_path = repo.join(".khive/state/working.db");
+            let edges = [
+                format!(r#"{{"edge_id":"{edge_id_1}","source":"{id_a}","target":"{id_b}","relation":"{relation}","weight":0.5,"properties":{{}}}}"#),
+                format!(r#"{{"edge_id":"{edge_id_2}","source":"{id_b}","target":"{id_a}","relation":"{relation}","weight":0.9,"properties":{{}}}}"#),
+            ]
+            .join("\n");
+            assert_sync_rejected_before_db_write(
+                repo,
+                &db_path,
+                &entities,
+                &edges,
+                "duplicate edge triple",
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
