@@ -367,7 +367,7 @@ impl KgPack {
             resolve_uuid_unfiltered(&p.id, &self.runtime, token).await?
         };
         let owner = registry
-            .resolve_entity_delete_runtime(&self.runtime, token, id, hard)
+            .resolve_entity_delete_runtime(&self.runtime, token, id)
             .await?;
         let target = KgPack::new(owner.unwrap_or_else(|| self.runtime.clone()));
         let spec: Option<KindSpec> = match explicit_spec {
@@ -459,6 +459,12 @@ impl KgPack {
                 let deleted = target.runtime.delete_entity(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
+                }
+                let core = target.runtime.core();
+                if hard && target.runtime.backend_id() != core.backend_id() {
+                    registry
+                        .cleanup_deleted_entity_attachments(&target.runtime, token, id)
+                        .await?;
                 }
                 to_json(
                     &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),

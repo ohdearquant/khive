@@ -8,8 +8,11 @@ use khive_runtime::engine_config::WebSectionConfig;
 use khive_runtime::{
     BackendId, KhiveRuntime, PackRegistry, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::{EdgeFilter, Entity, EntityFilter, PageRequest};
-use khive_types::Namespace;
+use khive_storage::{
+    EdgeFilter, Entity, EntityFilter, EventFilter, PageRequest, TextFilter, TextQueryMode,
+    TextSearchRequest,
+};
+use khive_types::{EventKind, Namespace};
 use serde_json::json;
 use std::{collections::HashMap, path::Path, sync::Arc};
 
@@ -512,6 +515,114 @@ async fn routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments()
     }
 }
 
+#[tokio::test]
+async fn routed_delete_cleanup_retry_keeps_indexes_and_event_consistent() {
+    let fixture = Fixture::new();
+    fixture.ingest().await;
+    let entity = fetched_entities(&fixture.routed)
+        .await
+        .into_iter()
+        .find(|entity| entity.entity_type.as_deref() == Some("page"))
+        .unwrap();
+    let token = fixture.main.authorize(Namespace::local()).unwrap();
+    assert!(fixture
+        .routed
+        .text(&token)
+        .unwrap()
+        .search(TextSearchRequest {
+            query: "routed".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(TextFilter {
+                namespaces: vec!["local".to_string()],
+                ..Default::default()
+            }),
+            top_k: 10,
+            snippet_chars: 100,
+        })
+        .await
+        .unwrap()
+        .iter()
+        .any(|hit| hit.subject_id == entity.id));
+
+    {
+        let writer = fixture.main_backend.pool().try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_attachment_cleanup BEFORE DELETE ON attachments \
+                 WHEN OLD.record_uuid = '{}' AND OLD.substrate = 'entity' \
+                 BEGIN SELECT RAISE(ABORT, 'injected attachment cleanup failure'); END;",
+                entity.id
+            ))
+            .unwrap();
+    }
+    let first = fixture
+        .registry
+        .dispatch("delete", json!({ "id": entity.id, "hard": true }))
+        .await
+        .unwrap_err();
+    assert!(first
+        .to_string()
+        .contains("injected attachment cleanup failure"));
+    {
+        let writer = fixture.main_backend.pool().try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch("DROP TRIGGER fail_attachment_cleanup")
+            .unwrap();
+    }
+
+    let retry = fixture
+        .registry
+        .dispatch("delete", json!({ "id": entity.id, "hard": true }))
+        .await
+        .unwrap();
+    assert_eq!(retry["deleted"], true);
+    assert_eq!(retry["attachment_cleanup"], true);
+    assert!(fixture
+        .main
+        .attachments()
+        .unwrap()
+        .list_attachments(entity.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(fixture
+        .routed
+        .text(&token)
+        .unwrap()
+        .search(TextSearchRequest {
+            query: "routed".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(TextFilter {
+                namespaces: vec!["local".to_string()],
+                ..Default::default()
+            }),
+            top_k: 10,
+            snippet_chars: 100,
+        })
+        .await
+        .unwrap()
+        .iter()
+        .all(|hit| hit.subject_id != entity.id));
+    let events = fixture
+        .routed
+        .events(&token)
+        .unwrap()
+        .query_events(
+            EventFilter {
+                target_id: Some(entity.id),
+                kinds: vec![EventKind::EntityDeleted],
+                ..Default::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(events.len(), 1);
+}
+
 // Deletion must retain kind guards and attribute the caller without filtering record ownership.
 #[tokio::test]
 async fn routed_delete_preserves_kind_guards_and_namespace_agnostic_lookup() {
@@ -626,6 +737,118 @@ async fn routed_delete_refuses_duplicate_entity_ids_without_removing_body_roots(
             .unwrap()
             .is_some());
     }
+    assert_eq!(
+        fixture
+            .main
+            .attachments()
+            .unwrap()
+            .list_attachments(entity.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn routed_delete_refuses_live_entity_with_duplicate_tombstone() {
+    let fixture = Fixture::new();
+    fixture.ingest().await;
+    let entity = fetched_entities(&fixture.routed)
+        .await
+        .into_iter()
+        .find(|entity| entity.entity_type.as_deref() == Some("page"))
+        .unwrap();
+    let token = fixture.main.authorize(Namespace::local()).unwrap();
+    fixture
+        .main
+        .entities(&token)
+        .unwrap()
+        .upsert_entity(entity.clone())
+        .await
+        .unwrap();
+    assert!(fixture
+        .main
+        .delete_entity(&token, entity.id, false)
+        .await
+        .unwrap());
+    assert!(fixture
+        .main
+        .entities(&token)
+        .unwrap()
+        .get_entity(entity.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(fixture
+        .main
+        .entities(&token)
+        .unwrap()
+        .get_entity_including_deleted(entity.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    for hard in [false, true] {
+        let error = fixture
+            .registry
+            .dispatch("delete", json!({ "id": entity.id, "hard": hard }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple backends"));
+        assert!(fixture
+            .routed
+            .entities(&token)
+            .unwrap()
+            .get_entity(entity.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            fixture
+                .main
+                .attachments()
+                .unwrap()
+                .list_attachments(entity.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_routed_delete_preserves_root_of_other_live_owner() {
+    let fixture = Fixture::new();
+    fixture.ingest().await;
+    let entity = fetched_entities(&fixture.routed)
+        .await
+        .into_iter()
+        .find(|entity| entity.entity_type.as_deref() == Some("page"))
+        .unwrap();
+    let token = fixture.main.authorize(Namespace::local()).unwrap();
+    fixture
+        .main
+        .entities(&token)
+        .unwrap()
+        .upsert_entity(entity.clone())
+        .await
+        .unwrap();
+
+    assert!(fixture
+        .routed
+        .delete_entity(&token, entity.id, true)
+        .await
+        .unwrap());
+    assert!(fixture
+        .main
+        .entities(&token)
+        .unwrap()
+        .get_entity(entity.id)
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(
         fixture
             .main

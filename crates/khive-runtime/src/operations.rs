@@ -5734,6 +5734,7 @@ impl KhiveRuntime {
     /// On hard delete, cascades to remove all incident edges (both inbound and
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
+    /// Routed attachment cleanup is performed by the registry after ownership resolution.
     ///
     /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     pub async fn delete_entity(
@@ -5784,11 +5785,7 @@ impl KhiveRuntime {
                     SubstrateKind::Entity,
                 )
                 .await?;
-            // ADR-191 A1.2: commit the record first. A failed core cleanup may
-            // leak an orphan root, but must never unroot a still-live entity.
-            if deleted && self.backend_id() != self.core().backend_id() {
-                self.delete_entity_attachments_on_core(id).await?;
-            }
+            // Cross-backend attachment cleanup requires the registry's ownership check.
             self.remove_from_indexes(&record_tok, id).await?;
             deleted
         } else {
