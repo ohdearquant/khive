@@ -811,7 +811,17 @@ async fn remote_push_rejects_every_force_and_omission_before_network() {
         p.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        f.refusal(&f.actor, "git.push", p, "invalid_params").await;
+        let unknown = extra.as_object().unwrap().keys().next().unwrap();
+        let receipt = f
+            .refusal(
+                &f.actor,
+                "git.push",
+                p,
+                &format!("unknown field `{unknown}`"),
+            )
+            .await;
+        assert_eq!(receipt.reason.as_deref(), Some("invalid_params"));
+        assert!(!receipt.to_value().to_string().contains(SECRET));
     }
     let mut p = f.push();
     p.as_object_mut().unwrap().remove("expected_remote");

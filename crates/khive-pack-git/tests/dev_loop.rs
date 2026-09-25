@@ -593,7 +593,10 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
             }
             params["program"] = json!(f.git);
             let error = f.err(verb, params.clone()).await;
-            assert!(error.contains("invalid_params"), "{verb} {params}: {error}");
+            assert!(
+                error.contains("unknown field `program`"),
+                "{verb} {params}: {error}"
+            );
         }
     }
     assert_eq!(f.git_bytes(&["show-ref"]), refs);
