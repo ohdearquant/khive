@@ -466,7 +466,7 @@ fn spawn_email_channel_loops(
             let verb_reg = server.verb_registry_clone();
             let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
-            let default_actor = default_inbound_actor_from_env();
+            let default_actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR");
             let mut allowlist = allowed_recipients_from_env();
             if allowlist.is_empty() {
                 allowlist.push(email_ch.maintainer_address().to_string());
@@ -562,14 +562,14 @@ fn ingest_namespace_from_env() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// Resolve the default inbound actor for fresh (uncorrelated) email messages.
+/// Resolve the default inbound actor for fresh (uncorrelated) channel messages.
 ///
-/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"local"` when the
-/// variable is unset or blank. Called once at server startup alongside
-/// `ingest_namespace_from_env`, and defaults to the same neutral value.
-#[cfg(feature = "channel-email")]
-fn default_inbound_actor_from_env() -> String {
-    std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
+/// Reads the supplied environment variable; falls back to `"local"` when it
+/// is unset or blank. Called once at server startup and defaults to the same
+/// neutral value as the ingest namespace.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn default_inbound_actor_from_env(actor_variable: &str) -> String {
+    std::env::var(actor_variable)
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "local".to_string())
@@ -1912,10 +1912,12 @@ fn spawn_telegram_channel_loops(
             let tg_ch = Arc::new(tg_ch);
             let verb_reg = server.verb_registry_clone();
             let ingest_ns = telegram_ingest_namespace_from_env();
+            let default_actor = default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR");
 
             let verb_reg_poll = verb_reg.clone();
             let outbox_runtime = server.channel_outbox_runtime_clone();
             let ingest_ns_poll = ingest_ns.clone();
+            let default_actor_poll = default_actor.clone();
             let ingest_ns_outbox = ingest_ns.clone();
             let tg_ch_poll = Arc::clone(&tg_ch);
             let tg_ch_outbox = Arc::clone(&tg_ch);
@@ -1938,6 +1940,7 @@ fn spawn_telegram_channel_loops(
                                 tg_ch_poll,
                                 verb_reg_poll,
                                 ingest_ns_poll,
+                                default_actor_poll,
                                 khive_runtime::daemon_shutdown_token(),
                             )
                             .await;
@@ -2036,6 +2039,7 @@ async fn telegram_poll_loop(
     telegram_channel: std::sync::Arc<impl TelegramPollChannel>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
+    default_inbound_actor: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     use chrono::Utc;
@@ -2082,13 +2086,14 @@ async fn telegram_poll_loop(
                         "channel_slug": &slug,
                         "external_id": env.external_id.clone(),
                         "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
+                        "default_inbound_actor": default_inbound_actor,
                     });
                     if let Err(error) = registry.dispatch("comm.ingest", params).await {
                         let handled = handle_channel_ingest_failure(
                             &registry,
                             &ingest_namespace,
                             kind,
-                            None,
+                            Some(&default_inbound_actor),
                             &env,
                             &error,
                             &mut unknown_ingest_attempts,
@@ -9968,7 +9973,7 @@ region = "us-east-1"
         fn default_inbound_actor_defaults_to_local() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(
-                default_inbound_actor_from_env(),
+                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR"),
                 "local",
                 "an unset actor must resolve to the neutral namespace, not to any particular \
                  deployment's identity"
@@ -9979,7 +9984,7 @@ region = "us-east-1"
         #[serial]
         fn default_inbound_actor_reads_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
-            let actor = default_inbound_actor_from_env();
+            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR");
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "lambda:mybot");
         }
@@ -9988,9 +9993,148 @@ region = "us-east-1"
         #[serial]
         fn default_inbound_actor_ignores_blank_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
-            let actor = default_inbound_actor_from_env();
+            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR");
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "local", "blank env var must fall back to default");
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    mod telegram_default_actor_routing_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        struct OneMessageChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+            shutdown: CancellationToken,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageChannel {
+            fn kind(&self) -> &'static str {
+                "telegram"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                let envelope = self.envelope.lock().unwrap().take();
+                if envelope.is_none() {
+                    self.shutdown.cancel();
+                }
+                Ok(envelope.into_iter().collect())
+            }
+        }
+
+        impl TelegramPollChannel for OneMessageChannel {
+            fn commit_offset(&self) {
+                self.shutdown.cancel();
+            }
+        }
+
+        fn registry_for_actor(actor: &str) -> VerbRegistry {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_actor_id(Some(actor.to_string()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime,
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
+            builder.build().expect("registry builds")
+        }
+
+        async fn run_poll_once(default_actor: String, reader_actor: &str) -> serde_json::Value {
+            let registry = registry_for_actor(reader_actor);
+            let shutdown = CancellationToken::new();
+            let channel = Arc::new(OneMessageChannel {
+                envelope: Mutex::new(Some(
+                    ChannelEnvelope::new(
+                        "telegram:maintainer",
+                        "telegram:bot",
+                        "telegram routing check",
+                    )
+                    .with_external_id("telegram-routing-check"),
+                )),
+                shutdown: shutdown.clone(),
+            });
+
+            telegram_poll_loop(
+                channel,
+                registry.clone(),
+                "local".to_string(),
+                default_actor,
+                shutdown,
+            )
+            .await;
+
+            registry
+                .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                .await
+                .expect("inbox query succeeds")
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn telegram_poll_loop_delivers_uncorrelated_message_to_local_inbox_by_default() {
+            std::env::remove_var("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let actor = default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            let inbox = run_poll_once(actor, "local").await;
+            let messages = inbox["messages"].as_array().expect("messages array");
+
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["content"] == "telegram routing check"),
+                "local inbox must list the uncorrelated Telegram message; got {messages:?}"
+            );
+            assert_eq!(
+                messages[0]["properties"]["to_actor"], "local",
+                "the default route must be stored on the ingested message"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn telegram_poll_loop_delivers_uncorrelated_message_to_configured_actor_inbox() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            std::env::set_var("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:receiver");
+            let actor = default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            let inbox = run_poll_once(actor, "telegram:receiver").await;
+            let messages = inbox["messages"].as_array().expect("messages array");
+            std::env::remove_var("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["content"] == "telegram routing check"),
+                "configured actor inbox must list the uncorrelated Telegram message; got {messages:?}"
+            );
+            assert_eq!(
+                messages[0]["properties"]["to_actor"], "telegram:receiver",
+                "the configured route must be stored on the ingested message"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn telegram_default_actor_ignores_blank_env_var() {
+            std::env::set_var("KHIVE_TELEGRAM_DEFAULT_ACTOR", "  ");
+            let actor = default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            std::env::remove_var("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            assert_eq!(actor, "local", "blank env var must fall back to local");
         }
     }
 
