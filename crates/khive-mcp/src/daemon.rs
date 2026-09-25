@@ -2873,6 +2873,309 @@ mod tests {
         KhiveRuntime, Namespace, RuntimeConfig,
     };
 
+    const PRIMARY_MODEL: lattice_embed::EmbeddingModel =
+        lattice_embed::EmbeddingModel::AllMiniLmL6V2;
+    const EXTRA_MODEL: lattice_embed::EmbeddingModel = lattice_embed::EmbeddingModel::BgeSmallEnV15;
+    const SECOND_EXTRA_MODEL: lattice_embed::EmbeddingModel =
+        lattice_embed::EmbeddingModel::BgeBaseEnV15;
+
+    struct FixedModelService {
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for FixedModelService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![0.25; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "configured-test-embedder"
+        }
+    }
+
+    struct FixedModelProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for FixedModelProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(
+            &self,
+        ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+            Ok(Arc::new(FixedModelService {
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    fn embedding_runtime_config(extras: &[lattice_embed::EmbeddingModel]) -> RuntimeConfig {
+        let mut config = memory_runtime_config();
+        config.default_namespace = Namespace::parse("test").unwrap();
+        config.packs = vec!["kg".to_string(), "memory".to_string()];
+        config.embedding_model = Some(PRIMARY_MODEL);
+        config.additional_embedding_models = extras.to_vec();
+        config
+    }
+
+    fn install_test_embedders(runtime: &KhiveRuntime, config: &RuntimeConfig) {
+        let models = config
+            .embedding_model
+            .into_iter()
+            .chain(config.additional_embedding_models.iter().copied());
+        for model in models {
+            runtime.register_embedder(FixedModelProvider {
+                name: model.to_string(),
+                dimensions: model.dimensions(),
+            });
+        }
+    }
+
+    async fn start_embedding_daemon(
+        extras: &[lattice_embed::EmbeddingModel],
+    ) -> (
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+        KhiveRuntime,
+        crate::server::KhiveMcpServer,
+        std::path::PathBuf,
+    ) {
+        clear_daemon_env();
+        let config = embedding_runtime_config(extras);
+        let runtime = KhiveRuntime::new(config.clone()).expect("embedding runtime");
+        install_test_embedders(&runtime, &config);
+        let inspect_runtime = runtime.clone();
+        let server = crate::server::KhiveMcpServer::new(runtime).expect("embedding server");
+        let dir = tempfile::tempdir().expect("daemon tempdir");
+        let socket = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &socket);
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        let daemon_server = server.clone();
+        let daemon = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let ready = connect_when_ready(&socket).await;
+        drop(ready);
+        (dir, daemon, inspect_runtime, server, socket)
+    }
+
+    fn embedding_request_frame(ops: &str, config_id: String) -> DaemonRequestFrame {
+        DaemonRequestFrame {
+            plan: false,
+            ops: ops.to_owned(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id,
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: true,
+            request_id: None,
+        }
+    }
+
+    /// The namespace a successful daemon `create` wrote into, read from its
+    /// response, so vector counts look where the write landed.
+    fn created_namespace(response: &DaemonResponseFrame) -> String {
+        assert!(response.ok, "create failed: {:?}", response.error);
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.as_deref().expect("create response"))
+                .expect("JSON response");
+        assert_eq!(result["results"][0]["ok"], true, "{result}");
+        result["results"][0]["result"]["namespace"]
+            .as_str()
+            .expect("created note namespace")
+            .to_owned()
+    }
+
+    async fn vector_count(runtime: &KhiveRuntime, namespace: &str, model: &str) -> u64 {
+        let token = runtime
+            .authorize(Namespace::parse(namespace).unwrap())
+            .expect("note namespace token");
+        runtime
+            .vectors_for_model(&token, model)
+            .expect("model vector store")
+            .count()
+            .await
+            .expect("vector count")
+    }
+
+    async fn stop_embedding_daemon(daemon: tokio::task::JoinHandle<()>) {
+        daemon.abort();
+        let _ = daemon.await;
+        clear_daemon_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_omits_vectors_for_undeclared_extra_models() {
+        let (_dir, daemon, runtime, server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+        let client_config = embedding_runtime_config(&[]);
+        let client_id = crate::server::compute_config_id(&client_config, None);
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"client model scope\")",
+                client_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&response);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1,
+            "the client's primary model must receive the note vector"
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            0,
+            "a daemon-only extra must not receive the note vector"
+        );
+        assert_eq!(
+            server.config_id(),
+            crate::server::compute_config_id(&embedding_runtime_config(&[EXTRA_MODEL]), None)
+        );
+        stop_embedding_daemon(daemon).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_uses_only_client_declared_extra_models() {
+        let (_dir, daemon, runtime, _server, socket) =
+            start_embedding_daemon(&[EXTRA_MODEL, SECOND_EXTRA_MODEL]).await;
+        let client_config = embedding_runtime_config(&[EXTRA_MODEL]);
+        let client_id = crate::server::compute_config_id(&client_config, None);
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"declared extra scope\")",
+                client_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&response);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &SECOND_EXTRA_MODEL.to_string()).await,
+            0,
+            "the daemon's second extra is outside the client's declaration"
+        );
+
+        stop_embedding_daemon(daemon).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn equal_configuration_keeps_the_daemons_full_embedder_set() {
+        let (_dir, daemon, runtime, server, socket) =
+            start_embedding_daemon(&[EXTRA_MODEL, SECOND_EXTRA_MODEL]).await;
+        let equal_id = server.config_id().to_owned();
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"equal configuration scope\")",
+                equal_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&response);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &SECOND_EXTRA_MODEL.to_string()).await,
+            1
+        );
+        stop_embedding_daemon(daemon).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_treats_an_undeclared_explicit_model_as_unknown() {
+        let (_dir, daemon, runtime, _server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+        let client_id = crate::server::compute_config_id(&embedding_runtime_config(&[]), None);
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "memory.remember(content=\"outside the client model set\", memory_type=\"semantic\", embedding_model=\"bge-small-en-v1.5\")",
+                client_id.clone(),
+            ),
+        )
+        .await;
+        assert!(response.ok, "MCP dispatch failed: {:?}", response.error);
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.as_deref().expect("remember response"))
+                .expect("JSON response");
+        let entry = &result["results"][0];
+        assert_eq!(entry["ok"], false, "{result}");
+        assert!(
+            entry
+                .to_string()
+                .contains("unknown embedding model: bge-small-en-v1.5"),
+            "the explicit model must have the in-process unknown-model result: {entry}"
+        );
+        // A declared write through the same client lands one primary vector, so
+        // the counts below read the namespace this client's writes use.
+        let anchor = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"declared model anchor\")",
+                client_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&anchor);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            0
+        );
+        stop_embedding_daemon(daemon).await;
+    }
+
     fn memory_runtime_config() -> RuntimeConfig {
         KhiveRuntime::memory()
             .expect("memory runtime")

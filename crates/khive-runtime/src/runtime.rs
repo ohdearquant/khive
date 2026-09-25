@@ -3,7 +3,8 @@
 //! `RuntimeConfig`, `BackendId`, `NamespaceToken`, and embedding model helpers
 //! live in `super::config` and are re-exported from here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use khive_db::StorageBackend;
@@ -23,6 +24,44 @@ use crate::config::{
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::pack::KindHook;
+
+tokio::task_local! {
+    static REQUEST_EMBEDDER_EXCLUSIONS: Arc<HashSet<String>>;
+}
+
+/// Run one request with daemon-only embedding models excluded from registry access.
+pub fn scope_request_embedder_exclusions<F>(
+    excluded: Vec<String>,
+    future: F,
+) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    REQUEST_EMBEDDER_EXCLUSIONS.scope(Arc::new(excluded.into_iter().collect()), future)
+}
+
+/// Carry the current request's embedder exclusions into a spawned task.
+pub fn inherit_request_embedder_scope<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let exclusions = REQUEST_EMBEDDER_EXCLUSIONS.try_with(Arc::clone).ok();
+    async move {
+        match exclusions {
+            Some(exclusions) => REQUEST_EMBEDDER_EXCLUSIONS.scope(exclusions, future).await,
+            None => future.await,
+        }
+    }
+}
+
+fn request_excludes_embedder(name: &str) -> bool {
+    let canonical = parse_embedding_model_alias(name)
+        .map(|model| model.to_string())
+        .unwrap_or_else(|| name.to_string());
+    REQUEST_EMBEDDER_EXCLUSIONS
+        .try_with(|excluded| excluded.contains(&canonical))
+        .unwrap_or(false)
+}
 
 /// Callback type for pack-installed entity-type validators.
 ///
@@ -911,6 +950,9 @@ impl KhiveRuntime {
     /// Resolve the storage identity and declared dimensions together so guarded
     /// SQL publication agrees with VectorStore, including built-in aliases.
     pub(crate) fn vector_model_metadata(&self, model_name: &str) -> RuntimeResult<(String, usize)> {
+        if request_excludes_embedder(model_name) {
+            return Err(crate::RuntimeError::UnknownModel(model_name.to_string()));
+        }
         let registry = self
             .embedder_registry
             .read()
@@ -1042,6 +1084,9 @@ impl KhiveRuntime {
     /// custom provider's declared `dimensions()`. `None` when no such model
     /// is registered.
     pub fn embedder_dimensions(&self, model_name: &str) -> Option<usize> {
+        if request_excludes_embedder(model_name) {
+            return None;
+        }
         if let Some(model) = parse_embedding_model_alias(model_name) {
             let key = model.to_string();
             let in_registry = self
@@ -1786,6 +1831,12 @@ impl KhiveRuntime {
                 .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?,
         };
         let key = model.to_string();
+        if request_excludes_embedder(&key) {
+            return Err(crate::RuntimeError::UnknownModel(
+                name.unwrap_or_else(|| self.default_embedder_name())
+                    .to_string(),
+            ));
+        }
         let contains = self
             .embedder_registry
             .read()
@@ -1810,7 +1861,12 @@ impl KhiveRuntime {
     pub fn registered_embedding_model_names(&self) -> Vec<String> {
         self.embedder_registry
             .read()
-            .map(|reg| reg.names())
+            .map(|reg| {
+                reg.names()
+                    .into_iter()
+                    .filter(|name| !request_excludes_embedder(name))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1849,6 +1905,9 @@ impl KhiveRuntime {
             Some(model) => model.to_string(),
             None => name.to_owned(),
         };
+        if request_excludes_embedder(&canonical_key) {
+            return Err(crate::RuntimeError::UnknownModel(name.to_string()));
+        }
         // Clone the entry so we don't hold the RwLockGuard across the
         // async OnceCell initialisation (Send bound).
         let entry = {

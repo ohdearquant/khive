@@ -572,6 +572,32 @@ fn extra_embedder_set(extra: &str) -> std::collections::BTreeSet<&str> {
     extra.split(',').filter(|name| !name.is_empty()).collect()
 }
 
+/// Return daemon-configured extra models that are absent from a compatible client configuration.
+pub fn config_id_extra_embedder_exclusions(
+    client_id: &str,
+    daemon_id: &str,
+) -> Option<Vec<String>> {
+    if client_id == daemon_id {
+        return Some(Vec::new());
+    }
+    let client = parse_config_id(client_id)?;
+    let daemon = parse_config_id(daemon_id)?;
+    let client_extras = extra_embedder_set(client.extra);
+    let daemon_extras = extra_embedder_set(daemon.extra);
+    Some(
+        daemon_extras
+            .difference(&client_extras)
+            .map(|name| {
+                serde_json::from_value::<lattice_embed::EmbeddingModel>(serde_json::Value::String(
+                    (*name).to_string(),
+                ))
+                .map(|model| model.to_string())
+                .unwrap_or_else(|_| (*name).to_string())
+            })
+            .collect(),
+    )
+}
+
 /// Whether a daemon configuration can serve a client's requested runtime.
 /// Every fingerprint field must match except that the daemon may have more
 /// configured extra embedding models than the client requested.
@@ -1831,20 +1857,26 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         // nested scope keeps the earlier deadline, so the allowance must be
         // granted here or a long poll times out at the operator ceiling.
         let read_timeout = dispatcher.request_read_timeout(&frame.ops);
-        let dispatch = khive_storage::scope_request_read_cancellation(
-            shutdown,
+        let excluded_embedder_names =
+            config_id_extra_embedder_exclusions(&frame.config_id, dispatcher.config_id())
+                .expect("compatible configuration ids must expose their extra embedder sets");
+        let dispatch = crate::runtime::scope_request_embedder_exclusions(
+            excluded_embedder_names,
             khive_storage::scope_request_read_cancellation(
-                read_cancel_rx,
-                khive_storage::scope_request_read_deadline(
-                    read_timeout,
-                    dispatcher.dispatch_with_error_detail(
-                        frame.ops,
-                        frame.presentation,
-                        frame.presentation_per_op,
-                        frame.format,
-                        frame.format_per_op,
-                        frame.from_wire,
-                        Some(identity),
+                shutdown,
+                khive_storage::scope_request_read_cancellation(
+                    read_cancel_rx,
+                    khive_storage::scope_request_read_deadline(
+                        read_timeout,
+                        dispatcher.dispatch_with_error_detail(
+                            frame.ops,
+                            frame.presentation,
+                            frame.presentation_per_op,
+                            frame.format,
+                            frame.format_per_op,
+                            frame.from_wire,
+                            Some(identity),
+                        ),
                     ),
                 ),
             ),
