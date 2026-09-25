@@ -17,6 +17,7 @@ bench = false
 [dependencies]
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
+khive-score = { version = "0.8.0", path = "../khive-score" }
 khive-query = { version = "0.8.0", path = "../khive-query" }
 inventory = { workspace = true }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }

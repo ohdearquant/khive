@@ -1182,7 +1182,7 @@ mod tests {
     fn file_pool(path: &std::path::Path) -> ConnectionPool {
         let cfg = PoolConfig {
             path: Some(path.to_path_buf()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         ConnectionPool::new(cfg).expect("pool open")
     }
@@ -1345,7 +1345,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path),
             busy_timeout: Duration::from_millis(150),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         let view = database_tx_view(&pool);
@@ -1414,7 +1414,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path.clone()),
             busy_timeout: Duration::from_millis(150),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         {
@@ -1504,7 +1504,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             busy_timeout: Duration::from_millis(500),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         {
@@ -1574,7 +1574,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             busy_timeout,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         {
@@ -1789,7 +1789,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path.clone()),
             busy_timeout: Duration::from_millis(150),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         {
@@ -1895,7 +1895,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path),
             busy_timeout,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         {
@@ -2149,7 +2149,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path.clone()),
             write_admission_deadline_ms: 100,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         let handle = spawn(&pool, 1).expect("writer task should spawn on a file-backed pool");
@@ -2747,7 +2747,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(true),
             write_queue_capacity: 8,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         {

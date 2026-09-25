@@ -231,6 +231,7 @@ pub(crate) struct SearchParams {
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) source: Option<String>,
+    pub(crate) min_rank_score: Option<f64>,
     pub(crate) min_score: Option<f64>,
     pub(crate) order_by: Option<String>,
 }

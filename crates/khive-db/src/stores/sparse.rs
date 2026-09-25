@@ -965,7 +965,7 @@ mod tests {
         let pool_cfg = PoolConfig {
             path: Some(path.clone()),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(pool_cfg).expect("pool"));
         {

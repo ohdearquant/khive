@@ -3018,7 +3018,7 @@ async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -3356,7 +3356,7 @@ async fn rename_namespace_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -3443,7 +3443,7 @@ async fn rename_namespace_strict_routing_fails_closed_without_writer_task() {
         path: Some(path.clone()),
         write_queue_enabled: Some(false),
         write_routing_strict: true,
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -3492,7 +3492,7 @@ fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
