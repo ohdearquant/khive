@@ -470,6 +470,48 @@ pub(crate) async fn resolve_commit(program: &Path, repo: &Path, reference: &str)
     .await
 }
 
+pub(crate) async fn resolve_commit_object_id(
+    program: &Path,
+    repo: &Path,
+    object_id: &str,
+) -> Result<String> {
+    validate_oid(object_id, "to")?;
+    if object_id == ZERO_OID {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "to must not be the zero object id",
+        ));
+    }
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let object_id = object_id.to_string();
+    blocking("cat-file", false, move || {
+        let kind = run_git(
+            &program,
+            &repo,
+            &["cat-file", "-t", &object_id],
+            None,
+            None,
+            false,
+        )
+        .map_err(|error| {
+            if error.code() == "git_failed" {
+                LocalGitError::new("invalid_params", "to must identify an existing commit")
+            } else {
+                error
+            }
+        })?;
+        if kind != b"commit\n" {
+            return Err(LocalGitError::new(
+                "invalid_params",
+                "to must identify a commit object",
+            ));
+        }
+        Ok(object_id.to_ascii_lowercase())
+    })
+    .await
+}
+
 fn branch_head_sync(program: &Path, repo: &Path, branch: &str) -> Result<String> {
     let reference = branch_ref(branch)?;
     require_direct_ref(program, repo, &reference)?;
