@@ -294,3 +294,94 @@ blending outright; `blend_kg=false` reproduces pre-Amendment-1 behavior exactly.
   cross-namespace deferral) — no new namespace-visibility surface.
 - `atom_ids`-only compose is unaffected — an explicit, minimal-surface escape
   hatch for callers who already know exactly which atoms they want.
+
+## Amendment 2 (2026-09-25): the compose budget covers the whole briefing
+
+Status: Proposed. It is intended to land together with #3349, which implements it. (Numbered 2
+because this file carries two sections headed Amendment 1: the 2026-08-01 searchable-model atom
+indexing decision and the KG entity blend.)
+
+### Context
+
+§"Token budget" says: "Sections are greedily packed by descending score until the character
+budget is exhausted (~4 chars/token). The budget applies to both section-mode and atom-only
+fallback. This prevents unbounded output". Amendment 1 (KG entity blend) §"Budget" trims blended
+entities "against whatever budget is left over (`char_budget - body_used`)".
+
+At this revision `knowledge.compose` (`crates/khive-pack-knowledge/src/knowledge/search.rs`):
+
+- sets the budget to `max_tokens × CHARS_PER_TOKEN` with `CHARS_PER_TOKEN = 4`, and charges each
+  section or atom `compose_item_char_cost`, the title bytes plus the body bytes plus 40
+  (`crates/khive-pack-knowledge/src/knowledge/util.rs`). The briefing title, the `Query:` line,
+  each atom's heading and `Source:` line in section mode, the explain-mode score lines and the
+  `Domains:` footer are rendered outside that charge, and the finished markdown is never measured,
+  so it can exceed `max_tokens × 4` bytes (#3232);
+- packs sections with `retain`, which skips a section that does not fit, but packs whole atoms and
+  blended entities (`trim_kg_entities_to_budget`) with `take_while`, which stops at the first
+  candidate that does not fit, so one large top-ranked atom can leave an empty briefing with the
+  budget unused (#3233);
+- picks section mode or whole-atom mode once per request, so when any section is packed, atoms
+  without sections are not rendered even when budget remains (#3234);
+- reports every reranked candidate in `data.atoms` and `data.count`, including atoms the briefing
+  does not contain (#3235). The response fields are specified in the ADR-047 amendment of the same
+  date.
+
+### Decision
+
+1. **What `max_tokens` prices.** `max_tokens` (default 8000, clamped to 500..=100000) bounds the
+   complete `data.markdown` at `max_tokens × 4` UTF-8 bytes. Every emitted byte is charged: the
+   title and `Query:` line, each atom heading and `Source:` line (once per atom), each section
+   heading, explain-mode score lines, bodies, the `Domains:` footer, and the `## Knowledge graph`
+   heading and entity lines. The unit is bytes. Costs are computed from the same fragments the
+   renderer emits.
+2. **Title, query and footer.** The title, the `Query:` line and the domain footer are reserved
+   before the body is packed. A query that does not fit is clipped in the `Query:` line on a UTF-8
+   character boundary, and a footer that cannot fit beside the title is omitted. Neither is
+   clipped in the structured response: `data.query` keeps the full query and `data.domains` lists
+   every resolved domain.
+3. **Skip, do not stop.** Sections, whole atoms and blended entities are each considered in rank
+   order. A candidate whose rendered fragment does not fit the remaining budget is skipped, and
+   later candidates are still considered.
+4. **Sections and sectionless atoms in one briefing.** Sections are packed first, in descending
+   section score, and an atom's heading and `Source:` line are charged with its first packed
+   section. Then atoms with no section candidates are packed as whole-atom entries, in atom rerank
+   order, into the remaining body budget. When any section is packed, an atom that has section
+   candidates appears only through its packed sections. When no section fits, the whole-atom
+   fallback considers every atom. Section blocks render first, grouped under their atoms in the
+   existing per-atom order; whole-atom entries follow in rerank order; the domain footer ends the
+   body.
+5. **Blended entities (refines Amendment 1 §"Budget").** Entities are priced after the body
+   against the bytes that remain under the bound, which is `max_tokens × 4` minus the rendered
+   briefing so far. The `## Knowledge graph` heading is charged once, and the block is appended
+   only when it fits. Entities still never displace an atom or a section, and the inclusion floor
+   is still computed from the atoms rendered in the body.
+
+### Alternatives considered
+
+- **Keep pricing bodies plus a fixed per-item overhead and document the exclusions.** The excluded
+  bytes grow with query length, packed-atom count and domain count, so `max_tokens` could not be
+  used as an output bound.
+- **Render, measure, and drop the lowest-ranked item until the markdown fits.** This reaches the
+  same bound but renders repeatedly and needs its own drop order. Pricing the rendered fragments
+  while packing gives the bound in one pass.
+- **Interleave sections and whole atoms in one ranked list.** Sections are ranked by the hybrid
+  formula above and atoms by the atom rerank score, so one merged order would compare unlike
+  scores.
+- **Keep one mode per request.** Relevant sectionless atoms stay out of briefings that have room
+  for them (#3234).
+
+### Consequences
+
+- Every response satisfies `len(data.markdown) <= max_tokens × 4` bytes. For non-ASCII text a
+  token of budget covers fewer characters than the earlier "~4 chars/token" wording suggested.
+- Under a tight budget the `Query:` line can be clipped and the domain footer omitted from the
+  markdown; the structured fields stay complete.
+- Some briefings now carry more content (smaller candidates after an oversized one, sectionless
+  atoms beside sections), and some carry less body, because headings and metadata are now charged.
+- An atom whose sections all fail to fit is not offered as a whole atom while other sections are
+  packed.
+- Amendment 1's zero-atom rule is unchanged: when no atom is rendered, no entity is blended.
+
+### Refs
+
+- #3232, #3233, #3234, #3235; implemented by #3349.

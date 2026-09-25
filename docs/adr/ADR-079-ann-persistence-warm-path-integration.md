@@ -823,3 +823,90 @@ implements this replay.
   observation.
 - `VectorStorage::Mmap` + `load_v2_fast`/`mmap_vectors`: the existing fast path this amendment
   makes the steady state.
+
+---
+
+## Amendment 2 (2026-09-25): ANN operational knobs are environment variables
+
+**Status**: Proposed
+
+### Context
+
+§5 specifies a `[retrieval]` section in `khive.toml`, parsed into a `RetrievalSectionConfig` on
+`KhiveConfig`, with a CLI flag, an environment variable and a config key for each of five knobs,
+resolved in ADR-035 order. Amendment 1 adds `ann_rebuild_threshold` to that table with env
+`KHIVE_ANN_REBUILD_THRESHOLD` and CLI `--ann-rebuild-threshold`. Migration steps 4 and 5 gate the
+checkpoint cadence on `retrieval.ann_checkpoint_interval_secs` and add the section, flags and
+variables.
+
+None of that surface exists at this revision. A search of `crates/` finds no occurrence of
+`RetrievalSectionConfig`, of a `[retrieval]` section or `retrieval.ann_*` key, of the five §5 key
+names, of the `--ann-*` flags, or of `KHIVE_ANN_WARM_TIMEOUT_MS`, `KHIVE_ANN_SERVE_STALE`,
+`KHIVE_ANN_CHECKPOINT_SECS`, `KHIVE_ANN_CONSOLIDATE_TAU` and `KHIVE_ANN_PERSIST_DIR`; the same
+search finds the readers of `KHIVE_ANN_REBUILD_THRESHOLD` (#3182). Per knob, the code does this:
+
+| Knob                            | At this revision                                                                                                                                                                                                                                                     |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rebuild threshold (Amendment 1) | `KHIVE_ANN_REBUILD_THRESHOLD`, read by `ann_rebuild_threshold` in `crates/khive-pack-knowledge/src/knowledge/vamana.rs` and in `crates/khive-pack-memory/src/ann.rs`; default `0.20`; a value that does not parse or lies outside `(0, 1]` falls back to the default |
+| Warm-wait timeout               | constant `ANN_WARM_WAIT_TIMEOUT_MS = 5_000` in `crates/khive-pack-knowledge/src/knowledge/vamana.rs`; only a test-only setter overrides it                                                                                                                           |
+| Serve stale (§2)                | no switch: a Stale-rebuild classification always serves the loaded segment while the rebuild runs, so the `ann_serve_stale = false` arm of §2 is unreachable                                                                                                         |
+| Checkpoint interval (§4)        | no configuration input                                                                                                                                                                                                                                               |
+| Consolidation τ (§3)            | constant `DEFAULT_CONSOLIDATION_TAU = 40_000` in `crates/khive-vamana/src/index.rs`                                                                                                                                                                                  |
+| Persist dir (§1)                | no override: the segment root is the database-scoped `<db-file>.ann/` of Amendment 1, computed by `ann_root_for` in `crates/khive-db/src/backend.rs`                                                                                                                 |
+
+The other ANN settings that can be changed today are also environment variables read by the
+process doing the work: `KHIVE_ANN_FRESH_TAIL` (ADR-118; `crates/khive-runtime/src/config.rs`),
+`KHIVE_ANN_REBUILD_DEBOUNCE_MS` (`crates/khive-pack-memory/src/ann.rs`) and
+`KHIVE_ANN_BUILD_THREADS` (`crates/khive-vamana/src/index.rs`).
+
+### Decision
+
+1. ANN operational knobs are process environment variables only. The `[retrieval]` section and
+   `RetrievalSectionConfig` of §5, the CLI flags of §5 and of Amendment 1's configuration
+   paragraph, and the ADR-035 precedence rows §5 adds are withdrawn. A knob's value comes from the
+   environment of the process that performs the ANN work, which with the warm daemon (ADR-049) is
+   the daemon process.
+2. The knobs, their variables and their defaults:
+
+   | Knob                            | Environment variable          | Default                                 | Read at this revision      |
+   | ------------------------------- | ----------------------------- | --------------------------------------- | -------------------------- |
+   | Rebuild threshold (Amendment 1) | `KHIVE_ANN_REBUILD_THRESHOLD` | `0.20`, range `(0, 1]`                  | yes, by both consumers     |
+   | Warm-wait timeout (ms)          | `KHIVE_ANN_WARM_TIMEOUT_MS`   | `5000`                                  | no; built-in constant      |
+   | Serve stale                     | `KHIVE_ANN_SERVE_STALE`       | `true`                                  | no; stale is always served |
+   | Checkpoint interval (s)         | `KHIVE_ANN_CHECKPOINT_SECS`   | `300`; `0` disables periodic checkpoint | no                         |
+   | Consolidation τ                 | `KHIVE_ANN_CONSOLIDATE_TAU`   | `40000`                                 | no; built-in constant      |
+
+3. A knob marked "no" runs at its default. A change that makes it configurable reads exactly the
+   listed variable with the listed default and range, and updates this table in the same change.
+   A value that does not parse or is out of range is ignored and the default applies, as the
+   current readers do.
+4. `ann_persist_dir` and `KHIVE_ANN_PERSIST_DIR` are withdrawn with no replacement. The segment root
+   is the database-scoped `<db-file>.ann/` of Amendment 1; an override could point two databases at
+   one root, which is the segment-adoption hazard Amendment 1 removed.
+5. The warm-wait timeout's test override stays a test-only setter. §5's statement that tests set
+   the timeout through the same config path as production is withdrawn.
+
+### Alternatives considered
+
+- **Implement §5 as accepted.** This adds a TOML section, a config type, CLI flags and a precedence
+  tier for knobs that today have one reader among them. A file-level knob that changes daemon
+  behaviour would also need the treatment ADR-160 D3 gives `blob_hydration_bytes`: participation in
+  the warm daemon's configuration identity, so clients resolving different values do not share one
+  daemon.
+- **Keep §5 and mark it not implemented.** An operator following the ADR still sets options that
+  have no effect, which is the defect #3182 reports.
+
+### Consequences
+
+- Operators set these variables in the environment of the process that runs the daemon. They
+  cannot be committed in project configuration.
+- The §2 serve-stale opt-out, the §4 checkpoint cadence and an operator-lowered §3 τ stay
+  unavailable until their variables are read; until then each runs at the listed default.
+- Migration steps 4 and 5 read as this table rather than as a `[retrieval]` section.
+- An open change, #3161, proposes readers for `KHIVE_ANN_CHECKPOINT_SECS` and
+  `KHIVE_ANN_CONSOLIDATE_TAU` in the memory consumer with the defaults above, plus a further
+  `KHIVE_ANN_CHECKPOINT_OPS`. Under this amendment that change also updates the table.
+
+### References (Amendment 2)
+
+- #3182, #3161
