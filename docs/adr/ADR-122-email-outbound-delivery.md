@@ -223,7 +223,7 @@ runtime path. A later attempt uses an existing nonempty `external_id` verbatim,
 including when the sender mailbox's domain has changed. The claim therefore survives
 a send that succeeds before the delivery stamp is persisted. A failed claim
 does not proceed to SMTP, and caller-facing note updates cannot set
-`external_id`.
+`external_id`. A caller-supplied external_id at creation currently bypasses the claim; see #3350.
 
 The §1 outcome table is amended for outbound email as follows:
 
