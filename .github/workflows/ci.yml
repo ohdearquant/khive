@@ -846,22 +846,49 @@ jobs:
       # on a direct push) decides whether the rest of the job runs at all.
       - name: Determine whether storage crates changed
         id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-          else
-            base="${{ github.event.before }}"
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            push) base="$PUSH_BEFORE_SHA" ;;
+            *) base="" ;;
+          esac
+          # A depth-one checkout usually lacks the PR base or push predecessor.
+          # Fetch only that commit; manual/new-branch runs keep the safe fallback.
+          if [[ "$base" =~ ^[0-9a-fA-F]{40}$ ]] \
+             && [ "$base" != "0000000000000000000000000000000000000000" ] \
+             && ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            if ! git fetch --no-tags --depth=1 origin "$base"; then
+              echo "base fetch failed -- checking whether it is available locally"
+            fi
           fi
-          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+          if ! [[ "$base" =~ ^[0-9a-fA-F]{40}$ ]] \
+             || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "no comparable base SHA -- running the MinIO leg to be safe"
             exit 0
           fi
-          if git diff --name-only "$base" HEAD -- .. | grep -qE '^(crates/khive-db/|crates/khive-storage/|crates/Cargo\.(toml|lock)$|docs/adr/ADR-111|\.github/workflows/ci\.yml$)'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          # Ask Git about watched paths directly: --name-only C-quotes unusual
+          # filenames, which makes line-based prefix matching miss them. With
+          # --no-renames, moving a file out of a watched directory still counts
+          # its old path. A failed comparison also runs the leg to be safe.
+          if git diff --quiet --no-renames "$base" HEAD -- \
+            ':(top)crates/khive-db/' \
+            ':(top)crates/khive-storage/' \
+            ':(top,glob)docs/adr/ADR-111*' \
+            ':(top).github/workflows/ci.yml' \
+            ':(top)crates/Cargo.toml' \
+            ':(top)crates/Cargo.lock'; then
+            run=false
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            run=true
           fi
+          echo "storage path comparison ${base}..HEAD: run=${run}"
+          echo "run=${run}" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@1.95.0
         if: steps.changed.outputs.run == 'true'
       - uses: Swatinem/rust-cache@v2
