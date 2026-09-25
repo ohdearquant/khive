@@ -20,7 +20,7 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 6     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
@@ -1233,7 +1233,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 6 verbs
+## `gtd` pack — 7 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1349,6 +1349,16 @@ See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timesta
 ```
 request(ops="gtd.census()")
 ```
+
+### `gtd.repair` — Declaration
+
+Preview explicit corrections to task `created_at`, `updated_at`, or a noncanonical text
+status. Pass 1–100 distinct full task IDs in `items`, with each changed field's exact
+stored JSON source under `observed` and its proposed replacement under `value`.
+The default `apply=false` changes nothing. With `apply=true`, each accepted row and
+its mandatory lifecycle-audit entry commit together; timestamp units are never
+inferred. See [explicit historical task repair](../../crates/khive-pack-gtd/docs/api/task-repair.md)
+for the request shape, refusal reasons, and preserved evidence.
 
 ---
 
