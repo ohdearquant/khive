@@ -13,6 +13,26 @@ look up an entity, note, or atom before filtering. A known atom UUID therefore
 works even though the atom is not a graph entity. Other filters are intersected
 with this exact predicate; omitting `target_id` keeps the existing behavior.
 
+For example, add `actor="<stored event actor>"` to select that stored writer, or
+`limit=10, offset=10` for the second matching page. A target with no matching
+events returns an empty page; the handler never falls back to unfiltered events.
+
+`list` rejects unknown parameters and names them in the error. It also rejects
+filters that do not apply to the requested kind, including explicit null or
+empty values. In particular, `target_id` applies only to edges and events, and
+`actor` applies only to events and proposals. `list(kind="observation",
+actor="lambda:khive")` therefore fails rather than returning every observation.
+To find who wrote a record, list its events by `target_id`; `created_by_actor`
+on scheduled-event notes is separate creator metadata.
+
+The event filters are `target_id`, `verb`, `verbs`, `outcome`, `actor`,
+`substrate`, `since`, `until`, `event_kind`, `event_kinds`, `session_id`,
+`observed`, and `selected`. Time bounds use UTC epoch microseconds. The list
+help and generated schema declare these fields. Proposal lists retain their
+existing `status`, `proposer`, and `actor` filters. Generic note lists retain
+their message-property filters; scheduled-event `status` and
+`created_by_actor` still require that specific note kind.
+
 The request's authorized event namespace still bounds results. A target UUID
 does not grant access to events in another namespace. In particular, a refusal
 event records the operation in the caller namespace even when an admitted

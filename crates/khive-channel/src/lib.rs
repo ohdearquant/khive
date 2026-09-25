@@ -282,9 +282,31 @@ pub enum SendOutcome {
     /// The legacy adapter accepted the send; not a recipient commit receipt.
     LegacyAccepted,
     /// The sender retains the message until a verified recipient receipt arrives.
-    Pending,
+    Pending(PendingDetail),
     RecipientStored(DeliveryReceipt),
     RecipientQuarantined(DeliveryReceipt),
+}
+
+/// Admission or hold information retained while waiting for a verified recipient receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDetail {
+    /// The service admitted the submission (`202`, or `200` with state `pending`).
+    /// The runtime uses this timestamp to schedule resubmission if no receipt arrives.
+    Admitted { admitted_at: DateTime<Utc> },
+    /// The service refused with an outcome that holds the message until the owner acts.
+    Held(HoldReason),
+    /// A receipt failed sender verification; the message stays pending with retry backoff.
+    ReceiptUnverified { reason: String },
+}
+
+/// A service refusal that suspends retry until the owner acts, leaving the message pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReason {
+    /// The sender's account cannot pay for admission (`402 insufficient_credit`).
+    InsufficientCredit,
+    /// The recipient's device or key epoch changed (`409 recipient_key_changed`).
+    /// Retry waits for the owner's confirmation of the new fingerprint.
+    RecipientKeyChanged,
 }
 
 impl SendOutcome {
@@ -856,7 +878,26 @@ mod tests {
         let stored = receipt(ReceiptDisposition::Stored);
         let quarantined = receipt(ReceiptDisposition::Quarantined);
         assert!(SendOutcome::LegacyAccepted.validate_receipt().is_ok());
-        assert!(SendOutcome::Pending.validate_receipt().is_ok());
+        assert!(SendOutcome::Pending(PendingDetail::Admitted {
+            admitted_at: Utc::now(),
+        })
+        .validate_receipt()
+        .is_ok());
+        assert!(
+            SendOutcome::Pending(PendingDetail::Held(HoldReason::InsufficientCredit))
+                .validate_receipt()
+                .is_ok()
+        );
+        assert!(
+            SendOutcome::Pending(PendingDetail::Held(HoldReason::RecipientKeyChanged))
+                .validate_receipt()
+                .is_ok()
+        );
+        assert!(SendOutcome::Pending(PendingDetail::ReceiptUnverified {
+            reason: "receipt signature does not match the pinned key".into(),
+        })
+        .validate_receipt()
+        .is_ok());
         assert!(SendOutcome::RecipientStored(stored.clone())
             .validate_receipt()
             .is_ok());

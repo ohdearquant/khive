@@ -26,7 +26,7 @@ An always-machine-readable copy of this page is at
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
@@ -297,11 +297,19 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                                                                                     |
-| ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
-| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix.                    |
-| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
+When an entity id was consumed by a merge, default `get` follows `merged_into` to the
+first live kept entity. Its response adds `redirected_from`, an ordered array of the
+merged ids traversed; a live id has no such field. `include_deleted=true` takes
+precedence and returns the requested tombstone with its `merged_into` pointer.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long` respectively. The kept id is checked by the Gate before
+its entity is returned.
+
+| Param             | Type | Required | Notes                                                                                                                                                   |
+| ----------------- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                                            |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge without chasing a merge redirect (default false); accepts a full UUID or unique 8+ hex prefix. |
+| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records.               |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -559,18 +567,20 @@ request(ops="merge(into_id=\"<canonical-uuid>\", from_id=\"<dup-uuid>\")")
 
 Hybrid FTS + vector search with RRF fusion.
 
-| Param                | Type    | Required | Notes                                                                                                                                  |
-| -------------------- | ------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                  |
-| `query`              | string  | yes      | Free-text query.                                                                                                                       |
-| `limit`              | integer | no       | Default 10.                                                                                                                            |
-| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                        |
-| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                        |
-| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                          |
-| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                            |
-| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window. |
-| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                    |
-| `min_score`          | number  | no       | Score floor 0.0–1.0. No server default; RRF rank-1 scores on small corpora are typically 0.013–0.033.                                  |
+| Param                | Type    | Required | Notes                                                                                                                                                               |
+| -------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                               |
+| `query`              | string  | yes      | Free-text query.                                                                                                                                                    |
+| `limit`              | integer | no       | Default 10.                                                                                                                                                         |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                       |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                         |
+| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                              |
+| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                 |
+| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
+| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
+| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -665,6 +675,9 @@ Response shape (`kind="entity"` rows, `presentation="verbose"`):
   {
     "id": "3f2a9c1e-...",
     "entity_kind": "concept",
+    "rank_score": 0.0909,
+    "rank_score_kind": "rrf",
+    "signals": { "keyword_score": 12.5 },
     "score": 0.0909,
     "title": "LoRA",
     "snippet": "matched text from the description/properties"
@@ -682,8 +695,20 @@ FTS/vector hit carried no snippet text. `search` is not on the `AlwaysVerbose` v
 than returned as `null` (they are not on the lifecycle-preserve list), and `id` is shortened to
 an 8-character prefix (`crates/khive-runtime/src/presentation.rs`).
 
-`score` is an implementation-defined ranking value, not a normalized 0.0-1.0 similarity, and its
-construction differs by kind (see the `min_score` row above for typical magnitudes):
+`rank_score` is the deterministic ordering value under the strategy named by
+`rank_score_kind`: `rrf`, `vector`, `keyword`, `weighted`, or `union`. It is not
+a probability, a percentage match, or comparable across queries. In v0.8,
+deprecated `score` equals `rank_score` exactly after conversion to JSON. The
+`min_rank_score` range is an input constraint, not a calibration claim.
+
+`signals` carries available pre-fusion `vector_similarity` and/or `keyword_score`.
+Absent evidence keys are omitted, never synthesized as zero. Component scores
+are scoped to the producing backend and model; vector similarities from different
+embedding models are not comparable. Canonical evidence-free hits carry `{}`;
+Agent presentation drops that empty object and rounds ranking and signal values
+to three significant figures after all ranking and filtering decisions.
+
+The local RRF construction differs by substrate:
 
 - **Entity** (`crates/khive-runtime/src/retrieval.rs`): each retrieval leg (lexical, vector) that
   returns the entity contributes `1 / (k + rank)` with `k = 10`; contributions from every leg
@@ -695,8 +720,15 @@ construction differs by kind (see the `min_score` row above for typical magnitud
   `0.5` when unset), so the fused rank score is scaled down for low-salience notes and left
   closer to unscaled for high-salience ones.
 
+Both local modifiers retain kind `rrf` and leave component signals unchanged.
+A coordinator with one selected backend preserves that backend's hit. With
+multiple selected backends, it sums deterministic outer RRF contributions and
+publishes kind `rrf`. For a repeated ID, the complete signal set comes from the
+hit with the best within-backend rank, ties following deterministic backend
+order; it is never combined across backends.
+
 This row shape never includes the full entity/note record (no `description`, `content`,
-`properties`, `tags`, timestamps, …) in either presentation mode, only enough to rank and
+`properties`, or `tags`) in either presentation mode, only enough to rank and
 identify the hit. It diverges from both `neighbors` and `list`'s row shapes above; see `list`'s
 "Row shape" note above for the full comparison.
 
@@ -979,6 +1011,12 @@ actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.
 (4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+A resolved id consumed by an entity merge follows the transitive `merged_into`
+chain. Its result contains the live kept `id` and `redirected_from: [old_id, ...]`;
+an unredirected result has no marker. `resolve` has no `include_deleted` option.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long`. The kept id is checked by the Gate before return.
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
@@ -1919,8 +1957,10 @@ request(ops="comm.unread()")
 
 ### `comm.read` — Declaration
 
-Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
-content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
+Fetch and mark one or more inbound messages. Successful results return `subject`, `content`,
+`from`, `to`, `direction`, and `created_at` alongside the existing acknowledgement fields.
+Pass `body=false` for the prior acknowledgement-only shape. Failed or indeterminate marks do
+not add message fields. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
 remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
 `mark_error`. A write whose execution seam terminated after being accepted (so it may already
@@ -1929,14 +1969,16 @@ message's current state through `comm.inbox` before re-issuing; re-issuing is sa
 a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
 re-issue failures (or unresolved unknowns) later.
 
-| Param | Type            | Required    | Notes                                                                   |
-| ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
-| `id`  | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
-| `ids` | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
+| Param  | Type            | Required    | Notes                                                                   |
+| ------ | --------------- | ----------- | ----------------------------------------------------------------------- |
+| `id`   | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
+| `ids`  | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
+| `body` | bool            | no          | Defaults to true; false omits top-level message fields.                 |
 
 ```
 request(ops="comm.read(id=\"<message-id>\")")
 request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
+request(ops="comm.read(id=\"<message-id>\", body=false)")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
@@ -1949,7 +1991,8 @@ item's `read` and optional `mark_error`.
 ### `comm.mark_read` — Declaration
 
 Canonical named bulk mark-read. It accepts the same inbound targets and returns the same bulk
-summary shape as `comm.read(ids=[...])`, while adding an all-or-nothing mutation mode.
+summary and acknowledgement fields as `comm.read(ids=[...])`, while adding an all-or-nothing
+mutation mode. It does not add message fields.
 
 | Param    | Type            | Required | Notes                                                                                            |
 | -------- | --------------- | -------- | ------------------------------------------------------------------------------------------------ |
@@ -2517,7 +2560,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 4 verbs
+## `session` pack — 5 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2582,6 +2625,24 @@ Serialize one stored session as json or markdown.
 ```
 request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 ```
+
+### `session.search` — Assertive (dependency gated)
+
+Search mirrored message text within the request's resolved tenant scope. The
+public handler currently refuses until transcript deletion and resume/export
+continuity support are available. Serving multiple principals also requires
+authenticated connection identity.
+
+| Param    | Type    | Required | Notes                                                         |
+| -------- | ------- | -------- | ------------------------------------------------------------- |
+| `query`  | string  | yes      | Words to match in mirror text.                                |
+| `limit`  | integer | no       | 1–200, default 20.                                            |
+| `since`  | string  | no       | Inclusive RFC 3339 message creation lower bound.              |
+| `source` | string  | no       | Exact source; `unknown` returns migration orphans when named. |
+| `cwd`    | string  | no       | Exact session working directory.                              |
+
+The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
+specifies the scoped key, migration, and search result identity.
 
 ---
 

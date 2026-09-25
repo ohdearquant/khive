@@ -170,19 +170,21 @@ return immediately. A new committed message wakes the call and causes the full
 filtered query to run again; unrelated messages cannot leak through or end the
 wait early. `limit=0` remains immediate.
 
-### Mark read
+### Read and mark
 
-`comm.mark_read` is the named bulk mutation. It marks inbound messages read; it does not return
-message content. Use `comm.inbox` or `comm.thread` to retrieve content. Outbound messages cannot be
+`comm.read` fetches inbound messages and marks them read. Successful results include
+`subject`, `content`, `from`, `to`, `direction`, and `created_at`; pass `body=false`
+to retain the previous acknowledgement-only shape. `comm.mark_read` is the named
+bulk acknowledgement and does not return message content. Outbound messages cannot be
 marked read.
 
 ```
 request(ops="comm.mark_read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 request(ops="comm.mark_read(ids=[\"<message_id_1>\", \"<message_id_2>\"], atomic=true)")
 
-# Compatibility surface
 request(ops="comm.read(id=\"<message_id_or_prefix>\")")
 request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
+request(ops="comm.read(id=\"<message_id_or_prefix>\", body=false)")
 ```
 
 `comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
@@ -452,6 +454,10 @@ email channel loops NOT started: ingest namespace authorization failed (fail-clo
 
 If no daemon is running, mail is simply not polled until one starts. That is
 the intended behavior, not a silent failure.
+Once demand-mode retirement ([ADR-049](../adr/ADR-049-khived-daemon.md)
+Amendment 11) ships, a daemon that a client started automatically does not run
+these loops either; start it explicitly with `kkernel mcp --daemon` (or under a
+supervisor) to have mail polled and delivered.
 
 ## Limitations
 

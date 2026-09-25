@@ -25,6 +25,9 @@
 
 #![cfg(unix)]
 
+#[path = "../src/test_process.rs"]
+mod test_process;
+
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::types::SqlStatement;
 use serial_test::serial;
@@ -64,8 +67,8 @@ fn run_one_cold_boot(db_path: std::path::PathBuf, writer_label: &'static str, co
         .expect("build per-thread tokio runtime");
 
     rt_handle.block_on(async {
-        let rt =
-            KhiveRuntime::new(file_backed_config(db_path)).expect("cold-boot migrations succeed");
+        let rt = KhiveRuntime::new_for_test(file_backed_config(db_path))
+            .expect("cold-boot migrations succeed");
         let token = rt
             .authorize(Namespace::local())
             .expect("authorize local namespace");
@@ -97,7 +100,7 @@ fn verify_no_corruption(db_path: std::path::PathBuf, expected_count: usize) {
         .expect("build verification tokio runtime");
 
     rt_handle.block_on(async {
-        let verify_rt = KhiveRuntime::new(file_backed_config(db_path))
+        let verify_rt = KhiveRuntime::new_for_test(file_backed_config(db_path))
             .expect("post-race runtime opens cleanly");
         let token = verify_rt
             .authorize(Namespace::local())
@@ -146,6 +149,10 @@ fn verify_no_corruption(db_path: std::path::PathBuf, expected_count: usize) {
 #[test]
 #[serial]
 fn concurrent_cold_boots_do_not_corrupt_notes_fts_index() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let lock_file = dir.path().join("khived.recovery.lock");
     std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -175,6 +182,10 @@ fn concurrent_cold_boots_do_not_corrupt_notes_fts_index() {
 #[test]
 #[serial]
 fn sequential_cold_boots_against_same_file_are_idempotent() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let lock_file = dir.path().join("khived.recovery.lock");
     std::env::set_var("KHIVE_LOCK", &lock_file);

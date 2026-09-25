@@ -288,6 +288,61 @@ fn direct_backend_registry() -> &'static std::sync::Mutex<BackendMap> {
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Release only one test fixture's process-registry entries when its scope ends.
+///
+/// Borrow a unique temporary directory immediately after creating it, before
+/// declaring its backend/store/client handles. Those handles then drop before
+/// this guard, and the borrowed directory outlives registry cleanup. Production
+/// callers retain the normal process-lifetime registry ownership.
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub struct TestRegistryGuard<'a> {
+    root: &'a Path,
+    canonical_root: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-internals"))]
+impl<'a> TestRegistryGuard<'a> {
+    /// Keep `root` alive until this fixture's registry references are released.
+    pub fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            canonical_root: std::fs::canonicalize(root).expect("existing unique fixture root"),
+        }
+    }
+
+    fn remove_entries<T>(
+        &self,
+        registry: &std::sync::Mutex<std::collections::HashMap<PathBuf, T>>,
+    ) -> Vec<T> {
+        let mut entries = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys: Vec<_> = entries
+            .keys()
+            .filter(|path| path.starts_with(self.root) || path.starts_with(&self.canonical_root))
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| entries.remove(&key))
+            .collect()
+    }
+}
+
+#[cfg(any(test, feature = "test-internals"))]
+impl Drop for TestRegistryGuard<'_> {
+    fn drop(&mut self) {
+        // Destructors may close SQLite connections or senders. Run them only
+        // after releasing each registry lock; unrelated fixtures keep serving.
+        let backends = self.remove_entries(direct_backend_registry());
+        #[cfg(unix)]
+        let clients = self.remove_entries(client_registry());
+        drop(backends);
+        #[cfg(unix)]
+        drop(clients);
+    }
+}
+
 /// The process-wide client for `socket_path`, created (and its forwarder
 /// spawned) on first use. Requires a tokio runtime context on first call.
 #[cfg(unix)]
@@ -306,7 +361,7 @@ pub fn client_for(socket_path: &Path) -> crate::error::RuntimeResult<Arc<EventsS
 /// The process-wide direct (embedded-mode) backend for `db_path`, opened
 /// read-write on first use.
 pub fn direct_backend_for(db_path: &Path) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
-    direct_backend(db_path, false)
+    direct_backend_with_max_readers(db_path, false, None)
 }
 
 /// The process-wide direct backend for `db_path`, opened READ-ONLY on first
@@ -316,12 +371,13 @@ pub fn direct_backend_for(db_path: &Path) -> crate::error::RuntimeResult<Arc<Sto
 pub fn direct_backend_read_only_for(
     db_path: &Path,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
-    direct_backend(db_path, true)
+    direct_backend_with_max_readers(db_path, true, None)
 }
 
-fn direct_backend(
+pub(crate) fn direct_backend_with_max_readers(
     db_path: &Path,
     read_only: bool,
+    max_readers: Option<usize>,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
     let mut registry = direct_backend_registry()
         .lock()
@@ -395,9 +451,9 @@ fn direct_backend(
             .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
     let backend = Arc::new(if read_only {
-        StorageBackend::sqlite_read_only(db_path)?
+        StorageBackend::sqlite_read_only_with_max_readers(db_path, max_readers)?
     } else {
-        StorageBackend::sqlite(db_path)?
+        StorageBackend::sqlite_with_max_readers(db_path, max_readers)?
     });
     registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
@@ -2134,6 +2190,37 @@ impl EventStore for SplitEventStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fixture_registry_cleanup_preserves_other_roots() {
+        let live_dir = tempfile::tempdir().unwrap();
+        let _live_guard = TestRegistryGuard::new(live_dir.path());
+        let live_path = live_dir.path().join("events.db");
+        let live_backend = direct_backend_for(&live_path).unwrap();
+
+        let finished_dir = tempfile::tempdir().unwrap();
+        let finished_backend = {
+            let _finished_guard = TestRegistryGuard::new(finished_dir.path());
+            let backend = direct_backend_for(&finished_dir.path().join("events.db")).unwrap();
+            let weak = Arc::downgrade(&backend);
+            drop(backend);
+            assert!(
+                weak.upgrade().is_some(),
+                "registry retains the live fixture"
+            );
+            weak
+        };
+
+        assert!(
+            finished_backend.upgrade().is_none(),
+            "FD_FIXTURE_REGISTRY_RELEASED"
+        );
+        let same_live_backend = direct_backend_for(&live_path).unwrap();
+        assert!(
+            Arc::ptr_eq(&live_backend, &same_live_backend),
+            "FD_FIXTURE_OTHER_ROOT_RETAINED"
+        );
+    }
+
     #[cfg(unix)]
     mod target_filter_tests {
         include!("events_split_target_tests.rs");
@@ -2239,6 +2326,7 @@ mod tests {
         // symlink there is a planted redirect: following it would tighten
         // permissions on and write event rows into the link's target.
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, b"victim-bytes").unwrap();
         let mode_before = victim.metadata().unwrap().permissions();
@@ -2305,6 +2393,7 @@ mod tests {
         // local users can write. A group/other-writable parent is refused
         // before any open; an owner-only parent proceeds.
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let open_dir = dir.path().join("shared");
         std::fs::create_dir(&open_dir).unwrap();
         std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -2386,6 +2475,7 @@ mod tests {
         // would redirect WAL writes; admission checks the sidecar suffixes
         // before the database is ever created or opened.
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, b"w").unwrap();
         let sidecar = dir.path().join("db.events.db");
@@ -2528,7 +2618,7 @@ mod tests {
         let db = dir.path().join("events.db");
         ensure_events_db_owner_only(&db).unwrap();
         let before_open = harden_events_db_sidecars(&db).unwrap();
-        let backend = StorageBackend::sqlite(&db).unwrap();
+        let backend = StorageBackend::sqlite_for_test(&db).unwrap();
         backend.events().unwrap();
         verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
         std::fs::remove_file(&db).unwrap();
@@ -2553,7 +2643,7 @@ mod tests {
         let before_open = harden_events_db_sidecars(&db).unwrap();
         assert!(before_open[0].is_some());
         assert_eq!(&before_open[1..], &[None, None]);
-        let backend = StorageBackend::sqlite(&db).unwrap();
+        let backend = StorageBackend::sqlite_for_test(&db).unwrap();
         backend.events().unwrap();
         for path in events_db_targets(&db).iter().skip(1) {
             assert!(path.exists(), "SQLite creates {}", path.display());
@@ -2721,6 +2811,7 @@ mod tests {
         use khive_storage::event::EventAppendDisposition;
 
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let (legacy, lane) = store_pair(dir.path());
 
         let resident = split_retry_event("recall");
@@ -2774,6 +2865,7 @@ mod tests {
     #[tokio::test]
     async fn merged_offset_window_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let (legacy, lane) = store_pair(dir.path());
         let split = SplitEventStore::new(legacy, lane);
 
@@ -2919,6 +3011,7 @@ mod tests {
     fn direct_backend_hardens_preexisting_db_and_sidecars() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let db = dir.path().join("pre-existing.events.db");
         let wal = dir.path().join("pre-existing.events.db-wal");
         std::fs::write(&db, b"").unwrap();
@@ -3352,6 +3445,7 @@ mod tests {
     #[tokio::test]
     async fn split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let legacy_backend =
             direct_backend_for(&dir.path().join("legacy.db")).expect("legacy backend");
         let lane_backend = direct_backend_for(&dir.path().join("lane.db")).expect("lane backend");
@@ -3454,6 +3548,7 @@ mod tests {
         use khive_storage::types::{SqlStatement, SqlValue};
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let legacy_backend =
             direct_backend_for(&dir.path().join("legacy-guard.db")).expect("legacy backend");
         let lane_backend =
@@ -3703,10 +3798,11 @@ mod tests {
         use crate::{KhiveRuntime, Namespace, RuntimeConfig};
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let main_db = dir.path().join("main.db");
         // Materialize + migrate the main database with a writable runtime.
         drop(
-            KhiveRuntime::new(RuntimeConfig {
+            KhiveRuntime::new_for_test(RuntimeConfig {
                 db_path: Some(main_db.clone()),
                 ..RuntimeConfig::no_embeddings()
             })
@@ -3730,8 +3826,8 @@ mod tests {
 
         // Arm 1: read-only runtime, no events db on disk. Reads work through
         // the legacy store and nothing is minted.
-        let ro =
-            KhiveRuntime::new_readonly(split_config(events_db.clone())).expect("read-only runtime");
+        let ro = KhiveRuntime::new_readonly_for_test(split_config(events_db.clone()))
+            .expect("read-only runtime");
         let token = ro.authorize(Namespace::local()).expect("token");
         let store = ro.events(&token).expect("events store");
         let count = store
@@ -3751,7 +3847,7 @@ mod tests {
         // snapshot with a live writer, and that refusal is not this test's
         // subject.
         {
-            let lane_backend = StorageBackend::sqlite(&events_db).expect("writable lane");
+            let lane_backend = StorageBackend::sqlite_for_test(&events_db).expect("writable lane");
             lane_backend
                 .events_for_namespace("local")
                 .expect("lane store")
@@ -3773,6 +3869,7 @@ mod tests {
     #[tokio::test]
     async fn direct_mode_appends_and_reads_without_a_daemon() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _registry_guard = TestRegistryGuard::new(dir.path());
         let db = dir.path().join("events.db");
         let backend = direct_backend_for(&db).expect("direct backend");
         let store = backend.events_for_namespace("local").expect("store");

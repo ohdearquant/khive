@@ -231,7 +231,7 @@ using either alias. Rank position never supplies a judgment.
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                               | Resolve an ambiguous atomic-write outcome                   |
 | `comm.inbox`     | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields | Triage inbox, wait for what's next, or inspect sent history |
 | `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                                       | Cheap unread check without listing                          |
-| `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`)                  | Acknowledge receipt (recipient action)                      |
+| `comm.read`      | Fetch one or more **inbound** messages and mark read; `body=false` keeps the acknowledgement-only shape                 | Read and acknowledge received messages                      |
 | `comm.mark_read` | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                            | Clear a supplied inbox set without naming ambiguity         |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
 | `comm.thread`    | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
@@ -262,8 +262,9 @@ re-run the same actor/status/sender/time/text-filtered query with the same offse
 and the paginated response shape is unchanged. Omit it (or pass `0`) for the
 snapshot behavior.
 
-**Mark-read is inbound-only.** `comm.read` is the compatibility surface; it marks a received message
-as read and does not retrieve content. Calling it on an outbound
+**Mark-read is inbound-only.** `comm.read` fetches a received message and marks it read;
+successful results include its subject, content and routing fields unless `body=false`.
+Calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
 marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
 or `comm.thread`. Pass exactly one of `id` or `ids`; the latter accepts 1-500 IDs and returns
@@ -325,14 +326,15 @@ is a **closed enum** — valid values: `overview` | `core_model` | `boundary_con
 `references` | `other`. Content must be **at least 80 characters**. Shorter content or an
 unrecognized `section_type` returns a validation error listing the valid values.
 
-### Session pack — 4 verbs (`session.` prefix)
+### Session pack — 5 verbs (`session.` prefix)
 
-| Verb             | What it does                                      | When to use                              |
-| ---------------- | ------------------------------------------------- | ---------------------------------------- |
-| `session.store`  | Persist an agent-session record as a session note | Checkpoint/save a completed session      |
-| `session.list`   | List stored sessions, newest first                | "What sessions have I run?"              |
-| `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session |
-| `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive |
+| Verb             | What it does                                      | When to use                                                    |
+| ---------------- | ------------------------------------------------- | -------------------------------------------------------------- |
+| `session.store`  | Persist an agent-session record as a session note | Checkpoint/save a completed session                            |
+| `session.list`   | List stored sessions, newest first                | "What sessions have I run?"                                    |
+| `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session                       |
+| `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive                       |
+| `session.search` | Search scoped mirrored transcript text (gated)    | After transcript deletion and continuity support are available |
 
 Each `session.list` summary carries `full_id`, the canonical UUID to reuse with
 `session.resume` or `session.export`. Presentation mode does not remove it; the

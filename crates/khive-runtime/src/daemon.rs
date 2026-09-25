@@ -2339,6 +2339,17 @@ where
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),
         }
+        // Tokio retains its process-wide handlers after the streams are dropped.
+        // This daemon cannot restart without exec; a repeat signal must terminate
+        // even if shutdown is blocked in synchronous recovery-lock acquisition.
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            // SAFETY: setting SIG_DFL for these valid signals needs no handler
+            // pointer or shared Rust state and applies to the whole process.
+            if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok::<(), std::io::Error>(())
     };
 
     // SAFETY: `geteuid` is always successful and takes no arguments.
@@ -2399,7 +2410,7 @@ where
                 }
             }
         } => {}
-        _ = shutdown => {}
+        result = shutdown => result?,
     }
 
     // A listening backlog is not admitted work. Close it before draining so
@@ -2859,6 +2870,9 @@ pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, di
 #[cfg(all(test, unix))]
 mod tests {
     include!("daemon/plan_tests.rs");
+    mod shutdown_signals {
+        include!("daemon/shutdown_signal_tests.rs");
+    }
     use super::*;
     use serial_test::serial;
 
@@ -2987,7 +3001,7 @@ mod tests {
             });
         let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
         let secondary_backend =
-            khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
+            khive_db::StorageBackend::sqlite_for_test(secondary_dir.path().join("secondary.db"))
                 .expect("file-backed secondary backend");
 
         let mut tasks = checkpoint_task_specs(
@@ -3052,8 +3066,9 @@ mod tests {
         );
 
         let file_main_dir = tempfile::tempdir().expect("file-backed main tempdir");
-        let file_main = khive_db::StorageBackend::sqlite(file_main_dir.path().join("main.db"))
-            .expect("file-backed main backend");
+        let file_main =
+            khive_db::StorageBackend::sqlite_for_test(file_main_dir.path().join("main.db"))
+                .expect("file-backed main backend");
         let tasks = checkpoint_task_specs(
             Some(file_main.pool_arc()),
             vec![secondary_backend.pool_arc()],
@@ -3334,6 +3349,8 @@ mod tests {
             .prefix("kh-drain-")
             .tempdir_in("/tmp")
             .expect("short isolated socket directory");
+        let child_home = dir.path().join("home");
+        std::fs::create_dir(&child_home).expect("empty daemon child HOME");
         let mut child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -3346,11 +3363,14 @@ mod tests {
             .envs(
                 std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
             )
-            .env("HOME", dir.path())
+            .env("HOME", &child_home)
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_DRAIN_TEST_CHILD", "1")
             .env("KHIVE_SOCKET", dir.path().join("s"))
             .env("KHIVE_PID", dir.path().join("p"))
             .env("KHIVE_LOCK", dir.path().join("l"))
+            .env("KHIVE_RECOVERER_LOCK", dir.path().join("r"))
             .env("KHIVE_DRAIN_TIMEOUT_SECS", "10")
             .current_dir(dir.path())
             .stdin(Stdio::null())
@@ -3377,6 +3397,10 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("STOPPED_LISTENER_DRAIN_VERIFIED"),
             "child must run the listener witness: {output:?}"
+        );
+        assert!(
+            std::fs::read_dir(child_home).unwrap().next().is_none(),
+            "daemon drain child must leave its private HOME empty"
         );
     }
 
@@ -4751,7 +4775,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5005,7 +5029,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5110,7 +5134,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_enabled.db")),
                 write_queue_enabled: Some(true),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5132,7 +5156,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_disabled.db")),
                 write_queue_enabled: Some(false),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5442,6 +5466,33 @@ mod tests {
             .expect("successor must receive connection");
     }
 
+    #[test]
+    fn isolated_daemon_locks_use_private_fixture_paths() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        for path in [lock_path(), recoverer_lock_path()] {
+            assert_eq!(
+                path.parent(),
+                home.parent(),
+                "runtime daemon locks must use private fixture paths outside HOME"
+            );
+        }
+        let _boot = acquire_daemon_boot_guard().expect("private boot lock");
+        let _recoverer = try_acquire_recoverer_lock_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("private recoverer lock")
+        .expect("private recoverer lock must be available");
+        assert!(lock_path().is_file());
+        assert!(recoverer_lock_path().is_file());
+        assert!(
+            std::fs::read_dir(home).unwrap().next().is_none(),
+            "both daemon lock producers must leave the child HOME empty"
+        );
+    }
+
     // ── the recovery lock actually serializes two boot sequences ─────────────
     //
     // Production wiring (`khive_mcp::serve::run` / `serve_server`) now acquires
@@ -5456,6 +5507,10 @@ mod tests {
     #[test]
     #[serial]
     fn recovery_lock_serializes_two_concurrent_boot_sequences() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5499,6 +5554,10 @@ mod tests {
     #[test]
     #[serial]
     fn acquire_daemon_boot_guard_returns_guard_when_lock_available() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_file = dir.path().join("khived.recovery.lock");
         std::env::set_var("KHIVE_LOCK", &lock_file);
@@ -5516,6 +5575,10 @@ mod tests {
     #[test]
     #[serial]
     fn acquire_daemon_boot_guard_fails_loudly_when_lock_file_cannot_be_opened() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         // Point KHIVE_LOCK at a directory, not a file: opening a directory
         // with `write(true)` fails (EISDIR), so `acquire_recovery_lock`

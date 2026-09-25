@@ -123,6 +123,7 @@ async fn ingest_disk_before_open(
     let files = crate::confinement::open_files(cfg, Path::new(root), limit, before_open)?;
     let site_id = crate::fetch::canonical_site(runtime, token, &canonical_origin).await?;
     let mut minted = Vec::new();
+    let mut link_targets_processed = 0u32;
     for file in files {
         let relative = file
             .relative
@@ -130,7 +131,14 @@ async fn ingest_disk_before_open(
             .replace(std::path::MAIN_SEPARATOR, "/");
         let bytes = file.read()?;
         let id = ingest_disk_file(runtime, token, &canonical_origin, &relative, bytes).await?;
-        pack.handle_extract(token, json!({ "id": id })).await?;
+        let link_limit = limit
+            .saturating_sub(link_targets_processed)
+            .min(crate::extract::DEFAULT_LINK_LIMIT);
+        let extract_reply = pack
+            .handle_extract(token, json!({ "id": id, "link_limit": link_limit }))
+            .await?;
+        link_targets_processed =
+            link_targets_processed.saturating_add(extracted_link_count(&extract_reply));
         minted.push(id.to_string());
     }
     Ok(json!({ "mode": "disk", "site": site_id.to_string(), "ingested": minted }))
@@ -163,9 +171,26 @@ async fn ingest_urls(
     urls: Vec<String>,
     depth: u32,
     limit: u32,
+    extract_links_at_zero_depth: bool,
 ) -> Result<Value, RuntimeError> {
     let fetch_one = fetch_through_web_fetch(pack, token);
-    crawl(pack, token, urls, depth, limit, &fetch_one).await
+    crawl(
+        pack,
+        token,
+        urls,
+        depth,
+        limit,
+        extract_links_at_zero_depth,
+        &fetch_one,
+    )
+    .await
+}
+
+fn extracted_link_count(reply: &Value) -> u32 {
+    reply["result"]["links"]["edges_created"]
+        .as_u64()
+        .unwrap_or_default()
+        .min(u64::from(u32::MAX)) as u32
 }
 
 /// The crawl proper: queue, visited set, per-address fetch, applicable
@@ -179,6 +204,7 @@ async fn crawl<'a, 'f>(
     urls: Vec<String>,
     depth: u32,
     limit: u32,
+    extract_links_at_zero_depth: bool,
     fetch_one: &'f (dyn Fn(String) -> FetchReply<'a> + Sync + 'f),
 ) -> Result<Value, RuntimeError>
 where
@@ -188,6 +214,7 @@ where
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ingested = Vec::new();
     let mut refused: Vec<Value> = Vec::new();
+    let mut link_targets_processed = 0u32;
 
     while let Some((url_str, level)) = queue.pop_front() {
         if ingested.len() >= limit as usize {
@@ -213,8 +240,25 @@ where
         };
         ingested.push(id_str.to_string());
 
-        let extract_reply = pack.handle_extract(token, json!({ "id": id_str })).await;
-        if level < depth {
+        let should_extract_links = level < depth || (level == 0 && extract_links_at_zero_depth);
+        let link_limit = limit
+            .saturating_sub(link_targets_processed)
+            .min(crate::extract::DEFAULT_LINK_LIMIT);
+        let extract_reply = if should_extract_links && link_limit > 0 {
+            pack.handle_extract(token, json!({ "id": id_str, "link_limit": link_limit }))
+                .await
+        } else {
+            pack.handle_extract_without_links(token, json!({ "id": id_str }))
+                .await
+        };
+        if should_extract_links && link_limit > 0 {
+            let accounted = extract_reply
+                .as_ref()
+                .map(extracted_link_count)
+                .unwrap_or(link_limit);
+            link_targets_processed = link_targets_processed.saturating_add(accounted);
+        }
+        if level < depth && should_extract_links && link_limit > 0 {
             if let Ok(extract_reply) = extract_reply {
                 let _ = extract_reply;
                 let id = Uuid::parse_str(id_str).unwrap_or_default();
@@ -258,6 +302,7 @@ async fn run_ingest(
 ) -> Result<Value, RuntimeError> {
     let depth = params.depth.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_INGEST_LIMIT);
+    let extract_links_at_zero_depth = params.extract_links.unwrap_or(false);
 
     if let Some(origin) = &params.origin {
         let root = params.source.as_str().ok_or_else(|| {
@@ -288,7 +333,7 @@ async fn run_ingest(
             ))
         }
     };
-    ingest_urls(pack, token, urls, depth, limit).await
+    ingest_urls(pack, token, urls, depth, limit, extract_links_at_zero_depth).await
 }
 
 impl WebPack {
@@ -609,6 +654,123 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn url_ingest_at_zero_depth_does_not_extract_links() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+        let files = std::collections::HashMap::from([(
+            "/".to_string(),
+            b"<a href=\"/target\">target</a>".to_vec(),
+        )]);
+        let port = spawn_http_tree_server(files).await;
+        let fetch_one = served_fetch(&runtime, &token, port);
+
+        let reply = super::crawl(
+            &pack,
+            &token,
+            vec!["https://depth.example.test/".to_string()],
+            0,
+            10,
+            false,
+            &fetch_one,
+        )
+        .await
+        .expect("crawl succeeds");
+
+        assert_eq!(reply["ingested"].as_array().unwrap().len(), 1);
+        let (_, edges) = graph_snapshot(&runtime, &token).await;
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|(_, relation, _)| relation == "links_to")
+                .count(),
+            0,
+            "zero depth must not create links_to edges"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn url_ingest_at_zero_depth_extracts_links_when_requested() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+        let files = std::collections::HashMap::from([(
+            "/".to_string(),
+            b"<a href=\"/target\">target</a>".to_vec(),
+        )]);
+        let port = spawn_http_tree_server(files).await;
+        let fetch_one = served_fetch(&runtime, &token, port);
+
+        let reply = super::crawl(
+            &pack,
+            &token,
+            vec!["https://depth-opt-in.example.test/".to_string()],
+            0,
+            10,
+            true,
+            &fetch_one,
+        )
+        .await
+        .expect("crawl succeeds");
+
+        assert_eq!(reply["ingested"].as_array().unwrap().len(), 1);
+        let (_, edges) = graph_snapshot(&runtime, &token).await;
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|(_, relation, _)| relation == "links_to")
+                .count(),
+            1,
+            "an explicit request records the link without following it"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn url_ingest_limit_bounds_link_targets_across_pages() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+        let files = std::collections::HashMap::from([
+            (
+                "/".to_string(),
+                b"<a href=\"/one\">one</a><a href=\"/two\">two</a>".to_vec(),
+            ),
+            (
+                "/one".to_string(),
+                b"<a href=\"/three\">three</a><a href=\"/four\">four</a>".to_vec(),
+            ),
+            ("/two".to_string(), b"two".to_vec()),
+            ("/three".to_string(), b"three".to_vec()),
+            ("/four".to_string(), b"four".to_vec()),
+        ]);
+        let port = spawn_http_tree_server(files).await;
+        let fetch_one = served_fetch(&runtime, &token, port);
+
+        let reply = super::crawl(
+            &pack,
+            &token,
+            vec!["https://limit.example.test/".to_string()],
+            2,
+            3,
+            false,
+            &fetch_one,
+        )
+        .await
+        .expect("crawl succeeds");
+
+        assert_eq!(reply["ingested"].as_array().unwrap().len(), 3);
+        let (_, edges) = graph_snapshot(&runtime, &token).await;
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|(_, relation, _)| relation == "links_to")
+                .count(),
+            3,
+            "link targets extracted across pages must not exceed the document limit"
+        );
+    }
+
     // A5 compares independent databases. Only the HTTP fetch is supplied:
     // it reads real local HTTP bytes, then settles under the declared origin.
     // Both arms use production applicable extraction, with receipts excluded
@@ -678,6 +840,7 @@ mod tests {
             vec![format!("{origin}/index.html")],
             1,
             10,
+            false,
             &fetch_one,
         )
         .await

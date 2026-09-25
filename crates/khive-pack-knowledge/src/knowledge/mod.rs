@@ -6,6 +6,7 @@ pub(crate) mod scoring;
 pub(crate) mod section_feedback;
 pub(crate) mod vamana;
 
+mod atom_validation;
 mod compose;
 mod crud;
 mod eval;

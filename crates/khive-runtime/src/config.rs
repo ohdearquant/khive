@@ -132,6 +132,8 @@ mod private {
 pub struct NamespaceToken {
     namespace: Namespace,
     gate_namespace: Namespace,
+    gate_explicit_namespace: Option<String>,
+    request_id: Option<u64>,
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
@@ -158,6 +160,8 @@ impl NamespaceToken {
         debug_assert!(!visible.is_empty(), "visible set must be non-empty");
         Self {
             gate_namespace: namespace.clone(),
+            gate_explicit_namespace: None,
+            request_id: None,
             namespace,
             visible,
             actor,
@@ -210,6 +214,27 @@ impl NamespaceToken {
 
     pub(crate) fn with_gate_namespace(mut self, namespace: Namespace) -> Self {
         self.gate_namespace = namespace;
+        self
+    }
+
+    /// The exact submitted namespace argument, if the caller supplied one.
+    /// Pack handlers normally receive params after dispatch strips this key.
+    pub(crate) fn gate_explicit_namespace(&self) -> Option<&str> {
+        self.gate_explicit_namespace.as_deref()
+    }
+
+    pub(crate) fn with_gate_explicit_namespace(mut self, namespace: Option<String>) -> Self {
+        self.gate_explicit_namespace = namespace;
+        self
+    }
+
+    /// Correlates handler-internal Gate consultations with their dispatch audit.
+    pub(crate) fn request_id(&self) -> Option<u64> {
+        self.request_id
+    }
+
+    pub(crate) fn with_request_id(mut self, request_id: Option<u64>) -> Self {
+        self.request_id = request_id;
         self
     }
 

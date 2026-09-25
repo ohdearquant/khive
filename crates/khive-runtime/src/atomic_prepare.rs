@@ -2198,7 +2198,7 @@ mod tests {
     fn scratch_runtime() -> TestRuntime {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic_prepare_reindex.db");
-        let runtime = KhiveRuntime::new(RuntimeConfig {
+        let runtime = KhiveRuntime::new_for_test(RuntimeConfig {
             db_path: Some(path),
             embedding_model: None,
             additional_embedding_models: vec![],

@@ -2936,17 +2936,8 @@ async fn merge_note_reason_forwarded_through_registry_dispatch() {
     );
 }
 
-// ── interim merged_into miss-hint (data-integrity, precedes the full
-// ADR-113 transitive redirect chase) ───────────────────────────────────────
-//
-// `get(absorbed_id)` after a merge names the kept id in its NotFound error
-// instead of a bare "not found" — single-level pointer disclosure, message
-// only, never a transparent redirect to the kept entity's data.
-
 #[tokio::test]
-async fn get_dispatch_after_merge_discloses_kept_id() {
-    use khive_runtime::RuntimeError;
-
+async fn get_and_resolve_follow_merged_entity_with_explicit_marker() {
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
@@ -2974,34 +2965,742 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
         .await
         .expect("merge dispatch must succeed");
 
-    let err = registry
+    let got = registry
         .dispatch("get", json!({ "id": from.id.to_string() }))
         .await
-        .expect_err("get on an absorbed id must still miss");
-    let RuntimeError::NotFound(msg) = err else {
-        panic!("expected NotFound, got {err:?}");
-    };
-    assert!(
-        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
-        "expected a merged_into disclosure naming {}, got {msg:?}",
-        into.id
+        .expect("get must follow the merge redirect");
+    assert_eq!(got["id"], json!(into.id));
+    assert_eq!(
+        got["redirected_from"],
+        json!([from.id]),
+        "get must expose redirected_from chain"
     );
+    assert!(got["deleted_at"].is_null());
+
+    let resolved = registry
+        .dispatch("resolve", json!({ "refs": [from.id.to_string()] }))
+        .await
+        .expect("resolve must follow the merge redirect");
+    assert_eq!(resolved["results"][0]["id"], json!(into.id));
+    assert_eq!(resolved["results"][0]["redirected_from"], json!([from.id]));
+
+    let tombstone = registry
+        .dispatch(
+            "get",
+            json!({ "id": from.id.to_string(), "include_deleted": true }),
+        )
+        .await
+        .expect("include_deleted must return the tombstone itself");
+    assert_eq!(
+        tombstone["id"],
+        json!(from.id),
+        "include_deleted must return the consumed tombstone"
+    );
+    assert_eq!(tombstone["merged_into"], json!(into.id));
+    assert!(tombstone["redirected_from"].is_null());
 
     // The documented short-prefix form must reach the same disclosure:
     // absorbed entities are soft-deleted, so this exercises the
     // including-deleted prefix-resolution fallback in handle_get.
     let short = from.id.to_string().replace('-', "")[..8].to_string();
-    let err = registry
+    let short_got = registry
         .dispatch("get", json!({ "id": short }))
         .await
-        .expect_err("get on an absorbed short id must still miss");
-    let RuntimeError::NotFound(msg) = err else {
-        panic!("expected NotFound, got {err:?}");
+        .expect("short id must follow the merge redirect");
+    assert_eq!(short_got["id"], json!(into.id));
+    assert_eq!(short_got["redirected_from"], json!([from.id]));
+
+    let live = registry
+        .dispatch("get", json!({ "id": into.id.to_string() }))
+        .await
+        .expect("live id must remain readable");
+    assert!(live.get("redirected_from").is_none());
+}
+
+#[tokio::test]
+async fn get_and_resolve_follow_two_merges_to_final_entity() {
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let first = rt
+        .create_entity(&token, "concept", None, "First", None, None, vec![])
+        .await
+        .unwrap();
+    let middle = rt
+        .create_entity(&token, "concept", None, "Middle", None, None, vec![])
+        .await
+        .unwrap();
+    let final_entity = rt
+        .create_entity(&token, "concept", None, "Final", None, None, vec![])
+        .await
+        .unwrap();
+    for (from, into) in [(first.id, middle.id), (middle.id, final_entity.id)] {
+        registry
+            .dispatch(
+                "merge",
+                json!({
+                    "kind": "entity", "from_id": from, "into_id": into, "force": true
+                }),
+            )
+            .await
+            .expect("merge dispatch");
+    }
+
+    let got = registry
+        .dispatch("get", json!({"id": first.id}))
+        .await
+        .expect("two-merge get must reach the final live entity");
+    assert_eq!(got["id"], json!(final_entity.id));
+    assert_eq!(got["redirected_from"], json!([first.id, middle.id]));
+    let resolved = registry
+        .dispatch("resolve", json!({"refs": [first.id.to_string()]}))
+        .await
+        .unwrap();
+    assert_eq!(resolved["results"][0]["id"], json!(final_entity.id));
+    assert_eq!(
+        resolved["results"][0]["redirected_from"],
+        json!([first.id, middle.id])
+    );
+}
+
+#[tokio::test]
+async fn get_and_resolve_distinguish_redirect_cycle_from_long_chain() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let a = rt
+        .create_entity(&token, "concept", None, "Cycle A", None, None, vec![])
+        .await
+        .unwrap();
+    let b = rt
+        .create_entity(&token, "concept", None, "Cycle B", None, None, vec![])
+        .await
+        .unwrap();
+    let mut writer = rt.sql().writer().await.expect("sql writer");
+    for (from, into) in [(a.id, b.id), (b.id, a.id)] {
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE entities SET deleted_at = 1, merged_into = ?1, version = version + 1 WHERE id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(into.to_string()),
+                    SqlValue::Text(from.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("seed redirect cycle");
+    }
+    drop(writer);
+    for (verb, params) in [
+        ("get", json!({"id": a.id})),
+        ("resolve", json!({"refs": [a.id.to_string()]})),
+    ] {
+        let error = registry
+            .dispatch(verb, params)
+            .await
+            .expect_err("cycle must fail");
+        assert!(
+            error.to_string().contains("redirect cycle detected"),
+            "cycle must report redirect cycle detected, got {error}"
+        );
+    }
+
+    let mut chain = Vec::new();
+    for index in 0..34 {
+        chain.push(
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                &format!("Chain {index}"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap()
+            .id,
+        );
+    }
+    let mut writer = rt.sql().writer().await.expect("sql writer");
+    for pair in chain.windows(2) {
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE entities SET deleted_at = 1, merged_into = ?1, version = version + 1 WHERE id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(pair[1].to_string()),
+                    SqlValue::Text(pair[0].to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("seed long redirect chain");
+    }
+    drop(writer);
+    for (verb, params) in [
+        ("get", json!({"id": chain[0]})),
+        ("resolve", json!({"refs": [chain[0].to_string()]})),
+    ] {
+        let error = registry
+            .dispatch(verb, params)
+            .await
+            .expect_err("long chain must fail");
+        assert!(
+            error.to_string().contains("redirect chain too long"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_rejects_a_live_entity_with_a_redirect_pointer() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let live = rt
+        .create_entity(&token, "concept", None, "Corrupt live", None, None, vec![])
+        .await
+        .unwrap();
+    let kept = rt
+        .create_entity(&token, "concept", None, "Other live", None, None, vec![])
+        .await
+        .unwrap();
+    let mut writer = rt.sql().writer().await.expect("sql writer");
+    writer
+        .execute(SqlStatement {
+            sql: "UPDATE entities SET merged_into = ?1, version = version + 1 WHERE id = ?2".into(),
+            params: vec![
+                SqlValue::Text(kept.id.to_string()),
+                SqlValue::Text(live.id.to_string()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("seed live redirect corruption");
+    drop(writer);
+
+    for args in [
+        json!({"id": live.id}),
+        json!({"id": live.id, "include_deleted": true}),
+    ] {
+        let error = registry
+            .dispatch("get", args)
+            .await
+            .expect_err("corrupt live redirect must fail");
+        assert!(
+            error.to_string().contains("live entity")
+                && error.to_string().contains("carries merged_into"),
+            "corrupt live get must reject merged_into pointer, got {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn redirected_gate_recheck_preserves_implicit_and_explicit_namespace() {
+    use std::sync::{Arc, Mutex};
+
+    use khive_runtime::{
+        Gate, GateDecision, GateError, GateRequest, RequestIdentity, RuntimeError,
     };
-    assert!(
-        msg.contains("was merged into") && msg.contains(&into.id.to_string()),
-        "expected a merged_into disclosure for the short-prefix form naming {}, got {msg:?}",
-        into.id
+    use uuid::Uuid;
+
+    type SeenGateRequests = Arc<Mutex<Vec<(String, Option<String>, String)>>>;
+
+    #[derive(Debug)]
+    struct NamespacePolicy {
+        kept: Uuid,
+        seen: SeenGateRequests,
+    }
+    impl Gate for NamespacePolicy {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            let id = match request.verb.as_str() {
+                "get" => request.args["id"].as_str(),
+                "resolve" => request.args["refs"][0].as_str(),
+                _ => None,
+            };
+            if let Some(id) = id {
+                let namespace = request.namespace.as_str();
+                let explicit = request.args["namespace"].as_str();
+                self.seen.lock().unwrap().push((
+                    namespace.to_owned(),
+                    explicit.map(str::to_owned),
+                    id.to_owned(),
+                ));
+                let expected_scope = (namespace == "gate-tenant" && explicit.is_none())
+                    || (namespace == "gate-scope" && explicit == Some("gate-scope"));
+                if id == self.kept.to_string() && expected_scope {
+                    return Ok(GateDecision::deny("kept entity denied in request scope"));
+                }
+            }
+            Ok(GateDecision::allow())
+        }
+    }
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let kept = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .unwrap();
+    let consumed = rt
+        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .await
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    builder.with_gate(Arc::new(NamespacePolicy {
+        kept: kept.id,
+        seen: Arc::clone(&seen),
+    }));
+    let registry = builder.build().expect("registry build");
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity", "into_id": kept.id, "from_id": consumed.id, "force": true
+            }),
+        )
+        .await
+        .expect("merge dispatch");
+
+    for (verb, args) in [
+        ("get", json!({"id": consumed.id})),
+        ("resolve", json!({"refs": [consumed.id.to_string()]})),
+    ] {
+        for (explicit, expected_namespace) in [(false, "gate-tenant"), (true, "gate-scope")] {
+            seen.lock().unwrap().clear();
+            let mut args = args.clone();
+            if explicit {
+                args["namespace"] = json!("gate-scope");
+            }
+            let error = registry
+                .dispatch_with_identity(
+                    verb,
+                    args,
+                    Some(RequestIdentity {
+                        namespace: "gate-tenant".into(),
+                        ..RequestIdentity::default()
+                    }),
+                )
+                .await
+                .expect_err("effective Gate must deny in the original request scope");
+            assert!(
+                matches!(error, RuntimeError::PermissionDenied { .. }),
+                "{error}"
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "original and effective Gate checks must run");
+            assert_eq!(seen[0].0, expected_namespace);
+            assert_eq!(seen[1].0, expected_namespace);
+            assert_eq!(seen[0].1.as_deref(), explicit.then_some("gate-scope"));
+            assert_eq!(seen[1].1.as_deref(), explicit.then_some("gate-scope"));
+            assert_eq!(seen[0].2, consumed.id.to_string());
+            assert_eq!(seen[1].2, kept.id.to_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn redirected_reads_recheck_the_effective_id_and_audit_the_denial() {
+    use std::sync::Arc;
+
+    use khive_runtime::{
+        Gate, GateDecision, GateError, GateRequest, RequestIdentity, RuntimeError,
+    };
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::{EventKind, EventOutcome};
+    use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct DenyKept(Uuid);
+    impl Gate for DenyKept {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            let kept = self.0.to_string();
+            let denied = match request.verb.as_str() {
+                "get" => request.args["id"].as_str() == Some(kept.as_str()),
+                "resolve" => request.args["refs"].as_array().is_some_and(|refs| {
+                    refs.iter()
+                        .any(|reference| reference.as_str() == Some(kept.as_str()))
+                }),
+                _ => false,
+            };
+            Ok(if denied {
+                GateDecision::deny("kept entity denied")
+            } else {
+                GateDecision::allow()
+            })
+        }
+    }
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let kept = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .unwrap();
+    let consumed = rt
+        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .await
+        .unwrap();
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    builder.with_gate(Arc::new(DenyKept(kept.id)));
+    builder.with_runtime_event_store(&rt).expect("audit store");
+    let registry = builder.build().expect("registry build");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity", "into_id": kept.id, "from_id": consumed.id, "force": true
+            }),
+        )
+        .await
+        .expect("merge dispatch");
+
+    for (verb, args) in [
+        ("get", json!({"id": consumed.id})),
+        ("resolve", json!({"refs": [consumed.id.to_string()]})),
+    ] {
+        let request_id = if verb == "get" { 148_501 } else { 148_502 };
+        let error = registry
+            .dispatch_with_identity(
+                verb,
+                args,
+                Some(RequestIdentity {
+                    namespace: "local".into(),
+                    request_id: Some(request_id),
+                    ..RequestIdentity::default()
+                }),
+            )
+            .await
+            .expect_err("kept entity must be denied");
+        assert!(
+            matches!(error, RuntimeError::PermissionDenied { .. }),
+            "{error}"
+        );
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    verbs: vec![verb.to_string()],
+                    target_id: Some(kept.id),
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1, "effective check must name K once");
+        assert_eq!(events.items[0].outcome, EventOutcome::Denied);
+        assert_eq!(events.items[0].target_id, Some(kept.id));
+        let all_events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    verbs: vec![verb.to_string()],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(all_events.items.len(), 2);
+        assert!(
+            all_events
+                .items
+                .iter()
+                .all(|event| event.payload["resource"]["request_id"] == json!(request_id)),
+            "denied redirect must correlate both Gate audit rows"
+        );
+    }
+}
+
+#[tokio::test]
+async fn redirected_reads_audit_both_allowed_gate_consultations() {
+    use khive_runtime::RequestIdentity;
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::{EventKind, EventOutcome};
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let kept = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .unwrap();
+    let consumed = rt
+        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .await
+        .unwrap();
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    builder.with_runtime_event_store(&rt).expect("audit store");
+    let registry = builder.build().expect("registry build");
+
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity", "into_id": kept.id, "from_id": consumed.id, "force": true
+            }),
+        )
+        .await
+        .expect("merge dispatch");
+
+    for (verb, args) in [
+        ("get", json!({"id": consumed.id})),
+        ("resolve", json!({"refs": [consumed.id.to_string()]})),
+    ] {
+        let request_id = if verb == "get" { 148_503 } else { 148_504 };
+        registry
+            .dispatch_with_identity(
+                verb,
+                args,
+                Some(RequestIdentity {
+                    namespace: "local".into(),
+                    request_id: Some(request_id),
+                    ..RequestIdentity::default()
+                }),
+            )
+            .await
+            .expect("redirected read must be allowed");
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    verbs: vec![verb.to_string()],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.items.len(),
+            2,
+            "redirected read must audit original and effective Gate checks"
+        );
+        assert!(
+            events
+                .items
+                .iter()
+                .all(|event| event.payload["resource"]["request_id"] == json!(request_id)),
+            "allowed redirect must correlate both Gate audit rows"
+        );
+        assert_eq!(
+            events
+                .items
+                .iter()
+                .filter(|event| {
+                    event.target_id == Some(kept.id) && event.outcome == EventOutcome::Success
+                })
+                .count(),
+            1,
+            "effective allow audit must name the kept id exactly once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn redirected_gate_outage_audits_kept_id_with_request_id() {
+    use std::sync::Arc;
+
+    use khive_runtime::{
+        Gate, GateDecision, GateError, GateRequest, RequestIdentity, RuntimeError,
+    };
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::{EventKind, EventOutcome};
+    use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct FailKept(Uuid);
+    impl Gate for FailKept {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            let kept = self.0.to_string();
+            let targets_kept = match request.verb.as_str() {
+                "get" => request.args["id"].as_str() == Some(kept.as_str()),
+                "resolve" => request.args["refs"][0].as_str() == Some(kept.as_str()),
+                _ => false,
+            };
+            if targets_kept {
+                Err(GateError::Internal("effective target unavailable".into()))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let kept = rt
+        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .await
+        .unwrap();
+    let consumed = rt
+        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .await
+        .unwrap();
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    builder.with_gate(Arc::new(FailKept(kept.id)));
+    builder.with_runtime_event_store(&rt).expect("audit store");
+    let registry = builder.build().expect("registry build");
+    registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "entity", "into_id": kept.id, "from_id": consumed.id, "force": true
+            }),
+        )
+        .await
+        .expect("merge dispatch");
+
+    for (verb, args) in [
+        ("get", json!({"id": consumed.id})),
+        ("resolve", json!({"refs": [consumed.id.to_string()]})),
+    ] {
+        let request_id = if verb == "get" { 148_505 } else { 148_506 };
+        let error = registry
+            .dispatch_with_identity(
+                verb,
+                args,
+                Some(RequestIdentity {
+                    namespace: "local".into(),
+                    request_id: Some(request_id),
+                    ..RequestIdentity::default()
+                }),
+            )
+            .await
+            .expect_err("effective Gate outage must fail closed");
+        assert!(
+            matches!(error, RuntimeError::GateUnavailable { .. }),
+            "{error}"
+        );
+        let events = rt
+            .events(&token)
+            .unwrap()
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    verbs: vec![verb.to_string()],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 2);
+        assert!(
+            events
+                .items
+                .iter()
+                .all(|event| event.payload["resource"]["request_id"] == json!(request_id)),
+            "outage redirect must correlate both Gate audit rows"
+        );
+        assert_eq!(
+            events
+                .items
+                .iter()
+                .filter(|event| {
+                    event.target_id == Some(kept.id) && event.outcome == EventOutcome::Error
+                })
+                .count(),
+            1,
+            "effective outage audit must name the kept id exactly once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_entity_read_has_one_gate_audit_and_no_redirect_marker() {
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::EventKind;
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let live = rt
+        .create_entity(&token, "concept", None, "Live", None, None, vec![])
+        .await
+        .unwrap();
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    builder.with_runtime_event_store(&rt).expect("audit store");
+    let registry = builder.build().expect("registry build");
+
+    let got = registry
+        .dispatch("get", json!({"id": live.id}))
+        .await
+        .unwrap();
+    assert_eq!(got["id"], json!(live.id));
+    assert!(got.get("redirected_from").is_none());
+    let events = rt
+        .events(&token)
+        .unwrap()
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::Audit],
+                verbs: vec!["get".into()],
+                ..EventFilter::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.items.len(), 1, "live get must consult the gate once");
+
+    let resolved = registry
+        .dispatch("resolve", json!({"refs": [live.id.to_string()]}))
+        .await
+        .unwrap();
+    assert_eq!(resolved["results"][0]["id"], json!(live.id));
+    assert!(resolved["results"][0].get("redirected_from").is_none());
+    let resolve_events = rt
+        .events(&token)
+        .unwrap()
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::Audit],
+                verbs: vec!["resolve".into()],
+                ..EventFilter::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve_events.items.len(),
+        1,
+        "live resolve must consult the gate once"
     );
 }
 
@@ -3670,12 +4369,8 @@ async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge
     );
 }
 
-// `resolve`'s `NotFound` outcome (`ReferenceResolution::NotFound`) is a unit
-// variant with no message slot to carry a hint in — scope is `get` only for
-// this interim change (see PR description). This test pins that boundary:
-// resolving an absorbed uuid still reports a bare `not_found` status.
 #[tokio::test]
-async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
+async fn resolve_dispatch_on_merged_uuid_returns_redirect_marker() {
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
@@ -3709,11 +4404,9 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
         .await
         .expect("resolve dispatch must succeed (NotFound is a status, not an error)");
 
-    let status = result["results"][0]["status"].as_str().unwrap();
-    assert_eq!(
-        status, "not_found",
-        "resolve has no message slot for a merge hint in this interim change; got {result:?}"
-    );
+    assert_eq!(result["results"][0]["status"], "resolved");
+    assert_eq!(result["results"][0]["id"], json!(into.id));
+    assert_eq!(result["results"][0]["redirected_from"], json!([from.id]));
 }
 
 // The reason this change exists: before it, a create through the kg verbs left an

@@ -403,6 +403,8 @@ pub(crate) mod tests {
                     vec![SearchHit {
                         entity_id: id,
                         score: Default::default(),
+                        rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+                        signals: khive_runtime::SearchSignals::default(),
                         source: SearchSource::Both,
                         title: Some("entity result".to_string()),
                         snippet: None,
@@ -412,6 +414,8 @@ pub(crate) mod tests {
                     vec![NoteSearchHit {
                         note_id: id,
                         score: Default::default(),
+                        rank_score_kind: khive_runtime::RankScoreKind::Vector,
+                        signals: khive_runtime::SearchSignals::default(),
                         source: SearchSource::Vector,
                         title: Some("note result".to_string()),
                         snippet: None,
@@ -449,6 +453,8 @@ pub(crate) mod tests {
                             entity_hits: vec![SearchHit {
                                 entity_id: id,
                                 score: Default::default(),
+                                rank_score_kind: khive_runtime::RankScoreKind::Keyword,
+                                signals: khive_runtime::SearchSignals::default(),
                                 source: SearchSource::Text,
                                 title: Some("entity result".to_string()),
                                 snippet: None,

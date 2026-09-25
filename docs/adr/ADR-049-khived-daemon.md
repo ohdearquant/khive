@@ -49,6 +49,8 @@ config resolution are **identical** in both modes; only the transport differs:
 - **`--daemon`** — binds a Unix domain socket, builds the same `KhiveRuntime` + `VerbRegistry`,
   warms packs in the background, and serves request frames against that warm registry until
   it receives SIGTERM/SIGINT.
+  Amended by Amendment 11 (2026-09-23): a demand-mode daemon also retires on
+  quiescence; a persistent-mode daemon is unchanged.
 
 No separate `khived` binary: a single artifact keeps `make local`, packaging, and version
 skew trivial. The daemon and the stdio client are guaranteed to share dispatch logic because
@@ -109,6 +111,7 @@ Warm becomes **non-blocking**, benefiting both modes:
   exact collapse the amendment forbids. On SIGTERM/SIGINT, stop accepting, drain
   in-flight requests (`KHIVE_DRAIN_TIMEOUT_SECS`, default 10), remove socket +
   PID, exit.
+  When first-signal shutdown starts, this process-lifetime daemon restores the default SIGTERM and SIGINT dispositions, so a second signal during drain or cleanup terminates with that signal's status and abandons unfinished drain and cleanup.
 
 ### Scope boundary (what this ADR deliberately excludes)
 
@@ -129,6 +132,9 @@ Warm becomes **non-blocking**, benefiting both modes:
 **Positive**
 
 - Cold start is paid **once per machine-uptime**, not once per reconnect.
+  Amended by Amendment 11 (2026-09-23): this no longer holds unconditionally for a
+  demand-mode daemon, which pays cold start again after it retires; persistent mode
+  is unaffected.
 - No search blocks on a rebuild — first query is FTS-instant in either mode.
 - Single binary; `make local` unchanged. Daemon is transparent and optional.
 - Dispatch logic is shared, so the daemon can never drift from local behavior.
@@ -138,6 +144,8 @@ Warm becomes **non-blocking**, benefiting both modes:
 - A long-lived process holding the warm index uses resident memory (~the index size) for the
   machine's session. Mitigated by idle-exit being a cheap future addition; for now the daemon
   exits on signal and is re-spawned on demand.
+  Amended by Amendment 11 (2026-09-23): a demand-mode daemon now retires on
+  quiescence instead of waiting only on signal; persistent mode keeps this behavior.
 - Auto-spawn adds a process-management surface (stale socket, zombie daemon). Mitigated by the
   ported cleanup path and the unconditional local-dispatch fallback.
 - Config/namespace skew between a stale daemon and a new client. Mitigated by namespace check +
@@ -1175,3 +1183,244 @@ identity mismatches, and explicit errors remain nonretryable. A lost mutation
 response retains the existing ambiguity error and never triggers redispatch.
 See [daemon lifecycle](../../crates/khive-mcp/docs/api/daemon-lifecycle.md#long-poll-deadlines-and-one-read-replay-3045)
 for transport and regression details.
+
+## Amendment 11 (2026-09-23): demand-driven daemon retirement and drain
+
+The daemon deliberately outlives the client that starts it, so a warm process can serve many
+callers over its lifetime. Today that lifetime has no upper bound for an automatically started
+daemon: the accept loop in `crates/khive-runtime/src/daemon.rs` waits only on SIGTERM and
+SIGINT, and nothing in it ever asks whether the daemon is still needed once the client that
+spawned it is gone. This amendment gives every daemon an explicit, immutable launch mode, gives
+the automatically started mode a retirement path, and states how retirement interacts with
+in-flight work, explicit transactions ([ADR-005](ADR-005-storage-capability-traits.md)), and the
+events daemon.
+
+This amendment covers lifetime and drain only. Cross-request client ownership (#1933) and
+distinguishing two connections of one authenticated subject (#2792) are decided separately: the
+ownership contract is gated on an inventory of externally reachable retained state, and #2792
+requires measuring the actual conversation-to-session mapping first. Neither gate blocks this
+amendment, because until the ownership contract exists a demand daemon holds no credential-bearing
+background work at all (see Credential-bearing background work below).
+
+### Launch mode
+
+A daemon process now carries an immutable lifetime mode, selected at launch and never inferred
+afterward from parent liveness, a supervision marker, or the executable's location:
+
+- **Demand.** Every automatic-spawn path selects this mode explicitly. A demand-mode daemon is
+  eligible for idle retirement, as defined below.
+- **Persistent.** The default for an explicitly invoked `mcp --daemon` and for every supervised
+  launch. A persistent daemon keeps today's signal-only lifetime; this amendment does not
+  change it.
+
+An automatically started replacement permitted by [ADR-185](ADR-185-daemon-rendezvous-ownership.md)'s
+bounded takeover (its Amendment 1) remains demand mode even while a supervision marker is
+present: a marker records supervision, not launch mode, and this amendment changes neither
+marker ownership nor starter arbitration. The mode, the daemon's instance generation, its
+effective idle interval, and its shutdown reason are exposed through the daemon's existing
+lifecycle diagnostics.
+
+The mode travels on the daemon's command line. `mcp --daemon` gains `--lifetime <demand|persistent>`;
+when the flag is absent the mode is persistent, so an explicit invocation and every supervisor
+configuration written before this amendment keep today's behavior. Automatic spawn has a single
+construction point, the argument builder in `crates/khive-mcp/src/daemon.rs` that both CLI and MCP
+forwarding reach, and that builder passes `--lifetime demand`; the bounded-takeover replacement
+spawns through the same builder when it is implemented. The mode is not read from the environment:
+a spawned daemon inherits its caller's environment, so a variable set for one client would silently
+change unrelated launches, while a command-line value is visible to operators and to the
+process-identity check. The daemon parses the value once at startup and never re-reads it.
+
+Conformance requires:
+
+1. a test on the argument builder asserting that the spawned command line carries
+   `--lifetime demand`;
+2. a test asserting that a daemon started without the flag reports persistent in its lifecycle
+   diagnostics and one started with `--lifetime demand` reports demand;
+3. the command-line identity check that recognizes a khive daemon (`argv_is_khive_daemon`) still
+   recognizing both forms, with a test for each;
+4. every future automatic-spawn path going through the same builder; a second place that
+   constructs a daemon command line is a defect against this amendment.
+
+### Credential-bearing background work
+
+A demand-mode daemon starts no background component that acts with credentials or an actor
+identity captured at startup: no channel loops (inbound polling or outbound delivery) and no
+schedule execution. Those run only under a persistent daemon, started explicitly with
+`mcp --daemon` or by a supervisor, until the client-ownership contract (#1933) defines who owns such
+work once the client that caused the spawn is gone. An automatically started daemon inherits its
+caller's environment and working directory, and later clients of the same user can reuse its socket,
+so without this rule background mail or schedule work could keep running under a departed client's
+credentials and identity. A user who wants an email channel or scheduled work therefore starts the
+daemon explicitly. A demand daemon whose configuration declares a channel or schedules logs each
+skipped component at startup and names it in its lifecycle diagnostics, so the difference is
+visible rather than silent.
+
+### Idle eligibility
+
+A demand-mode daemon retires after 1,800 seconds (30 minutes) of quiescence, configurable to any
+positive duration. This default is a disclosed placeholder, not a measured value: no cold-start
+or reuse-cost measurement supports it today. The measurement that replaces it records two things:
+for each supported auto-spawn path, the cold-start latency from spawn to service readiness; and,
+from the lifecycle diagnostics of demand daemons in representative use, the distribution of gaps
+between the end of one admitted request and the next admitted request on the same daemon. The
+default then becomes the smallest interval that covers the 95th percentile of those gaps, so that
+a retired daemon's next cold start is the exception rather than the rule; if cold start is cheap
+enough that paying it on most reuses is negligible, a shorter interval is preferred. Until that
+measurement exists, the value ships only as a configurable, clearly labeled placeholder, and this
+amendment records no committed number.
+
+The idle clock starts at service readiness, not at process start. Service readiness is the point
+at which the daemon has bound its socket, published its pid file, started the background
+components its mode permits (events-daemon supervision in both modes; channel loops and schedule
+execution only in persistent mode), and installed its
+SIGTERM and SIGINT handlers. See Signal handling below for a gap in the current source between
+publishing the pid file and installing those handlers, and for the change that closes it; until
+that change lands, readiness as defined here is not yet reachable, and the idle clock would
+otherwise inherit the same unguarded window.
+
+The clock restarts after each admitted external request and its cleanup finish. Readiness
+probes, diagnostics-only probes, resource-lease heartbeats, checkpoint ticks, and an empty
+maintenance poll do not restart it; an ordinary application request, including an admitted long
+poll, does. A client's presence with no retained state does not by itself hold the clock open.
+In-flight requests, admitted writes, unsettled workers, retained explicit transactions, and a
+retained read-write connection handle (which keeps its writer permit for its whole handle
+lifetime under [ADR-005](ADR-005-storage-capability-traits.md)) all prevent quiescence.
+
+Background work must declare whether it is expendable cache maintenance or a service obligation
+before it can inhibit retirement. A declared service obligation keeps a demand daemon serving past
+its idle interval, with the diagnostic surface naming the obligation. Scheduled delivery and inbound
+channel loops never hold a demand daemon open, because a demand daemon does not run them; a
+deployment that needs them, or guaranteed continuous service, uses persistent mode. Unknown component state does not count as idle: a configuration is
+eligible for default idle retirement only once its component inventory is complete.
+
+### Admission and drain
+
+Retirement is a one-way transition: Serving, then Draining, then Stopped. The idle check and
+request or resource admission share one synchronization boundary, so an arriving request either
+wins admission, which postpones idle exit, or receives a refusal before dispatch; no request can
+arrive in an untracked gap between the two. An accepted connection whose frame never finishes
+arriving, or a response write that never finishes, has a bounded transport budget and cannot by
+itself hold retirement open indefinitely.
+
+At voluntary idle retirement the daemon closes its listener before it drains, keeps its
+rendezvous identity until settlement completes, and stops starting new background work. No
+permit, transaction record, or ownership reference is released before its worker has actually
+settled. An admitted write or an admitted transaction-control statement is never interrupted,
+turned into a retryable cancellation, or abandoned because the drain interval has expired. If
+outstanding work is still running when the drain interval expires, the daemon stays visibly
+draining and keeps its rendezvous rather than exiting or admitting a replacement writer over it.
+The drain interval bounds unused service retention, not the execution time of admitted work.
+
+This is a bound on unused capacity, not a change to how the daemon shuts down on a signal or to
+how a crash is handled. This amendment adds no durable write handoff and does not change the
+existing mutation-ambiguity or read-replay rules.
+
+### Explicit transactions
+
+An explicit deferred read transaction inhibits idle retirement while its own maximum age keeps
+it active; the existing maximum-age, cancellation, and handle-drop rules are unchanged. This
+amendment adds no wire transaction API and does not treat multiple calls on one SQL handle as
+multiple external requests. An admitted transaction-control statement always settles before
+cleanup: retirement may close an abandoned read transaction after `BEGIN`, but it never
+interrupts a `COMMIT` that is already executing.
+
+### Events daemon
+
+The main daemon already supervises a separate events daemon. `supervise_events_daemon`
+(`crates/khive-runtime/src/events_split.rs`) spawns the events-daemon subcommand when its socket
+is unreachable, reaps an exited child on every probe so it never accumulates a zombie, and, on
+the main daemon's own shutdown, sends SIGKILL to exactly the child it spawned (`Child::kill`) and
+reaps it; a pre-existing events daemon it did not spawn is left running untouched. The code's own reasoning for the
+unconditional kill is that durability rests on SQLite, not on the child's in-memory state.
+[ADR-170](ADR-170-events-daemon-split.md), which describes this split, is proposed, not accepted.
+
+Retirement must classify what the events daemon is to this process before deciding what to do
+with it, at shutdown and at idle retirement alike:
+
+1. **An exclusively owned demand child.** One this process spawned, with nothing else depending
+   on it.
+2. **An independently supervised service.** Running under its own supervisor, outside this
+   process's control.
+3. **A shared demand service.** A child that other consumers also depend on.
+
+For an independently supervised service, this process changes nothing: the service's own
+supervisor owns its lifetime. For a shared demand service, this process releases only its own
+usage and lets the child retire under its own idle protocol once every consumer is gone; this
+process never kills it.
+
+For an exclusively owned demand child, this amendment changes today's behavior. Instead of an
+unconditional kill, the main process stops routing new work to the child, waits for any event
+handoff it has already acknowledged to reach the durability point the split already promises,
+and only then asks the child to stop and reaps it. This is a change from the current
+unconditional kill on shutdown, and it ships as its own bounded, separately verified change; this
+amendment states the target contract, not an implementation. Idle retirement of the main daemon
+may ship ahead of that change for configurations where the events daemon runs supervised or
+shared. A configuration where the main daemon exclusively owns its events child is not eligible
+for default idle retirement until the drain-request change for that child lands.
+
+### Auto-spawn working directory and background actor resolution
+
+The helper that auto-spawns a demand daemon inherits its caller's working directory today and
+does not yet select a neutral one. A later change to use a neutral working directory must account
+for more than configuration discovery: the daemon also resolves its own actor identity for the
+background work it originates, such as channel loops and schedule execution, from a project
+directory tied to its working directory, the same resolution tier every process uses when no
+actor is set explicitly (`crates/khive-mcp/src/serve.rs`). A neutral working directory introduced
+without an explicit, equivalent actor selection would silently change which actor that background
+work runs as. Under this amendment a demand daemon runs no such work, so the question becomes live
+only when the client-ownership contract (#1933) admits it in demand mode. This amendment does not
+change the auto-spawn working directory; it records this so a later change treats the daemon's own
+background-work identity as part of its scope, not only the client's.
+
+### Signal handling
+
+Two gaps in today's signal handling affect this amendment and are named here rather than folded
+into its decision.
+
+The first is a startup window. At current source, the daemon binds its socket, publishes its pid
+file, and starts its background components before its SIGTERM and SIGINT handlers are installed;
+installation happens only when the shutdown path is first polled, later in startup. A signal
+arriving in that window has the platform's default disposition: the process exits with no drain
+and no cleanup, leaving its pid and socket files behind and orphaning any events child already
+spawned. Pull request #3091, open for review, closes this window by moving handler installation
+earlier, before the pid file is published; that is also the ordering this amendment's definition
+of service readiness depends on, above. Until that pull request merges, readiness as defined
+above is not yet reachable in the running code, and the idle clock would inherit the same window.
+
+The second is a repeat-signal gap, independent of this amendment's decision. Once installed, the
+signal handlers replace the platform default for the rest of the process, so a second SIGTERM or
+SIGINT sent while the daemon is already draining is captured and has no effect; only SIGKILL can
+force an exit at that point, and SIGKILL skips cleanup. This is filed as its own defect, issue
+#3119, and is referenced here, not decided: this amendment does not change what a repeat signal
+does during drain.
+
+### Text this amendment supersedes
+
+This amendment supersedes three sentences above, for demand-mode daemons only; a persistent-mode
+daemon keeps the original behavior exactly as written.
+
+- "serves request frames against that warm registry until it receives SIGTERM/SIGINT" no longer
+  describes a demand-mode daemon, which now also retires on quiescence.
+- "Cold start is paid once per machine-uptime, not once per reconnect" no longer holds
+  unconditionally for demand mode, where a retired daemon pays cold start again on its next
+  spawn; persistent mode is unaffected.
+- "for now the daemon exits on signal and is re-spawned on demand" is superseded for demand mode
+  by the retirement policy above; it remains accurate for persistent mode, which this amendment
+  does not change.
+
+### Verification obligations
+
+A second client attaches to a demand daemon after the first client that spawned it exits, and the
+daemon keeps serving. A quiescent demand daemon with no service obligation retires within its
+configured interval; an identical persistent daemon does not. Probe and empty-maintenance traffic
+do not restart the idle clock; an ordinary request does. A daemon with a declared service
+obligation stays serving past its idle interval and names the obligation in its diagnostics. A
+demand daemon whose configuration declares an email channel and schedules starts neither, reports
+both as skipped, and retires on its idle interval; the same configuration under a persistent daemon
+starts both. A
+request racing idle retirement either completes normally or receives a refusal before dispatch,
+with no request unaccounted for. A slow admitted write or an open explicit transaction is never
+interrupted by idle retirement, and a write that outlives the ordinary drain interval still
+reaches its own commit or rollback boundary without duplication. An exclusively owned events
+child is drained and reaped only after its acknowledged handoffs settle; a shared or
+independently supervised events child is never killed by this process.

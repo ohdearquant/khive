@@ -9,7 +9,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use khive_runtime::events_split::{direct_backend_for, direct_backend_read_only_for};
+use khive_runtime::events_split::{
+    direct_backend_for, direct_backend_read_only_for, TestRegistryGuard,
+};
 use serde_json::{json, Value};
 
 const CHILD_MODE: &str = "KHIVE_EVENTS_REGISTRY_LOCK_TEST_MODE";
@@ -105,6 +107,12 @@ fn run_lock_order(read_only_first: bool) {
             command.env_remove(key);
         }
     }
+    let child_home = dir.path().join("child-home");
+    std::fs::create_dir(&child_home).unwrap();
+    // The scrub above must not turn off the database test-harness guards.
+    command
+        .env("KHIVE_TEST_HARNESS", "1")
+        .env("HOME", &child_home);
     command.env(
         CHILD_MODE,
         if read_only_first {
@@ -149,6 +157,10 @@ fn run_lock_order(read_only_first: bool) {
         status.success(),
         "child failed: {}",
         std::fs::read_to_string(stderr_path).unwrap()
+    );
+    assert!(
+        std::fs::read_dir(&child_home).unwrap().next().is_none(),
+        "events registry child must leave its isolated HOME empty"
     );
     let (existing, requested) = if read_only_first {
         ("read-only", "writable")
@@ -256,6 +268,7 @@ fn events_registry_lock_child() {
 #[test]
 fn concurrent_compatible_openers_reuse_one_canonical_entry() {
     let dir = tempfile::tempdir().unwrap();
+    let _registry_guard = TestRegistryGuard::new(dir.path());
     let db = dir.path().join("events.db");
     std::fs::create_dir(dir.path().join("alias-parent")).unwrap();
     let start = Arc::new(std::sync::Barrier::new(8));
@@ -288,6 +301,7 @@ fn concurrent_compatible_openers_reuse_one_canonical_entry() {
 #[test]
 fn read_only_initialization_preserves_missing_and_frozen_files() {
     let dir = tempfile::tempdir().unwrap();
+    let _registry_guard = TestRegistryGuard::new(dir.path());
     let missing = dir.path().join("missing.db");
     assert!(direct_backend_read_only_for(&missing).is_err());
     assert!(!missing.exists());
