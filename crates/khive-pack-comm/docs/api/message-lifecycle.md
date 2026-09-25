@@ -337,12 +337,18 @@ dispatches share the same pack instance and wake immediately.
 
 ## `handlers.rs::handle_read`
 
-Marks a message as read. Rejects `read()` on outbound messages — "read" is a
+Fetches a message and marks it as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
 read/unread invariant and has no semantic meaning to the sender.
 
-Exactly one of `id` or `ids` is required. The single-ID form preserves its
-existing response. The bulk form accepts 1-500 IDs, resolves duplicates to one
+Exactly one of `id` or `ids` is required. `body` defaults to true. On a successful
+mark, the single-ID result or each successful bulk result adds the validated
+message's `subject`, `content`, `from`, `to`, `direction`, and `created_at` to the
+existing acknowledgement fields. `body=false` preserves the earlier response
+shape while still attempting the mark. A failed or indeterminate mark adds none
+of these message fields; validation failures return errors and no body.
+
+The bulk form accepts 1-500 IDs, resolves duplicates to one
 update, validates every target before the first mutation, and returns ordered
 per-target `results` with `requested_count`, `unique_count`, `marked_count`,
 `unknown_count`, and `failed_count`. Each result carries
@@ -375,9 +381,9 @@ patch with no eligibility recheck — since a reply has only one target and no
 validate-then-mark window to race.
 
 The mark-read patch is best-effort: under multi-client burst traffic the
-sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
-read itself has already succeeded by the time the patch runs, so a failed or
-no-op write no longer fails the whole call. This follows the same
+sqlite writer pool can time out (`checkout_timeout`, 5s default). A failed or
+no-op write is reported in the result rather than failing the whole call; the
+body is exposed only when the patch succeeds. This follows the same
 high-level best-effort principle as `handle_reply`'s fold-in mark, which has
 been best-effort since its introduction. Four outcomes:
 
@@ -407,8 +413,7 @@ been best-effort since its introduction. Four outcomes:
   from the indeterminate case above — classification matches on the error's
   real type, never its display text.
 
-`id`/`full_id` are returned in all four arms — only the mark degrades, not
-the read. There is no retry loop; a caller polling unread counts simply
+`id`/`full_id` are returned in all four arms. There is no retry loop; a caller polling unread counts simply
 sees the message still unread (or in an indeterminate state) and can
 re-issue `comm.read` (self-healing).
 Every validation error that runs before the patch (not found, wrong kind,
@@ -425,8 +430,9 @@ best-effort fold-in read mark.
 
 ## `handlers.rs::handle_mark_read`
 
-`comm.mark_read` is the canonical named bulk mutation; message bodies are retrieved through
-`comm.inbox` or `comm.thread`. It requires `ids` (1-500) and accepts optional `atomic` (default
+`comm.mark_read` is the canonical named bulk mutation; it remains acknowledgement-only.
+Message bodies can be retrieved through `comm.read`, `comm.inbox`, or `comm.thread`.
+It requires `ids` (1-500) and accepts optional `atomic` (default
 false). Resolution, namespace/message-kind checks, inbound-direction enforcement, addressee
 authorization, legacy-row compatibility, deduplication, response ordering, and aggregate counts
 are shared with `handle_read` rather than reimplemented.
