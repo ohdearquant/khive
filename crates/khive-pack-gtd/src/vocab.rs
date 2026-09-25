@@ -67,9 +67,9 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// Pack-auxiliary schema for GTD lifecycle audit.
 ///
 /// `gtd_lifecycle_audit` receives best-effort rows for successful real
-/// `transition`/`complete` changes. Same-status assertions are not lifecycle
-/// events and therefore do not create audit rows. The
-/// table is idempotent (`CREATE TABLE IF NOT EXISTS`) and is NOT part of the
+/// `transition`/`complete` changes and mandatory entries for applied repairs.
+/// Same-status assertions are not lifecycle events and do not create audit
+/// rows. The table is idempotent (`CREATE TABLE IF NOT EXISTS`) and is NOT part of the
 /// core versioned migration chain.
 ///
 /// Every statement must be idempotent so the generic boot applier can call them
@@ -95,7 +95,7 @@ pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
 ///   Directive  — attempts to get hearer to do something
 ///   Assertive  — retrieves/presents state of affairs
 ///   Declaration — changes institutional status by fiat
-pub(crate) static GTD_HANDLERS: [HandlerDef; 6] = [
+pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "gtd.census",
         description: "Count live task created_at and archived_at values by numeric magnitude in the visible namespaces. Reports null, nonnumeric, zero, 10/13/16-digit magnitude, and other buckets. Magnitude does not establish timestamp units; the raw greater-than count is NOT temporal ordering. Optional candidates expose bounded structural anomalies as exact JSON source text evidence. Read-only: no repair or conversion; candidate output is bounded but may scan the scoped population.",
@@ -121,6 +121,28 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 6] = [
                 param_type: "object",
                 required: false,
                 description: "Resume after {namespace, id} in namespace then UUID order. Use next_cursor from the preceding page with the same scope. The namespace must be visible and id a canonical lowercase dashed full UUID. Requires include_candidates=true; null and unknown fields are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "gtd.repair",
+        description: "Explicitly repair task timestamps or a noncanonical text status by full UUID and exact observed JSON source. Dry-run by default; apply=true commits each accepted row with its audit independently. Preserves first originals and never infers timestamp units. Status may become only done or cancelled; ordinary statuses use gtd.transition or gtd.complete. By-ID repair is namespace-agnostic.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "items",
+                param_type: "array of object",
+                required: true,
+                description: "1..=100 distinct rows: {id: canonical full UUID, changes: {field: {observed, value}}}. Fields: created_at/updated_at require i64 values and exact census raw source strings; status requires done/cancelled and its exact stored_status source. Only noncanonical text status is eligible. Missing status source is JSON null; explicit JSON null is the string null. First originals/time/actor remain in properties.gtd_repair.originals; gtd_repair.last describes the latest repair. Unknown fields and stale observations refuse the row without writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "apply",
+                param_type: "boolean",
+                required: false,
+                description: "Default false returns per-row stored/proposed values and acceptance/refusal without writes. True applies accepted rows in independent transactions with mandatory gtd_lifecycle_audit records. Storage errors stop the call; earlier row commits can remain. Unrequested timestamps and archived_at are preserved.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
