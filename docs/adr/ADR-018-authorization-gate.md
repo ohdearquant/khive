@@ -699,7 +699,7 @@ care; alert pipelines do.
   - `RuntimeError::PermissionDenied { verb, reason }` variant.
 - `crates/khive-runtime/src/lib.rs`:
   - Re-exports `Gate`, `GateDecision`, `Obligation`, `AuditEvent`, `AuditDecision`.
-- `crates/kkernel/src/server.rs` (or wherever MCP setup lives):
+- `crates/khive-mcp/src/serve.rs` (registry build in `build_registry_for_multi_backend*`):
   - Wires `event_store` from runtime into the registry builder.
 
 ## References
