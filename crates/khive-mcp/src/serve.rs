@@ -565,8 +565,9 @@ fn ingest_namespace_from_env() -> String {
 /// Resolve the default inbound actor for fresh (uncorrelated) email messages.
 ///
 /// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"local"` when the
-/// variable is unset or blank. Called once at server startup alongside
-/// `ingest_namespace_from_env`, and defaults to the same neutral value.
+/// variable is unset or blank. Set it to `"channel:email"` to route fresh,
+/// uncorrelated email to a separately addressed mailbox. Called once at server
+/// startup alongside `ingest_namespace_from_env`.
 #[cfg(feature = "channel-email")]
 fn default_inbound_actor_from_env() -> String {
     std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
@@ -1578,19 +1579,28 @@ pub(crate) async fn channel_outbox_loop(
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    outbox::validate_loop_channel(email_channel.as_ref(), "email")?;
+    let slug = email_channel.slug();
+    let mut channels = khive_channel::ChannelRegistry::new();
+    channels.register(email_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
         }
-        channel_outbox_once(
-            email_channel.as_ref(),
+        outbox::outbox_once(
+            outbox::OutboxChannels::Registered {
+                registry: &channels,
+                slug: &slug,
+            },
+            outbox::OutboxPolicy::Email {
+                mailbox: &mailbox,
+                domain: &domain,
+                allowlist: &allowlist,
+            },
             &runtime,
             &namespace,
-            &mailbox,
-            &domain,
-            &allowlist,
             ctx.cancellation(),
         )
         .await?;
@@ -1602,7 +1612,7 @@ pub(crate) async fn channel_outbox_loop(
 /// routing and owner-claim behavior can be verified without sleeping or
 /// opening a network transport. Account-wide authentication errors propagate
 /// to the supervisor without becoming per-message terminal failures.
-#[cfg(feature = "channel-email")]
+#[cfg(all(test, feature = "channel-email"))]
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
     email_channel: &dyn khive_channel::Channel,
@@ -1613,253 +1623,18 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
-    use chrono::Utc;
-    use khive_channel::ChannelEnvelope;
-
-    // Query outbound messages through the runtime's non-wire outbox scan.
-    // The generic wire `list` verb runs on the kg pack's runtime, which under
-    // a `[packs.comm]` backend assignment is not the backend holding comm's
-    // notes — the scan must use the comm-routed handle this loop was given.
-    // The `email:` prefix is applied INSIDE the scan (before its limit), so a
-    // backlog of another channel's pending rows cannot starve this one; the
-    // per-note checks below are defensive re-checks only.
-    let token = match runtime.authorize(namespace.clone()) {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
-            return Err(crate::components::ComponentError::Permanent(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes = match runtime
-        .list_undelivered_outbound_messages(&token, Some("email:"), 200)
-        .await
-    {
-        Ok(notes) => notes,
-        Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: outbox scan failed");
-            return Err(crate::components::ComponentError::Retryable(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes: Vec<serde_json::Value> = notes
-        .iter()
-        .filter_map(|note| serde_json::to_value(note).ok())
-        .collect();
-    for note_val in &notes {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let props = match note_val.get("properties") {
-            Some(serde_json::Value::Object(properties)) => properties.clone(),
-            _ => continue,
-        };
-
-        if props.get("direction").and_then(|value| value.as_str()) != Some("outbound") {
-            continue;
-        }
-        let to_actor = match props.get("to_actor").and_then(|value| value.as_str()) {
-            Some(actor) if actor.starts_with("email:") => actor.to_string(),
-            _ => continue,
-        };
-        if note_already_delivered(&props) {
-            continue;
-        }
-        let note_id = match note_val.get("id").and_then(|value| value.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-        let recipient = to_actor
-            .strip_prefix("email:")
-            .unwrap_or(to_actor.as_str())
-            .to_string();
-        if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-            // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
-            // must be recorded — skipping with only a log line leaves the row
-            // pending forever while the sender saw `ok: true`.
-            let failed_at = Utc::now().to_rfc3339();
-            let last_error = format!("recipient {recipient} not in outbound allowlist");
-            let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                Ok(uuid) => runtime
-                    .mark_outbound_message_failed(&token, uuid, failed_at, last_error.clone())
-                    .await
-                    .map(|_| ()),
-                Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                    "note id {note_id} is not a valid UUID: {error}"
-                ))),
-            };
-            match mark_result {
-                Ok(_) => tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    "outbox loop: recipient not in allowlist; recorded permanent failure"
-                ),
-                Err(error) => tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    error = %error,
-                    "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
-                ),
-            }
-            continue;
-        }
-
-        let subject = props
-            .get("subject")
-            .and_then(|value| value.as_str())
-            .unwrap_or("(no subject)")
-            .to_string();
-        let content = match note_val.get("content").and_then(|value| value.as_str()) {
-            Some(content) => content.to_string(),
-            None => continue,
-        };
-        let thread_id = props
-            .get("thread_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let in_reply_to = props
-            .get("in_reply_to_message_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let references = props
-            .get("references_chain")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-
-        // Mint-before-send through the comm-routed runtime's owner-only path.
-        // Generic `update` correctly refuses caller patches to `external_id`.
-        let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
-            Some(external_id) if !external_id.is_empty() => external_id.to_string(),
-            _ => {
-                let message_id = format!("<{note_id}@{domain}>");
-                let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => {
-                        runtime
-                            .claim_outbound_message_external_id(&token, uuid, message_id.clone())
-                            .await
-                    }
-                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {error}"
-                    ))),
-                };
-                if let Err(error) = claim_result {
-                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                        Ok(uuid) => {
-                            record_outbound_claim_failure(runtime, &token, uuid, &error).await
-                        }
-                        Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(
-                            format!("note id {note_id} is not a valid UUID: {parse_error}"),
-                        )),
-                    };
-                    match mark_result {
-                        Ok(note) => tracing::warn!(
-                            note_id = %note_id,
-                            error = %error,
-                            permanent = outbound_claim_failure_is_permanent(&error),
-                            delivery = ?note.properties.as_ref().and_then(|p| p.get("delivery")).and_then(|v| v.as_str()),
-                            "outbox loop: claim failure handled; existing claim or terminal state preserved"
-                        ),
-                        Err(mark_error) => tracing::warn!(
-                            note_id = %note_id,
-                            error = %error,
-                            mark_error = %mark_error,
-                            "outbox loop: claim failed and failure state could not be recorded"
-                        ),
-                    }
-                    continue;
-                }
-                message_id
-            }
-        };
-
-        let mut envelope = ChannelEnvelope::new(
-            format!("email:{mailbox}"),
-            format!("email:{recipient}"),
-            content,
-        )
-        .with_subject(subject)
-        .with_message_id(message_id.clone());
-        if let Some(thread_id) = thread_id {
-            envelope = envelope.with_correlation(thread_id);
-        }
-        if let Some(in_reply_to) = in_reply_to {
-            envelope = envelope.with_in_reply_to(in_reply_to);
-        }
-        if let Some(references) = references {
-            envelope = envelope.with_references(references);
-        }
-
-        match email_channel.send(envelope).await {
-            Ok(()) => {
-                let delivered_at = Utc::now().to_rfc3339();
-                let delivered_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => runtime
-                        .mark_outbound_message_delivered(
-                            &token,
-                            uuid,
-                            delivered_at,
-                            Some(message_id.clone()),
-                        )
-                        .await
-                        .map(|_| ()),
-                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {error}"
-                    ))),
-                };
-                match delivered_result {
-                    Ok(_) => tracing::info!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        message_id = %message_id,
-                        "outbox loop: delivered"
-                    ),
-                    Err(error) => tracing::warn!(
-                        note_id = %note_id,
-                        error = %error,
-                        "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                    ),
-                }
-            }
-            Err(
-                khive_channel::ChannelError::Auth(error)
-                | khive_channel::ChannelError::Config(error),
-            ) => {
-                return Err(crate::components::ComponentError::Permanent(error));
-            }
-            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
-                return Err(crate::components::ComponentError::Retryable(error));
-            }
-            Err(error) => {
-                let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => record_outbound_send_failure(runtime, &token, uuid, &error)
-                        .await
-                        .map(|_| ()),
-                    Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {parse_error}"
-                    ))),
-                };
-                match mark_result {
-                    Ok(()) => tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %error,
-                        classification = ?error.delivery_failure_class(),
-                        "outbox loop: send failure recorded"
-                    ),
-                    Err(mark_error) => tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %error,
-                        mark_error = %mark_error,
-                        "outbox loop: send failed and retry state could not be recorded"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(())
+    outbox::outbox_once(
+        outbox::OutboxChannels::Single(email_channel),
+        outbox::OutboxPolicy::Email {
+            mailbox,
+            domain,
+            allowlist,
+        },
+        runtime,
+        namespace,
+        cancellation,
+    )
+    .await
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
@@ -2142,14 +1917,22 @@ pub(crate) async fn telegram_outbox_loop(
     ingest_namespace: String,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
+    outbox::validate_loop_channel(telegram_channel.as_ref(), "telegram")?;
+    let slug = telegram_channel.slug();
+    let mut channels = khive_channel::ChannelRegistry::new();
+    channels.register(telegram_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
         }
-        telegram_outbox_once(
-            telegram_channel.as_ref(),
+        outbox::outbox_once(
+            outbox::OutboxChannels::Registered {
+                registry: &channels,
+                slug: &slug,
+            },
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
             &runtime,
             &namespace,
             ctx.cancellation(),
@@ -2159,110 +1942,21 @@ pub(crate) async fn telegram_outbox_loop(
     }
 }
 
-#[cfg(feature = "channel-telegram")]
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
 async fn telegram_outbox_once(
     telegram_channel: &dyn khive_channel::Channel,
     runtime: &khive_runtime::KhiveRuntime,
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
-    use khive_channel::ChannelEnvelope;
-
-    let token = match runtime.authorize(namespace.clone()) {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(error = %error, "telegram outbox loop: namespace authorization failed");
-            return Err(crate::components::ComponentError::Permanent(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes = match runtime
-        .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
-        .await
-    {
-        Ok(notes) => notes,
-        Err(error) => {
-            tracing::warn!(error = %error, "telegram outbox loop: outbox scan failed");
-            return Err(crate::components::ComponentError::Retryable(
-                error.to_string(),
-            ));
-        }
-    };
-
-    for note in notes {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let Some(props) = note
-            .properties
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-        else {
-            continue;
-        };
-        if props.get("direction").and_then(serde_json::Value::as_str) != Some("outbound") {
-            continue;
-        }
-        let Some(to_actor) = props
-            .get("to_actor")
-            .and_then(serde_json::Value::as_str)
-            .filter(|actor| actor.starts_with("telegram:"))
-        else {
-            continue;
-        };
-        if note_already_delivered(props) {
-            continue;
-        }
-
-        let envelope = ChannelEnvelope::new("telegram:bot", to_actor, note.content.clone());
-        match telegram_channel.send(envelope).await {
-            Ok(()) => {
-                match runtime
-                    .mark_outbound_message_delivered(
-                        &token,
-                        note.id,
-                        chrono::Utc::now().to_rfc3339(),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(_) => tracing::info!(note_id = %note.id, "telegram outbox loop: delivered"),
-                    Err(error) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                    ),
-                }
-            }
-            Err(
-                khive_channel::ChannelError::Auth(error)
-                | khive_channel::ChannelError::Config(error),
-            ) => {
-                return Err(crate::components::ComponentError::Permanent(error));
-            }
-            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
-                return Err(crate::components::ComponentError::Retryable(error));
-            }
-            Err(error) => {
-                match record_outbound_send_failure(runtime, &token, note.id, &error).await {
-                    Ok(_) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        classification = ?error.delivery_failure_class(),
-                        "telegram outbox loop: send failure recorded"
-                    ),
-                    Err(mark_error) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        mark_error = %mark_error,
-                        "telegram outbox loop: send failed and retry state could not be recorded"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(())
+    outbox::outbox_once(
+        outbox::OutboxChannels::Single(telegram_channel),
+        outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+        runtime,
+        namespace,
+        cancellation,
+    )
+    .await
 }
 
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
@@ -2368,6 +2062,26 @@ pub async fn build_registry_for_multi_backend_with_db_anchor(
     cli_db_override: Option<&str>,
     db_anchor: Option<&std::path::Path>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+        None,
+    )
+    .await
+}
+
+/// Build a registry with a reader count fixed before any configured store opens.
+/// `None` retains normal sizing; callers selecting a forwarding default should
+/// use [`mcp_max_readers`] so explicit counts and direct hosts retain precedence.
+pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+    max_readers: Option<usize>,
+) -> anyhow::Result<MultiBackendRegistry> {
     // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
     // so it must agree with the canonical anchor for this same `--db` input.
     // This is the shared choke point both multi-backend boot paths funnel
@@ -2376,7 +2090,13 @@ pub async fn build_registry_for_multi_backend_with_db_anchor(
     // once instead of at each caller.
     khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
-    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override).await
+    build_registry_for_multi_backend_inner_with_max_readers(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        max_readers,
+    )
+    .await
 }
 
 /// One backend's schema result from [`migrate_configured_storage_topology`].
@@ -2569,7 +2289,7 @@ pub async fn migrate_configured_storage_topology(
             .find(|backend| backend.name == target)
             .expect("the planner validated the selected backend")
             .clone();
-        let backend = Arc::new(open_backend(&selected)?);
+        let backend = Arc::new(open_backend(&selected, None)?);
         prepare_core_schema_for_boot(Arc::clone(&backend), format!("backend {}", selected.name))
             .await?;
         crate::attachment_cutover::require_secondary_attachment_empty(
@@ -2594,6 +2314,7 @@ pub async fn migrate_configured_storage_topology(
         khive_cfg,
         cli_db_override,
         StorageTopologyPurpose::SchemaAdministration,
+        None,
     )
     .await?;
     let selected_target = target_backend
@@ -3054,6 +2775,7 @@ async fn prepare_configured_storage_topology(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
     purpose: StorageTopologyPurpose,
+    max_readers: Option<usize>,
 ) -> anyhow::Result<PreparedStorageTopology> {
     let force_memory =
         normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
@@ -3116,7 +2838,7 @@ async fn prepare_configured_storage_topology(
                 continue;
             }
         }
-        let backend = open_backend(backend_cfg)?;
+        let backend = open_backend(backend_cfg, max_readers)?;
         let arc = Arc::new(backend);
         if let Some(canon) = canonical {
             path_to_backend.insert(canon, arc.clone());
@@ -3264,6 +2986,21 @@ async fn build_registry_for_multi_backend_inner(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    build_registry_for_multi_backend_inner_with_max_readers(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        None,
+    )
+    .await
+}
+
+async fn build_registry_for_multi_backend_inner_with_max_readers(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    max_readers: Option<usize>,
+) -> anyhow::Result<MultiBackendRegistry> {
     let PreparedStorageTopology {
         base_config,
         backends,
@@ -3274,6 +3011,7 @@ async fn build_registry_for_multi_backend_inner(
         khive_cfg,
         cli_db_override,
         StorageTopologyPurpose::Serving,
+        max_readers,
     )
     .await?;
 
@@ -3541,6 +3279,33 @@ pub fn enforce_strict_actor_mode(
     Ok(())
 }
 
+/// Select the local pool size before an MCP host opens any store.
+///
+/// A forwarding client retains these pools for boot work, `save_to`, and local
+/// fallback. Counts are fixed for the process lifetime; daemon and direct hosts
+/// retain the ordinary default. An explicit reader count always wins.
+pub fn mcp_max_readers(
+    args: &Args,
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    explicit: Option<usize>,
+) -> Option<usize> {
+    let file_backed = if args.db.as_deref() == Some(":memory:") {
+        false
+    } else if backends.is_empty() {
+        config.db_path.is_some()
+    } else {
+        backends
+            .iter()
+            .any(|backend| backend.name == BackendId::MAIN && backend.kind == BackendKind::Sqlite)
+    };
+    #[cfg(unix)]
+    let forwarding = !args.daemon && !khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON");
+    #[cfg(not(unix))]
+    let forwarding = false;
+    explicit.or((forwarding && file_backed).then_some(1))
+}
+
 /// Build a fully-configured server from parsed args (without serving).
 ///
 /// This is the supported production boot path for a single-backend server. The
@@ -3557,18 +3322,18 @@ pub fn enforce_strict_actor_mode(
 /// re-resolved one (PR #782 — see
 /// `crates/khive-mcp/docs/api/pending-events.md`).
 ///
-/// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
-/// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
-/// this is the genuine `--actor`/`--namespace` CLI flag path, also treats
-/// that explicitness as a real actor override.
+/// Derives identity explicitness from a real CLI parse and selects the MCP
+/// pool policy before constructing stores. Native one-shot callers use
+/// [`build_server_with_explicit_namespace`] and retain default pool sizing.
 pub async fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
-    build_server_with_explicit_namespace(
+    build_server_inner(
         args,
         cli_namespace,
         cli_namespace_explicit,
         cli_namespace_explicit,
+        true,
     )
     .await
 }
@@ -3577,7 +3342,8 @@ pub async fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
 /// Like [`build_server`], this is an asynchronous host-boot boundary and returns
-/// only after the attachment cutover is complete.
+/// only after the attachment cutover is complete. This native one-shot builder
+/// retains default pool sizing rather than selecting an MCP forwarding policy.
 ///
 /// Extracted from [`build_server`] (PR #782) so non-interactive-CLI callers
 /// (e.g. the `--pending-events` one-shot drain wrapper) can supply a
@@ -3594,6 +3360,16 @@ pub async fn build_server_with_explicit_namespace(
     namespace: khive_runtime::Namespace,
     namespace_explicit: bool,
     actor_explicit: bool,
+) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
+    build_server_inner(args, namespace, namespace_explicit, actor_explicit, false).await
+}
+
+async fn build_server_inner(
+    args: &Args,
+    namespace: khive_runtime::Namespace,
+    namespace_explicit: bool,
+    actor_explicit: bool,
+    mcp_host: bool,
 ) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (config, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
         db: args.db.as_deref(),
@@ -3657,6 +3433,12 @@ pub async fn build_server_with_explicit_namespace(
         )?;
     }
 
+    let max_readers = if mcp_host {
+        mcp_max_readers(args, &config, &khive_cfg.backends, None)
+    } else {
+        None
+    };
+
     // Issue #1586: disclose the resolved database target once at startup so a
     // no-override invocation's silent default (`$HOME/.khive/khive.db`) is
     // visible in the operator's log alongside the other startup facts. The
@@ -3665,7 +3447,8 @@ pub async fn build_server_with_explicit_namespace(
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
-        let runtime = build_single_backend_runtime(config, &khive_cfg).await?;
+        let runtime =
+            build_single_backend_runtime_with_max_readers(config, &khive_cfg, max_readers).await?;
         #[cfg(feature = "bench-embedder")]
         {
             for name in runtime.registered_embedding_model_names() {
@@ -3703,11 +3486,12 @@ pub async fn build_server_with_explicit_namespace(
     }
 
     // Multi-backend path (ADR-028).
-    let multi = build_registry_for_multi_backend_with_db_anchor(
+    let multi = build_registry_for_multi_backend_with_db_anchor_and_max_readers(
         config,
         &khive_cfg,
         args.db.as_deref(),
         db_anchor.as_deref(),
+        max_readers,
     )
     .await?;
     let schedule_rt = writable_schedule_runtime(
@@ -4133,7 +3917,15 @@ pub async fn build_single_backend_runtime(
     config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<KhiveRuntime> {
-    let backend = Arc::new(open_single_backend(&config)?);
+    build_single_backend_runtime_with_max_readers(config, khive_cfg, None).await
+}
+
+async fn build_single_backend_runtime_with_max_readers(
+    config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    max_readers: Option<usize>,
+) -> anyhow::Result<KhiveRuntime> {
+    let backend = Arc::new(open_single_backend(&config, max_readers)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator =
@@ -4152,7 +3944,10 @@ pub async fn build_single_backend_runtime(
     Ok(runtime)
 }
 
-fn open_single_backend(config: &RuntimeConfig) -> anyhow::Result<StorageBackend> {
+fn open_single_backend(
+    config: &RuntimeConfig,
+    max_readers: Option<usize>,
+) -> anyhow::Result<StorageBackend> {
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4163,7 +3958,7 @@ fn open_single_backend(config: &RuntimeConfig) -> anyhow::Result<StorageBackend>
                     )
                 })?;
             }
-            StorageBackend::sqlite(path)
+            StorageBackend::sqlite_with_max_readers(path, max_readers)
                 .map_err(|error| anyhow::anyhow!("open single SQLite backend: {error}"))?
         }
         None => StorageBackend::memory()
@@ -4176,7 +3971,7 @@ async fn prepare_single_backend_for_schema_admin(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<Arc<StorageBackend>> {
-    let backend = Arc::new(open_single_backend(config)?);
+    let backend = Arc::new(open_single_backend(config, None)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
@@ -4258,7 +4053,7 @@ fn build_pack_runtime(
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.
-fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
+fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Result<StorageBackend> {
     match cfg.kind {
         BackendKind::Memory => StorageBackend::memory()
             .map_err(|e| anyhow::anyhow!("backend {}: memory open: {e}", cfg.name)),
@@ -4282,11 +4077,11 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                 }
             }
             if cfg.read_only {
-                StorageBackend::sqlite_read_only(&expanded).map_err(|e| {
-                    anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name)
-                })
+                StorageBackend::sqlite_read_only_with_max_readers(&expanded, max_readers).map_err(
+                    |e| anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name),
+                )
             } else {
-                let backend = StorageBackend::sqlite(&expanded)
+                let backend = StorageBackend::sqlite_with_max_readers(&expanded, max_readers)
                     .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
                 if backend.is_read_only() {
                     anyhow::bail!(
@@ -5541,6 +5336,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn resolve_project_actor_id_reads_cwd_anchored_project_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -5575,6 +5374,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn seat_shaped_project_actor_resolves_through_full_tier_chain() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         // The seat: a project directory with its own `[actor] id`.
@@ -5640,6 +5443,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn resolve_runtime_config_unset_db_discovers_cwd_config_over_home() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -5688,6 +5495,10 @@ brain_profile = "project-profile"
     #[test]
     #[serial]
     fn cli_actor_flag_wins_over_project_config_actor() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -5792,6 +5603,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn real_clap_path_khive_actor_env_no_longer_wins_over_project_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use clap::Parser;
         std::env::remove_var("KHIVE_ACTOR");
 
@@ -5850,6 +5665,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn real_clap_path_khive_actor_env_falls_back_to_tier3_actor_id() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use clap::Parser;
         std::env::remove_var("KHIVE_ACTOR");
 
@@ -5905,6 +5724,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
 
         // The seat: a project directory with its own `[actor] id`.
@@ -5977,6 +5800,10 @@ id = "lambda:project-actor"
     #[test]
     #[serial]
     fn config_id_byte_identical_across_different_actor_ids() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
@@ -8694,7 +8521,7 @@ region = "us-east-1"
             "canonical backend identity must not create a missing read-only parent"
         );
 
-        let error = match open_backend(&config) {
+        let error = match open_backend(&config, None) {
             Ok(_) => panic!("missing read-only snapshot must fail"),
             Err(error) => error,
         };
@@ -8732,7 +8559,7 @@ region = "us-east-1"
             served_kinds: None,
             read_only: false,
         };
-        let error = match open_backend(&config) {
+        let error = match open_backend(&config, None) {
             Ok(_) => panic!("an undeclared multi-backend storage-mode change must fail closed"),
             Err(error) => error,
         };
@@ -9216,6 +9043,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn legacy_registry_rejects_unset_db_after_home_changes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let base_cfg = base_runtime_config_for_multi_backend();
@@ -9231,6 +9062,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn legacy_server_rejects_unset_db_after_home_changes() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let base_cfg = base_runtime_config_for_multi_backend();
@@ -9297,6 +9132,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
         let config_path = first_home.path().join("config.toml");
@@ -9760,6 +9599,10 @@ region = "us-east-1"
     #[test]
     #[serial]
     fn config_id_matches_for_tilde_and_equivalent_absolute_db_override() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let original_home = std::env::var_os("HOME");
         let home_dir = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("HOME", home_dir.path());
@@ -9814,16 +9657,67 @@ region = "us-east-1"
     mod default_inbound_actor_tests {
         use super::*;
 
+        const EMAIL_READER: &str = "lambda:email-reader";
+
+        fn email_test_registry(runtime: KhiveRuntime) -> khive_runtime::VerbRegistry {
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg and comm through the factory path");
+            builder.with_gate(runtime.config().gate.clone());
+            builder.with_actor_id(runtime.config().actor_id.clone());
+            builder.build().expect("build email comm registry")
+        }
+
+        async fn ingest_fresh_email(
+            registry: &khive_runtime::VerbRegistry,
+            external_id: &str,
+            default_actor: &str,
+        ) {
+            registry
+                .dispatch(
+                    "comm.ingest",
+                    serde_json::json!({
+                        "namespace": "local",
+                        "from": "email:sender@example.com",
+                        "to": "email:mailbox@example.com",
+                        "content": "fresh email",
+                        "channel_kind": "email",
+                        "external_id": external_id,
+                        "default_inbound_actor": default_actor,
+                    }),
+                )
+                .await
+                .expect("fresh email ingests");
+        }
+
+        async fn dispatch_as(
+            registry: &khive_runtime::VerbRegistry,
+            actor_id: Option<&str>,
+            verb: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, khive_runtime::RuntimeError> {
+            registry
+                .dispatch_with_identity(
+                    verb,
+                    params,
+                    Some(khive_runtime::RequestIdentity {
+                        namespace: "local".to_string(),
+                        actor_id: actor_id.map(str::to_string),
+                        ..Default::default()
+                    }),
+                )
+                .await
+        }
+
         #[test]
         #[serial]
         fn default_inbound_actor_defaults_to_local() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(
-                default_inbound_actor_from_env(),
-                "local",
-                "an unset actor must resolve to the neutral namespace, not to any particular \
-                 deployment's identity"
-            );
+            assert_eq!(default_inbound_actor_from_env(), "local");
         }
 
         #[test]
@@ -9842,6 +9736,214 @@ region = "us-east-1"
             let actor = default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "local", "blank env var must fall back to default");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn fresh_uncorrelated_email_defaults_to_local_inbox() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor = default_inbound_actor_from_env();
+            assert_eq!(default_actor, "local");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let registry = email_test_registry(runtime);
+            ingest_fresh_email(&registry, "email-default-local", &default_actor).await;
+
+            let inbox = registry
+                .dispatch("comm.inbox", serde_json::json!({}))
+                .await
+                .expect("the default caller can read its inbox");
+            let messages = inbox["messages"].as_array().expect("inbox messages");
+            assert_eq!(
+                messages.len(),
+                1,
+                "fresh email must be in the default inbox"
+            );
+            assert_eq!(messages[0]["content"], "fresh email");
+            assert_eq!(messages[0]["properties"]["to_actor"], "local");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn opt_in_email_mailbox_is_visible_only_to_a_configured_reader() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email");
+            let default_actor = default_inbound_actor_from_env();
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(default_actor, "channel:email");
+
+            let config: KhiveConfig = toml::from_str(&format!(
+                "[actor]\nid = 'channel:email'\nmailbox_readers = ['{EMAIL_READER}']\n"
+            ))
+            .expect("valid serving actor configuration");
+            config
+                .validate()
+                .expect("validate serving actor configuration");
+            let runtime_config = runtime_config_from_khive_config(
+                &config,
+                RuntimeConfig {
+                    db_path: None,
+                    ..RuntimeConfig::no_embeddings()
+                },
+            );
+            let runtime = KhiveRuntime::new(runtime_config).expect("configured runtime");
+            let registry = email_test_registry(runtime);
+            ingest_fresh_email(&registry, "email-opt-in-reader", &default_actor).await;
+
+            let inbox = dispatch_as(
+                &registry,
+                Some(EMAIL_READER),
+                "comm.inbox",
+                serde_json::json!({"mailbox_actor": "channel:email"}),
+            )
+            .await
+            .expect("the configured reader can select the email mailbox");
+            let messages = inbox["messages"].as_array().expect("inbox messages");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["content"], "fresh email");
+
+            let denied = dispatch_as(
+                &registry,
+                None,
+                "comm.inbox",
+                serde_json::json!({"mailbox_actor": "channel:email"}),
+            )
+            .await
+            .expect_err("the anonymous local caller has no delegated mailbox grant");
+            assert!(matches!(
+                denied,
+                khive_runtime::RuntimeError::PermissionDenied {
+                    ref verb,
+                    ref reason,
+                    ..
+                } if verb == "comm.inbox" && reason == "mailbox_read_not_granted"
+            ));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn email_sender_prefix_filters_fresh_ingest_from_local_sends() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor = default_inbound_actor_from_env();
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let registry = email_test_registry(runtime);
+            ingest_fresh_email(&registry, "email-prefix-filter", &default_actor).await;
+            registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({"to": "local", "content": "local message"}),
+                )
+                .await
+                .expect("the local caller can send its control message");
+
+            let all = registry
+                .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                .await
+                .expect("read all local inbox messages");
+            let all_messages = all["messages"].as_array().expect("inbox messages");
+            assert_eq!(all_messages.len(), 2, "both messages must be present");
+            assert!(all_messages.iter().any(|message| {
+                message["content"] == "local message"
+                    && message["properties"]["from_actor"] == "local"
+            }));
+
+            let email = registry
+                .dispatch(
+                    "comm.inbox",
+                    serde_json::json!({"status": "all", "from_prefix": "email:"}),
+                )
+                .await
+                .expect("filter the inbox by email sender prefix");
+            let email_messages = email["messages"].as_array().expect("filtered messages");
+            assert_eq!(email_messages.len(), 1);
+            assert_eq!(email_messages[0]["content"], "fresh email");
+            assert!(email_messages[0]["properties"]["from_actor"]
+                .as_str()
+                .is_some_and(|actor| actor.starts_with("email:")));
+        }
+
+        #[tokio::test]
+        async fn send_rejects_a_forged_from_actor_and_stores_the_caller_identity() {
+            let mut config = RuntimeConfig {
+                db_path: None,
+                ..RuntimeConfig::no_embeddings()
+            };
+            config.actor_id = Some("lambda:sender".to_string());
+            let runtime = KhiveRuntime::new(config).expect("sender runtime");
+            let registry = email_test_registry(runtime);
+
+            let forged = registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "lambda:recipient",
+                        "content": "forged sender probe",
+                        "from_actor": "email:forged@example.com",
+                    }),
+                )
+                .await
+                .expect_err("from_actor is not a comm.send argument");
+            assert!(forged.to_string().contains("unknown field `from_actor`"));
+
+            registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "lambda:recipient",
+                        "content": "caller attribution control",
+                    }),
+                )
+                .await
+                .expect("valid send from the configured actor");
+            let sent = registry
+                .dispatch(
+                    "comm.inbox",
+                    serde_json::json!({"box": "sent", "fields": ["from_actor"]}),
+                )
+                .await
+                .expect("read the caller's sent message");
+            let messages = sent["messages"].as_array().expect("sent messages");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["from_actor"], "lambda:sender");
+        }
+
+        #[test]
+        fn email_shaped_actor_label_resolves_but_fails_toml_namespace_validation() {
+            let label = "email:forged@example.com";
+            let actor = khive_runtime::resolve_actor(Some(label));
+            assert_eq!(actor.kind, "actor");
+            assert_eq!(actor.id, label);
+
+            let config: KhiveConfig = toml::from_str(&format!("[actor]\nid = '{label}'\n"))
+                .expect("actor label parses as TOML text");
+            let error = config
+                .validate()
+                .expect_err("actor.id must satisfy namespace validation")
+                .to_string();
+            assert!(error.contains("invalid character"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn comm_ingest_without_a_channel_capability_is_refused() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime));
+            let registry = builder.build().expect("build direct comm composition");
+
+            let error = registry
+                .dispatch(
+                    "comm.ingest",
+                    serde_json::json!({
+                        "from": "email:sender@example.com",
+                        "to": "email:mailbox@example.com",
+                        "content": "fresh email",
+                        "default_inbound_actor": "local",
+                    }),
+                )
+                .await
+                .expect_err("a direct comm pack without the grant must refuse ingest");
+            assert!(error
+                .to_string()
+                .contains("no channel-ingest capability grant"));
         }
     }
 
@@ -10483,6 +10585,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10513,6 +10619,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_actor_identity() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10547,6 +10657,10 @@ region = "us-east-1"
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set(
     ) {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -10574,6 +10688,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn default_read_only_server_omits_schedule_tick_and_warms_without_a_writer() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10631,6 +10749,10 @@ region = "us-east-1"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn multi_backend_schedule_tick_and_warm_use_each_assigned_backend_mode() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10821,6 +10943,10 @@ backend = "schedule-backend"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         // Regression for the exact "strict actor mode can make every tick
         // fail" scenario this fix addressed: before this fix, the
         // tick's separately-reconstructed `RuntimeConfig::default()` carried
@@ -10877,6 +11003,10 @@ backend = "schedule-backend"
     #[serial]
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
         // "schedule" pack is explicitly routed to its OWN backend, distinct
         // from "main". `build_server`'s returned schedule-tick runtime must
@@ -11010,6 +11140,10 @@ backend = "schedule-backend"
     #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
     ) {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
         std::env::remove_var("KHIVE_DB");
@@ -14423,3 +14557,17 @@ mod poll_timing_tests;
 #[cfg(all(test, feature = "channel-email"))]
 #[path = "serve_outbox_claim_tests.rs"]
 mod outbox_claim_tests;
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox.rs"]
+mod outbox;
+
+include!("serve_outbox_parity_tests.rs");
+
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox_slug_tests.rs"]
+mod outbox_slug_tests;
+
+#[cfg(all(test, unix))]
+#[path = "serve_reader_pool_tests.rs"]
+mod reader_pool_tests;

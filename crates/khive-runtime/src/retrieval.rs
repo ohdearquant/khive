@@ -33,11 +33,46 @@ pub fn arm_backfill_reader_fail() {
     BACKFILL_READER_FAIL.with(|c| c.set(true));
 }
 
+/// The strategy that produced a hit's ordering score, including local modifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RankScoreKind {
+    Rrf,
+    Vector,
+    Keyword,
+    Weighted,
+    Union,
+}
+
+impl RankScoreKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rrf => "rrf",
+            Self::Vector => "vector",
+            Self::Keyword => "keyword",
+            Self::Weighted => "weighted",
+            Self::Union => "union",
+        }
+    }
+}
+
+/// Retained component scores before fusion and strategy-local modifiers.
+/// An absent retrieval leg has no score, which is distinct from a measured zero.
+/// Scores belong to the backend and model that produced the retained hit;
+/// vector similarities from different embedding models are not comparable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchSignals {
+    pub vector_similarity: Option<DeterministicScore>,
+    pub keyword_score: Option<DeterministicScore>,
+}
+
 /// A unified search result combining vector and text signals.
 #[derive(Clone, Debug)]
 pub struct SearchHit {
     pub entity_id: Uuid,
     pub score: DeterministicScore,
+    pub rank_score_kind: RankScoreKind,
+    pub signals: SearchSignals,
     pub source: SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
@@ -1272,9 +1307,10 @@ impl KhiveRuntime {
     /// Sweep orphaned vector entries for all registered embedding models.
     ///
     /// A vector entry is orphaned when its `subject_id` no longer exists as a
-    /// live row in the entity or note tables (i.e. either the row is absent or
-    /// has `deleted_at IS NOT NULL`). Orphaned entries accumulate after
-    /// hard-deletes because the vector store and SQL substrate are decoupled.
+    /// live row in the entity, note, or knowledge-atom tables (i.e. either the
+    /// row is absent or has `deleted_at IS NOT NULL`). Orphaned entries
+    /// accumulate after hard-deletes because the vector store and SQL
+    /// substrate are decoupled.
     ///
     /// Iterates over every registered embedding model and calls
     /// [`khive_storage::VectorStore::orphan_sweep`] for the token's namespace. Models whose
@@ -1413,6 +1449,7 @@ fn rrf_fuse(
     #[derive(Default)]
     struct Bucket {
         score: DeterministicScore,
+        signals: SearchSignals,
         source: Option<SearchSource>,
         title: Option<String>,
         snippet: Option<String>,
@@ -1429,6 +1466,7 @@ fn rrf_fuse(
         let rank = i + 1; // RRF is 1-indexed
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
+        entry.signals.keyword_score = Some(hit.score);
         entry.source = Some(match entry.source {
             Some(SearchSource::Vector) => SearchSource::Both,
             _ => SearchSource::Text,
@@ -1455,6 +1493,7 @@ fn rrf_fuse(
         let rank = i + 1;
         let entry = buckets.entry(hit.subject_id).or_default();
         entry.score = entry.score + rrf_score(rank, RRF_K);
+        entry.signals.vector_similarity = Some(hit.score);
         entry.source = Some(match entry.source {
             Some(SearchSource::Text) => SearchSource::Both,
             _ => SearchSource::Vector,
@@ -1466,6 +1505,8 @@ fn rrf_fuse(
         .map(|(id, b)| SearchHit {
             entity_id: id,
             score: b.score,
+            rank_score_kind: RankScoreKind::Rrf,
+            signals: b.signals,
             source: b.source.expect("each bucket gets a source"),
             title: b.title,
             snippet: b.snippet,
@@ -1652,6 +1693,137 @@ mod tests {
             subject_id: id,
             score: DeterministicScore::from_f64(0.9),
             rank,
+        }
+    }
+
+    #[test]
+    fn rrf_evidence_keeps_absence_distinct_from_measured_zero() {
+        let text_id = Uuid::from_u128(1);
+        let vector_id = Uuid::from_u128(2);
+        let both_id = Uuid::from_u128(3);
+        let quarter = DeterministicScore::from_raw(1_i64 << 30);
+        let half = DeterministicScore::from_raw(1_i64 << 31);
+        let text = vec![
+            TextSearchHit {
+                score: DeterministicScore::ZERO,
+                ..text_hit(text_id, 1, "text")
+            },
+            TextSearchHit {
+                score: quarter,
+                ..text_hit(both_id, 2, "both")
+            },
+            text_hit(both_id, 3, "duplicate"),
+        ];
+        let vector = vec![
+            VectorSearchHit {
+                score: DeterministicScore::ZERO,
+                ..vector_hit(vector_id, 1)
+            },
+            VectorSearchHit {
+                score: half,
+                ..vector_hit(both_id, 2)
+            },
+            vector_hit(both_id, 3),
+        ];
+        let hits = rrf_fuse(text, vector, 10, "unmatched");
+        assert_eq!(hits.len(), 3);
+        for (id, source, signals) in [
+            (
+                text_id,
+                SearchSource::Text,
+                SearchSignals {
+                    vector_similarity: None,
+                    keyword_score: Some(DeterministicScore::ZERO),
+                },
+            ),
+            (
+                vector_id,
+                SearchSource::Vector,
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::ZERO),
+                    keyword_score: None,
+                },
+            ),
+            (
+                both_id,
+                SearchSource::Both,
+                SearchSignals {
+                    vector_similarity: Some(half),
+                    keyword_score: Some(quarter),
+                },
+            ),
+        ] {
+            let hit = hits.iter().find(|hit| hit.entity_id == id).unwrap();
+            assert_eq!(hit.rank_score_kind, RankScoreKind::Rrf);
+            assert_eq!(hit.source, source);
+            assert_eq!(hit.signals, signals);
+        }
+    }
+
+    #[test]
+    fn rrf_evidence_golden_preserves_true_ties_across_permutations() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let expected = vec![
+            (
+                a,
+                748_365_513,
+                RankScoreKind::Rrf,
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::from_raw(1_i64 << 31)),
+                    keyword_score: Some(DeterministicScore::from_raw(1_i64 << 30)),
+                },
+            ),
+            (
+                b,
+                748_365_513,
+                RankScoreKind::Rrf,
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::from_raw(1_i64 << 32)),
+                    keyword_score: Some(DeterministicScore::from_raw(3_i64 << 30)),
+                },
+            ),
+        ];
+        // Swapping both arms preserves each ID's rank-1 plus rank-2 total.
+        for (text_ids, vector_ids) in [([a, b], [b, a]), ([b, a], [a, b])] {
+            for _ in 0..4 {
+                let text = text_ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, id)| TextSearchHit {
+                        score: DeterministicScore::from_raw(
+                            if id == a { 1_i64 } else { 3_i64 } << 30,
+                        ),
+                        ..text_hit(id, rank as u32 + 1, "candidate")
+                    })
+                    .collect();
+                let vector = vector_ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, id)| VectorSearchHit {
+                        score: DeterministicScore::from_raw(
+                            if id == a { 1_i64 } else { 2_i64 } << 31,
+                        ),
+                        ..vector_hit(id, rank as u32 + 1)
+                    })
+                    .collect();
+                let hits = rrf_fuse(text, vector, 10, "unmatched");
+                assert_eq!(hits.len(), 2);
+                assert_eq!(hits[0].score, hits[1].score);
+                assert!(hits.iter().all(|hit| hit.source == SearchSource::Both));
+                let snapshot: Vec<_> = hits
+                    .iter()
+                    .map(|hit| {
+                        (
+                            hit.entity_id,
+                            hit.score.to_raw(),
+                            hit.rank_score_kind,
+                            hit.signals,
+                        )
+                    })
+                    .collect();
+                assert_eq!(snapshot, expected);
+            }
         }
     }
 

@@ -137,7 +137,7 @@ pool error and are not promoted by rendered-message matching.
 
 ## Typed storage-admission timeout
 
-`StorageError::AdmissionTimeout { operation, timeout_ms }` means a bounded
+`StorageError::AdmissionTimeout { operation, timeout_ms, pool_identity }` means a bounded
 wait for storage admission — a reader/writer handle slot or a pooled reader
 checkout — elapsed before anything was acquired. The operation never started,
 so retrying cannot duplicate a side effect. This is distinct from
@@ -156,6 +156,26 @@ MCP emits `code`/`stage` of `storage_admission_timeout` with the failing
 `operation`, the elapsed `timeout_ms`, and `retryable: true`. `capability`,
 `scope`, and `retry_after_ms` are null: the handle-slot and reader-checkout
 budgets are capability-neutral and no separate backoff policy is defined.
+
+`pool_identity: Option<String>` identifies the database of the refusing pool when
+known. MCP includes a `pool_identity` string only for `Some`; `None` leaves the
+existing wire fields and message unchanged. When present, Display appends
+` (pool: {identity})` without changing `operation`. A `ConnectionPool` supplies
+only the canonical file name (lossy for non-UTF-8 names), or `:memory:` for an
+in-memory database. No directory is reported, including on local stdio servers.
+When distinct canonical paths with the same rendered file name are open in the
+process, the file name carries `#<8 hex>`: the first eight lowercase hex digits
+of unkeyed SHA-256 over the canonical path (raw bytes on Unix; UTF-16 code units
+in little-endian order on Windows; lossy UTF-8 on other platforms). The suffix
+is stable across processes, restarts and builds for the same path bytes. It can
+be matched against guessed paths and can collide; it is not a secrecy mechanism.
+Multiple pools on the same canonical path alone do not cause a suffix;
+if another colliding store exists, those same-path pools share the suffix.
+Collision detection reflects the live pool set at refusal time, and the suffix
+disappears when the other colliding store closes. This value carries no pool
+role or information about another process's pools and is not a globally unique
+pool-instance identifier. Generic handle-slot refusals without pool
+context retain `None`.
 
 ## Typed cached-reader read-transaction age eviction
 

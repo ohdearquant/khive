@@ -839,15 +839,16 @@ fn orphan_sweep_dml(
 
     // Live-subjects subquery used in the orphan anti-join.
     //
-    // Policy-critical: `deleted_at IS NULL` means a soft-deleted substrate
-    // row is NOT considered live, so its vector is swept.
-    // To preserve vectors for soft-deleted subjects, remove the
-    // `deleted_at IS NULL` filter from both lines below (one-line change per
-    // table).  The `memories` table referenced in ADR-044 §5 does not exist;
-    // memory notes live in the `notes` table with kind = 'memory'.
+    // Policy-critical: only live subjects protect their vectors. Knowledge
+    // atoms have their own core table but use Entity-kind vectors in this
+    // same store. The table is required by the core schema: a missing table
+    // must fail the sweep before deletion rather than treat atoms as absent.
+    // Memory records live in `notes` with kind = 'memory'.
     let live_subq = "SELECT id FROM entities WHERE deleted_at IS NULL \
                      UNION ALL \
-                     SELECT id FROM notes    WHERE deleted_at IS NULL";
+                     SELECT id FROM notes WHERE deleted_at IS NULL \
+                     UNION ALL \
+                     SELECT id FROM knowledge_atoms WHERE deleted_at IS NULL";
 
     let orphan_pred = format!(
         "subject_id NOT IN ({live}) AND {f}",
@@ -2560,7 +2561,7 @@ mod delete_subjects_atomic_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(write_queue_enabled),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -2755,7 +2756,7 @@ mod delete_subjects_atomic_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -3808,7 +3809,7 @@ mod orphan_sweep_tests {
         )
     }
 
-    /// Create minimal substrate tables (id + deleted_at only — enough for the anti-join).
+    /// Create the three core live-subject tables used by the anti-join.
     fn create_substrate_tables(pool: &Arc<crate::pool::ConnectionPool>) {
         pool.try_writer()
             .expect("writer")
@@ -3817,6 +3818,8 @@ mod orphan_sweep_tests {
                 "CREATE TABLE IF NOT EXISTS entities \
                      (id TEXT PRIMARY KEY, deleted_at INTEGER); \
                  CREATE TABLE IF NOT EXISTS notes \
+                     (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE IF NOT EXISTS knowledge_atoms \
                      (id TEXT PRIMARY KEY, deleted_at INTEGER);",
             )
             .expect("create substrate tables");
@@ -4467,7 +4470,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4524,8 +4527,8 @@ mod write_queue_tests {
         );
     }
 
-    /// Create minimal substrate tables (id + deleted_at only — enough for the
-    /// anti-join). Mirrors `orphan_sweep_tests::create_substrate_tables`;
+    /// Create the three core live-subject tables used by the anti-join.
+    /// Mirrors `orphan_sweep_tests::create_substrate_tables`;
     /// duplicated here (rather than shared) because that helper is private to
     /// its own sibling module — same convention as this module's own
     /// `create_vec_table` duplicate.
@@ -4537,6 +4540,8 @@ mod write_queue_tests {
                 "CREATE TABLE IF NOT EXISTS entities \
                      (id TEXT PRIMARY KEY, deleted_at INTEGER); \
                  CREATE TABLE IF NOT EXISTS notes \
+                     (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE IF NOT EXISTS knowledge_atoms \
                      (id TEXT PRIMARY KEY, deleted_at INTEGER);",
             )
             .expect("create substrate tables");
@@ -4571,7 +4576,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4770,7 +4775,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4837,7 +4842,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4941,7 +4946,7 @@ mod write_queue_tests {
                 path: Some(path),
                 write_queue_enabled: Some(false),
                 write_routing_strict: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -4983,7 +4988,7 @@ mod write_queue_tests {
                 path: Some(path),
                 write_queue_enabled: Some(false),
                 write_routing_strict: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );
@@ -5055,7 +5060,7 @@ mod write_queue_tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("file-backed pool"),
         );

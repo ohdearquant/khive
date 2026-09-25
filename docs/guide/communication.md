@@ -170,19 +170,21 @@ return immediately. A new committed message wakes the call and causes the full
 filtered query to run again; unrelated messages cannot leak through or end the
 wait early. `limit=0` remains immediate.
 
-### Mark read
+### Read and mark
 
-`comm.mark_read` is the named bulk mutation. It marks inbound messages read; it does not return
-message content. Use `comm.inbox` or `comm.thread` to retrieve content. Outbound messages cannot be
+`comm.read` fetches inbound messages and marks them read. Successful results include
+`subject`, `content`, `from`, `to`, `direction`, and `created_at`; pass `body=false`
+to retain the previous acknowledgement-only shape. `comm.mark_read` is the named
+bulk acknowledgement and does not return message content. Outbound messages cannot be
 marked read.
 
 ```
 request(ops="comm.mark_read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 request(ops="comm.mark_read(ids=[\"<message_id_1>\", \"<message_id_2>\"], atomic=true)")
 
-# Compatibility surface
 request(ops="comm.read(id=\"<message_id_or_prefix>\")")
 request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
+request(ops="comm.read(id=\"<message_id_or_prefix>\", body=false)")
 ```
 
 `comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
@@ -410,10 +412,38 @@ Optional, with defaults:
   quarantine record instead of dropping it)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; inbound actor assigned to
-  fresh, uncorrelated email messages)
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; actor assigned to fresh,
+  uncorrelated email messages. Set it to `channel:email` to opt into a separate
+  mailbox.)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)
+
+An anonymous `local` caller cannot read the delegated `channel:email` mailbox;
+the mailbox gate denies that read with `mailbox_read_not_granted`. To grant a
+reader, configure the process that owns the mailbox with its actor id and the
+exact reader actor labels:
+
+```toml
+[actor]
+id = "channel:email"
+mailbox_readers = ["lambda:email-reader"]
+```
+
+The listed actor can read it by selecting the mailbox explicitly:
+
+```text
+request(ops="comm.inbox(mailbox_actor=\"channel:email\")")
+```
+
+The request must resolve to one of the configured reader actor labels.
+
+Sender labels are not proof of origin. Ingested mail is stored with the sender
+label `email:<address>`, but a local caller chooses its own actor label, and
+that label becomes `from_actor` on what it sends. A `comm.send` run with
+`KHIVE_ACTOR=email:forged@example.com` is stored with `from_actor`
+`email:forged@example.com`, and `comm.inbox(from_prefix="email:")` returns it
+beside ingested mail. Use `from_prefix="email:"` to filter by sender label; it
+does not show that a message arrived through the email channel.
 
 ### Feature gating
 
@@ -452,6 +482,10 @@ email channel loops NOT started: ingest namespace authorization failed (fail-clo
 
 If no daemon is running, mail is simply not polled until one starts. That is
 the intended behavior, not a silent failure.
+Once demand-mode retirement ([ADR-049](../adr/ADR-049-khived-daemon.md)
+Amendment 11) ships, a daemon that a client started automatically does not run
+these loops either; start it explicitly with `kkernel mcp --daemon` (or under a
+supervisor) to have mail polled and delivered.
 
 ## Limitations
 

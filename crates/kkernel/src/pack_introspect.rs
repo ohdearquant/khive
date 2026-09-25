@@ -345,6 +345,10 @@ mod tests {
     #[test]
     #[serial]
     fn introspection_registry_builds_under_strict_mode_without_actor() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let prev = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
 

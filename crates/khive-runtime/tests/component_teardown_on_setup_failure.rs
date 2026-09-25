@@ -6,12 +6,14 @@
 //! only after ownership succeeds, but a failed candidate must still cancel
 //! its process-wide token. The guard therefore precedes all fallible setup.
 //!
-//! Isolation: this test lives in its own integration-test binary on purpose.
-//! It mutates `KHIVE_SOCKET` and `KHIVE_PID` (process-global env) and fires
-//! the process-wide single-shot shutdown token; neither may leak into other
-//! tests.
+//! The fixture runs as the sole test in a child with private daemon paths.
+//! Its changes to `KHIVE_SOCKET`, `KHIVE_PID`, and the process-wide single-shot
+//! shutdown token cannot affect another test.
 
 #![cfg(unix)]
+
+#[path = "../src/test_process.rs"]
+mod test_process;
 
 use async_trait::async_trait;
 use khive_runtime::daemon::run_daemon_with_boot_guard_and_start;
@@ -52,6 +54,10 @@ impl DaemonDispatch for NeverDispatch {
 
 #[tokio::test]
 async fn setup_failure_before_bind_cancels_component_token() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let blocker = dir.path().join("not-a-directory");
     std::fs::write(&blocker, b"regular file blocking create_dir_all").expect("write blocker");

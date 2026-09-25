@@ -22,6 +22,10 @@ use super::util::{
 };
 use super::KnowledgeHandlers;
 
+#[path = "cursor_query.rs"]
+mod cursor_query;
+use cursor_query::cursor_query;
+
 const ATOM_LIST_FIELDS: &[&str] = &[
     "id",
     "namespace",
@@ -314,6 +318,16 @@ impl KnowledgeHandlers {
             ));
         }
 
+        if p.dry_run {
+            return super::atom_validation::dry_run(
+                runtime,
+                token,
+                &p.atoms,
+                preserve_content_whitespace,
+            )
+            .await;
+        }
+
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let now = now_us();
@@ -345,96 +359,27 @@ impl KnowledgeHandlers {
         let mut operations = Vec::with_capacity(p.atoms.len());
         let mut failed_index = 0;
         let preparation: Result<(), RuntimeError> = async {
-        for (index, atom_in) in p.atoms.iter().enumerate() {
-            failed_index = index;
-            let atom_in = match atom_in {
-                AtomWrite::Upsert(atom_in) => atom_in,
-                AtomWrite::PropertiesOnly(atom_in) => {
-                    let id = atom_in.id.to_string();
-                    let domain = reader
-                        .query_row(SqlStatement {
-                            sql: "SELECT id FROM knowledge_domains WHERE id = ?1".into(),
-                            params: vec![SqlValue::Text(id.clone())],
-                            label: None,
-                        })
-                        .await
-                        .map_err(|e| sql_err("upsert_atoms domain lookup", e))?;
-                    if domain.is_some() {
-                        return Err(RuntimeError::InvalidInput(
-                            "properties-only target is a domain; use domain verbs instead".into(),
-                        ));
+            for (index, atom_in) in p.atoms.iter().enumerate() {
+                failed_index = index;
+                if let AtomWrite::Upsert(input) = atom_in {
+                    if let Some(id) = ids_by_slug.get(input.slug.trim()) {
+                        operations.push((id.clone(), false));
+                        continue;
                     }
-                    let row = reader
-                        .query_row(SqlStatement {
-                            sql: "SELECT tags FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL".into(),
-                            params: vec![SqlValue::Text(id.clone())],
-                            label: None,
-                        })
-                        .await
-                        .map_err(|e| sql_err("upsert_atoms id lookup", e))?
-                        .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id}")))?;
-                    let tags = row_str(&row, "tags").unwrap_or_default();
-                    if tags.contains("type:domain") {
-                        return Err(RuntimeError::InvalidInput(
-                            "properties-only target is a domain mirror; use domain verbs instead"
-                                .into(),
-                        ));
-                    }
-                    operations.push((id, false));
-                    continue;
                 }
-            };
-            let slug = atom_in.slug.trim().to_string();
-            if let Some(id) = ids_by_slug.get(&slug) {
-                operations.push((id.clone(), false));
-                continue;
+                let target = super::atom_validation::target(reader.as_mut(), &ns, atom_in).await?;
+                let (id, insert) = match target {
+                    Some(id) => (id, false),
+                    None => (new_id(), true),
+                };
+                if let AtomWrite::Upsert(input) = atom_in {
+                    ids_by_slug.insert(input.slug.trim().to_owned(), id.clone());
+                }
+                operations.push((id, insert));
             }
-
-            // Look up by slug WITHOUT the deleted_at filter so a tombstoned row that
-            // still owns the (namespace, slug) unique index is detected before the
-            // insert path runs — otherwise SQLite raises a raw unique-constraint
-            // error instead of a defined lifecycle error.
-            let existing = reader
-                .query_row(SqlStatement {
-                    sql: "SELECT id, deleted_at, tags FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
-                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("upsert_atoms lookup", e))?;
-            if let Some(row) = &existing {
-                // A domain's mirror atom shares the (namespace, slug) index with
-                // ordinary atoms. Reject here (mirroring the delete_atoms guard)
-                // so a plain upsert_atoms call can never blind-overwrite the
-                // mirror's tags/content and desynchronize it from its domain.
-                let existing_tags = row_str(row, "tags").unwrap_or_default();
-                if existing_tags.contains("type:domain") {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
-                    )));
-                }
-                if row_i64(row, "deleted_at").is_some() {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "atom slug {slug:?} was previously deleted; choose a new slug"
-                    )));
-                }
-            }
-
-            let (id, insert) = if let Some(row) = existing {
-                (
-                    row_str(&row, "id").ok_or_else(|| {
-                        RuntimeError::Internal("missing id in existing atom row".into())
-                    })?,
-                    false,
-                )
-            } else {
-                (new_id(), true)
-            };
-            ids_by_slug.insert(slug, id.clone());
-            operations.push((id, insert));
+            Ok(())
         }
-        Ok(())
-        }.await;
+        .await;
         drop(reader);
         if let Err(error) = preparation {
             if matches!(
@@ -1013,12 +958,7 @@ impl KnowledgeHandlers {
                     let fetch_limit = limit.saturating_add(1);
                     match cursor_key.as_ref() {
                         Some((created_at, id)) => (
-                            format!(
-                                "SELECT {select_columns} FROM knowledge_domains \
-                                 WHERE namespace = ?1 AND deleted_at IS NULL \
-                                 AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)) \
-                                 ORDER BY created_at ASC, id ASC LIMIT ?4"
-                            ),
+                            cursor_query("knowledge_domains", &select_columns, true, ""),
                             vec![
                                 SqlValue::Text(ns.clone()),
                                 SqlValue::Integer(*created_at),
@@ -1027,11 +967,7 @@ impl KnowledgeHandlers {
                             ],
                         ),
                         None => (
-                            format!(
-                                "SELECT {select_columns} FROM knowledge_domains \
-                                 WHERE namespace = ?1 AND deleted_at IS NULL \
-                                 ORDER BY created_at ASC, id ASC LIMIT ?2"
-                            ),
+                            cursor_query("knowledge_domains", &select_columns, false, ""),
                             vec![SqlValue::Text(ns.clone()), SqlValue::Integer(fetch_limit)],
                         ),
                     }
@@ -1127,13 +1063,11 @@ impl KnowledgeHandlers {
                             ];
                             row_params.extend(data_status_params);
                             (
-                                format!(
-                                    "SELECT {select_columns} FROM knowledge_atoms \
-                                     WHERE namespace = ?1 AND deleted_at IS NULL \
-                                     AND tags NOT LIKE '%type:domain%' \
-                                     AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)){} \
-                                     ORDER BY created_at ASC, id ASC LIMIT ?4",
-                                    data_status_clause
+                                cursor_query(
+                                    "knowledge_atoms",
+                                    &select_columns,
+                                    true,
+                                    &data_status_clause,
                                 ),
                                 row_params,
                             )
@@ -1145,12 +1079,11 @@ impl KnowledgeHandlers {
                                 vec![SqlValue::Text(ns.clone()), SqlValue::Integer(fetch_limit)];
                             row_params.extend(data_status_params);
                             (
-                                format!(
-                                    "SELECT {select_columns} FROM knowledge_atoms \
-                                     WHERE namespace = ?1 AND deleted_at IS NULL \
-                                     AND tags NOT LIKE '%type:domain%'{} \
-                                     ORDER BY created_at ASC, id ASC LIMIT ?2",
-                                    data_status_clause
+                                cursor_query(
+                                    "knowledge_atoms",
+                                    &select_columns,
+                                    false,
+                                    &data_status_clause,
                                 ),
                                 row_params,
                             )

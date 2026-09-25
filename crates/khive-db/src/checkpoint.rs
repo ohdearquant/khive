@@ -127,6 +127,50 @@ pub struct RoutineWalObservation {
     pub observed_at_unix_ms: u64,
 }
 
+/// Process-lifetime totals for actual routine PASSIVE calls on one store.
+/// Skipped ticks and post-TRUNCATE probes are excluded. Busy counts only
+/// SQLite's returned busy flag, never an incomplete checkpoint's pending frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CheckpointTiming {
+    pub ticks: u64,
+    pub elapsed_us_sum: u64,
+    pub elapsed_us_max: u64,
+    pub busy_ticks: u64,
+    pub error_ticks: u64,
+}
+
+static CHECKPOINT_TIMINGS: OnceLock<Mutex<HashMap<Option<PathBuf>, CheckpointTiming>>> =
+    OnceLock::new();
+
+fn checkpoint_timings() -> &'static Mutex<HashMap<Option<PathBuf>, CheckpointTiming>> {
+    CHECKPOINT_TIMINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_checkpoint_timing(pool: &ConnectionPool, elapsed_us: u64, busy: Option<i64>) {
+    let mut timings = checkpoint_timings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let timing = timings.entry(checkpoint_db_key(pool)).or_default();
+    timing.ticks = timing.ticks.saturating_add(1);
+    timing.elapsed_us_sum = timing.elapsed_us_sum.saturating_add(elapsed_us);
+    timing.elapsed_us_max = timing.elapsed_us_max.max(elapsed_us);
+    timing.busy_ticks = timing
+        .busy_ticks
+        .saturating_add(u64::from(busy.is_some_and(|value| value != 0)));
+    timing.error_ticks = timing.error_ticks.saturating_add(u64::from(busy.is_none()));
+}
+
+/// Pure in-memory read; zero means no routine call has been recorded for this key.
+pub fn checkpoint_timing(pool: &ConnectionPool) -> CheckpointTiming {
+    checkpoint_timings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&checkpoint_db_key(pool))
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Latest routine observation by canonical database identity. Checkpoint
 /// tasks fan out per backend, so a single process-global "last task wins"
 /// gauge would misattribute a secondary backend to the main metrics frame.
@@ -2511,7 +2555,11 @@ fn log_tx_registry_oldest_warn(
 /// rate-limited — caller MUST gate on a below→above `high_water_pages`
 /// crossing (`crossing_warn`) or every tick repeats the full enumeration.
 fn log_tx_registry_snapshot_warn(wal_pages: u64) {
-    for (age, label) in khive_storage::tx_registry::snapshot() {
+    log_tx_registry_entries_warn(wal_pages, &khive_storage::tx_registry::snapshot());
+}
+
+fn log_tx_registry_entries_warn(wal_pages: u64, snapshot: &[(Duration, Option<String>)]) {
+    for (age, label) in snapshot {
         tracing::warn!(
             wal_pages,
             tx_age_secs = age.as_secs_f64(),
@@ -2519,6 +2567,37 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
             "WAL high-water: open transaction registry entry"
         );
     }
+}
+
+fn log_truncate_no_progress_warn(
+    wal_pages_before: u64,
+    wal_pages_after: u64,
+    snapshot: &[(Duration, Option<String>)],
+) {
+    let open_tx_count = snapshot.len();
+    let oldest_tx_age_secs = snapshot
+        .iter()
+        .map(|(age, _)| *age)
+        .max()
+        .map(|age| age.as_secs_f64());
+    if snapshot.is_empty() {
+        tracing::warn!(
+            wal_pages_before,
+            wal_pages_after,
+            open_tx_count,
+            oldest_tx_age_secs = ?oldest_tx_age_secs,
+            "WAL TRUNCATE attempt made no progress; no open transaction in this process's registry"
+        );
+    } else {
+        tracing::warn!(
+            wal_pages_before,
+            wal_pages_after,
+            open_tx_count,
+            oldest_tx_age_secs = ?oldest_tx_age_secs,
+            "WAL TRUNCATE attempt made no progress; open transactions observed in this process's registry"
+        );
+    }
+    log_tx_registry_entries_warn(wal_pages_after, snapshot);
 }
 
 /// Emits the high-water WARN, deciding its text from the registry entry this
@@ -2627,10 +2706,21 @@ fn checkpoint_once_core(
 ) -> Result<CheckpointCoreOutcome, rusqlite::Error> {
     #[cfg(unix)]
     truncate_state.begin_tick();
-    let raw_observation = match query_checkpoint_observation(conn) {
+    let started = Instant::now();
+    let checkpoint_result = query_checkpoint_observation(conn);
+    let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    record_checkpoint_timing(
+        pool,
+        elapsed_us,
+        checkpoint_result
+            .as_ref()
+            .ok()
+            .map(|observation| observation.busy),
+    );
+    let raw_observation = match checkpoint_result {
         Ok(observation) => observation,
         Err(e) => {
-            tracing::warn!(error = %e, "WAL checkpoint failed");
+            tracing::warn!(error = %e, elapsed_us, "WAL checkpoint failed");
             return Err(e);
         }
     };
@@ -2651,6 +2741,8 @@ fn checkpoint_once_core(
     }
     tracing::debug!(
         wal_pages,
+        elapsed_us,
+        busy = raw_observation.busy,
         wal_checkpointed_frames = observation.checkpointed_frames,
         wal_pending_frames = observation.pending_frames,
         wal_physical_bytes = ?observation.physical_wal_bytes,
@@ -2737,13 +2829,8 @@ fn maybe_truncate(
 
             let made_progress = wal_pages_after < wal_pages_before;
             if !made_progress {
-                tracing::warn!(
-                    wal_pages_before,
-                    wal_pages_after,
-                    "WAL TRUNCATE attempt made no progress; \
-                     a long-lived reader may still be pinning the WAL snapshot"
-                );
-                log_tx_registry_snapshot_warn(wal_pages_after);
+                let snapshot = khive_storage::tx_registry::snapshot();
+                log_truncate_no_progress_warn(wal_pages_before, wal_pages_after, &snapshot);
                 #[cfg(test)]
                 if let Some(path) = pool.canonical_path() {
                     truncate_report_test_sync::after_no_progress_before_report(path);
@@ -3396,6 +3483,10 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct CapturedEvent {
         message: Option<String>,
+        open_tx_count: Option<u64>,
+        oldest_tx_age_secs: Option<String>,
+        elapsed_us: Option<u64>,
+        busy: Option<i64>,
         oldest_tx_label: Option<String>,
         tx_label: Option<String>,
         census_only: Option<String>,
@@ -3405,6 +3496,20 @@ mod tests {
     struct CapturedEventVisitor(CapturedEvent);
 
     impl Visit for CapturedEventVisitor {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            match field.name() {
+                "open_tx_count" => self.0.open_tx_count = Some(value),
+                "elapsed_us" => self.0.elapsed_us = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            if field.name() == "busy" {
+                self.0.busy = Some(value);
+            }
+        }
+
         fn record_str(&mut self, field: &Field, value: &str) {
             match field.name() {
                 "message" => self.0.message = Some(value.to_string()),
@@ -3425,6 +3530,7 @@ mod tests {
                 "oldest_tx_label" => self.0.oldest_tx_label = Some(cleaned),
                 "tx_label" => self.0.tx_label = Some(cleaned),
                 "census_only" => self.0.census_only = Some(cleaned),
+                "oldest_tx_age_secs" => self.0.oldest_tx_age_secs = Some(cleaned),
                 _ => {}
             }
         }
@@ -3494,6 +3600,57 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
         let events = buffer.lock().unwrap();
         events.clone()
+    }
+
+    #[test]
+    fn truncate_no_progress_warn_reports_nonempty_registry_snapshot_facts() {
+        let snapshot = [
+            (Duration::from_secs(2), Some("younger-entry".to_string())),
+            (Duration::from_secs(7), Some("older-entry".to_string())),
+        ];
+        let events = capture(|| log_truncate_no_progress_warn(6003, 6003, &snapshot));
+        assert_eq!(events.len(), 3, "one summary and both captured entries");
+        let summary = &events[0];
+        assert_eq!(summary.open_tx_count, Some(2));
+        assert_eq!(summary.oldest_tx_age_secs.as_deref(), Some("Some(7.0)"));
+        let message = summary.message.as_deref().expect("summary message");
+        assert_eq!(
+            message,
+            "WAL TRUNCATE attempt made no progress; open transactions observed in this process's registry"
+        );
+        assert!(!message.contains("pinning"));
+        assert!(!message.contains("long-lived reader"));
+        assert_eq!(events[1].tx_label.as_deref(), Some("younger-entry"));
+        assert_eq!(events[2].tx_label.as_deref(), Some("older-entry"));
+        assert!(events[1..].iter().all(|event| {
+            event.message.as_deref() == Some("WAL high-water: open transaction registry entry")
+        }));
+    }
+
+    #[test]
+    fn truncate_no_progress_warn_reports_empty_process_registry_without_pin_claim() {
+        let events = capture(|| log_truncate_no_progress_warn(6003, 6003, &[]));
+        assert_eq!(
+            events.len(),
+            1,
+            "an empty snapshot has no entries to enumerate"
+        );
+        let summary = &events[0];
+        assert_eq!(summary.open_tx_count, Some(0));
+        assert_eq!(summary.oldest_tx_age_secs.as_deref(), Some("None"));
+        let message = summary.message.as_deref().expect("summary message");
+        assert_eq!(
+            message,
+            "WAL TRUNCATE attempt made no progress; no open transaction in this process's registry"
+        );
+        assert!(!message.contains("pinning"));
+        assert!(!message.contains("long-lived reader"));
+        let nonempty = capture(|| {
+            log_truncate_no_progress_warn(6003, 6003, &[(Duration::ZERO, None)]);
+        });
+        assert_ne!(summary.message, nonempty[0].message);
+        assert_eq!(nonempty[0].open_tx_count, Some(1));
+        assert_eq!(nonempty[0].oldest_tx_age_secs.as_deref(), Some("Some(0.0)"));
     }
 
     /// An entry at or past the threshold: the WARN names it, its age and its
@@ -3751,7 +3908,7 @@ mod tests {
     fn file_pool(path: &std::path::Path) -> Arc<ConnectionPool> {
         let cfg = PoolConfig {
             path: Some(path.to_path_buf()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
     }
@@ -4180,7 +4337,12 @@ mod tests {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let checkpoint_pool = Arc::clone(&pool);
         let dedicated_conn = checkpoint_conn(&checkpoint_pool);
+        let checkpoint_events = Arc::clone(&buffer);
         let checkpoint = std::thread::spawn(move || {
+            let subscriber = CaptureSubscriber {
+                events: checkpoint_events,
+            };
+            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
             let mut state = TruncateState::default();
             let result = checkpoint_once_core(
                 &checkpoint_pool,
@@ -4235,6 +4397,26 @@ mod tests {
         );
 
         let events = buffer.lock().expect("captured events");
+        let summaries: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.message.as_deref().is_some_and(|message| {
+                    message.starts_with("WAL TRUNCATE attempt made no progress;")
+                })
+            })
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "the real no-progress path emits one summary"
+        );
+        let summary = summaries[0];
+        assert!(summary.open_tx_count.is_some());
+        assert!(summary.oldest_tx_age_secs.is_some());
+        let message = summary.message.as_deref().expect("summary message");
+        assert!(message.contains("in this process's registry"));
+        assert!(!message.contains("pinning"));
+        assert!(!message.contains("long-lived reader"));
         assert!(
             events.iter().any(|event| {
                 event
@@ -4647,7 +4829,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_millis(1),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4909,7 +5091,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
                 busy_timeout: Duration::from_millis(2000),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -7061,7 +7243,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
                 read_only: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("read-only pool open"),
         );
@@ -7832,6 +8014,16 @@ mod tests {
             "one routine tick must issue exactly one PASSIVE checkpoint"
         );
         let pinned = routine_wal_observation(&pool).expect("routine sample");
+        assert_eq!(
+            pinned.busy, 0,
+            "a pinned reader is not checkpoint-lock contention"
+        );
+        let first_timing = checkpoint_timing(&pool);
+        assert_eq!(first_timing.ticks, 1);
+        assert_eq!(
+            first_timing.busy_ticks, 0,
+            "pending frames must not count as busy"
+        );
         assert!(pinned.log_frames > 0, "the test must create WAL frames");
         assert!(
             pinned.pending_frames > 0,
@@ -7855,11 +8047,273 @@ mod tests {
         )
         .unwrap();
         let drained = routine_wal_observation(&pool).expect("drained routine sample");
+        let drained_timing = checkpoint_timing(&pool);
+        assert_eq!(drained_timing.ticks, first_timing.ticks + 1);
+        assert!(drained_timing.elapsed_us_sum >= first_timing.elapsed_us_sum);
+        assert!(drained_timing.elapsed_us_max >= first_timing.elapsed_us_max);
+        assert_eq!(drained_timing.busy_ticks, 0);
         assert_eq!(drained.pending_frames, 0, "unpinned PASSIVE must drain");
         assert!(
             drained.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
             "PASSIVE may reuse rather than shrink the physical WAL; the two gauges must remain \
              independently visible: {drained:?}"
+        );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_timing_records_real_call_and_debug_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("timed_tick.db"));
+        let conn = checkpoint_conn(&pool);
+        conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let release_rx = Mutex::new(release_rx);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
+                if pragma_name.eq_ignore_ascii_case("wal_checkpoint"))
+            {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+        let tick_pool = Arc::clone(&pool);
+        let tick = std::thread::spawn(move || {
+            let mut result = None;
+            let events = capture(|| {
+                result = Some(checkpoint_once(
+                    &tick_pool,
+                    &conn,
+                    &CheckpointConfig {
+                        truncate_high_water_pages: u64::MAX,
+                        ..CheckpointConfig::default()
+                    },
+                    &mut TruncateState::default(),
+                ));
+            });
+            (result.unwrap(), events)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let during = checkpoint_timing(&pool);
+        release_tx.send(()).unwrap();
+        let (result, events) = tick.join().unwrap();
+        result.unwrap();
+        assert_eq!(
+            during.ticks, 0,
+            "in-flight call must not publish partial counters"
+        );
+        let timing = checkpoint_timing(&pool);
+        assert_eq!(
+            timing.ticks, 1,
+            "one actual PASSIVE call must advance the count"
+        );
+        assert!(
+            timing.elapsed_us_sum > 0,
+            "channel-held checkpoint call must record elapsed time"
+        );
+        assert_eq!(timing.elapsed_us_max, timing.elapsed_us_sum);
+        assert_eq!(timing.busy_ticks, 0);
+        assert_eq!(timing.error_ticks, 0);
+        let issued: Vec<_> = events
+            .iter()
+            .filter(|event| event.message.as_deref() == Some("WAL checkpoint issued"))
+            .collect();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].elapsed_us, Some(timing.elapsed_us_sum));
+        assert_eq!(issued[0].busy, Some(0));
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_timing_counts_sqlite_busy_from_competing_checkpoint() {
+        struct BusyGate {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        static BUSY_GATE: Mutex<Option<BusyGate>> = Mutex::new(None);
+        fn hold_checkpoint_lock(_attempt: i32) -> bool {
+            let gate = BUSY_GATE
+                .lock()
+                .unwrap()
+                .take()
+                .expect("armed busy handler");
+            gate.entered.send(()).unwrap();
+            gate.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            false
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy_checkpoint.db");
+        let pool = file_pool(&path);
+        let conn = checkpoint_conn(&pool);
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0; CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch("INSERT INTO t VALUES (2);").unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *BUSY_GATE.lock().unwrap() = Some(BusyGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let competing = std::thread::spawn(move || {
+            let checkpoint = rusqlite::Connection::open(path).unwrap();
+            checkpoint.busy_handler(Some(hold_checkpoint_lock)).unwrap();
+            checkpoint.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FULL checkpoint holds CKPT lock while waiting on reader");
+        let mut result = None;
+        let events = capture(|| {
+            result = Some(checkpoint_once(
+                &pool,
+                &conn,
+                &CheckpointConfig {
+                    truncate_high_water_pages: u64::MAX,
+                    ..CheckpointConfig::default()
+                },
+                &mut TruncateState::default(),
+            ));
+        });
+        release_tx.send(()).unwrap();
+        let competing_busy = competing.join().unwrap().unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(competing_busy, 1);
+        assert_eq!(
+            routine_wal_observation(&pool).unwrap().busy,
+            1,
+            "fixture must reach SQLite busy"
+        );
+        let timing = checkpoint_timing(&pool);
+        assert_eq!(timing.ticks, 1);
+        assert_eq!(
+            timing.busy_ticks, 1,
+            "SQLite busy result must increment busy ticks"
+        );
+        assert_eq!(timing.error_ticks, 0);
+        let issued = events
+            .iter()
+            .find(|event| event.message.as_deref() == Some("WAL checkpoint issued"))
+            .expect("existing tick record");
+        assert_eq!(issued.busy, Some(1), "tick record must retain SQLite busy");
+        assert_eq!(issued.elapsed_us, Some(timing.elapsed_us_sum));
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_timing_counts_errors_and_excludes_post_truncate_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("failed_tick.db"));
+        let conn = checkpoint_conn(&pool);
+        conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
+                if pragma_name.eq_ignore_ascii_case("wal_checkpoint"))
+            {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .unwrap();
+        let result = checkpoint_once(
+            &pool,
+            &conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        );
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert!(result.is_err());
+        let timing = checkpoint_timing(&pool);
+        assert_eq!(timing.ticks, 1);
+        assert_eq!(timing.error_ticks, 1);
+        assert_eq!(timing.busy_ticks, 0);
+        query_wal_pages(&conn);
+        assert_eq!(
+            checkpoint_timing(&pool),
+            timing,
+            "post-TRUNCATE observation is not a routine tick"
+        );
+    }
+
+    #[test]
+    fn checkpoint_timing_accumulates_per_store_and_saturates() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = file_pool(&dir.path().join("a.db"));
+        let b = file_pool(&dir.path().join("b.db"));
+        record_checkpoint_timing(&a, 17, Some(0));
+        record_checkpoint_timing(&a, 31, Some(1));
+        record_checkpoint_timing(&a, 7, None);
+        record_checkpoint_timing(&b, 3, Some(0));
+        assert_eq!(
+            checkpoint_timing(&a),
+            CheckpointTiming {
+                ticks: 3,
+                elapsed_us_sum: 55,
+                elapsed_us_max: 31,
+                busy_ticks: 1,
+                error_ticks: 1,
+            }
+        );
+        assert_eq!(
+            checkpoint_timing(&b),
+            CheckpointTiming {
+                ticks: 1,
+                elapsed_us_sum: 3,
+                elapsed_us_max: 3,
+                busy_ticks: 0,
+                error_ticks: 0,
+            }
+        );
+        checkpoint_timings().lock().unwrap().insert(
+            checkpoint_db_key(&a),
+            CheckpointTiming {
+                ticks: u64::MAX,
+                elapsed_us_sum: u64::MAX,
+                elapsed_us_max: 31,
+                busy_ticks: u64::MAX,
+                error_ticks: u64::MAX,
+            },
+        );
+        record_checkpoint_timing(&a, 1, Some(1));
+        assert_eq!(
+            checkpoint_timing(&a).elapsed_us_sum,
+            u64::MAX,
+            "elapsed sum must saturate on the first overflowing addition"
+        );
+        record_checkpoint_timing(&a, u64::MAX, None);
+        assert_eq!(
+            checkpoint_timing(&a),
+            CheckpointTiming {
+                ticks: u64::MAX,
+                elapsed_us_sum: u64::MAX,
+                elapsed_us_max: u64::MAX,
+                busy_ticks: u64::MAX,
+                error_ticks: u64::MAX,
+            }
         );
     }
 }

@@ -14,7 +14,7 @@ description = "Composable Service API: entity/note CRUD, graph traversal, hybrid
 [features]
 contract-faults = []
 fault-injection = []
-test-internals = []
+test-internals = ["khive-db/test-support"]
 
 [dependencies]
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde", "blake3"] }

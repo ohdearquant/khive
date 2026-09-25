@@ -588,3 +588,13 @@ carriage-return progress even with `--no-progress`; the parent requires the
 subprocess log to contain only its two structured markers. It also requires the
 successful HEAD and the deliberately failed update result, so quiet logs cannot
 be achieved by skipping operations or hiding failures.
+
+### Windows delete-pending entries
+
+The size walker rechecks `PermissionDenied` from descendant metadata or directory
+open operations on Windows up to four times, waiting 10 ms between attempts. Only
+`NotFound` proves the entry vanished and permits it to contribute zero bytes.
+Persistent denial remains fatal, preserving clone-cap enforcement. Root errors
+are always fatal without retry; other platforms retain the previous behavior.
+The 40 ms grace accommodates brief handle cleanup but promises no upper bound on
+how long another process may hold a delete-pending file.

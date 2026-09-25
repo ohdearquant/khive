@@ -3,7 +3,9 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
 use std::ops::{Deref, DerefMut};
@@ -27,6 +29,103 @@ const DEFAULT_READER_CAP: usize = 8;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+struct OpenPoolIdentity {
+    count: usize,
+    basename: String,
+    suffix: String,
+}
+
+/// Only final file names and the first eight SHA-256 hex digits enter errors.
+/// Canonical paths remain internal to the live-pool registry.
+#[derive(Default)]
+struct PoolIdentityRegistry {
+    paths: HashMap<PathBuf, OpenPoolIdentity>,
+}
+
+fn pool_identity_registry() -> &'static Mutex<PoolIdentityRegistry> {
+    static REGISTRY: OnceLock<Mutex<PoolIdentityRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(PoolIdentityRegistry::default()))
+}
+
+/// SHA-256 over raw Unix path bytes, or Windows UTF-16 code units in little
+/// endian order. Encoding and digest are explicit so toolchain upgrades and
+/// process restarts cannot change a given canonical path's suffix.
+fn pool_identity_suffix(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let bytes = path.to_string_lossy().as_bytes().to_vec();
+    let digest = Sha256::digest(&bytes);
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+struct PoolIdentityRegistration(PathBuf);
+
+impl PoolIdentityRegistration {
+    fn new(path: &Path) -> Self {
+        let mut registry = pool_identity_registry().lock();
+        if let Some(entry) = registry.paths.get_mut(path) {
+            entry.count += 1;
+        } else {
+            let basename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let suffix = pool_identity_suffix(path);
+            registry.paths.insert(
+                path.to_path_buf(),
+                OpenPoolIdentity {
+                    count: 1,
+                    basename,
+                    suffix,
+                },
+            );
+        }
+        Self(path.to_path_buf())
+    }
+
+    fn label(&self) -> String {
+        let registry = pool_identity_registry().lock();
+        let entry = &registry.paths[&self.0];
+        let collides = registry
+            .paths
+            .iter()
+            .any(|(path, other)| path != &self.0 && other.basename == entry.basename);
+        if collides {
+            format!("{}#{}", entry.basename, entry.suffix)
+        } else {
+            entry.basename.clone()
+        }
+    }
+}
+
+impl Drop for PoolIdentityRegistration {
+    fn drop(&mut self) {
+        let mut registry = pool_identity_registry().lock();
+        if let Some(entry) = registry.paths.get_mut(&self.0) {
+            entry.count -= 1;
+            if entry.count == 0 {
+                registry.paths.remove(&self.0);
+            }
+        }
+    }
+}
 
 /// Runtime-owned SQL transactions that share the store write-routing policy.
 #[derive(Clone, Copy, Debug)]
@@ -381,6 +480,20 @@ impl Default for PoolConfig {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl PoolConfig {
+    /// A small concurrent pool for private test databases.
+    ///
+    /// Tests of reader admission or production sizing should set their required
+    /// count explicitly. Ordinary fixtures need not reserve a CPU-sized pool.
+    pub fn for_test() -> Self {
+        Self {
+            max_readers: 2,
+            ..Self::default()
+        }
+    }
+}
+
 /// Prevent Cargo-launched tests and test subprocesses from opening the
 /// operator's default data tree in every build profile. Activation is solely
 /// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
@@ -569,6 +682,9 @@ pub struct ConnectionPool {
     /// derivation) use this, the same canonical value the identity was
     /// minted from, via [`Self::canonical_path`].
     identity_path: Option<PathBuf>,
+    /// Registered only after every connection opens successfully. RAII removes
+    /// the path when the last pool for it drops, including failed construction.
+    identity_registration: Option<PoolIdentityRegistration>,
     /// Test-only instrumentation: counts how many times the writer-task
     /// init closure actually ran. Must never exceed 1 per pool no matter how
     /// many stores are constructed over it — that is the invariant
@@ -1392,7 +1508,7 @@ impl ConnectionPool {
 
         let readers = ArrayQueue::new(max_readers.max(1));
 
-        let pool = Self {
+        let mut pool = Self {
             writer: Arc::new(Mutex::new(writer)),
             main_pool_generation: OnceLock::new(),
             checkpoint_ownership: CheckpointOwnershipGate::new(),
@@ -1410,6 +1526,7 @@ impl ConnectionPool {
             writer_task_join_stored: AtomicBool::new(false),
             origin,
             identity_path,
+            identity_registration: None,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1432,6 +1549,7 @@ impl ConnectionPool {
             );
         }
 
+        pool.identity_registration = pool.canonical_path().map(PoolIdentityRegistration::new);
         Ok(pool)
     }
 
@@ -1805,6 +1923,12 @@ impl ConnectionPool {
         StorageError::AdmissionTimeout {
             operation: operation.into(),
             timeout_ms: u64::try_from(self.config.checkout_timeout.as_millis()).unwrap_or(u64::MAX),
+            pool_identity: Some(
+                self.identity_registration
+                    .as_ref()
+                    .map(PoolIdentityRegistration::label)
+                    .unwrap_or_else(|| ":memory:".to_string()),
+            ),
         }
     }
 
@@ -3213,7 +3337,7 @@ mod tests {
             path: Some(path),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
 
@@ -3295,7 +3419,7 @@ mod tests {
             path: Some(snapshot.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a non-empty WAL without its frozen -shm must fail closed"),
             Err(error) => error,
@@ -3370,7 +3494,7 @@ mod tests {
             path: Some(snapshot.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3462,7 +3586,7 @@ mod tests {
             path: Some(alias.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3531,7 +3655,7 @@ mod tests {
             path: Some(path.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3574,7 +3698,7 @@ mod tests {
             path: Some(path),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         {
@@ -4099,7 +4223,7 @@ mod tests {
             path: Some(path.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a live WAL database with writable -shm must fail closed"),
             Err(error) => error,
@@ -4204,7 +4328,7 @@ mod tests {
             path: Some(alias),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a symlink must not hide the target's writable -shm"),
             Err(error) => error,
@@ -4250,7 +4374,7 @@ mod tests {
         let path = dir.path().join("legacy_autocheckpoint_env.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         {
@@ -4468,7 +4592,7 @@ mod tests {
             path: Some(path),
             journal_size_limit_bytes: configured_limit,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("WAL pool open");
 
@@ -4498,7 +4622,7 @@ mod tests {
             wal_mode: false,
             journal_size_limit_bytes: configured_limit,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("rollback-journal pool open");
 
@@ -4516,7 +4640,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
 
@@ -4580,7 +4704,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_secs(5),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4644,7 +4768,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_secs(5),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4696,7 +4820,7 @@ mod tests {
             path: Some(path),
             checkout_timeout: Duration::from_millis(1),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
 
@@ -4741,7 +4865,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         pool.claim_checkpoint_ownership()
@@ -4788,7 +4912,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         let writer = pool.writer().expect("pooled writer");
@@ -4833,7 +4957,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: None,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(true));
@@ -4877,7 +5001,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(false));
@@ -4971,7 +5095,7 @@ mod tests {
         let path = dir.path().join("standalone_writer_counter.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool");
 
@@ -5224,7 +5348,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
 
@@ -5251,7 +5375,7 @@ mod tests {
             path: Some(dir.path().join("strict_writer_task_no_runtime.db")),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
 
@@ -5275,7 +5399,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
 
@@ -5467,7 +5591,7 @@ mod tests {
         let pool_for = |path: &Path| -> Arc<ConnectionPool> {
             let cfg = PoolConfig {
                 path: Some(path.to_path_buf()),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             };
             Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"))
         };
@@ -5586,6 +5710,191 @@ mod tests {
         let (identity_again, canonical_again) = mint_db_identity(&db_path).unwrap();
         assert_eq!(identity, identity_again);
         assert_eq!(canonical, canonical_again);
+    }
+
+    fn admission_identity_after_refusal(pool: &ConnectionPool) -> String {
+        let held = pool.reader().expect("hold the sole reader");
+        let Err(error) = pool.resolve_reader_checkout(
+            StorageCapability::Sql,
+            "identity_read",
+            pool.reader_until(|| false),
+        ) else {
+            panic!("held reader must exhaust this pool's admission budget");
+        };
+        assert!(
+            error.is_retryable(),
+            "admission refusal must remain retryable"
+        );
+        let display = error.to_string();
+        let StorageError::AdmissionTimeout {
+            operation,
+            timeout_ms,
+            pool_identity,
+        } = error
+        else {
+            panic!("pool refusal must retain its typed admission classification");
+        };
+        assert_eq!(
+            operation, "identity_read",
+            "pool identity must not alter operation"
+        );
+        assert_eq!(timeout_ms, 20);
+        let identity = pool_identity.expect("typed admission error must name the pool");
+        assert!(
+            !identity.contains('/') && !identity.contains('\\'),
+            "pool identity must never contain a directory or separator: {identity}"
+        );
+        assert_eq!(
+            display,
+            format!("admission timeout during identity_read after 20ms (pool: {identity})"),
+            "admission error text must name the refusing pool"
+        );
+        drop(held);
+        identity
+    }
+
+    fn identity_test_pool(path: Option<PathBuf>, read_only: bool) -> ConnectionPool {
+        ConnectionPool::new(PoolConfig {
+            path,
+            read_only,
+            max_readers: 1,
+            checkout_timeout: Duration::from_millis(20),
+            ..PoolConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn reader_admission_timeout_identifies_the_refusing_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        for read_only in [false, true] {
+            let name = format!("identity-{}.db", uuid::Uuid::new_v4());
+            let path = dir.path().join(&name);
+            {
+                let seed = Connection::open(&path).unwrap();
+                seed.execute_batch("CREATE TABLE seed (id INTEGER)")
+                    .unwrap();
+            }
+            let canonical = fs::canonicalize(&path).unwrap();
+            let configured = dir.path().join(".").join(&name);
+            assert_ne!(configured.as_os_str(), canonical.as_os_str());
+            let pool = identity_test_pool(Some(configured), read_only);
+            assert_eq!(
+                admission_identity_after_refusal(&pool),
+                name,
+                "typed admission field must contain only the canonical file name"
+            );
+            #[cfg(unix)]
+            {
+                let alias = dir
+                    .path()
+                    .join(format!("alias-{}.db", uuid::Uuid::new_v4()));
+                std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+                let alias_pool = identity_test_pool(Some(alias), read_only);
+                assert_eq!(
+                    admission_identity_after_refusal(&alias_pool),
+                    name,
+                    "symlink spelling must not change the canonical database file name"
+                );
+            }
+        }
+        let memory = identity_test_pool(None, false);
+        assert_eq!(admission_identity_after_refusal(&memory), ":memory:");
+    }
+
+    #[test]
+    fn reader_admission_identity_hash_is_build_stable() {
+        // Literal vectors pin the specified encoding and digest, not a seeded
+        // process-local hasher or a hash recomputed by the implementation.
+        #[cfg(unix)]
+        assert_eq!(
+            pool_identity_suffix(Path::new("/khive/pool/khive.db")),
+            "8fa8797b",
+            "suffix must match the published Unix SHA-256 vector"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            pool_identity_suffix(Path::new("/khive/pool/khive.db")),
+            "1186b990",
+            "suffix must match the published Windows SHA-256 vector"
+        );
+    }
+
+    fn assert_disambiguated_identity(identity: &str, basename: &str) {
+        let suffix = identity
+            .strip_prefix(&format!("{basename}#"))
+            .expect("different open files with the same basename need a hash suffix");
+        assert_eq!(
+            suffix.len(),
+            8,
+            "disambiguation needs exactly eight hex digits"
+        );
+        assert!(
+            suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+            "disambiguation must contain only a hash, never directory text"
+        );
+    }
+
+    #[test]
+    fn reader_admission_identity_disambiguates_open_files() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let basename = format!("collision-{}.db", uuid::Uuid::new_v4());
+        let first = identity_test_pool(Some(first_dir.path().join(&basename)), false);
+        assert_eq!(admission_identity_after_refusal(&first), basename);
+        let second_path = second_dir.path().join(&basename);
+        let second = identity_test_pool(Some(second_path.clone()), false);
+        let first_identity = admission_identity_after_refusal(&first);
+        let second_identity = admission_identity_after_refusal(&second);
+        assert_disambiguated_identity(&first_identity, &basename);
+        assert_disambiguated_identity(&second_identity, &basename);
+        assert_ne!(
+            first_identity, second_identity,
+            "distinct files need distinct identities"
+        );
+        assert_eq!(admission_identity_after_refusal(&first), first_identity);
+        drop(second);
+        assert_eq!(
+            admission_identity_after_refusal(&first),
+            basename,
+            "closing the colliding store must remove its registry entry"
+        );
+        let reopened = identity_test_pool(Some(second_path), false);
+        assert_eq!(admission_identity_after_refusal(&first), first_identity);
+        assert_eq!(admission_identity_after_refusal(&reopened), second_identity);
+    }
+
+    #[test]
+    fn reader_admission_identity_same_path_pools_share_label() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let basename = format!("same-path-{}.db", uuid::Uuid::new_v4());
+        let first = identity_test_pool(Some(first_dir.path().join(&basename)), false);
+        let duplicate = identity_test_pool(Some(first_dir.path().join(".").join(&basename)), false);
+        assert_eq!(
+            admission_identity_after_refusal(&first),
+            basename,
+            "two pools on the same canonical path must not get a suffix"
+        );
+        assert_eq!(admission_identity_after_refusal(&duplicate), basename);
+        let other = identity_test_pool(Some(second_dir.path().join(&basename)), false);
+        let first_identity = admission_identity_after_refusal(&first);
+        let other_identity = admission_identity_after_refusal(&other);
+        assert_disambiguated_identity(&first_identity, &basename);
+        assert_disambiguated_identity(&other_identity, &basename);
+        assert_eq!(admission_identity_after_refusal(&duplicate), first_identity);
+        drop(first);
+        assert_eq!(
+            admission_identity_after_refusal(&other),
+            other_identity,
+            "dropping one pool must retain the other pool's path registration"
+        );
+        drop(duplicate);
+        assert_eq!(
+            admission_identity_after_refusal(&other),
+            basename,
+            "dropping the final pool must remove the path registration"
+        );
     }
 
     /// The checkout tri-state, arm by arm, at its single home. Each refusal

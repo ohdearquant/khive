@@ -1188,6 +1188,7 @@ async fn acquire_handle_slot(
             SlotTimeoutClass::Admission => StorageError::AdmissionTimeout {
                 operation: operation.into(),
                 timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                pool_identity: None,
             },
             SlotTimeoutClass::ReaderContract => StorageError::Timeout {
                 operation: operation.into(),
@@ -4886,7 +4887,7 @@ mod tests {
                 path: Some(dir.path().join("sql_bridge_writer_cache.db")),
                 write_queue_enabled: Some(true),
                 write_routing_strict: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .unwrap(),
         );
@@ -6622,7 +6623,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(dir.path().join("sql_bridge_writer_tx_cancel.db")),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .unwrap(),
         );
@@ -6901,7 +6902,7 @@ mod tests {
             path: Some(dir.path().join("sql_bridge_cancelled_writer.db")),
             write_queue_enabled: Some(false),
             checkout_timeout: std::time::Duration::from_millis(250),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -6957,7 +6958,7 @@ mod tests {
             path: Some(dir.path().join("sql_bridge_cancelled_writer_batch.db")),
             write_queue_enabled: Some(false),
             checkout_timeout: std::time::Duration::from_millis(250),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -7050,7 +7051,7 @@ mod tests {
             path: Some(dir.path().join("sql_bridge_dml_returning_cancel.db")),
             write_queue_enabled: Some(false),
             checkout_timeout: std::time::Duration::from_millis(250),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -7148,7 +7149,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_cancelled_reuse.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
 
@@ -7232,7 +7233,7 @@ mod tests {
             path: Some(dir.path().join("sql_bridge_tx_control_reject.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -7381,7 +7382,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_prefixed_commit_standalone.db")),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -7501,7 +7502,7 @@ mod tests {
                 path: Some(dir.path().join("sql_bridge_multi_statement_inline.db")),
                 write_queue_enabled: Some(true),
                 write_routing_strict: true,
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .unwrap(),
         );
@@ -7685,7 +7686,7 @@ mod tests {
             checkout_timeout: std::time::Duration::from_millis(250),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -7807,7 +7808,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_rollback_poison.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -7915,7 +7916,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_begin_poison.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
 
@@ -8005,7 +8006,7 @@ mod tests {
             path: Some(dir.path().join("sql_bridge_begin_busy.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
             busy_timeout: std::time::Duration::from_millis(100),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -8085,7 +8086,7 @@ mod tests {
             path: Some(dir.path().join("sql_bridge_atomic_unit_budget.db")),
             checkout_timeout: std::time::Duration::from_millis(50),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -8170,7 +8171,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(path.clone()),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -8237,7 +8238,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(path.clone()),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -8535,7 +8536,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(path.clone()),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -8634,7 +8635,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(false),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -8665,7 +8666,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(false),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -8701,7 +8702,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -8856,7 +8857,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -8923,7 +8924,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -8971,7 +8972,7 @@ mod tests {
             path: Some(path),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         {
@@ -9161,7 +9162,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("bridge_writer_acquisitions.db")),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -9224,7 +9225,7 @@ mod tests {
                     path: Some(path),
                     write_queue_enabled: Some(true),
                     write_routing_strict: true,
-                    ..PoolConfig::default()
+                    ..PoolConfig::for_test()
                 })
                 .unwrap(),
             );

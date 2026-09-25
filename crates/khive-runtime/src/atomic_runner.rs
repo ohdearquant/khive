@@ -654,7 +654,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );

@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use crate::error::SqliteError;
 use crate::stores::blob::{try_acquire_database_gc_owner_for_path, DatabaseGcOwnerGuard};
 
+#[path = "session_identity_migration.rs"]
+mod session_identity_migration;
+
 // =============================================================================
 // Legacy per-service migration API (preserved for backward compatibility)
 // =============================================================================
@@ -166,6 +169,10 @@ const V34_UP: &str = include_str!("../sql/034-notes-namespace-created.sql");
 const V35_UP: &str = include_str!("../sql/035-notes-unread-probe-recipient-type-direction.sql");
 const V36_UP: &str = include_str!("../sql/036-events-operation-attribution.sql");
 const V37_UP: &str = include_str!("../sql/037-entity-versions.sql");
+const V38_UP: &str = include_str!("../sql/038-entities-legacy-type-index.sql");
+const V39_UP: &str = include_str!("../sql/039-knowledge-cursor-indexes.sql");
+const SESSION_IDENTITY_UP: &str = include_str!("../sql/040-session-source-scope.sql");
+const SESSION_IDENTITY_MIGRATION_NAME: &str = "session_source_scoped_identity";
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -406,6 +413,21 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 37,
         name: "entity_versions",
         up: V37_UP,
+    },
+    VersionedMigration {
+        version: 38,
+        name: "entities_legacy_type_index",
+        up: V38_UP,
+    },
+    VersionedMigration {
+        version: 39,
+        name: "knowledge_cursor_indexes",
+        up: V39_UP,
+    },
+    VersionedMigration {
+        version: 40,
+        name: SESSION_IDENTITY_MIGRATION_NAME,
+        up: SESSION_IDENTITY_UP,
     },
 ];
 
@@ -1454,6 +1476,16 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                     version: migration.version,
                     error: e.to_string(),
                 }
+            })?;
+        } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
+            tx.execute_batch(migration.up)
+                .map_err(|error| SqliteError::Migration {
+                    version: migration.version,
+                    error: error.to_string(),
+                })?;
+            session_identity_migration::apply(&tx).map_err(|error| SqliteError::Migration {
+                version: migration.version,
+                error: error.to_string(),
             })?;
         } else {
             tx.execute_batch(migration.up)

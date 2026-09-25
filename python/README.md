@@ -36,6 +36,33 @@ db.diagnostics()          # writer/WAL/checkpoint counters
 - A `batch()` is one request, not a transaction: ops succeed or fail
   individually and the per-op results say which.
 
+## KG search ranking
+
+`Khive.search` returns the server's hit dictionaries, including `rank_score`,
+`rank_score_kind`, and `signals`:
+
+```python
+hits = db.search("low rank adaptation", min_rank_score=0.01)
+for hit in hits:
+    print(hit["id"], hit["rank_score"], hit["rank_score_kind"], hit["signals"])
+```
+
+`rank_score` orders results within the selected strategy and query; it is not a
+probability, percent match, or calibrated relevance value. `rank_score_kind` is
+one of `rrf`, `vector`, `keyword`, `weighted`, or `union`. The value includes the
+strategy's post-fusion modifiers. `signals` contains available component
+evidence, such as `keyword_score` or `vector_similarity`; unavailable components
+are absent, and an empty object means no retained component evidence. The client
+preserves the supplied evidence without filling missing keys with zero.
+
+In v0.8, `score` remains a deprecated exact alias of `rank_score`.
+`min_rank_score` accepts a floor in `[0, 1]` and retains hits whose rank is at
+least that floor, after fusion and boosts and before truncation. The deprecated
+`min_score` keyword is an exact alias; supplying both names raises `ValueError`
+before transport, even when equal. These thresholds are strategy-local and do
+not apply to component signals. Memory recall and knowledge search retain their
+own score contracts.
+
 ## khive-cloud
 
 See the [HTTP transport reference](docs/HTTP_TRANSPORT.md) for configuration,
