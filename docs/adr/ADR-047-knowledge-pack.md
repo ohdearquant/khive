@@ -1,6 +1,6 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c, 2026-09-14, 2026-09-15)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c, 2026-09-14, 2026-09-15, 2026-09-25)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
@@ -9,7 +9,7 @@ on acceptance.
 
 ## Amendment (2026-09-25): compose response reports the rendered atoms
 
-**Status: Proposed.** Related issue: #3235. It is intended to land together with #3349, which
+**Status: Accepted (2026-09-25).** Related issue: #3235. It is intended to land together with #3349, which
 implements it alongside [ADR-051](ADR-051-section-embeddings-hybrid-compose.md) Amendment 2.
 
 §2 "`knowledge.compose` — namespace-consistent briefing composition" specifies the output only as

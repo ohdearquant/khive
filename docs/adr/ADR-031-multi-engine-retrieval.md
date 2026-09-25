@@ -964,7 +964,7 @@ need changes.
 
 ## Amendment 2 (2026-09-25): implementation record for D1, D2 and D6
 
-Status: Proposed
+Status: Accepted (2026-09-25)
 
 ### Context
 
@@ -1028,7 +1028,7 @@ This amendment changes no code and does not restate or change D3's `[[engines]]`
 
 ## Amendment 3 (2026-09-25): a configured `fusion_weight` is refused until retrieval applies it
 
-Status: Proposed
+Status: Accepted (2026-09-25)
 
 ### Context
 

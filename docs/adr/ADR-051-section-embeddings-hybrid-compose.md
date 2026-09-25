@@ -297,7 +297,7 @@ blending outright; `blend_kg=false` reproduces pre-Amendment-1 behavior exactly.
 
 ## Amendment 2 (2026-09-25): the compose budget covers the whole briefing
 
-Status: Proposed. It is intended to land together with #3349, which implements it. (Numbered 2
+Status: Accepted (2026-09-25). It is intended to land together with #3349, which implements it. (Numbered 2
 because this file carries two sections headed Amendment 1: the 2026-08-01 searchable-model atom
 indexing decision and the KG entity blend.)
 

@@ -254,7 +254,7 @@ admission.
 
 #### Amendment 2 (2026-09-25): `blob.get` reserves the size it has already read
 
-Status: Proposed. (Amendment 1 is the legacy preference verifier note under "Phase 4b attachment
+Status: Accepted (2026-09-25). (Amendment 1 is the legacy preference verifier note under "Phase 4b attachment
 cutover".)
 
 **Context.** D3 says the hydrator "reserves `max_bytes` from a weighted raw-byte budget before

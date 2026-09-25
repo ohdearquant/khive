@@ -828,7 +828,7 @@ implements this replay.
 
 ## Amendment 2 (2026-09-25): ANN operational knobs are environment variables
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-25)
 
 ### Context
 
