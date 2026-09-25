@@ -56,16 +56,11 @@ impl KgReadResolver {
         &self,
         token: &NamespaceToken,
         id: Uuid,
-        include_deleted: bool,
     ) -> Result<Option<KhiveRuntime>, RuntimeError> {
         let mut owner = None;
         for runtime in &self.runtimes {
             let store = runtime.entities(token)?;
-            let entity = if include_deleted {
-                store.get_entity_including_deleted(id).await?
-            } else {
-                store.get_entity(id).await?
-            };
+            let entity = store.get_entity_including_deleted(id).await?;
             if entity.is_some() {
                 if owner.is_some() {
                     return Err(RuntimeError::InvalidInput(format!(

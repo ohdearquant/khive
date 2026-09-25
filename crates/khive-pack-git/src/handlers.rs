@@ -148,6 +148,7 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let params = crate::params::parse("git.digest", params)?;
         let source_raw = params
             .get("source")
             .and_then(Value::as_str)

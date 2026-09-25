@@ -53,6 +53,10 @@ phase_lint() {
     echo "=== CI Workflow Contract Tests ==="
     python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
 
+    echo "=== CI Empty-HOME Sentinel Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_ci_home_sentinel.py"
+    python3 "$SCRIPT_DIR/tests/test_kkernel_test_isolation.py"
+
     echo "=== Binary Resolution Harness Tests ==="
     python3 "$SCRIPT_DIR/tests/test_binary_resolution.py"
 
@@ -183,7 +187,7 @@ sentinel_fingerprint() {
 # Run the given test command inside the #1204 sentinel guard. Every phase that
 # executes workspace tests of any kind (unit/integration or doctests) must go
 # through this wrapper so no test-execution path escapes the default-store
-# isolation invariant.
+# isolation invariant. The initially empty HOME must remain completely empty.
 run_with_store_sentinel() (
     operator_home=${HOME:-}
     isolated_home=$(mktemp -d "${TMPDIR:-/tmp}/khive-ci-home.XXXXXX")
@@ -219,6 +223,16 @@ run_with_store_sentinel() (
         printf '%s\n' "$sentinel_before" >&2
         echo "after:" >&2
         printf '%s\n' "$sentinel_after" >&2
+        exit 1
+    fi
+
+    # A clean default database is not enough: timeout logs, recovery locks,
+    # dotenv state and empty directories also couple tests to the caller HOME.
+    # The directory was empty before the command; no allowlist hides new paths.
+    sentinel_home_entries=$(find "$isolated_home" -mindepth 1 -print)
+    if [ -n "$sentinel_home_entries" ]; then
+        echo "FAIL: test suite left files or directories in its isolated sentinel HOME (#3138)" >&2
+        printf '%s\n' "$sentinel_home_entries" >&2
         exit 1
     fi
 

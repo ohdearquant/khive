@@ -10,13 +10,14 @@
 //! — refusing over an unrelated pid when that process was alive, and deleting
 //! a live daemon's PID file when it was not.
 //!
-//! Isolation: this test lives in its own integration-test binary on purpose.
-//! It mutates `HOME`, `KHIVE_SOCKET` and `KHIVE_PID` (process-global env) and
-//! fires the process-wide single-shot shutdown token; neither may leak into
-//! other tests. `#[serial]` orders the cases inside this binary, matching the
-//! crate's existing serialization for env-dependent daemon tests.
+//! Each case runs as the sole test in a child with private daemon paths.
+//! Its changes to `HOME`, `KHIVE_SOCKET`, `KHIVE_PID`, and the process-wide
+//! single-shot shutdown token cannot affect another case.
 
 #![cfg(unix)]
+
+#[path = "../src/test_process.rs"]
+mod test_process;
 
 use async_trait::async_trait;
 use khive_runtime::daemon::{pid_path, run_daemon_with_boot_guard, socket_path};
@@ -112,6 +113,10 @@ fn unusable_home(dir: &tempfile::TempDir) -> std::path::PathBuf {
 #[tokio::test]
 #[serial]
 async fn only_socket_override_refuses_and_names_the_set_and_missing_variables() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let _env = EnvGuard::capture();
     let dir = tempfile::tempdir().expect("tempdir");
     let home = unusable_home(&dir);
@@ -162,6 +167,10 @@ async fn only_socket_override_refuses_and_names_the_set_and_missing_variables() 
 #[tokio::test]
 #[serial]
 async fn only_pid_override_refuses_and_names_the_set_and_missing_variables() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let _env = EnvGuard::capture();
     let dir = tempfile::tempdir().expect("tempdir");
     let home = unusable_home(&dir);
@@ -211,6 +220,10 @@ async fn only_pid_override_refuses_and_names_the_set_and_missing_variables() {
 #[tokio::test]
 #[serial]
 async fn both_overrides_set_boot_past_the_pairing_check_and_resolve_from_the_variables() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let _env = EnvGuard::capture();
     let dir = tempfile::tempdir().expect("tempdir");
     let home = unusable_home(&dir);
@@ -248,6 +261,10 @@ async fn both_overrides_set_boot_past_the_pairing_check_and_resolve_from_the_var
 #[tokio::test]
 #[serial]
 async fn neither_override_set_boots_past_the_pairing_check_and_resolves_both_defaults() {
+    if test_process::run_in_child() {
+        return;
+    }
+
     let _env = EnvGuard::capture();
     let dir = tempfile::tempdir().expect("tempdir");
     let home = unusable_home(&dir);
