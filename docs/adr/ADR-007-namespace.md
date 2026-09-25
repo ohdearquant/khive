@@ -151,7 +151,9 @@ absent anchor answers not found.
 
 **Consequences.** Two behaviour changes: an absent anchor returns an error instead of an empty list,
 and an anchor outside the read scope returns its in-scope edges instead of nothing. Nothing new is
-disclosed, since `get` already resolves the same id. Rule 9's "a full UUID is still unchecked" then
+disclosed, since `get` already resolves the same id. Separation between tenants does not rest on
+this rule: a hosted deployment keeps tenants apart in the service layer above the runtime, and inside
+one runtime the governing rule for a full-UUID argument is Rule 2. Rule 9's "a full UUID is still unchecked" then
 holds for the operation, not only for the resolver. Acceptance arms: an absent anchor is not found;
 an out-of-scope anchor with one in-scope edge returns that edge; an out-of-scope anchor with no
 in-scope edges returns an empty list; control, an in-scope anchor with no edges returns an empty
