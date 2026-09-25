@@ -293,12 +293,12 @@ impl ImapConnector for LiveImap {
         let _permit = self.single_flight.acquire().await;
         let mut session = self.connect().await?;
 
-        // SELECT returns the Mailbox struct; uid_validity is the UIDVALIDITY value needed
+        // EXAMINE opens INBOX read-only and returns the Mailbox struct; UIDVALIDITY is needed
         // for stable per-message dedup keys of the form `imap:{host}:{uidvalidity}:{uid}`.
         let mailbox = session
-            .select("INBOX")
+            .examine("INBOX")
             .await
-            .map_err(|e| ChannelError::Transport(format!("IMAP SELECT INBOX failed: {e}")))?;
+            .map_err(|e| ChannelError::Transport(format!("IMAP EXAMINE INBOX failed: {e}")))?;
         let uid_validity = validate_uid_validity(mailbox.uid_validity)?;
 
         let Some(query) = uid_search_query(since, uid_validity, progress) else {
@@ -334,13 +334,15 @@ impl ImapConnector for LiveImap {
             .collect::<Vec<_>>()
             .join(",");
 
+        // BODY.PEEK[] returns the full message without setting the Seen flag. Polling
+        // progress is the durable UID checkpoint, not a server-side read flag.
         // Collect the fetch stream into owned bytes before releasing the session borrow.
         // Every fetch entry is kept, including a `None` body: filtering bodyless
         // entries here would hide an incomplete selected page from
         // `process_selected_page`, which must see (and reject) that gap.
         let fetched_raw: Vec<(Option<u32>, Option<Vec<u8>>)> = {
             let mut stream = session
-                .uid_fetch(&uid_str, "RFC822")
+                .uid_fetch(&uid_str, "BODY.PEEK[]")
                 .await
                 .map_err(|e| ChannelError::Transport(format!("IMAP UID FETCH failed: {e}")))?;
 
@@ -374,7 +376,7 @@ impl ImapConnector for LiveImap {
 fn validate_uid_validity(uid_validity: Option<u32>) -> Result<NonZeroU32, ChannelError> {
     uid_validity.and_then(NonZeroU32::new).ok_or_else(|| {
         ChannelError::Transport(
-            "IMAP SELECT did not return a valid UIDVALIDITY; \
+            "IMAP EXAMINE did not return a valid UIDVALIDITY; \
              cannot safely deduplicate messages — poll aborted"
                 .to_string(),
         )
