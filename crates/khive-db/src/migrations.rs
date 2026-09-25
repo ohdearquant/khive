@@ -173,6 +173,7 @@ const V38_UP: &str = include_str!("../sql/038-entities-legacy-type-index.sql");
 const V39_UP: &str = include_str!("../sql/039-knowledge-cursor-indexes.sql");
 const SESSION_IDENTITY_UP: &str = include_str!("../sql/040-session-source-scope.sql");
 const SESSION_IDENTITY_MIGRATION_NAME: &str = "session_source_scoped_identity";
+const V41_UP: &str = include_str!("../sql/041-sender-transport.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -428,6 +429,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 40,
         name: SESSION_IDENTITY_MIGRATION_NAME,
         up: SESSION_IDENTITY_UP,
+    },
+    VersionedMigration {
+        version: 41,
+        name: "sender_transport",
+        up: V41_UP,
     },
 ];
 

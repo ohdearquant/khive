@@ -4809,3 +4809,75 @@ fn issue2673_v37_initializes_and_guards_entity_versions() {
         2
     );
 }
+
+#[test]
+fn sender_transport_migration_fresh_and_previous_tail() {
+    for previous in [0, 40] {
+        let mut conn = open_memory();
+        if previous != 0 {
+            migrate_through(&mut conn, previous);
+        }
+        run_migrations(&mut conn).unwrap();
+        assert!(table_exists(&conn, "comm_sender_transport"));
+        for (name, kind) in [
+            ("policy_mode", "TEXT"),
+            ("policy_revision", "INTEGER"),
+            ("admitted_at", "INTEGER"),
+        ] {
+            let column: (String, i64) = conn
+                .query_row(
+                    concat!(
+                        "SELECT type, [notnull] FROM pragma_table_info('comm_sender_transport') ",
+                        "WHERE name=?1"
+                    ),
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(column, (kind.to_owned(), 0));
+        }
+        let column: (String, i64, Option<String>) = conn.query_row(
+            "SELECT type, [notnull], dflt_value FROM pragma_table_info('comm_sender_transport') \
+             WHERE name='sender_assurance'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(column, ("TEXT".to_owned(), 1, None));
+        let insert = concat!(
+            "INSERT INTO comm_sender_transport (namespace,logical_message_id,outbound_note_id,",
+            "kind,slug,credential_ref,recipient_address,protocol_version,sender_agent_id,",
+            "recipient_agent_id,recipient_device_id,recipient_key_epoch,contact_generation,",
+            "sender_key_epoch,recipient_key_fingerprint,enc,ciphertext,envelope_seq,state,",
+            "created_at,updated_at,sender_assurance) VALUES ",
+            "('local',?1,'note','khive','device','keys/device','address',1,'sender','recipient',",
+            "'device',1,1,1,'fingerprint',zeroblob(32),zeroblob(1),1,'pending',0,0,?2)",
+        );
+        for spelling in ["claimed", "daemon_bearer", "actor_signature"] {
+            assert_eq!(
+                conn.execute(insert, rusqlite::params![spelling, spelling])
+                    .unwrap(),
+                1
+            );
+        }
+        for (value, expected) in [
+            (None, rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL),
+            (Some("unspecified"), rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+        ] {
+            let error = conn
+                .execute(insert, rusqlite::params!["invalid", value])
+                .unwrap_err();
+            match error {
+                rusqlite::Error::SqliteFailure(code, _) => assert_eq!(code.extended_code, expected),
+                other => panic!("expected constraint failure, got {other}"),
+            }
+        }
+        let foreign_keys: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list('comm_sender_transport')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(foreign_keys, 0, "transport rows must outlive note history");
+        run_migrations(&mut conn).unwrap();
+    }
+}
