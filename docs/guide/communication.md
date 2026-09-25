@@ -412,10 +412,38 @@ Optional, with defaults:
   quarantine record instead of dropping it)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; inbound actor assigned to
-  fresh, uncorrelated email messages)
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; actor assigned to fresh,
+  uncorrelated email messages. Set it to `channel:email` to opt into a separate
+  mailbox.)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)
+
+An anonymous `local` caller cannot read the delegated `channel:email` mailbox;
+the mailbox gate denies that read with `mailbox_read_not_granted`. To grant a
+reader, configure the process that owns the mailbox with its actor id and the
+exact reader actor labels:
+
+```toml
+[actor]
+id = "channel:email"
+mailbox_readers = ["lambda:email-reader"]
+```
+
+The listed actor can read it by selecting the mailbox explicitly:
+
+```text
+request(ops="comm.inbox(mailbox_actor=\"channel:email\")")
+```
+
+The request must resolve to one of the configured reader actor labels.
+
+Sender labels are not proof of origin. Ingested mail is stored with the sender
+label `email:<address>`, but a local caller chooses its own actor label, and
+that label becomes `from_actor` on what it sends. A `comm.send` run with
+`KHIVE_ACTOR=email:forged@example.com` is stored with `from_actor`
+`email:forged@example.com`, and `comm.inbox(from_prefix="email:")` returns it
+beside ingested mail. Use `from_prefix="email:"` to filter by sender label; it
+does not show that a message arrived through the email channel.
 
 ### Feature gating
 
