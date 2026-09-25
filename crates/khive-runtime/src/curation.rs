@@ -403,6 +403,10 @@ pub struct MergeSummary {
     /// Actual embedding-input truncation observed while reindexing the survivor.
     #[serde(skip)]
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
+    /// Error returned by the post-commit survivor reindex. A set value means
+    /// the note merge committed but the reindex did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_commit_reindex_error: Option<String>,
 }
 
 /// Complete stored state of an edge removed while resolving a merge conflict.
@@ -2969,58 +2973,91 @@ impl KhiveRuntime {
             );
         }
 
-        if !dry_run && !embedding_plan.is_empty() {
-            summary.embedding_truncation = self
-                .reindex_note_with_plan(token, &updated_note, &embedding_plan)
-                .await?;
-            // A merge changes the same ANN corpus as update_note's text_changed
-            // branch, so fire the same mutation hook regardless of which public
-            // write path reached the corpus change.
+        // Dry-run is a read-only preview: it must not append a merge event.
+        // Attempt the event write before reindexing so a post-commit index error
+        // cannot hide a merge that has already committed.
+        let event_result: RuntimeResult<()> = if !dry_run {
+            async {
+                let event_token = token.with_namespace(
+                    crate::Namespace::parse(&updated_note.namespace).map_err(|error| {
+                        RuntimeError::Internal(format!("note namespace invalid: {error}"))
+                    })?,
+                );
+                let event_store = self.events(&event_token)?;
+                // Mirror the wire-level strategy spelling from MergeParams so consumers
+                // can round-trip the policy string back into a request.
+                let policy_str = match strategy {
+                    EntityDedupMergePolicy::PreferInto => "prefer_into",
+                    EntityDedupMergePolicy::PreferFrom => "prefer_from",
+                    EntityDedupMergePolicy::Union => "union",
+                };
+                let mut payload = serde_json::json!({
+                    "into_id": summary.kept_id,
+                    "from_id": summary.removed_id,
+                    "policy": policy_str,
+                    "content_strategy": format!("{:?}", content_strategy),
+                    "edges_rewired": summary.edges_rewired,
+                    "edges_self_loop_dropped": summary.edges_self_loop_dropped,
+                    "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
+                    "edges_contract_skipped": summary.edges_contract_skipped,
+                    "edge_conflict_preimages": &summary.edge_conflict_preimages,
+                });
+                if let Some(reason) = reason {
+                    payload["reason"] = serde_json::Value::String(reason);
+                }
+                let event = khive_storage::event::Event::new(
+                    updated_note.namespace.clone(),
+                    "merge",
+                    EventKind::NoteMerged,
+                    SubstrateKind::Note,
+                    "",
+                )
+                .with_target(summary.kept_id)
+                .with_payload(payload);
+                event_store.append_event(event).await.map_err(|e| {
+                    RuntimeError::Internal(format!("merge_note: event store write failed: {e}"))
+                })
+            }
+            .await
+        } else {
+            Ok(())
+        };
+
+        if !dry_run {
+            if !embedding_plan.is_empty() {
+                #[cfg(any(test, feature = "fault-injection"))]
+                let reindex_result =
+                    if crate::operations::consume_fts_fail_fault(&updated_note.namespace) {
+                        Err(RuntimeError::Internal("injected FTS failure".to_string()))
+                    } else {
+                        self.reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                            .await
+                    };
+                #[cfg(not(any(test, feature = "fault-injection")))]
+                let reindex_result = self
+                    .reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                    .await;
+
+                match reindex_result {
+                    Ok(report) => summary.embedding_truncation = report,
+                    Err(error) => {
+                        tracing::warn!(
+                            into_id = %summary.kept_id,
+                            from_id = %summary.removed_id,
+                            error = %error,
+                            "merge_note: committed merge but survivor reindex failed"
+                        );
+                        summary.post_commit_reindex_error = Some(error.to_string());
+                    }
+                }
+            }
+            // The note row is committed even when no embedding model is
+            // registered or the post-commit reindex reports an error.
             self.fire_note_mutation_hook(&updated_note.kind, updated_note.id)
                 .await;
         }
 
-        // Dry-run is a read-only preview: it must not append a merge event.
-        if !dry_run {
-            let event_token =
-                token.with_namespace(crate::Namespace::parse(&updated_note.namespace).map_err(
-                    |error| RuntimeError::Internal(format!("note namespace invalid: {error}")),
-                )?);
-            let event_store = self.events(&event_token)?;
-            // Mirror the wire-level strategy spelling from MergeParams so consumers
-            // can round-trip the policy string back into a request.
-            let policy_str = match strategy {
-                EntityDedupMergePolicy::PreferInto => "prefer_into",
-                EntityDedupMergePolicy::PreferFrom => "prefer_from",
-                EntityDedupMergePolicy::Union => "union",
-            };
-            let mut payload = serde_json::json!({
-                "into_id": summary.kept_id,
-                "from_id": summary.removed_id,
-                "policy": policy_str,
-                "content_strategy": format!("{:?}", content_strategy),
-                "edges_rewired": summary.edges_rewired,
-                "edges_self_loop_dropped": summary.edges_self_loop_dropped,
-                "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
-                "edges_contract_skipped": summary.edges_contract_skipped,
-                "edge_conflict_preimages": &summary.edge_conflict_preimages,
-            });
-            if let Some(reason) = reason {
-                payload["reason"] = serde_json::Value::String(reason);
-            }
-            let event = khive_storage::event::Event::new(
-                updated_note.namespace.clone(),
-                "merge",
-                EventKind::NoteMerged,
-                SubstrateKind::Note,
-                "",
-            )
-            .with_target(summary.kept_id)
-            .with_payload(payload);
-            event_store.append_event(event).await.map_err(|e| {
-                RuntimeError::Internal(format!("merge_note: event store write failed: {e}"))
-            })?;
-        }
+        event_result?;
 
         Ok(summary)
     }
@@ -3823,6 +3860,7 @@ fn merge_entity_sql(
             dry_run,
             tx_budget: budget.report(),
             embedding_truncation: Default::default(),
+            post_commit_reindex_error: None,
         },
         updated_entity,
     ))
@@ -4481,6 +4519,7 @@ fn merge_note_sql(
             dry_run,
             tx_budget: budget.report(),
             embedding_truncation: Default::default(),
+            post_commit_reindex_error: None,
         },
         updated_note,
     ))
@@ -4889,6 +4928,7 @@ mod merge_reservation_tests;
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
@@ -9341,6 +9381,198 @@ mod tests {
         assert_eq!(
             payload.get("reason").and_then(|v| v.as_str()),
             Some("duplicate")
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_returns_committed_summary_when_post_commit_reindex_fails() {
+        use crate::operations::arm_fts_fail_scoped;
+
+        const DIMS: usize = 4;
+        let rt = rt();
+        rt.register_embedder(MergeTestVecProvider::new(
+            "merge-note-reindex-failure",
+            DIMS,
+        ));
+        let namespace = format!("merge-reindex-failure-{}", Uuid::new_v4().as_simple());
+        let tok = NamespaceToken::for_namespace(crate::Namespace::parse(&namespace).unwrap());
+        let into = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "survivor content",
+                None,
+                Some(serde_json::json!({"survivor": "retained"})),
+                vec![],
+            )
+            .await
+            .expect("create survivor note");
+        let from = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "source content",
+                None,
+                Some(serde_json::json!({"merged": "source"})),
+                vec![],
+            )
+            .await
+            .expect("create source note");
+
+        let observed_by_hook = Arc::new(Mutex::new(Vec::new()));
+        let hook_observations = Arc::clone(&observed_by_hook);
+        let event_store = rt.events(&tok).expect("event store");
+        rt.install_note_mutation_hook(Arc::new(move |kind, id| {
+            let hook_observations = Arc::clone(&hook_observations);
+            let event_store = Arc::clone(&event_store);
+            Box::pin(async move {
+                let events = event_store
+                    .query_events(
+                        khive_storage::EventFilter {
+                            kinds: vec![EventKind::NoteMerged],
+                            ..Default::default()
+                        },
+                        khive_storage::types::PageRequest {
+                            offset: 0,
+                            limit: 10,
+                        },
+                    )
+                    .await
+                    .expect("read merge event from mutation hook");
+                hook_observations
+                    .lock()
+                    .unwrap()
+                    .push((kind, id, !events.items.is_empty()));
+            })
+        }));
+
+        let _arm = arm_fts_fail_scoped(&namespace);
+        let outcome = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::Union,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "a committed merge must return its summary after reindexing fails: {outcome:?}"
+        );
+        let summary = outcome.expect("the committed merge summary must be returned");
+        assert_eq!(summary.kept_id, into.id);
+        assert_eq!(summary.removed_id, from.id);
+        assert!(
+            summary
+                .post_commit_reindex_error
+                .as_deref()
+                .is_some_and(|error| error.contains("injected FTS failure")),
+            "the summary must report the post-commit reindex failure: {:?}",
+            summary.post_commit_reindex_error
+        );
+
+        assert_eq!(
+            observed_by_hook.lock().unwrap().as_slice(),
+            &[("observation".to_string(), into.id, true)],
+            "the note mutation hook must observe the committed merge event"
+        );
+
+        let note_store = rt.notes(&tok).expect("note store");
+        let survivor = note_store
+            .get_note(into.id)
+            .await
+            .expect("read survivor")
+            .expect("survivor remains live");
+        assert_eq!(
+            survivor.content,
+            "survivor content\n\n---\n\nsource content"
+        );
+        let properties = survivor.properties.expect("merged properties");
+        assert_eq!(properties["survivor"], "retained");
+        assert_eq!(properties["merged"], "source");
+
+        let removed = note_store
+            .get_note_including_deleted(from.id)
+            .await
+            .expect("read merge tombstone")
+            .expect("source row is retained as a tombstone");
+        assert_eq!(removed.status, "deleted");
+        assert!(removed.deleted_at.is_some());
+
+        let events = rt
+            .events(&tok)
+            .expect("event store")
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("read merge event");
+        assert_eq!(
+            events.items.len(),
+            1,
+            "the merge event must be recorded when reindexing fails"
+        );
+        assert_eq!(
+            events.items[0]
+                .payload
+                .get("into_id")
+                .and_then(|v| v.as_str()),
+            Some(summary.kept_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            events.items[0]
+                .payload
+                .get("from_id")
+                .and_then(|v| v.as_str()),
+            Some(summary.removed_id.to_string()).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_fires_mutation_hook_without_embedding_models() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "survivor", None, None, vec![])
+            .await
+            .expect("create survivor note");
+        let from = rt
+            .create_note(&tok, "observation", None, "source", None, None, vec![])
+            .await
+            .expect("create source note");
+        let hook_calls = Arc::new(Mutex::new(Vec::new()));
+        let observed_calls = Arc::clone(&hook_calls);
+        rt.install_note_mutation_hook(Arc::new(move |kind, id| {
+            let observed_calls = Arc::clone(&observed_calls);
+            Box::pin(async move { observed_calls.lock().unwrap().push((kind, id)) })
+        }));
+
+        rt.merge_note(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .expect("merge note without registered embedding models");
+
+        assert_eq!(
+            hook_calls.lock().unwrap().as_slice(),
+            &[("observation".to_string(), into.id)],
+            "every committed note merge must notify mutation hooks without embedding models"
         );
     }
 
