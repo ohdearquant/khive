@@ -205,7 +205,7 @@ struct SyncArgs {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
 
-    /// Output SQLite database path. Replaced atomically via tmp+rename.
+    /// Output SQLite path. Close all clients and resolve any -wal/-shm before sync.
     #[arg(long)]
     db: PathBuf,
 
