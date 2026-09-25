@@ -1059,13 +1059,14 @@ async fn count_unread_messages(
     })
 }
 
-/// `read` — mark a message as read.
+/// `read` — retrieve an inbound message and mark it as read.
 pub(crate) async fn handle_read(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ReadParams = deser(params)?;
+    let include_body = p.body;
     match (p.id, p.ids) {
         (Some(_), Some(_)) => Err(RuntimeError::InvalidInput(
             "read: `id` and `ids` are mutually exclusive".into(),
@@ -1075,12 +1076,15 @@ pub(crate) async fn handle_read(
         )),
         (Some(raw), None) => {
             let (id, note) = validate_read_target(runtime, token, &raw).await?;
-            mark_read_target(runtime, token, id, note).await
+            let message = include_body.then(|| read_message_fields(&note));
+            let result = mark_read_target(runtime, token, id, note).await?;
+            Ok(read_result_with_body(result, message))
         }
         (None, Some(raw_ids)) => {
             let (requested_count, targets) =
                 validate_bulk_read_targets(runtime, token, raw_ids, "read").await?;
-            mark_read_targets_best_effort(runtime, token, requested_count, targets).await
+            mark_read_targets_best_effort(runtime, token, requested_count, targets, include_body)
+                .await
         }
     }
 }
@@ -1097,7 +1101,7 @@ pub(crate) async fn handle_mark_read(
     if p.atomic {
         mark_read_targets_atomic(runtime, token, requested_count, targets).await
     } else {
-        mark_read_targets_best_effort(runtime, token, requested_count, targets).await
+        mark_read_targets_best_effort(runtime, token, requested_count, targets, false).await
     }
 }
 
@@ -1138,12 +1142,14 @@ async fn mark_read_targets_best_effort(
     token: &NamespaceToken,
     requested_count: usize,
     targets: Vec<(Uuid, Note)>,
+    include_body: bool,
 ) -> Result<Value, RuntimeError> {
     let mut results = Vec::with_capacity(targets.len());
     for (id, note) in targets {
         let original_properties = note.properties.clone();
+        let message = include_body.then(|| read_message_fields(&note));
         match mark_read_target(runtime, token, id, note).await {
-            Ok(result) => results.push(result),
+            Ok(result) => results.push(read_result_with_body(result, message)),
             Err(error) => {
                 let (status, read) = match &error {
                     RuntimeError::Storage(storage_error) => {
@@ -1166,6 +1172,27 @@ async fn mark_read_targets_best_effort(
         }
     }
     Ok(bulk_read_response(requested_count, results))
+}
+
+fn read_message_fields(note: &Note) -> Value {
+    let message = note_to_message_json(note);
+    json!({
+        "subject": message["subject"],
+        "content": message["content"],
+        "from": message["from"],
+        "to": message["to"],
+        "direction": message["direction"],
+        "created_at": message["created_at"],
+    })
+}
+
+fn read_result_with_body(mut result: Value, message: Option<Value>) -> Value {
+    if result["status"] == "success" {
+        if let (Some(response), Some(Value::Object(message))) = (result.as_object_mut(), message) {
+            response.extend(message);
+        }
+    }
+    result
 }
 
 async fn mark_read_targets_atomic(
@@ -1387,9 +1414,8 @@ async fn mark_read_target(
     let recheck_filter = read_recheck_filter(token);
 
     // Best-effort: under multi-client writer contention the pool checkout can
-    // time out. The read itself already succeeded above — failing the whole
-    // call over a delivery-state patch would throw away a successful read for
-    // a caller who cannot retry the fetch half. Mirrors handle_reply's
+    // time out. Keep the failed or indeterminate mark in the response so the
+    // caller can retry or re-check state. Mirrors handle_reply's
     // fold-in mark-read: `Ok(false)` (no live row currently matches, e.g.
     // soft-deleted or an eligibility property changed mid-flight) and `Err`
     // both degrade to `read: false` + `mark_error` instead of failing the
@@ -3636,8 +3662,9 @@ mod tests {
     use super::{
         add_embedding_truncation_warning, build_references_header, bulk_read_response,
         channel_stalled, heartbeat_note_id, mark_read_target, message_id_match_candidates,
-        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
-        send_response_thread_id, validate_read_target, wait_for_inbox_response, wrap_message_id,
+        parent_references_chain, parent_wire_message_id, read_response, read_result_with_body,
+        sanitize_reference_token, send_response_thread_id, validate_read_target,
+        wait_for_inbox_response, wrap_message_id,
     };
     use crate::inbox_signal::InboxSignal;
     use khive_storage::note::Note;
@@ -4789,6 +4816,23 @@ mod tests {
              outcome; got {resp}"
         );
         assert_eq!(resp["read"], json!(false));
+    }
+
+    #[test]
+    fn read_body_is_exposed_only_for_a_successful_mark() {
+        let message = json!({"subject": "private subject", "content": "private body"});
+        for status in ["failed", "unknown"] {
+            let result = read_result_with_body(
+                json!({"status": status, "read": Value::Null}),
+                Some(message.clone()),
+            );
+            assert!(result.get("subject").is_none(), "{result}");
+            assert!(result.get("content").is_none(), "{result}");
+        }
+        let success =
+            read_result_with_body(json!({"status": "success", "read": true}), Some(message));
+        assert_eq!(success["subject"], "private subject");
+        assert_eq!(success["content"], "private body");
     }
 
     #[test]
