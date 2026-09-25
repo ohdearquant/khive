@@ -384,14 +384,15 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    ADR-191 A1.2's scheduling claim does not bound that leak.
 6. **Admit only a reviewed schema epoch.** ADR-160's Phase-4a gate admits only the exact completed
    V21 migration ledger. Define one explicit `REVIEWED_SCHEMA_EPOCH = 41` for this amendment's
-   core-schema review, the terminal migration version at this package base. The implementing change
-   must use that named constant in the exact-epoch predicate and its fixtures, rather than repeat a
-   version literal or derive admission from the latest compiled migration. It must review the complete
+   core-schema review, matching the terminal core migration on main when this amendment was written.
+   The implementing change must use that named constant in the exact-epoch predicate and its
+   fixtures, rather than repeat a version literal or derive admission from the latest compiled
+   migration. It must review the complete
    V22-through-`REVIEWED_SCHEMA_EPOCH` core migration chain, including `sender_transport`, together
-   with pack-owned schemas and blob-writing paths. V40 is a historical baseline sub-predicate within
-   that review, not an admitted terminal epoch. The predicate adds the completed cutover marker,
-   absent legacy reference column, functional attachment claim fences, canonical migration-name
-   checks and contiguous ledger to the historical exact-V21 gate; the current gate checks only the
+   with pack-owned schemas and blob-writing paths. V40 is not admitted separately. The predicate
+   retains the historical gate's completed cutover marker, absent legacy reference column,
+   functional attachment claim fences and contiguous ledger, and adds canonical migration-name
+   validation for every row below the reviewed terminal version; the current gate checks only the
    V21 name and leaves below-terminal name validation to boot. The liveness ownership rows and store
    binding in items 7 and 8 must also pass before a full sweep. The admission key is the reviewed
    schema epoch **and** the recorded store identity, never an epoch alone. Pack DDL outside
@@ -406,25 +407,31 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    change to core or pack-owned liveness schema, producer code or manifest format repeats that review
    and updates the gate and tests in the same change.
    ADR-160's exact-V21 rule remains the historical Phase-4a rollout contract.
-7. **Use pack-registered ownership as the complete liveness authority.** Choose option (a): every
-   pack that writes to the shared runtime blob store must register each durable root in the canonical
-   main database, either as an `attachments.content_ref` row or in a new versioned
+7. **Use registered ownership as the complete liveness authority.** Choose option (a): every
+   production path in any crate linked into `kkernel` that writes to the shared runtime blob store
+   and persists or returns a ref as durable must register each such root in the canonical main
+   database, either as an `attachments.content_ref` row or in a new versioned
    `blob_pack_owners` table. That table records at least `(store_id, content_ref, owner_pack,
-   owner_kind, owner_id, format_version)` with a unique owner/ref key. It is the ownership row, not
-   an ad hoc query over pack-specific JSON, that authorizes retention and release. This lets the
+   owner_kind, owner_id, format_version)` with a unique owner/ref key; `owner_pack` also identifies
+   non-pack producers such as `khive-mcp`. It is the ownership row, not an ad hoc query over
+   producer-specific JSON, that authorizes retention and release. This lets the
    sweep and all pack writers use one fenced SQL authority even when pack records live on secondary
-   backends. Raw `blob.put`/`blob.commit` output with no durable owner is explicitly an unowned
-   candidate after the grace period; a pack that returns or persists a ref as durable must register
-   it before publication. The sweep's atomic candidate-claim anti-join reads every attachment
-   role, every live pack ownership row for the bound `store_id`, conservative legacy pins and
-   transitive manifest closure. Registration (including idempotent put of an older unowned ref) and
+   backends. Only raw `blob.put`/`blob.commit` output that no production path persists or returns as a
+   durable ref is an explicitly unowned candidate after the grace period. Every path that persists
+   or returns such a ref as durable must register it before publication. The sweep's atomic
+   candidate-claim anti-join reads every attachment role, every live ownership row for the bound
+   `store_id`, conservative legacy pins and transitive manifest closure. Registration (including
+   idempotent put of an older unowned ref) and
    release serialize with claim/delete, so a newly published owner never points to deleted bytes.
 
    Exec registers run receipts (`tree_in`, `tree_out`, stdout, stderr, sandbox profile and
    changed/base refs) and receiptless `exec.tree`/`exec.tree_put` outputs; git registers input trees,
    checkout trees and diffs; persisted web derived-text bodies and the existing moodboard and
-   network bodies use main-backend attachments. The web pack must root a derived-text resource
-   body as an attachment under ADR-191 A1.2; a `properties.blob_ref` alone does not keep it.
+   network bodies use main-backend attachments. The `khive-mcp` channel quarantine path registers
+   each original as a main-backend attachment on its quarantine message before publishing
+   `quarantine_content_ref`, even though it writes through `registry.dispatch("blob.put", ...)` rather
+   than a direct `BlobStore` call. The web pack must root a derived-text resource body as an
+   attachment under ADR-191 A1.2; a `properties.blob_ref` alone does not keep it.
    Every live `khive-tree/v1` manifest keeps its entry refs live recursively: registration
    materializes a checked child-owner row for each transitive ref before publishing the root.
    ADR-181's exec
@@ -434,18 +441,25 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    live under that pack's retention contract; an unknown release rule retains the row.
 
    A test-time census covers production source in every crate linked into the `kkernel` binary,
-   including non-pack crates and packs absent from a particular test configuration. It keys on the
-   resolved receiver type, not method names, helper names, file paths or grep patterns: every call
-   resolving to a `BlobStore` write method (`put`, `begin`, `put_part`, `commit` or any future write
-   method) and every function that reaches such a call transitively is in scope. The trace follows
+   including non-pack crates and packs absent from a particular test configuration. For direct store
+   calls it keys on the resolved receiver type, not helper names, file paths or grep patterns: every
+   call resolving to a `BlobStore` write method (`put`, `begin_upload`, `append_part`,
+   `commit_upload` or any future write method) and every function that reaches such a call
+   transitively is in scope. A second arm covers string-keyed verb dispatch to `blob.put`,
+   `blob.begin`, `blob.put_part` or `blob.commit` from any linked crate, including aliases or
+   constructed verb names that can resolve to those writes. The trace follows
    `KhiveRuntime::blob_store()`, pack accessors such as `tree::blob_store`, wrappers taking
-   `&KhiveRuntime` or `&dyn BlobStore`, and paths that return an existing ref. Each reachable write
-   path is classified as main-backend attachment registration, `blob_pack_owners` registration or an
-   explicitly unowned producer; read-only paths are classified separately and cannot justify a
-   write. Adding an unclassified writer fails the gate. Must-fail controls plant production-shaped
-   paths in a linked-crate fixture: a newly named `f(rt: &KhiveRuntime)` that writes through
-   `rt.blob_store()?.put(...)` and `g(store: &dyn BlobStore)` that calls `store.put(...)`. Each alone
-   must trip the census. Backfill also inventories all historically co-resident pack backends, source
+   `&KhiveRuntime` or `&dyn BlobStore`, paths that return an existing ref, and verb-dispatch callers.
+   Each reachable write path is classified as main-backend attachment registration,
+   `blob_pack_owners` registration or an explicitly unowned producer only if no durable ref is
+   persisted or returned; read-only paths are classified separately and cannot justify a write.
+   Adding an unclassified writer fails the gate. Must-fail controls plant production-shaped paths
+   in a linked-crate fixture: a newly named `f(rt: &KhiveRuntime)` that writes through
+   `rt.blob_store()?.put(...)`, `g(store: &dyn BlobStore)` that calls `store.put(...)`, and a
+   quarantine-shaped caller that persists the result of `registry.dispatch("blob.put", ...)` in
+   message properties. Each alone must trip the census; a staged-upload control using
+   `registry.dispatch("blob.commit", ...)` must also trip it. Backfill also inventories all
+   historically co-resident pack backends, source
    tables and manifest formats; neither the core
    migration ledger nor an attachment-only scan proves this coverage. The registered-row design
    is chosen over querying each pack's evolving receipt/property schema at sweep time because a
@@ -537,13 +551,20 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   readable through the git receipt and `blob.get`. A persisted web extracted-text resource has a
   main-backend content attachment and survives; a pre-cutover derived resource whose only old root
   was `properties.blob_ref` is retained by backfill as well. Moodboard originals, model bundles and network
-  bodies survive under every existing attachment role. The same objects are absent from
+  bodies survive under every existing attachment role. A live channel-quarantine message's original,
+  written through `blob.put` and referenced by `quarantine_content_ref`, has a main-backend
+  attachment and survives an older-than-grace live scheduled pass and a live admin pass;
+  `blob.get` returns its original bytes exactly after both. The same objects are absent from
   `would_delete` in dry runs.
-- A test-time census fails if any crate linked into `kkernel` adds a path to a `BlobStore` write
-  method without a main-backend attachment, `blob_pack_owners` or explicit unowned classification.
-  It resolves receiver types and follows runtime/pack accessors and transitive callers, regardless
-  of names or which packs a test enables. Synthetic writers through `f(rt: &KhiveRuntime)` and
-  `g(store: &dyn BlobStore)` each fail the census until classified.
+- A test-time census fails if any crate linked into `kkernel` adds a direct `BlobStore` write or blob
+  write-verb dispatch without a main-backend attachment, `blob_pack_owners` or a justified explicit
+  unowned classification.
+  It resolves receiver types, enumerates blob verb dispatches and follows runtime/pack accessors
+  and transitive callers, regardless of names or which packs a test enables. Synthetic writers
+  through `f(rt: &KhiveRuntime)`, `g(store: &dyn BlobStore)`, and a quarantine-shaped
+  `registry.dispatch("blob.put", ...)` each fail the census until classified; so does a
+  `registry.dispatch("blob.commit", ...)` upload completion. A durable-ref producer cannot pass as
+  explicitly unowned.
   A planted older-than-grace exec tree and git checkout survive dry run and live sweep via their
   ownership rows, even when their source receipts are stored on secondary pack backends. Removing
   either row after the source becomes nonlive makes the ref eligible only under its approved release
