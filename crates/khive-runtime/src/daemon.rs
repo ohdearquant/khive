@@ -2339,6 +2339,17 @@ where
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),
         }
+        // Tokio retains its process-wide handlers after the streams are dropped.
+        // This daemon cannot restart without exec; a repeat signal must terminate
+        // even if shutdown is blocked in synchronous recovery-lock acquisition.
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            // SAFETY: setting SIG_DFL for these valid signals needs no handler
+            // pointer or shared Rust state and applies to the whole process.
+            if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok::<(), std::io::Error>(())
     };
 
     // SAFETY: `geteuid` is always successful and takes no arguments.
@@ -2399,7 +2410,7 @@ where
                 }
             }
         } => {}
-        _ = shutdown => {}
+        result = shutdown => result?,
     }
 
     // A listening backlog is not admitted work. Close it before draining so
@@ -2859,6 +2870,9 @@ pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, di
 #[cfg(all(test, unix))]
 mod tests {
     include!("daemon/plan_tests.rs");
+    mod shutdown_signals {
+        include!("daemon/shutdown_signal_tests.rs");
+    }
     use super::*;
     use serial_test::serial;
 

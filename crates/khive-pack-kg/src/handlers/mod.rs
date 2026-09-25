@@ -12,6 +12,7 @@ mod merge;
 mod note_list;
 mod params;
 mod proposal;
+mod redirect;
 mod resolve;
 mod scan;
 mod search;

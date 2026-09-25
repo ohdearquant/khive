@@ -26,7 +26,7 @@ An always-machine-readable copy of this page is at
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
@@ -297,11 +297,19 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                                                                                     |
-| ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
-| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix.                    |
-| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
+When an entity id was consumed by a merge, default `get` follows `merged_into` to the
+first live kept entity. Its response adds `redirected_from`, an ordered array of the
+merged ids traversed; a live id has no such field. `include_deleted=true` takes
+precedence and returns the requested tombstone with its `merged_into` pointer.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long` respectively. The kept id is checked by the Gate before
+its entity is returned.
+
+| Param             | Type | Required | Notes                                                                                                                                                   |
+| ----------------- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                                            |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge without chasing a merge redirect (default false); accepts a full UUID or unique 8+ hex prefix. |
+| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records.               |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -979,6 +987,12 @@ actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.
 (4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+A resolved id consumed by an entity merge follows the transitive `merged_into`
+chain. Its result contains the live kept `id` and `redirected_from: [old_id, ...]`;
+an unredirected result has no marker. `resolve` has no `include_deleted` option.
+Cycles and overlong chains fail with `redirect cycle detected` and
+`redirect chain too long`. The kept id is checked by the Gate before return.
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
@@ -2522,7 +2536,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 4 verbs
+## `session` pack — 5 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2587,6 +2601,24 @@ Serialize one stored session as json or markdown.
 ```
 request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 ```
+
+### `session.search` — Assertive (dependency gated)
+
+Search mirrored message text within the request's resolved tenant scope. The
+public handler currently refuses until transcript deletion and resume/export
+continuity support are available. Serving multiple principals also requires
+authenticated connection identity.
+
+| Param    | Type    | Required | Notes                                                         |
+| -------- | ------- | -------- | ------------------------------------------------------------- |
+| `query`  | string  | yes      | Words to match in mirror text.                                |
+| `limit`  | integer | no       | 1–200, default 20.                                            |
+| `since`  | string  | no       | Inclusive RFC 3339 message creation lower bound.              |
+| `source` | string  | no       | Exact source; `unknown` returns migration orphans when named. |
+| `cwd`    | string  | no       | Exact session working directory.                              |
+
+The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
+specifies the scoped key, migration, and search result identity.
 
 ---
 

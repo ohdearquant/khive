@@ -205,7 +205,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         description: "Fetch any record by UUID. Returns the bare record, no envelope: `kind` is \
                       the granular kind (concept, task, observation, ...), `entity_type` is the \
                       governed subtype when one is set, and an entity's vocabulary type lives \
-                      at `properties.type`.",
+                      at `properties.type`. A merged entity id returns the live kept entity with \
+                      `redirected_from` listing the traversed ids; include_deleted=true returns \
+                      the requested tombstone instead. Redirect cycles and excessive chains fail \
+                      with distinct errors, and the Gate checks the effective kept id.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -233,7 +236,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "boolean",
                 required: false,
                 description:
-                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated). Default false. \
+                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated), without following a merge redirect. Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
                      to soft-deleted records when no live record matches.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -1403,7 +1406,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                        -> Resolved; several identically-named entities -> \
                        Ambiguous over exactly that set); (4) hybrid search over \
                        the namespace, discarding vector hits with raw cosine similarity \
-                       below 0.3 before RRF fusion. Returns one of Resolved{id,confidence} | \
+                       below 0.3 before RRF fusion. A merged entity id resolves to the live kept \
+                       id with an ordered `redirected_from` chain after an effective-id Gate check; \
+                       cycles and excessive chains fail with distinct errors. Returns one of Resolved{id,confidence} | \
                        Ambiguous{candidates} | NotFound per ref — never a silent \
                        pick among close candidates. For a non-exact ref that \
                        stays ambiguous, `candidates` is a bounded sample capped \
