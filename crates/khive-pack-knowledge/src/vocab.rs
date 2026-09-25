@@ -27,7 +27,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
-        description: "Atomically insert or update knowledge atoms by slug, or replace existing atom properties by UUID. All inputs are validated before writing; a validation or secret refusal commits no atom writes. Secret refusals identify the zero-based atoms[index].field; valid siblings are not partially committed.",
+        description: "Atomically insert or update knowledge atoms by slug, or replace existing atom properties by UUID. All inputs are validated before writing; a validation or secret refusal commits no atom writes. dry_run=true returns every item's validation verdict without writing atoms, indexes or refusal events; host dispatch auditing may still record the call. Secret refusals identify the zero-based atoms[index].field; valid siblings are not partially committed.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -43,6 +43,13 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 param_type: "integer",
                 required: false,
                 description: "Per-chunk size for client-side chunking hint (max 5000)",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "dry_run",
+                param_type: "boolean",
+                required: false,
+                description: "Default false. True checks the whole batch and returns indexed results with would_refuse plus would_refuse_batch, without atom/index writes or refusal events. Secret details and secret-bearing identities are masked.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -797,7 +804,10 @@ mod tests {
     /// parent `ParamDef.description` rather than as separate top-level entries here.
     fn expected_params() -> &'static [(&'static str, &'static [&'static str])] {
         &[
-            ("knowledge.upsert_atoms", &["atoms", "chunk_size"]),
+            (
+                "knowledge.upsert_atoms",
+                &["atoms", "chunk_size", "dry_run"],
+            ),
             ("knowledge.upsert_domains", &["domains"]),
             ("knowledge.get", &["id", "include_sections"]),
             (
