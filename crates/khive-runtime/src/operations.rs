@@ -1115,7 +1115,9 @@ pub(crate) fn merge_dependency_kind(
             return metadata;
         }
     }
-    let inferred = infer_dependency_kind(src_kind, tgt_kind)?;
+    let Some(inferred) = infer_dependency_kind(src_kind, tgt_kind) else {
+        return metadata;
+    };
     let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
     if let Some(o) = obj.as_object_mut() {
         o.insert("dependency_kind".to_string(), serde_json::json!(inferred));
@@ -7272,6 +7274,16 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[test]
+    fn dependency_kind_inference_preserves_unmatched_metadata() {
+        let metadata = serde_json::json!({"note": "caller supplied"});
+        assert_eq!(
+            merge_dependency_kind("concept", "concept", Some(metadata.clone())),
+            Some(metadata)
+        );
+        assert_eq!(merge_dependency_kind("concept", "concept", None), None);
     }
 
     #[test]
