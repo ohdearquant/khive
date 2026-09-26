@@ -726,7 +726,7 @@ impl SubstrateCoordinator {
                         unreachable!("a pending future never resolves");
                     }
                     runtime
-                        .search_notes_outcome(
+                        .search_notes_outcome_with_text_mode(
                             &token,
                             request.query(),
                             search_limit,
@@ -734,6 +734,7 @@ impl SubstrateCoordinator {
                             include_superseded,
                             &tags_owned,
                             props_filter_owned.as_ref(),
+                            request.text_mode(),
                         )
                         .await
                 };
@@ -799,7 +800,7 @@ impl SubstrateCoordinator {
                         unreachable!("a pending future never resolves");
                     }
                     runtime
-                        .hybrid_search_outcome(
+                        .hybrid_search_outcome_with_text_mode(
                             &token,
                             request.query(),
                             search_limit,
@@ -807,6 +808,7 @@ impl SubstrateCoordinator {
                             request.entity_type(),
                             &tags_owned,
                             props_filter_owned.as_ref(),
+                            request.text_mode(),
                         )
                         .await
                 };
@@ -899,6 +901,7 @@ impl SubstrateCoordinator {
             let pf = props_filter_owned.clone();
             let tg = tags_owned.clone();
             let sl = search_limit;
+            let text_mode = request.text_mode();
             let should_fail = fail_id
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
@@ -969,7 +972,7 @@ impl SubstrateCoordinator {
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes_outcome(
+                        .search_notes_outcome_with_text_mode(
                             &token,
                             &q,
                             sl,
@@ -977,6 +980,7 @@ impl SubstrateCoordinator {
                             include_superseded,
                             &tg,
                             pf.as_ref(),
+                            text_mode,
                         )
                         .await;
                     match result {
@@ -996,7 +1000,7 @@ impl SubstrateCoordinator {
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search_outcome(
+                        .hybrid_search_outcome_with_text_mode(
                             &token,
                             &q,
                             sl,
@@ -1004,6 +1008,7 @@ impl SubstrateCoordinator {
                             et.as_deref(),
                             &tg,
                             pf.as_ref(),
+                            text_mode,
                         )
                         .await;
                     match result {

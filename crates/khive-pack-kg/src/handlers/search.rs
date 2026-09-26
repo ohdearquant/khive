@@ -16,7 +16,7 @@ use khive_runtime::{
     SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
-use khive_storage::types::PageRequest;
+use khive_storage::types::{PageRequest, TextQueryMode};
 use khive_storage::EntityFilter;
 
 use super::common::{
@@ -113,6 +113,7 @@ struct EntityMeta {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedSearchRequest {
     query: String,
+    text_mode: TextQueryMode,
     limit: u32,
     substrate: SearchSubstrate,
     kind_filter: Option<String>,
@@ -140,6 +141,15 @@ impl ValidatedSearchRequest {
             "min_score"
         };
         let p: SearchParams = deser(params)?;
+        let text_mode = match p.text_mode.as_deref() {
+            None | Some("all_terms") => TextQueryMode::Plain,
+            Some("any_term") => TextQueryMode::AnyTerm,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "text_mode must be one of: all_terms, any_term".to_string(),
+                ));
+            }
+        };
         super::common::require_object_param(p.properties.as_ref(), "properties")?;
         let kind_raw = p
             .kind
@@ -222,6 +232,7 @@ impl ValidatedSearchRequest {
                 )?;
                 Ok(Self {
                     query: p.query,
+                    text_mode,
                     limit,
                     substrate: SearchSubstrate::Entity,
                     kind_filter,
@@ -254,6 +265,7 @@ impl ValidatedSearchRequest {
                 )?;
                 Ok(Self {
                     query: p.query,
+                    text_mode,
                     limit,
                     substrate: SearchSubstrate::Note,
                     kind_filter,
@@ -285,6 +297,20 @@ impl ValidatedSearchRequest {
     /// Free-text query supplied by the caller.
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Lexical matching mode for the text arm.
+    pub fn text_mode(&self) -> TextQueryMode {
+        self.text_mode.clone()
+    }
+
+    /// Public spelling reported with text-arm participation.
+    pub fn text_mode_name(&self) -> &'static str {
+        match &self.text_mode {
+            TextQueryMode::Plain => "all_terms",
+            TextQueryMode::AnyTerm => "any_term",
+            TextQueryMode::Phrase => "phrase",
+        }
     }
 
     /// Caller limit after applying the public cap of 100.
@@ -394,7 +420,7 @@ impl KgPack {
                 let source_filter = request.source();
                 let mut hits = self
                     .runtime
-                    .hybrid_search(
+                    .hybrid_search_with_text_mode(
                         token,
                         request.query(),
                         None,
@@ -403,6 +429,7 @@ impl KgPack {
                         request.entity_type(),
                         tag_filter.unwrap_or(&[]),
                         props_filter,
+                        request.text_mode(),
                     )
                     .await?;
                 hits.retain(|hit| hit.score >= request.min_rank_score());
@@ -534,7 +561,7 @@ impl KgPack {
                 let source_filter = request.source();
                 let mut hits = self
                     .runtime
-                    .search_notes(
+                    .search_notes_with_text_mode(
                         token,
                         request.query(),
                         None,
@@ -543,6 +570,7 @@ impl KgPack {
                         request.include_superseded(),
                         tag_filter.unwrap_or(&[]),
                         props_filter,
+                        request.text_mode(),
                     )
                     .await?;
                 hits.retain(|hit| hit.score >= request.min_rank_score());

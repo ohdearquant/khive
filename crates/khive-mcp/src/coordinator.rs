@@ -857,7 +857,7 @@ pub(crate) mod tests {
             assert_eq!(
                 search["arm_participation"],
                 json!({
-                    "text": {"status": "error", "candidate_count": expected_text_candidates},
+                    "text": {"mode": "all_terms", "status": "error", "candidate_count": expected_text_candidates},
                     "vector": {"status": "error", "candidate_count": 1}
                 }),
                 "selected arms must remain typed on partial-with-hit responses"
@@ -908,6 +908,7 @@ pub(crate) mod tests {
             search["arm_participation"],
             json!({
                 "text": {
+                    "mode": "all_terms",
                     "status": "ran",
                     "candidate_count": 0,
                     "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
@@ -918,6 +919,84 @@ pub(crate) mod tests {
         assert!(search.get("partial").is_none());
         assert!(search.get("missing_backends").is_none());
         assert!(search.get("backend_errors").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn coordinated_search_reports_effective_any_term_mode_for_both_substrates() {
+        for kind in ["entity", "note"] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::empty_multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(
+                        r#"search(kind="{kind}", query="nothing matches", text_mode="any_term")"#
+                    ),
+                    ..Default::default()
+                })
+                .await
+                .expect("coordinated search dispatch");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let entry = &response["results"][0];
+            assert_eq!(entry["ok"], true, "{kind}: {entry}");
+            assert_eq!(entry["arm_participation"]["text"]["mode"], "any_term");
+            assert_eq!(
+                entry["arm_participation"]["text"]["reason"],
+                "No text candidate survived matching, filtering, fusion, and the result limit."
+            );
+            assert_eq!(
+                coord
+                    .last_search_request
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("validated request")
+                    .text_mode_name(),
+                "any_term"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn coordinated_any_term_mode_survives_partial_and_incomplete_results() {
+        for (kind, partial) in [("entity", true), ("entity", false), ("note", false)] {
+            let (registry, _runtime) = make_registry();
+            let coord = if partial {
+                MockCoordinator::degraded_multi_backend("archive")
+            } else {
+                MockCoordinator::degraded_empty_multi_backend("archive")
+            };
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(
+                        r#"search(kind="{kind}", query="nothing matches", text_mode="any_term")"#
+                    ),
+                    ..Default::default()
+                })
+                .await
+                .expect("coordinated search dispatch");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let entry = &response["results"][0];
+            let arms = if partial {
+                assert_eq!(entry["ok"], true, "{kind}: {entry}");
+                assert_eq!(entry["status"], "partial");
+                &entry["arm_participation"]
+            } else {
+                assert_eq!(entry["ok"], false, "{kind}: {entry}");
+                assert_eq!(entry["error"]["kind"], "search_incomplete");
+                &entry["error"]["arm_participation"]
+            };
+            assert_eq!(arms["text"]["mode"], "any_term");
+            assert_eq!(arms["text"]["status"], "error");
+            assert!(arms["text"].get("reason").is_none());
+            assert!(arms.get("vector").is_some());
+            assert_eq!(arms.as_object().expect("arm object").len(), 2);
+        }
     }
 
     /// A vector-arm-only failure (the text arm still ran and contributed a
@@ -1019,7 +1098,7 @@ pub(crate) mod tests {
         assert_eq!(
             search["error"]["arm_participation"],
             json!({
-                "text": {"status": "error", "candidate_count": 0},
+                "text": {"mode": "all_terms", "status": "error", "candidate_count": 0},
                 "vector": {"status": "error", "candidate_count": 0}
             })
         );
@@ -1285,7 +1364,7 @@ pub(crate) mod tests {
             );
             let expected_text_candidates = usize::from(kind == "entity");
             let mut expected_participation = json!({
-                "text": {"status": "ran", "candidate_count": expected_text_candidates},
+                "text": {"mode": "all_terms", "status": "ran", "candidate_count": expected_text_candidates},
                 "vector": {"status": "ran", "candidate_count": 1}
             });
             if kind == "note" {
