@@ -8,6 +8,16 @@ An ADR merges in whatever state its ratification had reached at merge time; the 
 
 A `Proposed` ADR becomes `accepted` only through an explicit ratification event, recorded by a dedicated status-flip PR. That PR's body must name three things: the immutable ratifying artifact with its event type and ISO timestamp; the 40-hex SHA of the commit containing the final ratified ADR text, with that commit's landing timestamp; and the explicit comparison `ratified_at > final_text_merged_at`. A sign-off issued against an earlier revision, followed by further edits, cannot be cited for the flip. The postdating requirement governs the flip itself: an amendment landing on an already-`accepted` ADR does not reset its status — an amendment is its own decision change and carries its own review. This rule applies prospectively from its adoption; status records that predate it stand as written. Contract-level ADRs scoped to one subsystem may be ratified by maintainer design review; cross-cutting or strategic ADRs require a project-owner decision. A conformant implementation landing is the usual trigger for seeking ratification.
 
+Each `ADR-*.md` file declares exactly one status in its header, and `scripts/lint-adr-status.py` requires that value to begin with a known lifecycle word, compared without regard to case. The records use five:
+
+- `accepted`: the decision is in force.
+- `Proposed`: awaiting ratification, as described above.
+- `draft`: an early record that has not yet been put forward as a proposal.
+- `superseded`: replaced by a later decision. The record stays as history, and its header gives the date and, where recorded, the replacing record.
+- `withdrawn`: retracted without taking effect, including numbers retired without a decision.
+
+The lint also admits `rejected`, `deprecated` and `implemented`; no record uses them at present. An amendment states its own status inside its own section, below the header. That status is independent of the record's header status, and the amendments whose status is Proposed are listed under [Proposed amendments](#proposed-amendments).
+
 The same head-binding governs review: a verdict authorizes only the exact commit it names. A sibling catalog-row merge does not move an open PR's branch head, but it does change the base underneath it and therefore the merge result that would land — so a verdict taken at the old head no longer covers what merging would produce. Catalog-touching PRs therefore serialize: after a sibling row lands, bring the branch up to the current base, take one narrow review at the resulting final head, and merge before the next catalog row lands.
 
 ## ADR catalog
@@ -215,6 +225,17 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 
 <!-- END GENERATED ADR CATALOG -->
 
+## Amendment files and supporting documents
+
+Most amendments are appended to the record they amend. Two ADR-088 amendments are separate files:
+
+- [ADR-088 Amendment 1](ADR-088-amendment-1-git-digest.md): `git.digest`, the agent-facing digest verb with remote-URL support (accepted).
+- [ADR-088 Amendment 2](ADR-088-amendment-2-anchor-identity.md): canonical repo-anchor identity for `git.digest` (accepted 2026-09-25).
+
+Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no ADR number and no status, and are not listed in the catalog:
+
+- [D5 join feasibility exhibit](D5-JOIN-FEASIBILITY.md): the history-to-structure join measurement behind [ADR-147](ADR-147-repo-showcase-bundle.md) decision D5, taken against the repository at commit `c2979d24`.
+
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
@@ -239,4 +260,33 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 
 ## Proposed amendments
 
-None at present. ADR-179 Amendment 1 (message-pair identity) was accepted on 2026-09-09.
+Amendments whose own status reads Proposed. Each needs the sign-off described under [ADR lifecycle](#adr-lifecycle) before it binds. Where this list and an amendment's own status line disagree, the status line is authoritative.
+
+Amendments to accepted records:
+
+- [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
+- [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
+- [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
+- [ADR-023](ADR-023-declarative-pack-format.md#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14) (2026-09-14): resolve fallback-limit disclosure.
+- [ADR-026 Amendment 4](ADR-026-rust-binary-packaging.md#amendment-4-2026-09-12-two-different-webassembly-questions-separated) (2026-09-12): two different WebAssembly questions, separated.
+- [ADR-027 Amendment 4](ADR-027-dynamic-pack-loading.md#amendment-4-2026-09-12-installable-pack-distributions-and-what-stays-rejected) (2026-09-12): installable pack distributions, and what stays rejected.
+- [ADR-028 Amendment A3](ADR-028-pack-scoped-backends.md#amendment-a3-backend-route-validation-and-search-runtime-selection-2026-09-14) (2026-09-14): backend route validation and search runtime selection.
+- [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14) (2026-09-14): inbox and thread limit disclosure.
+- [ADR-051 Amendment 1](ADR-051-section-embeddings-hybrid-compose.md#amendment-1-blend-kg-entities-into-the-compose-candidate-pool): blend KG entities into the compose candidate pool.
+- [ADR-061 Amendment 1](ADR-061-pack-extensible-by-id-resolution.md#amendment-1-unsupported-generic-mutation-of-pack-private-records) (2026-09-14): unsupported generic mutation of pack-private records.
+- [ADR-087 Amendment 1](ADR-087-workspace-mirror.md#amendment-1-2026-07-15-self-standing-content-convention-blob-backed-binaries-durability-separation) (2026-07-15): self-standing content convention, blob-backed binaries, durability separation.
+- [ADR-088 Amendment 1, operational rider](ADR-088-amendment-1-git-digest.md#proposed-operational-rider-persisted-cursor-inspection-2026-09-10) (2026-09-10): persisted cursor inspection. Its heading marks it Proposed; it has no separate status line.
+- [ADR-103 Amendment 4](ADR-103-resource-attribution-model.md#amendment-4-2026-09-01-extending-the-admission-degrade-allowlist-to-operational-read-verbs) (2026-09-01): extending the admission-degrade allowlist to operational read verbs.
+- [ADR-104 Amendment 1](ADR-104-posterior-serving-recall.md#amendment-1-2026-07-12-prior-preserving-evidence-decay-for-per-entity-posteriors) (2026-07-12): prior-preserving evidence decay for per-entity posteriors.
+- [ADR-105 Appendix A](ADR-105-cross-node-comm-transport.md#appendix-a-2026-09-23----node-wire-protocol-version-1) (2026-09-23): node wire protocol, version 1, proposed as part of the 2026-09-14 amendment.
+- [ADR-119 Amendment 6](ADR-119-daemon-component-supervision.md#amendment-6-cancellation-during-inbound-transport-reads-2026-09-14) (2026-09-14): cancellation during inbound transport reads.
+- [ADR-121 Amendment 1](ADR-121-attachments-first-class.md#amendment-1-2026-09-25-the-orphan-sweep-runs-on-a-schedule-and-on-demand) (2026-09-25): the orphan sweep runs on a schedule and on demand.
+- [ADR-130 Amendment 5](ADR-130-search-response-completeness-and-ranking-evidence.md#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14) (2026-09-14): search limit disclosure at the MCP operation boundary.
+- [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
+- [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.
+
+Amendments inside records whose own status is Proposed:
+
+- [ADR-133 Amendment 2](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-2-2026-09-01-extending-amendment-1s-verb-set-to-operational-reads) (2026-09-01) and [Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
+- [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
+- [ADR-172 Amendment 2](ADR-172-versioned-notes-compare-and-set.md#amendment-2-2026-09-08-a-head-note-kind-for-keyed-documents-the-document-kind-as-a-tag-embed-and-the-in-transaction-arm) (2026-09-08), [Amendment 3](ADR-172-versioned-notes-compare-and-set.md#amendment-3-2026-09-09-ordered-fence-lists) (2026-09-09), [Amendment 4](ADR-172-versioned-notes-compare-and-set.md#amendment-4-2026-09-11-absence-as-a-fence-predicate) (2026-09-11) and [Amendment 5](ADR-172-versioned-notes-compare-and-set.md#amendment-5-2026-09-14-an-accepted-fenced-write-always-mints-a-version-the-no-op-answer-is-for-unfenced-updates-only) (2026-09-14).

@@ -374,7 +374,7 @@ The author fills in `handlers.rs`. Everything else is generated boilerplate.
 read and modify the result directly; rust-analyzer works without expansion magic;
 debugging shows real call stacks, not macro-expanded ones.
 
-The canonical reference impl is `crates/khive-pack-kg/{lib.rs, vocab.rs, handlers.rs}`.
+The canonical reference impl is `crates/khive-pack-kg/src/{lib.rs, vocab.rs, handlers/}`.
 New pack authors should read it first.
 
 ### 9. Discovery and registration

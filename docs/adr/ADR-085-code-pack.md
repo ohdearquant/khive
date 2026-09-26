@@ -1659,3 +1659,125 @@ Acceptance:
    different evidence kinds; the final metadata contains both additions and its revision advances.
 3. Conditional entity insertion and edge insertion (including a natural-key collision) leave the
    first inserted row untouched when a competing insert loses.
+
+## Amendment 9 (2026-09-25): explicit map targets and the complete production deny set
+
+**Status**: Accepted (2026-09-25).
+
+### Context
+
+Two passages of this record disagree about whether `code.ingest` may create an explicit target, and
+the check that enforces "dedicated map databases only" is narrower than that rule.
+
+- B7, second paragraph (added with #3056, which closed #1793): "An explicit `db` must resolve to an
+  existing regular file before the handler constructs its target runtime. A pre-created empty
+  dedicated file may initialize and migrate; omitting `db` retains automatic creation of
+  `<path>/.khive/code-map.db`."
+- E7, the paragraph after its numbered sequence (written before #3056): "The existence check (step 2)
+  is analysis-only: `code.ingest` remains create-capable and never requires its target to
+  pre-exist".
+
+The code follows B7. `resolve_target_db` in `crates/khive-pack-code/src/db_target.rs` refuses an
+explicit target that is not an existing regular file, and `crates/khive-pack-code/src/handlers.rs`
+constructs the target runtime only after it passes. The only create path left is the omitted-`db`
+default. The repository build in `crates/kkernel/src/repo.rs` depends on this: it creates the empty
+map file itself (`File::create_new`) immediately before calling `code.ingest` with an explicit `db`.
+
+B7 says `db` "selects among dedicated map databases only". The check behind it is a deny list of two
+entries: `resolve_target_db` refuses the default production anchor (`resolve_db_anchor(None)`) and
+the calling runtime's configured database (its `db_path`, or `KHIVE_DB` when that is unresolved),
+compared by normalized path. Every other existing regular file is accepted. That includes the events
+database a file-backed deployment keeps beside its main database
+(`khive_runtime::events_split::events_db_path_beside`, `<main>.events.db`, wired in
+`crates/khive-mcp/src/serve.rs`) and the file of any other declared `[[backends]]` entry. An accepted
+target is opened with the general runtime constructor, which runs main-store migrations on it and
+writes map rows into it (#3298).
+
+E7 names the set its identity checks compare against as "the production database's own main file,
+plus whichever of its `-journal`, `-wal`, and `-shm` companions presently exist". Neither the events
+database nor declared backends are in it. At this revision the analysis verbs of Amendment 4 and
+E7's open-time wrapper are not implemented (`CodePack::dispatch` in
+`crates/khive-pack-code/src/pack.rs` routes only `code.ingest`), so the target preflight is the
+fence in force; #1855 tracks open-time identity enforcement.
+
+### Decision
+
+1. **An explicit target must exist; only the default is created.** B7's preflight governs
+   `code.ingest`. An explicit `db` must name an existing regular file, and an empty file initializes
+   and migrates. Omitting `db` is the only way `code.ingest` creates a database, at
+   `<path>/.khive/code-map.db`. E7's sentence that `code.ingest` "remains create-capable and never
+   requires its target to pre-exist" is superseded for explicit targets and holds only for that
+   default. The rest of E7's paragraph stands: `code.ingest` opens its target through the general,
+   create-capable constructor for its own writes, and only the analysis verbs are held to the
+   read-only constructor class.
+
+2. **The deny set is every store the process knows as production.** A `code.ingest` target, explicit
+   or default, and an analysis verb's `db` are refused before any open when they identify a member
+   of this set:
+   - the default production database anchor;
+   - the calling runtime's configured database, or `KHIVE_DB` when the configured path is
+     unresolved;
+   - the file of every `[[backends]]` entry in the process's loaded configuration;
+   - the events database beside each of the above (`events_db_path_beside`), whether or not the
+     events split is enabled in this process, because a file left by an earlier run is still that
+     store's event plane;
+   - the `-journal`, `-wal` and `-shm` companions of every member.
+
+   This set replaces E7's "production identity set" wherever E7 uses that term.
+
+3. **Membership is decided by file identity.** When the target and a member both exist, the target's
+   (device, inode) is compared with the member's, so a hard link under an unrelated name is caught as
+   well as a symlink or a relative spelling. When either does not exist yet, the existing
+   normalized-path comparison applies. The refusal names the member it matched and leaves that file's
+   bytes unchanged.
+
+4. **No map marker.** The target rule stays a deny rule over known stores. This amendment neither
+   requires nor writes a marker that identifies a database as a code map.
+
+Acceptance, stated before any implementation runs:
+
+1. An explicit `db` naming a missing path is refused and creates nothing; an explicit `db` naming an
+   existing empty file ingests (the existing B7 arms, unchanged).
+2. An explicit `db` naming the events database beside the runtime's main database is refused, the
+   error names that file, and its size and modification time are unchanged afterwards.
+3. An explicit `db` naming the file of a declared non-main backend is refused in the same way.
+4. A hard link to the runtime's main database under an unrelated name is refused. Control: a byte
+   copy of the same file at a new inode is accepted, so the arm tests identity rather than content.
+5. A populated map written by an earlier `code.ingest` is still accepted as an explicit target.
+
+### Alternatives considered
+
+- **Accept only databases carrying a code-map marker** (the rule #3298 suggests). A marker row
+  written when a map is created, and a refusal of any file without one. It breaks three things this
+  record or its callers rely on. B7's empty-file rule: an empty file carries no marker, so it needs a
+  carve-out that stamps on first use. The repository build, which pre-creates an empty map. And every
+  populated map written before the marker existed: `CodePack::schema_plan` declares no statements and
+  the handler opens a map with the general constructor over the `kg` and `code` packs, so a map has
+  no table or column that another khive database lacks and cannot be recognised after the fact.
+  Admitting those maps needs an adoption rule, and "stamp an unmarked file that passes the deny set"
+  is the current rule under another name. What a marker adds is protection against khive databases
+  this process does not know about, which is the residual named under Consequences; it can be taken
+  up as its own amendment.
+- **Write a marker now and enforce it later.** It adds a write and a stored field whose only reader
+  would be a future amendment, and nothing checks it in the meantime.
+- **Keep E7's create-capable sentence and remove B7's preflight.** It reinstates #1793: a typo in
+  `db` creates and migrates a fresh database at the wrong path. The repository build and the target
+  preflight tests already depend on the refusal.
+
+### Consequences
+
+- The disagreement between B7 and E7 is resolved in B7's favour, which is what the code does.
+- `resolve_target_db` needs every declared backend file and events database path. The code pack's
+  handler holds only its own runtime configuration (`RuntimeConfig::db_path` and `events_split`);
+  declared backends live in the loaded engine configuration, so the host has to pass that list to the
+  handler.
+- A process that serves a map as one of its own declared backends can no longer ingest into it; the
+  ingest runs from a process that does not serve that map. B7's documented read path, a dedicated
+  configuration whose `main` is the map, is already refused as an ingest target by the existing
+  runtime-database rule.
+- Residual, stated so it is not read as closed: a khive database this process does not know about,
+  such as another deployment's main database on the same host, is still accepted as an explicit
+  target. The preflight protects against typos and known stores, as B7 already says of it; it is not
+  an allow-list.
+
+Refs: #3298, #1855, #1793, #3056.
