@@ -763,6 +763,15 @@ mod tests {
         assert_eq!(envs[0].from, "email:maintainer@example.com");
     }
 
+    #[test]
+    fn spaced_auth_results_passes_attribution_gate() {
+        let mut email = make_email("user@example.com", "imap:test:1:7");
+        email.authentication_results =
+            vec!["mx.example.com; dmarc = pass header . from = example.com".to_string()];
+        let channel = build_channel("user@example.com", vec![]);
+        assert_eq!(channel.evaluate_auth(&email), Ok(()));
+    }
+
     #[tokio::test]
     async fn poll_extracts_wire_message_id_from_headers() {
         let mut email = make_email("maintainer@example.com", "imap:test:0:1");

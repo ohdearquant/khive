@@ -212,6 +212,50 @@ fn split_top_level_ws(segment: &str) -> Vec<String> {
     tokens
 }
 
+/// RFC 8601 permits CFWS on either side of `=` and of the dot in a
+/// `ptype.property` name. Comments were removed by the segment scanner;
+/// remove only adjacent whitespace here, retaining quoted pvalues byte for
+/// byte and leaving other whitespace for `split_top_level_ws` to tokenize.
+fn normalize_delimiter_cfws(segment: &str) -> String {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut normalized = String::with_capacity(segment.len());
+    let mut in_quotes = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if in_quotes {
+            normalized.push(current);
+            if current == '\\' {
+                if let Some(escaped) = chars.get(index + 1) {
+                    normalized.push(*escaped);
+                    index += 1;
+                }
+            } else if current == '"' {
+                in_quotes = false;
+            }
+        } else if current == '"' {
+            in_quotes = true;
+            normalized.push(current);
+        } else if current.is_whitespace() {
+            let start = index;
+            while index + 1 < chars.len() && chars[index + 1].is_whitespace() {
+                index += 1;
+            }
+            let next = chars.get(index + 1).copied();
+            let adjacent_to_delimiter =
+                matches!(normalized.as_bytes().last().copied(), Some(b'=' | b'.'))
+                    || matches!(next, Some('=' | '.'));
+            if !adjacent_to_delimiter {
+                normalized.extend(chars[start..=index].iter().copied());
+            }
+        } else {
+            normalized.push(current);
+        }
+        index += 1;
+    }
+    normalized
+}
+
 /// True if `target` occurs in `token` outside a quoted-string span (same
 /// quoted-pair semantics as [`split_top_level_ws`]) -- unlike `str::contains`,
 /// distinguishes a quoted `=` from an unquoted one. See
@@ -250,7 +294,9 @@ fn contains_unquoted(token: &str, target: char) -> bool {
 /// extracted at all -- see crates/khive-channel-email/docs/api/auth-results.md#parse_header
 /// for the full shape-detection contract and the empty-vs-zero-signal distinction.
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
-    let mut all_segments = split_top_level_segments(raw).into_iter();
+    let mut all_segments = split_top_level_segments(raw)
+        .into_iter()
+        .map(|segment| normalize_delimiter_cfws(&segment));
     let first_segment = all_segments.next()?;
     let first_token = split_top_level_ws(&first_segment).into_iter().next()?;
 
@@ -388,6 +434,33 @@ mod tests {
         let parsed = parse_header("mx.example.com; dmarc=pass header.from=example.com").unwrap();
         assert_eq!(parsed.authserv_id.as_deref(), Some("mx.example.com"));
         assert!(parsed.dmarc_pass());
+    }
+
+    #[test]
+    fn spaced_method_and_property_delimiters_preserve_alignment() {
+        let parsed = parse_header(
+            r#"mx.example.net; dmarc = pass header . from = example.com reason = "a = b""#,
+        )
+        .unwrap();
+        assert_eq!(parsed.authserv_id.as_deref(), Some("mx.example.net"));
+        assert_eq!(parsed.dmarc.len(), 1);
+        assert_eq!(parsed.dmarc[0].result, "pass");
+        assert_eq!(
+            parsed.dmarc[0].props.get("header.from").map(String::as_str),
+            Some("example.com")
+        );
+        assert_eq!(
+            parsed.dmarc[0].props.get("reason").map(String::as_str),
+            Some(r#""a = b""#)
+        );
+        assert!(parsed.dmarc_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn spaced_first_method_still_has_no_authserv_id() {
+        let parsed = parse_header("dmarc = pass header.from = example.com").unwrap();
+        assert_eq!(parsed.authserv_id, None);
+        assert!(parsed.dmarc_pass_aligned("example.com"));
     }
 
     #[test]
