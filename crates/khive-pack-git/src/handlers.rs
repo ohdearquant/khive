@@ -40,6 +40,27 @@ fn digest_failure_to_runtime(e: anyhow::Error) -> RuntimeError {
     }
 }
 
+fn duplicate_anchor_warning(selected: Uuid, duplicates: &[Uuid]) -> Option<String> {
+    (!duplicates.is_empty()).then(|| {
+        format!(
+            "multiple live project anchors resolve to the same repo identity; selected {} by canonical resolution order; duplicate or conflicting anchors: {}",
+            selected,
+            duplicates
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+fn log_duplicate_anchor_warning(error: RuntimeError, warning: Option<&str>) -> RuntimeError {
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    error
+}
+
 fn remote_cache_error(remote: &str, stage: &str, error: CacheError) -> RuntimeError {
     RuntimeError::RemoteFetchError {
         remote: redact_repo_url(remote),
@@ -242,6 +263,8 @@ impl GitPack {
         let project_id = resolution.id;
         let project_created = resolution.created;
 
+        let duplicate_warning = duplicate_anchor_warning(project_id, &resolution.slug_duplicates);
+
         let opts = IngestOptions {
             repo: repo_path,
             expected_github_repo,
@@ -271,19 +294,15 @@ impl GitPack {
                 run_remote_api_ingest(self.runtime(), token, registry, opts).await
             }
         }
-        .map_err(digest_failure_to_runtime)?;
+        .map_err(|error| {
+            log_duplicate_anchor_warning(
+                digest_failure_to_runtime(error),
+                duplicate_warning.as_deref(),
+            )
+        })?;
 
-        if !resolution.slug_duplicates.is_empty() {
-            report.warnings.push(format!(
-                "multiple live project anchors resolve to the same repo identity; selected {} by canonical resolution order; duplicate or conflicting anchors: {}",
-                project_id,
-                resolution
-                    .slug_duplicates
-                    .iter()
-                    .map(Uuid::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        if let Some(warning) = duplicate_warning {
+            report.warnings.push(warning);
         }
         report.project_id = Some(project_id.to_string());
         report.project_created = project_created;
@@ -804,7 +823,11 @@ async fn find_orphaned_anchor(
     // Newest-deleted-first across both sources: the signal below fires for
     // the first matching tombstone (newest first) that still has a live
     // annotating corpus, per the doc comment above.
-    dead_projects.sort_by_key(|(_, deleted_at)| std::cmp::Reverse(*deleted_at));
+    dead_projects.sort_by(|(left_id, left_deleted_at), (right_id, right_deleted_at)| {
+        right_deleted_at
+            .cmp(left_deleted_at)
+            .then_with(|| left_id.cmp(right_id))
+    });
     let dead_project_ids = dead_projects.into_iter().map(|(id, _)| id);
 
     for dead_project_id in dead_project_ids {
@@ -836,9 +859,58 @@ async fn find_orphaned_anchor(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use khive_runtime::{Namespace, VerbRegistryBuilder};
+    use tracing::field::{Field, Visit};
 
     use super::*;
+
+    #[derive(Default)]
+    struct WarningVisitor(Option<String>);
+
+    impl Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+        }
+    }
+
+    struct WarningCapture {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarningCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = WarningVisitor::default();
+                event.record(&mut visitor);
+                if let Some(message) = visitor.0 {
+                    self.messages
+                        .lock()
+                        .expect("warning capture lock")
+                        .push(message);
+                }
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
         let rt = KhiveRuntime::memory().expect("memory runtime");
@@ -882,6 +954,72 @@ mod tests {
             .await
             .expect("create note ok");
         Uuid::parse_str(resp["id"].as_str().expect("id present")).expect("id is uuid")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn explicit_project_resolves_across_namespaces_derived_does_not() {
+        let (rt, local, registry) = fixture().await;
+        let foreign = rt
+            .authorize(Namespace::parse("foreign").expect("foreign namespace"))
+            .expect("authorize foreign");
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin_and_one_commit(dir.path(), "https://github.com/org/foreign-anchor");
+        let source = dir.path().to_string_lossy().to_string();
+
+        let anchor = crate::dispatch_from_token(
+            &registry,
+            &foreign,
+            "create",
+            json!({
+                "kind": "project",
+                "name": "foreign-anchor",
+                "properties": {
+                    "repo_url": "https://github.com/org/foreign-anchor",
+                    "repo_slug": "github.com/org/foreign-anchor",
+                },
+            }),
+        )
+        .await
+        .expect("create foreign anchor");
+        let foreign_id =
+            Uuid::parse_str(anchor["id"].as_str().expect("anchor id")).expect("anchor uuid");
+
+        for project in [
+            foreign_id.to_string(),
+            foreign_id.simple().to_string()[..8].to_string(),
+        ] {
+            let explicit = crate::dispatch_from_token(
+                &registry,
+                &local,
+                "git.digest",
+                json!({ "source": source.clone(), "project": project, "include": [] }),
+            )
+            .await
+            .expect("explicit foreign anchor resolves");
+            assert_eq!(explicit["project_id"], json!(foreign_id.to_string()));
+            assert_eq!(explicit["project_created"], json!(false));
+        }
+
+        let derived = crate::dispatch_from_token(
+            &registry,
+            &local,
+            "git.digest",
+            json!({ "source": source, "include": [] }),
+        )
+        .await
+        .expect("derive local anchor");
+        assert_eq!(derived["project_created"], json!(true), "{derived}");
+        assert_ne!(derived["project_id"], json!(foreign_id.to_string()));
+        assert_eq!(
+            find_projects_by_slug(&rt, &local, "github.com/org/foreign-anchor")
+                .await
+                .expect("local slug lookup"),
+            vec![
+                Uuid::parse_str(derived["project_id"].as_str().expect("project id"))
+                    .expect("project uuid")
+            ],
+        );
     }
 
     /// Regression for the 505-dup incident shape (issue #1173): a repo
@@ -1078,6 +1216,121 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(config_ledger)]
+    async fn ingest_failure_still_reports_duplicate_anchors() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git init");
+        assert!(init.success());
+        let source = dir.path().to_string_lossy().to_string();
+
+        for _ in 0..2 {
+            registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "project",
+                        "name": "duplicate-anchor",
+                        "properties": { "repo_url": source.clone() },
+                    }),
+                )
+                .await
+                .expect("create legacy anchor");
+        }
+        let ids = find_projects_by_legacy_repo_url(&rt, &token, &source)
+            .await
+            .expect("legacy anchors");
+        assert_eq!(ids.len(), 2);
+
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(WarningCapture {
+            messages: Arc::clone(&warnings),
+        });
+        let error = registry
+            .dispatch(
+                "git.digest",
+                json!({ "source": source, "include": ["commits"] }),
+            )
+            .await
+            .expect_err("zero-commit repository has no HEAD to ingest");
+        let message = match error {
+            RuntimeError::InvalidInput(message) => message,
+            other => panic!("ingest error kind must be preserved: {other:?}"),
+        };
+        assert_eq!(message, "could not resolve commit snapshot HEAD");
+        let warning = duplicate_anchor_warning(ids[0], &ids[1..]).expect("warning");
+        {
+            let captured = warnings.lock().expect("warning capture lock");
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter(|message| *message == &warning)
+                    .count(),
+                1,
+                "expected one duplicate-anchor WARN, captured: {captured:?}"
+            );
+        }
+
+        let selected = rt
+            .get_entity(&token, ids[0])
+            .await
+            .expect("selected anchor survives failed ingest");
+        assert!(
+            selected
+                .properties
+                .as_ref()
+                .and_then(|props| props.get("repo_slug"))
+                .and_then(Value::as_str)
+                .is_some(),
+            "resolution backfilled the selected anchor before ingest failed"
+        );
+    }
+
+    #[test]
+    fn duplicate_warning_keeps_storage_error_subtype_and_retryability() {
+        let selected = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let duplicate = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let warning = duplicate_anchor_warning(selected, &[duplicate]).expect("warning");
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(WarningCapture {
+            messages: Arc::clone(&warnings),
+        });
+
+        let original = RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation: "git digest read".into(),
+            timeout_ms: 42,
+            pool_identity: Some("test-pool".into()),
+        });
+        let original_message = original.to_string();
+        let returned = log_duplicate_anchor_warning(original, Some(&warning));
+        assert_eq!(returned.to_string(), original_message);
+        match returned {
+            RuntimeError::Storage(source) => {
+                assert!(source.is_retryable());
+                let khive_storage::StorageError::AdmissionTimeout {
+                    operation,
+                    timeout_ms,
+                    pool_identity,
+                } = source
+                else {
+                    panic!("storage subtype changed");
+                };
+                assert_eq!(operation.as_ref(), "git digest read");
+                assert_eq!(timeout_ms, 42);
+                assert_eq!(pool_identity.as_deref(), Some("test-pool"));
+            }
+            other => panic!("storage subtype changed: {other:?}"),
+        }
+        let captured = warnings.lock().expect("warning capture lock");
+        assert_eq!(captured.as_slice(), &[warning]);
+    }
+
     /// A hard-deleted-vs-soft-deleted anchor whose corpus is still
     /// `annotates`-linked surfaces a distinct, non-silent signal instead of
     /// quietly minting a fresh anchor over an orphaned corpus (issue #1173
@@ -1245,6 +1498,69 @@ mod tests {
             orphan.dead_project_id, old_dead_id,
             "signal must point at the tombstone with the live corpus, not merely the most recent one"
         );
+        assert_eq!(orphan.annotated_note_count, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn orphan_tombstone_tie_breaks_by_id() {
+        let (rt, token, registry) = fixture().await;
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/tied-tombstones".to_string(),
+            gh_slug: Some(("org".to_string(), "tied-tombstones".to_string())),
+        };
+        let larger_id = Uuid::parse_str("ffffffff-ffff-4fff-8fff-fffffffffff0").unwrap();
+        let smaller_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+
+        let mut larger = khive_storage::Entity::new("local", "project", "tied-tombstones")
+            .with_properties(json!({
+                "repo_url": "https://github.com/org/tied-tombstones",
+                "repo_slug": "github.com/org/tied-tombstones",
+            }));
+        larger.id = larger_id;
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(larger.clone())
+            .await
+            .expect("insert larger anchor first");
+
+        let mut smaller = khive_storage::Entity::new("local", "project", "tied-tombstones")
+            .with_properties(json!({
+                "repo_url": "https://github.com/org/tied-tombstones.git",
+                "repo_slug": "legacy/tied-tombstones",
+            }));
+        smaller.id = smaller_id;
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(smaller.clone())
+            .await
+            .expect("insert smaller anchor second");
+
+        create_note_annotating(&registry, "issue", "larger anchor note", larger_id).await;
+        create_note_annotating(&registry, "pull_request", "smaller anchor note", smaller_id).await;
+
+        let deleted_at = larger.created_at.max(smaller.created_at) + 1;
+        larger.deleted_at = Some(deleted_at);
+        smaller.deleted_at = Some(deleted_at);
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(larger)
+            .await
+            .expect("tombstone larger anchor");
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(smaller)
+            .await
+            .expect("tombstone smaller anchor");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve orphaned anchors");
+        assert!(resolution.created);
+        let orphan = resolution
+            .orphan
+            .expect("live corpus raises an orphan signal");
+        assert_eq!(orphan.dead_project_id, smaller_id);
         assert_eq!(orphan.annotated_note_count, 1);
     }
 
