@@ -152,7 +152,7 @@ web_verbs! {
         namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
                               authorized token namespace, never elevates capability.", NotApplicable);
         #[serde(default)]
-        link_limit: Option<u32> => (4, "Maximum number of unique href targets to process for links on this page. \
+        link_limit: Option<u32> => (4, "Maximum number of targets to process across links, sitemap, and feed on this document. \
                               Defaults to 100 and cannot exceed 1,000.", NotApplicable);
     }
     IngestParams("web.ingest", "Fetch and extract over a URL, a list of URLs, or (with origin) a served \

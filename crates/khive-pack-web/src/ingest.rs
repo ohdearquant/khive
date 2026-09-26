@@ -120,6 +120,7 @@ async fn ingest_disk_before_open(
     let origin_url = Url::parse(origin)
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid origin: {error}")))?;
     let canonical_origin = identity::canonicalize(origin_url.clone());
+    let max_bytes = crate::egress::resolve_ceilings(cfg)?.max_bytes_default;
     let files = crate::confinement::open_files(cfg, Path::new(root), limit, before_open)?;
     let site_id = crate::fetch::canonical_site(runtime, token, &canonical_origin).await?;
     let mut minted = Vec::new();
@@ -129,7 +130,11 @@ async fn ingest_disk_before_open(
             .relative
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let bytes = file.read()?;
+        let bytes = tokio::task::spawn_blocking(move || file.read(max_bytes))
+            .await
+            .map_err(|error| {
+                RuntimeError::Internal(format!("web.ingest disk read worker failed: {error}"))
+            })??;
         let id = ingest_disk_file(runtime, token, &canonical_origin, &relative, bytes).await?;
         let link_limit = limit
             .saturating_sub(link_targets_processed)
@@ -138,7 +143,7 @@ async fn ingest_disk_before_open(
             .handle_extract(token, json!({ "id": id, "link_limit": link_limit }))
             .await?;
         link_targets_processed =
-            link_targets_processed.saturating_add(extracted_link_count(&extract_reply));
+            link_targets_processed.saturating_add(extracted_target_count(&extract_reply));
         minted.push(id.to_string());
     }
     Ok(json!({ "mode": "disk", "site": site_id.to_string(), "ingested": minted }))
@@ -186,11 +191,15 @@ async fn ingest_urls(
     .await
 }
 
-fn extracted_link_count(reply: &Value) -> u32 {
-    reply["result"]["links"]["edges_created"]
-        .as_u64()
-        .unwrap_or_default()
-        .min(u64::from(u32::MAX)) as u32
+fn extracted_target_count(reply: &Value) -> u32 {
+    [
+        &reply["result"]["links"]["edges_created"],
+        &reply["result"]["sitemap"]["entries"],
+        &reply["result"]["feed"]["entries"],
+    ]
+    .into_iter()
+    .map(|value| value.as_u64().unwrap_or_default().min(u64::from(u32::MAX)) as u32)
+    .fold(0u32, |total, count| total.saturating_add(count))
 }
 
 /// The crawl proper: queue, visited set, per-address fetch, applicable
@@ -214,6 +223,7 @@ where
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ingested = Vec::new();
     let mut refused: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
     let mut link_targets_processed = 0u32;
 
     while let Some((url_str, level)) = queue.pop_front() {
@@ -248,51 +258,74 @@ where
             pack.handle_extract(token, json!({ "id": id_str, "link_limit": link_limit }))
                 .await
         } else {
-            pack.handle_extract_without_links(token, json!({ "id": id_str }))
-                .await
+            pack.handle_extract_without_links(
+                token,
+                json!({ "id": id_str, "link_limit": link_limit }),
+            )
+            .await
         };
-        if should_extract_links && link_limit > 0 {
-            let accounted = extract_reply
-                .as_ref()
-                .map(extracted_link_count)
-                .unwrap_or(link_limit);
-            link_targets_processed = link_targets_processed.saturating_add(accounted);
-        }
+        let extract_reply = match extract_reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                // Extraction can have written some links before failing. Charge
+                // the full allowance so later pages cannot exceed the call budget.
+                link_targets_processed = link_targets_processed.saturating_add(link_limit);
+                failed.push(json!({ "id": id_str, "url": url_str, "stage": "extract", "error": error.to_string() }));
+                continue;
+            }
+        };
+        link_targets_processed =
+            link_targets_processed.saturating_add(extracted_target_count(&extract_reply));
         if level < depth && should_extract_links && link_limit > 0 {
-            if let Ok(extract_reply) = extract_reply {
-                let _ = extract_reply;
-                let id = Uuid::parse_str(id_str).unwrap_or_default();
-                if let Ok(neighbors) = pack
-                    .runtime
-                    .neighbors(
-                        token,
-                        id,
-                        khive_storage::Direction::Out,
-                        None,
-                        Some(vec![EdgeRelation::LinksTo]),
-                    )
-                    .await
-                {
-                    for n in neighbors {
-                        if let Ok(Some(entity)) = pack
-                            .runtime
-                            .entities(token)
-                            .unwrap()
-                            .get_entity(n.node_id)
-                            .await
-                        {
-                            if let Some(url) = entity.properties.and_then(|p| {
-                                p.get("url").and_then(|v| v.as_str().map(str::to_string))
-                            }) {
-                                queue.push_back((url, level + 1));
-                            }
+            let id = match Uuid::parse_str(id_str) {
+                Ok(id) => id,
+                Err(error) => {
+                    failed.push(json!({ "id": id_str, "url": url_str, "stage": "neighbors", "error": error.to_string() }));
+                    continue;
+                }
+            };
+            let neighbors = match pack
+                .runtime
+                .neighbors(
+                    token,
+                    id,
+                    khive_storage::Direction::Out,
+                    None,
+                    Some(vec![EdgeRelation::LinksTo]),
+                )
+                .await
+            {
+                Ok(neighbors) => neighbors,
+                Err(error) => {
+                    failed.push(json!({ "id": id_str, "url": url_str, "stage": "neighbors", "error": error.to_string() }));
+                    continue;
+                }
+            };
+            let entities = match pack.runtime.entities(token) {
+                Ok(entities) => entities,
+                Err(error) => {
+                    failed.push(json!({ "id": id_str, "url": url_str, "stage": "entities", "error": error.to_string() }));
+                    continue;
+                }
+            };
+            for neighbor in neighbors {
+                match entities.get_entity(neighbor.node_id).await {
+                    Ok(Some(entity)) => {
+                        if let Some(url) = entity.properties.and_then(|properties| {
+                            properties.get("url").and_then(Value::as_str).map(str::to_string)
+                        }) {
+                            queue.push_back((url, level + 1));
+                        } else {
+                            failed.push(json!({ "id": neighbor.node_id, "url": url_str, "stage": "neighbor_url", "error": "neighbor document has no url" }));
                         }
                     }
+                    Ok(None) => failed.push(json!({ "id": neighbor.node_id, "url": url_str, "stage": "neighbor_lookup", "error": "neighbor document is missing" })),
+                    Err(error) => failed.push(json!({ "id": neighbor.node_id, "url": url_str, "stage": "neighbor_lookup", "error": error.to_string() })),
                 }
             }
         }
     }
-    Ok(json!({ "mode": "urls", "ingested": ingested, "refused": refused }))
+    Ok(json!({ "mode": "urls", "ingested": ingested, "refused": refused, "failed": failed }))
 }
 
 async fn run_ingest(
@@ -912,6 +945,52 @@ mod tests {
         assert_eq!(reply["ingested"].as_array().unwrap().len(), 1);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn disk_ingest_refuses_oversize_file_before_document_or_blob_write() {
+        let tree = tempfile::tempdir().unwrap();
+        let large = tree.path().join("a-large.bin");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(khive_runtime::engine_config::WebCeilings::default().max_bytes_default + 1)
+            .unwrap();
+        std::fs::write(tree.path().join("b-small.txt"), b"small file").unwrap();
+        let (runtime, token, _dir) =
+            test_runtime_with_read_roots(vec![disk_path(tree.path())]).await;
+        let pack = WebPack::new(runtime.clone());
+        let source = disk_path(tree.path());
+        let origin = "https://bounded.example.test/";
+
+        let error = pack
+            .handle_ingest(
+                &token,
+                json!({ "source": source.clone(), "origin": origin }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ingest_file_too_large"),
+            "{error}"
+        );
+        let url = identity::canonicalize(Url::parse(origin).unwrap().join("a-large.bin").unwrap());
+        let large_id =
+            identity::document_id(identity::site_id(&url), &identity::path_and_query(&url));
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(large_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_file(large).unwrap();
+        let reply = pack
+            .handle_ingest(&token, json!({ "source": source, "origin": origin }))
+            .await
+            .unwrap();
+        assert_eq!(reply["ingested"].as_array().unwrap().len(), 1);
+    }
+
     // Empty `[web] read_roots` fails closed — disk ingest is refused
     // entirely until an operator names at least one root, matching
     // `[exec] read_roots`'s own precedent.
@@ -1193,5 +1272,47 @@ mod tests {
             error.contains("address_loopback"),
             "refusal names why the URL was skipped: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn crawl_reports_extraction_failure_for_a_persisted_document() {
+        fn fetch_persisted_id<'a>(
+            id: Uuid,
+            _pack: &'a WebPack,
+            _token: &'a NamespaceToken,
+        ) -> impl Fn(String) -> super::FetchReply<'a> + Sync + 'a {
+            move |_url: String| -> super::FetchReply<'a> {
+                Box::pin(async move { Ok(json!({ "id": id.to_string() })) })
+            }
+        }
+
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+        let url = "https://extract-failure.example.test/page";
+        let (_, id) = crate::fetch::mint_bare(&runtime, &token, &Url::parse(url).unwrap())
+            .await
+            .unwrap();
+        // The fetch stub names a real persisted row with no body. The fetch
+        // stage succeeds, but extract must refuse it as not_fetched.
+        let fetch_one = fetch_persisted_id(id, &pack, &token);
+        let reply = super::crawl(
+            &pack,
+            &token,
+            vec![url.to_string()],
+            0,
+            1,
+            false,
+            &fetch_one,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["ingested"], json!([id.to_string()]));
+        assert_eq!(reply["refused"], json!([]));
+        assert_eq!(reply["failed"][0]["id"], id.to_string());
+        assert_eq!(reply["failed"][0]["stage"], "extract");
+        assert!(reply["failed"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not_fetched"));
     }
 }

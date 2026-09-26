@@ -301,7 +301,7 @@ async fn not_modified_refresh_never_puts_cached_bytes_again() {
             vec![]
         };
         store.puts.store(0, Ordering::SeqCst);
-        let reply = settle_refresh(
+        let result = settle_refresh(
             &runtime,
             &token,
             source.id,
@@ -316,9 +316,17 @@ async fn not_modified_refresh_never_puts_cached_bytes_again() {
             },
             &hops,
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+        if redirected {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("redirected_not_modified"),
+                "{error}"
+            );
+            continue;
+        }
+        let reply = result.unwrap();
         let final_id = Uuid::parse_str(reply["final_id"].as_str().unwrap()).unwrap();
         let final_entity = runtime
             .entities(&token)
