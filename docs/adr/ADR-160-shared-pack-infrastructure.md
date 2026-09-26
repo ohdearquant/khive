@@ -252,6 +252,49 @@ Pack-facing raw `BlobStore` access remains available for put, size/stat, exists,
 maintenance operations, but a pack does not call `get_bounded_verified` directly and bypass shared
 admission.
 
+#### Amendment 2 (2026-09-25): `blob.get` reserves the size it has already read
+
+Status: Accepted (2026-09-25). (Amendment 1 is the legacy preference verifier note under "Phase 4b attachment
+cutover".)
+
+**Context.** D3 says the hydrator "reserves `max_bytes` from a weighted raw-byte budget before
+starting backend I/O. The default budget is 256 MiB, preserving the current blob pack's
+four-by-64-MiB raw hydration envelope." `blob.get` (`handle_get` in
+`crates/khive-pack-blob/src/handlers.rs`) reads the object's size with `size()`, refuses an object
+over `MAX_OBJECT_BYTES` (64 MiB), and then calls `hydrate_verified(&content_ref, MAX_OBJECT_BYTES)`.
+`BlobHydrator::hydrate_verified` (`crates/khive-runtime/src/blob.rs`) acquires `max_bytes` permits
+before any I/O. Every `blob.get` therefore reserves 64 MiB whatever the object's size: under the
+default budget at most four run at once, under the 64 MiB minimum budget one runs at a time, and
+other hydrations queue behind them (#3325).
+
+**Decision.** `blob.get` passes the size it read from `size()` as `max_bytes`, so it reserves
+exactly the object's size. The size is used as the reservation, not as proof of the read: D2's
+`get_bounded_verified` still bounds the actual bytes, so a stored object longer than the size read
+fails with `BlobTooLarge`, a shorter one with `BlobSizeMismatch`, and wrong content with
+`BlobDigestMismatch`. A range request reserves the whole object's size, because the v1 read
+verifies the complete object. An empty object reserves zero. The rest of D3 is unchanged: the
+hydrator reserves `max_bytes`, the 64 MiB envelope check and the 64 MiB budget floor stay, and the
+default budget still admits four 64 MiB hydrations at once, which is what the "four-by-64-MiB"
+wording describes. Other whole-buffer consumers keep passing their caller limits; this amendment
+does not change them.
+
+**Alternatives considered.** Keeping the 64 MiB reservation per call is correct for residency but
+limits concurrent `blob.get` calls to four (one at the minimum budget) regardless of size and
+delays every other hydration behind them. Reserving only the requested range length would
+under-count, because the v1 read holds the whole object in memory. Raising the default budget
+admits more 64 MiB reservations but raises the resident ceiling for every deployment and still
+makes small reads wait on large reservations.
+
+**Consequences.** Concurrent `blob.get` calls on small objects stop waiting on each other's 64 MiB
+reservations, and the bound on resident verified buffers is unchanged, because each buffer is at
+most the `max_bytes` it reserved. Admission stays first come, first served: the hydrator's budget
+is a `tokio::sync::Semaphore`, which is fair for `acquire_many`, so a large request at the head of
+the queue is not overtaken by later small ones. The implementing change shows several concurrent
+small `blob.get` calls under the default budget completing without an admission wait, and an
+object whose stored bytes exceed its reported size still refused.
+
+**Refs.** #3325
+
 ### D4 — Artifact consumers converge on ADR-121 attachments
 
 The shared blob operation is independent of record modeling. Packs attach original bytes through
@@ -287,6 +330,13 @@ ahead-of-V21 epochs return typed `Unsupported` before root locking, filesystem w
 abandoned-claim cleanup. Malformed schema/evidence and nonfunctional named fences also fail closed
 before claim cleanup or deletion, though their validation/probe may occur after ownership and the
 filesystem walk. There is no fallback to caller-snapshot sweep or unconditional delete.
+This exact-V21 rule describes the Phase-4a rollout binary. [ADR-121 Amendment 1](ADR-121-attachments-first-class.md#amendment-1-2026-09-25-the-orphan-sweep-runs-on-a-schedule-and-on-demand)
+proposes admission through a named `REVIEWED_SCHEMA_EPOCH` after review of the complete core migration
+chain, plus main-database ownership rows for every durable blob producer, a checked blob-writer
+census and a cutover-recorded store ID bound to the root, before any scheduled
+or on-demand transactional sweep. The ownership-table migration requires a separate exact-epoch review.
+The Phase-4a attachment-only liveness rule does not by itself protect persistent exec, git or
+derived web objects that share the root; newer epochs remain refused until separately reviewed.
 
 Phase 4a must converge on every process that can share the database/blob root, and every
 pre-Phase-4a process must then be drained and prevented from restarting, before any Phase-4b binary
