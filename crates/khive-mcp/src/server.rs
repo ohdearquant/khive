@@ -2098,6 +2098,8 @@ impl KhiveMcpServer {
         let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
+            let write =
+                crate::transport::DeadlineWriter::new(write, response_deadline, root.clone());
             crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     crate::stdio_line_limit::BoundedLineReader::new(read, max_line_bytes),
@@ -2148,6 +2150,7 @@ impl KhiveMcpServer {
         let (read, write) = stdio();
         let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let write = crate::transport::DeadlineWriter::new(write, response_deadline, root.clone());
         let transport =
             crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 AsyncRwTransport::new_server(
@@ -3858,8 +3861,9 @@ Response shape:
 
 Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
-`status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
-it (or summary) rather than relying on the absence of a top-level error.
+`status` is "partial" whenever summary.failed or summary.aborted is non-zero.
+The MCP tool result sets isError=true only when no op succeeded and at least
+one failed or aborted. For mixed batches inspect each result and the summary.
 
 A parallel write-heavy batch is best-effort, not atomic: `results` ordering is
 not a commit prefix (an earlier entry succeeding implies nothing about a later
@@ -5670,6 +5674,142 @@ fn build_instructions(catalog: &str, loaded: &str, unloaded: &str) -> String {
     )
 }
 
+/// Preserve the request envelope verbatim while making its all-failed state
+/// visible to MCP clients that inspect `isError` instead of parsing text.
+fn mark_all_failed_request_result(result: &mut rmcp::model::CallToolResult) {
+    let Some(text) = result.content.iter().find_map(|content| content.as_text()) else {
+        return;
+    };
+    let Ok(envelope) = serde_json::from_str::<Value>(&text.text) else {
+        return;
+    };
+    let Some(summary) = envelope.get("summary") else {
+        return;
+    };
+    let (Some(succeeded), Some(failed), Some(aborted)) = (
+        summary.get("succeeded").and_then(Value::as_u64),
+        summary.get("failed").and_then(Value::as_u64),
+        summary.get("aborted").and_then(Value::as_u64),
+    ) else {
+        return;
+    };
+    if succeeded == 0 && failed.saturating_add(aborted) > 0 {
+        result.is_error = Some(true);
+    }
+}
+
+#[cfg(test)]
+mod request_result_error_tests {
+    use super::{mark_all_failed_request_result, KhiveMcpServer};
+    use khive_runtime::{KhiveRuntime, RuntimeConfig};
+    use rmcp::model::{CallToolResult, Content};
+    use std::time::Duration;
+
+    fn result_with_summary(succeeded: u64, failed: u64, aborted: u64) -> CallToolResult {
+        CallToolResult::success(vec![Content::text(format!(
+            "{{\"results\":[],\"summary\":{{\"succeeded\":{succeeded},\"failed\":{failed},\"aborted\":{aborted}}},\"status\":\"partial\"}}"
+        ))])
+    }
+
+    #[test]
+    fn all_failed_request_sets_mcp_is_error_without_changing_envelope() {
+        let mut result = result_with_summary(0, 1, 2);
+        let original = result.content.clone();
+        mark_all_failed_request_result(&mut result);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content, original);
+    }
+
+    #[test]
+    fn mixed_request_does_not_set_mcp_is_error() {
+        let mut result = result_with_summary(1, 1, 0);
+        mark_all_failed_request_result(&mut result);
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn plan_response_without_summary_keeps_its_original_mcp_status() {
+        let mut result = CallToolResult::success(vec![Content::text("{\"parsed\":false}")]);
+        mark_all_failed_request_result(&mut result);
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn all_failed_request_is_error_on_tools_call_wire() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server with kg pack");
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            rmcp::transport::async_rw::AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(2)),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(server, transport, None, root.clone());
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"request\",\"arguments\":{\"ops\":\"not_loaded()\"}}}\n",
+            )
+            .await
+            .expect("send request tool call");
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client_read.read_line(&mut line))
+            .await
+            .expect("request tool response deadline")
+            .expect("read request tool response");
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("JSON-RPC response");
+        assert_eq!(wire["result"]["isError"], true, "response: {wire}");
+        let envelope: serde_json::Value = serde_json::from_str(
+            wire["result"]["content"][0]["text"]
+                .as_str()
+                .expect("request result text"),
+        )
+        .expect("unchanged request envelope");
+        assert_eq!(envelope["summary"]["succeeded"], 0);
+        assert_eq!(envelope["summary"]["failed"], 1);
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"request\",\"arguments\":{\"ops\":\"[stats(), not_loaded()]\"}}}\n",
+            )
+            .await
+            .expect("send mixed request tool call");
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(2), client_read.read_line(&mut line))
+            .await
+            .expect("mixed request response deadline")
+            .expect("read mixed request response");
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("mixed JSON-RPC response");
+        assert_eq!(wire["result"]["isError"], false, "response: {wire}");
+        let envelope: serde_json::Value = serde_json::from_str(
+            wire["result"]["content"][0]["text"]
+                .as_str()
+                .expect("mixed request result text"),
+        )
+        .expect("mixed request envelope");
+        assert_eq!(envelope["status"], "partial");
+        assert_eq!(envelope["summary"]["succeeded"], 1);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        root.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for KhiveMcpServer {
     async fn call_tool(
@@ -5677,6 +5817,7 @@ impl ServerHandler for KhiveMcpServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
+        let is_request_tool = request.name == "request";
         // The router turns parameter-deserialization failures into tool errors.
         // Plan isolation requires the JSON-RPC invalid_params response instead.
         if request.name == "request" {
@@ -5693,7 +5834,11 @@ impl ServerHandler for KhiveMcpServer {
             }
         }
         let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::tool_router().call(context).await
+        let mut result = Self::tool_router().call(context).await?;
+        if is_request_tool {
+            mark_all_failed_request_result(&mut result);
+        }
+        Ok(result)
     }
 
     fn get_info(&self) -> ServerInfo {
