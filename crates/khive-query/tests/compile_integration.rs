@@ -1670,6 +1670,68 @@ mod substrate_labels {
         conn
     }
 
+    fn insert_path_node(conn: &Connection, id: &str, namespace: &str, deleted_at: Option<i64>) {
+        conn.execute(
+            "INSERT INTO entities
+                (id, namespace, kind, name, description, properties, tags,
+                 created_at, updated_at, deleted_at, entity_type)
+             VALUES (?1, ?2, 'concept', ?1, NULL, '{}', '[]', 0, 0, ?3, NULL)",
+            rusqlite::params![id, namespace, deleted_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_local_path_edge(conn: &Connection, id: &str, source: &str, target: &str) {
+        conn.execute(
+            "INSERT INTO graph_edges
+                (namespace, id, source_id, target_id, relation, weight,
+                 created_at, updated_at, deleted_at, metadata, target_backend)
+             VALUES ('local', ?1, ?2, ?3, 'extends', 1.0, 0, 0, NULL, NULL, NULL)",
+            rusqlite::params![id, source, target],
+        )
+        .unwrap();
+    }
+
+    fn depth_two_from_fixture(conn: &Connection) -> Vec<String> {
+        let query = parse(
+            QueryLanguage::Gql,
+            "MATCH (a)-[:extends*2..2]->(b) \
+             WHERE a.id = 'e-fixture-1' RETURN b.id",
+        )
+        .unwrap();
+        run(conn, &compile(&query, &scoped("local")).unwrap())
+    }
+
+    #[test]
+    fn variable_length_seed_hop_cannot_cross_soft_deleted_node() {
+        let conn = fixture_db();
+        insert_path_node(&conn, "seed-deleted", "local", Some(1));
+        insert_path_node(&conn, "behind-deleted", "local", None);
+        insert_path_node(&conn, "seed-live", "local", None);
+        insert_path_node(&conn, "behind-live", "local", None);
+        insert_local_path_edge(&conn, "edge-deleted-1", "e-fixture-1", "seed-deleted");
+        insert_local_path_edge(&conn, "edge-deleted-2", "seed-deleted", "behind-deleted");
+        insert_local_path_edge(&conn, "edge-live-1", "e-fixture-1", "seed-live");
+        insert_local_path_edge(&conn, "edge-live-2", "seed-live", "behind-live");
+
+        assert_eq!(depth_two_from_fixture(&conn), vec!["behind-live"]);
+    }
+
+    #[test]
+    fn variable_length_seed_hop_cannot_cross_out_of_scope_node() {
+        let conn = fixture_db();
+        insert_path_node(&conn, "seed-foreign", "other", None);
+        insert_path_node(&conn, "behind-foreign", "local", None);
+        insert_path_node(&conn, "seed-live", "local", None);
+        insert_path_node(&conn, "behind-live", "local", None);
+        insert_local_path_edge(&conn, "edge-foreign-1", "e-fixture-1", "seed-foreign");
+        insert_local_path_edge(&conn, "edge-foreign-2", "seed-foreign", "behind-foreign");
+        insert_local_path_edge(&conn, "edge-live-1", "e-fixture-1", "seed-live");
+        insert_local_path_edge(&conn, "edge-live-2", "seed-live", "behind-live");
+
+        assert_eq!(depth_two_from_fixture(&conn), vec!["behind-live"]);
+    }
+
     #[test]
     fn entity_substrate_label_compiles_without_unsatisfiable_kind_filter() {
         let q = parse(

@@ -84,6 +84,9 @@ Digits are required on both sides of a float's decimal point, so `.5`, `1.`, and
 A numeric predicate condition targets a JSON property explicitly, even when its predicate name matches a dedicated field. This matches string-valued predicate properties and removes the prior value-type-dependent field ambiguity.
 
 The AST currently represents one connected, non-branching path. Disconnected or branched edge triples, and kind/property constraints on variables outside that path, are rejected so no conjunct is silently discarded. Triple conditions are folded into a left-associative `AND` tree.
+Identical repeated kind or string-valued property triples are accepted as one constraint;
+conflicting values for the same subject kind or property predicate are parse errors rather than
+silently replacing an earlier constraint.
 
 SPARQL `*` is rejected: it means zero-or-more, while the recursive SQL seed begins at depth one and cannot emit the start node as a depth-zero result. Treating `*` as `+` would lose valid matches.
 
