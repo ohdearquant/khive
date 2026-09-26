@@ -379,6 +379,17 @@ command this crate issues. This accounting is inherently a snapshot of a
 possibly-changing tree, so "a thing under the root I was about to size is
 already gone" is not an error here.
 
+On Windows, a descendant whose metadata remains `PermissionDenied` after
+the bounded recheck also contributes 0. Git creates the clone's files under
+the cache owner's account with ordinary permissions; a remote repository
+cannot make a persistent ACL-denied file. The expected error is a Git
+temporary file already delete-pending and no longer usable by the clone.
+This preserves the byte cap for remote-controlled, addressable clone content;
+an external local actor that changes ACLs or holds delete-pending handles can
+make a disk-usage snapshot incomplete, outside that trust boundary. Directory
+open failures are not skipped, so an unreadable subtree is not silently
+accepted after a successful directory stat.
+
 The walk **root** itself vanishing is different and is NOT tolerated — it
 surfaces as `CacheError::Io(NotFound)` rather than silently sizing to `0`. A
 caller that genuinely expects the root it's sizing to sometimes be absent
@@ -592,9 +603,11 @@ be achieved by skipping operations or hiding failures.
 ### Windows delete-pending entries
 
 The size walker rechecks `PermissionDenied` from descendant metadata or directory
-open operations on Windows up to four times, waiting 10 ms between attempts. Only
-`NotFound` proves the entry vanished and permits it to contribute zero bytes.
-Persistent denial remains fatal, preserving clone-cap enforcement. Root errors
-are always fatal without retry; other platforms retain the previous behavior.
-The 40 ms grace accommodates brief handle cleanup but promises no upper bound on
-how long another process may hold a delete-pending file.
+open operations on Windows up to four times, waiting 10 ms between attempts.
+Persistent metadata denial on a non-root entry is skipped like `NotFound`: a
+delete-pending Git temporary path cannot be opened by the clone or reused as
+an addressable cache file. Readable descendants still contribute their full
+size, so the cap continues to bound addressable clone content. Directory-open
+denial and all root errors remain fatal; other platforms retain the previous
+behavior. The 40 ms grace accommodates brief handle cleanup but promises no
+upper bound on how long another process may hold a delete-pending file.
