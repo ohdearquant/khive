@@ -234,7 +234,7 @@ pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeErro
     let items = value.as_array().ok_or_else(|| {
         RuntimeError::InvalidInput("entries must be an array of {path, ref, mode}".into())
     })?;
-    let mut seen: BTreeMap<String, TreeEntry> = BTreeMap::new();
+    let mut seen = EntryIndex::default();
     for item in items {
         let path = item
             .get("path")
@@ -264,12 +264,12 @@ pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeErro
             },
         )?;
     }
-    Ok(seen.into_values().collect())
+    Ok(seen.into_sorted_entries())
 }
 
 /// Validate captured output and loaded manifests with the same rules as wire entries.
 fn validate_entries(entries: &[TreeEntry]) -> Result<Vec<TreeEntry>, RuntimeError> {
-    let mut seen: BTreeMap<String, TreeEntry> = BTreeMap::new();
+    let mut seen = EntryIndex::default();
     for entry in entries {
         let path = validate_relative_path(&entry.path, "entry")?;
         ContentRef::from_hex(&entry.content_ref)
@@ -282,34 +282,215 @@ fn validate_entries(entries: &[TreeEntry]) -> Result<Vec<TreeEntry>, RuntimeErro
         }
         insert_entry(&mut seen, entry.clone())?;
     }
-    Ok(seen.into_values().collect())
+    Ok(seen.into_sorted_entries())
+}
+
+#[derive(Default)]
+struct EntryIndex {
+    entries: BTreeMap<String, TreeEntry>,
+    prefixes: PrefixIndex,
+    work: PrefixWork,
+}
+
+impl EntryIndex {
+    fn into_sorted_entries(self) -> Vec<TreeEntry> {
+        self.entries.into_values().collect()
+    }
+}
+
+#[derive(Default)]
+struct PrefixWork {
+    #[cfg(test)]
+    compared_bytes: usize,
+    #[cfg(test)]
+    child_lookups: usize,
+    #[cfg(test)]
+    ordered_probes: usize,
+}
+
+impl PrefixWork {
+    #[inline]
+    fn comparison(&mut self, bytes: usize) {
+        #[cfg(test)]
+        {
+            self.compared_bytes += bytes;
+        }
+        #[cfg(not(test))]
+        let _ = (self, bytes);
+    }
+
+    #[inline]
+    fn lookup(&mut self) {
+        #[cfg(test)]
+        {
+            self.child_lookups += 1;
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    #[inline]
+    fn ordered_probe(&mut self) {
+        #[cfg(test)]
+        {
+            self.ordered_probes += 1;
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+}
+
+struct PrefixEdge {
+    label: String,
+    child: usize,
+}
+
+#[derive(Default)]
+struct PrefixNode {
+    children: BTreeMap<char, PrefixEdge>,
+    entry: bool,
+}
+
+// Arena nodes keep both memory and destruction bounded for a path with many
+// components. Edge labels compress a long unbranched path into one allocation.
+struct PrefixIndex {
+    nodes: Vec<PrefixNode>,
+}
+
+impl Default for PrefixIndex {
+    fn default() -> Self {
+        Self {
+            nodes: vec![PrefixNode::default()],
+        }
+    }
+}
+
+impl PrefixIndex {
+    fn first_parent<'a>(&self, path: &'a str, work: &mut PrefixWork) -> Option<&'a str> {
+        let mut node = 0;
+        let mut consumed = 0;
+        loop {
+            let remaining = &path[consumed..];
+            if self.nodes[node].entry && remaining.starts_with('/') {
+                return Some(&path[..consumed]);
+            }
+            let first = remaining.chars().next()?;
+            work.lookup();
+            let edge = self.nodes[node].children.get(&first)?;
+            let common = common_prefix_bytes(remaining, &edge.label, work);
+            if common != edge.label.len() {
+                return None;
+            }
+            consumed += common;
+            node = edge.child;
+        }
+    }
+
+    fn insert(&mut self, path: &str, work: &mut PrefixWork) {
+        let mut node = 0;
+        let mut consumed = 0;
+        loop {
+            let remaining = &path[consumed..];
+            let Some(first) = remaining.chars().next() else {
+                self.nodes[node].entry = true;
+                return;
+            };
+            work.lookup();
+            let Some(edge) = self.nodes[node].children.get(&first) else {
+                let child = self.nodes.len();
+                self.nodes.push(PrefixNode {
+                    entry: true,
+                    ..PrefixNode::default()
+                });
+                self.nodes[node].children.insert(
+                    first,
+                    PrefixEdge {
+                        label: remaining.to_string(),
+                        child,
+                    },
+                );
+                return;
+            };
+            let common = common_prefix_bytes(remaining, &edge.label, work);
+            if common == edge.label.len() {
+                consumed += common;
+                node = edge.child;
+                continue;
+            }
+
+            // Split only at a UTF-8 character boundary. The old path keeps
+            // its child; the new path either ends here or gains a sibling.
+            let mut edge = self.nodes[node]
+                .children
+                .remove(&first)
+                .expect("edge exists");
+            let old_suffix = edge.label.split_off(common);
+            let middle = self.nodes.len();
+            let mut middle_node = PrefixNode::default();
+            middle_node.children.insert(
+                old_suffix.chars().next().expect("nonempty suffix"),
+                PrefixEdge {
+                    label: old_suffix,
+                    child: edge.child,
+                },
+            );
+            self.nodes.push(middle_node);
+            edge.child = middle;
+            self.nodes[node].children.insert(first, edge);
+            if common == remaining.len() {
+                self.nodes[middle].entry = true;
+            } else {
+                let suffix = &remaining[common..];
+                let child = self.nodes.len();
+                self.nodes.push(PrefixNode {
+                    entry: true,
+                    ..PrefixNode::default()
+                });
+                self.nodes[middle].children.insert(
+                    suffix.chars().next().expect("nonempty suffix"),
+                    PrefixEdge {
+                        label: suffix.to_string(),
+                        child,
+                    },
+                );
+            }
+            return;
+        }
+    }
+}
+
+fn common_prefix_bytes(left: &str, right: &str, work: &mut PrefixWork) -> usize {
+    let mut common = 0;
+    for (a, b) in left.chars().zip(right.chars()) {
+        work.comparison(a.len_utf8().max(b.len_utf8()));
+        if a != b {
+            break;
+        }
+        common += a.len_utf8();
+    }
+    common
 }
 
 /// Insert an already validated entry. Its parents and first ordered descendant
 /// find every file/directory collision without scanning all prior entries.
-fn insert_entry(
-    seen: &mut BTreeMap<String, TreeEntry>,
-    entry: TreeEntry,
-) -> Result<(), RuntimeError> {
+fn insert_entry(seen: &mut EntryIndex, entry: TreeEntry) -> Result<(), RuntimeError> {
     let path = &entry.path;
-    if seen.contains_key(path) {
+    seen.work.ordered_probe();
+    if seen.entries.contains_key(path) {
         return Err(RuntimeError::InvalidInput(format!(
             "duplicate entry path {path:?}"
         )));
     }
     // Neither a file nor a symlink can be a directory prefix of another entry.
-    for (index, byte) in path.bytes().enumerate() {
-        if byte == b'/' {
-            let parent = &path[..index];
-            if let Some((existing, _)) = seen.get_key_value(parent) {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "entry {path:?} conflicts with entry {existing:?} (file and directory at one path)"
-                )));
-            }
-        }
+    if let Some(existing) = seen.prefixes.first_parent(path, &mut seen.work) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "entry {path:?} conflicts with entry {existing:?} (file and directory at one path)"
+        )));
     }
     let prefix = format!("{path}/");
+    seen.work.ordered_probe();
     if let Some((existing, _)) = seen
+        .entries
         .range::<str, _>((Included(prefix.as_str()), Unbounded))
         .next()
     {
@@ -319,7 +500,9 @@ fn insert_entry(
             )));
         }
     }
-    seen.insert(entry.path.clone(), entry);
+    seen.prefixes.insert(path, &mut seen.work);
+    seen.work.ordered_probe();
+    seen.entries.insert(entry.path.clone(), entry);
     Ok(())
 }
 
@@ -645,6 +828,79 @@ mod tests {
             {"path": "pkg", "ref": r, "mode": 644},
         ]);
         assert_eq!(parse_entries(&siblings).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn compressed_prefix_validation_has_linear_counted_work() {
+        let mut index = EntryIndex::default();
+        let content_ref = digest_hex(b"target");
+        let prefix = "a/".repeat(4_096);
+        let mut input_bytes = 0;
+        for leaf in ["left", "right"] {
+            let path = format!("{prefix}{leaf}");
+            input_bytes += path.len();
+            insert_entry(
+                &mut index,
+                TreeEntry {
+                    path,
+                    content_ref: content_ref.clone(),
+                    mode: 644,
+                },
+            )
+            .unwrap();
+        }
+        for sibling in 0..4_096 {
+            let path = format!("bulk/{sibling:04}");
+            input_bytes += path.len();
+            insert_entry(
+                &mut index,
+                TreeEntry {
+                    path,
+                    content_ref: content_ref.clone(),
+                    mode: 644,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(index.entries.len(), 4_098);
+        let counted = index.work.compared_bytes + index.work.child_lookups;
+        assert!(
+            counted <= 4 * input_bytes,
+            "prefix probes examined {counted} units for {input_bytes} input bytes"
+        );
+        assert_eq!(index.work.ordered_probes, 3 * index.entries.len());
+    }
+
+    #[test]
+    fn compressed_prefix_index_preserves_boundary_and_lexical_error_order() {
+        let r = digest_hex(b"target");
+        let entries = json!([
+            {"path": "pkg/a/z", "ref": r, "mode": 644},
+            {"path": "pkg/a.", "ref": r, "mode": 644},
+            {"path": "pkg", "ref": r, "mode": 644},
+        ]);
+        let error = parse_entries(&entries).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInput(ref message)
+                if message == "entry \"pkg\" conflicts with entry \"pkg/a.\" (file and directory at one path)"
+        ));
+
+        let neighbors = json!([
+            {"path": "éclair", "ref": r, "mode": 644},
+            {"path": "éclairer/child", "ref": r, "mode": 644},
+        ]);
+        assert_eq!(parse_entries(&neighbors).unwrap().len(), 2);
+        let children = json!([
+            {"path": "éclair", "ref": r, "mode": 644},
+            {"path": "éclair/child", "ref": r, "mode": 644},
+        ]);
+        let error = parse_entries(&children).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInput(ref message)
+                if message == "entry \"éclair/child\" conflicts with entry \"éclair\" (file and directory at one path)"
+        ));
     }
 
     #[test]
