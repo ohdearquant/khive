@@ -86,6 +86,32 @@ pub struct NamedVectorIdentity {
     dimensions: usize,
 }
 
+struct CachedNamedVectorStores {
+    identity: NamedVectorIdentity,
+    by_namespace: HashMap<String, Arc<dyn VectorStore>>,
+}
+
+fn check_cached_named_vector_identity(
+    cached: &NamedVectorIdentity,
+    requested: &NamedVectorIdentity,
+) -> RuntimeResult<()> {
+    if cached.dimensions() != requested.dimensions() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "named vector model_key {:?} is already bound to {} dimensions, expected {}",
+            requested.model_key(),
+            cached.dimensions(),
+            requested.dimensions()
+        )));
+    }
+    if cached.model_name() != requested.model_name() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "named vector model_key {:?} is already bound to a different active model identity",
+            requested.model_key()
+        )));
+    }
+    Ok(())
+}
+
 impl NamedVectorIdentity {
     const MAX_MODEL_KEY_BYTES: usize = 128;
     const MAX_MODEL_NAME_BYTES: usize = 512;
@@ -169,6 +195,13 @@ struct CoreEmbedderState {
 #[derive(Clone)]
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
+    /// Successful named-vector bindings and their namespace-scoped stores.
+    /// Shared by runtime clones so repeated reads do not enter the writer or
+    /// rescan the vector table after the first verified binding.
+    named_vector_stores: Arc<RwLock<HashMap<String, CachedNamedVectorStores>>>,
+    /// The main backend's cache, used when a secondary runtime creates a
+    /// `core()` handle. It must never reuse a secondary backend's store.
+    core_named_vector_stores: Option<Arc<RwLock<HashMap<String, CachedNamedVectorStores>>>>,
     /// When `Some`, holds the main backend so that `core()` can return a
     /// main-bound runtime handle without constructing a new connection.
     /// `None` when this runtime is already bound to the main backend.
@@ -410,6 +443,8 @@ impl KhiveRuntime {
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
             backend,
+            named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
+            core_named_vector_stores: None,
             core_backend: None,
             config,
             ann_fresh_tail_enabled,
@@ -444,6 +479,9 @@ impl KhiveRuntime {
             "with_core_backend must not be called on the main runtime"
         );
         core.pool().main_pool_generation();
+        if self.core_named_vector_stores.is_none() {
+            self.core_named_vector_stores = Some(Arc::new(RwLock::new(HashMap::new())));
+        }
         self.core_backend = Some(core);
         self
     }
@@ -465,6 +503,10 @@ impl KhiveRuntime {
             embedding_model: main.config.embedding_model,
             additional_embedding_models: main.config.additional_embedding_models.clone(),
         });
+        self.core_named_vector_stores = Some(main.named_vector_stores.clone());
+        if Arc::ptr_eq(&self.backend, &main.backend) {
+            self.named_vector_stores = main.named_vector_stores.clone();
+        }
         self
     }
 
@@ -531,6 +573,11 @@ impl KhiveRuntime {
                 };
                 KhiveRuntime {
                     backend: main_arc.clone(),
+                    named_vector_stores: self
+                        .core_named_vector_stores
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
+                    core_named_vector_stores: None,
                     core_backend: None,
                     config: core_config,
                     ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
@@ -969,11 +1016,23 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         identity: &NamedVectorIdentity,
     ) -> RuntimeResult<Arc<dyn VectorStore>> {
+        let namespace = token.namespace().as_str();
+        {
+            let cached = self.named_vector_stores.read().map_err(|_| {
+                RuntimeError::Internal("named vector store cache lock poisoned".into())
+            })?;
+            if let Some(entry) = cached.get(identity.model_key()) {
+                check_cached_named_vector_identity(&entry.identity, identity)?;
+                if let Some(store) = entry.by_namespace.get(namespace) {
+                    return Ok(Arc::clone(store));
+                }
+            }
+        }
         let store = self.backend.vectors_for_namespace(
             identity.model_key(),
             identity.model_name(),
             identity.dimensions(),
-            token.namespace().as_str(),
+            namespace,
         )?;
 
         let table = format!("vec_{}", identity.model_key());
@@ -1060,6 +1119,20 @@ impl KhiveRuntime {
                 }
             })?;
 
+        let mut cached = self
+            .named_vector_stores
+            .write()
+            .map_err(|_| RuntimeError::Internal("named vector store cache lock poisoned".into()))?;
+        let entry = cached
+            .entry(identity.model_key().to_owned())
+            .or_insert_with(|| CachedNamedVectorStores {
+                identity: identity.clone(),
+                by_namespace: HashMap::new(),
+            });
+        check_cached_named_vector_identity(&entry.identity, identity)?;
+        entry
+            .by_namespace
+            .insert(namespace.to_owned(), Arc::clone(&store));
         Ok(store)
     }
 
@@ -3987,6 +4060,56 @@ mod tests {
             panic!("same key cannot change model identity");
         };
         assert!(model_error.to_string().contains("already bound"));
+    }
+
+    #[tokio::test]
+    async fn repeated_named_vector_lookup_avoids_writer_acquisition() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let identity = NamedVectorIdentity::new("visual_cached", "model-a", 4).unwrap();
+        runtime
+            .vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("first lookup validates and registers");
+        let writer_before = runtime.backend().pool().writer_acquisition_snapshot();
+
+        runtime
+            .clone()
+            .vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("clone reuses verified store");
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            writer_before,
+            "repeated reads must not reach vector-table setup or model registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_projection_reuses_main_named_vector_cache() {
+        let main_backend = migrated_memory_backend();
+        let main =
+            KhiveRuntime::from_backend(Arc::clone(&main_backend), RuntimeConfig::no_embeddings());
+        let secondary = KhiveRuntime::from_backend(migrated_memory_backend(), secondary_config())
+            .with_core_embedders_from(&main)
+            .with_core_backend(Arc::clone(&main_backend));
+        let core = secondary.core();
+        let token = core.authorize(Namespace::local()).expect("authorize");
+        let identity = NamedVectorIdentity::new("core_visual_cached", "model-a", 4).unwrap();
+        core.vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("first lookup validates on main");
+        let writer_before = main_backend.pool().writer_acquisition_snapshot();
+
+        secondary
+            .core()
+            .vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("new core projection reuses main store");
+        assert_eq!(
+            main_backend.pool().writer_acquisition_snapshot(),
+            writer_before
+        );
     }
 
     #[tokio::test]

@@ -1790,33 +1790,98 @@ impl std::error::Error for PackSchemaCollisionError {}
 
 /// Extract table names from a single DDL statement.
 ///
-/// Handles `CREATE TABLE IF NOT EXISTS`, `CREATE TABLE`, and
-/// `CREATE VIRTUAL TABLE IF NOT EXISTS`, `CREATE VIRTUAL TABLE`.
-/// Returns an empty Vec when no table name is found (e.g. index DDL).
+/// Handles SQL trivia, SQLite identifier quoting, optional TEMP/VIRTUAL and a
+/// `main.` qualifier. Index and other non-table DDL return no table names.
 fn extract_table_names(stmt: &str) -> Vec<String> {
-    let normalized = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
-    let upper = normalized.to_ascii_uppercase();
-    let table_name = if let Some(rest) = upper.strip_prefix("CREATE VIRTUAL TABLE IF NOT EXISTS ") {
-        rest.split_whitespace().next()
-    } else if let Some(rest) = upper.strip_prefix("CREATE VIRTUAL TABLE ") {
-        rest.split_whitespace().next()
-    } else if let Some(rest) = upper.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
-        rest.split_whitespace().next()
-    } else if let Some(rest) = upper.strip_prefix("CREATE TABLE ") {
-        rest.split_whitespace().next()
-    } else {
-        None
-    };
-    match table_name {
-        Some(name) => {
-            let clean = name.trim_matches(|c: char| c == '(' || c == ';');
-            if clean.is_empty() {
-                vec![]
-            } else {
-                vec![clean.to_ascii_lowercase()]
-            }
+    let mut tokens = Vec::new();
+    let mut chars = stmt.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
         }
-        None => vec![],
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for next in chars.by_ref() {
+                if previous == '*' && next == '/' {
+                    break;
+                }
+                previous = next;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '`' | '[') {
+            let closing = if ch == '[' { ']' } else { ch };
+            let mut token = String::new();
+            while let Some(next) = chars.next() {
+                if next == closing {
+                    if chars.peek() == Some(&closing) {
+                        chars.next();
+                        token.push(closing);
+                    } else {
+                        break;
+                    }
+                } else {
+                    token.push(next);
+                }
+            }
+            tokens.push(token);
+            continue;
+        }
+        if matches!(ch, '.' | '(' | ';') {
+            tokens.push(ch.to_string());
+            continue;
+        }
+        let mut token = ch.to_string();
+        while let Some(next) = chars.peek().copied() {
+            if next.is_whitespace() || matches!(next, '.' | '(' | ';' | '"' | '`' | '[') {
+                break;
+            }
+            token.push(next);
+            chars.next();
+        }
+        tokens.push(token);
+    }
+
+    let keyword = |index: usize, word: &str| {
+        tokens
+            .get(index)
+            .is_some_and(|token| token.eq_ignore_ascii_case(word))
+    };
+    if !keyword(0, "CREATE") {
+        return Vec::new();
+    }
+    let mut index = 1;
+    if keyword(index, "TEMP") || keyword(index, "TEMPORARY") {
+        index += 1;
+    }
+    if keyword(index, "VIRTUAL") {
+        index += 1;
+    }
+    if !keyword(index, "TABLE") {
+        return Vec::new();
+    }
+    index += 1;
+    if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
+        index += 3;
+    }
+    if keyword(index, "main") && tokens.get(index + 1).is_some_and(|t| t == ".") {
+        index += 2;
+    }
+    match tokens.get(index) {
+        Some(name) if !name.is_empty() && !matches!(name.as_str(), "." | "(" | ";") => {
+            vec![name.to_ascii_lowercase()]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -4286,7 +4351,10 @@ impl VerbRegistry {
         // Backend identity is the raw pointer of the underlying connection pool Arc.
         let mut claimed: HashMap<(*const (), String), &'static str> = HashMap::new();
 
-        for (plan, additions) in self.all_schema_plans_with_columns() {
+        let plans = self.all_schema_plans_with_columns();
+        // Check every declaration before applying any pack DDL. A collision
+        // must not leave earlier plans installed on a failed boot.
+        for (plan, additions) in &plans {
             if plan.is_empty() && additions.is_empty() {
                 continue;
             }
@@ -4297,7 +4365,7 @@ impl VerbRegistry {
                 .unwrap_or(default_backend);
             let backend_ptr = std::sync::Arc::as_ptr(&backend.pool_arc()) as *const ();
 
-            // Pre-scan DDL for table names and detect collisions before applying.
+            // Collect DDL table ownership for the full plan set.
             for stmt in plan.statements {
                 for table_name in extract_table_names(stmt) {
                     let key = (backend_ptr, table_name.clone());
@@ -4316,8 +4384,7 @@ impl VerbRegistry {
                     }
                 }
             }
-
-            for addition in additions {
+            for addition in *additions {
                 let table_name = addition.table.to_ascii_lowercase();
                 let key = (backend_ptr, table_name.clone());
                 match claimed.entry(key) {
@@ -4338,7 +4405,17 @@ impl VerbRegistry {
                     }
                 }
             }
+        }
 
+        for (plan, additions) in plans {
+            if plan.is_empty() && additions.is_empty() {
+                continue;
+            }
+            let pack_name = plan.pack;
+            let backend = backend_for_pack
+                .get(pack_name)
+                .copied()
+                .unwrap_or(default_backend);
             if backend.is_read_only() {
                 backend.validate_pack_schema_columns(additions).map_err(|error| {
                     crate::PackSchemaCollisionError {
@@ -16002,6 +16079,48 @@ mod help_tests {
             msg.contains("collision_table"),
             "collision error must name the table; got: {msg}"
         );
+    }
+
+    #[test]
+    fn schema_collision_normalizes_sql_identifiers_before_any_ddl() {
+        let spellings: [&'static [&'static str]; 4] = [
+            &["CREATE TABLE IF NOT EXISTS \"shared\"(id INTEGER)"],
+            &["-- pack table\nCREATE TABLE IF NOT EXISTS shared(id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS main.shared(id INTEGER)"],
+            &["CREATE TEMP TABLE IF NOT EXISTS shared(id INTEGER)"],
+        ];
+        for statements in spellings {
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_alpha",
+                statements: &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+                column_additions: &[],
+            }));
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_beta",
+                statements,
+                column_additions: &[],
+            }));
+            let registry = builder.build().expect("registry builds");
+            let error = registry
+                .apply_schema_plans_with_map(&HashMap::new(), &backend)
+                .expect_err("spelling must not evade table ownership");
+            let message = error.to_string();
+            assert!(message.contains("pack_alpha") && message.contains("pack_beta"));
+            assert!(message.contains("shared"));
+            let table_count: i64 = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'shared'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("schema count");
+            assert_eq!(table_count, 0, "collision must precede all pack DDL");
+        }
     }
 
     #[test]
