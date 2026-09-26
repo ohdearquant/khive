@@ -303,7 +303,7 @@ for existing consumers; it does not claim the complete ADR-121 public verb rollo
 
 ## Amendment 1 (2026-09-25): the orphan sweep runs on a schedule and on demand
 
-**Status: Proposed.** Refs #3038, #3178. This amendment also proposes to amend one sentence of
+**Status: Accepted (2026-09-25).** Refs #3038, #3178. This amendment also proposes to amend one sentence of
 [ADR-111](ADR-111-blob-store.md) §8, named in item 3.
 
 ### Why
@@ -677,7 +677,7 @@ census leaves one population question open.
 
 ## Amendment 3 (2026-09-25): rows whose record is gone are reported now, and no scan removes them until a reviewed design exists
 
-**Status: Proposed.** Refs #3178. A follow-up to Amendment 1 that addresses part of the case its item 5 leaves out of
+**Status: Accepted (2026-09-26).** Refs #3178. A follow-up to Amendment 1 that addresses part of the case its item 5 leaves out of
 scope: it ships a read-only report of attachment rows whose record was not found, and it states what any code that
 removes such rows must first supply. It changes no text of Amendment 1 or Amendment 2. Item 1 only reads and does not
 depend on Amendment 1 being accepted; the requirements in item 3 build on Amendment 1 items 6 to 8 and bind only
