@@ -338,6 +338,8 @@ phase_daemon_recovery_flake() {
 phase_no_default_features() {
     echo "=== No-Default-Features Check ==="
     cargo check --workspace --no-default-features
+    # Workspace feature unification can silently re-enable khive-fold/serde.
+    cargo check -p khive-fold --no-default-features
 }
 
 # Single source of truth for where the built kkernel binary lives: KKERNEL_BINARY

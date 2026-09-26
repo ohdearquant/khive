@@ -8,7 +8,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{timeout, timeout_at, Instant},
 };
 
 use crate::{catalog, error::Failure, store};
@@ -38,6 +38,19 @@ enum Operation {
 struct Job {
     operation: Operation,
     reply: oneshot::Sender<Result<Value, Failure>>,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct CallFence<'a> {
+    reply: &'a oneshot::Sender<Result<Value, Failure>>,
+    deadline: Instant,
+}
+
+impl CallFence<'_> {
+    fn expired(self) -> bool {
+        self.reply.is_closed() || Instant::now() >= self.deadline
+    }
 }
 
 impl Client {
@@ -54,10 +67,15 @@ impl Client {
     }
     async fn request(&self, operation: Operation) -> Result<Value, Failure> {
         let (reply, receiver) = oneshot::channel();
+        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
         self.sender
-            .try_send(Job { operation, reply })
+            .try_send(Job {
+                operation,
+                reply,
+                deadline,
+            })
             .map_err(|_| Failure::error("mount_busy"))?;
-        timeout(Duration::from_millis(self.timeout_ms), receiver)
+        timeout_at(deadline, receiver)
             .await
             .map_err(|_| Failure::timeout())?
             .map_err(|_| Failure::error("mount_down"))?
@@ -95,8 +113,9 @@ async fn supervise(config: MountConfig, connection: Connection, mut receiver: mp
             _ = current.child.wait() => true,
             job = receiver.recv() => {
                 let Some(job) = job else { return };
-                if job.reply.is_closed() { continue; }
-                let result = timeout(Duration::from_millis(config.timeout_ms), current.perform(&config, job.operation)).await.unwrap_or_else(|_| Err(Failure::timeout()));
+                let fence = CallFence { reply: &job.reply, deadline: job.deadline };
+                if fence.expired() { continue; }
+                let result = timeout_at(job.deadline, current.perform(&config, job.operation, fence)).await.unwrap_or_else(|_| Err(Failure::timeout()));
                 let fatal = result.as_ref().err().is_some_and(|error| error.fatal);
                 let _ = job.reply.send(result);
                 fatal
@@ -137,20 +156,23 @@ impl Connection {
             let stdin = child.stdin.take().ok_or_else(Failure::io)?;
             let stdout = BufReader::new(child.stdout.take().ok_or_else(Failure::io)?);
             let mut connection = Self { child, stdin, stdout, sequence: 0 };
-            let init = connection.rpc("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "khive-mounts", "version": env!("CARGO_PKG_VERSION")}})).await?;
+            let init = connection.rpc("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "khive-mounts", "version": env!("CARGO_PKG_VERSION")}}), None).await?;
             if !matches!(init.get("protocolVersion").and_then(Value::as_str), Some("2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25")) || !init.get("capabilities").is_some_and(Value::is_object) || !init.get("serverInfo").is_some_and(Value::is_object) {
                 return Err(Failure::malformed());
             }
-            connection.write(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await?;
+            connection.write(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), None).await?;
             Ok(connection)
         }).await.unwrap_or_else(|_| Err(Failure::timeout()))
     }
-    async fn write(&mut self, value: &Value) -> Result<(), Failure> {
+    async fn write(&mut self, value: &Value, fence: Option<CallFence<'_>>) -> Result<(), Failure> {
         let mut bytes = serde_json::to_vec(value).map_err(|_| Failure::malformed())?;
         if bytes.len() > MAX_FRAME {
             return Err(Failure::error("request_too_large"));
         }
         bytes.push(b'\n');
+        if fence.is_some_and(|fence| fence.expired()) {
+            return Err(Failure::timeout());
+        }
         self.stdin
             .write_all(&bytes)
             .await
@@ -179,11 +201,19 @@ impl Connection {
         }
         serde_json::from_slice(&bytes).map_err(|_| Failure::malformed())
     }
-    async fn rpc(&mut self, method: &str, params: Value) -> Result<Value, Failure> {
+    async fn rpc(
+        &mut self,
+        method: &str,
+        params: Value,
+        fence: Option<CallFence<'_>>,
+    ) -> Result<Value, Failure> {
         self.sequence += 1;
         let id = self.sequence;
-        self.write(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
+        self.write(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            fence,
+        )
+        .await?;
         for _ in 0..128 {
             let reply = self.read().await?;
             if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
@@ -213,7 +243,7 @@ impl Connection {
             let params = cursor
                 .as_ref()
                 .map_or(json!({}), |cursor| json!({"cursor": cursor}));
-            let result = self.rpc("tools/list", params).await?;
+            let result = self.rpc("tools/list", params, None).await?;
             let page = result
                 .get("tools")
                 .and_then(Value::as_array)
@@ -238,6 +268,7 @@ impl Connection {
         &mut self,
         config: &MountConfig,
         operation: Operation,
+        fence: CallFence<'_>,
     ) -> Result<Value, Failure> {
         let Operation::Invoke {
             definition,
@@ -279,10 +310,14 @@ impl Connection {
         if current.is_none_or(|(generation, _)| generation != definition.generation) {
             return Err(Failure::error("catalog_drift"));
         }
+        if fence.expired() {
+            return Err(Failure::timeout());
+        }
         let result = self
             .rpc(
                 "tools/call",
                 json!({"name": definition.name, "arguments": arguments}),
+                Some(fence),
             )
             .await?;
         let parsed: rmcp::model::CallToolResult =

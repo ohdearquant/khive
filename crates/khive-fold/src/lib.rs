@@ -10,6 +10,7 @@ mod result;
 
 // ── Checkpoint protocol ─────────────────────────────────────────────────
 
+#[cfg(feature = "serde")]
 pub mod checkpoint;
 
 pub use compose::{filter, map, DualFold, FilterFold, MapFold, SequentialFold};
@@ -23,6 +24,7 @@ pub use result::FoldOutcome;
 
 // ── Checkpoint re-exports ────────────────────────────────────────────────
 
+#[cfg(feature = "serde")]
 pub use checkpoint::{Checkpoint, CheckpointStore, InMemoryCheckpointStore};
 
 // ── Anchor primitive ────────────────────────────────────────────────────

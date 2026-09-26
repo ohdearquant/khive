@@ -363,7 +363,7 @@ def recv_exact(sock: socketlib.socket, n: int, deadline: float | None = None) ->
     could hold the caller open arbitrarily long past the caller's actual
     deadline.
     """
-    buf = b""
+    buf = bytearray()
     while len(buf) < n:
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -373,8 +373,8 @@ def recv_exact(sock: socketlib.socket, n: int, deadline: float | None = None) ->
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise RuntimeError("daemon socket closed mid-frame")
-        buf += chunk
-    return buf
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def raw_daemon_roundtrip(sock_path: str, frame: dict, timeout_s: float = 5.0) -> dict:

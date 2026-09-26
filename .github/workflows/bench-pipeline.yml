@@ -27,6 +27,7 @@ on:
       - "crates/khive-mcp/**"
       - "crates/kkernel/**"
       - "scripts/perf/bench_pipeline_daemon.py"
+      - "scripts/perf/test_bench_pipeline_daemon.py"
       - ".github/workflows/bench-pipeline.yml"
 
 permissions:
@@ -78,6 +79,10 @@ jobs:
           cp target/release/kkernel target/release/kkernel-bench
 
       - uses: astral-sh/setup-uv@v5
+
+      - name: Validate recall-score response checks
+        working-directory: .
+        run: python3 -m unittest discover -s scripts/perf -p 'test_bench_pipeline_daemon.py' -v
 
       - name: Run pipeline regression gate
         working-directory: .

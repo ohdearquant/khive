@@ -165,6 +165,45 @@ async fn foreign_errors_timeouts_and_malformed_are_classified_and_redacted() {
 }
 
 #[tokio::test]
+async fn queued_call_expiring_during_catalog_refresh_never_reaches_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    write_catalog(&path, &["A"], false);
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["catalog_delay_ms"] = json!(200);
+    fs::write(&path, state.to_string()).unwrap();
+    let runtime = runtime();
+    let mut cfg = config(&path, &["A"]);
+    cfg.timeout_ms = 600;
+    let registry = registry(&runtime, cfg, false).await;
+
+    let first = registry.dispatch("demo.A", json!({"mode": "delay"}));
+    let second = async {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        registry.dispatch("demo.A", json!({})).await
+    };
+    let (first, second) = tokio::join!(first, second);
+    assert!(
+        first.is_ok(),
+        "the first call must finish inside its deadline"
+    );
+    let error = second.expect_err("the queued call must expire during catalog refresh");
+    let khive_runtime::RuntimeError::Khive(error) = error else {
+        panic!("queued timeout must use the normal error envelope")
+    };
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["details"]["class"],
+        "tool_timeout"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        count(&path, ".calls"),
+        1,
+        "the expired queued call must not be sent"
+    );
+}
+
+#[tokio::test]
 async fn gate_denial_has_no_foreign_call_or_additional_process() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
