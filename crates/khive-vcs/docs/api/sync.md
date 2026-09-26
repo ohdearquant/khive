@@ -9,21 +9,29 @@ visible as the "current" state.
 
 1. Read `<repo_root>/.khive/kg/entities.ndjson` and `edges.ndjson`.
 2. **Validate-first gate** (`validate_ndjson_records`, issue #476): full
-   ADR-020 structural validation — entity kind validity, non-blank entity names, entity/edge
+   ADR-020 structural validation — entity kind validity against the loaded pack
+   registry (including `resource`), non-blank entity names, entity/edge
    timestamp validity, entity/edge sort order, duplicate entity ids,
    duplicate edge ids, duplicate semantic edge triples
    `(source, target, relation)`, dangling edge endpoints, edge
    relation/weight validity — runs **before** the temp DB is created. A
    violation leaves the existing target DB completely untouched.
-3. Build the working database in `<db_path>.tmp`.
+3. Acquire `<db_path>.sync.lock` and refuse an existing target `-wal` or
+   `-shm` sidecar. The target must be closed by every SQLite client before
+   sync. The lock serializes concurrent sync calls; SQLite clients do not
+   participate in it. Recover/checkpoint a stale WAL with SQLite instead of
+   deleting a nonempty WAL file. Build the working database in a unique sibling file.
 4. Upsert entities and populate the FTS5 index. Vector embeddings are
    skipped — they're local-only derived state repaired explicitly via
    `kkernel reindex` (ADR-035 §5).
 5. Upsert edges without normalizing their wire provenance: `properties` map to
    storage `metadata`, and `created_at`/`updated_at` remain independent.
 6. Checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`).
-7. Atomic rename: `<db_path>.tmp` → `<db_path>`. A crash before this step
-   leaves the previous DB intact (all-or-nothing guarantee).
+7. Recheck target sidecars, rename the completed database over `<db_path>`,
+   then reopen it and verify entity and edge counts. Errors before the rename
+   leave the previous DB intact. An error during post-rename verification may
+   leave the new database visible. Failure cleanup removes the unique temporary
+   main file and its `-wal`/`-shm` companions; the lock file remains for reuse.
 
 Records are converted and written in chunks of `SYNC_CHUNK_SIZE` (10,000 in
 production, 5 in test builds) rather than all at once, so peak

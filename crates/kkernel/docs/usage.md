@@ -466,8 +466,12 @@ newer build. Recreate it from the current schema; in-place downgrade is unsuppor
 kkernel sync --repo . --db ~/.khive/working.db --namespace local
 ```
 
-Reads `.khive/kg/{entities,edges}.ndjson`, builds a queryable SQLite DB, and replaces
-the target atomically (tmp + rename). Consumed by the deno CLI's `khive kg sync`.
+Reads `.khive/kg/{entities,edges}.ndjson`, builds a queryable SQLite DB in a
+unique sibling file, and renames it over the target after checkpointing. Close
+all SQLite clients using the target first. Sync refuses existing `-wal` or
+`-shm` sidecars and serializes concurrent sync calls with a sibling lock file.
+Errors before the rename leave the previous database intact. Consumed by the
+deno CLI's `khive kg sync`.
 
 ---
 

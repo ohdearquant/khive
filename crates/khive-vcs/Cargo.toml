@@ -23,6 +23,10 @@ hex = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+libc = { workspace = true }
+fs4 = { workspace = true }
+rusqlite = { workspace = true }
+khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
