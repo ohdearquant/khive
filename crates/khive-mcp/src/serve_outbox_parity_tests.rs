@@ -6,13 +6,14 @@ mod outbox_parity_tests {
     use khive_channel::{Channel, ChannelEnvelope, ChannelError};
     use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken};
     use khive_storage::note::Note;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::sync::Mutex;
 
     #[derive(Clone, Copy)]
     pub(super) enum Outcome {
         Success,
         Transient,
+        RateLimited,
         Permanent,
         Auth,
     }
@@ -62,6 +63,10 @@ mod outbox_parity_tests {
             match *self.outcome.lock().unwrap() {
                 Outcome::Success => Ok(()),
                 Outcome::Transient => Err(ChannelError::Transport("temporary pressure".into())),
+                Outcome::RateLimited => Err(ChannelError::RateLimited {
+                    message: "Telegram asks us to wait".into(),
+                    retry_after: std::time::Duration::from_secs(2),
+                }),
                 Outcome::Permanent => Err(ChannelError::PermanentTransport(
                     "recipient rejected".into(),
                 )),
@@ -232,6 +237,55 @@ mod outbox_parity_tests {
             );
             assert_eq!(props(&runtime, &token, id).await["delivery"], "delivered");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telegram_rate_limit_holds_following_messages_until_retry_after() {
+        let (runtime, token) = fixture();
+        seed(&runtime, &token, "telegram", None).await;
+        seed(&runtime, &token, "telegram", None).await;
+        let channel = RecordingChannel::new("telegram", "sender@example.com", Outcome::RateLimited);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut pause_until = None;
+
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+            &runtime,
+            &Namespace::local(),
+            &cancellation,
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        *channel.outcome.lock().unwrap() = Outcome::Success;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+            &runtime,
+            &Namespace::local(),
+            &cancellation,
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+            &runtime,
+            &Namespace::local(),
+            &cancellation,
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.sent.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
