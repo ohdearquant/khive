@@ -1,5 +1,7 @@
 //! Read-only operator reports over the canonical main backend's attachment rows.
 
+use crate::sql::sql;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs::Metadata;
 use std::path::PathBuf;
@@ -367,22 +369,23 @@ async fn read_page(
     after: Option<&(String, String)>,
 ) -> Result<Vec<AttachmentRow>> {
     let mut reader = sql.reader().await.context("read main attachment page")?;
-    let (where_clause, params) = match after {
+    let (statement, params) = match after {
         Some((record_uuid, role)) => (
-            "WHERE (record_uuid, role) > (?1, ?2)",
+            sql!("blob_ownerless_attachment_page_after"),
             vec![
                 SqlValue::Text(record_uuid.clone()),
                 SqlValue::Text(role.clone()),
+                SqlValue::Integer(PAGE_SIZE as i64),
             ],
         ),
-        None => ("", Vec::new()),
+        None => (
+            sql!("blob_ownerless_attachment_page_first"),
+            vec![SqlValue::Integer(PAGE_SIZE as i64)],
+        ),
     };
     let rows = reader
         .query_all(SqlStatement {
-            sql: format!(
-                "SELECT record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at \
-                 FROM attachments {where_clause} ORDER BY record_uuid COLLATE BINARY, role COLLATE BINARY LIMIT {PAGE_SIZE}"
-            ),
+            sql: statement.into(),
             params,
             label: Some("ownerless-attachment-page".into()),
         })
@@ -407,19 +410,12 @@ async fn read_page(
 }
 
 async fn probe_member(member: &Member, ids: &[String]) -> Result<HashMap<String, Presence>> {
-    let placeholders = (1..=ids.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let sql = member.runtime.sql();
     let mut reader = sql.reader().await?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: format!(
-                "SELECT id, deleted_at FROM entities WHERE id IN ({placeholders}) \
-                 UNION ALL SELECT id, deleted_at FROM notes WHERE id IN ({placeholders})"
-            ),
-            params: ids.iter().cloned().map(SqlValue::Text).collect(),
+            sql: sql!("blob_ownerless_record_probe").into(),
+            params: vec![SqlValue::Text(serde_json::to_string(ids)?)],
             label: Some("ownerless-record-probe".into()),
         })
         .await?;
@@ -465,7 +461,8 @@ fn optional_integer_column(row: &SqlRow, column: &str) -> Result<Option<i64>> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::path::Path;
 
