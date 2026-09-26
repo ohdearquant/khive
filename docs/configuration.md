@@ -106,6 +106,19 @@ widen their namespace visibility, or grant an aggregate mode to profile resoluti
 or binding listing. See the [brain API reference](guide/api-reference.md#brainevent_counts--assertive)
 for actor-filter and anonymous-caller behavior.
 
+### Exec sandbox path matches
+
+The optional `[exec] never` list names executable paths that `exec.run` refuses
+when selected as a registered tool or launched by a child process. The
+seatbelt profile also refuses launches whose final path component is `git`,
+`gh`, or starts with `git-`. These are name and path matches: the profile
+permits execution from the run directory, so a copy launched from a path
+matching neither the listed paths nor those names is outside this rule. Treat
+`never` as a guard against accidental use of
+the listed paths, and use the sandbox's write, network, and environment
+boundaries to limit what a run can affect. `exec.identity` reports the
+resolved `never` paths. See [ADR-181 Amendment 9](adr/ADR-181-exec-verb-sandboxed-run.md#amendment-9-2026-09-25-what-the-version-control-and-never-denial-guarantees).
+
 ### The naming wrinkle: `khive.toml` vs `config.toml`
 
 The two accepted filenames are not interchangeable at every tier, and this
