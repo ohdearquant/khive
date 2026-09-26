@@ -800,8 +800,9 @@ impl AnnBridge {
         self.index.set_last_applied_seq(Some(seq));
     }
 
-    /// Ordinal lookup for streamed tail replay. Built once per replay so
-    /// batches can apply incrementally without rescanning the id-map.
+    /// Ordinal lookup for only the subjects in a coalesced tail. Scan the
+    /// id-map once, but allocate and hash at most one entry per tail subject
+    /// instead of rebuilding a corpus-sized reverse map for a short replay.
     /// Highest ordinal wins for a repeated uuid: inserts append, so the
     /// latest slot is the live one; earlier slots are tombstoned.
     ///
@@ -810,10 +811,22 @@ impl AnnBridge {
     /// stale (tombstoning never clears them) and are excluded here, or a
     /// reused slot's new owner can be tombstoned by a replay op for the
     /// old, already-deleted subject (#1150).
-    pub(crate) fn reverse_map(&self) -> HashMap<Uuid, u32> {
-        let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.index.live_count());
+    pub(crate) fn reverse_map_for(
+        &self,
+        subjects: impl IntoIterator<Item = Uuid>,
+    ) -> HashMap<Uuid, u32> {
+        let wanted: Vec<Uuid> = subjects.into_iter().collect();
+        // One/few-row tails are common: comparing UUID bytes is cheaper
+        // than hashing every id-map entry while scanning the corpus.
+        let wanted_set = (wanted.len() > 4).then(|| wanted.iter().copied().collect::<HashSet<_>>());
+        let mut reverse: HashMap<Uuid, u32> =
+            HashMap::with_capacity(wanted.len().min(self.index.live_count()));
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
-            if self.index.is_tombstoned(ordinal as u32) {
+            let in_tail = match &wanted_set {
+                Some(set) => set.contains(uuid),
+                None => wanted.contains(uuid),
+            };
+            if !in_tail || self.index.is_tombstoned(ordinal as u32) {
                 continue;
             }
             reverse.insert(*uuid, ordinal as u32);
@@ -825,7 +838,7 @@ impl AnnBridge {
     /// `Some(embedding)` replays a final upsert (tombstone the mapped old
     /// ordinal, then exactly one insert); `None` replays a final delete
     /// (tombstone if mapped, no-op otherwise). `reverse` is the map from
-    /// [`reverse_map`](Self::reverse_map), kept current across calls.
+    /// [`reverse_map_for`](Self::reverse_map_for), kept current across calls.
     ///
     /// A delete whose mapped ordinal has been reassigned by an earlier
     /// upsert in this replay is skipped with a warning, not an error: the
@@ -1528,6 +1541,96 @@ async fn scope_counts(
     Ok((get("live")?, get("tail")?))
 }
 
+/// Classification needs the exact *decision*, not the full live count when
+/// the tail is small. This statement counts log rows and reads at most `cap`
+/// scope-matching vec0 rows in the same SQLite snapshot. If the cap is reached,
+/// it is a proven lower bound high enough for Stale-tail; otherwise the count
+/// is exact (including zero, which must classify Empty). A tail of one needs
+/// only a scope-existence probe. Extreme cap arithmetic falls back to an
+/// unlimited, exact count inside this same statement.
+struct ClassificationScopeCounts {
+    live_lower_bound: u64,
+    tail: u64,
+    live_count_exact: bool,
+}
+
+async fn classification_scope_counts(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    s: u64,
+    threshold: f64,
+) -> Result<ClassificationScopeCounts, String> {
+    // For tail > 1, cap >= 2 * tail / threshold guarantees that
+    // ceil(threshold * cap) >= tail despite floating-point rounding. A
+    // multiplier that cannot fit in SQLite INTEGER instead selects the
+    // unbounded exact count. The tail=1 case needs just one live row.
+    let multiplier = (2.0 / threshold).ceil();
+    let multiplier = if multiplier.is_finite() && multiplier < i64::MAX as f64 {
+        SqlValue::Integer(multiplier as i64)
+    } else {
+        SqlValue::Null
+    };
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "WITH tail AS MATERIALIZED (\
+                   SELECT COUNT(*) AS tail_rows FROM ann_write_log \
+                   WHERE namespace = ?1 AND embedding_model = ?2 \
+                     AND field = 'knowledge.atom' AND seq > ?3\
+                 ), cap AS MATERIALIZED (\
+                   SELECT CASE \
+                     WHEN tail_rows = 1 THEN 1 \
+                     WHEN tail_rows = 0 OR ?4 IS NULL \
+                       OR tail_rows > 9223372036854775807 / ?4 THEN -1 \
+                     ELSE tail_rows * ?4 END AS max_rows FROM tail\
+                 ), live AS (\
+                   SELECT COUNT(*) AS live_rows FROM (\
+                     SELECT 1 FROM {table_name} \
+                     WHERE namespace = ?1 AND embedding_model = ?2 \
+                       AND field = 'knowledge.atom' \
+                     LIMIT (SELECT max_rows FROM cap)\
+                   )\
+                 ) \
+                 SELECT live.live_rows AS live, tail.tail_rows AS tail, \
+                        cap.max_rows AS cap FROM live CROSS JOIN tail CROSS JOIN cap"
+            ),
+            params: vec![
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+                multiplier,
+            ],
+            label: Some("ann_classification_scope_counts".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or("classification_scope_counts returned no row")?;
+    let get = |col: &str| match row.get(col) {
+        Some(SqlValue::Integer(n)) => u64::try_from(*n).map_err(|_| format!("negative {col}")),
+        other => Err(format!(
+            "classification_scope_counts {col}: unexpected value {other:?}"
+        )),
+    };
+    let live_lower_bound = get("live")?;
+    let tail = get("tail")?;
+    let cap = match row.get("cap") {
+        Some(SqlValue::Integer(n)) => *n,
+        other => return Err(format!("classification_scope_counts cap: {other:?}")),
+    };
+    Ok(ClassificationScopeCounts {
+        live_lower_bound,
+        tail,
+        live_count_exact: cap < 0 || live_lower_bound < cap as u64,
+    })
+}
+
 /// Coalesce the scope's tail (rows above `s`) to the final op per subject in
 /// ONE aggregate query — SQLite's bare-column-with-MAX guarantee makes `op`
 /// the value from each subject's max-seq row. Returns `(subject, is_delete)`
@@ -1608,7 +1711,7 @@ async fn replay_final_states(
     );
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    let mut reverse = bridge.reverse_map();
+    let mut reverse = bridge.reverse_map_for(finals.iter().map(|(uuid, _)| *uuid));
 
     for batch in finals.chunks(REPLAY_BATCH) {
         let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
@@ -3077,8 +3180,8 @@ async fn classify_and_adopt_segment(
 
     // Rule 3: configured embedder dimensions ≠ segment dimensions → Cold.
     // Resolved from the embedder registry — no storage access. The corpus
-    // itself is touched by exactly one statement in the whole decision path:
-    // `scope_counts` below.
+    // is normally touched by one bounded statement after the tail probe:
+    // `classification_scope_counts` below (with an exact-query fallback).
     match rt.embedder_dimensions(model) {
         Some(dims) if dims as u64 == info.dimensions => {}
         Some(dims) => {
@@ -3140,15 +3243,46 @@ async fn classify_and_adopt_segment(
         }
     }
 
-    // A tail exists — corpus-scale work is inherent from here. Rules 5, 7,
-    // and 8 read (live, tail) from one snapshot.
-    let (live, tail) = match scope_counts(rt, ns, model, s).await {
+    // A tail exists. Rules 5, 7, and 8 use one snapshot; a short tail
+    // usually needs only a bounded scope count, not a full vec0 scan.
+    let rebuild_fraction = ann_rebuild_threshold();
+    let counts = match classification_scope_counts(rt, ns, model, s, rebuild_fraction).await {
         Ok(counts) => counts,
-        Err(e) => {
-            tracing::warn!(error = %e, "ann scope-count read failed; Cold");
-            return SegmentOutcome::Cold;
+        Err(error) => {
+            tracing::warn!(error = %error, "bounded ANN scope count failed; retrying exact count");
+            match scope_counts(rt, ns, model, s).await {
+                Ok((live, tail)) => ClassificationScopeCounts {
+                    live_lower_bound: live,
+                    tail,
+                    live_count_exact: true,
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "ann scope-count read failed; Cold");
+                    return SegmentOutcome::Cold;
+                }
+            }
         }
     };
+    let mut live = counts.live_lower_bound;
+    let mut tail = counts.tail;
+
+    let mut threshold = (rebuild_fraction * live as f64).ceil() as u64;
+    // A saturated cap must prove Stale-tail. This fallback keeps the exact
+    // decision if floating-point or SQLite arithmetic ever violates that
+    // conservative bound; its fresh exact query is internally one snapshot.
+    if !counts.live_count_exact && tail > threshold {
+        match scope_counts(rt, ns, model, s).await {
+            Ok((exact_live, exact_tail)) => {
+                live = exact_live;
+                tail = exact_tail;
+                threshold = (rebuild_fraction * live as f64).ceil() as u64;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ANN exact scope-count fallback failed; Cold");
+                return SegmentOutcome::Cold;
+            }
+        }
+    }
 
     // Rule 5: zero live corpus → Empty, regardless of tail contents.
     if live == 0 {
@@ -3160,7 +3294,6 @@ async fn classify_and_adopt_segment(
     // Rule 7: tail within threshold → Stale-tail: mmap load + final-state
     // replay, then checkpoint so the next restart's tail starts empty and the
     // served bridge returns to mmap backing.
-    let threshold = (ann_rebuild_threshold() * live as f64).ceil() as u64;
     if tail <= threshold {
         let mut bridge = match AnnBridge::load(seg_dir) {
             Ok(b) => b,
@@ -3650,6 +3783,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reverse_map_for_tail_excludes_unrelated_and_tombstoned_owners() {
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+        let absent = Uuid::new_v4();
+        let vectors = vec![
+            1.0, 0.0, 0.0, // old id_a, ordinal 0
+            0.0, 1.0, 0.0, // id_b, ordinal 1
+            0.0, 0.0, 1.0, // latest id_a, ordinal 2
+            1.0, 1.0, 0.0, // unrelated id_c, ordinal 3
+        ];
+        let mut bridge =
+            AnnBridge::build(vectors, 3, vec![id_a, id_b, id_a, id_c]).expect("build bridge");
+        bridge.index.tombstone(0).expect("tombstone old id_a");
+        bridge.index.tombstone(1).expect("tombstone id_b");
+
+        let reverse = bridge.reverse_map_for([id_a, id_b, absent]);
+        assert_eq!(reverse.len(), 1, "only requested live owners are indexed");
+        assert_eq!(reverse.get(&id_a), Some(&2));
+        assert!(!reverse.contains_key(&id_b), "tombstoned owner excluded");
+        assert!(
+            !reverse.contains_key(&id_c),
+            "unrelated live owner excluded"
+        );
+    }
+
     /// #1150 regression: a tombstoned ordinal's stale id-map entry must not
     /// let a later replay op for the old (already-deleted) subject tombstone
     /// the slot a same-batch upsert just reused for a different subject.
@@ -3678,7 +3838,7 @@ mod tests {
         // ordinal 0) is processed BEFORE id_a's own final delete — a legal
         // op order since coalescing only guarantees per-subject dedup, not
         // cross-subject sequencing.
-        let mut reverse = bridge.reverse_map();
+        let mut reverse = bridge.reverse_map_for([id_c, id_a]);
         bridge
             .apply_final_op(&mut reverse, id_c, Some(vec![0.0f32, 0.0, 1.0]))
             .expect("apply upsert");
@@ -5069,6 +5229,90 @@ mod tests {
             .await
             .expect("append fresh-tail log row");
         subject
+    }
+
+    async fn append_warm_delete_tail(rt: &KhiveRuntime, count: usize) {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        for _ in 0..count {
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO ann_write_log \
+                          (namespace, embedding_model, kind, field, subject_id, op) \
+                          VALUES ('local', ?1, 'concept', 'knowledge.atom', ?2, 'delete')"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(WARM_TEST_MODEL.into()),
+                        SqlValue::Text(Uuid::new_v4().to_string()),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("append delete tail");
+        }
+    }
+
+    #[tokio::test]
+    async fn classification_scope_counts_one_tail_row_uses_existence_bound() {
+        let rt = memory_rt_with_embedder();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus_opts(&rt, &token, 12, false).await;
+        append_warm_delete_tail(&rt, 1).await;
+
+        let bounded = classification_scope_counts(&rt, "local", WARM_TEST_MODEL, 0, 0.20)
+            .await
+            .expect("bounded counts");
+        assert_eq!(bounded.tail, 1);
+        assert_eq!(bounded.live_lower_bound, 1);
+        assert!(
+            !bounded.live_count_exact,
+            "one matching row proves Stale-tail"
+        );
+        assert_eq!(
+            scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+                .await
+                .expect("exact counts"),
+            (12, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn classification_scope_counts_preserves_zero_and_threshold_boundary() {
+        let empty_rt = memory_rt_with_embedder();
+        let empty_token = empty_rt.authorize(Namespace::local()).expect("authorize");
+        let _store = empty_rt
+            .vectors_for_model(&empty_token, WARM_TEST_MODEL)
+            .expect("create vec table");
+        append_warm_delete_tail(&empty_rt, 1).await;
+        let empty = classification_scope_counts(&empty_rt, "local", WARM_TEST_MODEL, 0, 0.20)
+            .await
+            .expect("empty counts");
+        assert_eq!(empty.tail, 1);
+        assert_eq!(empty.live_lower_bound, 0);
+        assert!(
+            empty.live_count_exact,
+            "zero must be a predicate-scoped fact"
+        );
+
+        let rt = memory_rt_with_embedder();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus_opts(&rt, &token, 5, false).await;
+        append_warm_delete_tail(&rt, 2).await;
+        let below = classification_scope_counts(&rt, "local", WARM_TEST_MODEL, 0, 0.20)
+            .await
+            .expect("five-row counts");
+        assert_eq!(below.tail, 2);
+        assert_eq!(below.live_lower_bound, 5);
+        assert!(below.live_count_exact);
+        assert!(below.tail > (0.20 * below.live_lower_bound as f64).ceil() as u64);
+
+        seed_warm_corpus_opts(&rt, &token, 1, false).await;
+        let at = classification_scope_counts(&rt, "local", WARM_TEST_MODEL, 0, 0.20)
+            .await
+            .expect("six-row counts");
+        assert_eq!(at.tail, 2);
+        assert_eq!(at.live_lower_bound, 6);
+        assert!(at.live_count_exact);
+        assert!(at.tail <= (0.20 * at.live_lower_bound as f64).ceil() as u64);
     }
 
     #[test]
