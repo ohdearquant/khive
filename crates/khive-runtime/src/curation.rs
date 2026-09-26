@@ -8,6 +8,7 @@
 // logic into `curation/merge.rs` once the dedup policy API stabilises.
 //! Curation operations: entity update/merge and edge-list filter type.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use uuid::Uuid;
 use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{EdgeFilter, PageRequest, SqlValue, TextDocument};
-use khive_storage::{EdgeRelation, Entity, SubstrateKind};
+use khive_storage::{AtomicUnitOp, EdgeRelation, Entity, SqlStatement, SubstrateKind};
 use khive_types::{Details, EdgeEndpointRule, EventKind, KhiveError};
 use rusqlite::OptionalExtension;
 
@@ -41,11 +42,27 @@ pub(crate) mod race_seam {
 
     tokio::task_local! {
         pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+        pub(crate) static BEFORE_ENTITY_INDEX_PUBLISH: Arc<(Barrier, Barrier)>;
+        pub(crate) static BEFORE_ENTITY_VECTOR_PUBLISH: Arc<(Barrier, Barrier)>;
     }
 
     pub(crate) async fn pause_after_read() {
         if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
             barrier.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_before_entity_index_publish() {
+        if let Ok(barriers) = BEFORE_ENTITY_INDEX_PUBLISH.try_with(Arc::clone) {
+            barriers.0.wait().await;
+            barriers.1.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_before_entity_vector_publish() {
+        if let Ok(barriers) = BEFORE_ENTITY_VECTOR_PUBLISH.try_with(Arc::clone) {
+            barriers.0.wait().await;
+            barriers.1.wait().await;
         }
     }
 }
@@ -1726,6 +1743,111 @@ impl KhiveRuntime {
 
     // ---- Internal helpers ----
 
+    async fn apply_entity_index_revision(
+        &self,
+        entity: &Entity,
+        statements: Vec<SqlStatement>,
+    ) -> RuntimeResult<bool> {
+        let namespace = entity.namespace.clone();
+        let id = entity.id.to_string();
+        let version = entity.version;
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                let current = writer
+                    .query_scalar(SqlStatement {
+                        sql: "SELECT version FROM entities \
+                              WHERE namespace=?1 AND id=?2 AND deleted_at IS NULL"
+                            .into(),
+                        params: vec![SqlValue::Text(namespace), SqlValue::Text(id)],
+                        label: Some("entity-index-revision".into()),
+                    })
+                    .await?;
+                if !matches!(current, Some(SqlValue::Integer(current)) if current == version) {
+                    return Ok(Box::new(false) as Box<dyn Any + Send>);
+                }
+                for statement in statements {
+                    writer.execute(statement).await?;
+                }
+                Ok(Box::new(true) as Box<dyn Any + Send>)
+            })
+        });
+        self.sql()
+            .atomic_unit(op)
+            .await?
+            .downcast::<bool>()
+            .map(|result| *result)
+            .map_err(|_| RuntimeError::Internal("invalid entity index outcome".into()))
+    }
+
+    fn entity_vector_insert_statements(
+        table: &str,
+        entity: &Entity,
+        model_name: &str,
+        vector: &[f32],
+    ) -> Vec<SqlStatement> {
+        let subject = entity.id.to_string();
+        let kind = SubstrateKind::Entity.to_string();
+        let field = "entity.body";
+        let blob = vector
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        vec![
+            SqlStatement {
+                sql: format!(
+                    "INSERT INTO ann_write_log \
+                     (namespace, embedding_model, kind, field, subject_id, op) \
+                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                     FROM {table} WHERE subject_id=?1 AND NOT \
+                     (namespace=?2 AND embedding_model=?3 AND kind=?4 AND field=?5)"
+                ),
+                params: vec![
+                    SqlValue::Text(subject.clone()),
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(model_name.to_string()),
+                    SqlValue::Text(kind.clone()),
+                    SqlValue::Text(field.into()),
+                ],
+                label: Some("entity-reindex-log-delete".into()),
+            },
+            SqlStatement {
+                sql: format!("DELETE FROM {table} WHERE subject_id=?1"),
+                params: vec![SqlValue::Text(subject.clone())],
+                label: Some("entity-reindex-vector-delete".into()),
+            },
+            SqlStatement {
+                sql: format!(
+                    "INSERT INTO {table} \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                ),
+                params: vec![
+                    SqlValue::Text(subject.clone()),
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(kind.clone()),
+                    SqlValue::Text(field.into()),
+                    SqlValue::Text(model_name.to_string()),
+                    SqlValue::Blob(blob),
+                ],
+                label: Some("entity-reindex-vector-insert".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(model_name.to_string()),
+                    SqlValue::Text(kind),
+                    SqlValue::Text(field.into()),
+                    SqlValue::Text(subject),
+                ],
+                label: Some("entity-reindex-log-upsert".into()),
+            },
+        ]
+    }
+
     /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
     /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
@@ -1736,8 +1858,8 @@ impl KhiveRuntime {
     /// logs a warning and continues to the next model. The FTS step is fail-closed
     /// (propagates error). Callers (update_entity, merge_entity) have already committed
     /// the entity row, so a partial embed miss leaves a stale vector rather than
-    /// rolling back the update — acceptable because SqliteVecStore::insert is an upsert
-    /// (the prior vector stays intact on failure, keeping the record searchable).
+    /// rolling back the update. Each failed guarded vector replacement rolls back
+    /// its own index writes, keeping the prior row searchable.
     pub(crate) async fn reindex_entity(
         &self,
         token: &NamespaceToken,
@@ -1755,10 +1877,25 @@ impl KhiveRuntime {
         embedding_plan: &EmbeddingModelPlan,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         // Use entity.namespace (authoritative) rather than token.namespace().as_str() (caller claim).
-        let ns = entity.namespace.clone();
         let doc = entity_fts_document(entity);
         let embed_body = doc.body.clone();
-        self.text(token)?.upsert_document(doc).await?;
+        let _ = self.text(token)?;
+        #[cfg(test)]
+        race_seam::pause_before_entity_index_publish().await;
+        let statements = khive_db::stores::text::delete_document_statements(
+            "fts_entities",
+            &entity.namespace,
+            entity.id,
+        )
+        .into_iter()
+        .chain(khive_db::stores::text::insert_document_statements(
+            "fts_entities",
+            &doc,
+        ))
+        .collect();
+        if !self.apply_entity_index_revision(entity, statements).await? {
+            return Ok(crate::retrieval::EmbeddingTruncationReport::default());
+        }
 
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
@@ -1769,22 +1906,59 @@ impl KhiveRuntime {
                 Ok(outcome) => {
                     report.observe(&outcome);
                     match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => {
-                            if let Err(e) = vs
-                                .insert(
-                                    entity.id,
-                                    SubstrateKind::Entity,
-                                    &ns,
-                                    "entity.body",
-                                    vec![outcome.vector],
-                                )
-                                .await
+                        Ok(_) => {
+                            if let Some(index) =
+                                outcome.vector.iter().position(|value| !value.is_finite())
                             {
                                 tracing::warn!(
                                     model = model_name,
                                     id = %entity.id,
-                                    "reindex_entity: vector insert failed, skipping model: {e}"
+                                    index,
+                                    "reindex_entity: non-finite vector, skipping model"
                                 );
+                                continue;
+                            }
+                            let (storage_model, dimensions) = match self
+                                .vector_model_metadata(model_name)
+                            {
+                                Ok(metadata) => metadata,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        model = model_name,
+                                        id = %entity.id,
+                                        "reindex_entity: could not resolve vector model, skipping: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if outcome.vector.len() != dimensions {
+                                tracing::warn!(
+                                    model = model_name,
+                                    id = %entity.id,
+                                    "reindex_entity: vector dimensions do not match model, skipping"
+                                );
+                                continue;
+                            }
+                            let table =
+                                format!("vec_{}", crate::config::sanitize_key(&storage_model));
+                            let statements = Self::entity_vector_insert_statements(
+                                &table,
+                                entity,
+                                &storage_model,
+                                &outcome.vector,
+                            );
+                            #[cfg(test)]
+                            race_seam::pause_before_entity_vector_publish().await;
+                            match self.apply_entity_index_revision(entity, statements).await {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        model = model_name,
+                                        id = %entity.id,
+                                        "reindex_entity: vector insert failed, skipping model: {e}"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -12486,6 +12660,72 @@ mod tests {
         {
             Ok(std::sync::Arc::new(MergeTestVecService { dims: self.dims }))
         }
+    }
+
+    async fn assert_delete_during_entity_reindex_does_not_restore_indexes(pause_vector: bool) {
+        const MODEL: &str = "entity-reindex-delete-race";
+        let rt = Arc::new(KhiveRuntime::memory().unwrap());
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(MODEL, 4));
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "DeletedDuringReindex",
+                Some("the stale document must not return"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let id = entity.id;
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        let reindex_rt = Arc::clone(&rt);
+        let reindex_tok = tok.clone();
+        let reindex = async move { reindex_rt.reindex_entity(&reindex_tok, &entity).await };
+        let reindex = if pause_vector {
+            tokio::spawn(
+                race_seam::BEFORE_ENTITY_VECTOR_PUBLISH.scope(Arc::clone(&barriers), reindex),
+            )
+        } else {
+            tokio::spawn(
+                race_seam::BEFORE_ENTITY_INDEX_PUBLISH.scope(Arc::clone(&barriers), reindex),
+            )
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), barriers.0.wait())
+            .await
+            .expect("reindex reached publication boundary");
+        assert!(rt.delete_entity(&tok, id, false).await.unwrap());
+        barriers.1.wait().await;
+        reindex.await.unwrap().unwrap();
+
+        assert!(rt
+            .text(&tok)
+            .unwrap()
+            .get_document("local", id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            rt.vectors_for_model(&tok, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_entity_cannot_restore_fts_at_pending_reindex() {
+        assert_delete_during_entity_reindex_does_not_restore_indexes(false).await;
+    }
+
+    #[tokio::test]
+    async fn deleted_entity_cannot_restore_vector_after_embedding() {
+        assert_delete_during_entity_reindex_does_not_restore_indexes(true).await;
     }
 
     #[tokio::test]
