@@ -26,6 +26,23 @@ const IMAP_FOLDER: &str = "INBOX";
 /// `poll_page` path.
 const IMAP_PAGE_LIMIT: usize = 50;
 
+/// Scope the connector's pre-account UID key to the configured mailbox.
+/// Keep the connector's original key separately for the read-only migration
+/// lookup; new rows are written only under this account-scoped form.
+fn account_scoped_imap_id(old_id: &str, mailbox: &str) -> String {
+    let account = mailbox.to_lowercase();
+    if let Some((host_and_validity, uid)) = old_id.rsplit_once(':') {
+        if let Some((host, validity)) = host_and_validity.rsplit_once(':') {
+            if host.starts_with("imap:") {
+                return format!("{host}:{account}:{validity}:{uid}");
+            }
+        }
+    }
+    // An alternate connector can supply an opaque key. Still include the
+    // account so an unexpected format cannot collapse two credentials.
+    format!("imap:{account}:{old_id}")
+}
+
 // Quarantine sender prefix invariant: `email:quarantine` must retain the
 // channel's `email:` prefix because prefix-keyed consumers use it to surface
 // the notification. Renaming it outside that prefix silently hides alerts.
@@ -284,7 +301,12 @@ impl EmailChannel {
         if let Some(date) = email.date {
             env = env.with_sent_at(date);
         }
-        env = env.with_external_id(&email.imap_external_id);
+        env = env
+            .with_external_id(account_scoped_imap_id(
+                &email.imap_external_id,
+                &self.config.mailbox,
+            ))
+            .with_legacy_external_id(&email.imap_external_id);
 
         env.metadata
             .insert("quarantined".to_string(), "true".to_string());
@@ -316,7 +338,12 @@ impl EmailChannel {
         let body = format!("(khive: IMAP message UID {uid} was quarantined: {reason})");
         let mut env = ChannelEnvelope::new(EMAIL_QUARANTINE_SENDER, to.clone(), body)
             .with_quarantine_replay(raw_bytes.unwrap_or_default(), to);
-        env = env.with_external_id(imap_external_id);
+        env = env
+            .with_external_id(account_scoped_imap_id(
+                imap_external_id,
+                &self.config.mailbox,
+            ))
+            .with_legacy_external_id(imap_external_id);
         env.metadata
             .insert("quarantined".to_string(), "true".to_string());
         env.metadata
@@ -479,7 +506,12 @@ impl EmailChannel {
         }
         // Always set external_id from the stable IMAP-based dedup key. Never derive it
         // from Message-ID, which is optional and could be absent or absent-by-design.
-        env = env.with_external_id(&email.imap_external_id);
+        env = env
+            .with_external_id(account_scoped_imap_id(
+                &email.imap_external_id,
+                &self.config.mailbox,
+            ))
+            .with_legacy_external_id(&email.imap_external_id);
         if let Some(corr) = email.correlation() {
             env = env.with_correlation(corr);
         }
@@ -748,6 +780,36 @@ mod tests {
         assert_eq!(ch.kind(), "email");
     }
 
+    #[test]
+    fn same_imap_uid_in_two_accounts_has_distinct_new_keys_and_shared_legacy_key() {
+        let raw = "imap:mail.example.com:17:42";
+        let mut config_a = make_config("maintainer@example.com");
+        config_a.mailbox = "A@Example.com".to_string();
+        let mut config_b = make_config("maintainer@example.com");
+        config_b.mailbox = "b@example.com".to_string();
+        let a = build_channel_from(config_a, vec![]);
+        let b = build_channel_from(config_b, vec![]);
+        let a_env = a.disposition(vec![SelectedMessage::Email(Box::new(make_email(
+            "maintainer@example.com",
+            raw,
+        )))]);
+        let b_env = b.disposition(vec![SelectedMessage::Email(Box::new(make_email(
+            "maintainer@example.com",
+            raw,
+        )))]);
+        assert_eq!(
+            a_env[0].external_id.as_deref(),
+            Some("imap:mail.example.com:a@example.com:17:42")
+        );
+        assert_eq!(
+            b_env[0].external_id.as_deref(),
+            Some("imap:mail.example.com:b@example.com:17:42")
+        );
+        assert_ne!(a_env[0].external_id, b_env[0].external_id);
+        assert_eq!(a_env[0].legacy_external_id.as_deref(), Some(raw));
+        assert_eq!(b_env[0].legacy_external_id.as_deref(), Some(raw));
+    }
+
     // --- Authorization: authorized sender ---
 
     #[tokio::test]
@@ -759,7 +821,11 @@ mod tests {
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
         // external_id is now always the stable IMAP key, not Message-ID.
-        assert_eq!(envs[0].external_id.as_deref(), Some("imap:test:0:1"));
+        assert_eq!(
+            envs[0].external_id.as_deref(),
+            Some("imap:test:user@example.com:0:1")
+        );
+        assert_eq!(envs[0].legacy_external_id.as_deref(), Some("imap:test:0:1"));
         assert_eq!(envs[0].from, "email:maintainer@example.com");
     }
 
@@ -1401,7 +1467,7 @@ mod tests {
 
         let quarantined = envs
             .iter()
-            .find(|e| e.external_id.as_deref() == Some("imap:test:0:1"))
+            .find(|e| e.external_id.as_deref() == Some("imap:test:user@example.com:0:1"))
             .expect("unauthorized message must still be present, quarantined");
         assert_eq!(
             quarantined.from, EMAIL_QUARANTINE_SENDER,
@@ -1417,7 +1483,7 @@ mod tests {
 
         let attributed = envs
             .iter()
-            .find(|e| e.external_id.as_deref() == Some("imap:test:0:2"))
+            .find(|e| e.external_id.as_deref() == Some("imap:test:user@example.com:0:2"))
             .expect("authorized message must be attributed");
         assert_eq!(attributed.from, "email:maintainer@example.com");
     }
@@ -1732,7 +1798,7 @@ mod tests {
         );
         assert_eq!(
             page2.envelopes[0].external_id.as_deref(),
-            Some("imap:mail.example.com:7:6"),
+            Some("imap:mail.example.com:a@example.com:7:6"),
             "the fresh instance must correctly pick up the newly-arrived UID"
         );
         assert_eq!(
@@ -1913,7 +1979,9 @@ mod tests {
         let quarantined = page
             .envelopes
             .iter()
-            .find(|e| e.external_id.as_deref() == Some("imap:imap.example.com:4:1"))
+            .find(|e| {
+                e.external_id.as_deref() == Some("imap:imap.example.com:user@example.com:4:1")
+            })
             .expect(
                 "the malformed UID's stable external_id must be present on the \
                  envelope actually handed to comm.ingest",
@@ -1984,7 +2052,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             envelopes[1].external_id.as_deref(),
-            Some("imap:imap.example.com:4:2")
+            Some("imap:imap.example.com:user@example.com:4:2")
         );
     }
 

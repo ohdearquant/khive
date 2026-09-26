@@ -56,13 +56,17 @@ pub struct ChannelEnvelope {
     pub sent_at: Option<DateTime<Utc>>,
     /// External deduplication key.
     ///
-    /// For IMAP email the format is `imap:{host}:{uidvalidity}:{uid}` (e.g.
-    /// `imap:mail.example.com:1234567:42`).  This key is derived from the IMAP
-    /// UIDVALIDITY and UID values, not from the RFC 822 `Message-ID` header.
+    /// For IMAP email the format is `imap:{host}:{account}:{uidvalidity}:{uid}`.
+    /// This key is derived from the account, UIDVALIDITY and UID values, not
+    /// from the RFC 822 `Message-ID` header.
     /// Adapters must not populate this field when UIDVALIDITY or UID is absent
     /// or zero; `comm.ingest` performs atomic dedup against the unique index on
     /// this field.
     pub external_id: Option<String>,
+    /// The pre-account IMAP dedup key, used only to recognize stored rows
+    /// during the one-release migration window. Never persisted on new rows.
+    #[serde(default)]
+    pub legacy_external_id: Option<String>,
     /// External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID header
     /// or In-Reply-To header value for email). The handler resolves this to an internal UUID.
     pub correlation_external_id: Option<String>,
@@ -108,6 +112,7 @@ impl ChannelEnvelope {
             subject: None,
             sent_at: None,
             external_id: None,
+            legacy_external_id: None,
             correlation_external_id: None,
             metadata: HashMap::new(),
             quarantine_replay: None,
@@ -134,6 +139,12 @@ impl ChannelEnvelope {
     /// Attach an external deduplication key.
     pub fn with_external_id(mut self, id: impl Into<String>) -> Self {
         self.external_id = Some(id.into());
+        self
+    }
+
+    /// Carry the old IMAP key for a read-only migration lookup on ingest.
+    pub fn with_legacy_external_id(mut self, id: impl Into<String>) -> Self {
+        self.legacy_external_id = Some(id.into());
         self
     }
 

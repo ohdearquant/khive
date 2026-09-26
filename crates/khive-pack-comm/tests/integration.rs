@@ -5577,6 +5577,84 @@ async fn ingest_dedup_returns_existing_canonical_thread_id() {
     );
 }
 
+#[tokio::test]
+async fn imap_account_keys_keep_accounts_distinct_and_recognize_same_account_legacy_row() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let old_id = "imap:mail.example.com:17:42";
+    let account_a_id = "imap:mail.example.com:a@example.com:17:42";
+    let account_b_id = "imap:mail.example.com:b@example.com:17:42";
+
+    // A stored pre-release row is never rewritten when its UID is replayed.
+    let old = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:sender@example.com", "to": "email:a@example.com",
+                "content": "old account A body", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": old_id,
+            }),
+        )
+        .await
+        .expect("seed old-key fixture");
+    assert_eq!(old["deduplicated"], false);
+
+    let replay_a = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:sender@example.com", "to": "email:a@example.com",
+                "content": "replayed account A body", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": account_a_id,
+                "legacy_external_id": old_id,
+            }),
+        )
+        .await
+        .expect("same-account old key must be recognized");
+    assert_eq!(replay_a["deduplicated"], true);
+    assert_eq!(replay_a["thread_id"], old["thread_id"]);
+
+    // The shared old key belongs to account A, so it cannot suppress B.
+    let first_b = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:sender@example.com", "to": "email:b@example.com",
+                "content": "new account B body", "channel_kind": "email",
+                "channel_slug": "b@example.com", "external_id": account_b_id,
+                "legacy_external_id": old_id,
+            }),
+        )
+        .await
+        .expect("other account must ingest independently");
+    assert_eq!(first_b["deduplicated"], false);
+    assert_ne!(first_b["full_id"], old["full_id"]);
+
+    let retry_b = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:sender@example.com", "to": "email:b@example.com",
+                "content": "retry account B", "channel_kind": "email",
+                "channel_slug": "b@example.com", "external_id": account_b_id,
+                "legacy_external_id": old_id,
+            }),
+        )
+        .await
+        .expect("new key remains idempotent");
+    assert_eq!(retry_b["deduplicated"], true);
+
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let old_note = rt
+        .notes(&token)
+        .expect("note store")
+        .get_note(old["full_id"].as_str().unwrap().parse().unwrap())
+        .await
+        .expect("old row lookup")
+        .expect("old row retained");
+    assert_eq!(old_note.content, "old account A body");
+    assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
+}
+
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
 #[tokio::test]
 async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {
