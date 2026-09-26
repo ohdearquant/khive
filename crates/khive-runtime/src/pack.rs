@@ -1929,6 +1929,43 @@ impl VerbRegistry {
         }
     }
 
+    /// Find the unique configured backend holding an entity for deletion.
+    /// Includes tombstones so soft deletion cannot hide a duplicate owner.
+    /// The dispatch-authorized token is preserved; lookup is namespace-agnostic.
+    pub async fn resolve_entity_delete_runtime(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<Option<KhiveRuntime>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.entity_runtime(token, id).await,
+            None => {
+                let store = runtime.entities(token)?;
+                let entity = store.get_entity_including_deleted(id).await?;
+                Ok(entity.map(|_| runtime.clone()))
+            }
+        }
+    }
+
+    /// Clean main-backend attachments after no live or tombstoned owner remains.
+    /// A live or tombstoned entity on any configured backend keeps its roots.
+    pub async fn cleanup_deleted_entity_attachments(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<bool, RuntimeError> {
+        if self
+            .resolve_entity_delete_runtime(runtime, token, id)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        runtime.delete_entity_attachments_on_core(id).await
+    }
+
     /// Recheck a merged-entity read against the kept id before returning it.
     /// The submitted argument shape is the verb's ordinary shape with the
     /// effective id substituted. The dispatch's original check remains its
