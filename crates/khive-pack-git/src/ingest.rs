@@ -5,17 +5,21 @@
 //! and crates/khive-pack-git/docs/ingest.md for the full design notes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    secret_gate, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_types::EdgeRelation;
 
 use crate::hook;
 use crate::refs;
@@ -1474,7 +1478,6 @@ async fn write_page_checkpoint(
 // ── commits ─────────────────────────────────────────────────────────────────
 
 const RECORD_SEP: char = '\u{1e}';
-const FIELD_SEP: char = '\u{1f}';
 const TOUCHED_HEADER_PREFIX: &[u8] = b"/\x1e";
 
 struct RawCommit {
@@ -1496,7 +1499,7 @@ pub(crate) enum GitLogPhase {
     TouchedFiles,
 }
 
-/// A non-zero-exit `git log` failure, carrying its phase and raw stderr for
+/// A non-zero-exit history command failure, carrying its phase and raw stderr for
 /// classification by `is_missing_promisor_object`.
 #[derive(Debug)]
 pub(crate) struct GitLogError {
@@ -1507,7 +1510,7 @@ pub(crate) struct GitLogError {
 impl std::fmt::Display for GitLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cmd = match self.phase {
-            GitLogPhase::Metadata => "git log",
+            GitLogPhase::Metadata => "git log/cat-file",
             GitLogPhase::TouchedFiles => "git log --name-only",
         };
         write!(f, "{cmd} failed: {}", self.stderr)
@@ -1528,18 +1531,17 @@ impl GitLogError {
     }
 }
 
-/// Walk local git history via `git log` with a stable, machine-parseable
-/// format. See crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
+/// Walk local history using `git log` only for fixed-format metadata, then
+/// length-framed raw objects from `git cat-file --batch` for contributor text.
+/// See crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
 fn walk_commits(
     repo: &Path,
     since_sha: Option<&str>,
     snapshot_head: &str,
 ) -> Result<Vec<RawCommit>> {
-    // Raw control-byte separators embedded directly in the format string
-    // (not git's `%xHH` escape syntax) — passed as a single argv element
-    // (never through a shell), so the literal bytes survive intact and git's
-    // pretty-format engine emits any non-`%` character verbatim.
-    let format = format!("%H{FIELD_SEP}%h{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%cI{FIELD_SEP}%P{FIELD_SEP}%s{FIELD_SEP}%b{RECORD_SEP}");
+    // These four fields are Git-generated IDs/date only. Contributor-controlled
+    // author and message bytes never enter this line-delimited stream.
+    let format = "%H%x00%h%x00%cI%x00%P%x00";
     let mut args = vec![
         "log".to_string(),
         "--reverse".to_string(),
@@ -1563,40 +1565,215 @@ fn walk_commits(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut commits = Vec::new();
-    for record in text.split(RECORD_SEP) {
-        let record = record.trim_matches('\n');
+    let mut metadata = Vec::new();
+    for record in output.stdout.split(|byte| *byte == b'\n') {
         if record.is_empty() {
             continue;
         }
-        let fields: Vec<&str> = record.splitn(8, FIELD_SEP).collect();
-        if fields.len() < 8 {
-            continue;
+        let fields: Vec<&[u8]> = record.split(|byte| *byte == 0).collect();
+        if fields.len() != 5 || !fields[4].is_empty() {
+            bail!("git log returned a malformed commit metadata record");
         }
-        let sha = fields[0].to_string();
-        let short_sha = fields[1].to_string();
-        let author = fields[2].to_string();
-        let author_email = fields[3].to_string();
-        let committed_at = fields[4].to_string();
-        let parents = fields[5]
-            .split_whitespace()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let subject = fields[6].to_string();
-        let body = fields[7].trim_end_matches('\n').to_string();
-        commits.push(RawCommit {
+        let text = |field: &[u8]| String::from_utf8_lossy(field).into_owned();
+        let sha = text(fields[0]);
+        if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("git log returned a malformed commit id");
+        }
+        metadata.push((
             sha,
-            short_sha,
+            text(fields[1]),
+            text(fields[2]),
+            text(fields[3])
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    if metadata.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A regular file avoids a bidirectional pipe deadlock for long histories:
+    // cat-file can read every SHA while its length-framed stdout is collected.
+    let mut input = tempfile::tempfile().context("creating cat-file request list")?;
+    for (sha, _, _, _) in &metadata {
+        writeln!(input, "{sha}").context("writing cat-file request list")?;
+    }
+    input.seek(SeekFrom::Start(0))?;
+    let objects = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::from(input))
+        .output()
+        .context("spawning git cat-file --batch")?;
+    if !objects.status.success() {
+        return Err(anyhow::Error::new(GitLogError {
+            phase: GitLogPhase::Metadata,
+            stderr: String::from_utf8_lossy(&objects.stderr).into_owned(),
+        }));
+    }
+    parse_batch_commits(&metadata, &objects.stdout)
+}
+
+type CommitMetadata = (String, String, String, Vec<String>);
+
+fn parse_batch_commits(metadata: &[CommitMetadata], bytes: &[u8]) -> Result<Vec<RawCommit>> {
+    let mut offset = 0;
+    let mut commits = Vec::with_capacity(metadata.len());
+    for (sha, short_sha, committed_at, parents) in metadata {
+        let line_end = bytes[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| offset + index)
+            .context("git cat-file returned a truncated object header")?;
+        let header = std::str::from_utf8(&bytes[offset..line_end])
+            .context("git cat-file returned a non-UTF-8 object header")?;
+        let expected = format!("{sha} commit ");
+        let length: usize = header
+            .strip_prefix(&expected)
+            .context("git cat-file returned an unexpected object")?
+            .parse()
+            .context("git cat-file returned an invalid object length")?;
+        offset = line_end + 1;
+        let end = offset
+            .checked_add(length)
+            .context("git cat-file object length overflow")?;
+        let object = bytes
+            .get(offset..end)
+            .context("git cat-file returned a truncated object")?;
+        if bytes.get(end) != Some(&b'\n') {
+            bail!("git cat-file omitted the object terminator");
+        }
+        offset = end + 1;
+        let separator = object
+            .windows(2)
+            .position(|part| part == b"\n\n")
+            .context("git commit object has no message separator")?;
+        let headers = &object[..separator];
+        let author_line = headers
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"author "))
+            .context("git commit object has no author")?;
+        let author_text = String::from_utf8_lossy(author_line);
+        let email_end = author_text
+            .rfind('>')
+            .context("git commit author has no email end")?;
+        let email_start = author_text[..email_end]
+            .rfind(" <")
+            .context("git commit author has no email start")?;
+        let author = author_text[..email_start].to_string();
+        let author_email = author_text[email_start + 2..email_end].to_string();
+        let message = String::from_utf8_lossy(&object[separator + 2..]);
+        let (subject, body) = message.split_once('\n').unwrap_or((message.as_ref(), ""));
+        commits.push(RawCommit {
+            sha: sha.clone(),
+            short_sha: short_sha.clone(),
             author,
             author_email,
-            committed_at,
-            parents,
-            subject,
-            body,
+            committed_at: committed_at.clone(),
+            parents: parents.clone(),
+            subject: subject.to_string(),
+            body: body
+                .trim_start_matches('\n')
+                .trim_end_matches('\n')
+                .to_string(),
         });
     }
+    if offset != bytes.len() {
+        bail!("git cat-file returned trailing object data");
+    }
     Ok(commits)
+}
+
+#[cfg(test)]
+mod commit_framing_tests {
+    use super::*;
+
+    #[test]
+    fn contributor_control_bytes_do_not_split_or_drop_commits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-w", "-t", "tree", "--stdin"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+
+        let cases = [
+            (
+                "Author",
+                "body separator",
+                format!("first\n\npart{RECORD_SEP}tail\n"),
+            ),
+            (
+                "Author",
+                "subject separator",
+                format!("second{RECORD_SEP}part\n\nbody\n"),
+            ),
+            (
+                "Name\u{1f}Tail",
+                "author separator",
+                "third\n\nbody\n".to_string(),
+            ),
+        ];
+        let mut parent: Option<String> = None;
+        for (author, _, message) in &cases {
+            let parent_header = parent
+                .as_ref()
+                .map(|sha| format!("parent {sha}\n"))
+                .unwrap_or_default();
+            let raw = format!(
+                "tree {tree}\n{parent_header}author {author} <author@example.invalid> 1760000000 +0000\ncommitter Test <test@example.invalid> 1760000000 +0000\n\n{message}"
+            );
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "hash-object",
+                    "--literally",
+                    "-w",
+                    "-t",
+                    "commit",
+                    "--stdin",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(raw.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            parent = Some(String::from_utf8(output.stdout).unwrap().trim().to_string());
+        }
+        let commits = walk_commits(repo, None, parent.as_deref().unwrap()).unwrap();
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].subject, "first");
+        assert_eq!(commits[0].body, format!("part{RECORD_SEP}tail"));
+        assert_eq!(commits[1].subject, format!("second{RECORD_SEP}part"));
+        assert_eq!(commits[1].body, "body");
+        assert_eq!(commits[2].author, "Name\u{1f}Tail");
+        assert_eq!(commits[2].author_email, "author@example.invalid");
+    }
 }
 
 /// `sha -> [touched paths]` for every commit in `repo`'s history, via a
@@ -2139,15 +2316,7 @@ async fn ingest_commits(
             ));
             break;
         }
-        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
-            local_sha_to_id.insert(c.sha.clone(), existing);
-            report.commits_skipped_existing += 1;
-            if !cursor_stalled {
-                checkpoint.last_completed_sha.clone_from(&c.sha);
-                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
-            }
-            continue;
-        }
+        let existing = find_commit_by_sha(runtime, token, &c.sha).await?;
 
         let masked = MaskedCommitFields::new(c);
         let content = if masked.body.trim().is_empty() {
@@ -2254,6 +2423,37 @@ async fn ingest_commits(
         };
         if let Some(pr_id) = pr_id {
             annotates.insert(pr_id.to_string());
+        }
+
+        if let Some(existing) = existing {
+            // A SHA is shared across project anchors. The natural-key hit
+            // skips note creation, but it must still materialize this
+            // project's annotations from the same snapshot/path map as the
+            // create path before advancing this project's checkpoint.
+            let links = annotates
+                .iter()
+                .map(|target| LinkSpec {
+                    namespace: None,
+                    source_id: existing,
+                    target_id: Uuid::parse_str(target).expect("annotation target is a UUID"),
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                })
+                .collect();
+            if let Err(error) = runtime.link_many(token, links).await {
+                record_write_failure(report, "link", "commit", c.sha.clone(), error);
+                stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+            local_sha_to_id.insert(c.sha.clone(), existing);
+            report.commits_skipped_existing += 1;
+            if !cursor_stalled {
+                checkpoint.last_completed_sha.clone_from(&c.sha);
+                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
+            }
+            continue;
         }
 
         let mut properties = json!({

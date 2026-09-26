@@ -337,7 +337,7 @@ pub async fn run_sync_remote(
 }
 
 /// Injection points for #475 failure-injection tests: simulate a crash at each
-/// publish step so tests can assert readers never observe a mixed cache state.
+/// staging step so tests can assert readers never observe a mixed cache state.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishFailAt {
@@ -348,14 +348,14 @@ enum PublishFailAt {
 }
 
 /// Publish a complete `{entities.ndjson, edges.ndjson, meta.json}` triple to
-/// `<remotes_root>/<name>/` as a single atomic unit.
+/// `<remotes_root>/<name>/` as one complete cache generation.
 ///
 /// Builds a complete staging directory (a sibling of the cache directory,
 /// under `remotes_root`) containing all three files, then switches visibility
-/// with one directory-rename swap ([`atomic_replace_dir`]). A crash or error
-/// at any point before the swap leaves the existing cache untouched; a crash
-/// or error during the swap either leaves the old cache in place or completes
-/// to the new cache — a reader never observes a mix of old and new files.
+/// with [`atomic_replace_dir`]. A crash between its two renames can leave the
+/// target briefly absent and the old generation in a `.replaced-*` sibling;
+/// the next publish recovers that sibling before replacing it. A reader never
+/// observes a mix of old and new files within the target directory.
 fn publish_remote_cache(
     remotes_root: &Path,
     name: &str,
@@ -366,6 +366,12 @@ fn publish_remote_cache(
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(remotes_root)
         .with_context(|| format!("creating {}", remotes_root.display()))?;
+    let cache_dir = remotes_root.join(name);
+    // Recovery precedes staging I/O too: an error while constructing the next
+    // generation must not leave a prior crash's backup as the only copy.
+    recover_stale_backups(&cache_dir, |from: &Path, to: &Path| {
+        std::fs::rename(from, to)
+    })?;
     let staging = tempfile::TempDir::new_in(remotes_root).context("creating staging dir")?;
 
     write_sorted_entities(&staging.path().join("entities.ndjson"), entities)
@@ -391,7 +397,6 @@ fn publish_remote_cache(
         anyhow::bail!("injected failure after staged meta write, before swap");
     }
 
-    let cache_dir = remotes_root.join(name);
     #[cfg(test)]
     if fail_at == Some(PublishFailAt::BeforeSwap) {
         anyhow::bail!("injected failure before swap");
@@ -407,30 +412,92 @@ fn publish_remote_cache(
 /// into place. If `target_dir` already exists, the existing directory is first
 /// renamed to a sibling backup path, then `new_dir` is renamed into
 /// `target_dir`'s place; the backup is removed only after the swap succeeds.
-/// If the second rename fails, the backup is restored so the old cache is
-/// never lost. Both renames are single filesystem rename(2) calls, each of
+/// If the second rename fails, restoration is attempted and any restoration
+/// failure names the retained backup. Both renames are filesystem rename(2) calls, each of
 /// which is atomic — at every instant `target_dir` resolves to either the
 /// complete old directory, is briefly absent, or resolves to the complete new
 /// directory; it never contains a mix of old and new files.
 fn atomic_replace_dir(new_dir: &Path, target_dir: &Path) -> Result<()> {
+    atomic_replace_dir_with(new_dir, target_dir, |from: &Path, to: &Path| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn recover_stale_backups(
+    target_dir: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let parent = target_dir.parent().context("cache target has no parent")?;
+    let name = target_dir
+        .file_name()
+        .and_then(|part| part.to_str())
+        .context("cache target has no UTF-8 name")?;
+    let backup_prefix = format!("{name}.replaced-");
+    let mut stale = Vec::new();
+    for entry in
+        std::fs::read_dir(parent).with_context(|| format!("reading {}", parent.display()))?
+    {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(suffix) = file_name
+            .to_str()
+            .and_then(|part| part.strip_prefix(&backup_prefix))
+        else {
+            continue;
+        };
+        if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            // Never follow or remove a symlink that merely resembles our backup.
+            if !entry.file_type()?.is_dir() {
+                bail!("cache backup {} is not a directory", entry.path().display());
+            }
+            stale.push(entry.path());
+        }
+    }
+    if !target_dir.exists() && !stale.is_empty() {
+        if stale.len() != 1 {
+            bail!(
+                "cache {} is missing with multiple backups; manual recovery required",
+                target_dir.display()
+            );
+        }
+        rename(&stale[0], target_dir).with_context(|| {
+            format!(
+                "restoring cache backup {} -> {}",
+                stale[0].display(),
+                target_dir.display()
+            )
+        })?;
+    } else {
+        // A present target is the published generation; these are leftovers of
+        // earlier completed or interrupted swaps.
+        for path in stale {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("removing stale cache backup {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_replace_dir_with(
+    new_dir: &Path,
+    target_dir: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    recover_stale_backups(target_dir, &mut rename)?;
     if !target_dir.exists() {
-        std::fs::rename(new_dir, target_dir).with_context(|| {
+        rename(new_dir, target_dir).with_context(|| {
             format!("renaming {} -> {}", new_dir.display(), target_dir.display())
         })?;
         return Ok(());
     }
 
-    let backup = target_dir.with_file_name(format!(
-        "{}.replaced-{}",
-        target_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("cache"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&backup);
+    let name = target_dir
+        .file_name()
+        .and_then(|part| part.to_str())
+        .context("cache target has no UTF-8 name")?;
+    let backup = target_dir.with_file_name(format!("{name}.replaced-{}", std::process::id()));
 
-    std::fs::rename(target_dir, &backup).with_context(|| {
+    rename(target_dir, &backup).with_context(|| {
         format!(
             "backing up existing cache {} -> {}",
             target_dir.display(),
@@ -438,21 +505,24 @@ fn atomic_replace_dir(new_dir: &Path, target_dir: &Path) -> Result<()> {
         )
     })?;
 
-    match std::fs::rename(new_dir, target_dir) {
+    match rename(new_dir, target_dir) {
         Ok(()) => {
+            // The new generation is already published. A cleanup failure is
+            // recoverable on the next publish and must not report this commit
+            // as failed.
             let _ = std::fs::remove_dir_all(&backup);
             Ok(())
         }
         Err(e) => {
-            // Restore the old cache so a failed swap never leaves the target missing.
-            let _ = std::fs::rename(&backup, target_dir);
-            Err(e).with_context(|| {
-                format!(
-                    "renaming {} -> {} (old cache restored)",
-                    new_dir.display(),
-                    target_dir.display()
-                )
-            })
+            match rename(&backup, target_dir) {
+                Ok(()) => Err(e).with_context(|| {
+                    format!("renaming {} -> {} (old cache restored)", new_dir.display(), target_dir.display())
+                }),
+                Err(restore) => Err(anyhow!(
+                    "renaming {} -> {} failed: {e}; restoring old cache failed: {restore}; old cache remains at {}",
+                    new_dir.display(), target_dir.display(), backup.display()
+                )),
+            }
         }
     }
 }
@@ -2638,6 +2708,67 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta["content_hash"], "sha256:new");
+    }
+
+    #[test]
+    fn remote_cache_publish_recovers_crash_backup_before_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join("remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+        let backup = remotes_root.join("upstream.replaced-99999");
+        std::fs::rename(&cache_dir, &backup).unwrap();
+
+        let entities = vec![sample_entity(
+            "22222222-2222-2222-2222-222222222222",
+            "NewEntity",
+        )];
+        publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &entities,
+            &[],
+            &sample_meta("new"),
+            None,
+        )
+        .unwrap();
+
+        assert!(cache_dir.join("entities.ndjson").exists());
+        assert!(!backup.exists());
+        assert_eq!(
+            std::fs::read_dir(&remotes_root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("upstream.replaced-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn remote_cache_publish_reports_failed_rollback_and_retained_backup() {
+        let tmp = TempDir::new().unwrap();
+        let remotes_root = tmp.path().join("remotes");
+        let cache_dir = publish_old_generation(&remotes_root, "upstream");
+        let staged = tempfile::TempDir::new_in(&remotes_root).unwrap();
+        let mut renames = 0;
+        let error = atomic_replace_dir_with(staged.path(), &cache_dir, |from, to| {
+            renames += 1;
+            if renames >= 2 {
+                return Err(std::io::Error::other("injected rename failure"));
+            }
+            std::fs::rename(from, to)
+        })
+        .unwrap_err();
+        let backup = remotes_root.join(format!("upstream.replaced-{}", std::process::id()));
+        assert!(!cache_dir.exists());
+        assert_cache_is_old_generation(&backup);
+        let message = error.to_string();
+        assert!(message.contains("restoring old cache failed"), "{message}");
+        assert!(message.contains(&backup.display().to_string()), "{message}");
+        assert!(!message.contains("old cache restored"), "{message}");
     }
 
     // ── F201 tests ────────────────────────────────────────────────────────────

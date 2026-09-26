@@ -265,13 +265,12 @@ plus either `not in the object database` or `missing object`) so ordinary
 auth/network/`bad object`/spawn/local-source failures are never treated as
 corrupt-cache and never trigger a destructive repair.
 
-`walk_commits` shells out to `git log` with a stable, machine-parseable
-format (v0 choice per ADR-088 §5 — `git2`/`gix` are not workspace
-dependencies today, so shelling out avoids a new heavy dependency). Raw
-control-byte separators are embedded directly in the format string (not
-git's `%xHH` escape syntax) — passed as a single argv element (never
-through a shell), so the literal bytes survive intact and git's
-pretty-format engine emits any non-`%` character verbatim.
+`walk_commits` shells out to `git log` for Git-generated IDs and dates, then
+reads contributor-controlled author and message text through the byte-length
+framing of `git cat-file --batch` (v0 shell-out choice per ADR-088 §5 —
+`git2`/`gix` are not workspace dependencies). Control bytes in author names or
+messages cannot split a commit record; malformed metadata or batch framing is
+an error rather than a silent skipped commit.
 
 `touched_files` is a separate `--name-only` pass, kept apart from
 `walk_commits`'s custom `--pretty=format` — interleaving file-name lines
@@ -548,7 +547,7 @@ ids, or the case where at most one has a parseable id — a row whose `id` does
 not parse as a UUID is still a live row for the key, so it marks the pair
 ambiguous, but can never itself be the annotated candidate) and the
 single-row sub-case whose one row's id does not parse (not ambiguous — just
-no bindable candidate). Each skip is counted only when an ingested commit's
+no bindable candidate). Each skip is counted only when a walked commit's
 path actually hits the key, so unusable keys untouched by the pass never
 inflate the count, and the run's bounded warning names the first skipped
 paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
@@ -559,3 +558,12 @@ the durable fact. This makes module churn and repeated
 cross-project co-change derivable from incoming `annotates` graph reads while
 retaining `changed_paths` as a durable path fact when no matching code map
 exists.
+
+Commit notes are keyed by SHA within a namespace, while commit checkpoints
+belong to individual projects. When a later project walks an already stored
+SHA, the ingester reuses that note and resolves its annotations from the
+later project's frozen snapshot and path map. It upserts the note's links to
+that project and any matching module, document, or pull request before
+advancing the project's checkpoint. Existing live links retain their identity
+on a replay. A refused link freezes the cursor before that SHA so the next
+pass retries it; an explicitly deleted link is not silently resurrected.
