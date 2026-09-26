@@ -366,9 +366,10 @@ impl StorageBackend {
 
     /// Apply a service's schema plan (run migrations).
     ///
-    /// Each migration in the plan's `sqlite` list is applied idempotently.
-    /// Already-applied migrations are skipped. The `_schema_versions` table
-    /// tracks which migrations have been run.
+    /// Each migration in the plan's `sqlite` list is applied idempotently,
+    /// including when another opener commits it first. Already-applied
+    /// migrations are skipped after taking the SQLite write lock. The
+    /// `_schema_versions` table tracks which migrations have been run.
     pub fn apply_schema(
         &self,
         plan: &crate::migrations::ServiceSchemaPlan,
