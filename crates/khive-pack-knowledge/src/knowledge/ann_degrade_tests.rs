@@ -1467,9 +1467,10 @@ async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
 
     let baseline = calls.load(Ordering::Acquire);
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    // Eight query words expand beyond the per-pass scaling cap (4x base).
     let stage_budget =
-        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS);
-    assert!(stage_budget < std::time::Duration::from_secs(6));
+        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS * 4);
+    assert!(stage_budget < std::time::Duration::from_secs(30));
     tokio::time::pause();
     let result =
         khive_storage::scope_request_read_deadline(std::time::Duration::from_secs(30), async {
@@ -1551,8 +1552,9 @@ async fn suggest_still_prices_members_after_a_lexical_stage_only_timeout() {
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    // Eight query words expand beyond the per-pass scaling cap (4x base).
     let stage_budget =
-        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS);
+        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS * 4);
     tokio::time::pause();
     let result =
         khive_storage::scope_request_read_deadline(std::time::Duration::from_secs(30), async {
