@@ -134,6 +134,7 @@ struct SearchArmEvidence {
 struct SearchArmParticipation {
     text: SearchArmEvidence,
     vector: SearchArmEvidence,
+    text_mode: &'static str,
 }
 
 impl SearchArmParticipation {
@@ -151,6 +152,7 @@ impl SearchArmParticipation {
                 },
                 candidate_count: 0,
             },
+            text_mode: "all_terms",
         }
     }
 
@@ -202,7 +204,11 @@ impl SearchDegradation {
         }
     }
 
-    fn from_result(result: &CoordSearchResult, final_result: &Value) -> Self {
+    fn from_result(
+        result: &CoordSearchResult,
+        final_result: &Value,
+        text_mode: &'static str,
+    ) -> Self {
         let vector_selected = result
             .per_backend
             .iter()
@@ -252,6 +258,7 @@ impl SearchDegradation {
                 },
                 candidate_count: 0,
             },
+            text_mode,
         };
         arm_participation.observe_result(final_result);
         let failed_backend_count = result
@@ -349,6 +356,13 @@ impl SearchDegradation {
         }
     }
 
+    fn with_text_mode(mut self, text_mode: &'static str) -> Self {
+        if let Some(participation) = self.arm_participation.as_mut() {
+            participation.text_mode = text_mode;
+        }
+        self
+    }
+
     fn is_partial(&self) -> bool {
         self.status == Some(SearchStatus::Partial)
     }
@@ -377,6 +391,7 @@ fn search_arm_participation_value(participation: SearchArmParticipation) -> Valu
         "text": {
             "status": participation.text.status.as_str(),
             "candidate_count": participation.text.candidate_count,
+            "mode": participation.text_mode,
         },
         "vector": {
             "status": participation.vector.status.as_str(),
@@ -385,9 +400,11 @@ fn search_arm_participation_value(participation: SearchArmParticipation) -> Valu
     });
     if participation.text.status == SearchArmStatus::Ran && participation.text.candidate_count == 0
     {
-        value["text"]["reason"] = json!(
+        value["text"]["reason"] = json!(if participation.text_mode == "all_terms" {
             "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
-        );
+        } else {
+            "No text candidate survived matching, filtering, fusion, and the result limit."
+        });
     }
     value
 }
@@ -522,15 +539,29 @@ fn op_success_from_registry_result(
     is_help: bool,
     result: Value,
     vector_selected: bool,
+    text_mode: &'static str,
 ) -> OpSuccess {
     if tool == "search" && !is_help {
         OpSuccess {
-            degradation: SearchDegradation::complete(&result, vector_selected),
+            degradation: SearchDegradation::complete(&result, vector_selected)
+                .with_text_mode(text_mode),
             result,
         }
     } else {
         OpSuccess::complete(result)
     }
+}
+
+fn validated_search_text_mode(
+    args: &Value,
+    registry: &VerbRegistry,
+) -> Result<&'static str, RuntimeError> {
+    let mut handler_args = args.clone();
+    if let Some(fields) = handler_args.as_object_mut() {
+        fields.remove("namespace");
+    }
+    ValidatedSearchRequest::from_value(handler_args, registry)
+        .map(|request| request.text_mode_name())
 }
 
 /// Structured error for a search whose selected backends failed such that no
@@ -2276,12 +2307,25 @@ impl KhiveMcpServer {
             return coord_result.and_then(|result| chain_ok_envelope_or_depth_error(tool, result));
         }
 
+        let search_args = (tool == "search" && !is_help).then(|| args_value.clone());
         match self
             .registry
             .dispatch_with_disposition(&tool, args_value, identity.cloned())
             .await
         {
             Ok(result) => {
+                let text_mode = match search_args.as_ref() {
+                    Some(args) => match validated_search_text_mode(args, &self.registry) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            return Err(DispatchFailure::before_dispatch(
+                                &tool,
+                                json!(error.to_string()),
+                            ));
+                        }
+                    },
+                    None => "all_terms",
+                };
                 let result = decorate_schedule_agenda_with_ticker_health(
                     &tool,
                     is_help,
@@ -2292,8 +2336,13 @@ impl KhiveMcpServer {
                     .runtime
                     .as_ref()
                     .is_some_and(|runtime| runtime.vector_arm_selected());
-                let success =
-                    op_success_from_registry_result(&tool, is_help, result, vector_selected);
+                let success = op_success_from_registry_result(
+                    &tool,
+                    is_help,
+                    result,
+                    vector_selected,
+                    text_mode,
+                );
                 chain_ok_envelope_or_depth_error(tool, success)
             }
             Err(error) => Err(DispatchFailure::from_dispatch(&tool, error)),
@@ -2553,11 +2602,28 @@ impl KhiveMcpServer {
                             }
                         }
 
+                        let search_args =
+                            (tool == "search" && !is_help).then(|| args_value.clone());
                         match registry
                             .dispatch_with_disposition(&tool, args_value, op_identity)
                             .await
                         {
                             Ok(result) => {
+                                let text_mode = match search_args.as_ref() {
+                                    Some(args) => {
+                                        match validated_search_text_mode(args, &registry) {
+                                            Ok(mode) => mode,
+                                            Err(error) => {
+                                                return DispatchFailure::before_dispatch(
+                                                    &tool,
+                                                    json!(error.to_string()),
+                                                )
+                                                .into_entry();
+                                            }
+                                        }
+                                    }
+                                    None => "all_terms",
+                                };
                                 let result = decorate_schedule_agenda_with_ticker_health(
                                     &tool,
                                     is_help,
@@ -2570,6 +2636,7 @@ impl KhiveMcpServer {
                                         is_help,
                                         result,
                                         op_vector_selected,
+                                        text_mode,
                                     );
                                 let content_scope = note_content_scope(
                                     parse_content && !is_help, &tool, &success.result, &registry,
@@ -3257,8 +3324,11 @@ async fn dispatch_via_coordinator_inner(
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
                         };
-                        let degradation =
-                            SearchDegradation::from_result(&coord_result, &result_val);
+                        let degradation = SearchDegradation::from_result(
+                            &coord_result,
+                            &result_val,
+                            request.text_mode_name(),
+                        );
 
                         Ok(InterceptedDispatchResult::new(result_val, degradation))
                     },
@@ -5654,6 +5724,7 @@ mod tests {
     use std::{collections::BTreeMap, future::Future, sync::Arc};
     include!("server/plan_tests.rs");
     include!("server/search_text_reason_tests.rs");
+    include!("server/search_text_mode_tests.rs");
     include!("server/search_ranking_tests.rs");
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
@@ -9293,8 +9364,10 @@ mod tests {
             }
         }
 
-        let forward = SearchDegradation::from_result(&degraded_result(false), &json!([]));
-        let reversed = SearchDegradation::from_result(&degraded_result(true), &json!([]));
+        let forward =
+            SearchDegradation::from_result(&degraded_result(false), &json!([]), "all_terms");
+        let reversed =
+            SearchDegradation::from_result(&degraded_result(true), &json!([]), "all_terms");
 
         assert!(!forward.backend_errors.is_empty());
         assert!(forward.backend_errors.len() <= MAX_BACKEND_ERROR_ENTRIES);
@@ -9369,7 +9442,7 @@ mod tests {
             note_names: std::collections::HashMap::new(),
         };
 
-        let degradation = SearchDegradation::from_result(&result, &json!([]));
+        let degradation = SearchDegradation::from_result(&result, &json!([]), "all_terms");
         let arm_participation = degradation
             .arm_participation
             .expect("arm participation must be computed");
@@ -9415,7 +9488,7 @@ mod tests {
             .without_time()
             .finish();
         let degradation = tracing::subscriber::with_default(subscriber, || {
-            SearchDegradation::from_result(&result, &json!([]))
+            SearchDegradation::from_result(&result, &json!([]), "all_terms")
         });
         let wire = search_diagnostic_value(&degradation).to_string();
         let logs = captured.contents();
@@ -9473,8 +9546,11 @@ mod tests {
             BackendSearchFailure::timeout("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic =
-            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &result,
+            &json!([]),
+            "all_terms",
+        ));
 
         assert_eq!(diagnostic["retryable"], json!(true));
         assert_eq!(diagnostic["retry_after_ms"], json!(2_000));
@@ -9499,8 +9575,11 @@ mod tests {
             BackendSearchFailure::backend("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic =
-            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &result,
+            &json!([]),
+            "all_terms",
+        ));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -9523,8 +9602,11 @@ mod tests {
             ),
         ]);
 
-        let diagnostic =
-            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &result,
+            &json!([]),
+            "all_terms",
+        ));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -9552,8 +9634,11 @@ mod tests {
             "zzzz-hidden-backend".to_string(),
             BackendSearchFailure::backend("storage unavailable"),
         ));
-        let degradation =
-            SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
+        let degradation = SearchDegradation::from_result(
+            &degraded_search_result(failures),
+            &json!([]),
+            "all_terms",
+        );
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
@@ -9575,8 +9660,11 @@ mod tests {
                 BackendSearchFailure::timeout("backend search timed out after 5000ms"),
             )
         });
-        let degradation =
-            SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
+        let degradation = SearchDegradation::from_result(
+            &degraded_search_result(failures),
+            &json!([]),
+            "all_terms",
+        );
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
@@ -9595,7 +9683,7 @@ mod tests {
                 "result": "oversized",
                 "status": "complete",
                 "arm_participation": {
-                    "text": {"status": "ran", "candidate_count": 0},
+                    "text": {"mode": "all_terms", "status": "ran", "candidate_count": 0},
                     "vector": {"status": "skipped", "candidate_count": 0}
                 },
             }),
@@ -9611,7 +9699,7 @@ mod tests {
         assert_eq!(
             omitted["error"]["search"]["arm_participation"],
             json!({
-                "text": {"status": "ran", "candidate_count": 0},
+                "text": {"mode": "all_terms", "status": "ran", "candidate_count": 0},
                 "vector": {"status": "skipped", "candidate_count": 0}
             })
         );
@@ -9633,7 +9721,7 @@ mod tests {
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
             "arm_participation": {
-                "text": {"status": "error", "candidate_count": 0},
+                "text": {"mode": "all_terms", "status": "error", "candidate_count": 0},
                 "vector": {"status": "error", "candidate_count": 0}
             },
             "missing_backends": ["archive"],
@@ -11179,6 +11267,7 @@ mod tests {
                         status: SearchArmStatus::Error,
                         candidate_count: 0,
                     },
+                    text_mode: "all_terms",
                 }),
                 retry_after_ms: None,
                 missing_backends: vec!["archive".to_string()],
@@ -12054,6 +12143,7 @@ mod tests {
             search["arm_participation"],
             json!({
                 "text": {
+                    "mode": "all_terms",
                     "status": "ran",
                     "candidate_count": 0,
                     "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
@@ -12094,7 +12184,7 @@ mod tests {
         assert_eq!(
             search["arm_participation"],
             json!({
-                "text": {"status": "ran", "candidate_count": 1},
+                "text": {"mode": "all_terms", "status": "ran", "candidate_count": 1},
                 "vector": {"status": "skipped", "candidate_count": 0}
             }),
             "an exact-name presence check must expose its text-arm evidence"

@@ -571,6 +571,7 @@ Hybrid FTS + vector search with RRF fusion.
 | -------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                               |
 | `query`              | string  | yes      | Free-text query.                                                                                                                                                    |
+| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                               |
 | `limit`              | integer | no       | Default 10.                                                                                                                                                         |
 | `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
 | `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
@@ -629,14 +630,24 @@ Every successful KG search also carries `arm_participation` beside `result`;
 ```json
 {
   "arm_participation": {
-    "text": { "status": "ran", "candidate_count": 0 },
+    "text": {
+      "status": "ran",
+      "candidate_count": 0,
+      "mode": "all_terms",
+      "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
+    },
     "vector": { "status": "ran", "candidate_count": 8 }
   }
 }
 ```
 
-Each arm status is `ran`, `skipped`, or `error`. `ran` with zero candidates
-means that arm completed but contributed no final hit; `skipped` means it was
+Each arm status is `ran`, `skipped`, or `error`. The text arm always reports
+its effective `mode`; the vector arm has no mode. Text `ran` with zero final
+candidates carries the exact all-terms reason shown above, or the shorter
+`No text candidate survived matching, filtering, fusion, and the result limit.`
+for `any_term`. Other text statuses and positive counts omit `reason`.
+An arm with `status: "ran"` and zero candidates completed but contributed no
+final hit; `skipped` means it was
 not selected (for example, vector search without a configured embedding model);
 and `error` means that arm itself failed on at least one backend where it was
 selected — including a backend whose _other_ arm completed normally. A backend
@@ -664,7 +675,9 @@ the response carries no `arm_participation` at all.
 For an entity-name presence check, issue the short bare canonical name and
 require the matching row itself to report `source: "text"` or `"both"`. An
 all-vector response, or text-arm status `error`/`skipped`, is not evidence that
-the name is absent. Long keyword-dense queries may legitimately report text
+the name is absent. This check uses the default `all_terms` mode; an `any_term`
+hit matching only one token does not establish the full canonical name. Long
+keyword-dense queries may legitimately report text
 `ran` with `candidate_count: 0` because the lexical expression is selective;
 the explicit arm evidence makes that different from a silent skip or failure.
 
