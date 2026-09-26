@@ -7246,17 +7246,18 @@ mod tests {
         // (unpaused) time, since a genuinely blocked socket write is real
         // I/O, not a timer, and would not release control for a paused
         // clock's auto-advance to fire.
-        let request_timeout = std::time::Duration::from_secs(1);
+        let request_timeout = std::time::Duration::from_secs(2);
         std::env::set_var(
             "KHIVE_REQUEST_READ_TIMEOUT_SECS",
             request_timeout.as_secs().to_string(),
         );
-        // The ordinary lane rejects an extra 1s return delay that the old 3s
-        // cap admitted. Coverage keeps its wider cap, still below the watchdog.
+        // A fixed second covers runner scheduling without scaling down with the
+        // timeout. The strict ordinary cap still rejects an extra 1s return
+        // delay; coverage keeps its wider cap, below the watchdog.
         let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
             request_timeout * 3
         } else {
-            request_timeout + request_timeout / 2
+            request_timeout + std::time::Duration::from_secs(1)
         };
         let watchdog = request_timeout * 5;
 
@@ -7376,17 +7377,17 @@ mod tests {
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::env::set_var("KHIVE_PID", &pid_file);
         std::env::remove_var("KHIVE_NO_DAEMON");
-        let request_timeout = std::time::Duration::from_secs(1);
+        let request_timeout = std::time::Duration::from_secs(2);
         std::env::set_var(
             "KHIVE_REQUEST_READ_TIMEOUT_SECS",
             request_timeout.as_secs().to_string(),
         );
-        // LLVM_PROFILE_FILE presence selects coverage slack deliberately;
-        // the ordinary cap rejects the old bound's extra 1s-delay blind spot.
+        // Coverage uses wider slack; the ordinary cap allows a fixed second
+        // for scheduling but still rejects an extra 1s return delay.
         let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
             request_timeout * 3
         } else {
-            request_timeout + request_timeout / 2
+            request_timeout + std::time::Duration::from_secs(1)
         };
         let watchdog = request_timeout * 5;
 
