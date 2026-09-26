@@ -6,6 +6,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::Namespace;
+use std::path::PathBuf;
 
 struct Fixture {
     runtime: KhiveRuntime,
