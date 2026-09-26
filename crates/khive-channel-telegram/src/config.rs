@@ -22,9 +22,10 @@ const DEFAULT_INGEST_NAMESPACE: &str = "local";
 pub struct TelegramChannelConfig {
     /// Bot API token (BotFather). Never logged in full.
     pub bot_token: String,
-    /// The single authorized inbound sender AND the outbound recipient for
-    /// the maintainer slug.
+    /// The inbound conversation and outbound recipient for the maintainer slug.
     pub maintainer_chat_id: i64,
+    /// The Telegram account authorized to send inbound messages in that chat.
+    pub authorized_sender_id: i64,
     /// The slug in `telegram:<slug>` that maps to `maintainer_chat_id`.
     pub maintainer_slug: String,
     /// Target namespace for ingested inbound messages.
@@ -36,6 +37,7 @@ impl std::fmt::Debug for TelegramChannelConfig {
         f.debug_struct("TelegramChannelConfig")
             .field("bot_token", &mask_token(&self.bot_token))
             .field("maintainer_chat_id", &self.maintainer_chat_id)
+            .field("authorized_sender_id", &self.authorized_sender_id)
             .field("maintainer_slug", &self.maintainer_slug)
             .field("ingest_namespace", &self.ingest_namespace)
             .finish()
@@ -54,6 +56,7 @@ impl TelegramChannelConfig {
     /// Required:
     /// - `KHIVE_TELEGRAM_BOT_TOKEN`
     /// - `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` (numeric)
+    /// - `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID` for non-private chats
     ///
     /// Optional with defaults:
     /// - `KHIVE_TELEGRAM_MAINTAINER_SLUG` (default `"maintainer"`)
@@ -67,6 +70,37 @@ impl TelegramChannelConfig {
                 "KHIVE_TELEGRAM_MAINTAINER_CHAT_ID must be a valid signed integer, got: {chat_id_raw:?}"
             ))
         })?;
+        let authorized_sender_id = match std::env::var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID") {
+            Ok(raw) if !raw.trim().is_empty() => {
+                let sender_id = raw.trim().parse::<i64>().map_err(|_| {
+                    ChannelError::Config(
+                        "KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID must be a positive integer"
+                            .to_string(),
+                    )
+                })?;
+                if sender_id <= 0 {
+                    return Err(ChannelError::Config(
+                        "KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID must be a positive integer"
+                            .to_string(),
+                    ));
+                }
+                sender_id
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ChannelError::Config(
+                    "KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID must be a positive integer".to_string(),
+                ));
+            }
+            Ok(_) | Err(std::env::VarError::NotPresent) if maintainer_chat_id > 0 => {
+                maintainer_chat_id
+            }
+            Ok(_) | Err(std::env::VarError::NotPresent) => {
+                return Err(ChannelError::Config(
+                    "KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID is required for a non-positive KHIVE_TELEGRAM_MAINTAINER_CHAT_ID"
+                        .to_string(),
+                ));
+            }
+        };
 
         let maintainer_slug = match std::env::var("KHIVE_TELEGRAM_MAINTAINER_SLUG") {
             Ok(v) if !v.trim().is_empty() => v,
@@ -81,6 +115,7 @@ impl TelegramChannelConfig {
         Ok(Self {
             bot_token,
             maintainer_chat_id,
+            authorized_sender_id,
             maintainer_slug,
             ingest_namespace,
         })
@@ -137,6 +172,7 @@ mod tests {
     const KEYS: &[&str] = &[
         "KHIVE_TELEGRAM_BOT_TOKEN",
         "KHIVE_TELEGRAM_MAINTAINER_CHAT_ID",
+        "KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID",
         "KHIVE_TELEGRAM_MAINTAINER_SLUG",
         "KHIVE_TELEGRAM_INGEST_NAMESPACE",
     ];
@@ -183,12 +219,14 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         let _snap = EnvSnapshot::capture(KEYS);
         std::env::set_var("KHIVE_TELEGRAM_BOT_TOKEN", "test-token"); // gitleaks:allow
-        std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_CHAT_ID", "-98765");
+        std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_CHAT_ID", "98765");
+        std::env::remove_var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID");
         std::env::remove_var("KHIVE_TELEGRAM_MAINTAINER_SLUG");
         std::env::remove_var("KHIVE_TELEGRAM_INGEST_NAMESPACE");
 
         let config = TelegramChannelConfig::from_env().expect("valid config must succeed");
-        assert_eq!(config.maintainer_chat_id, -98765);
+        assert_eq!(config.maintainer_chat_id, 98765);
+        assert_eq!(config.authorized_sender_id, 98765);
         assert_eq!(config.maintainer_slug, "maintainer");
         assert_eq!(config.ingest_namespace, "local");
     }
@@ -199,6 +237,7 @@ mod tests {
         let _snap = EnvSnapshot::capture(KEYS);
         std::env::set_var("KHIVE_TELEGRAM_BOT_TOKEN", "test-token"); // gitleaks:allow
         std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_CHAT_ID", "42");
+        std::env::remove_var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID");
         std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_SLUG", "leo");
         std::env::set_var("KHIVE_TELEGRAM_INGEST_NAMESPACE", "lambda:leo");
 
@@ -208,10 +247,44 @@ mod tests {
     }
 
     #[test]
+    fn group_chat_requires_explicit_authorized_sender_id() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(KEYS);
+        std::env::set_var("KHIVE_TELEGRAM_BOT_TOKEN", "test-token"); // gitleaks:allow
+        std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_CHAT_ID", "-100123");
+        std::env::remove_var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID");
+
+        let err = TelegramChannelConfig::from_env().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID"));
+        std::env::set_var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID", "42");
+        let config = TelegramChannelConfig::from_env().unwrap();
+        assert_eq!(config.maintainer_chat_id, -100123);
+        assert_eq!(config.authorized_sender_id, 42);
+    }
+
+    #[test]
+    fn invalid_explicit_sender_id_never_falls_back_to_chat_id() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _snap = EnvSnapshot::capture(KEYS);
+        std::env::set_var("KHIVE_TELEGRAM_BOT_TOKEN", "test-token"); // gitleaks:allow
+        std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_CHAT_ID", "42");
+        for invalid in ["not-a-number", "0", "-1"] {
+            std::env::set_var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID", invalid);
+            let err = TelegramChannelConfig::from_env().unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID"));
+        }
+    }
+
+    #[test]
     fn debug_output_masks_bot_token() {
         let config = TelegramChannelConfig {
             bot_token: "123456:AAFakeTokenValueForTestingOnly".to_string(), // gitleaks:allow
             maintainer_chat_id: 1,
+            authorized_sender_id: 1,
             maintainer_slug: "maintainer".to_string(),
             ingest_namespace: "local".to_string(),
         };
