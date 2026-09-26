@@ -7680,6 +7680,64 @@ mod adr081_retune_driver_tests {
     }
 
     #[tokio::test]
+    async fn serve_ledger_resolve_checks_stored_namespace() {
+        let (_pack, rt) = make_pack();
+        let arm = Namespace::parse("bench-arm-a").unwrap();
+        let token = rt.authorize(arm).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-arm-row",
+            "bench-arm-a",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-arm",
+            "raw query",
+            1_000,
+            Some("unattributed"),
+        )
+        .await
+        .unwrap();
+
+        let row = crate::serve_ledger::get_serve_row(rt.sql().as_ref(), "ledger-arm-row")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.namespace, "bench-arm-a");
+        let wrong_namespace = crate::serve_ledger::resolve(
+            rt.sql().as_ref(),
+            "ledger-arm-row",
+            "scorer-arm",
+            "local",
+            &target,
+            None,
+        )
+        .await
+        .err()
+        .expect("a different namespace must be rejected");
+        assert!(
+            matches!(wrong_namespace, RuntimeError::InvalidInput(message) if message.contains("namespace"))
+        );
+        assert!(matches!(
+            crate::serve_ledger::resolve(
+                rt.sql().as_ref(),
+                "ledger-arm-row",
+                "scorer-arm",
+                "bench-arm-a",
+                &target,
+                None,
+            )
+            .await
+            .unwrap(),
+            crate::serve_ledger::ServeLedgerResolution::Found { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn explicit_scorer_feedback_refuses_before_claiming_dedup_key() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
@@ -7847,6 +7905,73 @@ mod adr081_retune_driver_tests {
         );
         assert_eq!(result["serve_attribution"], json!("unattributed"));
         assert_eq!(result["served_by_profile_id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_null_accounting_does_not_accept_archived_explicit_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        create_active_lifecycle_profile(&pack, &registry, &token).await;
+        let target = create_test_entity(&rt, &token).await;
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-archived-explicit",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-archived",
+            "raw query",
+            1_000,
+            Some("unattributed"),
+        )
+        .await
+        .unwrap();
+
+        let error = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "served_by_profile_id": LIFECYCLE_PROFILE_ID,
+                    "scorer_run_id": "scorer-archived-explicit",
+                    "serve_ledger_id": "ledger-archived-explicit",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("null accounting must not accept an archived explicit profile");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("archived"))
+        );
+        let row = crate::serve_ledger::get_serve_row(rt.sql().as_ref(), "ledger-archived-explicit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.grade.is_none());
+        assert!(row.scorer_run_id.is_none());
     }
 
     /// ADR-081 amendment regression, paired with the two forced-zero tests

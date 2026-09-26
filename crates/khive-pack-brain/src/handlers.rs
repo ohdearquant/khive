@@ -1672,6 +1672,23 @@ impl BrainPack {
         }
     }
 
+    fn validate_feedback_serving_profile(&self, profile_id: &str) -> Result<(), RuntimeError> {
+        let state = self.state.lock().unwrap();
+        match state.profiles.get(profile_id) {
+            None => Err(RuntimeError::NotFound(format!(
+                "serving profile {:?} not found in profile registry",
+                profile_id
+            ))),
+            Some(rec) if rec.lifecycle == khive_brain_core::ProfileLifecycle::Archived => {
+                Err(RuntimeError::InvalidInput(format!(
+                    "serving profile {:?} is archived; feedback cannot credit archived profiles",
+                    profile_id
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
     // ── brain.feedback ────────────────────────────────────────────────────
 
     pub(crate) async fn handle_feedback(
@@ -1850,6 +1867,12 @@ impl BrainPack {
             crate::validate_section_signals(ss)?;
         }
 
+        // A null ledger accounting key may suppress a fold, but it cannot
+        // make an invalid caller-resolved profile a valid request.
+        if let Some(profile_id) = effective_profile.as_deref() {
+            self.validate_feedback_serving_profile(profile_id)?;
+        }
+
         let sql = self.runtime.sql();
         let now_us = Utc::now().timestamp_micros();
 
@@ -1925,23 +1948,8 @@ impl BrainPack {
 
         // Validate the profile that will actually receive the fold, after the
         // ledger has supplied its authoritative accounting_profile_id.
-        if let Some(effective_profile) = effective_profile.as_deref() {
-            let state = self.state.lock().unwrap();
-            match state.profiles.get(effective_profile) {
-                None => {
-                    return Err(RuntimeError::NotFound(format!(
-                        "serving profile {:?} not found in profile registry",
-                        effective_profile
-                    )));
-                }
-                Some(rec) if rec.lifecycle == khive_brain_core::ProfileLifecycle::Archived => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "serving profile {:?} is archived; feedback cannot credit archived profiles",
-                        effective_profile
-                    )));
-                }
-                Some(_) => {}
-            }
+        if let Some(profile_id) = effective_profile.as_deref() {
+            self.validate_feedback_serving_profile(profile_id)?;
         }
 
         if effective_profile.is_none() && !is_gated_implicit {

@@ -3395,6 +3395,48 @@ mod tests {
             found,
             "serve ledger row for the recalled target must appear within 2s"
         );
+
+        registry
+            .dispatch(
+                "brain.deactivate",
+                json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            )
+            .await
+            .expect("deactivate the bound profile");
+        registry
+            .dispatch(
+                "brain.archive",
+                json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            )
+            .await
+            .expect("archive the bound profile");
+        let resolution = registry
+            .dispatch(
+                "brain.resolve",
+                json!({"namespace": ns.as_str(), "consumer_kind": "recall"}),
+            )
+            .await
+            .expect("resolve after archiving");
+        assert_eq!(resolution["matched_binding"], false);
+
+        let after_archive = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "namespace": ns.as_str(),
+                    "query": "actor binding recall stamp note",
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect("recall falls through after archived binding");
+        let hits = after_archive.as_array().expect("bare array result");
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].get("served_by_profile_id").is_none()
+                || hits[0]["served_by_profile_id"].is_null()
+        );
+        assert_eq!(hits[0]["serve_attribution"], json!("unspecified"));
     }
 
     // The actor-resolved profile must both project weights and stamp the response.

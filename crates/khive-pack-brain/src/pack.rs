@@ -101,6 +101,33 @@ mod hook_queue_tests {
     }
 
     #[tokio::test]
+    async fn hook_queue_caps_pending_signals_and_reports_drops() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let brain = BrainPack::new(runtime);
+        for index in 0..(MAX_DEFERRED_HOOK_SIGNALS + 3) {
+            brain
+                .hook_queue
+                .enqueue(format!("namespace-{index}"), BrainSignal::Irrelevant);
+        }
+
+        let state = brain.handle_state(json!({})).await.expect("brain state");
+        assert_eq!(
+            state["dispatch_counters"]["contended_hook_signals_dropped"],
+            json!(3)
+        );
+        let pending = brain
+            .hook_queue
+            .take_batch_or_stop()
+            .expect("pending batch");
+        assert_eq!(pending.len(), MAX_DEFERRED_HOOK_SIGNALS);
+        assert_eq!(pending.first().unwrap().0, "namespace-3");
+        assert_eq!(
+            pending.last().unwrap().0,
+            format!("namespace-{}", MAX_DEFERRED_HOOK_SIGNALS + 2)
+        );
+    }
+
+    #[tokio::test]
     async fn brain_dispatch_applies_queued_cold_signal_before_handler_reads_state() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         let brain = BrainPack::new(runtime.clone());
