@@ -8,11 +8,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
 
 use khive_runtime::{
@@ -28,6 +31,91 @@ use crate::sql::sql;
 
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
+}
+
+/// The GitHub CLI is an optional network dependency, so neither a stalled
+/// process nor an unbounded response may occupy an ingest worker indefinitely.
+const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_STDOUT_LIMIT: usize = 32 * 1024 * 1024;
+const GH_STDERR_LIMIT: usize = 64 * 1024;
+const ORIGIN_STDOUT_LIMIT: usize = 16 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum IngestCommandError {
+    NotFound,
+    CouldNotStart,
+    TimedOut,
+    StdoutTooLarge,
+    StderrTooLarge,
+    Io,
+}
+
+impl std::fmt::Display for IngestCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::NotFound => "command not found on PATH",
+            Self::CouldNotStart => "command could not be started",
+            Self::TimedOut => "command timed out",
+            Self::StdoutTooLarge => "command stdout exceeded limit",
+            Self::StderrTooLarge => "command stderr exceeded limit",
+            Self::Io => "command I/O failed",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for IngestCommandError {}
+
+struct IngestCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+}
+
+async fn read_command_pipe(
+    pipe: impl AsyncRead + Unpin,
+    limit: usize,
+    overflow: IngestCommandError,
+) -> std::result::Result<Vec<u8>, IngestCommandError> {
+    let mut bytes = Vec::new();
+    pipe.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| IngestCommandError::Io)?;
+    if bytes.len() > limit {
+        return Err(overflow);
+    }
+    Ok(bytes)
+}
+
+async fn run_ingest_command(
+    mut command: AsyncCommand,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> std::result::Result<IngestCommandOutput, IngestCommandError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            IngestCommandError::NotFound
+        } else {
+            IngestCommandError::CouldNotStart
+        }
+    })?;
+    let stdout = child.stdout.take().ok_or(IngestCommandError::Io)?;
+    let stderr = child.stderr.take().ok_or(IngestCommandError::Io)?;
+    tokio::time::timeout(timeout, async {
+        let (stdout, _stderr, status) = tokio::try_join!(
+            read_command_pipe(stdout, stdout_limit, IngestCommandError::StdoutTooLarge),
+            read_command_pipe(stderr, GH_STDERR_LIMIT, IngestCommandError::StderrTooLarge),
+            async { child.wait().await.map_err(|_| IngestCommandError::Io) }
+        )?;
+        Ok(IngestCommandOutput { status, stdout })
+    })
+    .await
+    .map_err(|_| IngestCommandError::TimedOut)?
 }
 
 /// Which record kinds a `run_ingest` pass processes. `Default` selects all
@@ -489,7 +577,8 @@ async fn run_ingest_inner(
             &opts.repo,
             opts.expected_github_repo.as_deref(),
             origin_identity,
-        );
+        )
+        .await;
         if let Ok(gh_repo) = &gh_probe {
             report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
@@ -909,19 +998,58 @@ async fn link_references(
 /// checkout, passed explicitly to `gh repo view` (never argument-less
 /// selection). Failure strings are stable and credential-safe — see the
 /// module overview in crates/khive-pack-git/docs/api/ingest.md.
-fn probe_gh_repository(
+#[derive(Debug, PartialEq, Eq)]
+enum GhProbeError {
+    Reason(&'static str),
+    GhTimedOut,
+    OriginTimedOut,
+}
+
+impl std::fmt::Display for GhProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reason(reason) => f.write_str(reason),
+            Self::GhTimedOut => f.write_str("gh CLI repository probe timed out"),
+            Self::OriginTimedOut => f.write_str("git origin repository probe timed out"),
+        }
+    }
+}
+
+impl std::error::Error for GhProbeError {}
+
+async fn probe_gh_repository(
     repo: &Path,
     expected: Option<&str>,
     origin_identity: OriginIdentity,
-) -> std::result::Result<String, &'static str> {
+) -> std::result::Result<String, GhProbeError> {
+    probe_gh_repository_with_command(
+        repo,
+        expected,
+        origin_identity,
+        Path::new("gh"),
+        GH_COMMAND_TIMEOUT,
+    )
+    .await
+}
+
+async fn probe_gh_repository_with_command(
+    repo: &Path,
+    expected: Option<&str>,
+    origin_identity: OriginIdentity,
+    gh_program: &Path,
+    timeout: Duration,
+) -> std::result::Result<String, GhProbeError> {
     let expected = match (expected, origin_identity) {
-        (Some(expected), _) => validate_owner_repo(expected)?,
-        (None, OriginIdentity::DeriveFromCwd) => github_repository_from_origin(repo)?,
+        (Some(expected), _) => validate_owner_repo(expected).map_err(GhProbeError::Reason)?,
+        (None, OriginIdentity::DeriveFromCwd) => github_repository_from_origin(repo).await?,
         (None, OriginIdentity::Never) => {
-            return Err("remote source has no usable github.com repository identity")
+            return Err(GhProbeError::Reason(
+                "remote source has no usable github.com repository identity",
+            ))
         }
     };
-    let output = Command::new("gh")
+    let mut command = AsyncCommand::new(gh_program);
+    command
         .args([
             "repo",
             "view",
@@ -934,42 +1062,57 @@ fn probe_gh_repository(
         // checkout appear usable by probing a different repo or host.
         .env_remove("GH_REPO")
         .env_remove("GH_HOST")
-        .env("GH_PROMPT_DISABLED", "1")
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "gh CLI not found on PATH"
-            } else {
-                "gh CLI could not be started"
+        .env("GH_PROMPT_DISABLED", "1");
+    let output = run_ingest_command(command, timeout, ORIGIN_STDOUT_LIMIT)
+        .await
+        .map_err(|error| match error {
+            IngestCommandError::TimedOut => GhProbeError::GhTimedOut,
+            IngestCommandError::NotFound => GhProbeError::Reason("gh CLI not found on PATH"),
+            IngestCommandError::CouldNotStart => {
+                GhProbeError::Reason("gh CLI could not be started")
             }
+            IngestCommandError::StdoutTooLarge | IngestCommandError::StderrTooLarge => {
+                GhProbeError::Reason("gh CLI repository probe output exceeded limit")
+            }
+            IngestCommandError::Io => GhProbeError::Reason("gh CLI repository probe I/O failed"),
         })?;
     if !output.status.success() {
-        return Err(
+        return Err(GhProbeError::Reason(
             "gh CLI could not resolve an authenticated GitHub repository for this checkout",
-        );
+        ));
     }
-    parse_gh_repository_identity(&output.stdout, &expected)
+    parse_gh_repository_identity(&output.stdout, &expected).map_err(GhProbeError::Reason)
 }
 
 /// Derive a GitHub `owner/repo` from the checkout's fetch identity. Only the
 /// configured `origin` is authoritative: another remote, or `gh`'s own local
 /// default, must never select the issue/PR source for this ingest.
-fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, &'static str> {
-    let output = Command::new("git")
+async fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, GhProbeError> {
+    let mut command = AsyncCommand::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["remote", "get-url", "origin"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|_| "git CLI could not resolve this checkout's origin repository")?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_ingest_command(command, GH_COMMAND_TIMEOUT, ORIGIN_STDOUT_LIMIT)
+        .await
+        .map_err(|error| match error {
+            IngestCommandError::TimedOut => GhProbeError::OriginTimedOut,
+            _ => {
+                GhProbeError::Reason("git CLI could not resolve this checkout's origin repository")
+            }
+        })?;
     if !output.status.success() {
-        return Err("checkout has no usable github.com origin repository");
+        return Err(GhProbeError::Reason(
+            "checkout has no usable github.com origin repository",
+        ));
     }
     let origin = std::str::from_utf8(&output.stdout)
         .map(str::trim)
-        .map_err(|_| "checkout has no usable github.com origin repository")?;
-    let slug =
-        remote_url_to_slug(origin).ok_or("checkout has no usable github.com origin repository")?;
+        .map_err(|_| GhProbeError::Reason("checkout has no usable github.com origin repository"))?;
+    let slug = remote_url_to_slug(origin).ok_or(GhProbeError::Reason(
+        "checkout has no usable github.com origin repository",
+    ))?;
     let mut segments = slug.split('/');
     let (Some(host), Some(owner), Some(name), None) = (
         segments.next(),
@@ -977,12 +1120,16 @@ fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, &'s
         segments.next(),
         segments.next(),
     ) else {
-        return Err("checkout has no usable github.com origin repository");
+        return Err(GhProbeError::Reason(
+            "checkout has no usable github.com origin repository",
+        ));
     };
     if !host.eq_ignore_ascii_case("github.com") {
-        return Err("checkout has no usable github.com origin repository");
+        return Err(GhProbeError::Reason(
+            "checkout has no usable github.com origin repository",
+        ));
     }
-    validate_owner_repo(&format!("{owner}/{name}"))
+    validate_owner_repo(&format!("{owner}/{name}")).map_err(GhProbeError::Reason)
 }
 
 fn validate_owner_repo(slug: &str) -> std::result::Result<String, &'static str> {
@@ -1086,6 +1233,97 @@ mod gh_repository_identity_tests {
                 "fixture/repository",
             ),
             Err("gh CLI resolved a different repository than the digest source")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod gh_command_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        gh_json_with_command, probe_gh_repository_with_command, GhProbeError, IngestCommandError,
+        OriginIdentity,
+    };
+
+    fn executable(dir: &Path, body: &str) -> PathBuf {
+        let program = dir.join("fake-gh");
+        std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gh_page_timeout_is_typed_while_executor_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "exec sleep 5");
+        let ticked = Arc::new(AtomicBool::new(false));
+        let pulse = Arc::clone(&ticked);
+        let tick = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            pulse.store(true, Ordering::SeqCst);
+        });
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_millis(200),
+            128,
+        )
+        .await
+        .expect_err("a hung gh page must time out");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::TimedOut)
+        );
+        assert!(
+            ticked.load(Ordering::SeqCst),
+            "the runtime worker must remain available during a hung gh page"
+        );
+        tick.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gh_probe_timeout_is_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "exec sleep 5");
+        let error = probe_gh_repository_with_command(
+            dir.path(),
+            Some("fixture/repository"),
+            OriginIdentity::Never,
+            &program,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("a hung repository probe must time out");
+        assert_eq!(error, GhProbeError::GhTimedOut);
+    }
+
+    #[tokio::test]
+    async fn gh_page_stdout_is_bounded_before_json_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(
+            dir.path(),
+            "printf '1234567890123456789012345678901234567890'",
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["pr", "list"],
+            &program,
+            Duration::from_secs(1),
+            16,
+        )
+        .await
+        .expect_err("an oversized page must be refused");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::StdoutTooLarge)
         );
     }
 }
@@ -2830,19 +3068,40 @@ fn canonical_issue_timestamp(
     }
 }
 
-fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
+async fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
+    gh_json_with_command(
+        repo,
+        gh_repo,
+        args,
+        Path::new("gh"),
+        GH_COMMAND_TIMEOUT,
+        GH_STDOUT_LIMIT,
+    )
+    .await
+}
+
+async fn gh_json_with_command(
+    repo: &Path,
+    gh_repo: &str,
+    args: &[&str],
+    gh_program: &Path,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<String> {
     // gh has no `-C` flag (unlike git). Keep cwd for local git configuration,
     // but target the repository explicitly so later remote/cwd drift cannot
     // redirect a resumed digest to a different repository.
-    let output = Command::new("gh")
+    let mut command = AsyncCommand::new(gh_program);
+    command
         .current_dir(repo)
         .args(args)
         .args(["--repo", gh_repo])
         .env_remove("GH_REPO")
         .env_remove("GH_HOST")
-        .env("GH_PROMPT_DISABLED", "1")
-        .output()
-        .context("spawning gh")?;
+        .env("GH_PROMPT_DISABLED", "1");
+    let output = run_ingest_command(command, timeout, stdout_limit)
+        .await
+        .context("running gh")?;
     if !output.status.success() {
         let operation = args.get(0..2).unwrap_or(args).join(" ");
         return Err(anyhow!("gh {operation} failed"));
@@ -2924,7 +3183,7 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
-fn fetch_pr_page(
+async fn fetch_pr_page(
     repo: &Path,
     gh_repo: &str,
     floor: Option<&str>,
@@ -2947,11 +3206,12 @@ fn fetch_pr_page(
             "--json",
             PR_FIELDS,
         ],
-    )?;
+    )
+    .await?;
     serde_json::from_str(&raw).context("parsing gh pr list --json")
 }
 
-fn fetch_issue_page(
+async fn fetch_issue_page(
     repo: &Path,
     gh_repo: &str,
     floor: Option<&str>,
@@ -2974,7 +3234,8 @@ fn fetch_issue_page(
             "--json",
             ISSUE_FIELDS,
         ],
-    )?;
+    )
+    .await?;
     serde_json::from_str(&raw).context("parsing gh issue list --json")
 }
 
@@ -3100,7 +3361,7 @@ async fn ingest_prs(
         // and the arms below specialize the reason when they fire.
         let first_page = report.sources.pull_requests.is_none();
         let requested_limit = page_fetch_limit(budget, &checkpoint, floor.as_deref());
-        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref(), requested_limit) {
+        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref(), requested_limit).await {
             Ok(page) => {
                 if first_page {
                     report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
@@ -3381,7 +3642,7 @@ async fn ingest_issues(
         // leaving the loop early implies.
         let first_page = report.sources.issues.is_none();
         let requested_limit = page_fetch_limit(budget, &checkpoint, floor.as_deref());
-        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref(), requested_limit) {
+        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref(), requested_limit).await {
             Ok(page) => {
                 if first_page {
                     report.sources.issues = Some(IngestSourceState::StoppedEarly(

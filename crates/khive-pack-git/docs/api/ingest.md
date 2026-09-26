@@ -53,8 +53,11 @@ tracker records therefore cannot turn a small bound into an unbounded database s
 An exact durable boundary acknowledgment skips the lookup and consumes no unit;
 these replays do not increment `*_skipped_existing` (that count measures actual
 existence checks). Related lookups and enrichment within one record are not separate
-units. The bound does not limit git snapshot construction, the size of a fetched
-remote page, or subprocess wall time. Exact-budget passes retain the conservative
+units. The bound does not limit git snapshot construction. `gh` page fetches
+have a separate 60-second subprocess deadline and 32 MiB stdout ceiling; the
+repository probe has the same deadline and a 16 KiB stdout ceiling. Local
+git history work remains outside this remote-command bound. Exact-budget
+passes retain the conservative
 `done=false` result; a subsequent pass proves completion.
 
 ## Secret-gate refusal accounting
