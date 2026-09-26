@@ -10,6 +10,18 @@
 
 `VamanaIndex::save` writes three files into a caller-supplied directory:
 
+The v1 layout has no lifecycle segment. `save` refuses an index with tombstones
+before creating or overwriting any file; callers with deletions use `save_atomic`
+and its lifecycle-bearing v2 format.
+For an index without tombstones, an overwrite stages each payload in a fresh
+file within the destination directory, then renames the files over their old
+names under the same publication lock as `load` and `save_atomic`. A previously
+loaded mmap reader keeps its old `vectors.bin` inode. The v1 data layout remains
+three segments without a checksum-bearing cross-file commit record; use
+`save_atomic` when crash-consistent generations are required.
+If a platform refuses replacement of a mapped destination, `save` returns the
+I/O error; it never falls back to truncating the canonical file.
+
 ### `metadata.bin`
 
 | Offset | Size | Type   | Field              |
@@ -53,6 +65,10 @@ Raw `f32` values in little-endian IEEE 754 format, row-major:
   the live embedding store before installation; a mismatch causes silent rebuild
 - `index`: `VamanaIndexSnapshot` containing all graph and vector data
 - `external_ids`: `Vec<String>` mapping node IDs back to external UUID strings
+
+The v1 snapshot likewise has no tombstone or free-slot fields. `to_snapshot`
+refuses an index with tombstones; the portable `to_bytes`/`from_bytes` container
+preserves that lifecycle state.
 
 ---
 
@@ -163,5 +179,5 @@ happens in the validation step rather than in `restore_reverse_adj` itself.
 
 The single `unsafe` block in `mmap_vectors` maps `vectors.bin` read-only.
 The contract: callers must not mutate or truncate the file while the index
-is live. `kkernel` deletes snapshot files atomically before replacing them,
-so a live index always holds a mapping to a consistent file version.
+is live. Legacy `save` writes fresh temporary inodes and renames them over
+canonical names, so an existing reader's mapped inode is not truncated.
