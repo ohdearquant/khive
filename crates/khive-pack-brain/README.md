@@ -24,8 +24,12 @@ call time and feed back into via explicit or implicit signals.
   signal is an abstention, and rank position never creates positive evidence
 - **Deterministic fold reducers** — `BalancedRecallFold` and
   `SectionPosteriorFold` implement pure `khive_fold::Fold<Event, S>` reducers.
-  Current handlers invoke them synchronously; durable handler mutations append to
-  the private `brain_event_log` and write JSON snapshots. The best-effort
+  They are available to embedders, but the running handlers and dispatch hook do
+  not call these reducers. Live dispatch signals use profile-aware attribution
+  in `apply_dispatch_signal`; feedback handlers apply their own profile updates.
+  In particular, replaying events with `BalancedRecallFold` does not reproduce
+  live `served_by_profile_id` routing. Durable handler mutations append to the
+  private `brain_event_log` and write JSON snapshots. The best-effort
   `DispatchHook` updates in-memory state without durable replay, while automatic
   shared-log catch-up remains deferred by ADR-017.
 - **Adapter integrity gating** (`brain.register_adapter`) — records a
@@ -95,7 +99,8 @@ change applies to new writes: historical anonymous events and their existing
 posterior effects are retained, with no automatic deletion or retraining.
 
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
-reduction logic in another crate:
+reduction logic in another crate. They interpret events into a single fold state;
+they do not implement the running pack's per-profile serve attribution:
 
 ```rust
 use khive_fold::{Fold, FoldContext};

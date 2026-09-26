@@ -1811,12 +1811,12 @@ no `all_actors` binding-list mode.
 
 Create a new brain profile with a given name and optional seed priors.
 
-| Param           | Type   | Required | Notes                                                                                                                                                               |
-| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                |
-| `description`   | string | no       | Human-readable description.                                                                                                                                         |
-| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                 |
-| `seed_priors`   | object | no       | For `knowledge_compose`: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}, ...}}`; for `recall`: `{"relevance": {"alpha": 7.0, "beta": 3.0}, ...}`. |
+| Param           | Type   | Required | Notes                                                                                                                                                                    |
+| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                     |
+| `description`   | string | no       | Human-readable description.                                                                                                                                              |
+| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                      |
+| `seed_priors`   | object | no       | Section priors only: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}}}`. Recall priors cannot be seeded at creation; other top-level keys are rejected. |
 
 ```
 request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")

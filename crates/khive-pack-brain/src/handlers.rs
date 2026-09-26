@@ -651,7 +651,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "seed_priors",
                 param_type: "object",
                 required: false,
-                description: "Seed priors object. For knowledge_compose: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}, ...}}. For recall: {\"relevance\": {\"alpha\": 7.0, \"beta\": 3.0}, ...}.",
+                description: "Optional section priors only: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}}. Recall priors cannot be seeded at creation; other top-level keys are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -2868,6 +2868,15 @@ impl BrainPack {
         khive_runtime::secret_gate::check_at(&consumer_kind, "profile", "consumer_kind")?;
         if let Some(ref seed) = p.seed_priors {
             khive_runtime::secret_gate::check_json_at(seed, "profile", "seed_priors")?;
+            if let Some(unsupported) = seed.as_object().and_then(|fields| {
+                fields
+                    .keys()
+                    .find(|key| key.as_str() != "section_posteriors")
+            }) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "seed_priors has unsupported field {unsupported:?}; only 'section_posteriors' is accepted"
+                )));
+            }
         }
         let seed_priors = p.seed_priors;
 
@@ -3553,10 +3562,10 @@ pub(crate) async fn resolve_auto_feedback_target(
 ///
 /// When registered via `VerbRegistryBuilder::with_dispatch_hook`, every
 /// successful non-brain verb dispatch calls `on_dispatch` with a synthetic
-/// `EventView` whose observations are empty. The event is fed into
-/// `BalancedRecallFold::reduce`, updating in-memory posteriors in real time.
-/// This path appends no event and writes no snapshot, so it provides no
-/// durability or replay guarantee.
+/// `EventView` whose observations are empty. The event is interpreted and
+/// routed through `apply_dispatch_signal` for the active namespace, or queued
+/// for its cold namespace. This path does not call `BalancedRecallFold::reduce`,
+/// append an event, or write a snapshot, so it provides no durable replay.
 #[async_trait]
 impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {
