@@ -317,6 +317,48 @@ fn classify_atomic_preflight(
     Ok(failures)
 }
 
+/// Read-only admission shared by the real atomic run and its dry-run preview.
+/// Keep the order of these checks identical so a preview cannot accept a unit
+/// that the real run would refuse before opening the target runtime.
+pub(crate) fn preflight_atomic_ops_file(
+    ops: &[OpsFileEntry],
+    cfg: &RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    max_ops: usize,
+) -> Result<()> {
+    if ops.len() > max_ops {
+        anyhow::bail!(
+            "--atomic op count {} exceeds the configured maximum {max_ops}; \
+             split the file or raise --atomic-max-ops",
+            ops.len()
+        );
+    }
+
+    if !khive_cfg.backends.is_empty() {
+        anyhow::bail!(
+            "--atomic does not support a multi-backend [[backends]] topology in v1; \
+             found {} declared backend(s)",
+            khive_cfg.backends.len()
+        );
+    }
+
+    let preflight_failures = classify_atomic_preflight(ops, cfg)?;
+    if !preflight_failures.is_empty() {
+        let messages: Vec<&str> = preflight_failures
+            .iter()
+            .map(|failure| failure.error.as_str())
+            .collect();
+        let message = format!(
+            "--atomic rejected {} op(s) before any write:\n{}",
+            messages.len(),
+            messages.join("\n")
+        );
+        return Err(atomic_failure_error(ops, message, preflight_failures));
+    }
+
+    Ok(())
+}
+
 fn refusal_reason_for_prepare_error(error: &anyhow::Error) -> Option<RefusalReason> {
     match error.downcast_ref::<RuntimeError>() {
         Some(RuntimeError::SecretDetected(_)) => Some(RefusalReason::GateRefusal),
@@ -366,41 +408,9 @@ pub(crate) async fn execute_atomic_ops_file(
     khive_cfg: &KhiveConfig,
     max_ops: usize,
 ) -> Result<Value> {
-    // ── op-count guard (before any runtime / any write) ─────────────────────
-    if ops.len() > max_ops {
-        anyhow::bail!(
-            "--atomic op count {} exceeds the configured maximum {max_ops}; \
-             split the file or raise --atomic-max-ops",
-            ops.len()
-        );
-    }
-
-    // ── v1 restriction: single-backend topology only ────────────────────────
-    if !khive_cfg.backends.is_empty() {
-        anyhow::bail!(
-            "--atomic does not support a multi-backend [[backends]] topology in v1; \
-             found {} declared backend(s)",
-            khive_cfg.backends.len()
-        );
-    }
-
-    // ── parse-time admissibility (before target runtime / any target write) ─
-    // Resolve loaded-verb membership against a metadata-only in-memory
-    // registry. This keeps unknown/unloaded verbs distinct from known verbs
-    // that are merely ineligible for ADR-099 atomic execution.
-    let preflight_failures = classify_atomic_preflight(&ops, &cfg)?;
-    if !preflight_failures.is_empty() {
-        let messages: Vec<&str> = preflight_failures
-            .iter()
-            .map(|failure| failure.error.as_str())
-            .collect();
-        let message = format!(
-            "--atomic rejected {} op(s) before any write:\n{}",
-            messages.len(),
-            messages.join("\n")
-        );
-        return Err(atomic_failure_error(&ops, message, preflight_failures));
-    }
+    // The dry-run path calls the same read-only admission before reporting
+    // success. Keep it ahead of runtime construction and all target writes.
+    preflight_atomic_ops_file(&ops, &cfg, khive_cfg, max_ops)?;
 
     // Guard cold construction (migrations) the same way every other local
     // `kkernel exec` path does — see `crate::exec::acquire_local_construction_guard`.
@@ -1022,9 +1032,9 @@ async fn build_op_result(
     gtd_audit_outcomes: &HashMap<Uuid, bool>,
 ) -> anyhow::Result<Value> {
     match (tool, plan) {
-        // Canonical shape: `normalize_entity_timestamps(to_json(&updated))`
-        // (update.rs:209-211 entity, :242-244 note) — the full updated
-        // entity/note row with ISO-8601 timestamps.
+        // Canonical update result: entity timestamps are normalized; note
+        // timestamps are normalized and the note status is projected to the
+        // same top-level status/lifecycle shape as the regular handler.
         // ADR-099 B3: a
         // symmetric edge update carries `edge_natural_key` and MUST be
         // rendered from a fresh post-commit natural-key lookup, never from
@@ -1069,11 +1079,15 @@ async fn build_op_result(
                     ))
                 }
                 Some(Resolved::Note(note)) => {
-                    let mut value = serde_json::to_value(&note)?;
+                    let mut value = khive_pack_kg::handlers::remap_note_status(
+                        khive_pack_kg::handlers::normalize_entity_timestamps(serde_json::to_value(
+                            &note,
+                        )?),
+                    );
                     if p.is_idempotent_noop() {
                         value["unchanged"] = json!(true);
                     }
-                    Ok(khive_pack_kg::handlers::normalize_entity_timestamps(value))
+                    Ok(value)
                 }
                 Some(Resolved::Event(_)) | Some(Resolved::PackRecord { .. }) => {
                     Err(anyhow::anyhow!(
