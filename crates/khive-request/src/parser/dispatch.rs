@@ -206,6 +206,14 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
         let obj = entry.as_object().ok_or_else(|| DslError::InvalidJson {
             error: "each batch entry must be an object".into(),
         })?;
+        if let Some(unknown) = obj
+            .keys()
+            .find(|key| key.as_str() != "tool" && key.as_str() != "args")
+        {
+            return Err(DslError::InvalidJson {
+                error: format!("unknown JSON operation field {unknown:?}; expected tool or args"),
+            });
+        }
         let tool = obj
             .get("tool")
             .and_then(Value::as_str)

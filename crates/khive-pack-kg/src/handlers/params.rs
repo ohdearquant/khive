@@ -223,6 +223,7 @@ pub(crate) struct SearchParams {
     /// `missing_kind_error` instead of a raw serde "missing field" message.
     pub(crate) kind: Option<String>,
     pub(crate) query: String,
+    pub(crate) text_mode: Option<String>,
     pub(crate) limit: Option<u32>,
     pub(crate) entity_kind: Option<String>,
     pub(crate) entity_type: Option<String>,

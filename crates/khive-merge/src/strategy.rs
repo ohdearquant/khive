@@ -6,11 +6,23 @@
 
 use khive_runtime::portability::KgArchive;
 
+use crate::types::MergeConflict;
+
 /// Selects ours, plus additions unique to theirs, for entities and edges.
 ///
 /// This helper does not validate or sort; [`crate::merge::three_way_merge`]
 /// performs those steps and dangling-edge checks around it.
 pub fn apply_ours(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgArchive {
+    apply_ours_with_conflicts(base, ours, theirs).0
+}
+
+/// Keep the preferred edge when a new semantic key reuses its durable ID.
+/// The top-level merge reports the skipped edge as a typed conflict.
+pub(crate) fn apply_ours_with_conflicts(
+    base: &KgArchive,
+    ours: &KgArchive,
+    theirs: &KgArchive,
+) -> (KgArchive, Vec<MergeConflict>) {
     use crate::diff_local::EdgeKey;
     use khive_runtime::portability::{ExportedEdge, ExportedEntity};
     use std::collections::HashSet;
@@ -30,26 +42,47 @@ pub fn apply_ours(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgA
     let base_keys: HashSet<EdgeKey> = base.edges.iter().map(EdgeKey::from_edge).collect();
 
     let mut edges: Vec<ExportedEdge> = ours.edges.clone();
+    let mut used_edge_ids: HashSet<Uuid> = edges.iter().map(|edge| edge.edge_id).collect();
+    let mut conflicts = Vec::new();
     for e in &theirs.edges {
         let key = EdgeKey::from_edge(e);
         if !base_keys.contains(&key) && !ours_keys.contains(&key) {
-            edges.push(e.clone());
+            if used_edge_ids.insert(e.edge_id) {
+                edges.push(e.clone());
+            } else {
+                conflicts.push(MergeConflict::EdgeIdentityCollision {
+                    source_id: e.source,
+                    target_id: e.target,
+                    relation: e.relation.to_string(),
+                    attempted_edge_id: e.edge_id,
+                    retained_edge_id: e.edge_id,
+                });
+            }
         }
     }
 
-    KgArchive {
+    let archive = KgArchive {
         format: ours.format.clone(),
         version: ours.version.clone(),
         namespace: ours.namespace.clone(),
         exported_at: ours.exported_at,
         entities,
         edges,
-    }
+    };
+    (archive, conflicts)
 }
 
 /// Selects theirs, plus additions unique to ours, by swapping [`apply_ours`].
 pub fn apply_theirs(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgArchive {
     apply_ours(base, theirs, ours)
+}
+
+pub(crate) fn apply_theirs_with_conflicts(
+    base: &KgArchive,
+    ours: &KgArchive,
+    theirs: &KgArchive,
+) -> (KgArchive, Vec<MergeConflict>) {
+    apply_ours_with_conflicts(base, theirs, ours)
 }
 
 #[cfg(test)]

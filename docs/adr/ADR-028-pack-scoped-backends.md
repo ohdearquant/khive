@@ -806,3 +806,75 @@ query="handoff")` into `get(id="<uuid>")` or
 `brain.feedback(target_id="<uuid>", signal="useful")`. Search selection and
 fan-out remain governed by ADR-029; this amendment makes the returned KG handle
 usable by those consumers without changing the message's backend or namespace.
+
+## Amendment A6: configuration types and boot path as built (2026-09-25)
+
+**Status**: Accepted (2026-09-25)
+
+**Context.** Section 2 specifies the target configuration types as `AppConfig`,
+`BackendConfig`, `BackendKind` and `PackConfig` in `crates/khive-config/src/lib.rs` "(or in
+khive-mcp for v1 interim)". Section 8 boots from `AppConfig::load` in
+`crates/kkernel/src/main.rs`, and Open Question 1 asks which of those two crates should hold
+`AppConfig`. Neither placement was built. The repository history has no `crates/khive-config`
+path, and no type named `AppConfig` exists under `crates/`. Commit e1687e60b added the backend
+and pack types to `crates/khive-runtime/src/engine_config.rs` as fields of the existing
+top-level `KhiveConfig`:
+
+- `KhiveConfig.backends: Vec<BackendConfig>` and `KhiveConfig.packs: HashMap<String, PackConfig>`
+  sit beside `engines`, `actor`, `runtime` and the other sections of the same file.
+- `BackendKind` matches Section 2: `Sqlite` (the default) and `Memory`.
+- `BackendConfig` has `name`, `kind`, `path`, `cache_mb: Option<u32>`,
+  `journal_mode: Option<String>`, `served_kinds` and `read_only`. `cache_mb` and
+  `journal_mode` are parsed and then rejected at validation (Amendment A3), `served_kinds`
+  is the declaration Amendment A3 describes, and `read_only` carries the Amendment A2
+  semantics.
+- `PackConfig` has `backend` and `no_embed`. It has no `engines` field, so the per-pack
+  engine lists shown in Sections 2 and 4 configure nothing. The only per-pack embedding
+  control is `no_embed`, whose effect on search runtime selection Amendment A3 describes.
+
+The boot sequence that Section 8 sketches is implemented in `crates/khive-mcp/src/serve.rs`.
+`build_server_inner` loads the file with `KhiveConfig::load_with_home_fallback_and_source`
+and, when `[[backends]]` is declared, calls
+`build_registry_for_multi_backend_with_db_anchor_and_max_readers`. Its inner
+builder, `build_registry_for_multi_backend_inner_with_max_readers`, opens the declared
+backends through `prepare_configured_storage_topology`, then iterates the selected pack
+names. For each pack it resolves the backend with `resolve_pack_backend_config` and builds
+one runtime with `build_pack_runtime`. It then applies every pack schema plan with
+`VerbRegistry::apply_schema_plans_with_map`, which fails boot with `PackSchemaCollisionError`
+(`crates/khive-runtime/src/pack.rs`) when two packs on one backend declare the same table.
+
+Amendment A4 already records that `[[backends]]` and `[packs.<name>]` are shipped and sends
+readers to `engine_config.rs`. It does not touch Sections 2 and 8 or Open Question 1, which
+still name `AppConfig` at a path that has never existed.
+
+**Decision (accepted).** Section 2's target types are realized as `KhiveConfig`,
+`BackendConfig`, `BackendKind` and `PackConfig` in `crates/khive-runtime/src/engine_config.rs`.
+`AppConfig` is no longer a target type, and this ADR plans no `khive-config` crate. Open
+Question 1 is closed by that placement: the types live in `khive-runtime` with the rest of
+the configuration schema, which is neither of the two candidates the question listed.
+Section 8's code block stays as an outline of what boot does (open the declared backends,
+build one runtime per pack, apply each pack's schema plan with the collision check, register
+the verbs). The `serve.rs` functions named above are its implementation, and the order of
+those steps inside them is not fixed by this amendment. The per-pack `engines` list is
+unimplemented and deferred; until an amendment specifies it, a pack either uses the base
+embedding configuration or sets `no_embed`.
+
+**Alternatives considered.**
+
+- Keep `AppConfig` as the target and move the fields into a new `khive-config` crate. This
+  would split one configuration file across two schema types, or move the whole of
+  `KhiveConfig` and its validation for no behavioural gain. The shipped type already
+  carries every Section 2 field except the per-pack engine list.
+- Accept `KhiveConfig` and also require the per-pack `engines` field now. That is a new
+  runtime behaviour, a per-pack filtered embedder registry, and it needs its own
+  specification of how a filtered pack interacts with Amendment A3's search runtime
+  selection. It is not a documentation correction.
+
+**Consequences.** Readers looking for Section 2's types go to `engine_config.rs`, and the
+Section 8 pseudo-code is no longer read as a description of `kkernel` boot. The Section 4
+examples that set `engines = [...]` under `[packs.<name>]` describe the deferred per-pack
+engine list, not a working configuration. Sections 2, 4 and 8 keep their text as the
+original plan.
+
+**Refs.** #2270 (added `PackConfig.no_embed`); commit e1687e60b (added `BackendConfig`,
+`BackendKind`, `PackConfig` and the `KhiveConfig` fields).

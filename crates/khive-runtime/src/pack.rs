@@ -1284,6 +1284,7 @@ impl VerbRegistryBuilder {
                 if matches!(handler.visibility, Visibility::Verb)
                     && pack_name == canonical_owner
                     && crate::classify_operation(handler.name) == Some(crate::OperationAccess::Read)
+                    && !VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&handler.name)
                 {
                     read_replay_safe_verbs.insert(handler.name);
                 }
@@ -1929,6 +1930,43 @@ impl VerbRegistry {
         }
     }
 
+    /// Find the unique configured backend holding an entity for deletion.
+    /// Includes tombstones so soft deletion cannot hide a duplicate owner.
+    /// The dispatch-authorized token is preserved; lookup is namespace-agnostic.
+    pub async fn resolve_entity_delete_runtime(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<Option<KhiveRuntime>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.entity_runtime(token, id).await,
+            None => {
+                let store = runtime.entities(token)?;
+                let entity = store.get_entity_including_deleted(id).await?;
+                Ok(entity.map(|_| runtime.clone()))
+            }
+        }
+    }
+
+    /// Clean main-backend attachments after no live or tombstoned owner remains.
+    /// A live or tombstoned entity on any configured backend keeps its roots.
+    pub async fn cleanup_deleted_entity_attachments(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<bool, RuntimeError> {
+        if self
+            .resolve_entity_delete_runtime(runtime, token, id)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        runtime.delete_entity_attachments_on_core(id).await
+    }
+
     /// Recheck a merged-entity read against the kept id before returning it.
     /// The submitted argument shape is the verb's ordinary shape with the
     /// effective id substituted. The dispatch's original check remains its
@@ -2337,8 +2375,9 @@ impl VerbRegistry {
     }
 
     /// Transport replay eligibility from the shared operation-effects table,
-    /// restricted to trusted canonical public handlers. Read permits incidental
-    /// audit/cache effects; the request id is correlation, not deduplication.
+    /// restricted to trusted canonical public handlers. A read that persists a
+    /// fresh serve or telemetry row is excluded because the request id is
+    /// correlation, not deduplication.
     /// Custom and mounted handlers cannot inherit safety from a name/category.
     pub fn is_read_replay_safe(&self, verb: &str) -> bool {
         self.read_replay_safe_verbs.contains(verb)
@@ -4179,7 +4218,7 @@ impl VerbRegistry {
     /// storage. Adding a verb here (or removing one because its side effect
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
-    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
+    pub const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
         &["memory.recall", "search", "telemetry.emit"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
@@ -6160,6 +6199,27 @@ pub(crate) mod tests {
                 }
                 assert!(!registry.is_read_replay_safe("unknown.read"));
             }
+        }
+    }
+
+    #[test]
+    fn read_replay_excludes_reads_with_fresh_persisted_serve_or_search_rows() {
+        for (owner, verb) in [("memory", "memory.recall"), ("kg", "search")] {
+            let handler = Box::leak(Box::new([HandlerDef {
+                name: verb,
+                description: "side-effecting replay fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            }]));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_trusted(CountingHandlersPack {
+                name: owner,
+                handlers: handler,
+                calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let registry = builder.build().expect("side-effecting read fixture");
+            assert!(!registry.is_read_replay_safe(verb), "{verb}");
         }
     }
 

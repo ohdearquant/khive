@@ -830,9 +830,9 @@ fn atomic_secret_prepare_refusal_has_gate_reason() {
 #[test]
 fn atomic_strict_rollback_classifies_each_not_committed_operation() {
     let output = &atomic_scenario_outputs().strict_rollback;
-    // `--strict` was historically documented as not affecting atomic exit
-    // status. #1456 adds classification without changing that process status.
-    assert!(output.status.success(), "stderr={}", stderr(output));
+    // #3275 makes every rolled-back atomic unit exit non-zero, including
+    // --strict. #1456's per-operation refusal classification still applies.
+    assert!(!output.status.success(), "stderr={}", stderr(output));
     assert_refusal_count(output, "strict-op-failure", 2);
     let response = stdout_json(output);
     assert_eq!(response["atomic"]["rolled_back"], true);

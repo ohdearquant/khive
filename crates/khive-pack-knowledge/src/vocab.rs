@@ -427,7 +427,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.compose",
-        description: "Compose a markdown briefing from selected knowledge domains and atoms",
+        description: "Compose a budgeted markdown briefing from selected knowledge domains and atoms. The returned atoms/count describe atoms actually rendered in the briefing, not all reranked candidates.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -479,7 +479,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "max_tokens",
                 param_type: "integer",
                 required: false,
-                description: "Output token budget for the composed briefing (default 8000, clamped 500-100000; ~4 chars/token). Sections are trimmed to fit after scoring/selection.",
+                description: "Output budget for the complete composed markdown (default 8000, clamped 500-100000; at most 4 UTF-8 bytes/token, including query, headings, sources, scores, domains, and blended entities). Oversized candidates are skipped so smaller later ones can fit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

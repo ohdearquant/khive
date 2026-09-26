@@ -14,6 +14,9 @@ use khive_channel::ChannelError;
 /// with `!`, and this config contract reserves the exact string.
 pub const TOPMOST_NO_AUTHSERV_ID_SENTINEL: &str = "!topmost-no-authserv-id";
 
+pub(crate) const DEFAULT_IMAP_MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+pub(crate) const DEFAULT_IMAP_MAX_PAGE_BYTES: usize = 50 * 1024 * 1024;
+
 /// The trust-anchor mode this deployment uses to select which
 /// `Authentication-Results` header to trust (ADR-056 Amendment 2026-07-03,
 /// "EXO no-authserv-id trust anchor"). Parsed once, at config load, from
@@ -109,6 +112,11 @@ pub struct EmailChannelConfig {
     pub imap_host: String,
     /// IMAP port. Defaults to 993 (TLS) when `KHIVE_EMAIL_IMAP_PORT` is unset.
     pub imap_port: u16,
+    /// Maximum RFC 822 bytes fetched for one inbound message. Messages above
+    /// this limit are quarantined without fetching their bodies.
+    pub imap_max_message_bytes: usize,
+    /// Maximum aggregate RFC 822 bytes fetched in one inbound page.
+    pub imap_max_page_bytes: usize,
     /// Login username for SMTP AUTH / IMAP LOGIN (used in `Basic` mode).
     pub username: String,
     /// Mailbox address used as the `user=` field in the XOAUTH2 SASL string.
@@ -158,6 +166,8 @@ impl EmailChannelConfig {
     /// Optional variables with defaults:
     /// - `KHIVE_EMAIL_SMTP_PORT` (default `587`)
     /// - `KHIVE_EMAIL_IMAP_PORT` (default `993`)
+    /// - `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` (default 25 MiB)
+    /// - `KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES` (default 50 MiB)
     /// - `KHIVE_EMAIL_MAILBOX` (default: same as `KHIVE_EMAIL_USERNAME`)
     /// - `KHIVE_EMAIL_QUARANTINE_STORE` (default `true`)
     pub fn from_env() -> Result<Self, ChannelError> {
@@ -165,6 +175,20 @@ impl EmailChannelConfig {
         let smtp_port = optional_port("KHIVE_EMAIL_SMTP_PORT", 587)?;
         let imap_host = require_env("KHIVE_EMAIL_IMAP_HOST")?;
         let imap_port = optional_port("KHIVE_EMAIL_IMAP_PORT", 993)?;
+        let imap_max_message_bytes = optional_positive_bytes(
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            DEFAULT_IMAP_MAX_MESSAGE_BYTES,
+        )?;
+        let imap_max_page_bytes = optional_positive_bytes(
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
+            DEFAULT_IMAP_MAX_PAGE_BYTES,
+        )?;
+        if imap_max_page_bytes < imap_max_message_bytes {
+            return Err(ChannelError::Config(
+                "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES must be at least KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES"
+                    .into(),
+            ));
+        }
         let username = require_env("KHIVE_EMAIL_USERNAME")?;
         validate_sasl_string(&username, "KHIVE_EMAIL_USERNAME")?;
 
@@ -208,6 +232,8 @@ impl EmailChannelConfig {
             smtp_port,
             imap_host,
             imap_port,
+            imap_max_message_bytes,
+            imap_max_page_bytes,
             username,
             mailbox,
             auth,
@@ -292,6 +318,21 @@ fn optional_port(key: &str, default: u16) -> Result<u16, ChannelError> {
                 "environment variable {key:?} must be a valid port number (1-65535), got: {v:?}"
             ))
         }),
+    }
+}
+
+fn optional_positive_bytes(key: &str, default: usize) -> Result<usize, ChannelError> {
+    match std::env::var(key) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Ok(value) => match value.parse::<usize>() {
+            Ok(bytes) if bytes > 0 && bytes < u32::MAX as usize => Ok(bytes),
+            _ => Err(ChannelError::Config(format!(
+                "environment variable {key:?} must be a positive byte count below 4294967295"
+            ))),
+        },
+        Err(error) => Err(ChannelError::Config(format!(
+            "environment variable {key:?} could not be read: {error}"
+        ))),
     }
 }
 
