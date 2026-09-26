@@ -17,7 +17,7 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use khive_runtime::daemon::{
     self, acquire_recovery_lock, env_truthy, pid_path, read_frame, socket_path, write_frame,
-    DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
+    DaemonRequestFrame, DaemonResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use rmcp::ErrorData as McpError;
 use sha2::{Digest, Sha256};
@@ -440,6 +440,10 @@ enum ForwardOutcome {
     /// The socket is absent/refused, or the frame failed before it could reach
     /// dispatch. These outcomes are safe to route through recovery.
     NoSocket,
+    /// Serialization produced a frame over the transport cap. `write_frame`
+    /// would refuse it before writing any byte, so reconnecting or spawning
+    /// cannot change the outcome.
+    RequestTooLarge { bytes: usize },
     /// This process could not establish whether a daemon is listening. An OS
     /// access/policy failure is not proof that the daemon is absent, so it must
     /// never enter lifecycle recovery or local fallback (#1242).
@@ -479,23 +483,16 @@ fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
     }
 }
 
+#[cfg(test)]
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     try_forward_before(frame, None).await
 }
 
-async fn try_forward_before(
-    frame: &DaemonRequestFrame,
+fn socket_exchange_deadline(
+    probe_only: bool,
+    ops: &str,
     retry_deadline: Option<tokio::time::Instant>,
-) -> ForwardOutcome {
-    let sock = socket_path();
-    #[cfg(test)]
-    {
-        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
-        if forced_error != 0 {
-            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
-        }
-    }
-
+) -> tokio::time::Instant {
     // One absolute deadline bounds connect, write, and read together, so the
     // whole socket exchange can never exceed the ceiling the read phase alone
     // used to honour on its own. A same-UID peer that accepts the connection
@@ -511,17 +508,54 @@ async fn try_forward_before(
     // future caller outside the MCP bridge) fall back to a fresh relative
     // ceiling derived from the configured read timeout and the request's
     // valid long-poll waits plus a five-second transport margin.
-    let deadline = khive_storage::capture_request_read_context()
-        .deadline()
-        .map(khive_storage::RequestReadDeadline::async_at)
-        .unwrap_or_else(|| {
-            tokio::time::Instant::now()
-                + crate::request_policy::read_timeout(
-                    &frame.ops,
-                    khive_storage::request_read_timeout_from_env(),
-                )
-        });
-    let deadline = retry_deadline.map_or(deadline, |retry| retry.min(deadline));
+    if probe_only {
+        // Lifecycle probes are independent of the request that happened to
+        // trigger recovery. Their caller supplies a fresh probe deadline; an
+        // expired request deadline must never make a live daemon appear dead.
+        retry_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + khive_storage::request_read_timeout_from_env()
+        })
+    } else {
+        let request_deadline = khive_storage::capture_request_read_context()
+            .deadline()
+            .map(khive_storage::RequestReadDeadline::async_at)
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + crate::request_policy::read_timeout(
+                        ops,
+                        khive_storage::request_read_timeout_from_env(),
+                    )
+            });
+        retry_deadline.map_or(request_deadline, |retry| retry.min(request_deadline))
+    }
+}
+
+async fn try_forward_before(
+    frame: &DaemonRequestFrame,
+    retry_deadline: Option<tokio::time::Instant>,
+) -> ForwardOutcome {
+    let payload = match serde_json::to_vec(frame) {
+        Ok(p) => p,
+        Err(_) => return ForwardOutcome::NoSocket,
+    };
+    // Check before even connecting. The same cap is enforced by write_frame,
+    // but that function returns InvalidData before its first write; treating
+    // that as NoSocket would enter deterministic, futile lifecycle recovery.
+    if payload.len() > MAX_FRAME_BYTES {
+        return ForwardOutcome::RequestTooLarge {
+            bytes: payload.len(),
+        };
+    }
+    let sock = socket_path();
+    #[cfg(test)]
+    {
+        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
+        if forced_error != 0 {
+            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
+        }
+    }
+
+    let deadline = socket_exchange_deadline(frame.probe_only, &frame.ops, retry_deadline);
 
     let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&sock)).await {
         Ok(Ok(s)) => s,
@@ -535,10 +569,6 @@ async fn try_forward_before(
             );
             return ForwardOutcome::NoSocket;
         }
-    };
-    let payload = match serde_json::to_vec(frame) {
-        Ok(p) => p,
-        Err(_) => return ForwardOutcome::NoSocket,
     };
     match tokio::time::timeout_at(deadline, write_frame(&mut stream, &payload)).await {
         Ok(Ok(())) => {}
@@ -823,6 +853,22 @@ async fn try_forward_with_read_replay(
 fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
     let error = daemon::DaemonDispatchError::new(message, data);
     McpError::internal_error(error.message, Some(error.error_detail))
+}
+
+fn request_too_large_error(bytes: usize) -> McpError {
+    let message =
+        format!("request too large: {bytes} bytes exceeds {MAX_FRAME_BYTES} byte daemon IPC cap");
+    let error = daemon::DaemonDispatchError::new(
+        message,
+        Some(serde_json::json!({
+            "kind": "transport",
+            "code": "request_frame_size_limit",
+            "frame_bytes": bytes,
+            "max_frame_bytes": MAX_FRAME_BYTES,
+            "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+        })),
+    );
+    McpError::invalid_params(error.message, Some(error.error_detail))
 }
 
 /// The operator-facing text for a protocol mismatch, by direction. A daemon ahead
@@ -1205,6 +1251,7 @@ const INCUMBENT_EXIT_POLL_MS: u64 = 25;
 enum RecoveryError {
     Spawn(std::io::Error),
     IncumbentStillAlive { pid: u32 },
+    RequestExpired,
     PidFileDirectoryUntrusted(String),
 }
 
@@ -1460,7 +1507,21 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         request_id: None,
     };
     let deadline = std::time::Duration::from_millis(timeout_ms);
-    match tokio::time::timeout(deadline, try_forward_inner(&probe)).await {
+    let probe_deadline = tokio::time::Instant::now() + deadline;
+    let exchange = tokio::time::timeout_at(
+        probe_deadline,
+        try_forward_before(&probe, Some(probe_deadline)),
+    )
+    .await;
+    // The inner connect/read timeout and this outer probe timeout can become
+    // ready in the same scheduler turn. A timed-out inner NoSocket/ParseFailure
+    // is uncertainty about a slow peer, never evidence that it is dead.
+    if tokio::time::Instant::now() >= probe_deadline
+        && !matches!(&exchange, Ok(ForwardOutcome::Response(_)))
+    {
+        return ProbeOutcome::Timeout;
+    }
+    match exchange {
         Err(_elapsed) => {
             tracing::debug!(
                 timeout_ms,
@@ -1514,6 +1575,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
             | ForwardOutcome::ResponseLost
             | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
+        Ok(ForwardOutcome::RequestTooLarge { .. }) => ProbeOutcome::Timeout,
         Ok(ForwardOutcome::Unreachable {
             kind,
             os_error_code,
@@ -1811,6 +1873,12 @@ where
         }
     };
 
+    // The bridge may have stopped waiting while this task waited for a peer
+    // recoverer. Its detached task must not now classify or kill a daemon.
+    if khive_storage::request_read_is_cancelled() {
+        return Err(RecoveryError::RequestExpired);
+    }
+
     let outcome = match confirm_genuinely_dead(config_id, namespace).await {
         ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
         ProbeOutcome::LockContended => {
@@ -1826,6 +1894,9 @@ where
                 ProbeOutcome::Alive | ProbeOutcome::Timeout => return Ok(RecoveryOutcome::Skipped),
                 ProbeOutcome::LockContended => return Ok(RecoveryOutcome::Uncertain),
                 ProbeOutcome::Dead => {}
+            }
+            if khive_storage::request_read_is_cancelled() {
+                return Err(RecoveryError::RequestExpired);
             }
             let expected_snapshot = kill_stale_daemon_inner(exit_timeout, boot_lock).await?;
             // Keep the recoverer-only lock throughout, but let graceful exit
@@ -2732,6 +2803,9 @@ where
         ForwardOutcome::Response(resp) => {
             return map_response(*resp, &frame.config_id, &frame.namespace)
         }
+        ForwardOutcome::RequestTooLarge { bytes } => {
+            return Some(Err(request_too_large_error(bytes)));
+        }
         ForwardOutcome::NoSocket => {
             // No marker (checked above): nothing was written; fall through
             // to the spawn/recover-then-send path below, unchanged from
@@ -2787,6 +2861,12 @@ where
     // connect-retry window or the #667 boot-quiescence wait short.
     let mut spawned_child: Option<std::process::Child> = None;
     match kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await {
+        Err(RecoveryError::RequestExpired) => {
+            return Some(Err(daemon_mcp_error(
+                "daemon reconnect deadline expired or request cancelled before lifecycle recovery",
+                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+            )));
+        }
         Err(RecoveryError::Spawn(e)) => {
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
@@ -2825,12 +2905,18 @@ where
 
     // Send the real frame now that a daemon is confirmed ready
     // (or believed ready via Skipped). The connect attempt inside
-    // `try_forward_inner` doubles as the readiness check — a `NoSocket`
+    // `try_forward_before` doubles as the readiness check — a `NoSocket`
     // outcome here just means "not listening yet" (nothing written), so keep
     // retrying. Only the explicit read policy may replay a lost response;
     // every other post-write outcome is terminal and returned immediately.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
+        if khive_storage::request_read_is_cancelled() {
+            return Some(Err(daemon_mcp_error(
+                "daemon reconnect deadline expired or request cancelled before dispatch",
+                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+            )));
+        }
         if tokio::time::Instant::now() >= deadline {
             // #667: a bare timeout here does not mean "no daemon" — it may
             // mean "daemon is still inside cold-boot schema init". Wait for
@@ -2869,6 +2955,9 @@ where
         match try_forward_with_read_replay(frame, &mut replay, None).await {
             ForwardOutcome::Response(resp) => {
                 return map_response(*resp, &frame.config_id, &frame.namespace)
+            }
+            ForwardOutcome::RequestTooLarge { bytes } => {
+                return Some(Err(request_too_large_error(bytes)));
             }
             ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
                 let config_id = opaque_config_id(&frame.config_id);
@@ -2940,6 +3029,21 @@ mod tests {
         runtime_config_from_khive_config, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
         KhiveRuntime, Namespace, RuntimeConfig,
     };
+
+    #[tokio::test]
+    async fn lifecycle_probe_uses_own_deadline_when_request_deadline_has_expired() {
+        khive_storage::scope_request_read_deadline(std::time::Duration::ZERO, async {
+            tokio::task::yield_now().await;
+            let now = tokio::time::Instant::now();
+            let probe_deadline = now + std::time::Duration::from_millis(500);
+            assert_eq!(
+                socket_exchange_deadline(true, "", Some(probe_deadline)),
+                probe_deadline
+            );
+            assert!(socket_exchange_deadline(false, "stats()", None) <= now);
+        })
+        .await;
+    }
 
     const PRIMARY_MODEL: lattice_embed::EmbeddingModel =
         lattice_embed::EmbeddingModel::AllMiniLmL6V2;
@@ -4817,6 +4921,65 @@ mod tests {
                 _ => panic!("EACCES/EPERM must be unreachable, never safe-to-recover NoSocket"),
             }
         }
+    }
+
+    /// A frame-size refusal happens before the first socket write and cannot
+    /// be repaired by reconnecting, killing a peer, or spawning a daemon.
+    /// The unbounded per-op override represents the old caller path: `ops`
+    /// itself is capped separately before forwarding.
+    #[tokio::test]
+    #[serial]
+    async fn oversized_request_frame_is_terminal_before_recovery() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
+        clear_daemon_env();
+        reset_counters();
+        reset_fallback_counters();
+        let _cleanup = RecoveryTestGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let mut frame = unreachable_daemon_frame("oversized-request-test");
+        frame.format_per_op = Some(vec![Some("x".repeat(MAX_FRAME_BYTES))]);
+        let bytes = serde_json::to_vec(&frame).expect("serialize frame").len();
+        assert!(bytes > MAX_FRAME_BYTES);
+        assert!(matches!(
+            try_forward_inner(&frame).await,
+            ForwardOutcome::RequestTooLarge { bytes: actual } if actual == bytes
+        ));
+
+        let spawn_attempts = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("oversized request must not spawn"))
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            forward_or_spawn_with(&frame, &spawn),
+        )
+        .await
+        .expect("deterministic pre-write refusal must not wait for daemon recovery");
+        match outcome {
+            Some(Err(error)) => {
+                assert!(error.message.contains("request too large"));
+                let data = error.data.expect("structured frame cap error");
+                assert_eq!(data["code"], "request_frame_size_limit");
+                assert_eq!(data["domain_disposition"], "not_committed");
+                assert_eq!(data["frame_bytes"].as_u64(), Some(bytes as u64));
+                assert_eq!(
+                    data["max_frame_bytes"].as_u64(),
+                    Some(MAX_FRAME_BYTES as u64)
+                );
+            }
+            other => panic!("oversized frame must be a terminal request error: {other:?}"),
+        }
+        assert_eq!(spawn_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 0);
     }
 
     #[tokio::test]
@@ -7502,7 +7665,11 @@ mod tests {
                 None
             }
             Ok(RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain)
-            | Err(RecoveryError::Spawn(_) | RecoveryError::PidFileDirectoryUntrusted(_)) => None,
+            | Err(
+                RecoveryError::Spawn(_)
+                | RecoveryError::RequestExpired
+                | RecoveryError::PidFileDirectoryUntrusted(_),
+            ) => None,
         };
         let live_pid_file_preserved = pid_file.exists();
         cleanup.kill_and_reap_child();
