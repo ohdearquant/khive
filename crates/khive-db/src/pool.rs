@@ -2814,11 +2814,45 @@ fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
     Ok(())
 }
 
+/// Order-preserving UTC key across Chrono's signed timestamp range, with
+/// nanoseconds kept after the sign-adjusted epoch seconds.
+pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    let mut key = Vec::with_capacity(12);
+    key.extend_from_slice(&((instant.timestamp() as u64) ^ (1_u64 << 63)).to_be_bytes());
+    key.extend_from_slice(&instant.timestamp_subsec_nanos().to_be_bytes());
+    key
+}
+
+fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::types::ValueRef;
+
+    conn.create_scalar_function(
+        "khive_rfc3339_key",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let text = match ctx.get_raw(0) {
+                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let key = text
+                .and_then(|text| text.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .map(rfc3339_instant_key);
+            Ok(key)
+        },
+    )?;
+    Ok(())
+}
+
 fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
     register_writer_clock(conn)?;
+    register_rfc3339_key(conn)?;
     if config.read_only {
         // Read-only writer slot: skip write-intent PRAGMAs (journal_mode,
         // wal_autocheckpoint, journal_size_limit all require write access to
@@ -2867,6 +2901,7 @@ fn configure_writer_connection(
 }
 
 fn configure_reader_connection(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    register_rfc3339_key(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
     conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
