@@ -276,13 +276,18 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
             .expect("missing public lexical_timeout_details");
         assert_eq!(details.len(), passes.len(), "one record per executed pass");
         for (detail, pass) in details.iter().zip(passes) {
+            // Six expanded query words receive 7.5 s; each three-word
+            // decomposed pass receives 4.5 s. The probe still has its own
+            // unchanged 500 ms bound.
+            let stage_budget_ms = if pass == "full" { 7_500 } else { 4_500 };
             assert_eq!(
                 *detail,
                 json!({
                     "pass": pass, "phase": "term_frequency",
                     "bound": "ordering_probe",
                     "stage_elapsed_ms": 9, "operation_elapsed_ms": 9,
-                    "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "configured_budget_ms": stage_budget_ms,
+                    "effective_budget_ms": stage_budget_ms,
                     "read_budget_ms": 500,
                 })
             );
@@ -432,8 +437,8 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
                     "pass": "full", "phase": phase.label(),
                     "bound": if probe_site { "ordering_probe" } else { "stage" },
                     "stage_elapsed_ms": 11,
-                    "operation_elapsed_ms": 11, "configured_budget_ms": 2000, "effective_budget_ms": 2000,
-                    "read_budget_ms": if probe_site { 500 } else { 2000 },
+                    "operation_elapsed_ms": 11, "configured_budget_ms": 2500, "effective_budget_ms": 2500,
+                    "read_budget_ms": if probe_site { 500 } else { 2500 },
                 }]
             }});
             if probe_site {
@@ -542,7 +547,7 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
                     "pass": "full", "phase": "term_frequency",
                     "bound": "ordering_probe",
                     "stage_elapsed_ms": 11, "operation_elapsed_ms": 11,
-                    "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "configured_budget_ms": 5500, "effective_budget_ms": 5500,
                     "read_budget_ms": 500,
                 }]
             }}),
@@ -725,7 +730,11 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
     for query in ["term1 term18", "term18 term1"] {
         let outcome = with_fts_deadline_advance_after_term(
             1,
-            Duration::from_millis(2000),
+            // Both query words have a plural expansion, so this pass admits
+            // four terms and has a 3.5 s stage budget. Advance past that
+            // bound after the first completed term to preserve the partial
+            // candidate fixture under the scaled allowance.
+            Duration::from_millis(3600),
             search_core(&ctx, query, LexicalPass::Full),
         )
         .await
@@ -788,11 +797,11 @@ async fn configured_budget_uses_the_stage_override() {
     );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["configured_budget_ms"],
-        137
+        171
     );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["effective_budget_ms"],
-        137
+        171
     );
 }
 
