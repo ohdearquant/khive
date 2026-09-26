@@ -419,13 +419,20 @@ impl KgPack {
                 // nothing, and a caller who deleted by a bare id or a hex prefix learns
                 // what it actually removed.
                 let resolved_kind = entity.kind.clone();
-                let deleted = self.runtime.delete_entity(token, id, hard).await?;
+                let (deleted, degradations) = self
+                    .runtime
+                    .delete_entity_with_post_commit_report(token, id, hard)
+                    .await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
-                to_json(
+                let mut response = to_json(
                     &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
-                )
+                )?;
+                if !degradations.is_empty() {
+                    response["post_commit_degradations"] = serde_json::json!(degradations);
+                }
+                Ok(response)
             }
             KindSpec::Note { specific } => {
                 // Read the row whether or not the caller named a kind. It used to be read
@@ -454,13 +461,20 @@ impl KgPack {
                     }
                 }
                 let resolved_kind = note.kind.clone();
-                let deleted = self.runtime.delete_note(token, id, hard).await?;
+                let (deleted, degradations) = self
+                    .runtime
+                    .delete_note_with_post_commit_report(token, id, hard)
+                    .await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
-                to_json(
+                let mut response = to_json(
                     &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
-                )
+                )?;
+                if !degradations.is_empty() {
+                    response["post_commit_degradations"] = serde_json::json!(degradations);
+                }
+                Ok(response)
             }
             KindSpec::Edge => {
                 let deleted = self.runtime.delete_edge(token, id, hard).await?;
