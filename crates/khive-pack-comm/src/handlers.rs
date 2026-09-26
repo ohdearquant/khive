@@ -15,6 +15,7 @@ use khive_runtime::{
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
@@ -2444,6 +2445,35 @@ pub(crate) async fn handle_ingest(
         }
     }
 
+    // The original bytes are this quarantine message's own binary content.
+    // A metadata-only ContentRef is invisible to blob GC, so pass its role to
+    // the note store for one transaction with the new note. Other inbound
+    // messages and quarantines without replay bytes keep their old behavior.
+    let is_quarantined = matches!(props.get("quarantined"), Some(Value::Bool(true)))
+        || props.get("quarantined").and_then(Value::as_str) == Some("true");
+    let quarantine_attachment = if is_quarantined {
+        match props.get("quarantine_content_ref") {
+            None => None,
+            Some(Value::String(raw)) => Some(NewAttachment {
+                role: "quarantine-original".to_string(),
+                content_ref: ContentRef::from_hex(raw).map_err(|error| {
+                    RuntimeError::InvalidInput(format!(
+                        "ingest: invalid quarantine_content_ref: {error}"
+                    ))
+                })?,
+                media_type: None,
+                size_bytes: None,
+            }),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "ingest: quarantine_content_ref must be a ContentRef string".to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Trusted-ingest entry point: comm.ingest is the sole legitimate writer of
     // transport-owned quarantine disposition and channel provenance (`quarantined`,
     // `channel_kind`, `channel_slug`), derived above from the inbound transport
@@ -2458,17 +2488,31 @@ pub(crate) async fn handle_ingest(
                 .to_string(),
         )
     })?;
-    let note = match runtime
-        .try_create_note_as_trusted_ingest(
-            capability,
-            token,
-            "message",
-            p.subject.as_deref(),
-            p.content.trim(),
-            Some(props),
-        )
-        .await?
-    {
+    let created = if let Some(attachment) = quarantine_attachment.clone() {
+        runtime
+            .try_create_note_as_trusted_ingest_with_attachment(
+                capability,
+                token,
+                "message",
+                p.subject.as_deref(),
+                p.content.trim(),
+                Some(props),
+                attachment,
+            )
+            .await?
+    } else {
+        runtime
+            .try_create_note_as_trusted_ingest(
+                capability,
+                token,
+                "message",
+                p.subject.as_deref(),
+                p.content.trim(),
+                Some(props),
+            )
+            .await?
+    };
+    let note = match created {
         Some(n) => n,
         None => {
             tracing::debug!(
@@ -2504,6 +2548,55 @@ pub(crate) async fn handle_ingest(
                     "comm.ingest: duplicate external_id {external_id:?} has no existing row"
                 ))
             })?;
+            if let Some(attachment) = quarantine_attachment {
+                let stored_ref = duplicate
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("quarantine_content_ref"))
+                    .and_then(Value::as_str);
+                if stored_ref != Some(attachment.content_ref.as_str()) {
+                    return Err(RuntimeError::InvalidInput(
+                        "ingest: duplicate quarantine external_id holds different original bytes"
+                            .to_string(),
+                    ));
+                }
+                let store = runtime.core().attachments()?;
+                match store
+                    .get_attachment(duplicate.id, "quarantine-original")
+                    .await?
+                {
+                    Some(existing) if existing.content_ref == attachment.content_ref => {}
+                    Some(_) => {
+                        return Err(RuntimeError::Internal(
+                            "ingest: duplicate quarantine attachment disagrees with note metadata"
+                                .to_string(),
+                        ));
+                    }
+                    None => {
+                        // Retry/backfill an older metadata-only quarantine.
+                        // A failed owner write keeps the channel cursor stalled.
+                        let blob = runtime.blob_store().ok_or_else(|| {
+                            RuntimeError::Unconfigured(
+                                "ingest: quarantine replay requires a BlobStore".to_string(),
+                            )
+                        })?;
+                        if !blob.exists(&attachment.content_ref).await? {
+                            return Err(RuntimeError::InvalidInput(
+                                "ingest: duplicate quarantine original is not published"
+                                    .to_string(),
+                            ));
+                        }
+                        store
+                            .upsert_attachment(Attachment::from_new(
+                                duplicate.id,
+                                AttachmentSubstrate::Note,
+                                attachment,
+                                duplicate.created_at,
+                            ))
+                            .await?;
+                    }
+                }
+            }
             // Ack schema boundary: `thread_id` is a free-form string here, so a
             // stored legacy label (non-UUID) is echoed verbatim. Fabricating
             // `duplicate.id` instead would point the caller at a DIFFERENT

@@ -1019,6 +1019,21 @@ pub trait NoteStore: Send + Sync + 'static {
     /// so that callers do not misinterpret unexpected failures as deduplication.
     async fn try_insert_note(&self, note: Note) -> StorageResult<bool>;
 
+    /// Atomically insert an ingest note and the blob attachments owned by it.
+    /// A deduplicated note writes no attachments; callers must inspect the
+    /// existing note before repairing a legacy missing role.
+    async fn try_insert_note_with_attachments(
+        &self,
+        _note: Note,
+        _attachments: Vec<crate::Attachment>,
+    ) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "try_insert_note_with_attachments".into(),
+            message: "this backend cannot atomically insert note attachments".into(),
+        })
+    }
+
     /// Fetch multiple notes by UUID in a single call.
     async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
         let mut out = Vec::with_capacity(ids.len());

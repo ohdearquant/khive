@@ -278,6 +278,11 @@ fn commit_staged(
         .map_err(|error| upload_error(error, id, "commit_upload"))?;
     let staged = openat_regular_file_no_follow(uploads.as_raw_fd(), id.as_str(), libc::O_WRONLY)
         .map_err(|error| upload_error(error, id, "commit_upload"))?;
+    // rename preserves this inode's mtime. Restart grace before the existing
+    // pre-publication fsync, even when the last part arrived long ago.
+    staged
+        .set_modified(SystemTime::now())
+        .map_err(|error| map_io_err(error, "put_touch_mtime"))?;
     context
         .publication
         .step("put_fsync", || staged.sync_all())?;
@@ -331,6 +336,9 @@ fn commit_staged(
     let source = uploads.join(id.as_str());
     let staged =
         open_staging(&source, false).map_err(|error| upload_error(error, id, "commit_upload"))?;
+    staged
+        .set_modified(SystemTime::now())
+        .map_err(|error| map_io_err(error, "put_touch_mtime"))?;
     staged
         .sync_all()
         .map_err(|error| map_io_err(error, "put_fsync"))?;
@@ -513,6 +521,28 @@ mod tests {
         assert!(fs::metadata(&target).unwrap().modified().unwrap() > old);
         assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
         assert_eq!(store.put(bytes.to_vec()).await.unwrap(), reference);
+    }
+
+    #[tokio::test]
+    async fn fresh_upload_commit_restarts_grace_after_old_staging_mtime() {
+        let (_dir, store) = fixture();
+        let bytes = b"staged long before publication";
+        let (id, reference) = stage(&store, bytes).await;
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(staged(&store, &id))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        store.commit_upload(&id, &reference).await.unwrap();
+        let target = shard_path(store.root(), &reference);
+        assert!(
+            fs::metadata(&target).unwrap().modified().unwrap() > old,
+            "fresh commit must start grace at publication, not the last part"
+        );
+        assert_eq!(fs::read(target).unwrap(), bytes);
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
-use khive_storage::attachment::AttachmentSubstrate;
+use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NoteSeekAfter, NoteTagMode,
@@ -25,7 +25,7 @@ use khive_storage::{StorageCapability, StorageResult};
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
-use crate::stores::attachment::delete_record_attachments_statement;
+use crate::stores::attachment::{attachment_upsert_statement, delete_record_attachments_statement};
 use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -1566,6 +1566,32 @@ impl NoteStore for SqlNoteStore {
     }
 
     async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
+        self.try_insert_note_with_attachments(note, Vec::new())
+            .await
+    }
+
+    async fn try_insert_note_with_attachments(
+        &self,
+        note: Note,
+        attachments: Vec<Attachment>,
+    ) -> Result<bool, StorageError> {
+        let mut attachment_statements = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            attachment.validate()?;
+            if attachment.record_uuid != note.id
+                || attachment.substrate != AttachmentSubstrate::Note
+            {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Attachments,
+                    operation: "try_insert_note_with_attachments".into(),
+                    message: format!(
+                        "attachment {} must target note {}",
+                        attachment.role, note.id
+                    ),
+                });
+            }
+            attachment_statements.push(attachment_upsert_statement(&attachment)?);
+        }
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
@@ -1610,6 +1636,11 @@ impl NoteStore for SqlNoteStore {
 
             if rows > 0 {
                 assign_note_seq(conn, &id_str)?;
+                for statement in attachment_statements {
+                    let mut stmt = conn.prepare(&statement.sql)?;
+                    bind_params(&mut stmt, &statement.params)?;
+                    stmt.raw_execute()?;
+                }
                 return Ok(true);
             }
 
