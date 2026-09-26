@@ -56,6 +56,16 @@ async fn latest_receipt(
         .await
 }
 
+fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
+    let url = properties
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::Internal("stored document has no url property".to_string()))?;
+    Url::parse(url)
+        .map(crate::identity::request_url)
+        .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))
+}
+
 async fn run_refresh(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -85,13 +95,8 @@ async fn run_refresh(
             ))
         })?
         .to_string();
-    let url_str = properties
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::Internal("stored document has no url property".to_string()))?
-        .to_string();
-    let url = Url::parse(&url_str)
-        .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
+    let url = stored_request_url(&properties)?;
+    let url_str = url.to_string();
 
     let ceilings = egress::resolve_ceilings(cfg)?;
     let max_bytes = egress::check_ceiling(
@@ -264,8 +269,8 @@ async fn settle_refresh(
             .properties
             .as_ref()
             .expect("validated cached properties");
-        let canonical = crate::identity::canonicalize(outcome.final_url.clone());
-        let (_, terminal) = crate::fetch::mint_bare(runtime, token, &canonical).await?;
+        let request_url = crate::identity::request_url(outcome.final_url.clone());
+        let (_, terminal) = crate::fetch::mint_bare(runtime, token, &request_url).await?;
         debug_assert_eq!(terminal, final_id);
         let content_type = properties.get("content_type").and_then(Value::as_str);
         crate::entities::patch(
@@ -274,7 +279,7 @@ async fn settle_refresh(
             terminal,
             source.entity_type.as_deref(),
             json!({
-                "url": canonical.to_string(),
+                "url": request_url.to_string(),
                 "blob_ref": content_ref.to_string(),
                 "content_digest": content_ref.to_string(),
                 "content_type": content_type,
@@ -404,23 +409,6 @@ async fn settle_refresh(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.refresh: receipt write failed: {error}"))
     })?;
-    if let Some(content_ref) = &new_content_ref {
-        crate::fetch::root_body(
-            runtime,
-            receipt_id,
-            khive_storage::AttachmentSubstrate::Note,
-            &khive_storage::ContentRef::from_hex(content_ref.clone()).map_err(|error| {
-                RuntimeError::Internal(format!("content_ref {content_ref:?} unparseable: {error}"))
-            })?,
-            outcome
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            body_bytes,
-        )
-        .await?;
-    }
-
     if let Some(previous) = previous_receipt {
         runtime
             .link(
@@ -503,11 +491,8 @@ mod tests {
             .as_str()
             .expect("seeded entity carries blob_ref")
             .to_string();
-        let url_str = properties["url"]
-            .as_str()
-            .expect("seeded entity carries url")
-            .to_string();
-        let url = Url::parse(&url_str).expect("valid stored url");
+        let url = stored_request_url(&properties)?;
+        let url_str = url.to_string();
         let client = plain_client(Duration::from_secs(5));
         let outcome = run_one_hop(
             &client,
@@ -1196,3 +1181,7 @@ mod reuse_tests;
 #[cfg(test)]
 #[path = "refresh_receipt_tests.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "refresh_query_tests.rs"]
+mod query_tests;

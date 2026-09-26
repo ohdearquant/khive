@@ -21,7 +21,7 @@ from pathlib import Path
 from uuid import UUID
 
 from khive.models import OpResult
-from khive.transport import Session
+from khive.transport import PROTOCOL_VERSION, Session
 
 from test_domain_disposition import framed_daemon
 
@@ -39,7 +39,7 @@ def main() -> None:
     assert frame["ok"] is True
     assert frame.get("error") is None
     assert frame.get("error_detail") is None
-    assert frame["daemon_protocol_version"] == 4
+    assert frame["daemon_protocol_version"] == PROTOCOL_VERSION
     assert frame["result"] == capture["dispatch_payload"] == capture["mcp_payload"]
     envelope = json.loads(capture["mcp_payload"])
     assert len(envelope["results"]) == 1
@@ -94,7 +94,7 @@ def main() -> None:
         assert requests[0]["metrics_only"] is True
         assert requests[1]["ops"] == request_ops
         assert requests[1]["config_id"] == frame["served_config_id"]
-        assert requests[1]["protocol_version"] == 4
+        assert requests[1]["protocol_version"] == PROTOCOL_VERSION
 
     canonical = json.dumps(expected, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     print(json.dumps({

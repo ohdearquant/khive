@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 #[cfg(windows)]
 #[path = "external_ids_windows.rs"]
-mod windows;
+pub(crate) mod windows;
 
 const SIDECAR_MAGIC: &[u8; 8] = b"KHVANID2";
 const HEADER_LEN: usize = 8 + 32 + 32 + 8;
@@ -193,7 +193,7 @@ fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsW
 }
 
 #[cfg(unix)]
-fn verify_original_dir_identity(
+pub(crate) fn verify_original_dir_identity(
     dir: &std::path::Path,
     canonical_dir: &std::fs::File,
 ) -> Result<(), ExternalIdsWriteError> {
@@ -238,7 +238,7 @@ fn verify_original_dir_identity(
 }
 
 #[cfg(unix)]
-fn open_dir_with_trusted_symlinks(
+pub(crate) fn open_dir_with_trusted_symlinks(
     dir: &std::path::Path,
 ) -> Result<std::fs::File, ExternalIdsWriteError> {
     use std::os::unix::ffi::OsStrExt as _;

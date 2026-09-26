@@ -94,7 +94,7 @@ fn sink_never_adds_measurable_latency_when_its_directory_is_unwritable() {
     let cfg = PoolConfig {
         path: Some(db_path),
         checkout_timeout,
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
 
     // Pool construction must finish while the sink writer is paused before

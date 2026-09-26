@@ -222,6 +222,9 @@ pub(super) async fn embed_query_model(
     model_name: String,
     query: String,
 ) -> Result<(String, Vec<f32>), RuntimeError> {
+    if runtime.embedder_dimensions(&model_name).is_none() {
+        return Err(RuntimeError::UnknownModel(model_name));
+    }
     if let Some(v) = cache.get(&model_name, &query) {
         return Ok((model_name, v));
     }
@@ -910,6 +913,16 @@ pub(super) fn fuse_candidates(
             SearchHit {
                 entity_id: id,
                 score,
+                rank_score_kind: match &cfg.fuse_strategy {
+                    FusionStrategy::Rrf { .. } => khive_runtime::RankScoreKind::Rrf,
+                    FusionStrategy::VectorOnly => khive_runtime::RankScoreKind::Vector,
+                    FusionStrategy::KeywordOnly => khive_runtime::RankScoreKind::Keyword,
+                    FusionStrategy::Weighted { .. } => khive_runtime::RankScoreKind::Weighted,
+                    FusionStrategy::Union => khive_runtime::RankScoreKind::Union,
+                    // The retrieval helper resolves custom strategies to its RRF fallback.
+                    FusionStrategy::Custom { .. } => khive_runtime::RankScoreKind::Rrf,
+                },
+                signals: khive_runtime::SearchSignals::default(),
                 source,
                 title,
                 snippet,
@@ -1212,14 +1225,16 @@ impl MemoryPack {
                         let cache = self.query_cache.clone();
                         let q = query.to_string();
                         let name_for_result = model_name.clone();
-                        handles.push(tokio::spawn(khive_storage::inherit_request_read_context(
-                            async move {
-                                (
-                                    name_for_result,
-                                    embed_query_model(rt, cache, model_name, q).await,
-                                )
-                            },
-                        )));
+                        handles.push(tokio::spawn(
+                            khive_runtime::runtime::inherit_request_embedder_scope(
+                                khive_storage::inherit_request_read_context(async move {
+                                    (
+                                        name_for_result,
+                                        embed_query_model(rt, cache, model_name, q).await,
+                                    )
+                                }),
+                            ),
+                        ));
                     }
                     let mut named_results = Vec::with_capacity(handles.len());
                     while !handles.is_empty() {
@@ -1331,24 +1346,26 @@ impl MemoryPack {
                         let token_owned = token.clone();
                         let ns_owned = ns.to_string();
                         let visible_owned = visible_namespaces.clone();
-                        handles.push(tokio::spawn(khive_storage::inherit_request_read_context(
-                            async move {
-                                collect_model_ann_hits(
-                                    &rt,
-                                    &ann_shared,
-                                    &token_owned,
-                                    &ns_owned,
-                                    &visible_owned,
-                                    model_name,
-                                    vec,
-                                    candidate_limit,
-                                    ann_fetch_limit,
-                                    ann_overfetch_max_rounds,
-                                    ann_ready_timeout_ms,
-                                )
-                                .await
-                            },
-                        )));
+                        handles.push(tokio::spawn(
+                            khive_runtime::runtime::inherit_request_embedder_scope(
+                                khive_storage::inherit_request_read_context(async move {
+                                    collect_model_ann_hits(
+                                        &rt,
+                                        &ann_shared,
+                                        &token_owned,
+                                        &ns_owned,
+                                        &visible_owned,
+                                        model_name,
+                                        vec,
+                                        candidate_limit,
+                                        ann_fetch_limit,
+                                        ann_overfetch_max_rounds,
+                                        ann_ready_timeout_ms,
+                                    )
+                                    .await
+                                }),
+                            ),
+                        ));
                     }
                     let mut out = Vec::with_capacity(handles.len());
                     while !handles.is_empty() {

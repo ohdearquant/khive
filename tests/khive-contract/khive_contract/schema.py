@@ -174,10 +174,19 @@ SEARCH_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {
         "type": "object",
-        "required": ["id"],
+        "required": ["id", "rank_score", "rank_score_kind", "signals", "score"],
         "properties": {
             "id": {"type": "string"},
-            "score": {"type": ["number", "null"]},
+            "rank_score": {"type": "number"},
+            "rank_score_kind": {
+                "type": "string",
+                "enum": ["rrf", "vector", "keyword", "weighted", "union"],
+            },
+            "signals": {
+                "type": "object",
+                "additionalProperties": {"type": "number"},
+            },
+            "score": {"type": "number"},
         },
     },
 }
@@ -269,6 +278,10 @@ def assert_list_response(result: Any) -> None:
 
 def assert_search_response(result: Any) -> None:
     validate(result, SEARCH_RESPONSE_SCHEMA, context="search")
+    for hit in result:
+        assert float(hit["score"]).hex() == float(hit["rank_score"]).hex(), (
+            "[search] deprecated score must exactly equal rank_score on the wire"
+        )
 
 
 def assert_link_response(result: Any) -> None:
