@@ -4,14 +4,14 @@
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
 accepted 2026-07-17; Amendment 4 accepted 2026-07-19; Amendment 5 accepted 2026-09-24; attachment-GC compatibility epoch added
-2026-08-16 by ADR-160; a proposed §8 verb clarification appears in ADR-121 Amendment 1)
+2026-08-16 by ADR-160; a §8 verb clarification accepted 2026-09-25 appears in ADR-121 Amendment 1)
 **Authors**: khive maintainers
 **Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
 backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
 ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
 mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
-cutover. [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (proposed) would scope §8's
-"not an MCP verb" sentence to the caller-snapshot `orphan_sweep` and gate any scheduled
+cutover. [ADR-121](ADR-121-attachments-first-class.md) Amendment 1 (accepted 2026-09-25) scopes §8's
+"not an MCP verb" sentence to the caller-snapshot `orphan_sweep` and gates any scheduled
 transactional sweep on complete root liveness and durable main-database ownership.
 **Depends on**:
 
@@ -258,7 +258,7 @@ and passes it in `BlobOrphanSweepConfig`;
 `FsBlobStore` walks its shard tree and reports (`dry_run: true`) or deletes (`dry_run: false`)
 everything not in that set.
 
-> Proposed clarification in [ADR-121](ADR-121-attachments-first-class.md) Amendment 1: the "not
+> Clarification accepted 2026-09-25 in [ADR-121](ADR-121-attachments-first-class.md) Amendment 1: the "not
 > an MCP verb" sentence above applies to the caller-snapshot `orphan_sweep` only, which stays
 > admin-side. Only after main-owned pack ownership rows with a checked writer census and a durable blob-root owner
 > binding are proven would `transactional_orphan_sweep` run on a daemon schedule, as a dry run on
