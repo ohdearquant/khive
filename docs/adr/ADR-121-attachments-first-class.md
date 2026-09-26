@@ -610,3 +610,64 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   runs later after cancellation. Shutdown during a walk or delete finishes at most the current
   bounded enumeration chunk or claim/delete/release unit; no later unit starts, all guards are released, and a
   replacement process can acquire ownership without inheriting an active blocking task.
+
+## Amendment 2 (2026-09-25): the issues Amendment 1 item 7 answers, and the blob writer census population
+
+**Status: Accepted (2026-09-25).** Refs #3327, #3273, #3344, #3038, #3178. A follow-up to Amendment 1; it does not
+change Amendment 1's text or status, and it binds only together with Amendment 1.
+
+### Why
+
+Amendment 1 cites #3038 and #3178. Its item 7 also answers two filed defects it does not cite, and its
+census leaves one population question open.
+
+- #3327: exec run receipts (stdout, stderr and profile refs), `khive-tree/v1` manifests and their
+  entries, and git checkout trees and diffs are referenced only from pack receipts and manifests, so an
+  attachment-only liveness query treats them as orphans. Item 7's `blob_pack_owners` rows and
+  transitive manifest closure are the resolution.
+- #3273: the channel quarantine path in `crates/khive-mcp/src/serve.rs`
+  (`quarantine_channel_ingest_failure`) stores an inbound original through `dispatch("blob.put", ...)`
+  and keeps the ref only in the quarantine message's `quarantine_content_ref` property. Item 7 requires
+  that original to be a main-backend attachment on the quarantine message, and its census covers
+  string-keyed dispatch.
+- #3344: item 7's census covers "every crate linked into the `kkernel` binary" but does not say under
+  which cargo features. Several writers are feature-gated. `khive-pack-moodboard` is optional in
+  `crates/kkernel/Cargo.toml` and `crates/khive-mcp/Cargo.toml`; the channel crates are optional in
+  `crates/khive-mcp/Cargo.toml`; `quarantine_channel_ingest_failure` is compiled only under
+  `cfg(any(feature = "channel-email", feature = "channel-telegram"))`; `kkernel` declares no `default`
+  feature; and the serving artifact workflow (`.github/workflows/serving-artifact.yml`) builds
+  `kkernel` with `--features pack-formal` only. A census run on the default build cannot see the
+  moodboard or quarantine writers, and a future writer behind a non-default feature would pass it.
+
+### Decision
+
+1. **The census population is the union over `kkernel`'s features.** The census runs with every feature
+   `kkernel` declares enabled at once, and it reads the declared feature list from cargo metadata and
+   refuses to run if the enabled set is not all of it, so a newly added feature cannot be left out
+   silently. Because the census keys on resolved receiver types, source that no enabled feature
+   compiles cannot be classified; under the all-features rule no linked production source is in that
+   state, and if features ever become mutually exclusive, the census runs once per exclusive
+   combination and the union of the runs is the result.
+2. **A must-fail control behind a feature.** Beside item 7's controls, a production-shaped writer
+   placed in a linked-crate fixture behind a feature that is off by default must trip the census.
+3. **The survival arms run where the writers are compiled.** The acceptance arms that keep a
+   quarantined original and moodboard bodies alive through a live sweep run in a CI job built with
+   `channel-email` or `channel-telegram` and `pack-moodboard`; the default matrix alone does not satisfy
+   them.
+
+### Alternatives considered
+
+- _Census the default build only._ Rejected: the quarantine and moodboard writers are not compiled
+  there, which is the gap #3344 reports.
+- _Scan `cfg`-gated source textually and fail closed on anything the enabled set cannot resolve._
+  Rejected as the primary rule: item 7 forbids keying on names and grep patterns because they miss
+  aliases and wrappers, and a textual scan of uncompiled source is that kind of check. It remains a
+  possible second arm if a feature can never be enabled together with the others.
+- _Census the serving artifact's feature set._ Rejected: a deployment can build other features, and
+  the ownership invariant has to hold for every binary a root can be served by.
+
+### Consequences
+
+- The census job needs an all-features build of the `kkernel` dependency graph; the repository's lint
+  pass already builds the workspace with `--all-features`.
+- Acceptance adds the arms in items 2 and 3 to Amendment 1's list.
