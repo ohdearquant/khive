@@ -1,4 +1,4 @@
-//! Shared, read-only KG handle resolution for pack-scoped backends.
+//! Shared KG handle resolution and entity-delete routing for pack-scoped backends.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -50,6 +50,27 @@ impl KgReadResolver {
             }
         }
         Ok(found)
+    }
+
+    pub(crate) async fn entity_runtime(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> Result<Option<KhiveRuntime>, RuntimeError> {
+        let mut owner = None;
+        for runtime in &self.runtimes {
+            let store = runtime.entities(token)?;
+            let entity = store.get_entity_including_deleted(id).await?;
+            if entity.is_some() {
+                if owner.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "entity {id} exists on multiple backends; deletion is ambiguous"
+                    )));
+                }
+                owner = Some(runtime.clone());
+            }
+        }
+        Ok(owner)
     }
 
     pub(crate) async fn prefix(

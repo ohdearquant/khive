@@ -318,3 +318,63 @@ escape hatch for legitimate upstream updates.
 - `crates/khive-vcs/src/hash.rs`: `snapshot_id_for_archive`, `canonical_json`
 - `crates/khive-vcs/src/types.rs`: `SnapshotId` — `"sha256:" + 64 hex chars` invariant
 - `crates/khive-vcs/src/error.rs`: `VcsError::HashMismatch`
+
+## Amendment 1 (2026-09-25): cache publication is a two-rename directory swap
+
+Status: Accepted (2026-09-25). Refs #3215, #475.
+
+### Context
+
+Part 2, "Durability and staging", steps 5 and 6 say: "Atomically publish: rename staging NDJSON files
+into `.khive/kg/remotes/<remote>/`", then "Write `meta.json`", and "Step 5 is a single filesystem
+rename. Either the old cache remains intact (any failure before step 5) or the new cache is fully
+populated. There is no intermediate state visible to concurrent readers."
+
+The shipped path differs. `publish_remote_cache` in `crates/khive-vcs/src/sync.rs` writes
+`entities.ndjson`, `edges.ndjson` and `meta.json` into a staging directory beside the cache under
+`.khive/kg/remotes/`, then calls `atomic_replace_dir`. When the cache directory already exists, that is
+two renames: the current directory to a sibling `<remote>.replaced-<pid>`, then the staging directory
+into place, after which the backup is removed. Between the two renames the cache path does not exist,
+which the function's own comment states ("is briefly absent"). The directory swap is the intended
+design, adopted for #475 so that the three files change together; a directory cannot be renamed over
+a non-empty directory in one portable step. Three details are not intended (#3215): a failed restore
+after a failed second rename is ignored while the error says "(old cache restored)"; a crash between
+the renames leaves no cache and a backup that no later publish restores or removes, because cleanup
+targets only the current process id's backup; and the function's doc comment says a crash during the
+swap leaves the old or the new cache. No production code reads `.khive/kg/remotes/` today (Part 1,
+"Remote configuration and cache status"), so the absent window has no reader yet.
+
+### Decision
+
+1. **Publication.** Steps 5 and 6 are one step: the staging directory holds all three files,
+   `meta.json` included, and is swapped into `.khive/kg/remotes/<remote>/`. A reader of that path sees
+   the complete old cache, no cache, or the complete new cache, never a mix of old and new files. The
+   "no cache" state exists only between the two renames of a replacement.
+2. **Failure between the renames.** If the second rename fails, the publish restores the backup. If the
+   restore also fails, the error says so and names the backup path that holds the old cache; it never
+   reports a restore that did not happen.
+3. **Recovery after a crash.** A publish first inspects the remote's `<remote>.replaced-*` siblings.
+   If the cache directory is missing and a backup exists, the newest backup is restored before the
+   publish proceeds; any other backup is removed. So a crash can leave the absent window open only
+   until the next publish of that remote.
+4. **A reader added later** treats a missing cache directory as "not fetched", never as "empty remote",
+   and does not read a `.replaced-*` sibling.
+
+### Alternatives considered
+
+- _A single atomic exchange (`renameat2` with `RENAME_EXCHANGE`)._ Rejected as the contract: it is
+  Linux-only, and the other supported platforms would still need the two-rename path, so the contract
+  would still have to describe the absent window.
+- _Publish a versioned directory and switch a symlink._ Rejected for now: it changes the cache layout
+  that ADR-020 defines, for a window that has no reader today.
+- _Keep the text and fix only the code comments._ Rejected: the ADR is where a future reader of the
+  cache looks for its visibility guarantee.
+
+### Consequences
+
+- The code changes are the ones #3215 lists: check the restore result and report it, and handle stale
+  backups at the start of a publish. The `publish_remote_cache` doc comment is corrected to item 1.
+- Acceptance: a failure injected at both the second rename and the restore yields an error that names
+  the backup path and does not claim a restore; a `<remote>.replaced-99999` sibling with no cache
+  directory is restored by the next publish, and no `.replaced-*` sibling remains afterwards; the
+  existing failure-injection arms (no mixed cache after a failure at any staging step) still pass.

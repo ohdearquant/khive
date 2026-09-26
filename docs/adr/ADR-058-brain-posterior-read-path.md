@@ -741,6 +741,67 @@ fallback would be noisy and cannot distinguish absence-by-design from a stale op
 The write-time validation prevents new unreachable bindings without changing the event contract;
 a future diagnostic should compare persisted bindings to the registry aggregate directly.
 
+### Amendment (2026-09-25): the `change_counter` weights cache was not built
+
+**Status**: Accepted (2026-09-25)
+
+#### Context
+
+§Decision adopts "Option b-amended: an on-resolution cache, keyed on a monotonic `change_counter`
+incremented on every `brain.feedback` application". The cache is filled through a new
+`brain.serve_weights` verb (§New brain verb), and the counter is persisted by a V5 migration
+(§Exact change list, item 2: "New file: `crates/khive-db/sql/005-brain-change-counter.sql`").
+None of this exists. `change_counter` and `serve_weights` occur nowhere in the code, and schema
+version 5 is `crates/khive-db/sql/005-unique-comm-external-id.sql`, recorded in ADR-015's
+post-consolidation ledger as V5 `unique_comm_message_external_id` (ADR-056).
+
+The read path shipped under [ADR-104](ADR-104-posterior-serving-recall.md) §1 instead.
+`memory.recall` takes an explicit `profile_id` or resolves the serving profile on every request
+(`resolve_serving_profile` in `crates/khive-pack-memory/src/handlers/common.rs`), loads that
+profile's state through a registry dispatch of `brain.profile` (`load_brain_profile` in
+`crates/khive-pack-memory/src/handlers/recall.rs`), and projects the request's three weights
+through `project_config` (`crates/khive-pack-memory/src/tunable.rs`) without changing the pack's
+configuration. The memory pack keeps no weights cache, so there is nothing for a counter to
+invalidate. The seed-readiness notice at the top of this ADR says the design sections are a
+point-in-time record, but it does not say which of the specified mechanisms were dropped.
+
+#### Decision
+
+The `change_counter` mechanism is superseded by ADR-104 §1's per-request projection and is not
+to be implemented. That covers the cache and its key in §Decision; §New brain verb
+(`brain.serve_weights`); §Where the `change_counter` lives and where it increments; §Cache
+invalidation semantics; the counter, verb, migration and cache parts of §Exact change list items 1
+to 3; the `brain.serve_weights` row that item 5 asks ADR-032 to add; and test cases 4 and 5 of
+§Test cases required for implementation. Schema version 5 stays assigned as ADR-015 records it.
+
+These parts stay in force: the binding semantics for the read path, the pack decoupling invariant
+of item 4 (`khive-pack-brain` is only a dev-dependency of `khive-pack-memory`, and the read reaches
+brain through registry dispatch, now of `brain.profile`), and the 2026-07-03 and 2026-08-01
+amendments above.
+
+#### Alternatives considered
+
+- **Add the counter and cache on top of ADR-104's per-request read.** This would need a new
+  migration slot and a write to the counter on every feedback event, to save one `brain.profile`
+  read per recall that resolves a profile. ADR-104 (Consequences, Negative) expects that read to
+  be negligible. Reopening the cache needs a measurement showing the read matters; without one
+  the counter is cost with no demonstrated benefit.
+- **Leave §Decision as written.** The seed-readiness notice already warns that the design
+  sections are historical, but a reader following §Exact change list would still add a V5
+  migration whose version number is taken and a verb nothing calls.
+
+#### Consequences
+
+- ADR-104 §1 is the normative description of how posteriors reach recall scoring.
+- A future cache for profile weights is a new decision that states its invalidation key and the
+  measurement behind it.
+- No code change follows from this amendment.
+
+#### Refs
+
+- #85 and #62 (the gaps this ADR set out to close; see the header)
+- #542 (the implementation issue this ADR's change list was written for)
+
 ---
 
 ## Determinism and test plan

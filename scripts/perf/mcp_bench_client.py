@@ -48,6 +48,7 @@ import concurrent.futures
 import json
 import os
 import pathlib
+import re
 import signal
 import socket as socketlib
 import struct
@@ -55,9 +56,21 @@ import subprocess
 import sys
 import time
 
-# ── Wire protocol constants (mirrors crates/khive-runtime/src/daemon.rs) ──────
+# ── Wire protocol constants (crates/khive-runtime/src/daemon.rs) ────────────
 
-PROTOCOL_VERSION = 4
+_daemon_source_path = (
+    pathlib.Path(__file__).resolve().parents[2] / "crates/khive-runtime/src/daemon.rs"
+)
+try:
+    _daemon_source = _daemon_source_path.read_text()
+except OSError as exc:
+    raise RuntimeError(
+        f"cannot read the daemon protocol version from {_daemon_source_path}"
+    ) from exc
+_protocol_version = re.search(r"(?m)^pub const PROTOCOL_VERSION: u32 = (\d+);$", _daemon_source)
+if _protocol_version is None:
+    raise RuntimeError(f"cannot find the daemon protocol version in {_daemon_source_path}")
+PROTOCOL_VERSION = int(_protocol_version.group(1))
 
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
