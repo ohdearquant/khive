@@ -1028,6 +1028,57 @@ async fn remote_lost_ack_without_marker_stays_unknown_and_never_retries() {
         .await;
 }
 
+#[tokio::test]
+async fn pr_open_and_review_reconcile_return_unknown_without_platform_evidence() {
+    let f = Fixture::new(true, None).await;
+    for (actor, verb, inputs) in [
+        (
+            &f.actor,
+            "git.pr_open",
+            json!({"head":"work","base":"main","expected_head":f.head}),
+        ),
+        (
+            &f.reviewer,
+            "git.pr_review",
+            json!({"number":1,"verdict":"approve","expected_head":f.head}),
+        ),
+    ] {
+        let mut prior = Receipt::new(
+            "local",
+            actor,
+            verb,
+            f.repo.to_str().unwrap(),
+            inputs,
+            json!({"decision":"allow","source":"git_write.allowed","id":0}),
+            Value::Null,
+        );
+        prior.result = json!({"slug":SLUG,"remote":REMOTE});
+        receipts::insert(&f.rt, &prior).await.unwrap();
+        let calls = f.remote.state.lock().unwrap().calls.clone();
+        let writes = f.remote.writes();
+
+        let result = f
+            .call(actor, "git.reconcile", json!({"receipt":prior.id}))
+            .await
+            .unwrap();
+        assert_eq!(result["receipt"]["id"], prior.id);
+        assert_eq!(result["receipt"]["disposition"], "unknown");
+        assert_eq!(result["receipt"]["result"], prior.result);
+        let stored = receipts::load_owned(&f.rt, "local", actor, &prior.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.disposition, Disposition::Unknown);
+        assert_eq!(stored.finished_at, None);
+        assert_eq!(stored.result, prior.result);
+        assert_eq!(f.remote.state.lock().unwrap().calls, calls);
+        assert_eq!(f.remote.writes(), writes);
+    }
+    assert!(
+        !f.dir.path().join("reads").exists(),
+        "reconcile must not resolve either actor's platform credential"
+    );
+}
+
 /// Every push case in this crate reaches `push_marker_support`, so on a host whose `git` does not
 /// advertise `git reflog write ` each of them fails on the `unsupported_toolchain` refusal and the
 /// run reads as nineteen defects rather than one fact about the host. This case states the fact

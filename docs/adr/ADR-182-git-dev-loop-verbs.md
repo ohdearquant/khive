@@ -164,8 +164,12 @@ item 1 is amended again in item 3.
    mutation writes its receipt row as `unknown` before the effect and updates it to `committed` or
    `not_committed` afterwards; a lost reply or a failed audit append leaves `unknown` or `committed`
    in the durable row, never a refusal, and a caller never retries a mutation. `git.reconcile(receipt)`
-   is read-only: it re-reads the ref or the pull request and settles an `unknown` row to what the
-   platform holds.
+   never repeats a mutation. It can settle an `unknown` local ref receipt from its reflog marker,
+   a push receipt from its marker and remote SHA, and a PR merge receipt from the platform's merged
+   state and head SHA. `git.pr_open` and `git.pr_review` have no receipt-specific platform marker:
+   reconciliation returns their caller-owned receipt with `unknown` unchanged, without resolving
+   credentials or reading the platform. Neither absence nor a later matching PR or review proves
+   the original write's disposition; a caller does not retry it.
 7. **Receipts.** `git.receipts(repo?, session_id?, limit, offset)` returns `{receipts, next_offset}`
    scoped to the calling actor; an `actor` filter naming another actor refuses. A receipt carries
    `id`, `namespace`, `actor`, `session_id`, `verb`, `repo`, `inputs`, `gate: {decision, source:
