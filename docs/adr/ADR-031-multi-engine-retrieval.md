@@ -856,7 +856,9 @@ that already lives under `.khive/`.
 
 - Exactly one engine with `default = true` (error: `ConfigError::DefaultCount`).
 - Unique engine names (error: `ConfigError::DuplicateName`).
-- `fusion_weight` > 0 when present (error: `ConfigError::InvalidFusionWeight`).
+- `fusion_weight` finite and > 0 when present (error: `ConfigError::InvalidFusionWeight`).
+  Until per-engine fusion is wired, a valid explicit weight is then refused with
+  `ConfigError::UnsupportedFusionWeight` rather than silently ignored.
 
 **Backward compatibility**: when no config file is present, the env-var path is used
 automatically. `RuntimeConfig::default()` continues to read `KHIVE_EMBEDDING_MODEL` and
@@ -872,7 +874,10 @@ the primary interface.
 available on each `EngineConfig` for pack handlers to inject into `FusionStrategy::Weighted`.
 For pure rank-based unweighted RRF the weights are ignored (as stated in D5). Pack handlers
 are responsible for reading `EngineConfig.fusion_weight` and building the appropriate fusion
-strategy; no automatic wiring exists yet.
+strategy; no automatic wiring exists yet. In the current implementation,
+`RuntimeConfig` retains the engine models but drops their weights, and no retrieval handler
+reads them. The loader therefore rejects explicit `fusion_weight` until that integration is
+implemented. This is a fail-closed implementation status, not a change to D5's target semantics.
 
 **Example config**: `docs/khive-config-example.toml` ships as a reference.
 
