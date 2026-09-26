@@ -8,7 +8,10 @@ consumes this accepted role-keyed desired state, makes the canonical main backen
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
 a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`; and by its own
 Amendment 1 below (proposed), which specifies a gated attachment orphan sweep in the daemon,
-adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI.\
+adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI; Amendment 2 below
+(accepted, binding only with Amendment 1), which names the issues Amendment 1 item 7 answers and the blob
+writer census population; and Amendment 3 below (proposed), which ships a read-only report of attachment
+rows whose record was not found and states what any code that removes such rows must first supply.\
 **Depends on**:
 
 - [ADR-111](ADR-111-blob-store.md) — BlobStore (the content-addressed storage capability,
@@ -671,3 +674,261 @@ census leaves one population question open.
 - The census job needs an all-features build of the `kkernel` dependency graph; the repository's lint
   pass already builds the workspace with `--all-features`.
 - Acceptance adds the arms in items 2 and 3 to Amendment 1's list.
+
+## Amendment 3 (2026-09-25): rows whose record is gone are reported now, and no scan removes them until a reviewed design exists
+
+**Status: Proposed.** Refs #3178. A follow-up to Amendment 1 that addresses part of the case its item 5 leaves out of
+scope: it ships a read-only report of attachment rows whose record was not found, and it states what any code that
+removes such rows must first supply. It changes no text of Amendment 1 or Amendment 2. Item 1 only reads and does not
+depend on Amendment 1 being accepted; the requirements in item 3 build on Amendment 1 items 6 to 8 and bind only
+together with Amendment 1. This amendment does not by itself reclaim the space #3178 describes. Every code and document
+reference below is to commit `18b1113a3bb760caa4fa3e29f986eae15586c9b0`.
+
+### Why
+
+[ADR-191](ADR-191-web-pack-ontology-and-operations.md) A1.2 makes the hard delete of a `page` or `resource` routed to
+its own backend one verb invocation with two commits: the record's backend deletes the record, then the canonical main
+backend deletes the attachment rows that named it (`crates/khive-pack-kg/src/handlers/update.rs:463-472`,
+`crates/khive-runtime/src/pack.rs:1951-1967`). A crash or a failed write between the two commits leaves rows on the
+main backend for a record that exists nowhere. Amendment 1 item 5 records why the blob sweep cannot reclaim their
+blobs: its claim anti-join reads only `attachments` (`crates/khive-db/src/stores/blob.rs:2133-2141`), so a row counts as
+live whether or not its record exists.
+
+Nothing else removes such a row. The production statements that delete attachment rows name their rows by record id
+(`crates/khive-db/src/stores/attachment.rs:71-95`) or by the ids of the probe rows the sweep's fence probe inserted in
+the same unit (`blob.rs:1901-1915`). The second commit runs again only when a caller repeats `delete(hard=true)` with
+the record's id (`update.rs:397-408`, `update.rs:431-442`). No path finds these rows without their id.
+
+The blob sweep itself has no production caller at this commit. Every call of `transactional_orphan_sweep`, and every
+call of a blob store's `orphan_sweep`, is test code: the `#[cfg(test)]` modules of `crates/khive-db/src/stores/blob.rs`
+(from line 3366), `crates/khive-db/src/stores/blob_s3.rs` (from 705), `crates/khive-mcp/src/attachment_cutover.rs`
+(from 422), `crates/khive-mcp/src/serve.rs` (from 4556) and `crates/khive-pack-moodboard/src/preference_handlers.rs`
+(from 1666), and the test sources `crates/khive-db/tests/blob_conformance.rs` and
+`crates/khive-pack-blob/src/uploads/tests.rs`. The two calls of a method named `orphan_sweep` outside test code
+(`crates/khive-runtime/src/retrieval.rs:1370`, `crates/kkernel/src/vector.rs:225`) are the vector store's sweep of
+[ADR-044](ADR-044-vector-store-extensions.md). So no serving process reclaims any blob today, whether or not its row has
+a record, and removing an ownerless row frees its blob only once Amendment 1's sweep runs live. A report can size and
+locate the leak now. It cannot shrink it.
+
+Locating the rows is a read. Removing them is a decision about several databases that other processes may be writing
+while it is made, and five situations stand in the way of any remover that runs beside those writers:
+
+1. **A publication in flight.** Under the order Amendment 1 item 7 requires, a new durable ref is registered on the
+   main backend before a record exposes it, so a routed record's row commits before the record, and until the record
+   commits the row looks exactly like a leftover. A producer can stall there for any length of time, and no elapsed
+   time proves that it will not commit.
+2. **A re-creation under the same id.** Web ids are derived from the URL
+   (`crates/khive-pack-web/src/identity.rs:70-78`), so a later fetch re-creates a deleted page under its old id. A HEAD
+   fetch re-creates the entity and writes no row (`crates/khive-pack-web/src/fetch.rs:641-650`, `674-675`, `706-716`),
+   so a re-creation need not change the row a remover last saw.
+3. **A hard delete running beside the remover.** The retry decides absence and deletes rows in two separate steps
+   (`pack.rs:1959-1966`).
+4. **A change to the set of backends or to a backend file.** A backend is added, dropped from configuration while it
+   still holds records, or replaced or restored. `kkernel sync` renames a rebuilt database over its target
+   (`crates/khive-vcs/src/sync.rs:846-883`).
+5. **A record published again without its row.** Archive import restores each entity's supplied id and properties
+   through `upsert_entity` with `content_ref: None` (`crates/khive-runtime/src/portability.rs:275-300`), a statement
+   that writes only the entity (`crates/khive-db/src/stores/entity.rs:731-740`). The archive carries no attachments
+   (`portability.rs:24-52`), and `kkernel kg import` runs this path (`crates/kkernel/src/kg/archive.rs:121-134`). Sync
+   writes records the same way (`sync.rs:976-1010`). A web page exposes its body through `properties.blob_ref`
+   (`fetch.rs:578-598`, `690-705`), which Amendment 1 item 7 does not count as a root. A correctly removed row can
+   therefore be followed by an import that exposes its body again with no row, and a sweep may then collect bytes a
+   live record names.
+
+At this commit nothing excludes those writers. The daemon is unique per rendezvous, not per database: the pairing check
+accepts a daemon given its own socket and PID file (`crates/khive-runtime/src/daemon.rs:147-190`), and the lock its boot
+takes lives under the khive home directory (`daemon.rs:192-207`, `daemon.rs:371-374`). A client that finds no daemon
+socket dispatches locally unless `KHIVE_DAEMON_STRICT=1` is set, and one run with `KHIVE_NO_DAEMON` always does
+(`crates/khive-mcp/src/daemon.rs:2491-2500`), and
+[ADR-100](ADR-100-store-backup-replication.md) records the result: "there is no quiescent origin state to capture
+against short of a real maintenance window" (`docs/adr/ADR-100-store-backup-replication.md:229-231`). The pool's
+exclusive writer is a per-process mutex (`crates/khive-db/src/pool.rs:602-607`), so a second process's writer contends
+only on SQLite's own lock. [ADR-150](ADR-150-single-write-owner-topology.md), which makes one process the only writer,
+is proposed and not implemented (`docs/adr/ADR-150-single-write-owner-topology.md:3`). So no timing rule, recheck or
+documented maintenance window makes a removal safe at this commit.
+
+### Decision
+
+1. **A read-only report ships now.** `kkernel blob ownerless-rows` is an admin command. It resolves the effective
+   configuration as Amendment 1 item 3 describes for `kkernel blob sweep`, and lists the attachment rows of the
+   canonical main backend whose record it did not find on any member of a stated roster. It never deletes and has no
+   removal mode.
+   - **Roster.** The main backend, every backend declared in the effective configuration's `[[backends]]` whether or
+     not a selected pack is assigned to it, and every database the operator adds with `--with-db <path>` (a backend that
+     once held records and is no longer configured). Members that resolve to the same file are probed once. The roster
+     is fixed when the report starts. The report never uses the backends a serving process has open: that set follows
+     pack selection, because pack runtimes are built only for the selected packs
+     (`crates/khive-mcp/src/serve.rs:3027-3059`) and the shared resolver holds the default runtime and those runtimes
+     (`crates/khive-runtime/src/kg_read.rs:14-28`, installed at `pack.rs:4822-4825`). The output header names each
+     member (how it was named, its canonical path, its device and inode, its schema version) and states that the
+     roster's completeness is not verified.
+   - **Opening and failing closed.** Every member opens through `KhiveRuntime::new_readonly`, read-only and query-only,
+     at this build's current schema (`crates/khive-runtime/src/runtime.rs:369-377`,
+     `crates/khive-db/src/backend.rs:446-449`, `pool.rs:2822-2831`). A member that cannot be opened, is not at the
+     current schema, is an in-memory database, or returns an error on any probe stops the report with a nonzero exit and
+     a message naming the member and the error. No row list is printed, because a partial list would show that member's
+     records as ownerless.
+   - **Walk.** Rows are read from main in pages of at most 128, ordered by `(record_uuid, role)` under SQLite's `BINARY`
+     collation (the key columns declare no other, `crates/khive-db/sql/021-attachments-a-stage.sql:8-29`). Each page
+     continues strictly after the last key read, `(record_uuid, role) > (?, ?)`, never by offset. Each page read and
+     each member probe runs in its own read transaction, and none is held from one page to the next, as ADR-150
+     component 3 asks of readers outside the owner (`docs/adr/ADR-150-single-write-owner-topology.md:140-142`).
+   - **Probe.** For each page, every member is asked for the page's ids in its `entities` and `notes` tables with no
+     `deleted_at` predicate and no namespace predicate, the shape of the existing reads that include tombstones
+     (`crates/khive-db/src/stores/entity.rs:1111-1125`, `crates/khive-db/src/stores/note.rs:1623-1639`). A row is owned
+     when any member holds its id in either table. A soft-deleted record, the tombstone of a merged entity and a record
+     moved to another namespace therefore own their rows, as §6 requires. ADR-044's vector sweep treats a soft-deleted
+     subject as orphaned (`docs/adr/ADR-044-vector-store-extensions.md:350-353`); a vector can be rebuilt from its
+     record, and a body cannot.
+   - **Output.** For each row not found on any member: `record_uuid`, `substrate`, `role`, `content_ref`, `media_type`,
+     `size_bytes`, and `created_at` labelled as producer-supplied (the web pack stamps the time it writes the row,
+     `fetch.rs:539`, while `create_entity_with_attachments` uses the record's creation time,
+     `crates/khive-runtime/src/operations.rs:1589-1597`); the time the row was read; and for each member, `absent` with
+     the time that member was probed. Counters: `members`, `scanned`, `owned`, `owned_deleted` (present only
+     soft-deleted or as a tombstone), `owned_multiple` (on more than one member) and `ownerless`, with the walk's start
+     and end times.
+
+2. **The report is a best-effort interval report, and a listed row is only a candidate.** Its output says so, and says:
+   - a row present on main for the whole walk is read exactly once. A row inserted behind the cursor during the walk
+     is not read, and a row changed by an upsert (`attachment.rs:44-52`) or deleted after its page was read is reported
+     as it was read;
+   - the counters describe observations, each made at its recorded time, not a total at one instant;
+   - each member probe is its own read, so the probes for one row are not a simultaneous snapshot of several
+     databases. A record moved from one member to another between their probes reads absent on both;
+   - a listed row's record may exist on a probed member by the time the output appears, may be committed by a
+     publication in flight, may live on a backend outside the roster, or may come back when a backend is restored from
+     an older copy. The row's age decides none of these.
+
+   The report is input to an operator's investigation. It is never an instruction to delete and never a deletion
+   manifest: any future removal computes its own set under the conditions of item 3.
+
+3. **No code removes rows by scanning for ownerless ones until a separately reviewed design supplies at least the
+   following,** and none is added behind a flag in the meantime.
+   - **(a) Writer exclusion per database file.** Every writer-capable open of a file holds a shared side for the life
+     of the open, whether it comes from a daemon on any rendezvous, local dispatch, a migration, a maintenance command,
+     the blob sweep or cutover, or a direct connection. Replacing or restoring the file, and removing rows, need the
+     exclusive side, which is granted only when no other holder exists. The design also supplies: validation that the
+     SQLite handles a removal uses belong to the file incarnation its lock protects, checked again after any wait; a
+     replacement handoff that covers both the old and the new incarnation, including processes that hold either open
+     read-only; coordination of SQLite handles with the file's WAL and SHM sidecars; hard-link aliases resolved to one
+     supported filename or refused; and the supported filesystems stated, with network storage refused. A lock file
+     beside the database path is not by itself such a design. A census over the population Amendment 2 item 1 defines
+     finds every production open of a database for writing, and a planted open that skips the exclusion fails it.
+     ADR-150's topology meets this requirement only if its single owner is enforced per database file: under ADR-150
+     other processes reach the owner through the daemon socket
+     (`docs/adr/ADR-150-single-write-owner-topology.md:86-95`), and two rendezvous can name one database.
+   - **(b) A durable backend roster.** Each member is named by a durable database identity stored in the member, of the
+     kind Amendment 1 item 8 defines for main, with its canonical path. A backend is enrolled on main's roster before it
+     serves a write under that main, and the roster shrinks only through an explicit retirement action. A member that
+     is gone stays on the roster, and removal refuses until it is retired. A backend with no durable identity, such as
+     an in-memory one, cannot be enrolled. Backends that held records before enrollment existed are covered exactly as
+     far as Amendment 1 item 7's inventory covers them.
+   - **(c) No record publication without its row.** Every path that publishes or re-creates a record able to expose a
+     durable body reference either registers and validates its attachment row before the record exposes the reference,
+     fails before publication, or is explicitly unsupported. That explicitly includes archive import and sync
+     (situation 5 above). Holding the shared side of (a) does not satisfy this: a record-only path that waits for a
+     removal to end and then publishes still exposes a body with no row. The census extends Amendment 1 item 7's census
+     to every record publication and re-creation path, including paths that call no attachment or blob writer, over
+     the population Amendment 2 item 1 defines, and a planted record-only replay must fail it.
+
+   That design carries its own acceptance, showing that none of the five situations above can remove a row whose record
+   exists or will exist. If it bounds how many rows one pass may remove, the bound refuses an oversized set before
+   deleting anything. A pass interrupted after it starts deleting may have committed a prefix, and the next pass starts
+   from a fresh observation, never from an earlier list.
+
+   Nothing is paid forward toward removal. The report writes nothing, starts no grace period and marks no row. There is
+   no pending-removal state, nothing is scheduled, and no time is promised by which a row will be removed or its blob
+   reclaimed.
+
+4. **Retrying a hard delete.** Repeating a previously authorized `delete(id=<record_uuid>, hard=true)` remains possible,
+   but it is not a safe way to clear report candidates: it decides absence only over the backends the calling process
+   built runtimes for (`pack.rs:1935-1948`), it hard-deletes whatever record currently holds that id, including one
+   re-created after the report was read (`update.rs:369-372`, `update.rs:424-472`), and its absence check and its
+   delete are two steps under no exclusion (`pack.rs:1959-1966`).
+
+5. **Claims and time.** The report neither reads nor writes `blob_gc_claims` and does not refuse because claims exist.
+   A claim abandoned by a crashed live sweep is cleared by the next admitted live sweep and never by a dry run
+   (`blob.rs:2921-2928`). Deleting an attachment row is not fenced by a claim, because the claim triggers fire on an
+   insert and on an update of `content_ref` only (`crates/khive-db/sql/021-attachments-b-claim-fences.sql:4-20`); a
+   removal design accounts for that itself. Once a row is gone, its blob is reclaimed only by an admitted live sweep
+   under Amendment 1, subject to that sweep's publish grace and cadence (Amendment 1 item 1).
+
+6. **Surfaces and schema.** The report adds one admin command, no MCP verb and no migration, and leaves the
+   `blob.sweep` response of Amendment 1 item 3 unchanged. The roster and per-member identity of item 3(b) are new
+   schema, reviewed through their new terminal epoch with `REVIEWED_SCHEMA_EPOCH` updated in the same change, as
+   Amendment 1 item 6 requires.
+
+### Alternatives considered
+
+- _Specify the removal pass in this amendment, conditional on its prerequisites._ Rejected for now. The pass's safety
+  argument rests on the file-lifecycle protocol of item 3(a) and the publication rule of item 3(c), and neither is
+  designed yet. A command specified ahead of them would be approved on an argument its prerequisites might not support.
+- _Remove online after two observations a grace period apart, restoring a row whose record reappears._ Rejected on three
+  counterexamples. A producer stalled between its row and its record for longer than the grace loses its row, then
+  commits a record whose body a later sweep collects. A record re-created between the last probe and the delete without
+  writing a row, for example by a HEAD fetch, leaves the delete matching the old row, and a crash before the restore
+  leaves a live record with no row. A restore decided on a positive recheck can commit after a concurrent hard delete
+  finished both commits, so the record is gone and its row is back.
+- _Remove after stopping the daemon, in a documented maintenance window._ Rejected: nothing enforces the window.
+  Stopping the daemon does not stop writes, and commands that already ask for stopped writers do not check for them
+  (`crates/kkernel/src/entity_type_backfill.rs:33`, `docs/adr/ADR-111-blob-store.md:290`).
+- _Reuse an existing lock._ Rejected. The recovery lock lives under the khive home directory (`daemon.rs:192-207`), and
+  a non-daemon process holds it only while it builds its server (`serve.rs:161-179`). The database GC owner is shared by
+  the sweep and the V21 cutover (`blob.rs:2307-2318`) and taken by migrations (`backend.rs:462-471`). None is held for
+  the life of an ordinary writer.
+- _Fence each record's publication with a per-record lease on main._ Deferred, not rejected. It would let removal run
+  beside writers, but every record writer on every backend must take the lease, a whole-file replacement cannot take
+  one, and an abandoned lease needs its own recovery rule. It can replace item 3(a) later without changing the report.
+- _Clear candidates by repeating the hard delete._ Rejected for the reasons in item 4.
+- _Take a removal roster from the effective configuration, or from the backends one process has open._ The report does
+  this, says so, and deletes nothing. Rejected for removal: configuration and pack selection change, and a backend
+  dropped from configuration still holds records that return when it is configured again.
+- _Store the owning backend on each row, or log an intent before a routed delete's first commit._ Rejected: every
+  producer changes, earlier rows carry no value, and an intent log misses rows left before it ships or by other causes.
+- _Leave the rows._ Rejected as an end state, because ADR-191 A1.2 records the leak as an obligation. Reporting now and
+  gating removal behind named requirements neither removes a live row nor hides the leak.
+
+### Acceptance
+
+- **Interrupted routed delete.** In the fixture of `routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments`
+  (`crates/khive-pack-web/tests/backend_routing.rs:408-410`) with the second commit failed, the report lists exactly the
+  page's rows, each `absent` on main and on the web backend, with probe times. Control: without the injected failure it
+  lists nothing.
+- **Deleted but present.** A soft-deleted routed page, an entity merged into another and a record moved to another
+  namespace are counted as owned and are not listed. Must fail if the probe filters on `deleted_at` or on namespace.
+- **Failing closed.** A configured member whose file is missing, a member at another schema version, an in-memory
+  member, and a probe error injected on one member at the second page each end the report with a nonzero exit and no
+  row list. Control: with the member present, the report lists the leftover row.
+- **Roster from configuration, not packs.** A page on a backend declared in `[[backends]]` while the web pack is not
+  selected is owned. With the declaration removed, its rows are listed and the header no longer shows the member.
+  Adding the member with `--with-db` makes the page owned again.
+- **Walk.** With a page boundary between two roles of one `record_uuid`, every row is reported once. Deleting an
+  already-read row between two pages does not skip an unread row; must fail under offset paging. A row inserted behind
+  the cursor between pages is not reported. A record moved from one member to another between their probes is listed,
+  and its probe times show the two probes at different times.
+- **Read-only, no held transaction.** Every member opens read-only and query-only, and every database's contents are
+  unchanged after the report. A checkpoint run from another connection between two pages advances past frames committed
+  after the first page.
+- **In flight.** With a row written and its record held uncommitted by a test hook, the report lists the row with the
+  candidate notice.
+- **No removal.** The command accepts no argument that deletes, and a log of every statement it issues on every
+  database shows reads only.
+
+### Consequences
+
+- Until a design satisfying item 3 ships, these rows and their blobs stay. The cost is space, not data. This amendment
+  does not reclaim the space #3178 describes, and #3178 stays open.
+- Removing rows frees blobs only when Amendment 1's sweep runs live; at this commit no serving process calls it.
+- The report reads one page of main and probes each member once per page. Its output carries its duration.
+- The exclusion of item 3(a) is shared infrastructure. Amendment 1 item 7 also requires a writer barrier for its
+  backfill, and this exclusion is one way to provide it; that choice belongs to Amendment 1.
+
+### Out of scope
+
+- The second commit of a routed hard delete and its retry are unchanged.
+- A record re-created under a leftover row's id without writing a row of its own (a HEAD fetch) owns that row. The
+  report answers only whether a record with that id exists.
+- `blob_pack_owners` rows of Amendment 1 item 7 whose source record is gone follow their pack's release rule.
+- Rows of soft-deleted records keep their blobs until the record is hard-deleted or restored, as §6 intends.
+- The removal command and its acceptance, retiring a roster member, removing rows while writers run, and restoring one
+  backend independently of main.
