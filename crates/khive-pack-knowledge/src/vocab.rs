@@ -511,7 +511,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Sections to upsert: [{section_type, content, heading?, sort_order?}]. \
                     section_type is a closed enum — valid values: overview | core_model | boundary_conditions | formalism | operational_guidance | examples | failure_modes | expert_lens | references | other. \
-                    content must be ≥80 characters.",
+                    content must be ≥80 characters. Resubmitting the same content for an atom updates that section's stored section_type and heading.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

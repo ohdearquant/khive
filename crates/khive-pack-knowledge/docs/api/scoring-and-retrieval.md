@@ -25,6 +25,11 @@ w_{\text{exact\_name}} \cdot \mathrm{exact}(t, \text{name})
 Default weights: `w_exact_name=5.0`, `w_name=3.0`, `w_description=1.5`, `w_tags=1.25`,
 `w_content=1.0`, `w_bigram=2.0`, `expand_discount=0.35`, `coverage_alpha=0.5`.
 
+Coverage is the fraction of original non-stop query terms found in a candidate.
+A term's own singular/plural expansion can satisfy that term; matching a different
+original query term cannot. With `coverage_alpha=0.5`, a candidate covering one
+of two original terms receives a factor of `sqrt(0.5)`.
+
 ### Query Decomposition
 
 When `decompose=true` and the query has >= `decompose_threshold` (default 4) non-stop terms,
