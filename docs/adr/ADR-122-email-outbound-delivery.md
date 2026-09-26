@@ -209,6 +209,8 @@ stage-based classification fails two of them:
 
 ## Amendment 2 (2026-09-25): claim the outbound Message-ID before sending
 
+**Status: Accepted (2026-09-26).**
+
 This amendment supersedes the Message-ID derivation in §3 and clarifies the
 property timing in §1 and the behavioral assertions in §5. The original §3
 describes UUIDv5 and names only `transport_message_id`; the implementation
