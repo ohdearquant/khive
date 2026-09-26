@@ -1280,6 +1280,7 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
             "auth"
         }
         khive_channel::ChannelError::Transport(_)
+        | khive_channel::ChannelError::RateLimited { .. }
         | khive_channel::ChannelError::PermanentTransport(_) => "transport",
         khive_channel::ChannelError::Config(_)
         | khive_channel::ChannelError::UnauthorizedSender(_)
@@ -1476,14 +1477,21 @@ async fn record_outbound_send_failure(
 
     match error.delivery_failure_class() {
         DeliveryFailureClass::Transient => {
+            let (base_delay, max_delay) = match error {
+                khive_channel::ChannelError::RateLimited { retry_after, .. } => (
+                    OUTBOUND_RETRY_BASE.max(*retry_after),
+                    OUTBOUND_RETRY_CEILING.max(*retry_after),
+                ),
+                _ => (OUTBOUND_RETRY_BASE, OUTBOUND_RETRY_CEILING),
+            };
             runtime
                 .mark_outbound_message_transient_failure(
                     token,
                     note_id,
                     chrono::Utc::now(),
                     error.to_string(),
-                    OUTBOUND_RETRY_BASE,
-                    OUTBOUND_RETRY_CEILING,
+                    base_delay,
+                    max_delay,
                 )
                 .await
         }
@@ -1585,6 +1593,7 @@ pub(crate) async fn channel_outbox_loop(
     channels.register(email_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
@@ -1602,6 +1611,7 @@ pub(crate) async fn channel_outbox_loop(
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -1623,6 +1633,7 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(email_channel),
         outbox::OutboxPolicy::Email {
@@ -1633,6 +1644,7 @@ async fn channel_outbox_once(
         runtime,
         namespace,
         cancellation,
+        &mut pause_until,
     )
     .await
 }
@@ -1923,6 +1935,7 @@ pub(crate) async fn telegram_outbox_loop(
     channels.register(telegram_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
@@ -1936,6 +1949,7 @@ pub(crate) async fn telegram_outbox_loop(
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -1949,12 +1963,14 @@ async fn telegram_outbox_once(
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(telegram_channel),
         outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
         runtime,
         namespace,
         cancellation,
+        &mut pause_until,
     )
     .await
 }

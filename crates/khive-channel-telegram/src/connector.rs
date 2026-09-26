@@ -48,6 +48,14 @@ struct TelegramApiResponse<T> {
     error_code: Option<u16>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    parameters: Option<TelegramResponseParameters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramResponseParameters {
+    #[serde(default)]
+    retry_after: Option<u32>,
 }
 
 /// Classify a failed Bot API call by HTTP status, falling back to the
@@ -68,7 +76,19 @@ fn telegram_api_error<T>(
     let message = format!(
         "{method} failed: status={status}, error_code={error_code:?}, description={description:?}"
     );
-    if code == 408 || code == 429 || code >= 500 {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || code == 429 {
+        if let Some(retry_after) = response
+            .and_then(|r| r.parameters.as_ref())
+            .and_then(|p| p.retry_after)
+        {
+            return ChannelError::RateLimited {
+                message,
+                retry_after: std::time::Duration::from_secs(u64::from(retry_after)),
+            };
+        }
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || code == 408 || code == 429 || code >= 500
+    {
         ChannelError::Transport(message)
     } else if (400..500).contains(&code) {
         ChannelError::PermanentTransport(message)
@@ -336,7 +356,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_classifies_rate_limit_as_transient() {
+    async fn send_message_carries_retry_after_from_rate_limit() {
+        let base_url = spawn_one_shot_server_with_status(
+            "429 Too Many Requests",
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":2}}"#,
+        );
+        let connector = LiveTelegramConnector::with_base_url("token".to_string(), base_url);
+
+        let error = connector.send_message(555, "hi").await.unwrap_err();
+        assert!(matches!(
+            &error,
+            ChannelError::RateLimited { retry_after, .. }
+                if *retry_after == std::time::Duration::from_secs(2)
+        ));
+        assert_eq!(
+            error.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_rate_limit_without_retry_after_stays_transient() {
         let base_url = spawn_one_shot_server_with_status(
             "429 Too Many Requests",
             r#"{"ok":false,"error_code":429,"description":"Too Many Requests"}"#,
@@ -345,10 +385,6 @@ mod tests {
 
         let error = connector.send_message(555, "hi").await.unwrap_err();
         assert!(matches!(error, ChannelError::Transport(_)));
-        assert_eq!(
-            error.delivery_failure_class(),
-            khive_channel::DeliveryFailureClass::Transient
-        );
     }
 
     #[tokio::test]

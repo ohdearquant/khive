@@ -429,6 +429,13 @@ pub enum ChannelError {
     /// Transport-level connection or I/O failure.
     #[error("transport error: {0}")]
     Transport(String),
+    /// A remote service rejected the request temporarily and supplied a
+    /// channel-wide wait before another request may be sent.
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: std::time::Duration,
+    },
     /// A definitive transport rejection for which retrying the same envelope
     /// cannot help (for example SMTP 5xx or a Telegram client-error response).
     #[error("permanent transport error: {0}")]
@@ -459,7 +466,9 @@ impl ChannelError {
     /// Classify this error for durable outbound-note delivery state.
     pub fn delivery_failure_class(&self) -> DeliveryFailureClass {
         match self {
-            Self::Transport(_) | Self::RetryableAuth(_) => DeliveryFailureClass::Transient,
+            Self::Transport(_) | Self::RetryableAuth(_) | Self::RateLimited { .. } => {
+                DeliveryFailureClass::Transient
+            }
             Self::Config(_)
             | Self::PermanentTransport(_)
             | Self::Auth(_)
