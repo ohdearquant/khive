@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -10,6 +9,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 use khive_pack_git::source::{parse_source, remote_url_to_slug, DigestSource};
+use khive_repo_showcase::git_safety::{hardened_git_command, hardened_git_command_for_repo};
 use khive_repo_showcase::{
     export, write_canonical_atomic, Availability, CodeIngestProvenance, ExportRequest,
     GitDigestProvenance, HistorySourceCoverage, PipelineProvenance, SourceCoverage,
@@ -969,7 +969,8 @@ fn preflight_tracked_inputs(repo: &Path) -> Result<()> {
     let root = repo
         .canonicalize()
         .with_context(|| format!("canonicalize repository {}", repo.display()))?;
-    let output = hardened_git_command()
+    let output = hardened_git_command_for_repo(&root)
+        .context("inspect repository content filters before tracked-input preflight")?
         .arg("-C")
         .arg(&root)
         .args(["ls-files", "--cached", "--stage", "-z"])
@@ -1078,7 +1079,8 @@ fn require_unchanged_head(repo: &Path, expected: &str, stage: &str) -> Result<()
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = hardened_git_command()
+    let output = hardened_git_command_for_repo(repo)
+        .context("inspect repository content filters before Git command")?
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -1092,24 +1094,6 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
         bail!("git {} failed for {}", args.join(" "), repo.display());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn hardened_git_command() -> Command {
-    let mut command = Command::new("git");
-    command
-        .args(["-c", "core.hooksPath=/dev/null"])
-        .args(["-c", "gc.auto=0"])
-        .args(["-c", "maintenance.auto=false"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT");
-    command
 }
 
 fn canonical_timestamp(raw: &str) -> Result<String> {
@@ -1198,4 +1182,130 @@ fn sqlite_sidecars(path: &Path) -> [PathBuf; 3] {
 fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn clean_snapshot_never_runs_repo_configured_filter() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join(".gitattributes"), "tracked.txt filter=marker\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+        git(&["add", ".gitattributes", "tracked.txt"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+
+        let helper = fixture.path().join("fake-clean.sh");
+        let marker = fixture.path().join("fake-clean.sh.marker");
+        std::fs::write(&helper, "#!/bin/sh\n: > \"$0.marker\"\ncat\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        git(&["config", "filter.marker.clean", helper.to_str().unwrap()]);
+        git(&["config", "filter.marker.smudge", helper.to_str().unwrap()]);
+        git(&["config", "filter.marker.process", helper.to_str().unwrap()]);
+        git(&["config", "filter.marker.required", "true"]);
+        std::fs::write(
+            repo.join("tracked.txt"),
+            "changed content with a new size\n",
+        )
+        .unwrap();
+
+        let attribute = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["check-attr", "filter", "--", "tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(attribute.status.success());
+        assert_eq!(
+            String::from_utf8(attribute.stdout).unwrap().trim(),
+            "tracked.txt: filter: marker"
+        );
+        let configured_clean = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--get", "filter.marker.clean"])
+            .output()
+            .unwrap();
+        assert!(configured_clean.status.success());
+        assert_eq!(
+            String::from_utf8(configured_clean.stdout).unwrap().trim(),
+            helper.to_str().unwrap()
+        );
+        git(&["config", "core.fsmonitor", helper.to_str().unwrap()]);
+
+        for key in ["clean", "smudge", "process"] {
+            let setting = format!("filter.marker.{key}");
+            let effective = hardened_git_command_for_repo(&repo)
+                .unwrap()
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--get", &setting])
+                .output()
+                .unwrap();
+            assert!(effective.status.success(), "{setting}");
+            assert!(
+                String::from_utf8(effective.stdout)
+                    .unwrap()
+                    .trim()
+                    .is_empty(),
+                "{setting} must be overridden before any worktree read"
+            );
+        }
+        let required = hardened_git_command_for_repo(&repo)
+            .unwrap()
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--get", "filter.marker.required"])
+            .output()
+            .unwrap();
+        assert!(required.status.success());
+        assert_eq!(String::from_utf8(required.stdout).unwrap().trim(), "false");
+
+        let fsmonitor = hardened_git_command_for_repo(&repo)
+            .unwrap()
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--get", "core.fsmonitor"])
+            .output()
+            .unwrap();
+        assert!(fsmonitor.status.success());
+        assert_eq!(String::from_utf8(fsmonitor.stdout).unwrap().trim(), "false");
+
+        assert!(
+            ensure_clean_snapshot(&repo).is_err(),
+            "modified file must remain visible"
+        );
+        assert!(
+            !marker.exists(),
+            "repo export must not run the configured filter"
+        );
+    }
 }
