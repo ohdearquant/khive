@@ -336,7 +336,7 @@ pub(crate) fn execute_wrapped_transaction<R, F>(
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
-    let profiled = execute_wrapped_transaction_profiled(conn, commit_operation, operation);
+    let profiled = execute_wrapped_transaction_profiled(conn, commit_operation, None, operation);
     (profiled.result, profiled.terminal_state)
 }
 
@@ -350,6 +350,7 @@ struct ProfiledWrappedTransaction<R> {
 fn execute_wrapped_transaction_profiled<R, F>(
     conn: &Connection,
     commit_operation: &'static str,
+    db: Option<&str>,
     operation: F,
 ) -> ProfiledWrappedTransaction<R>
 where
@@ -384,29 +385,34 @@ where
                         commit,
                     }
                 }
-                Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
-                    RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
-                        result: Err(StorageError::WriterTaskRequestFailed {
-                            request_state: WriterTaskRequestState::TransactionRolledBack,
-                            source: Box::new(StorageError::Pool {
-                                operation: commit_operation.into(),
-                                message: commit_error.to_string(),
+                Err(commit_error) => {
+                    if let Some(db) = db {
+                        crate::timeout_sink::maybe_emit_sqlite_full(db, &commit_error);
+                    }
+                    match rollback_after_failure(conn, "commit failure") {
+                        RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
+                            result: Err(StorageError::WriterTaskRequestFailed {
+                                request_state: WriterTaskRequestState::TransactionRolledBack,
+                                source: Box::new(StorageError::Pool {
+                                    operation: commit_operation.into(),
+                                    message: commit_error.to_string(),
+                                }),
                             }),
-                        }),
-                        terminal_state: None,
-                        body,
-                        commit,
-                    },
-                    RollbackDisposition::SideEffectsUnknown => {
-                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                        ProfiledWrappedTransaction {
-                            result: Err(writer_task_terminated(request_state)),
-                            terminal_state: Some(request_state),
+                            terminal_state: None,
                             body,
                             commit,
+                        },
+                        RollbackDisposition::SideEffectsUnknown => {
+                            let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                            ProfiledWrappedTransaction {
+                                result: Err(writer_task_terminated(request_state)),
+                                terminal_state: Some(request_state),
+                                body,
+                                commit,
+                            }
                         }
                     }
-                },
+                }
             }
         }
         Ok(Err(operation_error)) => {
@@ -465,7 +471,15 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             telemetry,
             ..
         } = *self;
-        let profiled = execute_wrapped_transaction_profiled(conn, "writer_task_commit", op);
+        let profiled = execute_wrapped_transaction_profiled(
+            conn,
+            "writer_task_commit",
+            Some(&telemetry.db),
+            op,
+        );
+        if let Err(error) = &profiled.result {
+            crate::timeout_sink::maybe_emit_sqlite_full(&telemetry.db, error);
+        }
         // The reply wake can make the caller immediately observe the
         // committed/error result. Deregister the transaction span first so
         // tx_registry continues to mean "currently open SQL transaction",
@@ -497,11 +511,15 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         let body_started = Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| op(conn)));
         let body = body_started.elapsed();
+        let telemetry_db = telemetry.db.clone();
         telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
         match outcome {
             Ok(outcome) if conn.is_autocommit() => {
                 // No COMMIT/ROLLBACK here: this request explicitly did not
                 // open a transaction, so there is nothing to close.
+                if let Err(error) = &outcome {
+                    crate::timeout_sink::maybe_emit_sqlite_full(&telemetry_db, error);
+                }
                 let _ = reply.send(outcome);
                 None
             }
@@ -861,6 +879,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     // ownership boundary instead.
     let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
+    let write_admission = pool.write_admission();
     let busy_timeout = pool.config().busy_timeout;
     let origin = pool.origin();
     let backend_key = writer_db_key(pool);
@@ -872,6 +891,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         origin,
         db.clone(),
         acquisition_counters,
+        write_admission,
         busy_timeout,
     ));
     // Stored on the pool (not returned) so the handle's clone-and-share
@@ -1004,6 +1024,7 @@ async fn run_writer_task(
     origin: khive_storage::tx_registry::TxOrigin,
     db: String,
     acquisition_counters: Arc<WriterAcquisitionCounters>,
+    write_admission: Arc<crate::pool::WriteAdmission>,
     busy_timeout: Duration,
 ) {
     while let Some(request) = rx.recv().await {
@@ -1013,6 +1034,8 @@ async fn run_writer_task(
         let queue_wait = request.queue_wait();
         let origin = origin.clone();
         let blocking_counters = Arc::clone(&acquisition_counters);
+        let blocking_admission = Arc::clone(&write_admission);
+        let blocking_db = db.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let acquisition_counters = blocking_counters;
             // A top-level request deliberately skips BEGIN, so it would
@@ -1027,6 +1050,14 @@ async fn run_writer_task(
                 let request_state = WriterTaskRequestState::NotStarted;
                 request.reply_error(writer_task_terminated(request_state));
                 return (conn, Some(request_state));
+            }
+
+            if let Err(error) = blocking_admission.check() {
+                request.reply_error(error.into_storage_error(
+                    khive_storage::StorageCapability::Sql,
+                    "writer_task_admission",
+                ));
+                return (conn, None);
             }
 
             let terminal_state = if request.is_top_level() {
@@ -1070,6 +1101,7 @@ async fn run_writer_task(
                         // here would run in autocommit mode and land partial
                         // writes for a request the caller is about to be told
                         // failed.
+                        crate::timeout_sink::maybe_emit_sqlite_full(&blocking_db, &e);
                         tracing::warn!(
                             error = %e,
                             attempts = begin_attempt,
@@ -1943,6 +1975,53 @@ mod tests {
         );
 
         lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn writer_task_resamples_capacity_for_each_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_capacity.db");
+        let mut pool = file_pool(&path);
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&samples);
+        pool.set_test_write_admission(100, move |_| {
+            match observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok(102),
+                1 => Ok(100),
+                extra => panic!("unexpected capacity sample {extra}"),
+            }
+        });
+        let operations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = spawn(&pool, 8).unwrap();
+
+        let first_count = Arc::clone(&operations);
+        handle
+            .send(move |_| {
+                first_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, StorageError>(())
+            })
+            .await
+            .expect("first request should clear the reserve");
+        let second_count = Arc::clone(&operations);
+        let second = handle
+            .send(move |_| {
+                second_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, StorageError>(())
+            })
+            .await;
+
+        assert!(matches!(
+            second,
+            Err(StorageError::CapacityFloor {
+                capability: khive_storage::StorageCapability::Sql,
+                available_bytes: 100,
+                floor_bytes: 100,
+                ..
+            })
+        ));
+        assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(operations.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     // `#[serial(tx_registry)]`: shares the key with the checkpoint

@@ -32,7 +32,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Events, op, e)
+    e.into_storage_error(StorageCapability::Events, op)
 }
 
 /// An EventStore backed by SQLite tables.
