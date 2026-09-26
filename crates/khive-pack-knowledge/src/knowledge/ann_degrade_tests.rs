@@ -387,8 +387,6 @@ async fn lexical_timeout_fixture(
         .dispatch("knowledge.index", json!({"rebuild_ann": false}))
         .await
         .expect("index");
-    // Index only the small corpus; these additional rows stay lexical-only.
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
     (rt, registry)
 }
 
@@ -904,24 +902,19 @@ async fn suggest_flags_degraded_no_match_when_hits_empty() {
 
 // ── P4: issue #1930 — lexical-timeout degraded arm ────────────────────────────
 
-/// A lexical/FTS candidate fetch that hits the request read deadline must
-/// degrade `suggest` to ANN-backed results carrying `degraded.lexical_timeout`
-/// — never a verb-level error. ANN candidates are fetched before the lexical
-/// stage precisely so they survive a lexical timeout (see `search.rs`'s
-/// `search`/`suggest` handlers); a real (unwarmed, no snapshot) `SharedAnn`
-/// still serves via the fresh-tail vector-store scan, so this exercises the
-/// production code path, not a mock. When the expired deadline also leaves
-/// member sizing unrun, the survivor is reported under
-/// `degraded.member_sizing_timeout.excluded` instead of being served with a
-/// fabricated size.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A timed-out lexical read must retain the independently completed ANN
+/// candidate. Inject only the lexical timeout so the shared request deadline
+/// cannot also cancel ANN under host-dependent load. The real fresh-tail scan
+/// remains in use; the candidate is served or explicitly excluded if sizing
+/// could not measure it.
+#[tokio::test(start_paused = true)]
 async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     let (rt, _registry) = lexical_timeout_fixture(
         Vec::new(),
         json!({
             "slug": "degrade-lexical-timeout-domain",
             "name": "Degrade Lexical Timeout Domain",
-            "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical fetch itself exceeds the request read deadline during this regression test",
+            "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical reader times out during this regression test",
             "members": []
         }),
     )
@@ -934,9 +927,9 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let deadline = std::time::Duration::from_millis(200);
-    let result = khive_storage::scope_request_read_deadline(
-        deadline,
+    let result = crate::knowledge::lexical_timeout::tests::with_timeout(
+        vec![crate::knowledge::lexical_timeout::LexicalPhase::ReaderOpen],
+        std::time::Duration::from_millis(1),
         KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
     )
     .await
@@ -946,10 +939,18 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
         result["degraded"]["lexical_timeout"], true,
         "suggest must flag degraded.lexical_timeout when the lexical fetch times out; got: {result}"
     );
+    assert_eq!(
+        result["total"], 1,
+        "ANN must survive lexical timeout: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"],
+        "Degrade Lexical Timeout Domain"
+    );
     // The ANN survivor is never dropped silently: it is served in `results`
     // when its member size was measured, and reported under
     // `degraded.member_sizing_timeout.excluded` (rank and score intact, no
-    // fabricated size) when the expired request deadline left sizing unrun.
+    // fabricated size) if sizing was unmeasured.
     let surfaced: Vec<&str> = result["results"]
         .as_array()
         .into_iter()
@@ -975,16 +976,14 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     }
 }
 
-/// Issue #2396 fix 3 (revised): same outer-deadline shape as the test above,
-/// but the seeded domain has a real member atom, so a real (non-zero) size
-/// would be computed if member sizing ran. The expired ambient deadline
-/// skips member sizing entirely (the same `request_read_is_cancelled()`
-/// guard that skips the embedding rerank), and that domain must be withheld
-/// from `results` and reported under `degraded.member_sizing_timeout.excluded`
+/// Issue #2396 fix 3 (revised): the seeded domain has a real member atom, so a
+/// real (non-zero) size would be computed if member sizing ran. A separate
+/// scoped read timeout at the sizing boundary must withhold that domain
+/// from `results` and report it under `degraded.member_sizing_timeout.excluded`
 /// instead — never left in `results` with `size: 0` (which would let a
 /// caller pass it into `knowledge.fold` as a free item) or `size: null`
 /// (which breaks the documented suggest -> fold passthrough, issue #105).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
     let (rt, registry) = lexical_timeout_fixture(
         vec![json!({
@@ -1006,10 +1005,12 @@ async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let deadline = std::time::Duration::from_millis(200);
-    let result = khive_storage::scope_request_read_deadline(
-        deadline,
-        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    let result = crate::knowledge::search::with_member_sizing_read_timeout(
+        crate::knowledge::lexical_timeout::tests::with_timeout(
+            vec![crate::knowledge::lexical_timeout::LexicalPhase::ReaderOpen],
+            std::time::Duration::from_millis(1),
+            KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+        ),
     )
     .await
     .expect("suggest must not Err on a lexical-stage read timeout");
@@ -1030,6 +1031,7 @@ async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
         "the degradation entry must list the excluded domain; got: {result}"
     );
     assert_eq!(excluded[0]["rank"], 1, "got: {result}");
+    assert_eq!(excluded[0]["name"], "Degrade Sizing Domain");
     assert!(
         excluded[0]["id"].is_string()
             && excluded[0]["name"].is_string()
@@ -1059,7 +1061,7 @@ async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
 /// `results` with a `size` that `FoldCandidate`'s non-optional `usize`
 /// cannot parse. Before the fix, this test's `fold` dispatch failed with a
 /// parse error on the degraded domain's `size: null`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold() {
     let (rt, registry) = lexical_timeout_fixture(
         vec![json!({
@@ -1081,10 +1083,12 @@ async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold()
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let deadline = std::time::Duration::from_millis(200);
-    let result = khive_storage::scope_request_read_deadline(
-        deadline,
-        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    let result = crate::knowledge::search::with_member_sizing_read_timeout(
+        crate::knowledge::lexical_timeout::tests::with_timeout(
+            vec![crate::knowledge::lexical_timeout::LexicalPhase::ReaderOpen],
+            std::time::Duration::from_millis(1),
+            KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+        ),
     )
     .await
     .expect("suggest must not Err on a lexical-stage read timeout");
