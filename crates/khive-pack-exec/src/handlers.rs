@@ -1138,7 +1138,8 @@ async fn execute(
             )));
         }
     };
-    let enforced = read_limit_report(limit_reader);
+    let report_wait = req.timeout.min(Duration::from_secs(1));
+    let enforced = collect_limit_report(limit_reader, report_wait).await;
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
     let pid = child.id().unwrap_or_default() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
@@ -1336,8 +1337,26 @@ fn kill_group(pid: i32) {
 #[cfg(unix)]
 fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: plain pipe creation; both ends are marked close-on-exec so the
-    // writer closes in the child at exec and the reader never leaks.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    ))]
+    unsafe {
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return Err(RuntimeError::Unconfigured(format!(
+                "pipe2: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) != 0 {
             return Err(RuntimeError::Unconfigured(format!(
@@ -1347,21 +1366,62 @@ fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
         }
         for fd in fds {
             let flags = libc::fcntl(fd, libc::F_GETFD);
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                let error = std::io::Error::last_os_error();
+                for fd in fds {
+                    libc::close(fd);
+                }
+                return Err(RuntimeError::Unconfigured(format!(
+                    "pipe close-on-exec: {error}"
+                )));
+            }
         }
     }
     Ok((fds[0], fds[1]))
 }
 
 #[cfg(unix)]
-fn read_limit_report(reader: libc::c_int) -> Value {
-    use std::io::Read;
+async fn collect_limit_report(reader: libc::c_int, wait: Duration) -> Value {
+    let task = tokio::task::spawn_blocking(move || read_limit_report(reader, wait));
+    match tokio::time::timeout(wait, task).await {
+        Ok(Ok(report)) => report,
+        _ => json!({}),
+    }
+}
+
+#[cfg(unix)]
+fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     use std::os::unix::io::FromRawFd;
     // SAFETY: we own the descriptor and close it exactly once through File.
     let mut file = unsafe { std::fs::File::from_raw_fd(reader) };
-    let mut text = String::new();
-    let _ = file.read_to_string(&mut text);
-    serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+    let deadline = Instant::now() + wait;
+    let mut poll_fd = libc::pollfd {
+        fd: reader,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return json!({});
+        }
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: poll_fd is valid for one descriptor owned by file.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready > 0 {
+            break;
+        }
+        if ready == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return json!({});
+        }
+    }
+    // The child emits one JSON write below the minimum POSIX PIPE_BUF; a
+    // single read does not depend on every inherited writer reaching EOF.
+    let mut bytes = [0u8; 512];
+    match file.read(&mut bytes) {
+        Ok(size) => serde_json::from_slice(&bytes[..size]).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1372,6 +1432,103 @@ mod grant_pin_tests;
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn limit_pipe_descriptors_are_close_on_exec() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let reader = unsafe { std::fs::File::from_raw_fd(reader) };
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        for fd in [
+            std::os::fd::AsRawFd::as_raw_fd(&reader),
+            std::os::fd::AsRawFd::as_raw_fd(&writer),
+        ] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_report_arrives_without_waiting_for_writer_eof() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let bytes = br#"{"cpu_seconds":1}"#;
+        let written = unsafe {
+            libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&writer),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        assert_eq!(written, bytes.len() as isize);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(750),
+            collect_limit_report(reader, Duration::from_secs(1)),
+        )
+        .await;
+        // Close the held writer before asserting the deadline. A broken
+        // EOF-dependent reader must be released before this test's Tokio
+        // runtime shuts down, so the failure stays bounded.
+        drop(writer);
+        let report = outcome.expect("report read waited for writer EOF");
+        assert_eq!(report, json!({"cpu_seconds": 1}));
+    }
+
+    #[tokio::test]
+    async fn silent_limit_report_writer_releases_blocking_worker() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let task = tokio::task::spawn_blocking(move || {
+            read_limit_report(reader, Duration::from_millis(30))
+        });
+        let outcome = tokio::time::timeout(Duration::from_millis(750), task).await;
+        drop(writer);
+        let report = outcome
+            .expect("blocking report reader did not reach its deadline")
+            .unwrap();
+        assert_eq!(report, json!({}));
+    }
+
+    #[test]
+    fn pending_limit_report_does_not_hold_async_executor() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let report = runtime.block_on(async move {
+                let report_task =
+                    tokio::spawn(collect_limit_report(reader, Duration::from_millis(800)));
+                tokio::task::yield_now().await;
+                let _ = progress_tx.send(());
+                report_task.await.unwrap()
+            });
+            let _ = done_tx.send(report);
+        });
+        // A synchronous pipe read on the current-thread executor prevents its
+        // own Tokio timer from firing. Observe progress from this independent
+        // test thread, then release the held writer before any assertion.
+        let progress = progress_rx.recv_timeout(Duration::from_millis(500));
+        drop(writer);
+        let report = done_rx.recv_timeout(Duration::from_secs(2));
+        if report.is_ok() {
+            worker.join().unwrap();
+        }
+        assert!(
+            progress.is_ok(),
+            "pending report blocked the async executor"
+        );
+        assert_eq!(
+            report.expect("pending report exceeded its deadline"),
+            json!({})
+        );
+    }
 
     #[test]
     fn wide_list_limit_saturates_before_clamping() {
