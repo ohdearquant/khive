@@ -2095,11 +2095,13 @@ impl KhiveMcpServer {
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let max_outstanding_requests = stdio_bridge_max_outstanding_requests_from_env();
+        let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
             crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
-                    read, write,
+                    crate::stdio_line_limit::BoundedLineReader::new(read, max_line_bytes),
+                    write,
                 )),
                 root,
                 idle_timeout,
@@ -2144,10 +2146,14 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
+        let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let transport =
             crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
-                AsyncRwTransport::new_server(read, write),
+                AsyncRwTransport::new_server(
+                    crate::stdio_line_limit::BoundedLineReader::new(read, max_line_bytes),
+                    write,
+                ),
                 root.clone(),
                 stdio_bridge_idle_timeout_from_env(),
                 Some(response_deadline),
@@ -4815,6 +4821,17 @@ impl KhiveMcpServer {
                 None
             };
 
+        // Reserve and validate the destination before any operation can run.
+        // Wire requests are restricted to the export root; the trusted CLI
+        // keeps its documented unrestricted destination policy.
+        let save_sink = save_to
+            .as_deref()
+            .map(|path| {
+                crate::save_sink::JsonlSaveSink::new(std::path::Path::new(path), from_wire)
+                    .map_err(|error| invalid_request_error(format!("save_to: {error}")))
+            })
+            .transpose()?;
+
         let (mut result, content_scopes) = self
             .run_parsed(
                 parsed.ops,
@@ -4837,15 +4854,10 @@ impl KhiveMcpServer {
             attach_strict_refusal_reasons(&mut result);
         }
 
-        if let Some(path_str) = save_to {
-            let path = std::path::Path::new(&path_str);
-            // `from_wire` gates the destination policy: the agent-facing MCP
-            // `request` tool (`from_wire = true`) restricts `save_to` to the
-            // allowed export root; the trusted operator CLI path
-            // (`kkernel exec --save-file`, `from_wire = false`) is unrestricted,
-            // matching its documented "write anywhere" behavior.
-            let manifest = crate::save_sink::write_and_manifest(&result, path, from_wire)
-                .map_err(|e| request_internal_error(format!("save_to: {e}")))?;
+        if let Some(sink) = save_sink {
+            let manifest = sink
+                .write_envelope(&result)
+                .map_err(|error| save_to_write_error(format!("save_to: {error}"), &result))?;
             // Manifests are always compact JSON regardless of format (lossless metadata).
             return serde_json::to_string(&manifest)
                 .map_err(|e| request_internal_error(format!("serialize manifest: {e}")));
@@ -4962,6 +4974,67 @@ fn request_internal_error(message: String) -> McpError {
             }),
             DomainDisposition::Unknown,
         )),
+    )
+}
+
+/// A sink can still fail after domain dispatch. Preserve the known per-op
+/// receipts while bounding error details for results too large to return inline.
+fn save_to_write_error(message: String, result: &Value) -> McpError {
+    const MAX_INLINE_OUTCOME_BYTES: usize = 8 * 1024;
+
+    let outcomes = result
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, row)| {
+            let ok = row.get("ok").and_then(Value::as_bool);
+            let disposition = if ok == Some(true) {
+                DomainDisposition::Committed.as_str()
+            } else {
+                row.get("domain_disposition")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DomainDisposition::Unknown.as_str())
+            };
+            let mut outcome = json!({
+                "op_index": row.get("op_index").and_then(Value::as_u64).unwrap_or(index as u64),
+                "tool": row.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                "ok": ok,
+                "domain_disposition": disposition,
+            });
+            for field in ["result", "error"] {
+                if let Some(value) = row.get(field) {
+                    if serialized_response_len(value) <= MAX_INLINE_OUTCOME_BYTES {
+                        outcome[field] = value.clone();
+                    } else {
+                        outcome
+                            .as_object_mut()
+                            .expect("outcome is an object")
+                            .insert(format!("{field}_omitted"), Value::Bool(true));
+                    }
+                }
+            }
+            for field in ["reason", "aborted"] {
+                if let Some(value) = row.get(field) {
+                    outcome[field] = value.clone();
+                }
+            }
+            outcome
+        })
+        .collect::<Vec<_>>();
+    let mut detail = json!({
+        "kind": "internal",
+        "message": message.clone(),
+        "summary": result.get("summary"),
+        "results": outcomes,
+    });
+    if let Some(atomic) = result.get("atomic") {
+        detail["atomic"] = atomic.clone();
+    }
+    McpError::internal_error(
+        message,
+        Some(error_with_disposition(detail, DomainDisposition::Unknown)),
     )
 }
 
@@ -8881,6 +8954,112 @@ mod tests {
                 result_bytes
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn invalid_save_to_refuses_before_create_on_wire_and_cli() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("save_to fixture directory");
+        std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
+        let server = make_daemon_save_to_test_server(Some(dir.path().join("main.db")));
+        let create = "create(kind=\"concept\", name=\"save-to-preflight\")";
+
+        let wire_error = server
+            .request(
+                Parameters(RequestParams {
+                    ops: create.to_string(),
+                    save_to: Some("../outside-export-root.jsonl".to_string()),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect_err("a wire destination outside the export root must fail before create");
+        assert_eq!(
+            wire_error.data.as_ref().unwrap()["domain_disposition"],
+            "not_committed"
+        );
+
+        let stats = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("read post-refusal stats");
+        let stats: Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["results"][0]["result"]["entities"], 0);
+
+        let valid_path = dir.path().join("inside.jsonl");
+        let manifest = server
+            .request(
+                Parameters(RequestParams {
+                    ops: create.to_string(),
+                    save_to: Some(valid_path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the same create must succeed with a valid destination");
+        let manifest: Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(manifest["summary"]["succeeded"], 1);
+
+        let cli_error = server
+            .dispatch_request_inner(
+                RequestParams {
+                    ops: "create(kind=\"concept\", name=\"cli-save-to-preflight\")".to_string(),
+                    save_to: Some(dir.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                false,
+                None,
+                DispatchOrigin::Local,
+            )
+            .await
+            .expect_err("an operator destination that is a directory must fail before create");
+        assert_eq!(
+            cli_error.data.as_ref().unwrap()["domain_disposition"],
+            "not_committed"
+        );
+
+        let stats = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("read post-CLI-refusal stats");
+        let stats: Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["results"][0]["result"]["entities"], 1);
+
+        std::env::remove_var("KHIVE_SAVE_TO_ROOT");
+    }
+
+    #[test]
+    fn save_to_write_failure_retains_known_operation_outcomes() {
+        let result = json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {"id": "created-id"}},
+                {"ok": false, "tool": "link", "domain_disposition": "not_committed",
+                 "error": {"kind": "invalid_input", "message": "missing endpoint"}},
+            ],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        });
+        let error = super::save_to_write_error("save_to: disk full".to_string(), &result);
+        let details = error.data.as_ref().expect("save error details");
+        assert_eq!(details["domain_disposition"], "unknown");
+        assert_eq!(details["summary"]["succeeded"], 1);
+        assert_eq!(details["results"][0]["domain_disposition"], "committed");
+        assert_eq!(details["results"][0]["result"]["id"], "created-id");
+        assert_eq!(details["results"][1]["domain_disposition"], "not_committed");
+        assert_eq!(details["results"][1]["error"]["kind"], "invalid_input");
     }
 
     #[tokio::test]
