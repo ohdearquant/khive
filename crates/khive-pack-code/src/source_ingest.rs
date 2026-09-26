@@ -1580,32 +1580,14 @@ const SOURCE_SKIP_DIRS: &[&str] = &[
     "build",
 ];
 
-fn collect_source_files(root: &Path, ext: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
-                continue;
-            }
-            collect_source_files(&path, ext, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// L2's source walk resolves symlinks but never crosses the canonical ingest
+/// Both source tiers resolve symlinks without crossing the canonical ingest
 /// root. Canonical directory de-duplication also prevents symlink cycles.
-fn collect_l2_source_files(
+fn collect_source_files(
     root: &Path,
     ext: &str,
     out: &mut Vec<PathBuf>,
     skipped_outside_root: &mut Vec<PathBuf>,
+    skipped_non_regular: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
     fn visit(
         path: &Path,
@@ -1613,17 +1595,18 @@ fn collect_l2_source_files(
         ext: &str,
         visited_dirs: &mut BTreeSet<PathBuf>,
         out: &mut Vec<PathBuf>,
-        skipped: &mut Vec<PathBuf>,
+        skipped_outside_root: &mut Vec<PathBuf>,
+        skipped_non_regular: &mut Vec<PathBuf>,
     ) -> std::io::Result<()> {
         let canonical = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(_) => {
-                skipped.push(path.to_path_buf());
+                skipped_outside_root.push(path.to_path_buf());
                 return Ok(());
             }
         };
         if !canonical.starts_with(canonical_root) {
-            skipped.push(path.to_path_buf());
+            skipped_outside_root.push(path.to_path_buf());
             return Ok(());
         }
         if canonical.is_dir() {
@@ -1638,10 +1621,22 @@ fn collect_l2_source_files(
                 if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
                     continue;
                 }
-                visit(&entry_path, canonical_root, ext, visited_dirs, out, skipped)?;
+                visit(
+                    &entry_path,
+                    canonical_root,
+                    ext,
+                    visited_dirs,
+                    out,
+                    skipped_outside_root,
+                    skipped_non_regular,
+                )?;
             }
         } else if canonical.extension().and_then(|value| value.to_str()) == Some(ext) {
-            out.push(canonical);
+            if canonical.is_file() {
+                out.push(canonical);
+            } else {
+                skipped_non_regular.push(path.to_path_buf());
+            }
         }
         Ok(())
     }
@@ -1654,6 +1649,7 @@ fn collect_l2_source_files(
         &mut BTreeSet::new(),
         out,
         skipped_outside_root,
+        skipped_non_regular,
     )?;
     out.sort();
     out.dedup();
@@ -1902,14 +1898,45 @@ async fn run_import_scan(
     let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
+    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
+        Ok(path) => path,
+        Err(error) => {
+            report.warnings.push(format!(
+                "canonicalizing L1.5 ingest root {}: {error}",
+                ingest_root.display()
+            ));
+            return Ok(());
+        }
+    };
     let mut files = Vec::new();
-    if let Err(e) = collect_source_files(ingest_root, ext, &mut files) {
+    let mut skipped_outside_root = Vec::new();
+    let mut skipped_non_regular = Vec::new();
+    if let Err(e) = collect_source_files(
+        &canonical_ingest_root,
+        ext,
+        &mut files,
+        &mut skipped_outside_root,
+        &mut skipped_non_regular,
+    ) {
         report
             .warnings
             .push(format!("walking {}: {e}", ingest_root.display()));
         return Ok(());
     }
-    files.sort();
+    for skipped in skipped_outside_root {
+        report.warnings.push(format!(
+            "L1.5 skipped source outside the canonical ingest root: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_regular {
+        report.warnings.push(format!(
+            "L1.5 skipped non-regular source: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
     if !files.is_empty() {
         record_observed_language(report, language);
     }
@@ -1919,19 +1946,19 @@ async fn run_import_scan(
             continue;
         };
         let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, ingest_root, language).unwrap_or_else(
-                || {
+            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, language)
+                .unwrap_or_else(|| {
                     (
-                        ingest_root.to_path_buf(),
+                        canonical_ingest_root.clone(),
                         basename_project_name(ingest_root),
                     )
-                },
-            );
+                });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) = derive_source_path(&file, ingest_root, &snapshot.root, report)
+        let Some(source_path) =
+            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
         else {
             continue;
         };
@@ -3226,11 +3253,13 @@ async fn run_l2_sweep(
     };
     let mut files = Vec::new();
     let mut skipped_outside_root = Vec::new();
-    if let Err(e) = collect_l2_source_files(
+    let mut skipped_non_regular = Vec::new();
+    if let Err(e) = collect_source_files(
         &canonical_ingest_root,
         ext,
         &mut files,
         &mut skipped_outside_root,
+        &mut skipped_non_regular,
     ) {
         report
             .warnings
@@ -3240,6 +3269,13 @@ async fn run_l2_sweep(
     for skipped in skipped_outside_root {
         report.warnings.push(format!(
             "L2 skipped source outside the canonical ingest root: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_regular {
+        report.warnings.push(format!(
+            "L2 skipped non-regular source: {}",
             skipped.display()
         ));
         report.files_dropped_without_source_path += 1;
