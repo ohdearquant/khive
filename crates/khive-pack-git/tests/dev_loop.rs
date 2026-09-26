@@ -1045,6 +1045,78 @@ async fn update_ref_moves_an_existing_branch_and_reconcile_settles_its_receipt()
 
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
+async fn update_ref_unchanged_head_records_marker_and_reconciles_lost_terminal_receipt() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    let f = Fixture::new(true, true).await;
+    let head = f.base.clone();
+    let help = command(&f.git, &f.repo, &["reflog", "-h"], true)
+        .output()
+        .expect("probe Git reflog capabilities");
+    if !String::from_utf8_lossy(&help.stdout).contains("git reflog write ") {
+        // Ubuntu 24.04's Git lacks this newer capability. The test still
+        // checks the durable refusal receipt, then skips only the marker arm.
+        let error = f
+            .err(
+                "git.update_ref",
+                json!({"repo":f.repo,"branch":"work","to":head.clone(),"expected":head}),
+            )
+            .await;
+        assert!(error.contains("unsupported_toolchain"), "{error}");
+        let receipt = f.refusal_receipt(&error).await;
+        assert_eq!(
+            receipt["result"]["toolchain"]["missing_capability"],
+            "reflog write"
+        );
+        assert_eq!(
+            receipt["result"]["toolchain"]["git_version"],
+            f.git_text(&["--version"])
+        );
+        assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), f.base);
+        return;
+    }
+    let result = f
+        .call(
+            "git.update_ref",
+            json!({"repo":f.repo,"branch":"work","to":head.clone(),"expected":head}),
+        )
+        .await;
+
+    assert_eq!(result["from"], f.base);
+    assert_eq!(result["to"], f.base);
+    assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), f.base);
+    let receipt_id = result["receipt_id"].as_str().expect("receipt id");
+    assert_eq!(
+        f.git_text(&["reflog", "-1", "--format=%gs", "refs/heads/work"]),
+        format!("khive-receipt:{receipt_id}")
+    );
+
+    // Simulate a lost terminal receipt write after the successful no-op CAS.
+    let mut writer = f.rt.sql().writer().await.expect("receipt writer");
+    let changed = writer
+        .execute(SqlStatement {
+            sql: "UPDATE git_receipts SET disposition = 'unknown', finished_at = NULL WHERE id = ?1 AND namespace = 'local' AND actor = ?2".into(),
+            params: vec![
+                SqlValue::Text(receipt_id.into()),
+                SqlValue::Text(ACTOR.into()),
+            ],
+            label: Some("git_update_ref_noop_receipt_reconciliation".into()),
+        })
+        .await
+        .expect("simulate an unsettled receipt");
+    assert_eq!(changed, 1);
+    drop(writer);
+
+    let reconciled = f.call("git.reconcile", json!({"receipt":receipt_id})).await;
+    assert_eq!(reconciled["receipt"]["disposition"], "committed");
+    assert_eq!(f.receipt(receipt_id).await["disposition"], "committed");
+    assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), f.base);
+}
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn update_ref_rejects_non_commit_targets() {
     if crate::test_process::run_in_child() {
         return;

@@ -22,6 +22,12 @@ Version history for `PROTOCOL_VERSION`:
 - 5 — added `plan` (default false). A true value returns syntax and loaded-catalog information
   before request identity construction or dispatch. Older daemons reject v5 frames before they
   could ignore the flag and execute the operations. Restart a warm daemon when upgrading clients.
+- 6 — added new resident verbs. Older bridges re-exec onto the installed binary instead of
+  forwarding to a warm daemon that lacks the new catalog.
+- 7 — expanded the verb set and the `knowledge.search` candidate provenance response.
+- 8 — a daemon may serve a client whose extra embedders are a subset of its own. Older bridges
+  require exact config ids and could replay a successful write locally after a compatible daemon
+  serves it; reject their v7 frames before dispatch during a rolling upgrade.
 
 `process_ref` carries the originating client's opaque `KHIVE_PROCESS_REF`; it is request
 attribution, not identity, and prevents a shared daemon from substituting its own process

@@ -397,6 +397,36 @@ async fn self_grant_is_refused() {
     assert_eq!(granted["grant"]["status"], json!("granted"));
 }
 
+#[tokio::test]
+async fn pattern_request_cannot_self_grant() {
+    let f = fixture();
+    f.call("tool.register", json!({"name": "send_mail"})).await;
+    let own_actor = s(
+        &f.call("tool.check", json!({"tool": "send_mail"})).await,
+        "actor",
+    );
+
+    for actor in ["*".to_string(), format!("{own_actor}*")] {
+        let request = f
+            .call("tool.request", json!({"tool": "send_mail", "actor": actor}))
+            .await;
+        let id = s(&request, "request_id");
+        let err = f.call_err("tool.grant", json!({"id": &id})).await;
+        assert!(err.contains("own request"), "{err}");
+        let still = f
+            .call("tool.requests", json!({"status": "requested"}))
+            .await;
+        assert!(still["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"].as_str() == Some(id.as_str())));
+        let decision = f.call("tool.check", json!({"tool": "send_mail"})).await;
+        assert_eq!(decision["decision"], json!("ask"));
+        assert_eq!(decision["source"], json!("default"));
+    }
+}
+
 // Arm 10: a registry row is opaque to the generic entity verbs. `update` and
 // `delete` refuse a row whose current tags carry the registry tag, and the
 // refusal reads those tags before the write, so stripping the tag is itself
