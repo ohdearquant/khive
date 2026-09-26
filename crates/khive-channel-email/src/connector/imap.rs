@@ -4,7 +4,7 @@
 //! required; plaintext IMAP connections are rejected. Credentials are supplied
 //! at construction time from environment variables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::instrument;
 
 use crate::backoff::ImapSingleFlight;
+use crate::config::{DEFAULT_IMAP_MAX_MESSAGE_BYTES, DEFAULT_IMAP_MAX_PAGE_BYTES};
 use crate::oauth::{TokenProvider, XOAuth2Authenticator};
 
 use super::RawEmail;
@@ -60,6 +61,8 @@ pub(crate) enum MalformedReason {
     MissingBody,
     /// An RFC822 body was present but `mail_parser` could not parse it.
     ParseFailure,
+    /// The RFC 822 size exceeds the configured inbound message limit.
+    TooLarge,
 }
 
 impl std::fmt::Display for MalformedReason {
@@ -67,6 +70,7 @@ impl std::fmt::Display for MalformedReason {
         f.write_str(match self {
             MalformedReason::MissingBody => "missing-body",
             MalformedReason::ParseFailure => "parse-failure",
+            MalformedReason::TooLarge => "too-large",
         })
     }
 }
@@ -125,6 +129,8 @@ pub(crate) struct LiveImap {
     host: String,
     port: u16,
     auth: ImapAuthConfig,
+    max_message_bytes: usize,
+    max_page_bytes: usize,
     /// Per-credential single-flight guard (#605): at most one concurrent
     /// connection attempt for this `LiveImap` (i.e. this credential) proceeds;
     /// a bounded semaphore is the only way to widen the cap later.
@@ -138,6 +144,8 @@ impl LiveImap {
         port: u16,
         username: impl Into<String>,
         password: impl Into<String>,
+        max_message_bytes: usize,
+        max_page_bytes: usize,
     ) -> Self {
         Self {
             host: host.into(),
@@ -146,6 +154,8 @@ impl LiveImap {
                 username: username.into(),
                 password: password.into(),
             },
+            max_message_bytes,
+            max_page_bytes,
             single_flight: ImapSingleFlight::new(),
         }
     }
@@ -161,6 +171,8 @@ impl LiveImap {
         port: u16,
         mailbox: impl Into<String>,
         token_provider: Arc<TokenProvider>,
+        max_message_bytes: usize,
+        max_page_bytes: usize,
     ) -> Self {
         Self {
             host: host.into(),
@@ -169,6 +181,8 @@ impl LiveImap {
                 mailbox: mailbox.into(),
                 token_provider,
             },
+            max_message_bytes,
+            max_page_bytes,
             single_flight: ImapSingleFlight::new(),
         }
     }
@@ -334,36 +348,156 @@ impl ImapConnector for LiveImap {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Collect the fetch stream into owned bytes before releasing the session borrow.
-        // Every fetch entry is kept, including a `None` body: filtering bodyless
-        // entries here would hide an incomplete selected page from
-        // `process_selected_page`, which must see (and reject) that gap.
-        let fetched_raw: Vec<(Option<u32>, Option<Vec<u8>>)> = {
+        let fetched_sizes: Vec<(Option<u32>, Option<u32>)> = {
             let mut stream = session
-                .uid_fetch(&uid_str, "RFC822")
+                .uid_fetch(&uid_str, "RFC822.SIZE")
                 .await
-                .map_err(|e| ChannelError::Transport(format!("IMAP UID FETCH failed: {e}")))?;
+                .map_err(|e| ChannelError::Transport(format!("IMAP UID FETCH size failed: {e}")))?;
 
             let mut collected = Vec::new();
-            while let Some(msg) = stream
-                .try_next()
-                .await
-                .map_err(|e| ChannelError::Transport(format!("IMAP fetch stream error: {e}")))?
-            {
-                collected.push((msg.uid, msg.body().map(|b| b.to_vec())));
+            while let Some(msg) = stream.try_next().await.map_err(|e| {
+                ChannelError::Transport(format!("IMAP size fetch stream error: {e}"))
+            })? {
+                collected.push((msg.uid, msg.size));
             }
             collected
         };
+        let plan = plan_size_page(
+            &selected,
+            fetched_sizes,
+            self.max_message_bytes,
+            self.max_page_bytes,
+        )?;
+
+        let mut fetched_raw = Vec::new();
+        let mut processed = Vec::new();
+        let mut oversized = plan.oversized;
+        let mut page_bytes = 0usize;
+        for uid in plan.selected {
+            if oversized.contains(&uid.get()) {
+                processed.push(uid);
+                continue;
+            }
+
+            let remaining = self.max_page_bytes - page_bytes;
+            let allowed = self.max_message_bytes.min(remaining);
+            let body_query = format!("BODY.PEEK[]<0.{}>", allowed + 1);
+            let uid_str = uid.get().to_string();
+            let (body, body_len) = {
+                let mut stream = session
+                    .uid_fetch(&uid_str, &body_query)
+                    .await
+                    .map_err(|e| {
+                        ChannelError::Transport(format!("IMAP UID FETCH body failed: {e}"))
+                    })?;
+                let mut response = None;
+                while let Some(msg) = stream.try_next().await.map_err(|e| {
+                    ChannelError::Transport(format!("IMAP body fetch stream error: {e}"))
+                })? {
+                    if msg.uid != Some(uid.get()) {
+                        tracing::warn!(host = %self.host, uid = ?msg.uid, "ignoring unrequested IMAP body response");
+                        continue;
+                    }
+                    let raw = msg.body();
+                    let len = raw.map_or(0, |bytes| bytes.len());
+                    let body = if len > allowed {
+                        None
+                    } else {
+                        raw.map(|bytes| bytes.to_vec())
+                    };
+                    if response.replace((body, len)).is_some() {
+                        return Err(ChannelError::Transport(format!(
+                            "IMAP UID FETCH returned duplicate responses for selected UID {}",
+                            uid.get()
+                        )));
+                    }
+                }
+                response.ok_or_else(|| {
+                    ChannelError::Transport(format!(
+                        "IMAP UID FETCH did not return a response for selected UID {}; page rejected",
+                        uid.get()
+                    ))
+                })?
+            };
+
+            if body_len > allowed {
+                if allowed < self.max_message_bytes {
+                    break;
+                }
+                oversized.insert(uid.get());
+                processed.push(uid);
+                continue;
+            }
+            page_bytes += body_len;
+            fetched_raw.push((Some(uid.get()), body));
+            processed.push(uid);
+        }
 
         let _ = session.logout().await;
 
-        let emails = process_selected_page(uid_validity, &selected, fetched_raw, &self.host)?;
-        let next = next_progress(uid_validity, progress, &selected);
+        let emails = process_selected_page(
+            uid_validity,
+            &processed,
+            fetched_raw,
+            &oversized,
+            &self.host,
+        )?;
+        let next = next_progress(uid_validity, progress, &processed);
         Ok(ImapFetchPage {
             emails,
             next_progress: next,
         })
     }
+}
+
+struct ImapSizePlan {
+    selected: Vec<NonZeroU32>,
+    oversized: HashSet<u32>,
+}
+
+fn plan_size_page(
+    selected: &[NonZeroU32],
+    fetched_sizes: Vec<(Option<u32>, Option<u32>)>,
+    max_message_bytes: usize,
+    max_page_bytes: usize,
+) -> Result<ImapSizePlan, ChannelError> {
+    let mut by_uid = HashMap::new();
+    for (uid, size) in fetched_sizes {
+        let Some(uid) = uid.filter(|&uid| selected.iter().any(|selected| selected.get() == uid))
+        else {
+            continue;
+        };
+        if by_uid.insert(uid, size).is_some() {
+            return Err(ChannelError::Transport(format!(
+                "IMAP UID FETCH returned duplicate sizes for selected UID {uid}"
+            )));
+        }
+    }
+
+    let mut planned = Vec::new();
+    let mut oversized = HashSet::new();
+    let mut page_bytes = 0usize;
+    for &uid in selected {
+        let size = by_uid.remove(&uid.get()).flatten().ok_or_else(|| {
+            ChannelError::Transport(format!(
+                "IMAP UID FETCH did not return RFC822.SIZE for selected UID {}; page rejected",
+                uid.get()
+            ))
+        })? as usize;
+
+        if size > max_message_bytes {
+            oversized.insert(uid.get());
+        } else if size > max_page_bytes - page_bytes {
+            break;
+        } else {
+            page_bytes += size;
+        }
+        planned.push(uid);
+    }
+    Ok(ImapSizePlan {
+        selected: planned,
+        oversized,
+    })
 }
 
 /// Reject a missing or zero `UIDVALIDITY` before any search/fetch is issued.
@@ -463,16 +597,16 @@ fn next_progress(
     }
 }
 
-/// Validate a fully-fetched selected page and build the [`SelectedMessage`]
-/// list, in `selected_uids` order — exactly one entry per selected UID. A
-/// gap or duplicate fails the whole page (no partial advancement); a missing
-/// or unparseable body gets a durable `Malformed` disposition instead
-/// (khive #449) so the caller can quarantine it and advance past it.
+/// Validate a selected page and build the [`SelectedMessage`] list in UID order.
+/// Every UID needs either one body response or a size-based quarantine marker.
+/// A gap or duplicate body response fails the page (no partial advancement);
+/// a missing or unparseable body gets a durable `Malformed` disposition.
 /// See `crates/khive-channel-email/docs/api/imap-connector.md`.
 pub(crate) fn process_selected_page(
     uid_validity: NonZeroU32,
     selected_uids: &[NonZeroU32],
     fetched_raw: Vec<(Option<u32>, Option<Vec<u8>>)>,
+    oversized: &HashSet<u32>,
     host: &str,
 ) -> Result<Vec<SelectedMessage>, ChannelError> {
     let mut by_uid: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
@@ -495,6 +629,15 @@ pub(crate) fn process_selected_page(
     for &uid in selected_uids {
         let uid = uid.get();
         let imap_external_id = format!("imap:{host}:{}:{uid}", uid_validity.get());
+        if oversized.contains(&uid) {
+            result.push(SelectedMessage::Malformed {
+                uid,
+                imap_external_id,
+                reason: MalformedReason::TooLarge,
+                raw_bytes: None,
+            });
+            continue;
+        }
         let entry = by_uid.remove(&uid).ok_or_else(|| {
             ChannelError::Transport(format!(
                 "IMAP UID FETCH did not return a response for selected UID {uid}; \
@@ -691,8 +834,33 @@ pub struct ImapFetcher {
 impl ImapFetcher {
     /// Create a production fetcher using basic IMAP LOGIN credentials.
     pub fn new(host: impl Into<String>, port: u16, username: &str, password: &str) -> Self {
+        Self::new_with_limits(
+            host,
+            port,
+            username,
+            password,
+            DEFAULT_IMAP_MAX_MESSAGE_BYTES,
+            DEFAULT_IMAP_MAX_PAGE_BYTES,
+        )
+    }
+
+    pub(crate) fn new_with_limits(
+        host: impl Into<String>,
+        port: u16,
+        username: &str,
+        password: &str,
+        max_message_bytes: usize,
+        max_page_bytes: usize,
+    ) -> Self {
         Self {
-            inner: Arc::new(LiveImap::new(host, port, username, password)),
+            inner: Arc::new(LiveImap::new(
+                host,
+                port,
+                username,
+                password,
+                max_message_bytes,
+                max_page_bytes,
+            )),
             legacy_progress: tokio::sync::Mutex::new(ImapProgress::default()),
         }
     }
@@ -704,8 +872,33 @@ impl ImapFetcher {
         mailbox: impl Into<String>,
         token_provider: Arc<TokenProvider>,
     ) -> Self {
+        Self::new_oauth_with_limits(
+            host,
+            port,
+            mailbox,
+            token_provider,
+            DEFAULT_IMAP_MAX_MESSAGE_BYTES,
+            DEFAULT_IMAP_MAX_PAGE_BYTES,
+        )
+    }
+
+    pub(crate) fn new_oauth_with_limits(
+        host: impl Into<String>,
+        port: u16,
+        mailbox: impl Into<String>,
+        token_provider: Arc<TokenProvider>,
+        max_message_bytes: usize,
+        max_page_bytes: usize,
+    ) -> Self {
         Self {
-            inner: Arc::new(LiveImap::new_oauth(host, port, mailbox, token_provider)),
+            inner: Arc::new(LiveImap::new_oauth(
+                host,
+                port,
+                mailbox,
+                token_provider,
+                max_message_bytes,
+                max_page_bytes,
+            )),
             legacy_progress: tokio::sync::Mutex::new(ImapProgress::default()),
         }
     }
@@ -1251,8 +1444,14 @@ mod tests {
             (Some(2), Some(minimal_rfc822("b@example.com", "two"))),
             (Some(1), Some(minimal_rfc822("a@example.com", "one"))),
         ];
-        let emails =
-            process_selected_page(validity, &selected, fetched, "imap.example.com").unwrap();
+        let emails = process_selected_page(
+            validity,
+            &selected,
+            fetched,
+            &HashSet::new(),
+            "imap.example.com",
+        )
+        .unwrap();
         let uids: Vec<u32> = emails
             .iter()
             .map(|m| match m {
@@ -1268,6 +1467,88 @@ mod tests {
     }
 
     #[test]
+    fn size_preflight_skips_oversized_body_and_keeps_later_messages() {
+        let validity = NonZeroU32::new(7).unwrap();
+        let selected = (1..=3)
+            .map(|uid| NonZeroU32::new(uid).unwrap())
+            .collect::<Vec<_>>();
+        let plan = plan_size_page(
+            &selected,
+            vec![
+                (Some(3), Some(80)),
+                (Some(2), Some(201)),
+                (Some(1), Some(80)),
+            ],
+            200,
+            300,
+        )
+        .unwrap();
+        assert_eq!(plan.selected, selected);
+        let body_fetch_uids = plan
+            .selected
+            .iter()
+            .filter(|uid| !plan.oversized.contains(&uid.get()))
+            .map(|uid| uid.get())
+            .collect::<Vec<_>>();
+        assert_eq!(body_fetch_uids, vec![1, 3]);
+
+        let fetched = body_fetch_uids
+            .into_iter()
+            .map(|uid| {
+                (
+                    Some(uid),
+                    Some(minimal_rfc822("sender@example.com", "valid")),
+                )
+            })
+            .collect();
+        let messages = process_selected_page(
+            validity,
+            &plan.selected,
+            fetched,
+            &plan.oversized,
+            "imap.example.com",
+        )
+        .unwrap();
+        assert!(matches!(&messages[0], SelectedMessage::Email(email) if email.uid == 1));
+        assert!(matches!(
+            &messages[1],
+            SelectedMessage::Malformed {
+                uid: 2,
+                imap_external_id,
+                reason: MalformedReason::TooLarge,
+                raw_bytes: None,
+            } if imap_external_id == "imap:imap.example.com:7:2"
+        ));
+        assert!(matches!(&messages[2], SelectedMessage::Email(email) if email.uid == 3));
+        assert_eq!(
+            next_progress(validity, ImapProgress::default(), &plan.selected).last_seen_uid,
+            NonZeroU32::new(3),
+        );
+    }
+
+    #[test]
+    fn page_byte_budget_defers_a_uid_until_the_next_page() {
+        let validity = NonZeroU32::new(7).unwrap();
+        let selected = (1..=3)
+            .map(|uid| NonZeroU32::new(uid).unwrap())
+            .collect::<Vec<_>>();
+        let sizes = vec![
+            (Some(1), Some(80)),
+            (Some(2), Some(80)),
+            (Some(3), Some(80)),
+        ];
+        let first = plan_size_page(&selected, sizes.clone(), 100, 150).unwrap();
+        assert_eq!(first.selected.as_slice(), &selected[..1]);
+        let progress = next_progress(validity, ImapProgress::default(), &first.selected);
+        assert_eq!(progress.last_seen_uid, NonZeroU32::new(1));
+
+        let remaining = select_uid_page(vec![1, 2, 3], 3, validity, progress).unwrap();
+        let second = plan_size_page(&remaining, sizes, 100, 150).unwrap();
+        assert_eq!(second.selected.as_slice(), &remaining[..1]);
+        assert_eq!(second.selected[0].get(), 2);
+    }
+
+    #[test]
     fn strict_page_missing_body_quarantines_without_failing_page() {
         // UID 2 is present in the response but carries no RFC822 body -- must
         // get a durable Malformed disposition, not fail the whole page
@@ -1279,7 +1560,8 @@ mod tests {
             (Some(1), Some(minimal_rfc822("a@example.com", "one"))),
             (Some(2), None),
         ];
-        let result = process_selected_page(validity, &selected, missing_body, "h").unwrap();
+        let result =
+            process_selected_page(validity, &selected, missing_body, &HashSet::new(), "h").unwrap();
         assert_eq!(result.len(), 2, "both selected UIDs must get a disposition");
         assert!(
             matches!(&result[0], SelectedMessage::Email(e) if e.uid == 1),
@@ -1308,7 +1590,7 @@ mod tests {
         let selected = vec![NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap()];
         let missing_uid = vec![(Some(1), Some(minimal_rfc822("a@example.com", "one")))];
         assert!(
-            process_selected_page(validity, &selected, missing_uid, "h").is_err(),
+            process_selected_page(validity, &selected, missing_uid, &HashSet::new(), "h").is_err(),
             "a selected UID absent from the fetch response must fail the whole page"
         );
     }
@@ -1320,7 +1602,8 @@ mod tests {
         // Empty body — mail_parser returns None ("if no headers are found
         // None is returned").
         let fetched = vec![(Some(1), Some(Vec::new()))];
-        let result = process_selected_page(validity, &selected, fetched, "h").unwrap();
+        let result =
+            process_selected_page(validity, &selected, fetched, &HashSet::new(), "h").unwrap();
         assert_eq!(result.len(), 1);
         assert!(
             matches!(
@@ -1347,7 +1630,8 @@ mod tests {
             // not treated as part of the page.
             (Some(99), Some(minimal_rfc822("stray@example.com", "stray"))),
         ];
-        let emails = process_selected_page(validity, &selected, fetched, "h").unwrap();
+        let emails =
+            process_selected_page(validity, &selected, fetched, &HashSet::new(), "h").unwrap();
         assert_eq!(emails.len(), 1);
         assert!(matches!(&emails[0], SelectedMessage::Email(e) if e.uid == 1));
     }
@@ -1382,8 +1666,13 @@ mod tests {
                         )
                     })
                     .collect();
-                let emails =
-                    process_selected_page(self.validity, &selected, fetched, "mail.example.com")?;
+                let emails = process_selected_page(
+                    self.validity,
+                    &selected,
+                    fetched,
+                    &HashSet::new(),
+                    "mail.example.com",
+                )?;
                 let next = next_progress(self.validity, progress, &selected);
                 Ok(ImapFetchPage {
                     emails,
@@ -1428,7 +1717,8 @@ mod tests {
             (2u32..=51).map(|u| (Some(u), Some(minimal_rfc822("sender@example.com", "valid")))),
         );
 
-        let result = process_selected_page(validity, &selected, fetched, "h").unwrap();
+        let result =
+            process_selected_page(validity, &selected, fetched, &HashSet::new(), "h").unwrap();
         assert_eq!(result.len(), 51, "every selected UID gets a disposition");
 
         assert!(

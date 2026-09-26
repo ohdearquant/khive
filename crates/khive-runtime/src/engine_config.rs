@@ -11,7 +11,10 @@ use khive_types::{namespace::Namespace, SubstrateKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{config::BackendId, presentation::OutputFormat};
+use crate::{
+    config::{parse_embedding_model_alias, BackendId},
+    presentation::OutputFormat,
+};
 
 // ---- Error type ----
 
@@ -1498,11 +1501,9 @@ impl KhiveConfig {
     /// Checks:
     /// - Exactly one engine has `default = true` (when the list is non-empty).
     /// - Engine names are unique.
+    /// - Every engine model is recognized by the runtime's alias parser.
     /// - `fusion_weight`, when present, is finite and `> 0`, then rejected as
     ///   unsupported until the retrieval path actually consumes it.
-    ///
-    /// Model name validity is checked lazily at runtime (the config loader does
-    /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
@@ -1766,6 +1767,12 @@ impl KhiveConfig {
             if !seen_names.insert(engine.name.clone()) {
                 return Err(ConfigError::DuplicateName {
                     name: engine.name.clone(),
+                });
+            }
+            if parse_embedding_model_alias(&engine.model).is_none() {
+                return Err(ConfigError::UnknownModel {
+                    name: engine.name.clone(),
+                    model: engine.model.clone(),
                 });
             }
         }
@@ -2067,6 +2074,50 @@ default = true
         assert_eq!(cfg.engines[0].name, "x");
         assert_eq!(cfg.engines[0].model, "all-minilm-l6-v2");
         assert!(cfg.engines[0].default);
+    }
+
+    #[test]
+    fn test_unknown_engine_model_rejected_before_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            "[[engines]]\nname = \"primary\"\nmodel = \"not-a-model\"\ndefault = true\n",
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown primary model must fail");
+        assert!(
+            matches!(
+                config_error_root(&err),
+                ConfigError::UnknownModel { name, model }
+                    if name == "primary" && model == "not-a-model"
+            ),
+            "expected UnknownModel for the primary engine, got {err:?}"
+        );
+
+        let config: KhiveConfig = toml::from_str(
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n\n[[engines]]\nname = \"secondary\"\nmodel = \"not-a-model\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnknownModel { name, model })
+                if name == "secondary" && model == "not-a-model"
+        ));
+    }
+
+    #[test]
+    fn test_recognized_engine_model_validates_and_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        );
+        let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        config.validate().unwrap();
+        let runtime = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        assert_eq!(
+            runtime.embedding_model,
+            Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2)
+        );
     }
 
     #[test]
