@@ -1742,6 +1742,52 @@ async fn get_include_sections_returns_all_sections_ordered() {
 }
 
 #[tokio::test]
+async fn edit_same_body_persists_changed_section_type() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "section-type-refresh",
+            "name": "Section Type Refresh",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let body = "The same section body can move from an overview to an example when the author changes its role, while its content-addressed identity remains stable.";
+    let first = f
+        .dispatch(
+            "knowledge.edit",
+            json!({ "id": "section-type-refresh", "sections": [{
+                "section_type": "overview", "heading": "Shared heading", "content": body
+            }] }),
+        )
+        .await
+        .expect("create overview section");
+    let second = f
+        .dispatch(
+            "knowledge.edit",
+            json!({ "id": "section-type-refresh", "sections": [{
+                "section_type": "examples", "heading": "Shared heading", "content": body
+            }] }),
+        )
+        .await
+        .expect("change section type without changing body");
+
+    assert_eq!(first["sections"][0]["id"], second["sections"][0]["id"]);
+    assert_eq!(second["sections"][0]["section_type"], "examples");
+    let stored = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "section-type-refresh", "include_sections": true }),
+        )
+        .await
+        .expect("read section after edit");
+    assert_eq!(stored["sections"][0]["section_type"], "examples");
+}
+
+#[tokio::test]
 async fn get_include_sections_by_uuid() {
     let f = pack(rt());
     f.dispatch(
@@ -5171,6 +5217,71 @@ mod kg_blend {
     const OVERLAP_CONTENT: &str = "kv cache paging decode attention retrieval augmented \
         generation dense sparse benchmark corpus latency gradient descent transformer vector \
         index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+
+    async fn section_embedding_head(rt: &KhiveRuntime, section_id: &str) -> [f32; 2] {
+        let mut reader = rt.sql().reader().await.expect("section embedding reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT embedding FROM knowledge_sections WHERE id = ?1".into(),
+                params: vec![SqlValue::Text(section_id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("section embedding query")
+            .expect("section row");
+        let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
+            panic!("section must have an inline embedding: {row:?}");
+        };
+        assert!(bytes.len() >= 8, "section embedding has two dimensions");
+        [
+            f32::from_le_bytes(bytes[0..4].try_into().expect("first dimension")),
+            f32::from_le_bytes(bytes[4..8].try_into().expect("second dimension")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn edit_same_body_changed_heading_refreshes_section_embedding() {
+        let rt = rt_with_marker_embedder();
+        let f = pack(rt.clone());
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{
+                "slug": "heading-vector-refresh",
+                "name": "Heading Vector Refresh",
+                "content": OVERLAP_CONTENT
+            }] }),
+        )
+        .await
+        .expect("upsert atom");
+
+        let body = "The section body stays byte identical across edits so its content hash and section identity remain unchanged while the heading changes the embedding input.";
+        let first = f
+            .dispatch(
+                "knowledge.edit",
+                json!({ "id": "heading-vector-refresh", "sections": [{
+                    "section_type": "overview", "heading": "Plain heading", "content": body
+                }] }),
+            )
+            .await
+            .expect("create section with plain heading");
+        let section_id = first["sections"][0]["id"]
+            .as_str()
+            .expect("section id")
+            .to_string();
+        assert_eq!(section_embedding_head(&rt, &section_id).await, [0.0, 1.0]);
+
+        let second = f
+            .dispatch(
+                "knowledge.edit",
+                json!({ "id": "heading-vector-refresh", "sections": [{
+                    "section_type": "overview", "heading": format!("{MARKER} heading"), "content": body
+                }] }),
+            )
+            .await
+            .expect("change heading without changing section body");
+        assert_eq!(second["sections"][0]["id"], section_id);
+        assert_eq!(section_embedding_head(&rt, &section_id).await, [1.0, 0.0]);
+    }
 
     async fn seed_domain_and_atom(f: &Fixture) -> String {
         f.dispatch(
