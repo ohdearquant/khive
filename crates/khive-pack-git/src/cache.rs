@@ -1917,9 +1917,10 @@ fn touch(repo_dir: &Path) -> Result<(), CacheError> {
 }
 
 /// Recursive directory size, following no symlinks. Tolerant of a
-/// *descendant* disappearing mid-walk (contributes 0 bytes); the walk
-/// **root** itself vanishing is NOT tolerated and surfaces as
-/// `CacheError::Io(NotFound)`. See
+/// *descendant* disappearing mid-walk (contributes 0 bytes), or a Windows
+/// delete-pending descendant whose metadata stays inaccessible after the
+/// bounded recheck. The walk **root** itself vanishing or becoming
+/// inaccessible is NOT tolerated. See
 /// crates/khive-pack-git/docs/api/cache.md#dir_size.
 fn dir_size(path: &Path) -> Result<u64, CacheError> {
     dir_size_with(
@@ -1930,15 +1931,16 @@ fn dir_size(path: &Path) -> Result<u64, CacheError> {
     )
 }
 
-// A brief cleanup grace period, not evidence that an unreadable file vanished.
-// Windows delete-pending handles have no guaranteed release deadline. Four
-// rechecks at 10 ms bound this grace at 40 ms; persistent denial still fails.
+// A brief cleanup grace period before a denied descendant metadata probe is
+// skipped. Windows delete-pending handles have no guaranteed release deadline.
+// Four rechecks at 10 ms bound this grace at 40 ms.
 const DIR_SIZE_DENIED_RETRIES: usize = 4;
 const DIR_SIZE_DENIED_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn dir_size_io<T>(
     is_root: bool,
     retry_denied: bool,
+    skip_denied: bool,
     mut operation: impl FnMut() -> std::io::Result<T>,
     wait: &mut impl FnMut(),
 ) -> std::io::Result<Option<T>> {
@@ -1958,6 +1960,14 @@ fn dir_size_io<T>(
                 retries += 1;
                 wait();
             }
+            Err(error)
+                if retry_denied
+                    && skip_denied
+                    && !is_root
+                    && error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1975,15 +1985,20 @@ fn dir_size_with(
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
         let is_root = p == path;
-        let Some(md) = dir_size_io(is_root, retry_denied, || stat(&p), &mut wait)
+        let Some(md) = dir_size_io(is_root, retry_denied, true, || stat(&p), &mut wait)
             .map_err(|error| io_err("dir_size: stat", &p, error))?
         else {
             continue;
         };
         if md.is_dir() {
-            let Some(read_dir) =
-                dir_size_io(is_root, retry_denied, || std::fs::read_dir(&p), &mut wait)
-                    .map_err(|error| io_err("dir_size: read_dir", &p, error))?
+            let Some(read_dir) = dir_size_io(
+                is_root,
+                retry_denied,
+                false,
+                || std::fs::read_dir(&p),
+                &mut wait,
+            )
+            .map_err(|error| io_err("dir_size: read_dir", &p, error))?
             else {
                 continue;
             };
