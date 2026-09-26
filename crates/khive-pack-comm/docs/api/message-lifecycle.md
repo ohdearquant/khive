@@ -637,6 +637,12 @@ caller-supplied `channel_kind`, `channel_slug`, or `quarantined`. The internal
 `comm.ingest` subhandler remains their only supported writer; ordinary custom
 message metadata is unaffected.
 
+When a quarantined inbound message carries `quarantine_content_ref`, ingest
+commits a `quarantine-original` note attachment with that same reference in the
+note's transaction. This attachment is the blob sweep's liveness root; metadata
+alone does not own stored bytes. A duplicate transport id repairs a missing
+legacy attachment only when its stored reference matches the replayed bytes.
+
 ## Message-ID / References header helpers (#403)
 
 - `message_id_match_candidates`: outbound mail stores its Message-ID in wire

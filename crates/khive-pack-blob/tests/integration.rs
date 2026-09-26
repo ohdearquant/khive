@@ -18,6 +18,8 @@ struct BoundedOnlyBlobStore {
     bytes: Vec<u8>,
     content_ref: ContentRef,
     bounded_calls: AtomicUsize,
+    entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    release: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl BoundedOnlyBlobStore {
@@ -27,7 +29,20 @@ impl BoundedOnlyBlobStore {
             bytes,
             content_ref,
             bounded_calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
         }
+    }
+
+    fn gated(
+        bytes: Vec<u8>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        let mut store = Self::new(bytes);
+        store.entered = Some(entered);
+        store.release = Some(release);
+        store
     }
 }
 
@@ -44,7 +59,14 @@ impl BlobStore for BoundedOnlyBlobStore {
     ) -> StorageResult<Vec<u8>> {
         self.bounded_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(content_ref, &self.content_ref);
-        assert_eq!(max_bytes, khive_storage::MAX_BLOB_WHOLE_BYTES);
+        assert_eq!(max_bytes, self.bytes.len() as u64);
+        if let Some(entered) = &self.entered {
+            entered.send(()).expect("test receiver remains open");
+        }
+        if let Some(release) = &self.release {
+            let permit = release.acquire().await.expect("test gate remains open");
+            permit.forget();
+        }
         Ok(self.bytes.clone())
     }
 
@@ -162,6 +184,61 @@ async fn get_uses_the_runtime_hydrator_instead_of_unbounded_store_get() {
         bytes
     );
     assert_eq!(store.bounded_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn five_small_blob_gets_enter_hydration_without_serializing_on_budget() {
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Arc::new(BoundedOnlyBlobStore::gated(
+        b"small hydration".to_vec(),
+        entered_tx,
+        Arc::clone(&release),
+    ));
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    runtime
+        .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+        .expect("install blob store");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(BlobPack::new(runtime));
+    let registry = Arc::new(builder.build().expect("registry builds"));
+    let mut requests = Vec::new();
+    for _ in 0..5 {
+        let registry = Arc::clone(&registry);
+        let reference = store.content_ref.to_string();
+        requests.push(tokio::spawn(async move {
+            registry
+                .dispatch("blob.get", serde_json::json!({"content_ref": reference}))
+                .await
+        }));
+    }
+
+    let mut entered = 0;
+    for _ in 0..5 {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            entered += 1;
+        } else {
+            break;
+        }
+    }
+    // Release held store reads before asserting, so a failing old admission
+    // policy does not strand a tracked hydration task after the test panics.
+    release.add_permits(5);
+    for request in requests {
+        request
+            .await
+            .expect("request task")
+            .expect("blob.get succeeds");
+    }
+    assert_eq!(
+        entered, 5,
+        "all five tiny reads must pass byte admission together"
+    );
 }
 
 #[tokio::test]
