@@ -33,7 +33,11 @@ The adapter requires `KHIVE_TELEGRAM_BOT_TOKEN` and a numeric
   never redirected to the maintainer.
 - Bot API 408, 429, and 5xx responses are transient delivery failures. Other 4xx responses are
   permanent for the individual outbound note. The shared outbox loop durably backs off transient
-  failures and terminally records permanent ones.
+  failures and terminally records permanent ones. A 429 carrying `retry_after` also pauses the
+  Telegram outbound pass until that interval has elapsed.
+- Outbound Telegram delivery is at-least-once. `sendMessage` has no idempotency key or receiver-side
+  deduplication: if Telegram accepts a send but its response is lost, or the daemon stops before
+  recording delivery, the pending note can be sent again and appear twice in the chat.
 - Bot tokens must not appear in diagnostics. `TelegramChannelConfig` has a manual `Debug`
   implementation that masks the token, and connector errors remove request URLs containing it.
 - `poll` uses Telegram's offset watermark and ignores its timestamp argument. A fetched batch only
