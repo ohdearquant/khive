@@ -62,9 +62,10 @@ exclude = ["khive-merge"]
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
-# lattice-embed and lattice-fann require Rust 1.93, setting the workspace MSRV.
+# The locked libsqlite3-sys build script uses `cfg_select!`, which Rust 1.93 rejects as
+# unstable; the workspace MSRV is the CI toolchain, 1.95.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).
-rust-version = "1.93.0"
+rust-version = "1.95.0"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/khive"

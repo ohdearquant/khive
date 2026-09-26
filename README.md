@@ -367,7 +367,7 @@ cd crates && cargo test --workspace
 make ci  # Full CI: fmt, clippy, test, build
 ```
 
-Prerequisites: Rust 1.93+ (workspace MSRV) (via [rustup](https://rustup.rs)),
+Prerequisites: Rust 1.95+ (workspace MSRV) (via [rustup](https://rustup.rs)),
 Deno 2.x (for the TypeScript CLI layer, optional)
 
 - Node.js 20+ and pnpm (for frontend, optional)
