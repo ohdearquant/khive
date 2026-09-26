@@ -344,7 +344,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 // MAINTENANCE, deliberately kept out of the description: ADR-081.
-                description: "Scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+                description: "Scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id and an implicit signal. The feedback target and profile must match the serve row.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -352,7 +352,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 // MAINTENANCE, deliberately kept out of the description: ADR-081.
-                description: "Id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+                description: "Id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id and an implicit signal; binds the feedback target and profile, backfills the row's grade, and gates dedup.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -413,7 +413,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 // MAINTENANCE, deliberately kept out of the description: ADR-081.
-                description: "Forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+                description: "Forwarded to brain.feedback. Must be supplied together with serve_ledger_id and an implicit signal.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -421,7 +421,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 // MAINTENANCE, deliberately kept out of the description: ADR-081.
-                description: "Forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
+                description: "Forwarded to brain.feedback. Must be supplied together with scorer_run_id and an implicit signal; the selected target and profile must match the serve row.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -742,6 +742,12 @@ impl BrainPack {
             .snapshot_serializations
             .load(std::sync::atomic::Ordering::Relaxed);
         drop(state);
+        let cold_hook_signals_dropped = self
+            .persistence
+            .lock()
+            .unwrap()
+            .pending_hook_signals_dropped();
+        let contended_hook_signals_dropped = self.hook_queue.dropped();
         let mut value = serde_json::to_value(&snapshot)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         // Beside the state rather than inside it: the snapshot is the persisted
@@ -753,6 +759,8 @@ impl BrainPack {
                 serde_json::json!({
                     "signals_applied": signals_applied,
                     "snapshot_serializations": snapshot_serializations,
+                    "cold_hook_signals_dropped": cold_hook_signals_dropped,
+                    "contended_hook_signals_dropped": contended_hook_signals_dropped,
                 }),
             );
         }
@@ -1491,6 +1499,16 @@ impl BrainPack {
             },
             ENTITY_CACHE_CAPACITY,
             move |state: &mut khive_brain_core::BrainState| -> Result<Value, RuntimeError> {
+                if profile_id == "balanced-recall-v1"
+                    && matches!(
+                        &lifecycle,
+                        ProfileLifecycle::Inactive | ProfileLifecycle::Archived
+                    )
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "balanced-recall-v1 is the required default profile and cannot be deactivated or archived".into(),
+                    ));
+                }
                 let record = state
                     .profiles
                     .get_mut(&profile_id)
@@ -1654,6 +1672,23 @@ impl BrainPack {
         }
     }
 
+    fn validate_feedback_serving_profile(&self, profile_id: &str) -> Result<(), RuntimeError> {
+        let state = self.state.lock().unwrap();
+        match state.profiles.get(profile_id) {
+            None => Err(RuntimeError::NotFound(format!(
+                "serving profile {:?} not found in profile registry",
+                profile_id
+            ))),
+            Some(rec) if rec.lifecycle == khive_brain_core::ProfileLifecycle::Archived => {
+                Err(RuntimeError::InvalidInput(format!(
+                    "serving profile {:?} is archived; feedback cannot credit archived profiles",
+                    profile_id
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
     // ── brain.feedback ────────────────────────────────────────────────────
 
     pub(crate) async fn handle_feedback(
@@ -1735,6 +1770,15 @@ impl BrainPack {
             FeedbackEventKind::from_signal_str(signal),
             Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
         );
+        // ADR-081 §3 maps scorer grades to implicit signals. The explicit
+        // persistence path does not claim a scorer dedup key atomically, so
+        // reject scorer provenance there rather than allowing duplicate folds.
+        if p.scorer_run_id.is_some() && !is_gated_implicit {
+            return Err(RuntimeError::InvalidInput(
+                "scorer_run_id and serve_ledger_id require implicit_positive or implicit_negative"
+                    .to_string(),
+            ));
+        }
 
         // Caller identity and serve attribution are separate: omitting the
         // profile may resolve a shared default, but cannot authorize an
@@ -1823,26 +1867,10 @@ impl BrainPack {
             crate::validate_section_signals(ss)?;
         }
 
-        // Validate every profile selected by the normal resolver before any
-        // ledger fast path. A later null accounting profile may suppress its
-        // mutation, but must not turn an invalid explicit id into a valid call.
-        if let Some(effective_profile) = effective_profile.as_deref() {
-            let state = self.state.lock().unwrap();
-            match state.profiles.get(effective_profile) {
-                None => {
-                    return Err(RuntimeError::NotFound(format!(
-                        "serving profile {:?} not found in profile registry",
-                        effective_profile
-                    )));
-                }
-                Some(rec) if rec.lifecycle == khive_brain_core::ProfileLifecycle::Archived => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "serving profile {:?} is archived; feedback cannot credit archived profiles",
-                        effective_profile
-                    )));
-                }
-                Some(_) => {}
-            }
+        // A null ledger accounting key may suppress a fold, but it cannot
+        // make an invalid caller-resolved profile a valid request.
+        if let Some(profile_id) = effective_profile.as_deref() {
+            self.validate_feedback_serving_profile(profile_id)?;
         }
 
         let sql = self.runtime.sql();
@@ -1855,50 +1883,73 @@ impl BrainPack {
         if let (Some(scorer_run_id), Some(serve_ledger_id)) =
             (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
         {
-            match crate::serve_ledger::resolve(sql.as_ref(), serve_ledger_id, scorer_run_id).await?
-            {
-                crate::serve_ledger::ServeLedgerResolution::AlreadyGraded => {
-                    return Ok(json!({
-                        "emitted": false,
-                        "deduped": true,
-                        "verb": "brain.feedback",
-                        "signal": signal,
-                        "target_id": target.to_string(),
-                        "serve_ledger_id": serve_ledger_id,
-                        "scorer_run_id": scorer_run_id,
-                        "served_by_profile_id": effective_profile.as_deref(),
-                        "serve_attribution": serve_attribution,
-                    }));
-                }
-                crate::serve_ledger::ServeLedgerResolution::NotFound => {
-                    return Err(RuntimeError::NotFound(format!(
-                        "serve_ledger_id {:?} not found",
-                        serve_ledger_id
-                    )));
-                }
-                crate::serve_ledger::ServeLedgerResolution::Proceed {
-                    accounting_profile_id,
-                    serve_attribution: ledger_attribution,
-                } => {
-                    // ADR-081 §4 fail-safe: an implicit event whose serve row has
-                    // no resolvable profile is recorded at zero weight — never
-                    // folded under a guessed profile. The stored tri-state marker
-                    // preserves the one exception: a row stamped `unspecified`
-                    // (no profile was ever selected at serve time) keeps the
-                    // legacy binding/default fallback already resolved above,
-                    // instead of being forced to zero like a genuine
-                    // `unattributed` (failed profile read) or a legacy row with
-                    // no stored marker at all.
-                    if accounting_profile_id.is_none()
-                        && ledger_attribution != Some(ServeAttribution::Unspecified)
-                    {
-                        forced_zero_weight = true;
-                        effective_profile = None;
-                        profile_resolution = "serve_ledger_unattributed";
-                        serve_attribution = ServeAttribution::Unattributed;
+            let (already_graded, accounting_profile_id, ledger_attribution) =
+                match crate::serve_ledger::resolve(
+                    sql.as_ref(),
+                    serve_ledger_id,
+                    scorer_run_id,
+                    token.namespace().as_str(),
+                    &target.to_string(),
+                    p.served_by_profile_id.as_deref(),
+                )
+                .await?
+                {
+                    crate::serve_ledger::ServeLedgerResolution::NotFound => {
+                        return Err(RuntimeError::NotFound(format!(
+                            "serve_ledger_id {:?} not found",
+                            serve_ledger_id
+                        )));
                     }
+                    crate::serve_ledger::ServeLedgerResolution::Found {
+                        already_graded,
+                        accounting_profile_id,
+                        serve_attribution: ledger_attribution,
+                    } => (already_graded, accounting_profile_id, ledger_attribution),
+                };
+
+            if let Some(accounting_profile_id) = accounting_profile_id {
+                if serve_attribution == ServeAttribution::Unattributed {
+                    return Err(RuntimeError::InvalidInput(
+                        "serve_attribution=\"unattributed\" conflicts with the serve ledger accounting_profile_id"
+                            .to_string(),
+                    ));
                 }
+                // The serve row owns the accounting key. A caller's
+                // binding/default may differ from the profile that
+                // actually served this target.
+                effective_profile = Some(accounting_profile_id);
+                profile_resolution = "serve_ledger";
+                serve_attribution = ServeAttribution::Profile;
+                forced_zero_weight = false;
+            } else if ledger_attribution != Some(ServeAttribution::Unspecified) {
+                // ADR-081 §4 fail-safe: only a row stamped `unspecified`
+                // permits legacy binding/default fallback. A null accounting
+                // profile otherwise records the implicit event at zero weight.
+                forced_zero_weight = true;
+                effective_profile = None;
+                profile_resolution = "serve_ledger_unattributed";
+                serve_attribution = ServeAttribution::Unattributed;
             }
+
+            if already_graded {
+                return Ok(json!({
+                    "emitted": false,
+                    "deduped": true,
+                    "verb": "brain.feedback",
+                    "signal": signal,
+                    "target_id": target.to_string(),
+                    "serve_ledger_id": serve_ledger_id,
+                    "scorer_run_id": scorer_run_id,
+                    "served_by_profile_id": effective_profile.as_deref(),
+                    "serve_attribution": serve_attribution,
+                }));
+            }
+        }
+
+        // Validate the profile that will actually receive the fold, after the
+        // ledger has supplied its authoritative accounting_profile_id.
+        if let Some(profile_id) = effective_profile.as_deref() {
+            self.validate_feedback_serving_profile(profile_id)?;
         }
 
         if effective_profile.is_none() && !is_gated_implicit {
@@ -3563,23 +3614,25 @@ impl DispatchHook for BrainPack {
         if view.event.verb.starts_with("brain.") {
             return;
         }
-
-        let _gate = self.dispatch_gate.lock().await;
-
         let signal = interpret(&view.event);
+        if matches!(signal, khive_brain_core::BrainSignal::Irrelevant) {
+            return;
+        }
 
-        // Route the signal to the state bucket that owns view.event.namespace.
-        // Namespace residency never loses an otherwise-applicable signal: cold
-        // and saved namespaces are handled inside PersistenceTracker; only the
-        // active slot is applied through the shared BrainState here.
-        let target = {
-            let mut tracker = self.persistence.lock().unwrap();
-            tracker.route_signal(&view.event.namespace, &signal, ENTITY_CACHE_CAPACITY)
-        };
-
-        if matches!(target, crate::persist::ApplyTarget::ActiveSlot) {
-            let mut state = self.state.lock().unwrap();
-            crate::apply_dispatch_signal(&mut state, &signal);
+        // The gate is held over whole brain handlers to prevent cross-namespace
+        // slot swaps. A normal verb must never wait behind one of those handlers.
+        // A contended signal keeps its namespace and serving attribution in a
+        // bounded handoff; the worker later routes it under the same gate.
+        match self.dispatch_gate.try_lock() {
+            Ok(_gate) if !self.hook_queue.worker_running() => {
+                self.apply_hook_signal(&view.event.namespace, &signal);
+            }
+            Ok(_gate) => {
+                self.defer_hook_signal(view.event.namespace.clone(), signal);
+            }
+            Err(_) => {
+                self.defer_hook_signal(view.event.namespace.clone(), signal);
+            }
         }
     }
 }
@@ -3640,6 +3693,14 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         let _gate = self.dispatch_gate.lock().await;
 
         self.ensure_loaded(token).await?;
+
+        // A contended post-dispatch hook may have elected its background
+        // worker while this dispatch was waiting for the gate. If we win the
+        // gate first, apply that queued evidence before the handler observes
+        // state. The worker remains elected and will drain later arrivals.
+        for (namespace, signal) in self.hook_queue.drain_pending() {
+            self.apply_hook_signal(&namespace, &signal);
+        }
 
         // In test builds, fire the interleaving hook (if any) between
         // ensure_loaded returning and the handler acquiring self.state.

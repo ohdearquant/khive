@@ -50,6 +50,10 @@ use khive_brain_core::{
     validate_brain_state_snapshot_with_capacity, BrainSignal, BrainState, BrainStateSnapshot,
 };
 
+/// Hook signals have no durable replay guarantee. A cold namespace retains
+/// only its most recent useful signals until its first brain verb loads it.
+pub(crate) const MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE: usize = 256;
+
 use crate::event::interpret;
 
 const SNAPSHOT_PROFILE_ID: &str = "__brain__";
@@ -92,6 +96,9 @@ pub struct PersistenceTracker {
     /// signals are pending; that prevents `ensure_loaded` from skipping the DB
     /// round-trip for a namespace that may have existing persisted history.
     pending_hook_signals: HashMap<String, Vec<BrainSignal>>,
+    /// Process-local count of useful cold-namespace signals discarded when a
+    /// namespace's pending queue reached its ceiling.
+    pending_hook_signals_dropped: u64,
 }
 
 impl Default for PersistenceTracker {
@@ -111,6 +118,7 @@ impl PersistenceTracker {
             dirty_counts: HashMap::new(),
             snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
             pending_hook_signals: HashMap::new(),
+            pending_hook_signals_dropped: 0,
         }
     }
 
@@ -187,27 +195,34 @@ impl PersistenceTracker {
             .map(|signals| signals.len() as u64)
     }
 
+    pub(crate) fn pending_hook_signals_dropped(&self) -> u64 {
+        self.pending_hook_signals_dropped
+    }
+
     /// Apply a signal to the state bucket that owns `namespace`.
     ///
     /// - Active namespace: returns `ApplyTarget::ActiveSlot` — caller must apply
     ///   the signal to the shared `BrainState` lock while holding the dispatch gate.
     /// - Saved (loaded) namespace: applies directly to `saved_states` and returns
     ///   `ApplyTarget::Done`.
-    /// - Cold/unknown namespace: enqueues the signal in `pending_hook_signals` and
-    ///   returns `ApplyTarget::Done`.  The namespace is NOT marked loaded; the DB
-    ///   round-trip is preserved for the first `ensure_loaded` call.  The queue is
-    ///   drained by `ensure_loaded` *after* snapshot restore and event replay, so
-    ///   the ordering guarantee is: snapshot → replayed events → queued signals.
+    /// - Cold/unknown namespace: enqueues a useful signal in the bounded
+    ///   `pending_hook_signals` queue and returns `ApplyTarget::Done`. The
+    ///   namespace is NOT marked loaded; the DB round-trip is preserved for
+    ///   the first `ensure_loaded` call. The queue is drained *after* snapshot
+    ///   restore and event replay, so retained signals land afterward.
     ///
-    /// Namespace residency never drops an otherwise-applicable signal; the
-    /// attribution policy may still intentionally reject an unattributed or
-    /// unavailable-profile signal after it reaches the owning state bucket.
+    /// `Irrelevant` is discarded. On cold-queue overflow, the oldest useful
+    /// signal is dropped and counted; attribution policy may independently
+    /// reject an unattributed or unavailable-profile signal after routing.
     pub(crate) fn route_signal(
         &mut self,
         namespace: &str,
         signal: &khive_brain_core::BrainSignal,
         entity_capacity: usize,
     ) -> ApplyTarget {
+        if matches!(signal, BrainSignal::Irrelevant) {
+            return ApplyTarget::Done;
+        }
         if self.is_active(namespace) {
             return ApplyTarget::ActiveSlot;
         }
@@ -225,10 +240,15 @@ impl PersistenceTracker {
         // Do NOT mark the namespace loaded — ensure_loaded must still perform
         // the DB snapshot + event-replay before draining this queue.
         let _ = entity_capacity;
-        self.pending_hook_signals
+        let pending = self
+            .pending_hook_signals
             .entry(namespace.to_string())
-            .or_default()
-            .push(signal.clone());
+            .or_default();
+        if pending.len() == MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE {
+            pending.remove(0);
+            self.pending_hook_signals_dropped = self.pending_hook_signals_dropped.saturating_add(1);
+        }
+        pending.push(signal.clone());
         ApplyTarget::Done
     }
 
@@ -250,6 +270,42 @@ pub(crate) enum ApplyTarget {
     ActiveSlot,
     /// Signal was applied inside `PersistenceTracker`; caller has nothing left to do.
     Done,
+}
+
+#[cfg(test)]
+mod pending_hook_signal_tests {
+    use super::{PersistenceTracker, MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE};
+    use khive_brain_core::BrainSignal;
+
+    #[test]
+    fn cold_namespace_drops_irrelevant_and_keeps_recent_bounded_signals() {
+        let mut tracker = PersistenceTracker::new();
+        tracker.route_signal("cold", &BrainSignal::Irrelevant, 10);
+        assert!(!tracker.pending_hook_signals.contains_key("cold"));
+
+        for sequence in 0..MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE + 3 {
+            tracker.route_signal(
+                "cold",
+                &BrainSignal::SearchCompleted {
+                    latency_us: sequence as i64,
+                },
+                10,
+            );
+        }
+        let pending = tracker.drain_pending_signals("cold");
+        assert_eq!(pending.len(), MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE);
+        assert_eq!(tracker.pending_hook_signals_dropped(), 3);
+        assert!(matches!(
+            pending.first(),
+            Some(BrainSignal::SearchCompleted { latency_us: 3 })
+        ));
+        assert!(matches!(
+            pending.last(),
+            Some(BrainSignal::SearchCompleted { latency_us })
+                if *latency_us == (MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE + 2) as i64
+        ));
+        assert!(!tracker.is_loaded("cold"));
+    }
 }
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {

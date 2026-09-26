@@ -469,6 +469,7 @@ mod tests {
         let restored = BalancedRecallState::from_snapshot(legacy, capacity);
 
         assert_eq!(restored.entity_posteriors.len(), capacity);
+        assert_eq!(restored.entity_posteriors.order(), ids[..capacity].to_vec());
         for id in ids.iter().take(capacity) {
             assert!(
                 restored.entity_posteriors.get(id).is_some(),

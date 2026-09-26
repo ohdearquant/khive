@@ -23,6 +23,7 @@ chrono = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
