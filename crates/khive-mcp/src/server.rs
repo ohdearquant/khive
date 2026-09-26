@@ -3162,9 +3162,9 @@ async fn dispatch_via_coordinator_inner(
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
-                        // entity_kind/note_kind), `name`, and `created_at`.
-                        // Ranking fields use the same conversion as the KG path;
-                        // the metadata below retains this route's existing shape.
+                        // entity_kind/note_kind), `name`, `created_at`, `updated_at`,
+                        // and `version`. Shared KG rank conversion also adds
+                        // `score`, `rank_score`, `rank_score_kind`, and `signals`.
                         let result_val = if request.substrate() == SearchSubstrate::Note {
                             let items: Vec<Value> = coord_result
                                 .note_hits

@@ -70,6 +70,13 @@ jobs:
           cargo test -p khive-mcp --features bench-embedder bench_embedder 2>&1 | tee "$RUNNER_TEMP/bench_embedder.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/bench_embedder.log" 1
 
+      - name: Test real retrieval search shapes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p khive-mcp --features bench-embedder --lib real_retrieval 2>&1 | tee "$RUNNER_TEMP/real_retrieval.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/real_retrieval.log" 1
+
       # Build the bench binary (bench-embedder injects FNV-1a, no lattice model download)
       - name: Build kkernel (bench-embedder feature)
         run: |

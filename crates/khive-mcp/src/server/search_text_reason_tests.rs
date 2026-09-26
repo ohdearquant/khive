@@ -38,6 +38,36 @@ mod search_text_reason_tests {
         }
     }
 
+    fn same_hits_except_keyword_rounding(raw: &Value, mcp: &Value) {
+        let raw_hits = raw.as_array().expect("raw pack hit array");
+        let mut normalized_mcp = mcp.clone();
+        let mcp_hits = normalized_mcp.as_array_mut().expect("MCP hit array");
+        assert_eq!(mcp_hits.len(), raw_hits.len(), "MCP hit count changed");
+        for (index, (raw_hit, mcp_hit)) in raw_hits.iter().zip(mcp_hits).enumerate() {
+            match (
+                raw_hit.pointer("/signals/keyword_score"),
+                mcp_hit.pointer("/signals/keyword_score"),
+            ) {
+                (Some(raw_score), Some(mcp_score)) => {
+                    let raw_number = raw_score.as_f64().expect("numeric raw keyword score");
+                    let mcp_number = mcp_score.as_f64().expect("numeric MCP keyword score");
+                    assert!(raw_number.is_finite() && raw_number >= 0.0, "raw keyword score {index} must be finite and nonnegative");
+                    assert!(mcp_number.is_finite() && mcp_number >= 0.0, "MCP keyword score {index} must be finite and nonnegative");
+                    // These are independent FTS searches. BM25 normalization can round
+                    // its f64 evidence by one ULP; every other hit field remains exact.
+                    assert!(
+                        raw_number.to_bits().abs_diff(mcp_number.to_bits()) <= 1,
+                        "keyword score {index} changed beyond one ULP: raw={raw_number:?}, MCP={mcp_number:?}"
+                    );
+                    *mcp_hit.pointer_mut("/signals/keyword_score").expect("MCP keyword score") = raw_score.clone();
+                }
+                (None, None) => {}
+                _ => panic!("keyword score {index} presence changed"),
+            }
+        }
+        assert_eq!(&normalized_mcp, raw, "complete canonical hit array changed outside keyword rounding");
+    }
+
     #[test]
     fn serializer_condition_matrix() {
         let statuses = [
@@ -83,7 +113,7 @@ mod search_text_reason_tests {
         assert_eq!(entry["ok"], true);
         assert_eq!(entry["tool"], "search");
         assert_eq!(entry["status"], "complete");
-        assert_eq!(entry["result"], raw, "complete canonical hit array must remain unchanged");
+        same_hits_except_keyword_rounding(&raw, &entry["result"]);
         assert!(entry.get("partial").is_none());
         assert!(entry.get("backend_errors").is_none());
         assert!(entry.get("error").is_none());
@@ -232,6 +262,7 @@ mod search_text_reason_tests {
         use khive_runtime::EmbedderProvider;
         use khive_storage::{TextFilter, TextQueryMode, TextSearchRequest};
         use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::collections::BTreeSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct LocalEmbeddingService { dimensions: usize, calls: Arc<AtomicUsize> }
@@ -335,7 +366,57 @@ mod search_text_reason_tests {
                     assert!(hit["score"].as_f64().expect("numeric score") > 0.0);
                     assert!(hit["created_at"].is_string());
                     assert!(hit["snippet"].is_string());
-                    assert_eq!(hit.as_object().expect("hit object").len(), 9);
+                    let expected_keys = BTreeSet::from([
+                        "created_at",
+                        "entity_kind",
+                        "id",
+                        "kind",
+                        "name",
+                        "rank_score",
+                        "rank_score_kind",
+                        "score",
+                        "signals",
+                        "snippet",
+                        "source",
+                        "title",
+                        "updated_at",
+                        "version",
+                    ]);
+                    let actual_keys = hit
+                        .as_object()
+                        .expect("hit object")
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>();
+                    let missing_keys = expected_keys
+                        .difference(&actual_keys)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let extra_keys = actual_keys
+                        .difference(&expected_keys)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual_keys,
+                        expected_keys,
+                        "{query}: entity hit keys mismatch; missing: {missing_keys:?}; extra: {extra_keys:?}"
+                    );
+                    assert!(
+                        hit["updated_at"].is_string() || hit["updated_at"].is_null(),
+                        "{query}: updated_at must be a string or null"
+                    );
+                    assert!(
+                        hit["version"].as_i64().is_some() || hit["version"].is_null(),
+                        "{query}: version must be an integer or null"
+                    );
+                    assert_eq!(hit["score"], hit["rank_score"]);
+                    assert!(hit["rank_score_kind"].is_string());
+                    assert!(hit["signals"].is_object());
+                    assert_eq!(
+                        hit["signals"].get("keyword_score").is_some(),
+                        sources[index] == "both",
+                        "{query}: lexical score presence at hit {index}"
+                    );
                 }
                 legacy_arms(&arms, "ran", text_count, "ran", 3);
                 eprintln!("T5 legacy query={query:?}, text={text_count}, vector=3, hits={raw}");
