@@ -44,7 +44,7 @@ Chain parsing does not resolve references; it only represents them. The dispatch
 
 ## JSON form
 
-JSON form accepts one object or a non-empty array of objects. Every entry requires a string `tool`; `args` is optional and defaults to `{}`, but when present must be an object.
+JSON form accepts one object or a non-empty array of objects. Every entry requires a string `tool`; `args` is optional and defaults to `{}`, but when present must be an object. The only allowed entry keys are `tool` and `args`; unknown keys are rejected as `InvalidJson` so a misspelled `args` cannot silently run an operation with defaults.
 
 JSON form never represents a chain. The parser recursively rejects string values that are `$prev`, begin with `$prev.`, or begin with `$prev[`, even inside nested arrays and objects. Callers that need substitution must use function-call chain form.
 

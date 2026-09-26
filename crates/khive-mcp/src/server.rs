@@ -3960,6 +3960,7 @@ impl KhiveMcpServer {
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        validate_request_overrides(&p, parsed.ops.len())?;
         #[cfg(unix)]
         let replay_read_only = !parsed.ops.is_empty()
             && parsed
@@ -4027,7 +4028,7 @@ impl KhiveMcpServer {
             // actually left on the REQUEST's own deadline, not by a fresh
             // full ceiling starting from whenever cancellation happens to
             // arrive. Also propagated into the spawned task itself
-            // (`inherit_request_read_context`) so `try_forward_inner`'s
+            // (`inherit_request_read_context`) so the forwarding path's
             // socket-exchange deadline is this exact same instant, instead
             // of a second, independently-ticking relative timer.
             let post_cancellation_deadline = khive_storage::capture_request_read_context()
@@ -4676,6 +4677,7 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         policy: ParsedDispatchPolicy,
     ) -> Result<String, McpError> {
+        validate_request_overrides(&p, parsed.ops.len())?;
         let ParsedDispatchPolicy {
             strict_refusals,
             max_batch_concurrency,
@@ -4931,6 +4933,41 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
             "unknown output format {other:?}; valid values: \"json\", \"auto\", \"table\""
         )),
     }
+}
+
+/// Validate envelope presentation/format overrides before daemon framing and
+/// before local dispatch. A surplus per-op array is never meaningful and can
+/// otherwise make a valid request exceed the daemon's frame budget.
+fn validate_request_overrides(p: &RequestParams, op_count: usize) -> Result<(), McpError> {
+    parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
+    parse_output_format(p.format.as_deref()).map_err(invalid_request_error)?;
+    if let Some(entries) = &p.presentation_per_op {
+        if entries.len() > op_count {
+            return Err(invalid_request_error(format!(
+                "presentation_per_op has {} entries for {op_count} operations",
+                entries.len()
+            )));
+        }
+        for entry in entries {
+            if let Some(value) = entry.as_deref() {
+                parse_presentation_mode(Some(value)).map_err(invalid_request_error)?;
+            }
+        }
+    }
+    if let Some(entries) = &p.format_per_op {
+        if entries.len() > op_count {
+            return Err(invalid_request_error(format!(
+                "format_per_op has {} entries for {op_count} operations",
+                entries.len()
+            )));
+        }
+        for entry in entries {
+            if let Some(value) = entry.as_deref() {
+                parse_output_format(Some(value)).map_err(invalid_request_error)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Registered policies and per-operation content scopes used during rendering.
@@ -5622,6 +5659,33 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    fn per_op_overrides_are_bounded_and_validated_before_forwarding() {
+        let mut p = RequestParams {
+            ops: "stats()".into(),
+            presentation_per_op: Some(vec![None, None]),
+            ..Default::default()
+        };
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("presentation_per_op"));
+
+        p.presentation_per_op = Some(vec![Some("bogus".into())]);
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("unknown presentation mode"));
+
+        p.presentation_per_op = None;
+        p.format_per_op = Some(vec![None, None]);
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("format_per_op"));
+
+        p.format_per_op = Some(vec![Some("bogus".into())]);
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("unknown output format"));
+
+        p.format_per_op = Some(vec![Some("table".into())]);
+        super::validate_request_overrides(&p, 1).unwrap();
+    }
+
+    #[test]
     fn remember_key_named_disposition_preserves_details_and_other_errors() {
         let id = uuid::Uuid::new_v4().to_string();
         let key = "k".repeat(512);
@@ -6064,8 +6128,10 @@ mod tests {
                     "comm.mark_read(ids=[\"00000000-0000-0000-0000-000000000001\"], atomic=true)",
                     false,
                 ),
-                ("search(kind=\"entity\", query=\"policy-fixture\")", true),
-                ("memory.recall(query=\"policy-fixture\")", true),
+                // These assertive reads append fresh durable search/serve
+                // records, so transport cannot replay them after a lost reply.
+                ("search(kind=\"entity\", query=\"policy-fixture\")", false),
+                ("memory.recall(query=\"policy-fixture\")", false),
                 ("get(id=\"00000000-0000-0000-0000-000000000001\")", true),
             ];
 
