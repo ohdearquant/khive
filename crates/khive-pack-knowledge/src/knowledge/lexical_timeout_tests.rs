@@ -102,8 +102,9 @@ impl Subscriber for TimeoutEvents {
     fn event(&self, event: &Event<'_>) {
         let mut fields = Fields::default();
         event.record(&mut fields);
-        if fields.0.contains_key("stage_elapsed_ms") {
-            fields.0.remove("message");
+        if event.metadata().level() == &tracing::Level::WARN
+            && fields.0.contains_key("stage_elapsed_ms")
+        {
             self.0
                 .lock()
                 .expect("events lock")
@@ -173,6 +174,11 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
         let mut logged = events.0.lock().unwrap().clone();
         assert_eq!(logged.len(), 1, "{label}");
         let mut logged = logged.remove(0);
+        let message = logged
+            .as_object_mut()
+            .expect("event is an object")
+            .remove("message");
+        assert_eq!(message, Some(json!("lexical read timed out")), "{label}");
         let completed = logged
             .as_object_mut()
             .expect("event is an object")
@@ -314,6 +320,41 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
         };
         assert_eq!(response, expected, "empty-timeout response: {verb}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn flagged_lexical_timeout_emits_one_log_record_from_the_same_dispatch() {
+    let runtime = fixture(false).await;
+    let registry = registry(&runtime);
+    let args = json!({"query": "unrelated", "rerank": false});
+
+    let healthy_events = TimeoutEvents::default();
+    let healthy = registry
+        .dispatch("knowledge.search", args.clone())
+        .with_subscriber(healthy_events.clone())
+        .await
+        .expect("healthy public dispatch");
+    assert!(healthy["degraded"]["lexical_timeout"].is_null());
+    assert!(healthy_events.0.lock().unwrap().is_empty());
+
+    let timeout_events = TimeoutEvents::default();
+    let response = with_timeout(
+        vec![LexicalPhase::PhaseBHydration],
+        Duration::from_millis(11),
+        registry.dispatch("knowledge.search", args),
+    )
+    .with_subscriber(timeout_events.clone())
+    .await
+    .expect("timed-out public dispatch");
+    assert_eq!(response["degraded"]["lexical_timeout"], true);
+    assert!(response["degraded"]
+        .get("lexical_timeout_details")
+        .is_none());
+
+    let events = timeout_events.0.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["message"], "lexical read timed out");
+    assert_eq!(events[0]["phase"], "phase_b_hydration");
 }
 
 #[tokio::test(start_paused = true)]
