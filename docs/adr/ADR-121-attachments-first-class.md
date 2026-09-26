@@ -831,12 +831,13 @@ documented maintenance window makes a removal safe at this commit.
      to every record publication and re-creation path, including paths that call no attachment or blob writer, over
      the population Amendment 2 item 1 defines, and a planted record-only replay must fail it.
 
-   That design carries its own acceptance, showing that none of the five situations above can remove a row whose record
-   exists or will exist. If it bounds how many rows one pass may remove, the bound refuses an oversized set before
+   That design carries its own acceptance, showing that none of the five situations above can remove a row while its
+   record exists or while a pending publication could expose a body using that row; a later re-creation of the same id
+   must satisfy (c). If it bounds how many rows one pass may remove, the bound refuses an oversized set before
    deleting anything. A pass interrupted after it starts deleting may have committed a prefix, and the next pass starts
    from a fresh observation, never from an earlier list.
 
-   Nothing is paid forward toward removal. The report writes nothing, starts no grace period and marks no row. There is
+   The report writes nothing, starts no grace period and marks no row. There is
    no pending-removal state, nothing is scheduled, and no time is promised by which a row will be removed or its blob
    reclaimed.
 
