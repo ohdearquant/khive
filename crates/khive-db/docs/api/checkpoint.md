@@ -260,6 +260,41 @@ incomplete progress is not counted as SQLite busy. Counters are process-lifetime
 coherently read under one registry lock, and saturate rather than wrap. This adds
 observation only; checkpoint order, scheduling and escalation thresholds are unchanged.
 
+## Oldest pinned frame in `db_diagnostics`
+
+The report's top-level `backfill_ceiling` is the `checkpointed_frames` value from its
+own `checkpoint_probe` row when `busy` is zero and the non-negative checkpointed frame
+count is below the non-negative `log_frames` count. `oldest_pinned_frame` is that same
+ceiling only when the per-backend checkpoint run is at the same frame and began at least
+one second earlier. The probe's `backfill_gap_frames()` is only the one-row
+`log_frames - checkpointed_frames` difference; it does not establish a pin.
+The report's `pin_depth` is `log_frames - oldest_pinned_frame` from that same
+probe row, and is null with a reason unless `oldest_pinned_frame` is available.
+The report also carries `oldest_pinned_frame_run` with
+`frame` and `first_observed_at_unix_ms` when that condition holds. Each nullable field
+has a sibling `*_unavailable_reason`; probe errors, nonzero `busy`, negative frame
+counts, a fully backfilled WAL, a missing checkpoint task, a different run frame, and a
+run younger than one second remain distinguishable.
+
+The run ends after a failed checkpoint, a fully backfilled row, or any informative row that
+does not continue the same frame with a non-decreasing `log_frames` value. A `busy=1`
+row is neutral regardless of its other columns: it neither extends nor ends the run.
+The next `busy=0` row is compared against the last informative row. If busy rows intervened
+and more than two configured checkpoint intervals elapsed since that row, the old run
+ends before the next result is applied. The scheduled
+PASSIVE row, the TRUNCATE row and its post-attempt PASSIVE probes, the top-level WAL
+checkpoint operation, and each `db_diagnostics` probe feed the same backend-scoped run.
+A process without a scheduled checkpoint task reports that no task is present. This is
+one current run per backend, not a history of samples.
+The TRUNCATE no-progress WARN logs `backfill_gap_frames`, not a reader pin depth.
+
+Under `wal_pin`, `reporting_pid` and `reporting_process_is_holder` identify whether the
+process assembling the report appears in the OS holder census. `census_process_start_times`
+contains one entry for every confirmed holder, including its raw `process_start_time_secs`
+or a reason when the operating system cannot provide it. `start_time_resolution_secs` is
+one second on macOS and Windows, two seconds on Linux, and null where start times are not
+available. These values are reported as census data; they do not remove or rank holders.
+
 ## `run_checkpoint_task` — shutdown design history
 
 See `crates/khive-db/src/checkpoint.rs` — `run_checkpoint_task`.
