@@ -705,6 +705,14 @@ pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPin
 /// a boot/schema probe cannot make a hot path look like it churned readers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReaderContentionDiagnostics {
+    /// Reader connections requested in this pool's configuration. The
+    /// effective admission capacity below can be smaller in degraded mode.
+    pub configured_reader_cap: usize,
+    /// Configured wait for a reader slot, in milliseconds.
+    pub configured_checkout_timeout_ms: u64,
+    /// Configured SQLite busy-handler wait, in milliseconds. This is separate
+    /// from the reader-slot checkout deadline.
+    pub configured_busy_timeout_ms: u64,
     /// Configured total reader admission budget shared by pooled readers and
     /// explicit raw-SQL read transactions.
     pub reader_admission_capacity: usize,
@@ -748,6 +756,13 @@ impl ReaderContentionDiagnostics {
     fn snapshot(pool: &ConnectionPool) -> Self {
         let reader = pool.reader_acquisition_snapshot();
         Self {
+            configured_reader_cap: pool.config().max_readers,
+            configured_checkout_timeout_ms: u64::try_from(
+                pool.config().checkout_timeout.as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            configured_busy_timeout_ms: u64::try_from(pool.config().busy_timeout.as_millis())
+                .unwrap_or(u64::MAX),
             reader_admission_capacity: reader.reader_admission_capacity,
             available_reader_admission_slots: reader.available_reader_admission_slots,
             reader_acquisitions: reader.acquisitions,
@@ -2533,6 +2548,13 @@ mod tests {
         assert_eq!(
             report.reader_contention,
             ReaderContentionDiagnostics {
+                configured_reader_cap: pool.config().max_readers,
+                configured_checkout_timeout_ms: u64::try_from(
+                    pool.config().checkout_timeout.as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+                configured_busy_timeout_ms: u64::try_from(pool.config().busy_timeout.as_millis())
+                    .unwrap_or(u64::MAX),
                 reader_admission_capacity,
                 available_reader_admission_slots: reader_admission_capacity,
                 reader_acquisitions: 0,
@@ -2649,6 +2671,38 @@ mod tests {
             json.pointer("/reader_contention/max_completed_reader_hold_micros")
                 .is_some(),
             "the operator wire payload must expose completed hold-time evidence"
+        );
+    }
+
+    #[test]
+    fn diagnostics_reports_configured_reader_budget_and_both_deadlines() {
+        let pool = ConnectionPool::new(PoolConfig {
+            max_readers: 6,
+            checkout_timeout: Duration::from_millis(17),
+            busy_timeout: Duration::from_millis(31),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool");
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+        );
+        let reader = report.reader_contention;
+        assert_eq!(reader.reader_admission_capacity, 1);
+
+        let json = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(
+            json.pointer("/reader_contention/configured_reader_cap"),
+            Some(&serde_json::json!(6))
+        );
+        assert_eq!(
+            json.pointer("/reader_contention/configured_checkout_timeout_ms"),
+            Some(&serde_json::json!(17))
+        );
+        assert_eq!(
+            json.pointer("/reader_contention/configured_busy_timeout_ms"),
+            Some(&serde_json::json!(31))
         );
     }
 
