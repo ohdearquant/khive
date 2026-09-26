@@ -670,7 +670,7 @@ async fn entity_deleted_event_count(
 }
 
 #[tokio::test]
-async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
+async fn routed_delete_reports_failed_event_append_without_repeating_committed_delete() {
     for explicit_kind in [false, true] {
         let fixture = Fixture::new();
         fixture.ingest().await;
@@ -703,10 +703,17 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
             .registry
             .dispatch("delete", request.clone())
             .await
-            .expect_err("the event write failure is returned after the row delete commits");
-        assert!(first
-            .to_string()
-            .contains("entity deletion event write failed"));
+            .expect("the committed delete reports the post-commit event failure");
+        assert_eq!(first["deleted"], true);
+        assert_eq!(first["id"], entity.id.to_string());
+        let degradations = first["post_commit_degradations"]
+            .as_array()
+            .expect("post-commit degradation list");
+        assert_eq!(degradations.len(), 1, "{first}");
+        assert_eq!(degradations[0]["stage"], "event_append");
+        assert!(degradations[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("entity deletion event write failed")));
         assert!(fixture
             .routed
             .entities(&token)
@@ -720,7 +727,7 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
             entity_deleted_event_count(&fixture.routed, &token, entity.id).await,
             0
         );
-        assert_eq!(
+        assert!(
             fixture
                 .main
                 .attachments()
@@ -728,9 +735,8 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
                 .list_attachments(entity.id)
                 .await
                 .unwrap()
-                .len(),
-            1,
-            "the first error occurs before routed cleanup removes the core root"
+                .is_empty(),
+            "routed cleanup still removes the core root after the committed delete"
         );
         {
             let writer = fixture.routed_backend.pool().try_writer().unwrap();
@@ -744,17 +750,13 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
             .registry
             .dispatch("delete", request)
             .await
-            .expect("retry cleans the remaining core attachment");
-        let index_entries_gone = !entity_is_indexed(&fixture.routed, &token, entity.id).await;
-        let deleted_events = entity_deleted_event_count(&fixture.routed, &token, entity.id).await;
-        assert!(
-            retry["deleted"] != json!(true) || (index_entries_gone && deleted_events == 1),
-            "retry must not claim deletion completed unless indexes are gone and exactly one deletion event exists"
+            .expect_err("retry cannot claim a second deletion of the absent row");
+        assert!(matches!(retry, khive_runtime::RuntimeError::NotFound(_)));
+        assert!(!entity_is_indexed(&fixture.routed, &token, entity.id).await);
+        assert_eq!(
+            entity_deleted_event_count(&fixture.routed, &token, entity.id).await,
+            0
         );
-        assert_eq!(retry["deleted"], false);
-        assert_eq!(retry["attachment_cleanup"], true);
-        assert!(index_entries_gone);
-        assert_eq!(deleted_events, 0);
         assert!(fixture
             .main
             .attachments()

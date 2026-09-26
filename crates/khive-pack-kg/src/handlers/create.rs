@@ -952,14 +952,15 @@ impl KgPack {
             None
         };
 
-        let (mut response, new_id, embedding_input_truncated) = match p.kind.as_str() {
+        let (mut response, new_id, embedding_input_truncated, degradations) = match p.kind.as_str()
+        {
             "entity" => {
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.expect("entity fields validated during preparation");
                 let tags = p.tags.unwrap_or_default();
-                let (entity, embedding_report) = self
+                let (entity, embedding_report, degradations) = self
                     .runtime
-                    .create_entity_with_embedding_report(
+                    .create_entity_with_post_commit_report(
                         token,
                         &canonical,
                         p.entity_type.as_deref(),
@@ -976,7 +977,12 @@ impl KgPack {
                         obj.insert("entity_type_normalized".to_string(), applied);
                     }
                 }
-                (entity_json, id, embedding_report.any_truncated())
+                (
+                    entity_json,
+                    id,
+                    embedding_report.any_truncated(),
+                    degradations,
+                )
             }
             "note" => {
                 let canonical = sub_kind
@@ -1015,9 +1021,10 @@ impl KgPack {
                             },
                         )
                         .await
+                        .map(|(note, report)| (note, report, Vec::new()))
                 } else {
                     self.runtime
-                        .create_note_with_embedding_content_and_report(
+                        .create_note_with_embedding_content_and_post_commit_report(
                             token,
                             &canonical,
                             p.name.as_deref(),
@@ -1029,7 +1036,7 @@ impl KgPack {
                         )
                         .await
                 };
-                let (note, embedding_report) = match result {
+                let (note, embedding_report, degradations) = match result {
                     Ok(pair) => pair,
                     Err(RuntimeError::Khive(error))
                         if error.details().and_then(|details| details.get("reason"))
@@ -1084,7 +1091,12 @@ impl KgPack {
                         obj.insert("created".to_string(), json!(true));
                     }
                 }
-                (note_json, id, embedding_report.any_truncated())
+                (
+                    note_json,
+                    id,
+                    embedding_report.any_truncated(),
+                    degradations,
+                )
             }
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -1094,6 +1106,9 @@ impl KgPack {
         };
 
         add_embedding_truncation_warning(&mut response, embedding_input_truncated);
+        if !degradations.is_empty() {
+            response["post_commit_degradations"] = json!(degradations);
+        }
 
         if let Some(ref h) = hook {
             if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {

@@ -1983,22 +1983,6 @@ impl KhiveRuntime {
         Ok(report)
     }
 
-    /// Remove an entity from FTS5 and vector indexes across all registered models.
-    pub(crate) async fn remove_from_indexes(
-        &self,
-        token: &NamespaceToken,
-        id: Uuid,
-    ) -> RuntimeResult<()> {
-        let ns = token.namespace().as_str().to_owned();
-        self.text(token)?.delete_document(&ns, id).await?;
-        for model_name in self.registered_embedding_model_names() {
-            self.vectors_for_model(token, &model_name)?
-                .delete(id)
-                .await?;
-        }
-        Ok(())
-    }
-
     /// Re-upsert FTS5 document and vector(s) for the note across all registered models.
     ///
     /// Best-effort for vectors: mirrors reindex_entity's warn-and-continue policy.
