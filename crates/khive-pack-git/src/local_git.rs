@@ -837,6 +837,14 @@ fn update_branch_sync(
     let reference = branch_ref(branch)?;
     let marker = receipt_marker(receipt_id)?;
     require_direct_ref(program, repo, &reference)?;
+    if new == expected && !reflog_write_support_sync(program, repo)?.1 {
+        // A no-op CAS writes no reflog entry. Refuse before even that CAS if
+        // this Git cannot record the separate receipt marker afterward.
+        return Err(LocalGitError::new(
+            "unsupported_toolchain",
+            "Git does not advertise reflog write",
+        ));
+    }
     // A symref installed after inspection must never redirect the ref-store write.
     run_git(
         program,
@@ -855,6 +863,19 @@ fn update_branch_sync(
         None,
         true,
     )?;
+    if new == expected {
+        // Git accepts a compare-and-swap to the current head without writing
+        // a reflog entry. Keep the receipt observable for reconciliation even
+        // when the successful operation leaves the ref unchanged.
+        run_git(
+            program,
+            repo,
+            &["reflog", "write", &reference, new, new, &marker],
+            None,
+            None,
+            false,
+        )?;
+    }
     Ok(())
 }
 
@@ -1207,26 +1228,30 @@ pub(crate) async fn record_push_marker(
     .await
 }
 
+fn reflog_write_support_sync(program: &Path, repo: &Path) -> Result<(String, bool)> {
+    let version = run_git(program, repo, &["--version"], None, None, false)?;
+    let version = String::from_utf8(version)
+        .map_err(|_| LocalGitError::new("git_output", "invalid Git version"))?;
+    let help = run_git_output(
+        program,
+        repo,
+        &["reflog", "-h"],
+        None,
+        None,
+        false,
+        Some(129),
+    )?;
+    Ok((
+        version.trim().to_owned(),
+        String::from_utf8_lossy(&help.stdout).contains("git reflog write "),
+    ))
+}
+
 pub(crate) async fn push_marker_support(program: &Path, repo: &Path) -> Result<(String, bool)> {
     let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     blocking("reflog", false, move || {
-        let version = run_git(&program, &repo, &["--version"], None, None, false)?;
-        let version = String::from_utf8(version)
-            .map_err(|_| LocalGitError::new("git_output", "invalid Git version"))?;
-        let help = run_git_output(
-            &program,
-            &repo,
-            &["reflog", "-h"],
-            None,
-            None,
-            false,
-            Some(129),
-        )?;
-        Ok((
-            version.trim().to_owned(),
-            String::from_utf8_lossy(&help.stdout).contains("git reflog write "),
-        ))
+        reflog_write_support_sync(&program, &repo)
     })
     .await
 }
