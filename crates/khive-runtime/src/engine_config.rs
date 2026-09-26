@@ -1533,13 +1533,36 @@ impl KhiveConfig {
                 });
             }
         }
-        if let (Some(d), Some(m)) = (self.exec.timeout_default_s, self.exec.timeout_max_s) {
-            if d > m {
+        // These defaults must agree with the exec pack's resolved defaults.
+        // Validate the effective pair, including one-sided overrides, before
+        // Duration conversion or a deadline can panic in exec.run.
+        let default_timeout = self.exec.timeout_default_s.unwrap_or(30.0);
+        let maximum_timeout = self.exec.timeout_max_s.unwrap_or(600.0);
+        for (key, value) in [
+            ("timeout_default_s", default_timeout),
+            ("timeout_max_s", maximum_timeout),
+        ] {
+            let duration = value
+                .is_finite()
+                .then(|| std::time::Duration::try_from_secs_f64(value).ok())
+                .flatten()
+                .filter(|duration| !duration.is_zero());
+            if duration
+                .is_none_or(|duration| std::time::Instant::now().checked_add(duration).is_none())
+            {
                 return Err(ConfigError::InvalidExecConfig {
-                    key: "timeout_default_s".to_string(),
-                    reason: format!("default {d} exceeds timeout_max_s {m}"),
+                    key: key.to_string(),
+                    reason: "must be positive, finite, and representable as a deadline".to_string(),
                 });
             }
+        }
+        if default_timeout > maximum_timeout {
+            return Err(ConfigError::InvalidExecConfig {
+                key: "timeout_default_s".to_string(),
+                reason: format!(
+                    "default {default_timeout} exceeds timeout_max_s {maximum_timeout}"
+                ),
+            });
         }
 
         if let Some(value) = self.runtime.blob_hydration_bytes {
@@ -1872,6 +1895,36 @@ fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_timeouts_validate_effective_values_and_deadlines() {
+        let mut config = KhiveConfig::default();
+        config.exec.timeout_default_s = Some(900.0);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
+        ));
+
+        config.exec.timeout_default_s = None;
+        config.exec.timeout_max_s = Some(1.0);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
+        ));
+
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            config.exec.timeout_max_s = None;
+            config.exec.timeout_default_s = Some(invalid);
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
+            ));
+        }
+
+        config.exec.timeout_default_s = None;
+        config.exec.timeout_max_s = Some(600.0);
+        config.validate().expect("valid resolved exec bounds");
+    }
 
     #[test]
     fn web_partial_ceiling_config_rejects_incoherent_effective_bounds_at_load() {

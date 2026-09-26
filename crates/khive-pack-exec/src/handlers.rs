@@ -4,13 +4,16 @@
 //! receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -23,6 +26,8 @@ use crate::capture::{drain, walk, Tail};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
+
+const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -48,7 +53,7 @@ fn opt_limit(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, R
         None | Some(Value::Null) => Ok(default),
         Some(v) => v
             .as_u64()
-            .map(|n| (n as u32).clamp(1, max))
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
             .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a positive integer"))),
     }
 }
@@ -462,6 +467,14 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
             cfg.timeout_max_s
         )));
     }
+    let timeout = Duration::try_from_secs_f64(timeout_s)
+        .ok()
+        .filter(|duration| !duration.is_zero() && Instant::now().checked_add(*duration).is_some())
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "timeout_s must be positive, finite, and representable as a deadline".into(),
+            )
+        })?;
     let session_id = opt_str(params, "session_id")?.filter(|s| !s.is_empty());
     let declared = opt_str_list(params, "declared_write_paths")?;
     if let Some(list) = &declared {
@@ -476,7 +489,7 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
         actor,
         cwd,
         env,
-        timeout: Duration::from_secs_f64(timeout_s),
+        timeout,
         session_id,
         declared,
     })
@@ -502,6 +515,20 @@ fn tool_binary(entity: &khive_storage::Entity) -> Result<String, RuntimeError> {
             entity.name
         ))),
     }
+}
+
+fn hash_tool_binary(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn refusal_error(reason: &str, id: &str, effective_max_output_bytes: u64) -> RuntimeError {
@@ -596,10 +623,52 @@ pub async fn run(
 
 /// What preflight hands to execution once every refusal rule passed.
 struct Ready {
-    binary: PathBuf,
+    binary_digest: String,
     registered: String,
     registry_id: Uuid,
     entries: Vec<TreeEntry>,
+    input_sizes: BTreeMap<String, u64>,
+}
+
+fn checked_input_total(total: u64, next: u64, ceiling: u64) -> Result<u64, String> {
+    total
+        .checked_add(next)
+        .filter(|sum| *sum <= ceiling)
+        .ok_or_else(|| format!("input tree exceeds {ceiling} bytes"))
+}
+
+async fn preflight_input_sizes(
+    rt: &KhiveRuntime,
+    entries: &[TreeEntry],
+) -> Result<BTreeMap<String, u64>, String> {
+    let store = tree::blob_store(rt).map_err(|error| error.to_string())?;
+    let mut sizes = BTreeMap::new();
+    let mut total = 0_u64;
+    for entry in entries {
+        let size = if let Some(size) = sizes.get(&entry.content_ref) {
+            *size
+        } else {
+            let reference = ContentRef::from_hex(&entry.content_ref)
+                .map_err(|error| format!("entry {:?} ref: {error}", entry.path))?;
+            let size = store
+                .size(&reference)
+                .await
+                .map_err(|error| format!("input blob {}: {error}", entry.content_ref))?
+                .ok_or_else(|| format!("entry {:?} references a missing blob", entry.path))?;
+            if size > khive_storage::MAX_BLOB_WHOLE_BYTES {
+                return Err(format!(
+                    "entry {:?} exceeds the per-blob hydration limit",
+                    entry.path
+                ));
+            }
+            sizes.insert(entry.content_ref.clone(), size);
+            size
+        };
+        // Count materialized entries, not just distinct references: two
+        // paths sharing a blob still occupy bytes twice in the run tree.
+        total = checked_input_total(total, size, MAX_RUN_INPUT_BYTES)?;
+    }
+    Ok(sizes)
 }
 
 fn preflight_registry_pin(entity: &khive_storage::Entity) -> Result<RegistryPin, RuntimeError> {
@@ -659,6 +728,10 @@ async fn preflight(
     // Binary identity (Amendment 1 item 8) before policy: a forbidden binary
     // is refused whatever the policy says.
     let binary = check_binary(&registered, &cfg.never).map_err(|e| e.to_string())?;
+    let binary_digest = tokio::task::spawn_blocking(move || hash_tool_binary(&binary))
+        .await
+        .map_err(|error| format!("reading registered tool for digest: {error}"))?
+        .map_err(|error| format!("reading registered tool for digest: {error}"))?;
     receipt.argv = std::iter::once(registered.clone())
         .chain(req.args.iter().cloned())
         .collect();
@@ -682,9 +755,7 @@ async fn preflight(
     let entries = tree::load(rt, &req.tree_in)
         .await
         .map_err(|e| format!("tree: {e}"))?;
-    tree::verify_blobs(rt, &entries)
-        .await
-        .map_err(|e| format!("tree: {e}"))?;
+    let input_sizes = preflight_input_sizes(rt, &entries).await?;
     let cwd = tree::resolve_cwd(rt, &entries, &req.cwd)
         .await
         .map_err(|e| e.to_string())?;
@@ -694,13 +765,119 @@ async fn preflight(
     // materializing a tree that could only ever fail at spawn.
     sandbox::check_backend(sandbox::SANDBOX_EXEC)?;
     Ok(Ready {
-        binary,
+        binary_digest,
         registered,
         registry_id: entity.id,
         entries,
+        input_sizes,
     })
 }
 
+#[cfg(unix)]
+struct PartialRunDir<'a> {
+    path: &'a Path,
+    complete: bool,
+}
+
+#[cfg(unix)]
+impl Drop for PartialRunDir<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = std::fs::remove_dir_all(self.path);
+        }
+    }
+}
+
+/// Hydrate only the entry being written. Its admission lease stays held
+/// through the write, then drops before the next blob is requested.
+#[cfg(unix)]
+async fn materialize_hydrated(
+    rt: &KhiveRuntime,
+    run_dir: &Path,
+    entries: &[TreeEntry],
+    input_sizes: &BTreeMap<String, u64>,
+) -> Result<(), RuntimeError> {
+    let hydrator = rt
+        .blob_hydrator()
+        .ok_or_else(|| RuntimeError::Unconfigured("exec blob hydrator is not installed".into()))?;
+    std::fs::create_dir(run_dir).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "creating run directory {}: {error}",
+            run_dir.display()
+        ))
+    })?;
+    let mut partial = PartialRunDir {
+        path: run_dir,
+        complete: false,
+    };
+
+    // A manifest cannot name a file as another entry's parent. Create all
+    // regular files before links so filesystem aliases cannot redirect a
+    // later materialization write.
+    for entry in entries.iter().filter(|entry| entry.mode != 120000) {
+        let target = run_dir.join(&entry.path);
+        let reference = ContentRef::from_hex(&entry.content_ref).map_err(|error| {
+            RuntimeError::InvalidInput(format!("entry {:?} ref: {error}", entry.path))
+        })?;
+        let size = *input_sizes.get(&entry.content_ref).ok_or_else(|| {
+            RuntimeError::Internal(format!("input size missing for entry {:?}", entry.path))
+        })?;
+        let blob = hydrator.hydrate_verified(&reference, size).await?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                RuntimeError::Unconfigured(format!(
+                    "creating input directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .await
+            .map_err(|error| {
+                RuntimeError::Unconfigured(format!("creating input {:?}: {error}", entry.path))
+            })?;
+        file.write_all(blob.bytes()).await.map_err(|error| {
+            RuntimeError::Unconfigured(format!("writing input {:?}: {error}", entry.path))
+        })?;
+        let mode = if entry.mode == 755 { 0o755 } else { 0o644 };
+        tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|error| {
+                RuntimeError::Unconfigured(format!("setting input mode {:?}: {error}", entry.path))
+            })?;
+    }
+    for entry in entries.iter().filter(|entry| entry.mode == 120000) {
+        let target = run_dir.join(&entry.path);
+        let reference = ContentRef::from_hex(&entry.content_ref).map_err(|error| {
+            RuntimeError::InvalidInput(format!("entry {:?} ref: {error}", entry.path))
+        })?;
+        let size = *input_sizes.get(&entry.content_ref).ok_or_else(|| {
+            RuntimeError::Internal(format!("input size missing for entry {:?}", entry.path))
+        })?;
+        let blob = hydrator.hydrate_verified(&reference, size).await?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                RuntimeError::Unconfigured(format!(
+                    "creating input directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(blob.bytes()), &target).map_err(
+            |error| {
+                RuntimeError::Unconfigured(format!("creating input link {:?}: {error}", entry.path))
+            },
+        )?;
+    }
+    partial.complete = true;
+    Ok(())
+}
+
+#[cfg(test)]
 fn materialize(
     run_dir: &Path,
     entries: &[TreeEntry],
@@ -716,6 +893,7 @@ fn materialize(
     result
 }
 
+#[cfg(test)]
 fn materialize_entries(
     run_dir: &Path,
     entries: &[TreeEntry],
@@ -810,21 +988,6 @@ async fn execute(
     receipt: &mut Receipt,
 ) -> Result<(), RuntimeError> {
     let store = tree::blob_store(rt)?;
-    // Hydrate every input blob before creating the run directory so a store
-    // failure leaves no directory behind.
-    let mut bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for entry in &ready.entries {
-        if bytes.contains_key(&entry.content_ref) {
-            continue;
-        }
-        let content_ref = ContentRef::from_hex(&entry.content_ref)
-            .map_err(|e| RuntimeError::InvalidInput(format!("entry {:?} ref: {e}", entry.path)))?;
-        let data = store
-            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
-            .await?;
-        bytes.insert(entry.content_ref.clone(), data);
-    }
-
     std::fs::create_dir_all(&cfg.root).map_err(|e| {
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
@@ -832,7 +995,8 @@ async fn execute(
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
     let run_dir = root.join(&receipt.id);
-    if let Err(error) = materialize(&run_dir, &ready.entries, &bytes) {
+    if let Err(error) = materialize_hydrated(rt, &run_dir, &ready.entries, &ready.input_sizes).await
+    {
         receipt.success = false;
         receipt.reason = Some(format!("materialize {}: {error}", run_dir.display()));
         receipt.finished_at = Some(receipts::now_micros());
@@ -856,10 +1020,9 @@ async fn execute(
     std::fs::write(&profile_path, &profile).map_err(|e| {
         RuntimeError::Unconfigured(format!("profile {}: {e}", profile_path.display()))
     })?;
-    let binary_bytes = std::fs::read(&ready.binary).unwrap_or_default();
     receipt.sandbox = Some(json!({
         "profile_digest": profile_ref.as_str(),
-        "tool_binary_digest": digest_hex(&binary_bytes),
+        "tool_binary_digest": ready.binary_digest,
         "tool_source": format!("exec:{}", ready.registered),
         "tool_registry_id": ready.registry_id.to_string(),
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
@@ -1209,6 +1372,43 @@ mod grant_pin_tests;
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn wide_list_limit_saturates_before_clamping() {
+        let params = json!({"limit": u64::from(u32::MAX) + 1});
+        assert_eq!(opt_limit(&params, "limit", 20, 500).unwrap(), 500);
+        let params = json!({"limit": u64::MAX});
+        assert_eq!(opt_limit(&params, "limit", 20, 500).unwrap(), 500);
+    }
+
+    #[test]
+    fn input_budget_counts_repeated_materialization_and_cannot_wrap() {
+        assert_eq!(checked_input_total(3, 2, 5).unwrap(), 5);
+        assert!(checked_input_total(3, 3, 5).is_err());
+        assert!(checked_input_total(u64::MAX, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn binary_digest_is_streamed_and_a_failed_read_is_not_a_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        let bytes = vec![0x5a; 128 * 1024];
+        std::fs::write(&binary, &bytes).unwrap();
+        assert_eq!(hash_tool_binary(&binary).unwrap(), digest_hex(&bytes));
+        std::fs::remove_file(&binary).unwrap();
+        assert!(hash_tool_binary(&binary).is_err());
+    }
+
+    #[test]
+    fn invalid_resolved_timeout_cannot_reach_duration_conversion() {
+        let mut config = sandbox::resolve(&Default::default());
+        config.timeout_default_s = f64::NAN;
+        assert!(parse_request(
+            &json!({"tree": "tree", "tool": "tool", "actor": "local"}),
+            &config,
+        )
+        .is_err());
+    }
 
     #[test]
     fn materialize_preserves_literal_symlink_targets() {
