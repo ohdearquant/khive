@@ -29,9 +29,9 @@ pub const SYSTEM_READ_ROOTS: &[&str] = &[
     "/dev",
 ];
 
-/// Binaries the run verb refuses by canonical file name regardless of the
-/// registry label (ADR-181 Amendment 1 item 8): version control never runs
-/// inside a sandbox, it runs through the git verbs.
+/// Registered binaries the run verb refuses by canonical file name regardless
+/// of registry label (ADR-181 Amendment 1 item 8). The seatbelt also refuses
+/// launches under these names; other names and paths are outside these matches.
 pub const FORBIDDEN_BASENAMES: &[&str] = &["git", "gh"];
 
 /// The sandbox launcher. Every run is a child of this binary, so its absence
@@ -179,8 +179,8 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
     }
     let run = format!("(subpath {})", quote(run_dir));
     maps.push(run.clone());
-    // ADR-181 Amendment 3 item 3: version control and the never set are
-    // refused by the kernel, not only at the registered binary.
+    // ADR-181 Amendment 9: these name and path matches apply to each sandboxed
+    // launch, not only to the registered binary.
     let mut denies: Vec<String> = vec![
         "(regex #\"(^|/)(git|gh)$\")".to_string(),
         "(regex #\"/git-[^/]+$\")".to_string(),
@@ -236,10 +236,13 @@ impl std::fmt::Display for BinaryRefusal {
                 basename,
             } => write!(
                 f,
-                "binary resolves to {canonical:?} ({basename}); version control never runs inside exec.run"
+                "registered binary resolves to forbidden path {canonical:?} ({basename})"
             ),
             BinaryRefusal::Never { canonical } => {
-                write!(f, "binary resolves to {canonical:?} which is in the [exec] never set")
+                write!(
+                    f,
+                    "binary resolves to {canonical:?} which is in the [exec] never set"
+                )
             }
         }
     }
