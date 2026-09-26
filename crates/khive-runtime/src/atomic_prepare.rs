@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
 use khive_storage::{AttachmentSubstrate, EdgeRelation, EdgeUpsertDisposition, SqlStatement};
+use khive_types::pack::pack_registry_tag;
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -63,6 +64,15 @@ use khive_db::stores::text::{delete_document_statements, insert_document_stateme
 fn obj(args: &Value) -> RuntimeResult<&serde_json::Map<String, Value>> {
     args.as_object()
         .ok_or_else(|| RuntimeError::InvalidInput("op args must be a JSON object".into()))
+}
+
+fn refuse_pack_registry_tags(tags: &[String], verb: &str) -> RuntimeResult<()> {
+    let Some(tag) = tags.iter().find_map(|tag| pack_registry_tag(tag)) else {
+        return Ok(());
+    };
+    Err(RuntimeError::InvalidInput(format!(
+        "{verb} refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+    )))
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> RuntimeResult<&'a str> {
@@ -1069,6 +1079,7 @@ pub async fn prepare_update(
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
             }
+            refuse_pack_registry_tags(&entity.tags, "update")?;
             // Decide step lives in curation.rs's `prepare_update_entity` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
@@ -1081,6 +1092,9 @@ pub async fn prepare_update(
             let description = optional_string_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
+            if let Some(ref tags) = tags {
+                refuse_pack_registry_tags(tags, "update")?;
+            }
             let entity_type = optional_entity_type_patch(args, "entity_type")?;
 
             let expected_version = obj(args)?
@@ -1494,6 +1508,7 @@ pub async fn prepare_delete(
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
             }
+            refuse_pack_registry_tags(&entity.tags, "delete")?;
             let namespace = entity.namespace.clone();
             // Storage parity: `entity_soft_delete_statement`/
             // `entity_hard_delete_statement` are the SAME khive-db builders
@@ -1958,14 +1973,16 @@ async fn prepare_merge(
     }
 
     let entities = runtime.entities(token)?;
-    entities
+    let into_entity = entities
         .get_entity(into_id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("entity {into_id}")))?;
-    entities
+    let from_entity = entities
         .get_entity(from_id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("entity {from_id}")))?;
+    refuse_pack_registry_tags(&into_entity.tags, "merge")?;
+    refuse_pack_registry_tags(&from_entity.tags, "merge")?;
 
     let now = chrono::Utc::now().timestamp_micros();
     let rewires = vec![
@@ -2208,6 +2225,99 @@ mod tests {
         TestRuntime {
             runtime,
             _temp_dir: dir,
+        }
+    }
+
+    /// The CLI's atomic update/delete path prepares plans in this module,
+    /// bypassing the ordinary KG handlers. Registry ownership must survive
+    /// both existing-row mutation and an attempted tag assignment.
+    #[tokio::test]
+    async fn atomic_entity_writes_refuse_pack_registry_tags() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut registry = khive_storage::Entity::new("local", "project", "registry-target");
+        registry.tags = vec!["ToOl-ReGiStRy".into()];
+        let registry_id = registry.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(registry)
+            .await
+            .expect("seed registry row");
+
+        let update = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": registry_id.to_string(), "name": "hijacked"}),
+            None,
+        )
+        .await
+        .expect_err("atomic update must reject current registry row");
+        assert!(
+            matches!(update, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+        );
+
+        for hard in [false, true] {
+            let deletion = prepare_delete(
+                &runtime,
+                &token,
+                &json!({"id": registry_id.to_string(), "hard": hard}),
+                None,
+            )
+            .await
+            .expect_err("atomic delete must reject current registry row");
+            assert!(
+                matches!(deletion, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+            );
+        }
+        let unchanged = runtime
+            .get_entity(&token, registry_id)
+            .await
+            .expect("registry row remains");
+        assert_eq!(unchanged.name, "registry-target");
+        assert_eq!(unchanged.tags, vec!["ToOl-ReGiStRy".to_string()]);
+
+        let plain = khive_storage::Entity::new("local", "project", "plain-target");
+        let plain_id = plain.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(plain)
+            .await
+            .expect("seed ordinary row");
+        let tagging = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": plain_id.to_string(), "tags": ["TOOL-REGISTRY"]}),
+            None,
+        )
+        .await
+        .expect_err("atomic update must not mint a registry row");
+        assert!(
+            matches!(tagging, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+        );
+        assert!(runtime
+            .get_entity(&token, plain_id)
+            .await
+            .expect("ordinary row remains")
+            .tags
+            .is_empty());
+
+        // Atomic merge is currently rejected at the CLI, but the public
+        // prepare dispatch retains a direct merge arm. Keep it guarded too.
+        for (into_id, from_id) in [(registry_id, plain_id), (plain_id, registry_id)] {
+            let merge = prepare_merge(
+                &runtime,
+                &token,
+                &json!({"into_id": into_id.to_string(), "from_id": from_id.to_string()}),
+            )
+            .await
+            .expect_err("atomic merge must reject either protected operand");
+            assert!(
+                matches!(merge, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+            );
         }
     }
 

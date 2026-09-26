@@ -274,6 +274,98 @@ async fn changeset_adapter_builds_atomic_plans_for_supported_proposal_writes() {
     }
 }
 
+/// #3293: proposal apply must not bypass the generic KG registry-row boundary.
+/// Each case was accepted for preparation before the proposal-specific guard.
+#[tokio::test]
+async fn proposal_apply_refuses_registry_tags_for_create_update_and_merge() {
+    let (rt, tok) = setup();
+    let protected = rt
+        .create_entity(
+            &tok,
+            "project",
+            None,
+            "Protected tool row",
+            None,
+            None,
+            vec!["ToOl-ReGiStRy".to_string()],
+        )
+        .await
+        .expect("trusted fixture creates registry row");
+    let ordinary = rt
+        .create_entity(&tok, "project", None, "Ordinary row", None, None, vec![])
+        .await
+        .expect("create ordinary row");
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt);
+
+    let cases = [
+        (
+            "add tagged entity",
+            ProposalChangeset::AddEntity {
+                entity: EntityDraft {
+                    kind: "project".to_string(),
+                    name: "Forged registry row".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec!["TOOL-REGISTRY".to_string()],
+                },
+            },
+        ),
+        (
+            "update protected entity",
+            ProposalChangeset::UpdateEntity {
+                id: Id128::from_u128(protected.id.as_u128()),
+                patch: khive_types::ProposalEntityPatch {
+                    name: None,
+                    description: None,
+                    properties: Some(serde_json::json!({"source": "exec:/tmp/other"})),
+                    tags: None,
+                    entity_type: None,
+                },
+            },
+        ),
+        (
+            "add protected tag through update",
+            ProposalChangeset::UpdateEntity {
+                id: Id128::from_u128(ordinary.id.as_u128()),
+                patch: khive_types::ProposalEntityPatch {
+                    name: None,
+                    description: None,
+                    properties: None,
+                    tags: Some(vec!["tool-registry".to_string()]),
+                    entity_type: None,
+                },
+            },
+        ),
+        (
+            "merge into protected entity",
+            ProposalChangeset::MergeEntities {
+                into: Id128::from_u128(protected.id.as_u128()),
+                from: Id128::from_u128(ordinary.id.as_u128()),
+            },
+        ),
+        (
+            "merge protected entity into ordinary",
+            ProposalChangeset::MergeEntities {
+                into: Id128::from_u128(ordinary.id.as_u128()),
+                from: Id128::from_u128(protected.id.as_u128()),
+            },
+        ),
+    ];
+
+    for (label, changeset) in cases {
+        let error = worker
+            .prepare_changeset(&tok, &changeset, &registry, &mut WriteBudget::new(None))
+            .await
+            .err()
+            .expect(label);
+        assert!(
+            error.to_string().contains("tool-registry"),
+            "{label} should refuse the protected tag: {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn apply_worker_atomic_update_preserves_explicit_description_clear() {
     let (rt, tok) = setup();

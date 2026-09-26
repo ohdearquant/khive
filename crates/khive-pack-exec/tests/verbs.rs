@@ -751,6 +751,30 @@ async fn refusals_write_receipts_and_touch_no_disk() {
     assert!(root_is_empty(&f));
 }
 
+#[tokio::test]
+async fn run_refuses_an_ordinary_entity_id_as_a_tool() {
+    let f = fixture();
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "not-registered"}),
+        )
+        .await;
+    let id = ordinary["id"].as_str().expect("created id");
+    let tree = f.tree(&[]).await;
+    let err = f
+        .call_err(
+            "exec.run",
+            json!({"tree": tree, "tool": id, "args": [], "actor": "local"}),
+        )
+        .await;
+    assert!(err.contains("not registered"), "{err}");
+    assert!(
+        root_is_empty(&f),
+        "an unregistered id must not launch a process"
+    );
+}
+
 /// A consumer of a refused `exec.run` must be able to reach the durable receipt
 /// without a regular expression over the refusal sentence. The wording of that
 /// sentence is not a contract; `receipt_id` on the error envelope is.

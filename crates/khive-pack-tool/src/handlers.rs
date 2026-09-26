@@ -5,9 +5,13 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    micros_to_iso, operations::EntityClaimSpec, KhiveRuntime, NamespaceToken, RuntimeError,
+    VerbRegistry,
+};
 use khive_storage::types::Direction;
-use khive_storage::Entity;
+use khive_storage::{Entity, EntityFilter};
+use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
 use crate::policy::{self, actor_label, now_micros, Decision};
@@ -16,6 +20,18 @@ use crate::vocab::{
     TRUST_ORIGINS,
 };
 use crate::RegistryPin;
+
+#[cfg(test)]
+tokio::task_local! {
+    static BEFORE_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+}
+
+#[cfg(test)]
+async fn pause_before_claim() {
+    if let Ok(barrier) = BEFORE_CLAIM.try_with(std::sync::Arc::clone) {
+        barrier.wait().await;
+    }
+}
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -175,19 +191,34 @@ async fn resolve_tool(
 ) -> Result<Entity, RuntimeError> {
     if let Ok(id) = Uuid::parse_str(reference) {
         if let Ok(e) = rt.get_entity(token, id).await {
-            return Ok(e);
+            return require_registry_row(e, reference);
         }
     }
     if reference.len() >= 8 && reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         if let Ok(Some(id)) = rt.resolve_prefix(token, reference).await {
             if let Ok(e) = rt.get_entity(token, id).await {
-                return Ok(e);
+                return require_registry_row(e, reference);
             }
         }
     }
     find_visible_by_name(rt, token, reference)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("tool {reference:?} is not registered")))
+}
+
+fn require_registry_row(entity: Entity, reference: &str) -> Result<Entity, RuntimeError> {
+    if entity.kind == REGISTRY_ENTITY_KIND
+        && entity
+            .tags
+            .iter()
+            .any(|tag| pack_registry_tag(tag) == Some(REGISTRY_TAG))
+    {
+        Ok(entity)
+    } else {
+        Err(RuntimeError::NotFound(format!(
+            "tool {reference:?} is not registered"
+        )))
+    }
 }
 
 /// Resolve a registry object by uuid, id prefix or name for another pack
@@ -205,25 +236,56 @@ async fn ensure_capability(
     token: &NamespaceToken,
     name: &str,
 ) -> Result<Entity, RuntimeError> {
+    let own_namespace = token.with_namespace(token.namespace().clone());
     let existing = rt
-        .list_entities_tagged(token, Some("concept"), Some(CAPABILITY_TAG), 5000, 0)
+        .list_entities_filtered(
+            &own_namespace,
+            EntityFilter {
+                kinds: vec!["concept".into()],
+                entity_types: vec!["capability".into()],
+                tags_any: vec![CAPABILITY_TAG.into()],
+                names_ci: vec![name.into()],
+                ..Default::default()
+            },
+            1,
+            0,
+        )
         .await?;
-    if let Some(e) = existing
-        .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name))
-    {
+    if let Some(e) = existing.into_iter().next() {
+        rt.reindex_claimed_entity(token, &e).await?;
         return Ok(e);
     }
-    rt.create_entity(
-        token,
-        "concept",
-        Some("capability"),
-        name,
-        None,
-        None,
-        vec![CAPABILITY_TAG.to_string()],
-    )
-    .await
+    #[cfg(test)]
+    pause_before_claim().await;
+    let id = derived_registry_id("capability", token.namespace().as_str(), name);
+    let (entity, _) = rt
+        .claim_entity_if_absent(
+            token,
+            EntityClaimSpec {
+                id,
+                kind: "concept".into(),
+                entity_type: Some("capability".into()),
+                name: name.into(),
+                description: None,
+                properties: None,
+                tags: vec![CAPABILITY_TAG.into()],
+                identity_tag: CAPABILITY_TAG.into(),
+            },
+        )
+        .await?;
+    Ok(entity)
+}
+
+fn derived_registry_id(seed: &str, namespace: &str, name: &str) -> Uuid {
+    let pack_seed = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("khive:tool-registry:{seed}:v1").as_bytes(),
+    );
+    let mut key = Vec::with_capacity(8 + namespace.len() + name.len());
+    key.extend_from_slice(&(namespace.len() as u64).to_be_bytes());
+    key.extend_from_slice(namespace.as_bytes());
+    key.extend_from_slice(name.to_ascii_lowercase().as_bytes());
+    Uuid::new_v5(&pack_seed, &key)
 }
 
 async fn link_implements(
@@ -299,8 +361,13 @@ async fn register_one(
     one_of(&spec.trust, TRUST_ORIGINS, "trust")?;
 
     let (entity, created) = match find_by_name(rt, token, &spec.name).await? {
-        Some(existing) => (existing, false),
+        Some(existing) => {
+            rt.reindex_claimed_entity(token, &existing).await?;
+            (existing, false)
+        }
         None => {
+            #[cfg(test)]
+            pause_before_claim().await;
             let mut props = serde_json::Map::new();
             props.insert("side_effect".into(), json!(spec.side_effect));
             props.insert("trust".into(), json!(spec.trust));
@@ -317,18 +384,23 @@ async fn register_one(
                     tags.push(t.clone());
                 }
             }
-            let e = rt
-                .create_entity(
+            let id = derived_registry_id("object", token.namespace().as_str(), &spec.name);
+            let (entity, created) = rt
+                .claim_entity_if_absent(
                     token,
-                    REGISTRY_ENTITY_KIND,
-                    Some(&spec.kind),
-                    &spec.name,
-                    spec.description.as_deref(),
-                    Some(Value::Object(props)),
-                    tags,
+                    EntityClaimSpec {
+                        id,
+                        kind: REGISTRY_ENTITY_KIND.into(),
+                        entity_type: Some(spec.kind.clone()),
+                        name: spec.name.clone(),
+                        description: spec.description.clone(),
+                        properties: Some(Value::Object(props)),
+                        tags,
+                        identity_tag: REGISTRY_TAG.into(),
+                    },
                 )
                 .await?;
-            (e, true)
+            (entity, created)
         }
     };
 
@@ -911,3 +983,7 @@ pub(crate) async fn policies(
         "policies": rows.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
     }))
 }
+
+#[cfg(test)]
+#[path = "claim_tests.rs"]
+mod claim_tests;

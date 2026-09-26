@@ -53,6 +53,19 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
     .into()
 }
 
+/// Inputs for a store-owned entity identity. Unlike ordinary creation, a
+/// competing insert must leave the existing row untouched.
+pub struct EntityClaimSpec {
+    pub id: Uuid,
+    pub kind: String,
+    pub entity_type: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub properties: Option<serde_json::Value>,
+    pub tags: Vec<String>,
+    pub identity_tag: String,
+}
+
 fn live_merged_entity_refused(id: Uuid, kept_id: impl std::fmt::Display) -> RuntimeError {
     KhiveError::conflict(format!(
         "live_merged_entity: {id} is live but still carries merged_into {kept_id}; a row an \
@@ -1422,6 +1435,182 @@ impl KhiveRuntime {
                 cleanup_errors.join("; ")
             )))
         }
+    }
+
+    /// Claim a caller-derived entity id without replacing a competing row.
+    /// Index writes are repeatable and never compensate by deleting the claim.
+    pub async fn claim_entity_if_absent(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityClaimSpec,
+    ) -> RuntimeResult<(Entity, bool)> {
+        self.validate_entity_kind(&spec.kind)?;
+        let entity_type =
+            self.validate_entity_type_for_kind(&spec.kind, spec.entity_type.as_deref())?;
+        crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
+        crate::secret_gate::check_at(&spec.name, "entity", "name")?;
+        if let Some(description) = &spec.description {
+            crate::secret_gate::check_at(description, "entity", "description")?;
+        }
+        if let Some(properties) = &spec.properties {
+            crate::secret_gate::check_json_at(properties, "entity", "properties")?;
+        }
+        crate::secret_gate::check_tags_at(&spec.tags, "entity", "tags")?;
+
+        let mut proposed = Entity::new(token.namespace().as_str(), &spec.kind, &spec.name);
+        proposed.id = spec.id;
+        proposed.entity_type = entity_type.clone();
+        proposed.description = spec.description;
+        proposed.properties = spec.properties;
+        proposed.tags = spec.tags;
+
+        let store = self.entities(token)?;
+        let inserted = store.insert_entity_if_absent(proposed.clone()).await?;
+        let entity = if inserted {
+            proposed
+        } else {
+            store
+                .get_entity_including_deleted(spec.id)
+                .await?
+                .ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "entity claim {} lost but the winning row is missing",
+                        spec.id
+                    ))
+                })?
+        };
+        if entity.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity claim {} is soft-deleted; restore it explicitly",
+                entity.id
+            )));
+        }
+        if entity.namespace != token.namespace().as_str()
+            || entity.kind != spec.kind
+            || entity.entity_type.as_deref() != entity_type.as_deref()
+            || !entity.name.eq_ignore_ascii_case(&spec.name)
+            || !entity
+                .tags
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case(&spec.identity_tag))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity claim {} belongs to a different record",
+                entity.id
+            )));
+        }
+
+        if inserted {
+            let event = Event::new(
+                entity.namespace.clone(),
+                "create",
+                EventKind::EntityCreated,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(entity.id)
+            .with_payload(serde_json::json!({
+                "id": entity.id,
+                "namespace": &entity.namespace,
+                "kind": &entity.kind,
+            }));
+            self.events(token)
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} was claimed but its event store is unavailable: {error}",
+                        entity.id
+                    ))
+                })?
+                .append_event(event)
+                .await
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} was claimed but its create event failed: {error}",
+                        entity.id
+                    ))
+                })?;
+        }
+        self.reindex_claimed_entity(token, &entity).await?;
+        Ok((entity, inserted))
+    }
+
+    /// Repair a claimed row after an earlier post-insert indexing failure.
+    /// This path is strict: any failed index stage names the still-live id.
+    pub async fn reindex_claimed_entity(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+    ) -> RuntimeResult<()> {
+        if entity.namespace != token.namespace().as_str() || entity.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity {} is not a live row in the write namespace",
+                entity.id
+            )));
+        }
+        let doc = entity_fts_document(entity);
+        let embed_body = doc.body.clone();
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_inject = consume_fault(&FTS_FAIL_NS, &entity.namespace);
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_inject = false;
+        let fts_result = if fts_inject {
+            Err(RuntimeError::Internal("injected FTS failure".into()))
+        } else {
+            match self.text(token) {
+                Ok(text) => text.upsert_document(doc).await.map_err(Into::into),
+                Err(error) => Err(error),
+            }
+        };
+        fts_result.map_err(|error| {
+            RuntimeError::Internal(format!(
+                "entity {} persists but its text index failed: {error}",
+                entity.id
+            ))
+        })?;
+
+        for model_name in self.registered_embedding_model_names() {
+            let outcome = self
+                .embed_document_with_model_outcome_for_token(token, &model_name, &embed_body)
+                .await
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} persists but model {model_name} embedding failed: {error}",
+                        entity.id
+                    ))
+                })?;
+            #[cfg(any(test, feature = "fault-injection"))]
+            let vector_inject = consume_fault(&VECTOR_FAIL_NS, &entity.namespace);
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let vector_inject = false;
+            if vector_inject {
+                return Err(RuntimeError::Internal(format!(
+                    "entity {} persists but model {model_name} vector indexing failed: injected vector failure",
+                    entity.id
+                )));
+            }
+            self.vectors_for_model(token, &model_name)
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} persists but model {model_name} vector store is unavailable: {error}",
+                        entity.id
+                    ))
+                })?
+                .insert(
+                    entity.id,
+                    SubstrateKind::Entity,
+                    &entity.namespace,
+                    "entity.body",
+                    vec![outcome.vector],
+                )
+                .await
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} persists but model {model_name} vector indexing failed: {error}",
+                        entity.id
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Create and persist a new entity.

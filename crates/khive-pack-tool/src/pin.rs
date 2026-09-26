@@ -2,8 +2,11 @@
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{Entity, SqlReader, SqlStatement, SqlValue, StorageError};
+use khive_types::pack::TOOL_REGISTRY_TAG;
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+use crate::vocab::REGISTRY_ENTITY_KIND;
 
 /// Only these four properties affect a grant's definition pin. Missing
 /// properties are represented explicitly as JSON null, like tool.describe.
@@ -95,10 +98,10 @@ pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
         .query_row(SqlStatement {
             sql: "SELECT id, name, properties FROM entities \
                   WHERE namespace IN (SELECT value FROM json_each(?1)) \
-                    AND kind = 'project' AND deleted_at IS NULL \
+                    AND kind = ?6 AND deleted_at IS NULL \
                     AND CAST(lower(name) AS BLOB) = ?2 \
                     AND EXISTS (SELECT 1 FROM json_each(entities.tags) \
-                                WHERE lower(json_each.value) = 'tool-registry') \
+                                WHERE lower(json_each.value) = ?5) \
                   ORDER BY CASE WHEN namespace = ?4 THEN 0 ELSE 1 END, \
                            CASE WHEN name = ?3 COLLATE BINARY THEN 0 ELSE 1 END, \
                            created_at DESC, id ASC LIMIT 1"
@@ -108,6 +111,8 @@ pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
                 SqlValue::Blob(name.to_ascii_lowercase().into_bytes()),
                 SqlValue::Text(name.into()),
                 SqlValue::Text(own_namespace.into()),
+                SqlValue::Text(TOOL_REGISTRY_TAG.into()),
+                SqlValue::Text(REGISTRY_ENTITY_KIND.into()),
             ],
             label: Some("tool_registry_snapshot".into()),
         })
@@ -169,16 +174,25 @@ pub(crate) async fn invalidating_registration<R: SqlReader + ?Sized>(
     let prefix = pattern.strip_suffix('*').map_or(SqlValue::Null, |prefix| {
         SqlValue::Blob(prefix.as_bytes().to_vec())
     });
-    let row = reader.query_row(SqlStatement {
-        sql: "SELECT id, created_at FROM entities \
-              WHERE namespace = ?1 AND kind = 'project' AND deleted_at IS NULL \
-                AND EXISTS (SELECT 1 FROM json_each(entities.tags) WHERE lower(value) = 'tool-registry') \
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT id, created_at FROM entities \
+              WHERE namespace = ?1 AND kind = ?5 AND deleted_at IS NULL \
+                AND EXISTS (SELECT 1 FROM json_each(entities.tags) WHERE lower(value) = ?4) \
                 AND (CAST(lower(name) AS BLOB) = ?2 \
                      OR (?3 IS NOT NULL AND substr(CAST(name AS BLOB), 1, length(?3)) = ?3)) \
-              ORDER BY (CAST(lower(name) AS BLOB) = ?2) DESC, created_at, id LIMIT 1".into(),
-        params: vec![SqlValue::Text(namespace.into()), SqlValue::Blob(pattern.to_ascii_lowercase().into_bytes()), prefix],
-        label: Some("tool_grant_invalidation_evidence".into()),
-    }).await?;
+              ORDER BY (CAST(lower(name) AS BLOB) = ?2) DESC, created_at, id LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(namespace.into()),
+                SqlValue::Blob(pattern.to_ascii_lowercase().into_bytes()),
+                prefix,
+                SqlValue::Text(TOOL_REGISTRY_TAG.into()),
+                SqlValue::Text(REGISTRY_ENTITY_KIND.into()),
+            ],
+            label: Some("tool_grant_invalidation_evidence".into()),
+        })
+        .await?;
     row.map(|row| match (row.get("id"), row.get("created_at")) {
         (Some(SqlValue::Text(id)), Some(SqlValue::Integer(created_at))) => {
             Ok((id.clone(), *created_at))

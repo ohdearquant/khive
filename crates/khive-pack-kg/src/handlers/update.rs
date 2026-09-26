@@ -6,7 +6,7 @@ use uuid::Uuid;
 use khive_runtime::{EdgePatch, EntityPatch, NamespaceToken, RuntimeError, VerbRegistry};
 
 use khive_storage::Entity;
-use khive_types::pack::PACK_REGISTRY_TAGS;
+use khive_types::pack::pack_registry_tag;
 
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
@@ -23,12 +23,8 @@ use crate::KgPack;
 /// read at run time and handed to the policy decision. The check reads the
 /// row's CURRENT tags, so a patch that would strip the tag first is refused by
 /// the same rule rather than becoming the way around it.
-fn refuse_pack_registry_row(entity: &Entity, verb: &str) -> Result<(), RuntimeError> {
-    let Some(tag) = entity
-        .tags
-        .iter()
-        .find(|tag| PACK_REGISTRY_TAGS.contains(&tag.as_str()))
-    else {
+pub(super) fn refuse_pack_registry_row(entity: &Entity, verb: &str) -> Result<(), RuntimeError> {
+    let Some(tag) = entity.tags.iter().find_map(|tag| pack_registry_tag(tag)) else {
         return Ok(());
     };
     Err(RuntimeError::InvalidInput(format!(
@@ -225,6 +221,17 @@ impl KgPack {
             KindSpec::Entity { specific } => {
                 let entity = self.runtime.get_entity(token, id).await?;
                 refuse_pack_registry_row(&entity, "update")?;
+                if let Some(tag) = p
+                    .tags
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find_map(|tag| pack_registry_tag(tag))
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "update refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+                    )));
+                }
                 if let Some(k) = specific.as_ref() {
                     if entity.kind != *k {
                         return Err(RuntimeError::InvalidInput(format!(

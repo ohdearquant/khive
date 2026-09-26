@@ -224,7 +224,7 @@ async fn unregistered_grant_ends_at_first_registration_even_after_removal() {
 }
 
 #[tokio::test]
-async fn a_new_registered_approval_binds_the_replacement_and_supersedes_invalidation() {
+async fn a_soft_deleted_registration_refuses_replacement_and_cannot_rebind_a_grant() {
     let f = Fixture::new();
     let old_id = f.request("future").await;
     f.grant(&old_id).await;
@@ -245,8 +245,24 @@ async fn a_new_registered_approval_binds_the_replacement_and_supersedes_invalida
     );
     assert!(absent_reapproval["invalidated_at"].is_string());
     assert_eq!(f.check("future").await["source"], "default");
-    let replacement = f.register("future").await;
-    assert_ne!(original["full_id"], replacement["full_id"]);
+    // ADR-180 Amendment 5 keeps the derived identity as a tombstone. A
+    // same-name registration must refuse rather than minting a replacement
+    // that could silently change which registration an old grant names.
+    let refusal = f
+        .registry
+        .dispatch(
+            "tool.register",
+            json!({"name":"future", "source":"mcp:fixture", "side_effect":"write", "trust":"first_party", "schema":{"type":"object", "properties":{"z":{"type":"integer"}, "a":{"type":"string"}}}}),
+        )
+        .await
+        .expect_err("a soft-deleted registration must not be replaced");
+    assert!(refusal.to_string().contains("soft-deleted"), "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains(original["full_id"].as_str().unwrap()),
+        "{refusal}"
+    );
     assert_eq!(f.check("future").await["source"], "default");
     f.call("tool.deny", json!({"id":old_id})).await;
     assert_eq!(
@@ -254,10 +270,14 @@ async fn a_new_registered_approval_binds_the_replacement_and_supersedes_invalida
         original["full_id"]
     );
     let reapproved = f.grant(&old_id).await;
-    assert_eq!(reapproved["registry_id"], replacement["full_id"]);
-    assert!(reapproved["invalidated_by_registry_id"].is_null());
-    assert!(reapproved["invalidated_at"].is_null());
-    assert_eq!(f.check("future").await["grant_id"], old_id);
+    assert!(reapproved["registry_id"].is_null());
+    assert!(reapproved["definition_digest"].is_null());
+    assert_eq!(
+        reapproved["invalidated_by_registry_id"],
+        original["full_id"]
+    );
+    assert!(reapproved["invalidated_at"].is_string());
+    assert_eq!(f.check("future").await["source"], "default");
 }
 
 #[tokio::test]
