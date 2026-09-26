@@ -68,6 +68,14 @@ identity contract: the default MCP result is exactly the stored
 
 ### Repo-anchor resolution and conflict warning
 
+An explicit `project` UUID is used as supplied, and an 8-or-more-hex-digit
+prefix is resolved without a namespace filter. Either form can select an
+anchor in a different namespace from the digest request. This is the handler's
+current ID-resolution behavior: ADR-007 Rule 9 describes unfiltered UUID and
+prefix resolution for parameters declaring that contract, but does not
+expressly list `git.digest(project)` among them. When `project` is absent,
+anchor discovery is restricted to the request namespace.
+
 When `project` is absent, `git.digest` resolves a canonical `repo_slug` and
 uses the tier order defined by ADR-088 Amendment 2: exact canonical slug,
 exact legacy `repo_url`, normalized `repo_url`, then create. The normalized
@@ -92,6 +100,16 @@ uses this form:
 multiple live project anchors resolve to the same repo identity; selected <id> by canonical resolution order; duplicate or conflicting anchors: <ids>
 ```
 
+If ingest fails after duplicate anchors have been identified, the handler
+emits that same sentence at WARN level, including the selected and duplicate
+anchor ids. It returns the original error unchanged, preserving its kind,
+message, and any typed storage retry semantics.
+
 Candidate queries use `created_at ASC, id ASC`; tier precedence, selection,
 and warning-id order are deterministic. An anchor id appears at most once in
 the warning.
+
+For the orphaned-corpus signal, matching soft-deleted anchors are considered
+by `deleted_at DESC, id ASC` across the exact and normalized identity routes.
+The first anchor in that order with live annotating notes supplies the signal;
+an anchor without live notes is skipped.

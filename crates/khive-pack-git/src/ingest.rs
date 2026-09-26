@@ -810,10 +810,10 @@ async fn resolve_id(
         .map_err(anyhow::Error::new)
 }
 
-/// Resolve `raw` (a full UUID or an 8+ hex prefix) to an existing `project`
-/// entity id, unfiltered by namespace. Returns `Ok(None)` when no entity
-/// matches; never creates one. Used by the `git.digest` verb handler to
-/// resolve an explicitly supplied `project` argument.
+/// Resolve an explicit `git.digest(project)` UUID or 8+ hex prefix without a
+/// namespace filter. A full UUID is accepted as supplied; only a prefix is
+/// looked up, returning `Ok(None)` when it matches no record. This helper
+/// does not check that the resolved id is a live `project` entity.
 pub async fn resolve_project_id(runtime: &KhiveRuntime, raw: &str) -> Result<Option<Uuid>> {
     if let Ok(u) = Uuid::parse_str(raw) {
         return Ok(Some(u));
