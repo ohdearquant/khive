@@ -112,6 +112,15 @@ async fn load_brain_profile(
         .await
 }
 
+fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(), RuntimeError> {
+    if response.get("lifecycle").and_then(Value::as_str) == Some("archived") {
+        return Err(RuntimeError::InvalidInput(format!(
+            "profile_id {profile_id:?} is archived and cannot serve memory.recall"
+        )));
+    }
+    Ok(())
+}
+
 impl MemoryPack {
     pub(crate) async fn handle_recall(
         &self,
@@ -268,6 +277,7 @@ impl MemoryPack {
                             "profile_id {pid:?} is not a known profile: {e}"
                         ))
                     })?;
+                reject_archived_brain_profile(&resp, pid)?;
                 profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
                 (Some(pid.clone()), ServeAttribution::Profile)
             } else {
@@ -277,6 +287,7 @@ impl MemoryPack {
                 if let Some(profile_id) = resolved {
                     match load_brain_profile(registry, token, &profile_id).await {
                         Ok(resp) => {
+                            reject_archived_brain_profile(&resp, &profile_id)?;
                             profile_state =
                                 super::common::balanced_recall_state_from_profile_response(&resp);
                             (Some(profile_id), ServeAttribution::Profile)
@@ -4310,6 +4321,37 @@ mod tests {
         assert!(
             bad_result.is_err(),
             "unknown profile_id must be a per-op error, not a silent fallback to defaults"
+        );
+
+        registry
+            .dispatch(
+                "brain.deactivate",
+                json!({"namespace": ns.as_str(), "profile_id": "adr104-override-v1"}),
+            )
+            .await
+            .expect("deactivate explicit profile before archiving");
+        registry
+            .dispatch(
+                "brain.archive",
+                json!({"namespace": ns.as_str(), "profile_id": "adr104-override-v1"}),
+            )
+            .await
+            .expect("archive explicit profile");
+        let archived = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104 profile_id override note",
+                    "profile_id": "adr104-override-v1",
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect_err("archived profile must not serve recall");
+        assert!(
+            matches!(archived, RuntimeError::InvalidInput(ref message) if message.contains("archived")),
+            "archived explicit profile must be refused: {archived:?}"
         );
     }
 

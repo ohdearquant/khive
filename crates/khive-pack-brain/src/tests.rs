@@ -130,6 +130,31 @@ async fn create_test_entity(rt: &KhiveRuntime, token: &NamespaceToken) -> String
     entity.id.to_string()
 }
 
+const LIFECYCLE_PROFILE_ID: &str = "lifecycle-test-v1";
+
+async fn create_active_lifecycle_profile(
+    pack: &BrainPack,
+    registry: &khive_runtime::VerbRegistry,
+    token: &NamespaceToken,
+) {
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": LIFECYCLE_PROFILE_ID, "consumer_kind": "recall"}),
+        registry,
+        token,
+    )
+    .await
+    .expect("create lifecycle test profile");
+    pack.dispatch(
+        "brain.activate",
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
+        registry,
+        token,
+    )
+    .await
+    .expect("activate lifecycle test profile");
+}
+
 #[tokio::test]
 async fn dispatch_unknown_verb_returns_invalid_input() {
     let (pack, rt) = make_pack();
@@ -213,11 +238,12 @@ async fn dispatch_reset_archived_profile_returns_invalid_input() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     // Archive the profile via the lifecycle DAG
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -225,7 +251,7 @@ async fn dispatch_reset_archived_profile_returns_invalid_input() {
     .unwrap();
     pack.dispatch(
         "brain.archive",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -235,7 +261,7 @@ async fn dispatch_reset_archived_profile_returns_invalid_input() {
     let err = pack
         .dispatch(
             "brain.reset",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -392,12 +418,13 @@ async fn dispatch_activate_and_deactivate_profile() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
-    // Deactivate the default profile
+    // Deactivate the custom active profile
     let result = pack
         .dispatch(
             "brain.deactivate",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -409,7 +436,7 @@ async fn dispatch_activate_and_deactivate_profile() {
     let state = pack
         .dispatch(
             "brain.profile",
-            json!({"id": "balanced-recall-v1"}),
+            json!({"id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -421,7 +448,7 @@ async fn dispatch_activate_and_deactivate_profile() {
     let result = pack
         .dispatch(
             "brain.activate",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -435,11 +462,12 @@ async fn dispatch_archive_profile() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     // Lifecycle DAG requires active → inactive before archiving.
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -449,7 +477,7 @@ async fn dispatch_archive_profile() {
     let result = pack
         .dispatch(
             "brain.archive",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -658,11 +686,12 @@ async fn b_c1_archived_activate_is_rejected() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     // Deactivate first (active → inactive), then archive (inactive → archived)
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -670,7 +699,7 @@ async fn b_c1_archived_activate_is_rejected() {
     .unwrap();
     pack.dispatch(
         "brain.archive",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -681,7 +710,7 @@ async fn b_c1_archived_activate_is_rejected() {
     let err = pack
         .dispatch(
             "brain.activate",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -702,11 +731,12 @@ async fn b_c1_archived_deactivate_is_rejected() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     // Get to archived via active → inactive → archived
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -714,7 +744,7 @@ async fn b_c1_archived_deactivate_is_rejected() {
     .unwrap();
     pack.dispatch(
         "brain.archive",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -725,7 +755,7 @@ async fn b_c1_archived_deactivate_is_rejected() {
     let err = pack
         .dispatch(
             "brain.deactivate",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -742,12 +772,13 @@ async fn b_c1_active_to_archived_direct_is_rejected() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     // Profile starts active — direct archive must fail (must go through inactive)
     let err = pack
         .dispatch(
             "brain.archive",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -768,11 +799,12 @@ async fn b_c1_inactive_to_archived_is_permitted() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     // active → inactive → archived: legal path
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -781,7 +813,7 @@ async fn b_c1_inactive_to_archived_is_permitted() {
     let result = pack
         .dispatch(
             "brain.archive",
-            json!({"profile_id": "balanced-recall-v1"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID}),
             &registry,
             &token,
         )
@@ -1457,6 +1489,136 @@ async fn recall_hook_routes_known_profile_and_drops_unattributed_signal() {
     );
 }
 
+/// #3314: a successful memory recall must return from the runtime hook even
+/// while a long brain handler owns the namespace gate. The deferred signal
+/// still credits the profile named by the serving result after the gate opens.
+#[tokio::test(flavor = "current_thread")]
+async fn contended_brain_gate_does_not_hold_hook_caller_or_lose_attribution() {
+    use std::time::Duration;
+
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "deferred-profile-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("create serving profile");
+
+    let before = pack.snapshot();
+    let default_events = before.balanced_recall.total_events;
+    let served_events = before.profile_states["deferred-profile-v1"].total_events;
+    let mut event = khive_storage::event::Event::new(
+        "local",
+        "memory.recall",
+        khive_types::EventKind::Audit,
+        khive_types::SubstrateKind::Event,
+        "memory",
+    );
+    event.target_id = Some(uuid::Uuid::new_v4());
+    event.payload = json!({
+        "served_by_profile_id": "deferred-profile-v1",
+        "serve_attribution": "profile"
+    });
+    let view = khive_runtime::EventView {
+        event,
+        observations: Vec::new(),
+    };
+
+    let gate = pack.dispatch_gate.lock().await;
+    let unrelated = khive_runtime::EventView {
+        event: khive_storage::event::Event::new(
+            "local",
+            "comm.send",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Event,
+            "comm",
+        ),
+        observations: Vec::new(),
+    };
+    tokio::time::timeout(Duration::from_millis(200), pack.on_dispatch(&unrelated))
+        .await
+        .expect("an irrelevant verb must not touch the brain gate");
+    tokio::time::timeout(Duration::from_millis(200), pack.on_dispatch(&view))
+        .await
+        .expect("hook must hand off without awaiting a brain handler");
+    assert_eq!(
+        pack.snapshot().profile_states["deferred-profile-v1"].total_events,
+        served_events,
+        "deferred evidence must not apply outside the namespace gate"
+    );
+    drop(gate);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if pack.snapshot().profile_states["deferred-profile-v1"].total_events
+                == served_events + 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deferred evidence must drain after the gate opens");
+    assert_eq!(pack.snapshot().balanced_recall.total_events, default_events);
+}
+
+/// #3316: ordinary irrelevant dispatches do not establish a cold queue;
+/// useful cold signals have a ceiling and expose overflow in diagnostics.
+#[tokio::test]
+async fn cold_hook_overflow_is_visible_without_loading_namespace() {
+    let (pack, _) = make_pack();
+    let irrelevant = khive_runtime::EventView {
+        event: khive_storage::event::Event::new(
+            "never-loaded",
+            "comm.send",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Event,
+            "comm",
+        ),
+        observations: Vec::new(),
+    };
+    pack.on_dispatch(&irrelevant).await;
+    assert!(pack
+        .persistence
+        .lock()
+        .unwrap()
+        .drain_pending_signals("never-loaded")
+        .is_empty());
+
+    let recall_miss = khive_runtime::EventView {
+        event: khive_storage::event::Event::new(
+            "never-loaded",
+            "memory.recall",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Event,
+            "memory",
+        ),
+        observations: Vec::new(),
+    };
+    for _ in 0..=crate::persist::MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE {
+        pack.on_dispatch(&recall_miss).await;
+    }
+    let state = pack.handle_state(json!({})).await.unwrap();
+    assert_eq!(state["dispatch_counters"]["cold_hook_signals_dropped"], 1);
+    assert_eq!(
+        pack.persistence
+            .lock()
+            .unwrap()
+            .drain_pending_signals("never-loaded")
+            .len(),
+        crate::persist::MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE
+    );
+    assert!(
+        !pack.persistence.lock().unwrap().is_loaded("never-loaded"),
+        "hook observations cannot skip the first durable namespace load"
+    );
+}
+
 // ── Regression tests ──────────────────────────────────────────────────────
 
 // C2: brain.unbind with zero filters must be rejected.
@@ -1503,11 +1665,12 @@ async fn w4_c3_bind_archived_profile_is_rejected() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
-    // Archive the only profile.
+    // Archive the custom profile.
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -1515,7 +1678,7 @@ async fn w4_c3_bind_archived_profile_is_rejected() {
     .unwrap();
     pack.dispatch(
         "brain.archive",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -1525,7 +1688,7 @@ async fn w4_c3_bind_archived_profile_is_rejected() {
     let err = pack
         .dispatch(
             "brain.bind",
-            json!({"profile_id": "balanced-recall-v1", "consumer_kind": "recall"}),
+            json!({"profile_id": LIFECYCLE_PROFILE_ID, "consumer_kind": "recall"}),
             &registry,
             &token,
         )
@@ -2051,13 +2214,14 @@ async fn r2_feedback_rejects_archived_served_by_profile() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
+    create_active_lifecycle_profile(&pack, &registry, &token).await;
 
     let target = create_test_entity(&rt, &token).await;
 
-    // Archive the only profile.
+    // Archive the custom profile.
     pack.dispatch(
         "brain.deactivate",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -2065,7 +2229,7 @@ async fn r2_feedback_rejects_archived_served_by_profile() {
     .unwrap();
     pack.dispatch(
         "brain.archive",
-        json!({"profile_id": "balanced-recall-v1"}),
+        json!({"profile_id": LIFECYCLE_PROFILE_ID}),
         &registry,
         &token,
     )
@@ -2078,7 +2242,7 @@ async fn r2_feedback_rejects_archived_served_by_profile() {
             json!({
                 "target_id": target,
                 "signal": "useful",
-                "served_by_profile_id": "balanced-recall-v1"
+                "served_by_profile_id": LIFECYCLE_PROFILE_ID
             }),
             &registry,
             &token,
@@ -3263,6 +3427,39 @@ async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
 
 // ── Regression tests ──────────────────────────────────────────────
 
+#[tokio::test]
+async fn default_profile_cannot_be_deactivated_or_archived() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    for verb in ["brain.deactivate", "brain.archive"] {
+        let error = pack
+            .dispatch(
+                verb,
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("required default profile")),
+            "{verb} must refuse to disable the sole default: {error:?}"
+        );
+    }
+    let profile = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile["lifecycle"], json!("active"));
+}
+
 // Archiving balanced-recall-v1 then calling brain.feedback without
 // served_by_profile_id must return InvalidInput and must NOT append an event.
 #[tokio::test]
@@ -3273,25 +3470,23 @@ async fn r3_feedback_default_profile_archived_rejected() {
 
     let target = create_test_entity(&rt, &token).await;
 
-    // balanced-recall-v1 starts Active; must deactivate before archiving (lifecycle rule).
+    // Older snapshots could archive the default before the lifecycle guard
+    // existed. Model that state directly to keep the feedback defense test.
     pack.dispatch(
-        "brain.deactivate",
+        "brain.profile",
         json!({"profile_id": "balanced-recall-v1"}),
         &registry,
         &token,
     )
     .await
     .unwrap();
-
-    // Archive the default profile.
-    pack.dispatch(
-        "brain.archive",
-        json!({"profile_id": "balanced-recall-v1"}),
-        &registry,
-        &token,
-    )
-    .await
-    .unwrap();
+    pack.state
+        .lock()
+        .unwrap()
+        .profiles
+        .get_mut("balanced-recall-v1")
+        .unwrap()
+        .lifecycle = khive_brain_core::ProfileLifecycle::Archived;
 
     // Baseline: total_events on default profile before the attempted feedback.
     // Also capture brain.events count so we catch any FeedbackExplicit row that
@@ -7321,6 +7516,230 @@ mod adr081_retune_driver_tests {
             .expect("row must exist");
         assert_eq!(row.grade.as_deref(), Some("implicit_positive"));
         assert_eq!(row.scorer_run_id.as_deref(), Some("scorer-run-2"));
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_accounting_profile_overrides_default_and_rejects_misstatement() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "ledger-profile-v1", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.activate",
+            json!({"profile_id": "ledger-profile-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-profile-row",
+            "local",
+            "recall",
+            Some("ledger-profile-v1"),
+            Some("balanced-recall-v1"),
+            Some(500),
+            &target,
+            "class-profile",
+            "raw query",
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = pack.snapshot();
+        let mismatch = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "served_by_profile_id": "balanced-recall-v1",
+                    "scorer_run_id": "ledger-profile-run",
+                    "serve_ledger_id": "ledger-profile-row",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(mismatch, RuntimeError::InvalidInput(message) if message.contains("accounting_profile_id"))
+        );
+        assert_eq!(pack.snapshot().balanced_recall, before.balanced_recall);
+
+        // No caller profile: the default resolver would choose balanced-recall-v1,
+        // while the row says ledger-profile-v1 actually served this target.
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "ledger-profile-run",
+                    "serve_ledger_id": "ledger-profile-row",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["served_by_profile_id"], "ledger-profile-v1");
+        assert_eq!(result["serve_attribution"], "profile");
+
+        let after = pack.snapshot();
+        assert_eq!(
+            after.profile_states["ledger-profile-v1"].total_events,
+            before.profile_states["ledger-profile-v1"].total_events + 1,
+        );
+        assert_eq!(
+            after.balanced_recall.total_events, before.balanced_recall.total_events,
+            "the caller default must not receive the row's feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_ledger_target_mismatch_is_rejected_before_and_after_grade() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let served_target = create_test_entity(&rt, &token).await;
+        let other_target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-target-row",
+            "local",
+            "recall",
+            Some("balanced-recall-v1"),
+            None,
+            None,
+            &served_target,
+            "class-target",
+            "raw query",
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = |target: &str| {
+            json!({
+                "target_id": target,
+                "signal": "implicit_positive",
+                "scorer_run_id": "ledger-target-run",
+                "serve_ledger_id": "ledger-target-row",
+            })
+        };
+        let mismatch = pack
+            .dispatch("brain.feedback", params(&other_target), &registry, &token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(mismatch, RuntimeError::InvalidInput(message) if message.contains("target_id"))
+        );
+        assert!(
+            crate::serve_ledger::get_serve_row(rt.sql().as_ref(), "ledger-target-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .grade
+                .is_none(),
+            "a mismatched target must not grade the row"
+        );
+
+        let first = pack
+            .dispatch("brain.feedback", params(&served_target), &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(first["emitted"], true);
+        let mismatched_replay = pack
+            .dispatch("brain.feedback", params(&other_target), &registry, &token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(mismatched_replay, RuntimeError::InvalidInput(message) if message.contains("target_id"))
+        );
+        let replay = pack
+            .dispatch("brain.feedback", params(&served_target), &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(replay["deduped"], true);
+    }
+
+    #[tokio::test]
+    async fn explicit_scorer_feedback_refuses_before_claiming_dedup_key() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-explicit-row",
+            "local",
+            "recall",
+            Some("balanced-recall-v1"),
+            None,
+            None,
+            &target,
+            "class-explicit",
+            "raw query",
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rejected = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "scorer_run_id": "ledger-explicit-run",
+                    "serve_ledger_id": "ledger-explicit-row",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(rejected, RuntimeError::InvalidInput(message) if message.contains("implicit_positive"))
+        );
+        let row = crate::serve_ledger::get_serve_row(rt.sql().as_ref(), "ledger-explicit-row")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.grade.is_none());
+
+        let accepted = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "ledger-explicit-run",
+                    "serve_ledger_id": "ledger-explicit-row",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted["emitted"], true);
     }
 
     #[tokio::test]
@@ -11604,7 +12023,9 @@ mod feedback_actor_tests {
 /// two paths that deliberately count nothing, and then pin that a run of
 /// signals serializes nothing until someone reads.
 mod dispatch_counters {
-    use khive_brain_core::{BalancedRecallState, BrainSignal, BrainState, ServeAttribution};
+    use khive_brain_core::{
+        BalancedRecallState, BrainSignal, BrainState, ProfileLifecycle, ServeAttribution,
+    };
     use serde_json::json;
     use std::sync::atomic::Ordering;
     use uuid::Uuid;
@@ -11666,6 +12087,32 @@ mod dispatch_counters {
             (0, 0),
             "a failed profile read proves no profile served, so nothing was applied to count"
         );
+    }
+
+    #[test]
+    fn archived_default_and_named_profiles_ignore_dispatch_signals() {
+        let mut state = BrainState::new(8);
+        let mut named = state.profiles["balanced-recall-v1"].clone();
+        named.id = "archived-v1".into();
+        named.lifecycle = ProfileLifecycle::Archived;
+        state.profiles.insert(named.id.clone(), named);
+        state
+            .profile_states
+            .insert("archived-v1".into(), BalancedRecallState::new(8));
+        state
+            .profiles
+            .get_mut("balanced-recall-v1")
+            .unwrap()
+            .lifecycle = ProfileLifecycle::Archived;
+
+        crate::apply_dispatch_signal(&mut state, &hit(None, ServeAttribution::Unspecified));
+        crate::apply_dispatch_signal(
+            &mut state,
+            &hit(Some("archived-v1"), ServeAttribution::Profile),
+        );
+        assert_eq!(counts(&state), (0, 0));
+        assert_eq!(state.balanced_recall.total_events, 0);
+        assert_eq!(state.profile_states["archived-v1"].total_events, 0);
     }
 
     #[test]

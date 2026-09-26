@@ -6,6 +6,26 @@ across namespaces. This doc covers the races that arise from that design and the
 regression tests in `crates/khive-pack-brain/src/tests.rs` (private `mod tests`) that pin
 the fixes.
 
+## Non-blocking dispatch-hook handoff (#3314, #3316)
+
+The post-dispatch hook discards `Irrelevant` signals before taking any lock. For
+useful signals it tries `dispatch_gate` without waiting. If a brain handler owns
+the gate, the hook enqueues the typed signal with its namespace and serving
+profile attribution, then returns to the non-brain caller. One worker drains
+that queue under the gate in batches, so namespace-slot routing retains the
+same isolation rule as direct hook application. The handoff keeps the most
+recent 1024 signals; overflow evicts the oldest and increments the process-local
+`contended_hook_signals_dropped` diagnostic in `brain.state.dispatch_counters`.
+If a brain dispatch takes the gate before that worker, it loads its namespace
+then drains the queued signals before its handler reads state. The worker stays
+elected and handles any signals enqueued during the handler.
+
+A namespace that has never loaded brain state keeps at most 256 useful signals
+until `ensure_loaded` applies them after snapshot restore and event replay.
+Overflow evicts the oldest, increments `cold_hook_signals_dropped`, and does not
+mark the namespace loaded. Both counters describe the hook's existing
+best-effort, in-memory signal path; neither claims durable replay.
+
 ## `concurrent_cold_load_does_not_clobber_live_state`
 
 Deterministic interleaving test for the concurrent cold-load race. Interleaving

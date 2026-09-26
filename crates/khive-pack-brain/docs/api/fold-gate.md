@@ -57,6 +57,13 @@ other writer can observe or mutate that row between the read and the write.
 
 ## Scorer dedup (ADR-081 §2/§6)
 
+Scorer provenance is accepted only with `implicit_positive` or
+`implicit_negative`, the signals ADR-081 §3 assigns to scorer grades. An
+explicit/correction signal carrying scorer fields is rejected before any
+write; ordinary explicit feedback without those fields remains unchanged.
+For scorer feedback, the selected target and feedback namespace must match
+the serve row, and its `accounting_profile_id` determines the credited profile.
+
 A scorer-tagged event additionally claims a `(scorer_run_id, serve_ledger_id)` key in
 `brain_scorer_dedup` via `INSERT OR IGNORE`, inside the SAME held `BEGIN IMMEDIATE`
 transaction as the mass check-and-fold. A conflicting insert (0 rows affected) means a
