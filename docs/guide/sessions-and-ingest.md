@@ -95,10 +95,10 @@ verbatim.
 ## Provider mirror ingest
 
 The [mirror service](../../crates/khive-pack-session/src/mirror/service.rs) is a background task,
-distinct from the four verbs above, that discovers and tails local transcript files through the
+distinct from the four note-backed verbs above, that discovers and tails local transcript files through the
 [ingest module](../../crates/khive-pack-session/src/mirror/ingest.rs). It writes their events into
 three dedicated tables (`sessions`, `session_messages`, `session_mirror_cursor`) created by the
-pack's schema plan in
+versioned mirror migration and the pack's idempotent schema plan in
 [`src/vocab.rs`](../../crates/khive-pack-session/src/vocab.rs). It never calls `session.store` and
 does not create `session` notes.
 
@@ -194,8 +194,10 @@ request(ops="session.list(provider=\"claude_code\", limit=5)")
 ## Auditing the surface
 
 The wire contract is discoverable without relying on implementation paths:
-`request(ops="verbs(pack=\"session\")")` lists the four public verbs, and the
-[API reference](api-reference.md) records their parameters and response shapes. The source links
+`request(ops="verbs(pack=\"session\")")` lists five public verbs. Search
+remains unavailable until transcript deletion and resume/export continuity
+support are available. The [API reference](api-reference.md) records their
+parameters and response shapes. The source links
 above are implementation anchors verified in this distribution, not a substitute for runtime
 discovery.
 

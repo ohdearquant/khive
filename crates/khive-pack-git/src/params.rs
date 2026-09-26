@@ -77,6 +77,15 @@ arguments!(Branch {
     expected,
     session_id
 });
+arguments!(UpdateRef {
+    repo,
+    branch,
+    to,
+    expected,
+    require_fast_forward,
+    reason,
+    session_id
+});
 arguments!(Push {
     repo,
     branch,
@@ -169,6 +178,7 @@ pub(crate) fn parse(verb: &str, params: Value) -> Result<Value, RuntimeError> {
         "git.ingest_cursor" => decode::<IngestCursor>(verb, params),
         "git.commit" => decode::<Commit>(verb, params),
         "git.branch" => decode::<Branch>(verb, params),
+        "git.update_ref" => decode::<UpdateRef>(verb, params),
         "git.push" => decode::<Push>(verb, params),
         "git.pr_open" => decode::<PrOpen>(verb, params),
         "git.pr_review" => decode::<PrReview>(verb, params),

@@ -25,7 +25,7 @@ Python contract coverage added here:
   T6d analog  — malformed tags are rejected with per-op ok=false, not silently dropped
   T7a analog  — entity_kind field is non-null in entity search results
   T7b analog  — granular kind filter excludes entities of other kinds
-  T7c analog  — min_score floor is applied; impossibly high threshold yields empty results
+  T7c analog  — canonical rank floor and deprecated alias exclude below-floor hits
   cross-substrate isolation  — entity and note searches do not contaminate each other
   batch dispatch  — search and link in the same batch op dispatch independently
 """
@@ -41,6 +41,7 @@ from typing import Iterator
 import pytest
 
 from khive_contract.client import KhiveMcpSession, OwnedContractStore, error_text
+from khive_contract.schema import assert_search_response
 
 VERBS_UNDER_TEST = {"create", "search", "link"}
 
@@ -291,64 +292,42 @@ def test_search_kind_filter_excludes_off_kind(
 
 
 # ---------------------------------------------------------------------------
-# T7c analog: min_score floor applied
+# T7c analog: canonical rank floor and its deprecated exact alias
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.coordinator_fanout
 @pytest.mark.slow
-def test_search_min_score_filters_all_below_threshold(
+@pytest.mark.parametrize("floor_name", ["min_rank_score", "min_score"])
+def test_search_min_rank_score_filters_all_below_threshold(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
+    floor_name: str,
 ) -> None:
-    """search(kind="entity", min_score=1.0) returns empty results for any real entity.
+    """Both floor names filter the same ranking value in the valid [0, 1] domain.
 
-    Source: crates/kkernel/src/coordinator/tests.rs
-      t7c_multi_backend_search_min_score_applied
-
-    RRF scores for any real hit are always <= 1/(60+1) ~= 0.016, so a floor of
-    1.0 is above any achievable score.  If the coordinator or handler ignores
-    min_score, the seeded entity would be returned and this test fails; an empty
-    result proves the floor is applied.
-
-    This port previously used 2.0, which is outside the documented 0.0-1.0 range
-    and was only accepted because the range was unenforced.  Its own Rust source
-    uses 1.0.  The intent, a floor above every achievable score, is expressible
-    inside the contract, so the out-of-range value bought nothing and hid the
-    fact that the range was a promise with nothing behind it.
+    The fixture first establishes that its hits have rank_score below 1.0;
+    no universal upper bound is inferred across fusion strategies or backends.
     """
     ns = temp_namespace
-
-    khive_session.verb("create", {
-        "kind": "concept",
-        "name": f"cft7c_minscore_probe_{ns[-6:]}",
-        "description": "coordinator fanout T7c min_score probe entity",
-        "namespace": ns,
-    })
-
-    # Confirm the entity is findable without the floor (sanity check).
-    unfiltered = khive_session.verb("search", {
-        "kind": "entity",
-        "query": "cft7c_minscore_probe",
-        "namespace": ns,
-    })
-    assert isinstance(unfiltered, list) and len(unfiltered) >= 1, (
-        "sanity: seeded entity must appear without min_score filter"
+    khive_session.verb(
+        "create",
+        {
+            "kind": "concept",
+            "name": f"cft7c_rank_probe_{ns[-6:]}",
+            "description": "coordinator fanout rank floor probe entity",
+            "namespace": ns,
+        },
     )
+    args = {"kind": "entity", "query": "cft7c_rank_probe", "namespace": ns}
+    unfiltered = khive_session.verb("search", args)
+    assert_search_response(unfiltered)
+    assert unfiltered, "seeded entity must appear without the rank floor"
+    assert all(hit["rank_score"] < 1.0 for hit in unfiltered)
 
-    # Now apply an impossibly high min_score.
-    hits = khive_session.verb("search", {
-        "kind": "entity",
-        "query": "cft7c_minscore_probe",
-        "min_score": 1.0,
-        "namespace": ns,
-    })
-
-    assert isinstance(hits, list), f"search must return a list; got {type(hits)}"
-    assert hits == [], (
-        "min_score=1.0 must exclude all results (no real RRF score can reach 1.0); "
-        f"got {len(hits)} hit(s): {hits}"
-    )
+    hits = khive_session.verb("search", {**args, floor_name: 1.0})
+    assert_search_response(hits)
+    assert hits == [], f"{floor_name}=1.0 must exclude this fixture's below-floor hits"
 
 
 # ---------------------------------------------------------------------------

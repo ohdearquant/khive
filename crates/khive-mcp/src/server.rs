@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
-use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
+use khive_pack_kg::handlers::{search_rank_fields, SearchSubstrate, ValidatedSearchRequest};
 use khive_request::{
     parse_request, parse_typed_json_batch, unit_write_key_conflicts, ArgValue, DslError,
     ExecutionMode, ParsedOp, ParsedRequest, PrevFailure, TypedJsonOp,
@@ -786,16 +786,18 @@ fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
-/// Two servers produce the same id iff they can safely share one warm engine:
+/// Identical resolved configurations produce the same id. A daemon may also
+/// serve a compatible client with a different id when it has a superset of
+/// the client's requested extra embedders. Every other field must match:
 /// same pack set (order-independent), same storage target and effective access
-/// mode, same embedders, same backend topology/routing, and same
+/// mode, same primary embedder, same backend topology/routing, and same
 /// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
 /// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
-/// compares this against each forwarded request's `config_id` and rejects
-/// mismatches so a restricted client (e.g. `--pack kg`, `--db :memory:`) cannot
-/// execute through the broader default daemon.
+/// compares this against each forwarded request's `config_id` and rejects any
+/// difference outside the extra-embedder superset rule, so a restricted client
+/// cannot execute through a broader runtime with incompatible behavior.
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
 /// declaration, the backend topology (sorted backend list, explicit read-only
@@ -3161,13 +3163,13 @@ async fn dispatch_via_coordinator_inner(
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
                         // entity_kind/note_kind), `name`, and `created_at`.
-                        // Entity hits: [{id, kind, entity_kind, name, score, source, title, snippet, created_at}]
-                        // Note hits:   [{id, kind, note_kind, name, score, source, title, snippet, created_at}]
+                        // Ranking fields use the same conversion as the KG path;
+                        // the metadata below retains this route's existing shape.
                         let result_val = if request.substrate() == SearchSubstrate::Note {
                             let items: Vec<Value> = coord_result
                                 .note_hits
                                 .iter()
-                                .filter(|h| h.score.to_f64() >= request.min_score())
+                                .filter(|h| h.score >= request.min_rank_score())
                                 .filter_map(|h| {
                                     let version = coord_result.note_versions.get(&h.note_id)?;
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
@@ -3181,19 +3183,24 @@ async fn dispatch_via_coordinator_inner(
                                         .note_updated_at
                                         .get(&h.note_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
-                                    Some(json!({
+                                    let ranking =
+                                        search_rank_fields(h.score, h.rank_score_kind, h.signals);
+                                    let mut row = json!({
                                         "id": h.note_id.to_string(),
                                         "kind": note_kind,
                                         "note_kind": note_kind,
                                         "name": name,
-                                        "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
                                         "updated_at": updated_at,
                                         "version": version,
-                                    }))
+                                    });
+                                    row.as_object_mut().expect("search row object").extend(
+                                        ranking.as_object().expect("ranking fields object").clone(),
+                                    );
+                                    Some(row)
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
@@ -3201,7 +3208,7 @@ async fn dispatch_via_coordinator_inner(
                             let items: Vec<Value> = coord_result
                                 .entity_hits
                                 .iter()
-                                .filter(|h| h.score.to_f64() >= request.min_score())
+                                .filter(|h| h.score >= request.min_rank_score())
                                 .map(|h| {
                                     let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
                                     let created_at = coord_result
@@ -3212,20 +3219,25 @@ async fn dispatch_via_coordinator_inner(
                                         .entity_updated_at
                                         .get(&h.entity_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
+                                    let ranking =
+                                        search_rank_fields(h.score, h.rank_score_kind, h.signals);
                                     let version = coord_result.entity_versions.get(&h.entity_id);
-                                    json!({
+                                    let mut row = json!({
                                         "id": h.entity_id.to_string(),
                                         "kind": entity_kind,
                                         "entity_kind": entity_kind,
                                         "name": h.title,
-                                        "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
                                         "updated_at": updated_at,
                                         "version": version,
-                                    })
+                                    });
+                                    row.as_object_mut().expect("search row object").extend(
+                                        ranking.as_object().expect("ranking fields object").clone(),
+                                    );
+                                    row
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
@@ -3245,7 +3257,7 @@ async fn dispatch_via_coordinator_inner(
                         .map(|items| items.is_empty())
                         .unwrap_or(true);
                     // ADR-130 §1: a backend failure with zero surviving hits
-                    // (post server-side filtering, min_score included) is a
+                    // (post server-side filtering, min_rank_score included) is a
                     // failed operation, not a successful empty result — the
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
@@ -5590,6 +5602,7 @@ mod tests {
     use std::{collections::BTreeMap, future::Future, sync::Arc};
     include!("server/plan_tests.rs");
     include!("server/search_text_reason_tests.rs");
+    include!("server/search_ranking_tests.rs");
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 

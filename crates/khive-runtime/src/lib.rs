@@ -15,6 +15,7 @@ pub mod atomic_runner;
 pub mod audit_batch;
 pub mod blob;
 pub mod build_info;
+pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
@@ -178,7 +179,7 @@ pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceR
 pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
-pub use retrieval::{HybridSearchOutcome, SearchHit, SearchSource};
+pub use retrieval::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,

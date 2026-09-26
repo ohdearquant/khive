@@ -18,7 +18,7 @@ khive gives your agent:
 Production packs load by default; discover the exact loaded surface with
 `request(ops="verbs()")`. The `git` pack contributes the `git.digest` verb plus the
 commit/issue/pull_request provenance note kinds
-and a batch ingester, and three write verbs, `git.commit` / `git.branch` / `git.push`
+and a batch ingester, and four write verbs, `git.commit` / `git.branch` / `git.update_ref` / `git.push`
 (ADR-108), that shell to system git with hardened, allowlisted argv construction — no
 tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
 pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
@@ -326,14 +326,15 @@ is a **closed enum** — valid values: `overview` | `core_model` | `boundary_con
 `references` | `other`. Content must be **at least 80 characters**. Shorter content or an
 unrecognized `section_type` returns a validation error listing the valid values.
 
-### Session pack — 4 verbs (`session.` prefix)
+### Session pack — 5 verbs (`session.` prefix)
 
-| Verb             | What it does                                      | When to use                              |
-| ---------------- | ------------------------------------------------- | ---------------------------------------- |
-| `session.store`  | Persist an agent-session record as a session note | Checkpoint/save a completed session      |
-| `session.list`   | List stored sessions, newest first                | "What sessions have I run?"              |
-| `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session |
-| `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive |
+| Verb             | What it does                                      | When to use                                                    |
+| ---------------- | ------------------------------------------------- | -------------------------------------------------------------- |
+| `session.store`  | Persist an agent-session record as a session note | Checkpoint/save a completed session                            |
+| `session.list`   | List stored sessions, newest first                | "What sessions have I run?"                                    |
+| `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session                       |
+| `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive                       |
+| `session.search` | Search scoped mirrored transcript text (gated)    | After transcript deletion and continuity support are available |
 
 Each `session.list` summary carries `full_id`, the canonical UUID to reuse with
 `session.resume` or `session.export`. Presentation mode does not remove it; the

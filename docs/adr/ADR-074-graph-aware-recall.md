@@ -13,7 +13,7 @@
 
 ### What ships today
 
-`memory.recall` runs a multi-stage pipeline (ADR-033): FTS5 candidates and vector candidates are fused via RRF, then an optional weighted-feature reranker (`RecallConfig.reranker_weights`) replaces the default scoring when any weight is set. The shipped feature keys for `weighted_rerank` in `crates/khive-pack-memory/src/rerank.rs` (lines 29-37) are exactly five:
+`memory.recall` runs a multi-stage pipeline (ADR-033): FTS5 candidates and vector candidates are fused via RRF, then an optional weighted-feature reranker (`RecallConfig.reranker_weights`) replaces the default scoring when any weight is set. The shipped feature keys for `weighted_rerank` in `crates/khive-pack-memory/src/rerank.rs` (the name `match` inside `weighted_rerank`) are exactly five:
 
 | Key            | Source                                             |
 | -------------- | -------------------------------------------------- |
@@ -23,7 +23,7 @@
 | `text_match`   | Boolean: candidate appeared in FTS results         |
 | `vector_match` | Boolean: candidate appeared in vector results      |
 
-`graph_proximity` is listed as a planned built-in name in `crates/khive-pack-memory/src/config.rs:53`, but it is not a match arm in `rerank.rs`. A caller who sets `reranker_weights["graph_proximity"]` today gets the key silently ignored (falls through to `_ => continue`).
+`graph_proximity` is listed as a planned built-in name in `crates/khive-pack-memory/src/config.rs` (the doc comment on `RecallConfig::reranker_weights`), but it is not a recognized key in `weighted_rerank`. A caller who sets `reranker_weights["graph_proximity"]` today gets the key silently ignored (unrecognized names are skipped).
 
 The typed knowledge-graph edges, the substrate khive was designed around, are not consulted at all during flat recall.
 
@@ -164,4 +164,4 @@ Acceptance is pending the lattice parity measurements and maintainer approval. T
 - GitHub #80: Retrieval coverage metric — the measurement accumulation point for recall-lift parity figures
 - `crates/khive-pack-memory/src/rerank.rs`: `weighted_rerank` function; the new `graph_proximity` match arm lands here
 - `crates/khive-pack-memory/src/handlers/recall.rs`: the pre-rerank proximity step lands here
-- `crates/khive-runtime/src/operations.rs` (lines 1521, 1585, 1670): `neighbors`, `traverse`, `enrich_neighbor_hits` — the graph expansion primitives reused by the proximity step
+- `crates/khive-runtime/src/operations.rs`: `KhiveRuntime::neighbors`, `KhiveRuntime::traverse`, `KhiveRuntime::enrich_neighbor_hits` — the graph expansion primitives reused by the proximity step

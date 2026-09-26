@@ -185,6 +185,9 @@ web_verbs! {
             #[serde(default)]
             namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
                                   authorized token namespace, never elevates capability.", NotApplicable);
+            #[serde(default)]
+            link_limit: Option<u32> => (4, "Maximum number of unique href targets to process for links on this page. \
+                                  Defaults to 100 and cannot exceed 1,000.", NotApplicable);
         }
     }
     IngestParams => HandlerDef {
@@ -206,6 +209,9 @@ web_verbs! {
             #[serde(default)]
             namespace: Option<String> => (4, "Narrows the write to a namespace; must equal the caller's own \
                                   authorized token namespace, never elevates capability.", NotApplicable);
+            #[serde(default)]
+            extract_links: Option<bool> => (5, "In URL mode, true at depth 0 records link edges without following them. \
+                                  Positive depth extracts links as needed for traversal. Defaults to false at depth 0.", NotApplicable);
         }
     }
     SearchParams => HandlerDef {
@@ -444,6 +450,7 @@ mod tests {
         assert_eq!(extract.id, None);
         assert_eq!(extract.url, None);
         assert_eq!(extract.kinds, None);
+        assert_eq!(extract.link_limit, None);
         assert_eq!(extract.namespace, None);
 
         let ingest: IngestParams =
@@ -451,6 +458,7 @@ mod tests {
         assert_eq!(ingest.origin, None);
         assert_eq!(ingest.depth, None);
         assert_eq!(ingest.limit, None);
+        assert_eq!(ingest.extract_links, None);
         assert_eq!(ingest.namespace, None);
 
         let search: SearchParams = serde_json::from_value(json!({"query": "test"})).unwrap();
@@ -482,6 +490,7 @@ mod tests {
         assert!(serde_json::from_str::<FetchParams>(r#"{"url":"a","url":"b"}"#).is_err());
         assert!(serde_json::from_value::<ExtractParams>(json!({"id": "bad-id"})).is_err());
         assert!(serde_json::from_value::<ExtractParams>(json!({"kinds": [1]})).is_err());
+        assert!(serde_json::from_value::<ExtractParams>(json!({"link_limit": -1})).is_err());
         assert!(serde_json::from_value::<IngestParams>(json!({
             "source": "https://example.test/", "depth": u64::from(u32::MAX) + 1
         }))

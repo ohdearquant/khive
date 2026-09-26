@@ -3,7 +3,8 @@
 //! `RuntimeConfig`, `BackendId`, `NamespaceToken`, and embedding model helpers
 //! live in `super::config` and are re-exported from here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use khive_db::StorageBackend;
@@ -23,6 +24,44 @@ use crate::config::{
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::pack::KindHook;
+
+tokio::task_local! {
+    static REQUEST_EMBEDDER_EXCLUSIONS: Arc<HashSet<String>>;
+}
+
+/// Run one request with daemon-only embedding models excluded from registry access.
+pub fn scope_request_embedder_exclusions<F>(
+    excluded: Vec<String>,
+    future: F,
+) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    REQUEST_EMBEDDER_EXCLUSIONS.scope(Arc::new(excluded.into_iter().collect()), future)
+}
+
+/// Carry the current request's embedder exclusions into a spawned task.
+pub fn inherit_request_embedder_scope<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let exclusions = REQUEST_EMBEDDER_EXCLUSIONS.try_with(Arc::clone).ok();
+    async move {
+        match exclusions {
+            Some(exclusions) => REQUEST_EMBEDDER_EXCLUSIONS.scope(exclusions, future).await,
+            None => future.await,
+        }
+    }
+}
+
+fn request_excludes_embedder(name: &str) -> bool {
+    let canonical = parse_embedding_model_alias(name)
+        .map(|model| model.to_string())
+        .unwrap_or_else(|| name.to_string());
+    REQUEST_EMBEDDER_EXCLUSIONS
+        .try_with(|excluded| excluded.contains(&canonical))
+        .unwrap_or(false)
+}
 
 /// Callback type for pack-installed entity-type validators.
 ///
@@ -286,12 +325,25 @@ impl KhiveRuntime {
     /// [`from_backend`](Self::from_backend) seam is likewise only for an
     /// already-prepared backend.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
+        Self::new_with_file_backend(config, |path| StorageBackend::sqlite(path))
+    }
+
+    /// Construct a fixture runtime with a small concurrent reader pool.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn new_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
+        Self::new_with_file_backend(config, |path| StorageBackend::sqlite_for_test(path))
+    }
+
+    fn new_with_file_backend(
+        config: RuntimeConfig,
+        open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
+    ) -> RuntimeResult<Self> {
         let backend = match &config.db_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
-                StorageBackend::sqlite(path)?
+                open_file(path)?
             }
             None => StorageBackend::memory()?,
         };
@@ -321,8 +373,23 @@ impl KhiveRuntime {
     /// or configured-model registration writes are attempted. A `None` path
     /// retains the historical ephemeral in-memory behavior for tests.
     pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
+        Self::new_readonly_with_file_backend(config, |path| StorageBackend::sqlite_read_only(path))
+    }
+
+    /// Construct a read-only fixture runtime with a small reader pool.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn new_readonly_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
+        Self::new_readonly_with_file_backend(config, |path| {
+            StorageBackend::sqlite_read_only_for_test(path)
+        })
+    }
+
+    fn new_readonly_with_file_backend(
+        config: RuntimeConfig,
+        open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
+    ) -> RuntimeResult<Self> {
         let backend = match &config.db_path {
-            Some(path) => StorageBackend::sqlite_read_only(path)?,
+            Some(path) => open_file(path)?,
             None => StorageBackend::memory()?,
         };
         backend.prepare_core_schema()?;
@@ -911,6 +978,9 @@ impl KhiveRuntime {
     /// Resolve the storage identity and declared dimensions together so guarded
     /// SQL publication agrees with VectorStore, including built-in aliases.
     pub(crate) fn vector_model_metadata(&self, model_name: &str) -> RuntimeResult<(String, usize)> {
+        if request_excludes_embedder(model_name) {
+            return Err(crate::RuntimeError::UnknownModel(model_name.to_string()));
+        }
         let registry = self
             .embedder_registry
             .read()
@@ -1042,6 +1112,9 @@ impl KhiveRuntime {
     /// custom provider's declared `dimensions()`. `None` when no such model
     /// is registered.
     pub fn embedder_dimensions(&self, model_name: &str) -> Option<usize> {
+        if request_excludes_embedder(model_name) {
+            return None;
+        }
         if let Some(model) = parse_embedding_model_alias(model_name) {
             let key = model.to_string();
             let in_registry = self
@@ -1786,6 +1859,12 @@ impl KhiveRuntime {
                 .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?,
         };
         let key = model.to_string();
+        if request_excludes_embedder(&key) {
+            return Err(crate::RuntimeError::UnknownModel(
+                name.unwrap_or_else(|| self.default_embedder_name())
+                    .to_string(),
+            ));
+        }
         let contains = self
             .embedder_registry
             .read()
@@ -1810,7 +1889,12 @@ impl KhiveRuntime {
     pub fn registered_embedding_model_names(&self) -> Vec<String> {
         self.embedder_registry
             .read()
-            .map(|reg| reg.names())
+            .map(|reg| {
+                reg.names()
+                    .into_iter()
+                    .filter(|name| !request_excludes_embedder(name))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1849,6 +1933,9 @@ impl KhiveRuntime {
             Some(model) => model.to_string(),
             None => name.to_owned(),
         };
+        if request_excludes_embedder(&canonical_key) {
+            return Err(crate::RuntimeError::UnknownModel(name.to_string()));
+        }
         // Clone the entry so we don't hold the RwLockGuard across the
         // async OnceCell initialisation (Send bound).
         let entry = {
@@ -2220,7 +2307,7 @@ mod tests {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).expect("file runtime");
+        let rt = KhiveRuntime::new_for_test(config).expect("file runtime");
         let data_dir = rt
             .backend_data_dir()
             .expect("file backend must return Some");
@@ -2235,6 +2322,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefix_finds_sidecar_only_event() {
         let dir = tempfile::tempdir().unwrap();
+        let _registry_guard = crate::events_split::TestRegistryGuard::new(dir.path());
         let sidecar_path = dir.path().join("main.db.events.db");
         let config = RuntimeConfig {
             web: Default::default(),
@@ -2261,7 +2349,7 @@ mod tests {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).expect("file runtime");
+        let rt = KhiveRuntime::new_for_test(config).expect("file runtime");
 
         let event = khive_storage::Event::new(
             "local",
@@ -2351,7 +2439,7 @@ mod tests {
             actor_id: None,
             exec: Default::default(),
         };
-        let rt = KhiveRuntime::new(config).expect("file runtime should create");
+        let rt = KhiveRuntime::new_for_test(config).expect("file runtime should create");
         assert!(path.exists());
         assert_eq!(rt.config().default_namespace.as_str(), "test");
     }
@@ -2386,7 +2474,8 @@ mod tests {
             exec: Default::default(),
         };
         {
-            let writable = KhiveRuntime::new(base.clone()).expect("create migrated snapshot");
+            let writable =
+                KhiveRuntime::new_for_test(base.clone()).expect("create migrated snapshot");
             assert!(writable
                 .list_embedding_models(None)
                 .await
@@ -2406,7 +2495,7 @@ mod tests {
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             ..base
         };
-        let runtime = KhiveRuntime::new(read_only_config)
+        let runtime = KhiveRuntime::new_for_test(read_only_config)
             .expect("read-only boot must validate instead of migrating/registering");
         assert!(runtime.is_read_only());
         assert_eq!(
@@ -2450,11 +2539,11 @@ mod tests {
             actor_id: None,
             exec: Default::default(),
         };
-        KhiveRuntime::new(config.clone()).expect("create migrated database");
+        KhiveRuntime::new_for_test(config.clone()).expect("create migrated database");
         #[cfg(unix)]
         khive_storage::test_support::freeze_snapshot_sidecars(&path);
 
-        let runtime = KhiveRuntime::new_readonly(config).expect("explicit read-only boot");
+        let runtime = KhiveRuntime::new_readonly_for_test(config).expect("explicit read-only boot");
         assert!(runtime.is_read_only());
         assert_eq!(
             runtime.backend().pool().writer_acquisition_snapshot(),
@@ -2602,10 +2691,10 @@ mod tests {
             events_split: None,
             exec: Default::default(),
         };
-        KhiveRuntime::new(config.clone()).expect("create migrated database");
+        KhiveRuntime::new_for_test(config.clone()).expect("create migrated database");
         #[cfg(unix)]
         khive_storage::test_support::freeze_snapshot_sidecars(&path);
-        let runtime = KhiveRuntime::new_readonly(config).expect("read-only boot");
+        let runtime = KhiveRuntime::new_readonly_for_test(config).expect("read-only boot");
         assert!(runtime.is_read_only());
         (dir, runtime)
     }
@@ -2848,7 +2937,8 @@ mod tests {
 
             let tilde_cfg = make_config(tilde_anchor.clone());
 
-            let rt = KhiveRuntime::new(tilde_cfg).expect("boot must open the expanded path");
+            let rt =
+                KhiveRuntime::new_for_test(tilde_cfg).expect("boot must open the expanded path");
             assert_eq!(
                 rt.backend_data_dir().expect("file backend"),
                 home_dir.path(),

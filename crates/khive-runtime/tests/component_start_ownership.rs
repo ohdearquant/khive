@@ -138,7 +138,11 @@ async fn component_start_ownership_child() {
         "incumbent" => {
             let child = Incumbent(Command::new("sleep").arg("30").spawn().unwrap());
             std::fs::write(pid_path(), child.0.id().to_string()).unwrap();
-            incumbent = Some(child);
+            // A live PID alone is a reused PID and is reclaimed; an incumbent
+            // daemon also holds its PID file's lock, so this one holds it too.
+            let lock = std::fs::File::open(pid_path()).unwrap();
+            lock.lock().unwrap();
+            incumbent = Some((child, lock));
         }
         "startup-panic" => {}
         _ => panic!("unknown scenario"),
@@ -176,8 +180,8 @@ async fn component_start_ownership_child() {
             "untrusted" => assert!(error.to_string().contains("writable by")),
             "bind" => assert!(sock.is_dir()),
             "pid" => assert!(
-                std::fs::metadata(&sock).unwrap().file_type().is_socket(),
-                "the PID arm must reach socket bind"
+                std::fs::symlink_metadata(&sock).is_err(),
+                "the PID claim precedes socket bind, so a failed claim must leave no socket"
             ),
             "incumbent" => assert!(error.to_string().contains("owns the daemon PID file")),
             _ => unreachable!(),

@@ -6,8 +6,8 @@
 //! or XML parser crate is a workspace dependency, so every extraction here
 //! uses regex matches and a fixed-capacity text scan rather than a DOM walk.
 //!
-//! - `links`: every `<a href="...">` in an HTML body becomes a
-//!   `page links_to page|resource` edge (D2's new base row) to a target
+//! - `links`: up to the per-page limit of `<a href="...">` values in an HTML
+//!   body become `page links_to page|resource` edges to a target
 //!   minted, if absent, as an unfetched `resource` (`status: null`) — never
 //!   overwritten if the target already exists and has been fetched.
 //! - `sitemap`/`feed`: every `<loc>`/`<link>` entry becomes a `resource`
@@ -22,19 +22,21 @@
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
 use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
-use crate::egress::Refusal;
+use crate::egress::{self, Refusal};
 use crate::identity;
 use crate::vocab::ExtractParams;
 use crate::WebPack;
 
 const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
+pub(crate) const DEFAULT_LINK_LIMIT: u32 = 100;
+const MAX_LINK_LIMIT: u32 = 1_000;
 // Two fixed text buffers plus at most three UTF-8 bytes per raw byte (U+FFFD).
 // This pack-local aggregate budget is separate from raw blob admission. A
 // request acquires it once, after hydration, and never upgrades its reservation.
@@ -422,10 +424,16 @@ async fn extract_links(
     document_id: Uuid,
     base_url: &Url,
     body: &str,
-) -> Result<u32, RuntimeError> {
+    link_limit: u32,
+) -> Result<(u32, u32), RuntimeError> {
     let mut seen = std::collections::HashSet::new();
-    let mut count = 0u32;
+    let mut targets = Vec::new();
+    let mut skipped = 0u32;
     for capture in HREF_RE.captures_iter(body) {
+        if targets.len() >= link_limit as usize {
+            skipped += 1;
+            continue;
+        }
         let href = capture[1].trim();
         if href.is_empty() || href.starts_with("javascript:") || href.starts_with("mailto:") {
             continue;
@@ -442,6 +450,13 @@ async fn extract_links(
             continue;
         }
         let site = identity::site_id(&canonical);
+        let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
+        targets.push((request_url, canonical, site, target_id));
+    }
+
+    let processed = targets.len() as u32;
+    let mut link_specs = Vec::with_capacity(targets.len() * 2);
+    for (request_url, canonical, site, target_id) in targets {
         crate::entities::get_or_create(
             runtime,
             token,
@@ -456,7 +471,6 @@ async fn extract_links(
             }),
         )
         .await?;
-        let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
         crate::entities::get_or_create(
             runtime,
             token,
@@ -467,22 +481,27 @@ async fn extract_links(
             json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
-        runtime
-            .link(token, site, target_id, EdgeRelation::Contains, 1.0, None)
-            .await?;
-        runtime
-            .link(
-                token,
-                document_id,
-                target_id,
-                EdgeRelation::LinksTo,
-                1.0,
-                None,
-            )
-            .await?;
-        count += 1;
+        link_specs.push(LinkSpec {
+            namespace: None,
+            source_id: site,
+            target_id,
+            relation: EdgeRelation::Contains,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        });
+        link_specs.push(LinkSpec {
+            namespace: None,
+            source_id: document_id,
+            target_id,
+            relation: EdgeRelation::LinksTo,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        });
     }
-    Ok(count)
+    runtime.link_many(token, link_specs).await?;
+    Ok((processed, skipped))
 }
 
 async fn extract_entries(
@@ -655,11 +674,18 @@ async fn put_excerpt(
         .map_err(RuntimeError::from)
 }
 
-async fn run_extract(
+async fn run_extract_with_link_selection(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: ExtractParams,
+    include_links: bool,
 ) -> Result<Value, RuntimeError> {
+    let link_limit = egress::check_ceiling(
+        params.link_limit.map(u64::from),
+        u64::from(DEFAULT_LINK_LIMIT),
+        u64::from(MAX_LINK_LIMIT),
+        "link_limit",
+    )? as u32;
     let (target_id, entity) = resolve_target(runtime, token, &params).await?;
     let properties = entity.properties.clone().unwrap_or(Value::Null);
     let content_ref = properties
@@ -693,13 +719,16 @@ async fn run_extract(
     let entity_type = entity.entity_type.as_deref().unwrap_or("resource");
     let content_type = properties.get("content_type").and_then(Value::as_str);
 
-    let kinds: Vec<String> = match params.kinds {
+    let mut kinds: Vec<String> = match params.kinds {
         Some(k) if !k.is_empty() => k,
         _ => applicable_kinds(entity_type, content_type)
             .into_iter()
             .map(str::to_string)
             .collect(),
     };
+    if !include_links {
+        kinds.retain(|kind| kind != "links");
+    }
     for kind in &kinds {
         if !ALL_KINDS.contains(&kind.as_str()) {
             return Err(RuntimeError::InvalidInput(format!(
@@ -736,8 +765,12 @@ async fn run_extract(
     for kind in &kinds {
         match kind.as_str() {
             "links" => {
-                let count = extract_links(runtime, token, target_id, &base_url, &body).await?;
-                result.insert("links".to_string(), json!({ "edges_created": count }));
+                let (count, skipped) =
+                    extract_links(runtime, token, target_id, &base_url, &body, link_limit).await?;
+                result.insert(
+                    "links".to_string(),
+                    json!({ "edges_created": count, "skipped": skipped }),
+                );
             }
             "sitemap" => {
                 let count = extract_entries(runtime, token, site_id, &body, "sitemap").await?;
@@ -770,18 +803,47 @@ async fn run_extract(
     }))
 }
 
+#[cfg(test)]
+async fn run_extract(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: ExtractParams,
+) -> Result<Value, RuntimeError> {
+    run_extract_with_link_selection(runtime, token, params, true).await
+}
+
 impl WebPack {
     pub(crate) async fn handle_extract(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        self.handle_extract_with_link_selection(token, params, true)
+            .await
+    }
+
+    pub(crate) async fn handle_extract_without_links(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.handle_extract_with_link_selection(token, params, false)
+            .await
+    }
+
+    async fn handle_extract_with_link_selection(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        include_links: bool,
+    ) -> Result<Value, RuntimeError> {
         let params: ExtractParams = serde_json::from_value(params).map_err(|error| {
             RuntimeError::InvalidInput(format!("invalid web.extract arguments: {error}"))
         })?;
         let effective_token =
             crate::namespace::resolve_effective_token(token, params.namespace.as_deref())?;
-        run_extract(&self.runtime, &effective_token, params).await
+        run_extract_with_link_selection(&self.runtime, &effective_token, params, include_links)
+            .await
     }
 }
 
@@ -1197,6 +1259,7 @@ mod tests {
                 id: Some(page_id),
                 url: None,
                 kinds: Some(vec!["links".to_string()]),
+                link_limit: None,
                 namespace: None,
             },
         )
@@ -1257,6 +1320,7 @@ mod tests {
                 id: Some(page_id),
                 url: None,
                 kinds: Some(vec!["text".to_string()]),
+                link_limit: None,
                 namespace: None,
             },
         )
@@ -1271,6 +1335,7 @@ mod tests {
                 id: Some(page_id),
                 url: None,
                 kinds: Some(vec!["text".to_string()]),
+                link_limit: None,
                 namespace: None,
             },
         )
@@ -1435,6 +1500,7 @@ mod tests {
                 id: Some(id),
                 url: None,
                 kinds: None,
+                link_limit: None,
                 namespace: None,
             },
         )

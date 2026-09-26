@@ -480,6 +480,20 @@ impl Default for PoolConfig {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl PoolConfig {
+    /// A small concurrent pool for private test databases.
+    ///
+    /// Tests of reader admission or production sizing should set their required
+    /// count explicitly. Ordinary fixtures need not reserve a CPU-sized pool.
+    pub fn for_test() -> Self {
+        Self {
+            max_readers: 2,
+            ..Self::default()
+        }
+    }
+}
+
 /// Prevent Cargo-launched tests and test subprocesses from opening the
 /// operator's default data tree in every build profile. Activation is solely
 /// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
@@ -3323,7 +3337,7 @@ mod tests {
             path: Some(path),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
 
@@ -3405,7 +3419,7 @@ mod tests {
             path: Some(snapshot.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a non-empty WAL without its frozen -shm must fail closed"),
             Err(error) => error,
@@ -3480,7 +3494,7 @@ mod tests {
             path: Some(snapshot.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3572,7 +3586,7 @@ mod tests {
             path: Some(alias.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3641,7 +3655,7 @@ mod tests {
             path: Some(path.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3684,7 +3698,7 @@ mod tests {
             path: Some(path),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         {
@@ -4209,7 +4223,7 @@ mod tests {
             path: Some(path.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a live WAL database with writable -shm must fail closed"),
             Err(error) => error,
@@ -4314,7 +4328,7 @@ mod tests {
             path: Some(alias),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a symlink must not hide the target's writable -shm"),
             Err(error) => error,
@@ -4360,7 +4374,7 @@ mod tests {
         let path = dir.path().join("legacy_autocheckpoint_env.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         {
@@ -4578,7 +4592,7 @@ mod tests {
             path: Some(path),
             journal_size_limit_bytes: configured_limit,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("WAL pool open");
 
@@ -4608,7 +4622,7 @@ mod tests {
             wal_mode: false,
             journal_size_limit_bytes: configured_limit,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("rollback-journal pool open");
 
@@ -4626,7 +4640,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
 
@@ -4690,7 +4704,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_secs(5),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4754,7 +4768,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_secs(5),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4806,7 +4820,7 @@ mod tests {
             path: Some(path),
             checkout_timeout: Duration::from_millis(1),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
 
@@ -4851,7 +4865,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         pool.claim_checkpoint_ownership()
@@ -4898,7 +4912,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         let writer = pool.writer().expect("pooled writer");
@@ -4943,7 +4957,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: None,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(true));
@@ -4987,7 +5001,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(false));
@@ -5081,7 +5095,7 @@ mod tests {
         let path = dir.path().join("standalone_writer_counter.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool");
 
@@ -5334,7 +5348,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
 
@@ -5361,7 +5375,7 @@ mod tests {
             path: Some(dir.path().join("strict_writer_task_no_runtime.db")),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
 
@@ -5385,7 +5399,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
 
@@ -5577,7 +5591,7 @@ mod tests {
         let pool_for = |path: &Path| -> Arc<ConnectionPool> {
             let cfg = PoolConfig {
                 path: Some(path.to_path_buf()),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             };
             Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"))
         };

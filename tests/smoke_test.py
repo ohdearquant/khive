@@ -265,11 +265,13 @@ def main():
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 138 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 140 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
-        # pack contributes 4 agent-facing T1 verbs
+        # pack contributes five verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
-        # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
+        # Visibility::Verb per ADR-083, and transcript search (ADR-117a), which
+        # stays unavailable until its required features are ready;
+        # brain.register_adapter (#354), context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
         # draft ADR Slice 1, the 18th kg-substrate bare verb), whoami (caller
         # identity introspection, the 19th kg-substrate bare verb), db_diagnostics
@@ -278,7 +280,7 @@ def main():
         # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
         # windowed event read) are included in the count; git contributes
         # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
-        # git.push (ADR-108, three thin write verbs shelling to system git
+        # git.update_ref / git.push (four thin write verbs shelling to system git
         # with hardened argv construction); code contributes exactly one
         # verb, `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
         # L1.5 import-scan tiers; its `finding` note kind and
@@ -291,18 +293,19 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # The kg pack also carries its one documented sub-namespace,
         # stream.append / stream.batch / stream.read / stream.stat (ADR-174
-        # §2); git grew from four verbs to sixteen with the dev-loop surface
+        # §2); git grew from four verbs to seventeen with the dev-loop surface
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
-        # pr_open, pr_review, pr_merge; ADR-182) plus git.ingest_cursor
+        # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
         # (ADR-088 Amendment 1, the persisted ingest cursor read);
         # tool contributes fourteen verbs, including tool.policy_delete, and
         # exec nine (the tool registry with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 138, (
-            f"expected 138 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 140, (
+            f"expected 140 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
+            f"ADR-083 plus dependency-gated transcript search; "
+            f"context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "
             f"(caller identity introspection); db_diagnostics is the 20th "
@@ -310,7 +313,7 @@ def main():
             f"diagnostics); scan is the kg-substrate bare verb answering the "
             f"secret gate without a write; comm.health is #606; comm.probe is #644; "
             f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
-            f"git.commit/git.branch/git.push (ADR-108); "
+            f"git.commit/git.branch/git.update_ref/git.push (ADR-108 and ADR-182); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
             f"workspace (#873) contributes zero verbs; "
             f"blob contributes put/get/stat and begin/put_part/commit/abort per ADR-173; "
@@ -320,7 +323,7 @@ def main():
             f"the internal inbound sibling after an ambiguous atomic write), "
             f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
             f"(ADR-174); "
-            f"git contributes sixteen verbs with the ADR-182 dev-loop surface "
+            f"git contributes seventeen verbs with the ADR-182 dev-loop surface "
             f"and git.ingest_cursor; "
             f"tool contributes fourteen verbs including tool.policy_delete "
             f"(ADR-180 Amendment 3), and exec nine; "
