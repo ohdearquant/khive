@@ -1766,14 +1766,14 @@ impl KhiveRuntime {
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
-                join_set.spawn(async move {
+                join_set.spawn(crate::runtime::inherit_request_embedder_scope(async move {
                     let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
                     };
                     (idx, result)
-                });
+                }));
             }
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
@@ -4139,7 +4139,7 @@ impl KhiveRuntime {
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
-                join_set.spawn(async move {
+                join_set.spawn(crate::runtime::inherit_request_embedder_scope(async move {
                     let fut = rt.embed_document_with_model_outcome_for_token(
                         &token,
                         &name,
@@ -4150,7 +4150,7 @@ impl KhiveRuntime {
                         None => fut.await,
                     };
                     (idx, result)
-                });
+                }));
             }
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
@@ -5153,6 +5153,15 @@ impl KhiveRuntime {
             statement: row_statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
+        if substrate == SubstrateKind::Entity {
+            statements.push(PlanStatement {
+                statement: khive_db::stores::attachment::delete_record_attachments_statement(
+                    node_id,
+                    AttachmentSubstrate::Entity,
+                ),
+                guard: None,
+            });
+        }
         statements.extend(
             hard_delete_lineage_warning_statements(namespace, actor, node_id, substrate)
                 .into_iter()
@@ -5921,6 +5930,7 @@ impl KhiveRuntime {
     /// On hard delete, cascades to remove all incident edges (both inbound and
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
+    /// Routed attachment cleanup is performed by the registry after ownership resolution.
     ///
     /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     pub async fn delete_entity(
@@ -5975,6 +5985,7 @@ impl KhiveRuntime {
         // `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
+            // Cross-backend attachment cleanup requires the registry's ownership check.
             self.atomic_hard_delete_with_edge_purge(
                 entity_hard_delete_statement(id),
                 id,
@@ -6044,6 +6055,16 @@ impl KhiveRuntime {
             }
         }
         Ok((deleted, degradations))
+    }
+
+    pub(crate) async fn delete_entity_attachments_on_core(&self, id: Uuid) -> RuntimeResult<bool> {
+        let core = self.core();
+        drop(core.attachments()?);
+        let statement = khive_db::stores::attachment::delete_record_attachments_statement(
+            id,
+            AttachmentSubstrate::Entity,
+        );
+        Ok(core.sql().writer().await?.execute(statement).await? > 0)
     }
 
     /// Count entities in a namespace, optionally filtered.

@@ -35,7 +35,8 @@ pub(super) async fn run(args: &ExecArgs) -> Result<Value> {
     };
     use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
     use khive_runtime::daemon::{
-        read_frame, socket_path, write_frame, DaemonResponseFrame, PROTOCOL_VERSION,
+        config_ids_compatible, read_frame, socket_path, write_frame, DaemonResponseFrame,
+        PROTOCOL_VERSION,
     };
     use khive_runtime::Namespace;
     use tokio::net::UnixStream;
@@ -108,7 +109,10 @@ pub(super) async fn run(args: &ExecArgs) -> Result<Value> {
     anyhow::ensure!(
         !response.config_mismatch
             && !response.namespace_mismatch
-            && response.served_config_id.as_deref() == Some(config_id.as_str()),
+            && response
+                .served_config_id
+                .as_deref()
+                .is_some_and(|served| config_ids_compatible(&config_id, served)),
         "plan daemon configuration mismatch; start a daemon with matching --db and --config settings"
     );
     anyhow::ensure!(

@@ -1422,6 +1422,68 @@ fn theirs_strategy_reports_dangling_edge_after_shortcut() {
     }
 }
 
+#[test]
+fn ours_strategy_reports_retargeted_edge_identity_collision() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let entities = vec![entity(a, "A"), entity(b, "B"), entity(c, "C")];
+    let preferred = edge(a, b);
+    let mut retargeted = preferred.clone();
+    retargeted.target = c;
+    let base = archive_full(entities.clone(), vec![preferred.clone()]);
+    let ours = archive_full(entities.clone(), vec![preferred.clone()]);
+    let theirs = archive_full(entities, vec![retargeted]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
+    assert!(matches!(
+        result,
+        MergeResult::Conflicts { conflicts }
+            if conflicts.iter().any(|conflict| matches!(
+                conflict,
+                MergeConflict::EdgeIdentityCollision {
+                    target_id,
+                    attempted_edge_id,
+                    retained_edge_id,
+                    ..
+                } if *target_id == c
+                    && *attempted_edge_id == preferred.edge_id
+                    && *retained_edge_id == preferred.edge_id
+            ))
+    ));
+}
+
+#[test]
+fn theirs_strategy_reports_retargeted_edge_identity_collision() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let entities = vec![entity(a, "A"), entity(b, "B"), entity(c, "C")];
+    let preferred = edge(a, b);
+    let mut retargeted = preferred.clone();
+    retargeted.target = c;
+    let base = archive_full(entities.clone(), vec![preferred.clone()]);
+    let ours = archive_full(entities.clone(), vec![retargeted]);
+    let theirs = archive_full(entities, vec![preferred.clone()]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
+    assert!(matches!(
+        result,
+        MergeResult::Conflicts { conflicts }
+            if conflicts.iter().any(|conflict| matches!(
+                conflict,
+                MergeConflict::EdgeIdentityCollision {
+                    target_id,
+                    attempted_edge_id,
+                    retained_edge_id,
+                    ..
+                } if *target_id == c
+                    && *attempted_edge_id == preferred.edge_id
+                    && *retained_edge_id == preferred.edge_id
+            ))
+    ));
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn archive_with_entities(entities: Vec<ExportedEntity>) -> KgArchive {
