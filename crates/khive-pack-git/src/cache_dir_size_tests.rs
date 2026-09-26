@@ -34,13 +34,14 @@ fn denied_then_not_found_keeps_surviving_bytes() {
 }
 
 #[test]
-fn persistent_denial_remains_fatal_at_bound() {
+fn persistent_descendant_metadata_denial_is_skipped_after_bounded_retry() {
     let tree = tempfile::tempdir().unwrap();
     let denied = tree.path().join("denied");
     std::fs::write(&denied, b"unreadable").unwrap();
+    std::fs::write(tree.path().join("kept"), [1u8; 37]).unwrap();
     let calls = Cell::new(0);
     let waits = Cell::new(0);
-    let result = dir_size_with(
+    let size = dir_size_with(
         tree.path(),
         true,
         |path| {
@@ -52,11 +53,28 @@ fn persistent_denial_remains_fatal_at_bound() {
             }
         },
         || waits.set(waits.get() + 1),
+    )
+    .expect("denied descendant metadata is skipped after a bounded retry");
+    assert_eq!(size, 37, "all readable descendants remain counted");
+    assert_eq!(calls.get(), DIR_SIZE_DENIED_RETRIES + 1);
+    assert_eq!(waits.get(), DIR_SIZE_DENIED_RETRIES);
+}
+
+#[test]
+fn persistent_descendant_directory_open_denial_remains_fatal() {
+    let calls = Cell::new(0);
+    let waits = Cell::new(0);
+    let result = dir_size_io(
+        false,
+        true,
+        false,
+        || {
+            calls.set(calls.get() + 1);
+            Err::<(), _>(Error::from(ErrorKind::PermissionDenied))
+        },
+        &mut || waits.set(waits.get() + 1),
     );
-    assert!(
-        matches!(result, Err(CacheError::Io(error)) if error.kind() == ErrorKind::PermissionDenied),
-        "persistent denial must not evade byte cap"
-    );
+    assert!(matches!(result, Err(error) if error.kind() == ErrorKind::PermissionDenied));
     assert_eq!(calls.get(), DIR_SIZE_DENIED_RETRIES + 1);
     assert_eq!(waits.get(), DIR_SIZE_DENIED_RETRIES);
 }
