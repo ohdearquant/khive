@@ -277,21 +277,23 @@ mod prune_recall_visibility_tests {
     /// pruning, not just asserted absent.
     ///
     /// `memory.prune` soft-deletes via `NoteStore::delete_note` (sets `deleted_at`,
-    /// rows remain -- ADR-014) and bumps the per-model ANN generation so a background
-    /// rebuild drops stale vectors. It does not touch the FTS5 index or the
-    /// sqlite-vec store directly, so correctness depends on every recall path
-    /// filtering out soft-deleted rows after retrieval, not just at the index level.
+    /// rows remain -- ADR-014), cleans the FTS/vector rows, and bumps the per-model
+    /// ANN generation. Background maintenance replays the vector-log tail; when a
+    /// deletion would leave no live vector, it evicts the incumbent and an empty
+    /// corpus has no replacement bridge. Recall must exclude deleted rows on both
+    /// the warm and exact retrieval paths.
     ///
-    /// The test also forces the exact sqlite-vec fallback path (as opposed to the
-    /// warm ANN route) by evicting the warm graph after pruning, so both retrieval
-    /// paths are exercised, not just whichever one a fresh corpus happens to take.
+    /// A barrier pauses incremental maintenance after its protected-tail read so
+    /// the stale warm route is exercised deterministically. After maintenance
+    /// evicts the one-vector graph for the empty corpus, the test also exercises
+    /// the exact sqlite-vec fallback.
     #[tokio::test]
     #[serial(background_tasks)]
     #[serial_test::serial(config_ledger)]
     async fn prune_excludes_pruned_memory_across_fts_vector_and_hybrid_recall() {
-        const MODEL: &str = "prune-533-visibility-model";
+        const MODEL: &str = "prune-visibility-model";
         const DIMS: usize = 16;
-        const NOTE_TEXT: &str = "issue 533 prune stale fts vector ann visibility regression note";
+        const NOTE_TEXT: &str = "prune stale fts vector ann visibility regression note";
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(HashVecProvider {
@@ -356,28 +358,41 @@ mod prune_recall_visibility_tests {
             );
         }
 
-        let prune_result = registry
-            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
-            .await
-            .expect("memory.prune");
-        assert_eq!(
-            prune_result["pruned"], 1,
-            "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
+        let key = crate::ann::AnnKey::new(MODEL);
+        crate::ann::wait_until_warm_idle(&ann, &key).await;
+        assert!(
+            ann.warm_route_count() > 0,
+            "the pre-prune vector recall must have hit the installed warm graph"
         );
 
-        // The warm graph built during the pre-prune vector_only check above is still
-        // installed at this point: `memory.prune` bumps the per-model generation
-        // (`ann::bump_generation`) but never evicts the graph itself, and the
-        // background rebuild it triggers finds zero live rows post-prune (the
-        // corpus scan filters `deleted_at IS NULL`), so it resolves to
-        // `AnnEnsureStatus::EmptyCorpus` and leaves the stale graph installed
-        // rather than replacing it. A `vector_only` recall right now must
-        // therefore take the warm route (`ann::search_loaded` hits the still-
-        // installed bridge) and still exclude the pruned note, proving the
-        // post-hydration `deleted_at IS NULL` filter in `load_memory_candidate_notes`
-        // (`handlers/common.rs`) covers the stale-warm-graph path, not just the
-        // exact sqlite-vec fallback exercised below.
+        // Pause incremental maintenance after it has read the protected tail.
+        // This keeps the installed graph available while the recall below runs,
+        // independently of how quickly the background task is scheduled.
         ann.reset_warm_route_count();
+        ann.protected_tail_barrier
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let maintenance_paused = ann.protected_tail_notify.notified();
+        let prune_result = registry
+            .dispatch("memory.prune", serde_json::json!({ "min_salience": 0.5 }))
+            .await;
+
+        if let Err(error) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), maintenance_paused).await
+        {
+            // If the task reaches the barrier after the timeout, let it continue
+            // before this test reports the missing pause.
+            ann.protected_tail_release.notify_one();
+            panic!(
+                "background ANN maintenance did not pause after its protected tail read: {error}"
+            );
+        }
+
+        // The single-vector graph remains installed while incremental maintenance
+        // is paused. Its delete cannot be applied because Vamana refuses to
+        // tombstone the last live node; maintenance evicts that graph and an empty
+        // corpus has no replacement to install. Run this recall inside the pause
+        // to verify the stale warm route still excludes the pruned memory, then
+        // wait for maintenance to settle before checking the exact fallback.
         let stale_warm_result = registry
             .dispatch(
                 "memory.recall",
@@ -388,7 +403,16 @@ mod prune_recall_visibility_tests {
                     "embedding_model": MODEL,
                 }),
             )
-            .await
+            .await;
+        let stale_warm_route_count = ann.warm_route_count();
+        ann.protected_tail_release.notify_one();
+        crate::ann::wait_until_warm_idle(&ann, &key).await;
+        let prune_result = prune_result.expect("memory.prune");
+        assert_eq!(
+            prune_result["pruned"], 1,
+            "the single seeded note (salience 0.1 < 0.5) must be pruned: {prune_result:?}"
+        );
+        let stale_warm_result = stale_warm_result
             .expect("memory.recall [vector_only, stale warm graph] must not error");
         let stale_warm_hits = stale_warm_result.as_array().expect("bare array result");
         assert!(
@@ -397,17 +421,14 @@ mod prune_recall_visibility_tests {
              the stale-but-still-installed warm ANN graph, got: {stale_warm_hits:?}"
         );
         assert!(
-            ann.warm_route_count() > 0,
+            stale_warm_route_count > 0,
             "the stale warm graph must still be installed and hit by \
              ann::search_loaded — a warm_route_count of 0 means this assertion \
              is vacuously exercising the sqlite-vec fallback instead"
         );
 
-        // Evict the warm graph now, so the recalls below rebuild against the
-        // now-pruned corpus and fall through to the exact sqlite-vec search
-        // instead of the warm ANN route.
-        let key = crate::ann::AnnKey::new(MODEL);
-        crate::ann::clear_key(&ann, &key).await;
+        // Once maintenance is idle, no ANN bridge can represent this empty
+        // corpus, so the vector recall below uses the exact sqlite-vec fallback.
         ann.reset_warm_route_count();
 
         // `fusion_strategy: None` omits the param entirely rather than passing
@@ -442,9 +463,8 @@ mod prune_recall_visibility_tests {
         }
 
         // Prove the vector legs above actually took the exact sqlite-vec fallback
-        // (handlers/common.rs:1100-1129), not the warm ANN route: the corpus scan
-        // that would install a warm graph sees zero live rows post-prune, so
-        // `ann::search_loaded` must never have found a cached bridge for this model.
+        // (handlers/common.rs): the empty-corpus maintenance completed without
+        // installing a replacement bridge.
         assert_eq!(
             ann.warm_route_count(),
             0,

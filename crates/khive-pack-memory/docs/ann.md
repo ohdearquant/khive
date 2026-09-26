@@ -2,8 +2,9 @@
 
 This is the design companion to `crates/khive-pack-memory/src/ann.rs`. It covers material
 that does not belong at any single call site: the ADR-079 Amendment 1 restart classifier's
-full decision table, the ADR-118 fresh-tail exact leg's two tiers and re-resolution
-convergence argument, and the replay ownership rule. `docs/api/ann-lifecycle.md` covers the
+full decision table, steady-state incremental maintenance, the ADR-118 fresh-tail exact
+leg's two tiers and re-resolution convergence argument, and the replay ownership rule.
+`docs/api/ann-lifecycle.md` covers the
 warm cache, freshness signals, and durable-epoch helpers; `docs/recall-reliability.md`
 covers the write-generation re-enqueue guarantee. This document does not repeat what those
 already cover.
@@ -38,6 +39,106 @@ than paying an O(N) DISTINCT corpus scan to populate it.
 while a background rebuild replaces it keeps recall available; it never falls back to an
 FTS-only degraded mode.
 
+## Steady-state maintenance and checkpoint cadence
+
+The warm index host applies small write-log tails to its installed bridge when only the
+write generation changed and the durable corpus epoch still matches. It reads the tail,
+its scoped raw row count, and the registry compaction minimum in one read snapshot. The
+tail starts at the installed index's own applied watermark; repeated writes to one subject
+are coalesced to that subject's final state before mutation. A successful batch advances
+the bridge's generation and applied watermark without loading or publishing a segment.
+
+Three freshness markers have different roles:
+
+- **Write generation** coordinates process-local warming and prevents an older warm result
+  from replacing a newer one. It is not a durable log position.
+- **Applied watermark** records the log prefix already represented by the in-memory index.
+  The next incremental batch starts above this position.
+- **Published watermark** records the committed segment's prefix. While the bridge has
+  unpublished deltas, recall uses this earlier watermark for the fresh-tail exact leg.
+  Successfully inserting a vector into the approximate graph does not by itself guarantee
+  immediate recall visibility; the exact leg continues to cover those deltas until
+  publication.
+
+The host batches publication using these environment settings:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `KHIVE_ANN_CHECKPOINT_OPS` | `1000` | Maximum dirty raw log-row threshold, further limited by the corpus-relative cap below; zero is clamped to one. |
+| `KHIVE_ANN_CHECKPOINT_SECS` | `300` | A dirty bridge becomes due when this many seconds have elapsed since its last checkpoint; zero disables the interval trigger. |
+| `KHIVE_ANN_CONSOLIDATE_TAU` | `40000` | Insert-plus-tombstone churn threshold for consolidation before publication; zero is clamped to one. |
+
+Invalid unsigned settings fall back to their defaults. These are environment settings;
+they do not imply that the ADR's described TOML or CLI configuration wiring is available.
+
+Let `D` be the configured dirty-row threshold, `f` the existing
+`KHIVE_ANN_REBUILD_THRESHOLD` fraction (default `0.20`), and `L` the installed index's live
+vector count. The effective publication threshold is
+`max(1, min(D, floor(f * L / 4)))`. For example, with defaults and 10,000 live vectors, the
+threshold is 500 raw log rows; at 100,000 live vectors it is 1,000. Tiny corpora checkpoint
+at one row. This leaves replay headroom at normal corpus sizes; it does not bound the size
+of a burst that arrives between warm passes or change the restart classifier's
+`ceil(f * live corpus count)` rule.
+
+Dirty accounting accumulates scoped **raw log rows since publication**, not the number of
+coalesced subjects and not the difference between database-global sequence numbers. A
+thousand updates to one subject still contribute a thousand dirty rows. Consolidation
+uses a separate churn counter: replacing an existing vector normally performs one
+tombstone and one insert. When that counter reaches tau, consolidation compacts tombstoned
+slots and remaps the external UUID table before saving. An empty consolidation remap means
+ordinals are unchanged. Consolidation resets churn, not unpublished dirty-row accounting.
+
+Only dirty bridges checkpoint. Reaching either the effective row threshold or the enabled
+interval makes publication due; a fresh, clean warm is a no-op. A tracked, one-shot deadline
+handles dirty intervals even without another write or recall. Each model has at most one
+deadline; shutdown cancels it. A newer checkpoint followed by another dirty period can hand
+off the remaining deadline, while failures wait for the next ordinary attempt. The local model lock
+serializes mutation and publication. Filesystem publication borrows the installed bridge
+under a read lock so searches may continue while it saves; it does not hold the index
+write lock across filesystem or database I/O. A successful file publication writes the
+complete segment and UUID sidecar before conditionally raising the registry watermark and
+compacting the protected log prefix, then re-adopts mmap backing. Applying a batch in RAM
+alone never raises that durable watermark or authorizes compaction.
+
+The first valid insert after mmap adoption still copies the complete f32 vector store and
+SQ8 codes to owned memory. Later inserts reuse that owned backing until checkpoint and
+re-adoption. Tombstones mutate graph and lifecycle state without promoting the mapped
+vector/code stores. Save and load remain full-segment operations: even a Hot load checksums
+the segment files and reconstructs owned graph, lifecycle, and UUID-map state. Batching
+amortizes those costs; it does not make the first insert or a checkpoint proportional only
+to the changed rows.
+
+### Peer rotation and recovery
+
+The existing five-second rotation watcher still releases replaced mmap generations. A
+dirty bridge retains its mapped-generation identity, including after delete-only batches.
+A valid peer segment may be newer than the local published watermark yet older than its
+in-memory applied watermark. Rotation compares that candidate with the published baseline,
+adopts the validated segment, and advances the local write generation so the retained tail
+is replayed. The new bridge and exact leg start from the peer segment's own watermark;
+they never borrow the displaced dirty bridge's later applied position. The namespace set
+remains conservative because the peer may cover namespaces absent from the old local set.
+
+Registry protection, conditional publication, and compaction across overlapping consumers
+are unchanged. A missing or closed consumer registration, a changed durable epoch, an
+unavailable protected tail, or an incompatible segment still takes the established
+reclassification/rebuild path. A tail above the rebuild threshold can still require a full
+build. Restart continues to use the persisted segment and retained log: a crash before a
+batched checkpoint leaves a recoverable tail, rather than falsely recording unpublished
+deltas as durable. Processes that are not the warm index host retain their existing
+load/replay behavior and do not publish segments or build the full corpus.
+
+### Warm completion attribution
+
+The `memory.ann_warm` completion payload keeps the existing phase timing fields and adds
+`path` and `ops_applied`. Paths distinguish `already_fresh`, `incremental_in_place`,
+`incremental_checkpoint`, `segment_load`, `stale_tail_replay`, `stale_tail_publication`,
+`full_build`, `empty`, `declined`, `discarded`, and `failed`. On successful tail processing,
+`ops_applied` counts coalesced final subject operations, not raw dirty rows, Vamana churn,
+or vectors scanned by a full build. A path and count describe the warm attempt; they do not
+replace its outcome or timing evidence. Benign shutdown cancellation retains the existing
+cancellation event behavior, and event append remains best-effort.
+
 ## Replay id-map ownership rule (#1150)
 
 `AnnBridge::apply_final_ops` replays a coalesced final-state tail: `Some(embedding)` replays
@@ -45,8 +146,8 @@ a final upsert (tombstone the mapped old ordinal, then exactly one insert); `Non
 final delete (tombstone if mapped, no-op otherwise).
 
 A tombstoned ordinal has no owner — `id_map` entries for already-tombstoned slots are stale
-(tombstoning never clears them) — so the reverse-lookup built at the start of replay excludes
-them. Without that exclusion, a reused slot's new owner could be tombstoned by a replay
+(tombstoning never clears them) — so the reverse lookup initialized at the first replay excludes
+them. Later batches update this cached map in place; consolidation remaps and refreshes it. Without that exclusion, a reused slot's new owner could be tombstoned by a replay
 delete for the old, already-deleted subject. Concretely: a coalesced final tail can contain
 `(id_c, Some(embedding))` (upserting into id_a's freed ordinal) followed by `(id_a, None)`
 (id_a's own final delete) — a legal op order, since coalescing only guarantees per-subject
@@ -83,7 +184,9 @@ its intervening tail can be deleted.
 graph. It has two tiers:
 
 - **Tier 1 (primary), `s = Some(watermark)`.** A serving bridge exists; every committed write
-  above its watermark is merged in via `fresh_tail_serving`.
+  above its exact-leg watermark is merged in via `fresh_tail_serving`. A dirty bridge uses
+  its published watermark here, preserving exact coverage of unpublished incremental
+  updates even when its in-memory applied watermark is newer.
 - **Tier 2 (§3), `s = None`.** No serving index is available at all. The leg caps its scan at
   a corpus-relative newest suffix of the log (`ceil(threshold * live corpus)` rows) instead
   of the entire scope, guaranteeing visibility of only the caller's most recent writes until
