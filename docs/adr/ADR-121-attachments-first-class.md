@@ -752,7 +752,8 @@ documented maintenance window makes a removal safe at this commit.
 1. **A read-only report ships now.** `kkernel blob ownerless-rows` is an admin command. It resolves the effective
    configuration as Amendment 1 item 3 describes for `kkernel blob sweep`, and lists the attachment rows of the
    canonical main backend whose record it did not find on any member of a stated roster. It never deletes and has no
-   removal mode.
+   removal mode. It runs only against quiesced database members or frozen snapshot sets, not against members with live
+   writers.
    - **Roster.** The main backend, every backend declared in the effective configuration's `[[backends]]` whether or
      not a selected pack is assigned to it, and every database the operator adds with `--with-db <path>` (a backend that
      once held records and is no longer configured). Members that resolve to the same file are probed once. The roster
@@ -764,10 +765,19 @@ documented maintenance window makes a removal safe at this commit.
      roster's completeness is not verified.
    - **Opening and failing closed.** Every member opens through `KhiveRuntime::new_readonly`, read-only and query-only,
      at this build's current schema (`crates/khive-runtime/src/runtime.rs:369-377`,
-     `crates/khive-db/src/backend.rs:446-449`, `pool.rs:2822-2831`). A member that cannot be opened, is not at the
-     current schema, is an in-memory database, or returns an error on any probe stops the report with a nonzero exit and
-     a message naming the member and the error. No row list is printed, because a partial list would show that member's
-     records as ownerless.
+     `crates/khive-db/src/backend.rs:446-449`, `pool.rs:2822-2831`). Every member is a quiesced database or a frozen
+     snapshot set consisting of the database file and its matching `-wal` and read-only `-shm` sidecars when WAL frames
+     must be read. A writable `-shm` at open ends the report with a nonzero exit and no row list; the error names the
+     member and tells the operator to close every writer or take a frozen snapshot. A nonempty `-wal` without a frozen
+     read-only `-shm` also refuses, because immutable mode would omit committed WAL frames (`pool.rs:2623-2710`). A
+     read-only `-shm` without its matching `-wal` refuses as an inconsistent snapshot. The pool treats an `-shm` with
+     any write permission bits, including a copy left at `0644`, as writable. The `-shm` permission check is an
+     open-time heuristic, not proof that no writer can appear later. A rollback-journal member has no WAL `-shm` signal;
+     its normal read-only open cannot establish quiescence, so the operator must quiesce it before the report. The
+     operator must keep every member quiesced or frozen until the report exits. A member that cannot be opened, is not
+     at the current schema, is an in-memory database, or returns an error on any probe also stops the report with a
+     nonzero exit and a message naming the member and the error. No row list is printed, because a partial list would
+     show that member's records as ownerless.
    - **Walk.** Rows are read from main in pages of at most 128, ordered by `(record_uuid, role)` under SQLite's `BINARY`
      collation (the key columns declare no other, `crates/khive-db/sql/021-attachments-a-stage.sql:8-29`). Each page
      continues strictly after the last key read, `(record_uuid, role) > (?, ?)`, never by offset. Each page read and
@@ -789,6 +799,8 @@ documented maintenance window makes a removal safe at this commit.
      and end times.
 
 2. **The report is a best-effort interval report, and a listed row is only a candidate.** Its output says so, and says:
+   - the roster is probed as of its quiesce or freeze. A record committed after that snapshot is not visible to this
+     report;
    - a row present on main for the whole walk is read exactly once. A row inserted behind the cursor during the walk
      is not read, and a row changed by an upsert (`attachment.rs:44-52`) or deleted after its page was read is reported
      as it was read;
@@ -861,6 +873,10 @@ documented maintenance window makes a removal safe at this commit.
 
 ### Alternatives considered
 
+- _Open a live database through a new read-only pool mode._ Rejected for this amendment. A live-capable open changes
+  pool snapshot semantics: immutable mode can omit committed WAL frames, while ordinary read-only SQLite may create or
+  mutate `-shm`. Its correctness argument belongs in a separate proposal if operators need reports against a serving
+  daemon.
 - _Specify the removal pass in this amendment, conditional on its prerequisites._ Rejected for now. The pass's safety
   argument rests on the file-lifecycle protocol of item 3(a) and the publication rule of item 3(c), and neither is
   designed yet. A command specified ahead of them would be approved on an argument its prerequisites might not support.
@@ -903,15 +919,19 @@ documented maintenance window makes a removal safe at this commit.
 - **Roster from configuration, not packs.** A page on a backend declared in `[[backends]]` while the web pack is not
   selected is owned. With the declaration removed, its rows are listed and the header no longer shows the member.
   Adding the member with `--with-db` makes the page owned again.
-- **Walk.** With a page boundary between two roles of one `record_uuid`, every row is reported once. Deleting an
-  already-read row between two pages does not skip an unread row; must fail under offset paging. A row inserted behind
-  the cursor between pages is not reported. A record moved from one member to another between their probes is listed,
-  and its probe times show the two probes at different times.
+- **Walk through the CLI.** On quiesced or frozen members, with a page boundary between two roles of one
+  `record_uuid`, every row is reported once.
+- **Walk function under test internals.** On a writable fixture backend, delete an already-read row between two page
+  reads. The keyset walk still returns the unread row; an offset-paging control skips it. This mutation belongs in the
+  walk function test, not in a successful run of the read-only CLI.
 - **Read-only, no held transaction.** Every member opens read-only and query-only, and every database's contents are
-  unchanged after the report. A checkpoint run from another connection between two pages advances past frames committed
-  after the first page.
-- **In flight.** With a row written and its record held uncommitted by a test hook, the report lists the row with the
-  candidate notice.
+  unchanged after the report. A member with a nonempty `-wal` beside a frozen read-only `-shm` reports a row committed
+  only in the WAL. Control: a test-only immutable open of the same database and WAL without the `-shm` misses that row,
+  which is why the pool refuses that open for the report.
+- **In flight.** With a row committed on main and its record held uncommitted by a live writer that keeps main's `-shm`
+  writable, the command exits nonzero with no row list. Its error names main and directs the operator to close every
+  writer or take a frozen snapshot. Control: after the writer aborts and closes, checkpoint the same database and
+  provide frozen sidecars; the report lists the row as a candidate.
 - **No removal.** The command accepts no argument that deletes, and a log of every statement it issues on every
   database shows reads only.
 
@@ -921,6 +941,8 @@ documented maintenance window makes a removal safe at this commit.
   does not reclaim the space #3178 describes, and #3178 stays open.
 - Removing rows frees blobs only when Amendment 1's sweep runs live; at this commit no serving process calls it.
 - The report reads one page of main and probes each member once per page. Its output carries its duration.
+- Operators quiesce every member or supply frozen copies before running the report. A serving writer's database is not
+  an accepted input.
 - The exclusion of item 3(a) is shared infrastructure. Amendment 1 item 7 also requires a writer barrier for its
   backfill, and this exclusion is one way to provide it; that choice belongs to Amendment 1.
 
