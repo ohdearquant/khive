@@ -12,11 +12,13 @@ Allowlist (false-positive suppression) — **all of the following are prose-cont
 not unconditional passes: a credential trigger word in the surrounding window dominates, with
 narrow trigger-context exceptions for file paths, VCS revisions, and recognizable LaTeX fragments
 (defined below). The path and revision exceptions run only after the reconstruction checks and
-outside credential-value syntax; the LaTeX exception rejects credential-shaped inner runs and
-direct credential labels. Bare Git-length hex values use a separate line-local trigger rule,
+outside credential-value syntax; the general LaTeX exception rejects credential-shaped inner
+runs and direct credential labels, while the closed macro-reference exception below runs after
+the component and bridge checks. Bare Git-length hex values use a separate line-local trigger rule,
 gated by the clause-label guard. Valid JSON objects and arrays also bound surrounding trigger
 context to the candidate's scalar value and its owning credential labels (defined below). These
-rules change trigger attribution, not credential shape checks.** A UUID or a sha-prefixed content hash sitting directly beside
+rules change trigger attribution, not credential shape checks. A narrow set of explicitly shaped
+technical references (described below) may pass after the credential-run and fragment checks.** A UUID or a sha-prefixed content hash sitting directly beside
 "api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
 through to explicit detection instead of being silently allowed.
 
@@ -105,17 +107,45 @@ through to explicit detection instead of being silently allowed.
   a covered topology — unless a credential label is in clause range, in which case the clause
   guard below disables the exemption and the shape checks fire directly. The bare marker word
   itself (form `commit <hex>`) is skipped entirely — a fixed English marker word is not
-  attacker-controlled credential material. Generic `hash`/`sha256` prose does not rescue a token.
+  attacker-controlled credential material. Generic `hash` prose or a distant `sha256` mention
+  does not rescue a token; the explicit SHA-256 designation below is a separate rule.
 - LaTeX fragments (trigger-context, narrow): dense mathematical notation is exempt only when the
   token contains an alphabetic control sequence plus several structural LaTeX characters
   (`\\`, braces, superscript, or subscript syntax). The exemption is refused when an immediate
-  field label names a credential, when a normalized credential-length hex value is present, or
+  field label names a credential, except for the closed macro references below after all component
+  and bridge checks; a normalized credential-length hex value also refuses, as does
   when any embedded alphanumeric run is itself long and high-entropy. This admits formulas in
   prose such as `key estimate uses \\operatorname{softmax}` without letting decorative LaTeX wrap
   an opaque credential. Exact public RFC or vendor test-vector values deliberately remain
   fail-closed when they have a blocked secret shape: publication alone is not mechanically
   distinguishable from a live credential. Such corpora need a separate, audited exemption
   contract or a human-reviewed ingestion path.
+
+### Technical references beside credential vocabulary
+
+The gate admits five reference forms that commonly appear in prose about keys and authentication:
+
+- An inline-code Rust call, with backticks, a `::`-qualified symbol and an empty argument list.
+  Values in call arguments are not exempted. An ordinary structured identifier without this
+  syntax still follows the trigger-sensitive rule above.
+- An uppercase, underscore-separated environment variable name with at least four components
+  and a final `_PATH`, `_FILE`, `_NAME` or `_TTL` component. Every component is at most 16 bytes;
+  a long opaque component still fails the separate run check.
+- Exactly 64 hex digits designated as a SHA-256 digest (`sha256`, `sha256 digest`, or `sha256 key
+  digest` immediately before the value). A credential field governing the designation keeps the
+  value blocked. A bare 64-hex value, a different length, or a bare `hash` label does not qualify.
+- A recognizable math fragment beginning with `\mathsf{`, `\mathbf{`, `\mathcal{`, `\mathrm{`,
+  or `\operatorname{`, with structural LaTeX notation and no credential-shaped inner run. This
+  includes a formula directly after a credential word while still refusing opaque material inside
+  the formula.
+- An AWS S3 bucket ARN or IAM role/policy ARN with the canonical colon fields and short resource
+  name segments. Other ARN shapes keep the ordinary detector decision.
+
+Known credential prefixes, JWTs, private-key blocks and URL userinfo are checked independently
+before these exceptions. Hex/entropy checks on each long component, normalized-hex checks and
+multi-fragment reconstruction still run first. A value that meets one of those other credential shapes
+is refused even when it appears inside a reference. UUID-shaped values beside explicit credential
+labels retain their existing refusal rule.
 
 The path and ordinary-marker VCS exemptions above are gated by a **clause-label guard**
 (`has_clause_credential_label_with_inline`):
@@ -224,7 +254,7 @@ whitespace can still put a nearby credential word inside a value's external wind
 objects and arrays apply the scalar boundary below. The same member context governs shape checks,
 entropy checks, exemption guards, reconstruction, masking, and the trigger named in a refusal.
 
-A structured-identifier-shaped token sitting near a **genuinely standalone** trigger word (e.g.
+A structured-identifier-shaped token outside the narrow reference forms above sitting near a **genuinely standalone** trigger word (e.g.
 `auth work saved at .../repo-audit.md`, where `auth` is an actual topical mention rather than a
 substring collision) is an accepted false positive: no window-narrowing or exemption-widening
 scheme survives the adversarial regression corpus without also reopening a real bypass, because
@@ -515,7 +545,9 @@ For each token, in order:
 3. **Hex credential shape near trigger.** The entropy heuristic cannot catch hex API keys (AWS
    secret access key, Stripe test keys): hex's alphabet maxes at log2(16) = 4.0 bits/char, always
    below `ENTROPY_THRESHOLD` (4.5). A credential-shaped hex token (32/40/64/128 chars,
-   `HEX_CREDENTIAL_LENGTHS`) near a trigger word is flagged directly.
+   `HEX_CREDENTIAL_LENGTHS`) near a trigger word is flagged directly. An explicit SHA-256 digest
+   designation defers the 64-hex decision until after fragment reconstruction; it does not
+   suppress checks on any adjoining credential material.
 4. **Per-run hex/entropy re-check (issue #1044).** A genuine credential can dilute below the
    whole-token-average checks above when it shares a whitespace token with low-entropy filler
    segments (`vault/<payload>/rotate.md`). Decomposing the token on every non-alphanumeric
@@ -587,7 +619,9 @@ For each token, in order:
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a
    chain that would otherwise reconstruct a blocked credential.
-8. **Structured-identifier exemption** off-trigger only — must come after the UUID/content-hash
+8. **Technical-reference exceptions** near trigger — the five forms above are evaluated after
+   per-run and bridge checks. They do not apply to UUIDs or to arbitrary structured identifiers.
+9. **Structured-identifier exemption** off-trigger only — must come after the UUID/content-hash
    and hex-credential-token checks (neither of which it weakens) and before the entropy
    computation, since an identifier can exceed `ENTROPY_THRESHOLD` on Shannon entropy alone.
 
