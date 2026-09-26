@@ -14,29 +14,29 @@ use uuid::Uuid;
 /// calls with the same identity tuple converge on the same output.
 pub const WEB_NAMESPACE: Uuid = Uuid::from_u128(0x1910_adb1_91ad_5eb0_91ad_b191_05eb_0adb);
 
-/// Canonicalize a URL per D1: scheme and host lowercased, default port
-/// dropped, path percent-normalized, query kept with keys sorted, fragment
-/// dropped. The `url` crate already lowercases scheme/host and omits a
-/// default port during parsing (WHATWG URL spec), and its path is already
-/// percent-normalized on parse — only fragment-stripping and query-key
-/// sorting are this function's own work.
+/// The address used for a request, distinct from the sorted-query identity key.
+/// Fragments identify a position within a document and are not sent over HTTP.
+pub(crate) fn request_url(mut url: url::Url) -> url::Url {
+    url.set_fragment(None);
+    url
+}
+
+/// Canonicalize the identity key per D1, keeping query bytes intact while
+/// stably sorting pairs by their raw keys. Form decoding would merge distinct
+/// addresses (`%FF`/`%FE`, `+`/`%20`, and `flag`/`flag=`).
+/// The URL parser supplies scheme/host/default-port/path normalization.
 pub fn canonicalize(mut url: url::Url) -> url::Url {
     url.set_fragment(None);
-    let pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    if pairs.is_empty() {
-        url.set_query(None);
-        return url;
+    if let Some(query) = url.query() {
+        let mut pairs: Vec<&str> = query.split('&').collect();
+        pairs.sort_by(|left, right| {
+            let left_key = left.split_once('=').map_or(*left, |(key, _)| key);
+            let right_key = right.split_once('=').map_or(*right, |(key, _)| key);
+            left_key.as_bytes().cmp(right_key.as_bytes())
+        });
+        let sorted = pairs.join("&");
+        url.set_query(Some(&sorted));
     }
-    let mut sorted = pairs;
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (k, v) in &sorted {
-        serializer.append_pair(k, v);
-    }
-    url.set_query(Some(&serializer.finish()));
     url
 }
 
@@ -96,6 +96,23 @@ mod tests {
     use url::Url;
 
     #[test]
+    fn request_url_keeps_query_bytes_and_empty_query_without_changing_identity_rules() {
+        for (input, expected) in [
+            (
+                "HTTPS://Example.COM:443/a?z=1&id=%FF#top",
+                "https://example.com/a?z=1&id=%FF",
+            ),
+            ("https://example.com/a?#top", "https://example.com/a?"),
+            ("https://example.com/a#top", "https://example.com/a"),
+        ] {
+            assert_eq!(request_url(Url::parse(input).unwrap()).as_str(), expected);
+        }
+        let parsed = Url::parse("https://example.com/a?z=1&a=2").unwrap();
+        assert_eq!(request_url(parsed.clone()).query(), Some("z=1&a=2"));
+        assert_eq!(canonicalize(parsed).query(), Some("a=2&z=1"));
+    }
+
+    #[test]
     fn canonicalize_drops_fragment_default_port_and_sorts_query() {
         let url = Url::parse("HTTPS://Example.COM:443/a/b?z=1&a=2#top").unwrap();
         let out = canonicalize(url);
@@ -120,6 +137,57 @@ mod tests {
 
         assert_eq!(id_a, id_b, "#section must not change identity");
         assert_ne!(id_a, id_c, "?id=1 and ?id=2 are distinct resources");
+    }
+
+    // Must fail if query pairs are form-decoded/reencoded before identity derivation.
+    #[test]
+    fn raw_query_encodings_have_distinct_document_ids() {
+        for (left, right) in [
+            ("id=%FF", "id=%FE"),
+            ("q=a+b", "q=a%20b"),
+            ("flag", "flag="),
+            ("q=%2f", "q=%2F"),
+            ("%61=1", "a=1"),
+            ("a=1&a=2", "a=2&a=1"),
+        ] {
+            let left =
+                canonicalize(Url::parse(&format!("https://example.com/item?{left}")).unwrap());
+            let right =
+                canonicalize(Url::parse(&format!("https://example.com/item?{right}")).unwrap());
+            assert_ne!(
+                document_id(site_id(&left), &path_and_query(&left)),
+                document_id(site_id(&right), &path_and_query(&right)),
+                "{left} versus {right}"
+            );
+        }
+    }
+
+    // D1 still sorts keys; order-significant identity changes await an ADR decision.
+    #[test]
+    fn raw_query_sort_is_stable_and_preserves_complete_pairs() {
+        for (input, expected) in [
+            ("z=1&id=%FF&q=a%20b&flag", "flag&id=%FF&q=a%20b&z=1"),
+            ("a=1&b=2&a=3", "a=1&a=3&b=2"),
+            ("z=1&%61=2&a=3", "%61=2&a=3&z=1"),
+            ("z=1&&flag&x=a=b", "&flag&x=a=b&z=1"),
+        ] {
+            let canonical =
+                canonicalize(Url::parse(&format!("https://example.com/item?{input}")).unwrap());
+            assert_eq!(canonical.query(), Some(expected));
+        }
+        for (left, right) in [
+            ("add=1&mul=2", "mul=2&add=1"),
+            ("a=1&b=2&a=3", "a=1&a=3&b=2"),
+        ] {
+            let left =
+                canonicalize(Url::parse(&format!("https://example.com/item?{left}")).unwrap());
+            let right =
+                canonicalize(Url::parse(&format!("https://example.com/item?{right}")).unwrap());
+            assert_eq!(
+                document_id(site_id(&left), &path_and_query(&left)),
+                document_id(site_id(&right), &path_and_query(&right))
+            );
+        }
     }
 
     #[test]

@@ -50,6 +50,8 @@ enum QuarantineReason {
     /// An RFC822 body was present but could not be parsed (khive #449 High
     /// fix: a durable terminal disposition, never a silent drop).
     ParseFailure,
+    /// The message exceeds the configured inbound byte limit.
+    TooLarge,
 }
 
 impl std::fmt::Display for QuarantineReason {
@@ -61,6 +63,7 @@ impl std::fmt::Display for QuarantineReason {
             QuarantineReason::OffAllowlist => "off-allowlist",
             QuarantineReason::MissingBody => "missing-body",
             QuarantineReason::ParseFailure => "parse-failure",
+            QuarantineReason::TooLarge => "too-large",
         })
     }
 }
@@ -70,6 +73,7 @@ impl From<MalformedReason> for QuarantineReason {
         match reason {
             MalformedReason::MissingBody => QuarantineReason::MissingBody,
             MalformedReason::ParseFailure => QuarantineReason::ParseFailure,
+            MalformedReason::TooLarge => QuarantineReason::TooLarge,
         }
     }
 }
@@ -97,11 +101,13 @@ impl EmailChannel {
                     &config.username,
                     password,
                 );
-                let imap = ImapFetcher::new(
+                let imap = ImapFetcher::new_with_limits(
                     &config.imap_host,
                     config.imap_port,
                     &config.username,
                     password,
+                    config.imap_max_message_bytes,
+                    config.imap_max_page_bytes,
                 );
                 (smtp, imap)
             }
@@ -121,11 +127,13 @@ impl EmailChannel {
                     &config.mailbox,
                     Arc::clone(&token_provider),
                 );
-                let imap = ImapFetcher::new_oauth(
+                let imap = ImapFetcher::new_oauth_with_limits(
                     &config.imap_host,
                     config.imap_port,
                     &config.mailbox,
                     Arc::clone(&token_provider),
+                    config.imap_max_message_bytes,
+                    config.imap_max_page_bytes,
                 );
                 (smtp, imap)
             }
@@ -291,8 +299,8 @@ impl EmailChannel {
     }
 
     /// Build the envelope recorded for a selected UID that could not be
-    /// durably parsed into a message (khive #449 High fix: a missing RFC822
-    /// body or an unparseable one). Unlike [`Self::quarantine_envelope`],
+    /// ingested because it is too large or lacks a parseable RFC 822 body.
+    /// Unlike [`Self::quarantine_envelope`],
     /// this is never gated by `quarantine_store` -- a data-integrity failure
     /// must always leave a queryable record, never a silent drop, since
     /// dropping it here is the only way this UID's disposition could be lost
@@ -305,8 +313,7 @@ impl EmailChannel {
         raw_bytes: Option<Vec<u8>>,
     ) -> ChannelEnvelope {
         let to = format!("email:{}", self.maintainer_address());
-        let body =
-            format!("(khive: IMAP message UID {uid} could not be parsed and was quarantined)");
+        let body = format!("(khive: IMAP message UID {uid} was quarantined: {reason})");
         let mut env = ChannelEnvelope::new(EMAIL_QUARANTINE_SENDER, to.clone(), body)
             .with_quarantine_replay(raw_bytes.unwrap_or_default(), to);
         env = env.with_external_id(imap_external_id);
@@ -437,7 +444,7 @@ impl EmailChannel {
                     warn!(
                         uid,
                         reason = %reason,
-                        "quarantining permanently unparseable IMAP message"
+                        "quarantining IMAP message"
                     );
                     envelopes.push(self.malformed_quarantine_envelope(
                         uid,
@@ -596,6 +603,8 @@ mod tests {
             smtp_port: 587,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
+            imap_max_message_bytes: crate::config::DEFAULT_IMAP_MAX_MESSAGE_BYTES,
+            imap_max_page_bytes: crate::config::DEFAULT_IMAP_MAX_PAGE_BYTES,
             username: "user@example.com".to_string(),
             mailbox: "user@example.com".to_string(),
             auth: EmailAuth::Basic {
@@ -1947,6 +1956,44 @@ mod tests {
             page.next_checkpoint.unwrap().high_water,
             Some(2),
             "the checkpoint candidate must advance past the poison UID"
+        );
+    }
+
+    #[test]
+    fn oversized_uid_is_quarantined_without_body_even_if_attribution_quarantine_is_off() {
+        let mut config = make_config("maintainer@example.com");
+        config.quarantine_store = false;
+        let ch = build_channel_from(config, vec![]);
+        let mut good = make_email("maintainer@example.com", "imap:imap.example.com:4:2");
+        good.uid = 2;
+        let envelopes = ch.disposition(vec![
+            SelectedMessage::Malformed {
+                uid: 1,
+                imap_external_id: "imap:imap.example.com:4:1".to_string(),
+                reason: MalformedReason::TooLarge,
+                raw_bytes: None,
+            },
+            SelectedMessage::Email(Box::new(good)),
+        ]);
+
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].from, EMAIL_QUARANTINE_SENDER);
+        assert_eq!(
+            envelopes[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("too-large")
+        );
+        assert!(envelopes[0]
+            .quarantine_replay
+            .as_ref()
+            .unwrap()
+            .bytes
+            .is_empty());
+        assert_eq!(
+            envelopes[1].external_id.as_deref(),
+            Some("imap:imap.example.com:4:2")
         );
     }
 

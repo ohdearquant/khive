@@ -540,7 +540,7 @@ pub(crate) async fn prepare_atomic_note_requests(
             let token = token.expect("a selected model has at least one note");
             let name = model_name.clone();
             let ctx = usage_ctx.clone();
-            join_set.spawn(async move {
+            join_set.spawn(crate::runtime::inherit_request_embedder_scope(async move {
                 let fut = async {
                     let mut outcomes = Vec::with_capacity(texts.len());
                     for chunk in texts.chunks(lattice_embed::DEFAULT_MAX_BATCH_SIZE) {
@@ -558,7 +558,7 @@ pub(crate) async fn prepare_atomic_note_requests(
                     None => fut.await,
                 };
                 (groups, model_idx, result)
-            });
+            }));
         }
 
         while let Some(joined) = join_set.join_next().await {

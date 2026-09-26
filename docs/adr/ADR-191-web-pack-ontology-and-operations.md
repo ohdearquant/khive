@@ -213,6 +213,8 @@ Controls are stated before the arms run; an arm without its control is not evide
 
 ## Consequences
 
+Query-key sorting means documents such as `...?add=1&mul=2` and `...?mul=2&add=1`, differing only in the order of distinct query keys, resolve to one document; for an endpoint where parameter order is significant this is an accepted loss.
+
 The pack shrinks to what the web is: three subtypes, one new relation, two rules, five operations.
 Every application-level concept previously hosted here is expressible on top of it by a consumer pack
 through D6, and none of it lives in this repository. The runtime gains one relation, which is the cost of
@@ -288,6 +290,13 @@ as issue #3038). The
 reverse order is forbidden: a crash after the attachment
 rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
 which is data loss, and this amendment exists to make stored bodies stay alive.
+
+**Proposed correction (2026-09-25; ADR-121 Amendment 1).** The preceding scheduling claim does not
+bound this leak: the blob orphan sweep counts a still-present attachment row as live even when its
+record no longer exists. Removing such rows requires its own reconciliation (#3178). ADR-121
+Amendment 1 proposes a scheduled object sweep (#3038) under complete liveness and store-binding
+gates; that sweep does not discharge the attachment-row reconciliation. The accepted wording above
+remains intact pending the proposed correction.
 
 Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
 attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the

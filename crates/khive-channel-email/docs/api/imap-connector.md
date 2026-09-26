@@ -9,10 +9,10 @@ not server read flags, controls retries and checkpoint advancement.
 
 ## `process_selected_page`
 
-Validates a fully-fetched selected page and builds the `SelectedMessage` list, in
+Validates a selected page and builds the `SelectedMessage` list, in
 `selected_uids` order — exactly one entry per selected UID.
 
-Every UID in `selected_uids` must appear exactly once in `fetched_raw`:
+Every UID that passed the size preflight must appear exactly once in `fetched_raw`:
 
 - A **gap** (a UID absent from the fetch response entirely) or a **duplicate** response for
   the same UID fails the whole page — no partial advancement. These are treated as protocol
@@ -22,6 +22,14 @@ Every UID in `selected_uids` must appear exactly once in `fetched_raw`:
   (khive #449 High fix): rather than failing the whole page and re-selecting the same
   poison UID forever, that UID gets a durable `SelectedMessage::Malformed` disposition so
   the caller can quarantine it and advance past it.
+- Before body fetch, `RFC822.SIZE` is required for each selected UID. A message above
+  `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` is quarantined with reason `too-large` and
+  an empty replay body. Only the remaining UIDs are fetched, in order, with a
+  bounded partial `BODY.PEEK[]` request. Aggregate fetched body bytes stay within
+  `KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES`, apart from at most one probe byte used to
+  detect a body that grew after the size check. The first UID that would exceed the page
+  budget is left for the next poll, and the checkpoint advances only through
+  the processed prefix. Missing or duplicate size responses reject the page.
 - A fetch response for a UID **outside** `selected_uids` is unrequested (e.g. a stray server
   response) and is ignored with a `warn!`; it never affects page validity or the candidate
   high-water mark.

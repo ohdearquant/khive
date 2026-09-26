@@ -287,6 +287,13 @@ ahead-of-V21 epochs return typed `Unsupported` before root locking, filesystem w
 abandoned-claim cleanup. Malformed schema/evidence and nonfunctional named fences also fail closed
 before claim cleanup or deletion, though their validation/probe may occur after ownership and the
 filesystem walk. There is no fallback to caller-snapshot sweep or unconditional delete.
+This exact-V21 rule describes the Phase-4a rollout binary. [ADR-121 Amendment 1](ADR-121-attachments-first-class.md#amendment-1-2026-09-25-the-orphan-sweep-runs-on-a-schedule-and-on-demand)
+proposes admission through a named `REVIEWED_SCHEMA_EPOCH` after review of the complete core migration
+chain, plus main-database ownership rows for every durable blob producer, a checked blob-writer
+census and a cutover-recorded store ID bound to the root, before any scheduled
+or on-demand transactional sweep. The ownership-table migration requires a separate exact-epoch review.
+The Phase-4a attachment-only liveness rule does not by itself protect persistent exec, git or
+derived web objects that share the root; newer epochs remain refused until separately reviewed.
 
 Phase 4a must converge on every process that can share the database/blob root, and every
 pre-Phase-4a process must then be drained and prevented from restarting, before any Phase-4b binary

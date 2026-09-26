@@ -724,7 +724,9 @@ pub(crate) fn validate_transition(
             current.status
         )));
     }
-    if status == "granted" && current.actor == decider {
+    // Grant lookup treats the stored actor as a pattern, including legacy
+    // wildcard requests. The decider must not match the grant it is approving.
+    if status == "granted" && pattern_matches(&current.actor, decider) {
         return Err(RuntimeError::InvalidInput(format!(
             "grant {} is {} and was requested by {}; a requester cannot grant its own request",
             &current.id[..8],
