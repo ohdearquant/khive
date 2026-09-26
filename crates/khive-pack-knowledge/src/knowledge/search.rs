@@ -463,6 +463,15 @@ impl FtsTermBudget {
     fn truncated(&self) -> bool {
         self.truncated.load(Ordering::Relaxed)
     }
+
+    /// Count only terms this pass can actually admit. Decomposed passes share
+    /// the request allowance, so a pass after exhaustion must not acquire a
+    /// larger deadline just because its raw query contains many terms.
+    fn available_for(&self, raw_query: &str) -> usize {
+        fts5_candidate_terms(raw_query)
+            .len()
+            .min(self.remaining.load(Ordering::Relaxed))
+    }
 }
 
 fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
@@ -563,8 +572,26 @@ const PHASE_A_WIDEN_CEILING: usize = 8000;
 /// itself is out of time — only that this one stage's own budget is.
 pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
 
-/// Share of the lexical stage budget the rarity probe may spend before it is
-/// cut off and the terms are used in the order they arrived.
+/// The fixed 2 s stage allowance leaves the same time for one or many
+/// sequential bounded term reads. Give each additional admitted term one
+/// quarter of the base budget, capped at 4x for a pass. The request's outer
+/// read deadline remains authoritative (normally 30 s), and the 32-term
+/// request-wide admission bound still limits actual FTS work.
+const LEXICAL_STAGE_EXTRA_TERM_QUARTERS: usize = 12;
+
+fn lexical_stage_budget_for_terms(
+    base: std::time::Duration,
+    admitted_terms: usize,
+) -> std::time::Duration {
+    let quarters = 4 + admitted_terms
+        .saturating_sub(1)
+        .min(LEXICAL_STAGE_EXTRA_TERM_QUARTERS);
+    base.saturating_mul(quarters as u32) / 4
+}
+
+/// Share of the base lexical budget the rarity probe may spend before it is
+/// cut off and the terms are used in the order they arrived. Multi-term
+/// candidate fetches gain time; the optional ordering probe does not.
 ///
 /// `rarest_fts_terms_first` fetches no candidates. It issues one bounded
 /// `count(*)` per term, sequentially, and its entire product is an ORDERING of
@@ -586,8 +613,8 @@ pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
 const RARITY_PROBE_BUDGET_NUMERATOR: u32 = 1;
 const RARITY_PROBE_BUDGET_DENOMINATOR: u32 = 4;
 
-/// The rarity probe's own deadline, derived from whatever stage budget is in
-/// force (including the test override) rather than from a second constant that
+/// The rarity probe's own deadline, derived from the base budget in force
+/// (including the test override) rather than from a second constant that
 /// could drift away from it.
 fn rarity_probe_budget() -> std::time::Duration {
     lexical_stage_budget() / RARITY_PROBE_BUDGET_DENOMINATOR * RARITY_PROBE_BUDGET_NUMERATOR
@@ -1418,7 +1445,10 @@ async fn search_core(
     // deadline governs everything that runs after it (rerank, body-line
     // counts, member sizing) — a lexical-stage timeout no longer spends the
     // whole request.
-    let configured_budget = lexical_stage_budget();
+    let configured_budget = lexical_stage_budget_for_terms(
+        lexical_stage_budget(),
+        ctx.term_budget.available_for(&raw_query),
+    );
     let stage_started = tokio::time::Instant::now();
     let FtsFetchOutcome {
         atoms,
@@ -5387,6 +5417,71 @@ mod tests {
             "the outer request deadline must still be active once the lexical \
              stage's own budget expires and its scope returns; got {still_active:?}"
         );
+    }
+
+    #[test]
+    fn lexical_stage_allowance_scales_only_with_admitted_terms_and_is_capped() {
+        let base = lexical_stage_budget();
+        let budget = FtsTermBudget::new();
+        assert_eq!(
+            lexical_stage_budget_for_terms(base, budget.available_for("zzmass")),
+            base,
+        );
+        assert_eq!(
+            lexical_stage_budget_for_terms(base, budget.available_for("zzmass zzlass")),
+            std::time::Duration::from_millis(2_500),
+        );
+        let many = distinct_term_query(FTS_TERM_COUNT_LIMIT * 2);
+        assert_eq!(
+            lexical_stage_budget_for_terms(base, budget.available_for(&many)),
+            std::time::Duration::from_millis(8_000),
+        );
+        budget.admit(fts5_candidate_terms(&many));
+        assert_eq!(budget.available_for("zzmass zzlass"), 0);
+        assert_eq!(lexical_stage_budget_for_terms(base, 0), base);
+    }
+
+    /// A second bounded term read must have time to run after the original
+    /// 2 s single-term allowance has elapsed. The clock moves only after the
+    /// first term's rows are collected, so the old fixed 2 s stage returned a
+    /// partial timeout here even though both local terms have cheap matches.
+    #[tokio::test(start_paused = true)]
+    async fn multi_term_search_keeps_lexical_candidates_after_single_term_budget() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) \
+                      VALUES \
+                      ('92700000-0000-0000-0000-000000000011', 'local', 'zzmass-row', \
+                       'First term', 'zzmass content', '[]', 1, 'reviewed', 0, 0), \
+                      ('92700000-0000-0000-0000-000000000012', 'local', 'zzlass-row', \
+                       'Second term', 'zzlass content', '[]', 1, 'reviewed', 0, 0)"
+                    .into(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed two independently matching terms");
+        drop(writer);
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let response = with_fts_deadline_advance_after_term(
+            1,
+            std::time::Duration::from_millis(2_100),
+            KnowledgeHandlers::search(
+                &runtime,
+                &token,
+                json!({"query": "zzmass zzlass", "rerank": false}),
+                &vamana::new_shared(),
+            ),
+        )
+        .await
+        .expect("multi-term search");
+        assert_eq!(response["candidate_provenance"]["lexical"], "matched");
+        assert_eq!(response["total"], 2);
     }
 
     /// Companion pair for issue #1930 Amendment 2's phase-A overfetch/widen
