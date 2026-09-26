@@ -186,6 +186,7 @@ hold-time-gate:
 	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."
 	cd crates && cargo test -p khive-pack-comm --test hold_time_regression -- --nocapture
 
+# Python's fcntl.flock uses the same flock(2) lock as the daemon on macOS and Linux.
 local: verify-local-artifact
 	@if ! VERIFIED_ASSIGNMENTS=$$(python3 scripts/verify_local_artifact.py \
 	  --build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
@@ -249,13 +250,65 @@ local: verify-local-artifact
 	echo "==> Atomically moving into place..."; \
 	mv "$$DEST.new" "$$DEST"; \
 	MARKER=$${KHIVE_SUPERVISOR_MARKER:-$$HOME/.khive/khived.supervisor}; \
+	MARKER_LOCK=$${KHIVE_LOCK:-$$HOME/.khive/khived.recovery.lock}; \
+	MARKER_PY=$$(printf '%s\n' \
+	  'import fcntl, os, sys, tempfile' \
+	  'action, marker, pid, lock = sys.argv[1:]' \
+	  'label = "make-local"' \
+	  'os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)' \
+	  'with open(lock, "a+b") as lock_file:' \
+	  '    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)' \
+	  '    if action == "claim":' \
+	  '        if os.path.lexists(marker):' \
+	  '            print("foreign")' \
+	  '        elif not pid:' \
+	  '            print("absent")' \
+	  '        else:' \
+	  '            parent = os.path.dirname(marker) or "."' \
+	  '            os.makedirs(parent, exist_ok=True)' \
+	  '            fd, temporary = tempfile.mkstemp(prefix=".khived.supervisor.", dir=parent)' \
+	  '            try:' \
+	  '                with os.fdopen(fd, "w", encoding="utf-8") as output:' \
+	  '                    output.write(f"{label}\n{pid}\n10\n")' \
+	  '                os.replace(temporary, marker)' \
+	  '            finally:' \
+	  '                if os.path.exists(temporary):' \
+	  '                    os.unlink(temporary)' \
+	  '            print("owned")' \
+	  '    elif action == "release":' \
+	  '        try:' \
+	  '            with open(marker, "r", encoding="utf-8") as present:' \
+	  '                lines = present.read().splitlines()' \
+	  '        except FileNotFoundError:' \
+	  '            print("absent")' \
+	  '        else:' \
+	  '            if lines[:2] == [label, pid]:' \
+	  '                os.unlink(marker)' \
+	  '                print("released")' \
+	  '            else:' \
+	  '                print("kept")' \
+	  '    else:' \
+	  '        raise ValueError("unknown marker action")'); \
 	MARKER_OWNED=""; \
 	MARKER_FOREIGN=""; \
-	if [ -n "$$OLD_PID" ] && [ ! -e "$$MARKER" ]; then \
-	  printf 'make-local\n%s\n' "$$OLD_PID" > "$$MARKER" && MARKER_OWNED=1; \
-	  trap '[ -n "$$MARKER_OWNED" ] && rm -f "$$MARKER"' EXIT INT TERM; \
+	MARKER_STATUS=$$(python3 -c "$$MARKER_PY" claim "$$MARKER" "$$OLD_PID" "$$MARKER_LOCK") || exit 1; \
+	release_marker() { \
+	  [ -n "$$MARKER_OWNED" ] || return 0; \
+	  RELEASE_STATUS=$$(python3 -c "$$MARKER_PY" release "$$MARKER" "$$OLD_PID" "$$MARKER_LOCK") || { \
+	    echo "==> ERROR: could not check ownership before releasing $$MARKER" >&2; return 1; \
+	  }; \
+	  MARKER_OWNED=""; \
+	  if [ "$$RELEASE_STATUS" = released ]; then \
+	    echo "==> Released $$MARKER"; \
+	  else \
+	    echo "==> $$MARKER changed or disappeared; leaving it untouched ($$RELEASE_STATUS)"; \
+	  fi; \
+	}; \
+	if [ "$$MARKER_STATUS" = owned ]; then \
+	  MARKER_OWNED=1; \
+	  trap 'release_marker' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; \
 	  echo "==> Claimed the daemon rendezvous with $$MARKER so client requests wait for the replacement instead of spawning a competing daemon"; \
-	elif [ -e "$$MARKER" ]; then \
+	elif [ "$$MARKER_STATUS" = foreign ]; then \
 	  MARKER_FOREIGN=1; \
 	  echo "==> $$MARKER already exists; a supervisor owns this rendezvous. Leaving it untouched."; \
 	fi; \
@@ -292,11 +345,11 @@ local: verify-local-artifact
 	      if [ -S "$$SOCK" ] && /usr/sbin/lsof -t "$$SOCK" >/dev/null 2>&1; then SERVING=1; break; fi; \
 	      i=$$((i+1)); sleep 0.25; \
 	    done; \
-	    rm -f "$$MARKER"; MARKER_OWNED=""; \
+	    release_marker || exit 1; \
 	    if [ -n "$$SERVING" ]; then \
-	      echo "==> Replacement is serving; released $$MARKER"; \
+	      echo "==> Replacement is serving"; \
 	    else \
-	      echo "==> ERROR: nothing holds $$SOCK 10s after the start. Released $$MARKER so clients are not left blocked. Daemon log tail:"; \
+	      echo "==> ERROR: nothing holds $$SOCK 10s after the start. Daemon log tail:"; \
 	      tail -20 "$$DLOG" 2>/dev/null | sed "s/^/    /"; \
 	      exit 1; \
 	    fi; \
@@ -304,7 +357,7 @@ local: verify-local-artifact
 	elif [ -n "$$MARKER_FOREIGN" ]; then \
 	  echo "==> Not starting a replacement daemon: the supervisor named by $$MARKER starts the daemon for this socket, and a second one started here would be a daemon it does not own."; \
 	else \
-	  if [ -n "$$MARKER_OWNED" ]; then rm -f "$$MARKER"; MARKER_OWNED=""; fi; \
+	  release_marker || exit 1; \
 	  echo "==> KHIVE_LOCAL_NO_START set: not starting a replacement daemon; released $$MARKER so clients may spawn."; \
 	fi; \
 	DEST_HASH=$$(md5 -q "$$DEST"); \
