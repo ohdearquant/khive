@@ -1,9 +1,9 @@
 # SQ8 codec reference
 
 Two scalar-quantization codecs in `src/lib.rs` map `f32` vector components to
-`u8` codes so distance computation can run on integer hardware paths (NEON on
-aarch64, chunked widening multiply elsewhere). Both are trained on a corpus
-of vectors and then encode individual vectors against the trained min/scale.
+`u8` codes. The global-scale L2 path uses integer hardware (NEON on aarch64,
+chunked widening multiply elsewhere); per-dimension weighted sums use f64
+accumulation. Both codecs train on a corpus and encode against its min/scale.
 
 ## `Sq8Codec` — per-dimension affine (dot product / cosine)
 
@@ -17,14 +17,14 @@ Fields:
 | `min`                 | per-dimension minimum observed at train time                     |
 | `scale`               | per-dimension `(max - min) / 255`                                 |
 | `scale_sq`            | `scale²` per dimension, precomputed for L2/dot                    |
-| `mean_scale_sq`       | mean of `scale_sq` across dims — the integer-pass multiplier      |
-| `scale_sq_residual`   | `scale_sq_i - mean_scale_sq`, zero-mean and small magnitude       |
+| `mean_scale_sq`       | legacy shared mean retained for public-field compatibility       |
+| `scale_sq_residual`   | legacy residual retained for public-field compatibility          |
 | `offset_sq_sum`       | `Σ min_i²`, precomputed for the dot-product correction term       |
 
 `EncodedVector` carries, alongside `codes`, the per-vector correction terms
-(`norm`, `soc_sum`, `residual_dot_bias`) needed to reconstruct a
-full-precision-corrected distance from two encoded vectors without
-re-touching the original `f32` data.
+(`norm`, `soc_sum`) needed to reconstruct a corrected dot product from two
+encoded vectors without re-touching the original `f32` data.
+`residual_dot_bias` is retained for public-field compatibility.
 
 ### `approx_dot`
 
@@ -34,10 +34,10 @@ Full-precision correction identity (both vectors share one codec's min/scale):
 dot(a, b) = Σ scale_i² · a_i · b_i + soc_a + soc_b + offset_sq_sum
 ```
 
-The integer pass (`u8_dot_u32`) computes `raw = Σ a_i·b_i` as a `u32` (NEON
-16-wide on aarch64). The scale correction applies `mean_scale_sq · raw` plus a
-compact per-dimension residual `f32` pass (`scale_sq_residual`) for accuracy,
-then adds each vector's precomputed `soc_sum` and the shared `offset_sq_sum`.
+The weighted term `Σ scale_i² · a_i · b_i` is accumulated directly in f64.
+The precomputed `soc_sum` and `offset_sq_sum` corrections are added in f64,
+then the result is rounded to f32 once. Splitting the weighted term into a
+shared f32 mean and residual could erase small dimensions by cancellation.
 
 ### `approx_cosine_dist`
 
@@ -48,11 +48,11 @@ non-finite, instead of dividing by zero.
 ### `approx_l2_sq`
 
 Full-precision identity: `||a-b||² = Σ scale_sq_i · (a_i - b_i)²` — offset
-terms cancel because both vectors share the same codec. The integer pass
-(`u8_l2sq_u32`) computes `raw = Σ (a_i-b_i)²`; the residual correction keeps
-ordinal accuracy across anisotropic corpora. For Vamana's L2 acquisition path
-prefer `GsSq8Codec::l2_sq` instead — it is algebraically exact in code space
-and roughly 2x faster because it skips the residual pass entirely.
+terms cancel because both vectors share the same codec. Each nonnegative
+weighted term is accumulated in f64, then rounded to f32 once. This preserves
+small dimensions beside a much wider one. For Vamana's L2 acquisition path
+prefer `GsSq8Codec::l2_sq` instead — it uses a shared scale and an integer
+kernel, algebraically exact in its encoded code space.
 
 ## `GsSq8Codec` — global-scale affine (L2 / Vamana acquisition)
 
@@ -131,13 +131,11 @@ or a silently wrong result.
 
 ## NEON hot-loop helpers
 
-`u8_dot_u32` and `u8_l2sq_u32` are the two inner kernels both codecs share.
+`u8_l2sq_u32` is the production integer kernel used by `GsSq8Codec`.
 
-- **`u8_dot_u32`**: `Σ a_i * b_i` over `u8` slices, accumulated as `u32`. On
-  `aarch64`, uses NEON `vmull_u8` (16-wide `u8→u16` widening multiply per
-  iteration, split across 4 accumulator lanes) with a scalar tail loop for
-  the remainder. Elsewhere, a chunked (8-wide) portable widening-multiply
-  fallback.
+- **`u8_dot_u32`**: retained as a test-only integer-kernel check; the public
+  per-dimension `approx_dot` no longer uses it because shared-mean scaling
+  can cancel narrow dimensions.
 - **`u8_l2sq_u32`**: `Σ (a_i - b_i)²` over `u8` slices, accumulated as `u32`.
   On `aarch64`, NEON `vabdq_u8` (absolute difference) feeding `vmull_u8`
   (squaring), same 4-lane accumulation and scalar tail. Elsewhere, the
@@ -147,7 +145,7 @@ or a silently wrong result.
   than a `QuantError`).
 
 Both are `#[inline(always)]`; `u8_l2sq_u32` is `pub` (used directly by
-`GsSq8Codec::l2_sq` and by callers outside this crate that need the raw
-integer kernel), `u8_dot_u32` is private to this module.
+`GsSq8Codec::l2_sq` and callers that need the raw integer kernel), while
+`u8_dot_u32` is private and compiled only for tests.
 
 Measured cost: the NEON `l2_sq` path runs roughly 13 ns at 384 dimensions.

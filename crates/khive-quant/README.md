@@ -26,9 +26,9 @@ let cosine_dist = codec.approx_cosine_dist(&encoded[0], &encoded[1]);
 derive `scale_i = (max_i - min_i) / 255`; `encode` maps each `f32` dimension to
 a `u8` code via `round((x - min_i) / scale_i)`. `encode_par` / `encode_flat_par`
 parallelize encoding across a batch with `rayon`. `approx_dot`,
-`approx_cosine_dist`, and `approx_l2_sq` reconstruct the original-scale
-distance from `u8` codes using a residual-corrected integer pass, preserving
-ordinal ranking against the exact `f32` computation.
+`approx_cosine_dist`, and `approx_l2_sq` reconstruct original-scale distances
+from `u8` codes with per-dimension weighted sums accumulated in `f64`. This
+preserves small dimensions when another dimension has a much wider range.
 
 ## GsSq8Codec — the Vamana acquisition path
 
