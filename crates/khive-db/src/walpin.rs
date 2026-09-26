@@ -3065,6 +3065,42 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// PID spelling used by the local process census.
+pub fn reporting_pid() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        census_visible_self_pid().unwrap_or_else(std::process::id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::id()
+    }
+}
+
+/// Coarsest uncertainty of the process start-time value returned below.
+#[cfg(target_os = "macos")]
+pub fn start_time_resolution_secs() -> Option<u64> {
+    Some(1)
+}
+
+#[cfg(target_os = "linux")]
+/// Coarsest uncertainty of the Linux process start-time value.
+pub fn start_time_resolution_secs() -> Option<u64> {
+    Some(2)
+}
+
+#[cfg(windows)]
+/// Coarsest uncertainty of the Windows process start-time value.
+pub fn start_time_resolution_secs() -> Option<u64> {
+    Some(1)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+/// Process start-time values are unavailable on this platform.
+pub fn start_time_resolution_secs() -> Option<u64> {
+    None
+}
+
 /// The OS-reported start time of `pid`, in epoch seconds, or `None` if it
 /// cannot be determined (dead PID, permission denied, or an unsupported
 /// platform). Used as the required identity check in [`enumerate_live`] —

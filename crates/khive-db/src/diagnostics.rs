@@ -8,8 +8,9 @@
 //! `PRAGMA wal_checkpoint(PASSIVE)`, and a PASSIVE checkpoint that succeeds
 //! BACKFILLS WAL frames into the main database — ordinary database-page
 //! writes, on the happy path. That I/O is the point: the busy/log_frames/
-//! checkpointed_frames triple is the pin-depth signal this surface exists to
-//! report, and SQLite exposes no read-only API for those counters. The
+//! checkpointed_frames triple reports a one-row backfill gap; a sustained
+//! pinned-frame report additionally requires a matching checkpoint run.
+//! SQLite exposes no read-only API for those counters. The
 //! guarantee is that nothing here changes logical state or destroys
 //! evidence, not that nothing touches the disk.
 //!
@@ -62,7 +63,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use khive_storage::error::StorageError;
@@ -76,10 +76,11 @@ use crate::pool::ConnectionPool;
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///
-/// SQLite returns three columns: `busy` (1 when the checkpoint could not run
-/// to completion because a writer/reader held it back), `log` (frames
+/// SQLite returns three columns: `busy` (1 when the checkpoint could not
+/// obtain the checkpoint lock or read the WAL-index header), `log` (frames
 /// currently in the WAL), and `checkpointed` (frames moved into the database
-/// by THIS call). Pin depth is `log - checkpointed`.
+/// by THIS call). The one-row backfill gap is `log - checkpointed`; that
+/// difference alone does not establish a reader pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CheckpointProbe {
     pub busy: i64,
@@ -88,10 +89,16 @@ pub struct CheckpointProbe {
 }
 
 impl CheckpointProbe {
-    /// Frames still pinned behind the backfill boundary. Negative components
-    /// (an in-memory or non-WAL database reports `-1`) clamp to 0.
-    pub fn pin_depth(&self) -> i64 {
-        (self.log_frames - self.checkpointed_frames).max(0)
+    /// Frames still awaiting backfill in this row. Negative frame counts
+    /// (an in-memory or non-WAL database reports `-1`) return 0. Even when
+    /// busy, populated frame counts describe only a gap, never a reader pin.
+    pub fn backfill_gap_frames(&self) -> i64 {
+        if self.log_frames < 0 || self.checkpointed_frames < 0 {
+            return 0;
+        }
+        self.log_frames
+            .saturating_sub(self.checkpointed_frames)
+            .max(0)
     }
 }
 
@@ -274,6 +281,18 @@ pub struct WalPinAttribution {
     pub status_reasons: Vec<String>,
     /// Authoritative tagged result of the OS holder census.
     pub census: WalPinCensus,
+    /// PID spelling used by the process census for the reporting process.
+    pub reporting_pid: u32,
+    /// Whether the reporting process appears among confirmed file holders.
+    pub reporting_process_is_holder: Option<bool>,
+    /// Why the census could not determine whether the reporter is a holder.
+    pub reporting_process_is_holder_unavailable_reason: Option<String>,
+    /// Raw start-time values for every confirmed holder PID.
+    pub census_process_start_times: Vec<WalPinCensusProcessStart>,
+    /// Resolution of the operating system's process start-time value.
+    pub start_time_resolution_secs: Option<u64>,
+    /// Why the platform does not provide process start-time values.
+    pub start_time_resolution_unavailable_reason: Option<String>,
     /// `false` plus an `unavailable_reason` whenever the OS census failed,
     /// or when only a partial (census-only) answer is available.
     pub available: bool,
@@ -307,6 +326,40 @@ pub struct WalPinAttribution {
     /// diagnostic pass itself never performs that cleanup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidecar_entries_cleanup_would_reap: Option<usize>,
+}
+
+/// OS-reported start time for one holder confirmed by the process census.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WalPinCensusProcessStart {
+    /// PID confirmed by the OS holder census.
+    pub pid: u32,
+    /// Process start time as epoch seconds, if the OS reported it.
+    pub process_start_time_secs: Option<i64>,
+    /// Why the process start time is unavailable.
+    pub process_start_time_unavailable_reason: Option<String>,
+}
+
+fn census_process_start_times(holder_pids: &[u32]) -> Vec<WalPinCensusProcessStart> {
+    holder_pids
+        .iter()
+        .map(|pid| {
+            let process_start_time_secs = crate::walpin::process_start_time_secs(*pid);
+            let process_start_time_unavailable_reason =
+                process_start_time_secs.is_none().then(|| {
+                    if crate::walpin::start_time_resolution_secs().is_none() {
+                        "process start time is unavailable on this platform".to_string()
+                    } else {
+                        "the operating system did not report a start time for this process"
+                            .to_string()
+                    }
+                });
+            WalPinCensusProcessStart {
+                pid: *pid,
+                process_start_time_secs,
+                process_start_time_unavailable_reason,
+            }
+        })
+        .collect()
 }
 
 /// Overall quality of the WAL-pin attribution answer.
@@ -388,12 +441,23 @@ pub struct WalPinHolder {
 impl WalPinAttribution {
     fn unavailable(reason: impl Into<String>) -> Self {
         let reason = reason.into();
+        let start_time_resolution_secs = crate::walpin::start_time_resolution_secs();
         Self {
             status: WalPinAttributionStatus::Unavailable,
             status_reasons: vec![reason.clone()],
             census: WalPinCensus::Unavailable {
                 reason: reason.clone(),
             },
+            reporting_pid: crate::walpin::reporting_pid(),
+            reporting_process_is_holder: None,
+            reporting_process_is_holder_unavailable_reason: Some(
+                "the OS holder census supplied no holder evidence".to_string(),
+            ),
+            census_process_start_times: Vec::new(),
+            start_time_resolution_secs,
+            start_time_resolution_unavailable_reason: start_time_resolution_secs
+                .is_none()
+                .then(|| "process start time is unavailable on this platform".to_string()),
             available: false,
             unavailable_reason: Some(reason),
             census_holder_pids: Vec::new(),
@@ -428,6 +492,17 @@ fn wal_pin_attribution_without_sidecar(
     let census_is_complete = census.is_complete();
     let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();
     census_holder_pids.sort_unstable();
+    let reporting_pid = crate::walpin::reporting_pid();
+    let reporting_process_is_holder = census_holder_pids
+        .contains(&reporting_pid)
+        .then_some(true)
+        .or_else(|| census_is_complete.then_some(false));
+    let reporting_process_is_holder_unavailable_reason =
+        reporting_process_is_holder.is_none().then(|| {
+            "the reporting process was absent from the incomplete OS holder census".to_string()
+        });
+    let census_process_start_times = census_process_start_times(&census_holder_pids);
+    let start_time_resolution_secs = crate::walpin::start_time_resolution_secs();
     let mut census_uninspectable_pids = census.uninspectable_pids;
     census_uninspectable_pids.sort_unstable();
     census_uninspectable_pids.dedup();
@@ -468,6 +543,14 @@ fn wal_pin_attribution_without_sidecar(
         unavailable_reason: Some(status_reasons.join("; ")),
         status_reasons,
         census,
+        reporting_pid,
+        reporting_process_is_holder,
+        reporting_process_is_holder_unavailable_reason,
+        census_process_start_times,
+        start_time_resolution_secs,
+        start_time_resolution_unavailable_reason: start_time_resolution_secs
+            .is_none()
+            .then(|| "process start time is unavailable on this platform".to_string()),
         available: false,
         census_holder_pids,
         census_uninspectable_pids,
@@ -494,6 +577,17 @@ fn wal_pin_attribution_from_evidence(
     let census_is_complete = census.is_complete();
     let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();
     census_holder_pids.sort_unstable();
+    let reporting_pid = crate::walpin::reporting_pid();
+    let reporting_process_is_holder = census_holder_pids
+        .contains(&reporting_pid)
+        .then_some(true)
+        .or_else(|| census_is_complete.then_some(false));
+    let reporting_process_is_holder_unavailable_reason =
+        reporting_process_is_holder.is_none().then(|| {
+            "the reporting process was absent from the incomplete OS holder census".to_string()
+        });
+    let census_process_start_times = census_process_start_times(&census_holder_pids);
+    let start_time_resolution_secs = crate::walpin::start_time_resolution_secs();
     let mut census_uninspectable_pids = census.uninspectable_pids;
     census_uninspectable_pids.sort_unstable();
     census_uninspectable_pids.dedup();
@@ -641,6 +735,14 @@ fn wal_pin_attribution_from_evidence(
         status,
         status_reasons,
         census: census_carrier,
+        reporting_pid,
+        reporting_process_is_holder,
+        reporting_process_is_holder_unavailable_reason,
+        census_process_start_times,
+        start_time_resolution_secs,
+        start_time_resolution_unavailable_reason: start_time_resolution_secs
+            .is_none()
+            .then(|| "process start time is unavailable on this platform".to_string()),
         available: fully_attributed,
         unavailable_reason,
         census_holder_pids,
@@ -1351,6 +1453,9 @@ pub struct DbDiagnostics {
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
     pub checkpoint_probe_error: Option<String>,
+    #[serde(flatten)]
+    /// Frame pin fields serialized beside `checkpoint_probe` at the report root.
+    pub checkpoint_pin: CheckpointPinDiagnostics,
     /// Reader route, checkout saturation, and hold-lifecycle signals.
     pub reader_contention: ReaderContentionDiagnostics,
     /// Writer-pool and best-effort audit persistence signals.
@@ -1370,6 +1475,145 @@ pub struct DbDiagnostics {
     pub wal_pin: WalPinAttribution,
     /// Per-section assembly cost for this report. See [`CollectionCost`].
     pub collection_cost: CollectionCost,
+}
+
+/// Checkpoint-row evidence used to report a sustained backfill ceiling.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CheckpointPinDiagnostics {
+    /// The probe row's checkpointed frame when it shows unbackfilled frames.
+    pub backfill_ceiling: Option<i64>,
+    /// Why the probe row did not establish a backfill ceiling.
+    pub backfill_ceiling_unavailable_reason: Option<String>,
+    /// The ceiling after a matching checkpoint run has lasted at least one second.
+    pub oldest_pinned_frame: Option<i64>,
+    /// Why the current probe did not establish an oldest pinned frame.
+    pub oldest_pinned_frame_unavailable_reason: Option<String>,
+    /// The first observation for the reported frame.
+    pub oldest_pinned_frame_run: Option<crate::checkpoint::CheckpointRun>,
+    /// Why the matching checkpoint run is unavailable.
+    pub oldest_pinned_frame_run_unavailable_reason: Option<String>,
+    /// Frames from the sustained pin to the current probe's log end.
+    pub pin_depth: Option<i64>,
+    /// Why this report cannot claim a pin depth.
+    pub pin_depth_unavailable_reason: Option<String>,
+}
+
+fn checkpoint_pin_diagnostics(
+    pool: &ConnectionPool,
+    probe: Option<&CheckpointProbe>,
+    probe_error: Option<&str>,
+) -> CheckpointPinDiagnostics {
+    checkpoint_pin_diagnostics_for_run(
+        probe,
+        probe_error,
+        checkpoint::checkpoint_run_status(pool),
+        unix_time_ms(),
+    )
+}
+
+fn checkpoint_pin_diagnostics_for_run(
+    probe: Option<&CheckpointProbe>,
+    probe_error: Option<&str>,
+    run_status: checkpoint::CheckpointRunStatus,
+    now_unix_ms: u64,
+) -> CheckpointPinDiagnostics {
+    let (backfill_ceiling, backfill_reason) = match probe {
+        None => (
+            None,
+            Some(
+                probe_error
+                    .unwrap_or("checkpoint probe did not return a row")
+                    .to_string(),
+            ),
+        ),
+        Some(probe) if probe.busy != 0 => (
+            None,
+            Some(format!("PASSIVE checkpoint returned busy={}", probe.busy)),
+        ),
+        Some(probe) if probe.log_frames < 0 || probe.checkpointed_frames < 0 => (
+            None,
+            Some("PASSIVE checkpoint returned a negative frame count".to_string()),
+        ),
+        Some(probe) if probe.log_frames <= probe.checkpointed_frames => (
+            None,
+            Some("PASSIVE checkpoint found no frames beyond the backfill ceiling".to_string()),
+        ),
+        Some(probe) => (Some(probe.checkpointed_frames), None),
+    };
+
+    let (oldest_pinned_frame, oldest_reason, oldest_pinned_frame_run, run_reason) =
+        match backfill_ceiling {
+            None => {
+                let reason = backfill_reason
+                    .clone()
+                    .unwrap_or_else(|| "backfill ceiling is unavailable".to_string());
+                (None, Some(reason.clone()), None, Some(reason))
+            }
+            Some(ceiling) => match run_status {
+                checkpoint::CheckpointRunStatus::NoTask => {
+                    let reason = "no checkpoint task in this process".to_string();
+                    (None, Some(reason.clone()), None, Some(reason))
+                }
+                checkpoint::CheckpointRunStatus::NoObservation => {
+                    let reason = "no checkpoint run has been observed for this backend".to_string();
+                    (None, Some(reason.clone()), None, Some(reason))
+                }
+                checkpoint::CheckpointRunStatus::Observed(run) if run.frame != ceiling => {
+                    let reason = "checkpoint run frame does not match the current backfill ceiling";
+                    (
+                        None,
+                        Some(reason.to_string()),
+                        None,
+                        Some(reason.to_string()),
+                    )
+                }
+                checkpoint::CheckpointRunStatus::Observed(run)
+                    if now_unix_ms.saturating_sub(run.first_observed_at_unix_ms) < 1000 =>
+                {
+                    let reason = "checkpoint run has been observed for less than one second";
+                    (
+                        None,
+                        Some(reason.to_string()),
+                        None,
+                        Some(reason.to_string()),
+                    )
+                }
+                checkpoint::CheckpointRunStatus::Observed(run) => {
+                    (Some(ceiling), None, Some(run), None)
+                }
+            },
+        };
+
+    let pin_depth = oldest_pinned_frame.map(|frame| {
+        probe
+            .expect("a reported pin always has a probe row")
+            .log_frames
+            .saturating_sub(frame)
+            .max(0)
+    });
+    let pin_depth_reason = if pin_depth.is_none() {
+        oldest_reason.clone()
+    } else {
+        None
+    };
+
+    CheckpointPinDiagnostics {
+        backfill_ceiling,
+        backfill_ceiling_unavailable_reason: backfill_reason,
+        oldest_pinned_frame,
+        oldest_pinned_frame_unavailable_reason: oldest_reason,
+        oldest_pinned_frame_run,
+        oldest_pinned_frame_run_unavailable_reason: run_reason,
+        pin_depth,
+        pin_depth_unavailable_reason: pin_depth_reason,
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Assemble the report for `pool`'s database.
@@ -1477,6 +1721,11 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            checkpoint_pin: checkpoint_pin_diagnostics(
+                &pool,
+                None,
+                Some("in-memory database: no WAL file and no checkpoint to probe"),
+            ),
             reader_contention,
             writer_contention,
             size_composition: None,
@@ -1523,6 +1772,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
+        checkpoint_pin: inspection.checkpoint_pin,
         reader_contention,
         writer_contention,
         size_composition: inspection.size_composition,
@@ -1590,6 +1840,11 @@ fn collect_inner(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            checkpoint_pin: checkpoint_pin_diagnostics(
+                pool,
+                None,
+                Some("in-memory database: no WAL file and no checkpoint to probe"),
+            ),
             reader_contention,
             writer_contention,
             size_composition: None,
@@ -1631,6 +1886,7 @@ fn collect_inner(
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
+        checkpoint_pin: inspection.checkpoint_pin,
         reader_contention,
         writer_contention,
         size_composition: inspection.size_composition,
@@ -1661,6 +1917,7 @@ fn collect_inner(
 struct PoolInspection {
     checkpoint_probe: Option<CheckpointProbe>,
     checkpoint_probe_error: Option<String>,
+    checkpoint_pin: CheckpointPinDiagnostics,
     size_composition: Option<DatabaseSizeComposition>,
     size_composition_error: Option<String>,
     graph_edge_integrity: Option<GraphEdgeIntegrity>,
@@ -1681,6 +1938,19 @@ fn split_fts_segments_result(
     }
 }
 
+fn record_diagnostic_checkpoint_probe(
+    pool: &ConnectionPool,
+    result: &rusqlite::Result<CheckpointProbe>,
+) -> checkpoint::CheckpointRunStatus {
+    checkpoint::record_checkpoint_run_result(
+        pool,
+        result
+            .as_ref()
+            .ok()
+            .map(|probe| (probe.busy, probe.log_frames, probe.checkpointed_frames)),
+    )
+}
+
 fn inspect_pool_interruptibly(
     pool: &ConnectionPool,
     scope: &crate::read_cancellation::InterruptibleReadScope,
@@ -1694,6 +1964,7 @@ fn inspect_pool_interruptibly(
             return Ok(PoolInspection {
                 checkpoint_probe: None,
                 checkpoint_probe_error: Some(reason.clone()),
+                checkpoint_pin: checkpoint_pin_diagnostics(pool, None, Some(&reason)),
                 size_composition: None,
                 size_composition_error: Some(reason.clone()),
                 graph_edge_integrity: None,
@@ -1710,13 +1981,21 @@ fn inspect_pool_interruptibly(
     scope.ensure_active()?;
 
     // PASSIVE can perform write I/O. Never install sqlite3_interrupt for it.
-    let (checkpoint_probe, checkpoint_probe_error) = match checkpoint_probe(&conn) {
+    let probe_result = checkpoint_probe(&conn);
+    let run_status = record_diagnostic_checkpoint_probe(pool, &probe_result);
+    let (checkpoint_probe, checkpoint_probe_error) = match probe_result {
         Ok(probe) => (Some(probe), None),
         Err(e) => (
             None,
             Some(format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}")),
         ),
     };
+    let checkpoint_pin = checkpoint_pin_diagnostics_for_run(
+        checkpoint_probe.as_ref(),
+        checkpoint_probe_error.as_deref(),
+        run_status,
+        unix_time_ms(),
+    );
     #[cfg(test)]
     if TEST_PAUSE_AFTER_PASSIVE.load(Ordering::SeqCst) {
         TEST_REACHED_AFTER_PASSIVE.store(true, Ordering::SeqCst);
@@ -1757,6 +2036,7 @@ fn inspect_pool_interruptibly(
     Ok(PoolInspection {
         checkpoint_probe,
         checkpoint_probe_error,
+        checkpoint_pin,
         size_composition,
         size_composition_error,
         graph_edge_integrity,
@@ -1924,6 +2204,7 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             return PoolInspection {
                 checkpoint_probe: None,
                 checkpoint_probe_error: Some(reason.clone()),
+                checkpoint_pin: checkpoint_pin_diagnostics(pool, None, Some(&reason)),
                 size_composition: None,
                 size_composition_error: Some(reason.clone()),
                 graph_edge_integrity: None,
@@ -1934,13 +2215,21 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
         }
     };
 
-    let (checkpoint_probe, checkpoint_probe_error) = match checkpoint_probe(&conn) {
+    let probe_result = checkpoint_probe(&conn);
+    let run_status = record_diagnostic_checkpoint_probe(pool, &probe_result);
+    let (checkpoint_probe, checkpoint_probe_error) = match probe_result {
         Ok(probe) => (Some(probe), None),
         Err(e) => (
             None,
             Some(format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}")),
         ),
     };
+    let checkpoint_pin = checkpoint_pin_diagnostics_for_run(
+        checkpoint_probe.as_ref(),
+        checkpoint_probe_error.as_deref(),
+        run_status,
+        unix_time_ms(),
+    );
     let (graph_edge_integrity, graph_edge_integrity_error) = match graph_edge_integrity(&conn) {
         Ok(integrity) => (Some(integrity), None),
         Err(e) => (
@@ -1961,6 +2250,7 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
     PoolInspection {
         checkpoint_probe,
         checkpoint_probe_error,
+        checkpoint_pin,
         size_composition,
         size_composition_error,
         graph_edge_integrity,
@@ -2420,7 +2710,163 @@ mod tests {
             probe.checkpointed_frames <= probe.log_frames,
             "a PASSIVE pass cannot checkpoint more frames than the WAL holds: {probe:?}"
         );
-        assert!(probe.pin_depth() >= 0, "pin depth clamps at 0: {probe:?}");
+        assert!(
+            probe.backfill_gap_frames() >= 0,
+            "the one-row backfill gap clamps at 0: {probe:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_probe_backfill_gap_is_a_row_difference_not_a_pin_claim() {
+        let probe = CheckpointProbe {
+            busy: 0,
+            log_frames: 12,
+            checkpointed_frames: 7,
+        };
+        assert_eq!(probe.backfill_gap_frames(), 5);
+        let no_wal = CheckpointProbe {
+            busy: 0,
+            log_frames: -1,
+            checkpointed_frames: -1,
+        };
+        assert_eq!(no_wal.backfill_gap_frames(), 0);
+        let busy = CheckpointProbe { busy: 1, ..probe };
+        assert_eq!(busy.backfill_gap_frames(), 5);
+    }
+
+    #[test]
+    fn checkpoint_pin_report_waits_one_second_for_a_matching_run() {
+        let probe = CheckpointProbe {
+            busy: 0,
+            log_frames: 12,
+            checkpointed_frames: 7,
+        };
+        let run = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
+            frame: 7,
+            first_observed_at_unix_ms: 1_000,
+        });
+
+        let young = checkpoint_pin_diagnostics_for_run(Some(&probe), None, run, 1_999);
+        assert_eq!(young.backfill_ceiling, Some(7));
+        assert_eq!(young.oldest_pinned_frame, None);
+        assert!(young
+            .oldest_pinned_frame_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("less than one second")));
+        assert_eq!(young.oldest_pinned_frame_run, None);
+        assert_eq!(young.pin_depth, None);
+        assert!(young.pin_depth_unavailable_reason.is_some());
+
+        let aged = checkpoint_pin_diagnostics_for_run(Some(&probe), None, run, 2_000);
+        assert_eq!(aged.backfill_ceiling, Some(7));
+        assert_eq!(aged.oldest_pinned_frame, Some(7));
+        assert_eq!(aged.pin_depth, Some(5));
+        assert_eq!(aged.pin_depth_unavailable_reason, None);
+        assert_eq!(
+            aged.oldest_pinned_frame_run,
+            Some(match run {
+                checkpoint::CheckpointRunStatus::Observed(value) => value,
+                _ => unreachable!(),
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_pin_report_keeps_busy_probe_fields_null_even_with_an_aged_run() {
+        let run = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
+            frame: 7,
+            first_observed_at_unix_ms: 1,
+        });
+        for probe in [
+            Some(CheckpointProbe {
+                busy: 1,
+                log_frames: 12,
+                checkpointed_frames: 7,
+            }),
+            Some(CheckpointProbe {
+                busy: 0,
+                log_frames: -1,
+                checkpointed_frames: -1,
+            }),
+            Some(CheckpointProbe {
+                busy: 0,
+                log_frames: 12,
+                checkpointed_frames: 12,
+            }),
+        ] {
+            let result = checkpoint_pin_diagnostics_for_run(probe.as_ref(), None, run, 2_000);
+            assert_eq!(result.backfill_ceiling, None);
+            assert!(result.backfill_ceiling_unavailable_reason.is_some());
+            assert_eq!(result.oldest_pinned_frame, None);
+            assert!(result.oldest_pinned_frame_unavailable_reason.is_some());
+            assert_eq!(result.oldest_pinned_frame_run, None);
+            assert!(result.oldest_pinned_frame_run_unavailable_reason.is_some());
+            assert_eq!(result.pin_depth, None);
+            assert!(result.pin_depth_unavailable_reason.is_some());
+        }
+
+        let error = checkpoint_pin_diagnostics_for_run(None, Some("probe failed"), run, 2_000);
+        assert_eq!(error.backfill_ceiling, None);
+        assert_eq!(
+            error.backfill_ceiling_unavailable_reason.as_deref(),
+            Some("probe failed")
+        );
+        assert_eq!(error.oldest_pinned_frame, None);
+        assert!(error.oldest_pinned_frame_run_unavailable_reason.is_some());
+        assert_eq!(error.pin_depth, None);
+        assert!(error.pin_depth_unavailable_reason.is_some());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn db_diagnostics_reports_start_times_for_all_holders_and_identifies_reporter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, _) = seeded_pool(&dir);
+
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let reporter = crate::walpin::reporting_pid();
+        let process = report
+            .wal_pin
+            .census_process_start_times
+            .iter()
+            .find(|process| process.pid == reporter)
+            .expect("the reporting process must remain in the census list");
+
+        assert_eq!(report.wal_pin.reporting_pid, reporter);
+        assert_eq!(report.wal_pin.reporting_process_is_holder, Some(true));
+        assert_eq!(
+            report.wal_pin.census_process_start_times.len(),
+            report.wal_pin.census_holder_pids.len(),
+            "every confirmed holder gets raw start-time data"
+        );
+        assert_eq!(
+            process.process_start_time_secs,
+            crate::walpin::process_start_time_secs(reporter)
+        );
+        assert_eq!(process.process_start_time_unavailable_reason, None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(report.wal_pin.start_time_resolution_secs, Some(2));
+        #[cfg(target_os = "macos")]
+        assert_eq!(report.wal_pin.start_time_resolution_secs, Some(1));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["wal_pin"]["census_process_start_times"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry["pid"].as_u64())
+                .collect::<Vec<_>>(),
+            report
+                .wal_pin
+                .census_holder_pids
+                .iter()
+                .map(|pid| u64::from(*pid))
+                .collect::<Vec<_>>(),
+            "start-time reporting does not filter census holders"
+        );
     }
 
     /// The verb must not perturb the state it reports: the probe touches none
