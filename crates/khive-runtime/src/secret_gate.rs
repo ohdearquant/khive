@@ -976,7 +976,9 @@ fn check_known_patterns(text: &str) -> Option<(&str, &'static str)> {
     // The format embeds a space, so the generic prefix extractor (which stops at
     // whitespace) cannot measure the combined length.  Check for `FlyV1 ` followed
     // by ≥ 4 non-whitespace characters as the payload.
-    if let Some(pos) = text.find("FlyV1 ") {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("FlyV1 ") {
+        let pos = from + rel;
         let at_boundary = pos == 0 || {
             text[..pos]
                 .chars()
@@ -989,8 +991,10 @@ fn check_known_patterns(text: &str) -> Option<(&str, &'static str)> {
             if payload.len() >= 4 {
                 let candidate = &text[pos..payload_start + payload.len()];
                 keep_leftmost(&mut best, Some((candidate, "fly-token")), base);
+                break;
             }
         }
+        from = pos + "FlyV1 ".len();
     }
 
     // --- PEM private key block ---
@@ -3820,6 +3824,37 @@ mod tests {
         let fake = "FlyV1 FAKEFLYTOKEN000000000000000000";
         assert!(scan(fake).is_some(), "FlyV1 must be caught");
         assert_eq!(scan(fake).unwrap().detector, "fly-token");
+    }
+
+    #[test]
+    fn short_flyv1_marker_does_not_hide_later_token() {
+        let content = "FlyV1 ab FlyV1 FAKEFLYTOKEN000000000000000000";
+        let (matched, detector) = scan_match(content).expect("later FlyV1 token must be detected");
+        assert_eq!(detector, "fly-token");
+        assert_eq!(matched, "FlyV1 FAKEFLYTOKEN000000000000000000");
+        assert_eq!(
+            matched.as_ptr() as usize - content.as_ptr() as usize,
+            content.rfind("FlyV1 ").unwrap()
+        );
+        assert_eq!(scan(content).unwrap().detector, "fly-token");
+    }
+
+    #[test]
+    fn non_boundary_flyv1_marker_does_not_hide_later_token() {
+        for content in [
+            "xFlyV1 abc FlyV1 FAKEFLYTOKEN000000000000000000",
+            "xFlyV1 FAKE FlyV1 FAKEFLYTOKEN000000000000000000",
+        ] {
+            let (matched, detector) =
+                scan_match(content).expect("later FlyV1 token must be detected");
+            assert_eq!(detector, "fly-token");
+            assert_eq!(matched, "FlyV1 FAKEFLYTOKEN000000000000000000");
+            assert_eq!(
+                matched.as_ptr() as usize - content.as_ptr() as usize,
+                content.rfind("FlyV1 ").unwrap()
+            );
+            assert_eq!(scan(content).unwrap().detector, "fly-token");
+        }
     }
 
     #[test]
