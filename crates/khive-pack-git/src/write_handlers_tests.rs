@@ -273,6 +273,46 @@ async fn commit_ignores_hostile_ambient_global_config_in_tests() {
 }
 
 #[tokio::test]
+async fn commit_paths_form_ignores_injected_git_config_identity() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+    std::fs::write(repo.path().join("b.txt"), b"new file").unwrap();
+
+    {
+        let _count = EnvVarGuard::set("GIT_CONFIG_COUNT", "2");
+        let _name_key = EnvVarGuard::set("GIT_CONFIG_KEY_0", "user.name");
+        let _name_value = EnvVarGuard::set("GIT_CONFIG_VALUE_0", "Injected User");
+        let _email_key = EnvVarGuard::set("GIT_CONFIG_KEY_1", "user.email");
+        let _email_value = EnvVarGuard::set("GIT_CONFIG_VALUE_1", "injected@example.invalid");
+        pack.handle_commit_fixture(
+            &token,
+            json!({
+                "repo": repo.path().to_str().unwrap(),
+                "message": "add b.txt",
+                "paths": ["b.txt"],
+            }),
+        )
+        .await
+        .expect("paths commit succeeds with injected Git config present");
+    }
+
+    let commit = git_command(repo.path())
+        .args(["log", "-1", "--format=%an <%ae>|%cn <%ce>"])
+        .output()
+        .expect("read committed identity");
+    assert!(commit.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&commit.stdout).trim(),
+        "Test User <test@example.com>|Test User <test@example.com>"
+    );
+}
+
+#[tokio::test]
 async fn commit_with_paths_scopes_to_those_paths() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
