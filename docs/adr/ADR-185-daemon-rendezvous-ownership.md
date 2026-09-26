@@ -234,3 +234,104 @@ configuration file and environment that disagree is withdrawn along with that de
   times, and every sample fits inside two intervals.
 - **A foreign marker is left alone.** A launcher that finds a marker carrying another job label refuses
   to start and leaves the marker untouched.
+
+## Amendment 2 (2026-09-24): the launcher replaces a client-started incumbent
+
+This amendment adds Decision item 5 to Amendment 1, replaces one sentence of Amendment 1's consequences, and adds
+acceptance arms. Everything else in Amendment 1 stands.
+
+### Why ordering is not enough
+
+Amendment 1's arm "The launcher writes before exec" starts the launcher and a client together, the client at the
+instant that wins under ADR-049, and requires the supervised daemon to end up holding the socket. Serializing the
+client's marker read against the launcher's publication decides the order of the two, but not in the launcher's
+favour. When the client's decision comes first there is no marker yet, so the client spawns under ADR-049 and its
+daemon binds. The launcher then publishes and execs a daemon that the first-writer-wins refusal turns away, and the
+supervisor restarts it into the same refusal. That is the failure this record was written about, reached without any
+bound having passed. The launcher has to act on the daemon it finds.
+
+### Decision 5: the launcher replaces a client-started incumbent
+
+1. **Lock scope.** A client that decides to spawn holds the marker lock from its locked marker read until its daemon
+   answers on the socket or its ADR-049 spawn wait ends. The launcher holds the same lock from its first read of the
+   existing marker until it execs. With both held that way only two orders exist: either the client's daemon already
+   answers when the launcher probes, or the client finds the published marker and waits as Amendment 1 item 4 says. A
+   client blocked on the lock is inside that wait, and its caller deadline returns the retryable "starting" kind.
+2. **Its own job first.** Before publishing, the launcher reads the existing marker. If the marker carries its own label
+   and names a live pid that answers on the socket, that daemon is its own job's, because the launcher's pid survives
+   exec. A second launcher for a live job is a duplicate start: it refuses, leaves the marker byte-for-byte as it found
+   it, and exits non-zero.
+3. **Probe.** After publishing, still holding the lock, the launcher connects to the socket. If nothing accepts the
+   connection it execs as today. If something accepts, the launcher sends it the daemon identity probe the client
+   already uses. "A daemon answers" means the holder returned, within the probe timeout, a daemon response frame that
+   decodes and reports its protocol version and served configuration. A mismatching configuration or protocol version
+   still counts, since that is the daemon to replace; a socket that merely accepted does not. A holder that accepts but
+   stays silent until the timeout, resets the connection, or returns a frame that does not decode is not a khive daemon
+   as far as the launcher can prove: it is never signalled, and item 5 applies with the log line "incumbent is not a
+   khive daemon". When a daemon answers, the launcher reads the holder's pid from the kernel's peer credentials of that
+   connection (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS). It never takes the pid from the PID file, which can
+   name a dead process or a reused pid. Where the platform gives no peer pid, the launcher does not replace anything; it
+   logs the reason and exits non-zero.
+4. **Handover.** A holder that answered as a khive daemon and runs under the launcher's own uid is replaced. The
+   launcher sends it SIGTERM, which runs the daemon's existing shutdown path, and waits up to one restart interval (the
+   value it wrote into the marker) for the socket to stop answering and the pid to exit. Then it execs the supervised
+   daemon. Clients connected to the old daemon see their connection close; their next request finds the marker and no
+   socket, waits as Amendment 1 item 4 says, and connects to the supervised daemon.
+5. **A holder that does not leave.** The launcher never sends SIGKILL. A holder still present after the wait, or one
+   running under another uid (which the launcher cannot signal and does not try to), is logged with its pid, its uid and
+   the time waited ("incumbent did not yield"). A holder that did not answer as a khive daemon is logged the same way
+   with "incumbent is not a khive daemon" and is never signalled. The launcher leaves its marker in place and exits
+   non-zero, so the supervisor retries after its interval. While that holder still answers, clients keep connecting to
+   it.
+
+Why this shape and not the other two:
+
+- **The incumbent yields when it reads the marker.** Every running daemon would have to watch the marker. A daemon from
+  a release that predates the marker never yields, and a rollout is exactly when such a daemon holds the socket. It
+  also adds a poll loop to every daemon for a state only a launcher start creates.
+- **The launcher adopts the incumbent.** The adopted daemon keeps the configuration of the client that started it and
+  runs unsupervised, which are the two costs this record exists to remove. The arm's "the supervisor's pid equals the
+  socket holder's pid" fails by construction.
+- Socket activation stays the stronger form where the platform offers it (Alternatives considered, above), and it does
+  not cover a deployment without it.
+
+### Consequences of Amendment 2
+
+- Amendment 1's sentence "The cost is that a client-started daemon can then hold the socket, and the supervisor's next
+  start is refused by that incumbent, which is the original failure. It can only happen after the bound, and a log line
+  names it." is replaced by: after the bound a client-started daemon can hold the socket until the supervisor's next
+  start, which replaces it; the client logs the degradation when it starts the daemon, and the launcher logs the
+  replacement.
+- A replacement runs the old daemon's own shutdown path: its listening backlog closes, admitted requests get its bounded
+  drain window to commit or roll back, and idle connections close. The gap a caller
+  can see is at most one restart interval for the old daemon to leave plus the supervised daemon's bind time, and it is
+  spent inside Amendment 1's wait.
+- In a crash loop the socket alternates between owners: after the bound a client starts a daemon, the next supervised
+  start replaces it and fails again, and clients wait out the bound again. Every alternation is logged on both sides. A
+  crash loop is already an operator problem; this makes it a visible one rather than a silent one.
+- The first-writer-wins refusal stays as it is. The launcher never binds past a live daemon; it removes the daemon
+  first.
+
+### Acceptance changes
+
+The arm "The launcher writes before exec" stands and is decided by Decision 5 in the client-first order. Added:
+
+- **Client first, then launcher.** Start from no socket, no PID file and no marker. Start a client with auto-spawn and
+  wait until its daemon answers. Start the launcher. Within one restart interval plus the supervised bind time: exactly
+  one daemon process exists; the socket holder's pid (read from peer credentials) equals the supervisor job's pid and
+  the marker's pid; the client-started daemon left through its SIGTERM path; and the client's next request is served
+  by the supervised daemon under the supervised configuration. Control: the same run with the handover disabled ends
+  with the supervised start refused as "already serving this socket" and a socket holder whose pid differs from the
+  job's. The control is what shows the arm tests the handover and not an ordering accident.
+- **Started together, repeatedly.** Launcher and client start with a random offset between 0 and 1 second, twenty
+  times. Every run ends with one daemon whose pid equals the job's.
+- **Its own job is left alone.** With a supervised daemon serving, a second launcher for the same label refuses, the
+  marker is byte-identical afterwards, and the serving daemon's pid is unchanged.
+- **The PID file is not the pid source.** A PID file names a live unrelated process of the same uid and nothing answers
+  on the socket. The launcher execs its daemon, and the unrelated process is still alive afterwards.
+- **A silent holder is not signalled.** A same-uid stub accepts connections on the socket and never answers. The
+  launcher does not send it SIGTERM, logs "incumbent is not a khive daemon" and exits non-zero; the marker stays and the
+  stub is alive afterwards.
+- **A holder that does not leave.** A holder that answers the identity probe but ignores SIGTERM (a test stub) makes the
+  launcher wait one interval, log "incumbent did not yield", and exit non-zero; the marker stays, the holder still
+  serves, and no second daemon exists.

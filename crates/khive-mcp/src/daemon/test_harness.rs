@@ -15,7 +15,11 @@ use khive_runtime::daemon::{
 };
 use tokio::net::UnixStream;
 
+/// Entries into stale-daemon recovery, including a missing PID file/no signal.
 pub(super) static KILL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// SIGTERM syscall attempts made by stale-daemon recovery, not kill(0) probes
+/// or child cleanup performed by this test harness.
+pub(super) static SIGTERM_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(super) static FORCE_PID_IS_DAEMON: AtomicBool = AtomicBool::new(false);
 pub(super) static FORCE_PID_IS_FOREIGN: AtomicBool = AtomicBool::new(false);
@@ -28,6 +32,7 @@ pub(super) static RECOVERY_RACE_BARRIER: std::sync::Mutex<Option<Arc<tokio::sync
 
 pub(super) fn reset_counters() {
     KILL_COUNT.store(0, Ordering::SeqCst);
+    SIGTERM_COUNT.store(0, Ordering::SeqCst);
     SPAWN_COUNT.store(0, Ordering::SeqCst);
     FORCE_PID_IS_DAEMON.store(false, Ordering::SeqCst);
     FORCE_PID_IS_FOREIGN.store(false, Ordering::SeqCst);

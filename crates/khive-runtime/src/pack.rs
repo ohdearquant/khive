@@ -4528,6 +4528,8 @@ inventory::collect!(PackRegistration);
 pub enum PackLoadError {
     /// The requested pack name was not found in the inventory.
     UnknownPack(String),
+    /// The requested pack name occurs more than once.
+    DuplicatePack(String),
     /// A pack was requested but a declared dependency is absent from the list.
     MissingDependency {
         /// The pack that declared the dependency.
@@ -4547,6 +4549,7 @@ impl std::fmt::Display for PackLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PackLoadError::UnknownPack(name) => write!(f, "unknown pack {name:?}"),
+            PackLoadError::DuplicatePack(name) => write!(f, "duplicate pack {name:?}"),
             PackLoadError::MissingDependency { pack, dep } => write!(
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
@@ -4615,6 +4618,45 @@ impl PackRegistry {
             .collect()
     }
 
+    /// Validate linked pack names and explicit dependencies without creating
+    /// runtimes, opening stores, or constructing pack instances.
+    ///
+    /// Launchers can use this before publishing ownership. Registration uses
+    /// the same validation, including when extra factories are supplied.
+    pub fn validate_pack_selection(names: &[String]) -> Result<(), PackLoadError> {
+        let all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        Self::validate_pack_selection_from(&all, names)
+    }
+
+    fn validate_pack_selection_from(
+        factories: &[&'static dyn PackFactory],
+        names: &[String],
+    ) -> Result<(), PackLoadError> {
+        let factory_for = |name: &str| factories.iter().copied().find(|f| f.name() == name);
+        let mut requested = std::collections::HashSet::new();
+        for name in names {
+            factory_for(name).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
+            if !requested.insert(name.as_str()) {
+                return Err(PackLoadError::DuplicatePack(name.clone()));
+            }
+        }
+        for name in names {
+            let factory = factory_for(name).unwrap(); // All names were validated above.
+            for &dep in factory.requires() {
+                if !requested.contains(dep) {
+                    return Err(PackLoadError::MissingDependency {
+                        pack: name.clone(),
+                        dep: dep.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register the named packs into `builder` using the supplied `runtime`.
     ///
     /// Validates the explicit pack list against `PackFactory::requires()` —
@@ -4626,7 +4668,7 @@ impl PackRegistry {
     ///
     /// Returns `Ok(())` when all names are recognised and all declared
     /// dependencies are satisfied; returns `Err(PackLoadError)` with a
-    /// distinct variant for unknown pack vs missing dependency.
+    /// distinct variants for unknown or duplicate packs and missing dependencies.
     pub fn register_packs(
         names: &[String],
         runtime: KhiveRuntime,
@@ -4641,25 +4683,7 @@ impl PackRegistry {
             all.iter().copied().find(|f| f.name() == name)
         };
 
-        // Validate that every requested name is a known factory.
-        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
-        for name in names {
-            factory_for(name.as_str()).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
-        }
-
-        // Validate that all requires() dependencies are explicitly present in
-        // the requested set. Missing dep → boot error, not auto-add.
-        for name in names {
-            let factory = factory_for(name.as_str()).unwrap(); // validated above
-            for &dep in factory.requires() {
-                if !requested.contains(dep) {
-                    return Err(PackLoadError::MissingDependency {
-                        pack: name.clone(),
-                        dep: dep.to_string(),
-                    });
-                }
-            }
-        }
+        Self::validate_pack_selection_from(&all, names)?;
 
         // Register every requested pack; VerbRegistryBuilder::build()
         // performs the topo-sort, so insertion order here does not matter.
@@ -4802,22 +4826,7 @@ impl PackRegistry {
             factories.iter().copied().find(|f| f.name() == name)
         };
 
-        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
-        for name in names {
-            factory_for(name.as_str()).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
-        }
-
-        for name in names {
-            let factory = factory_for(name.as_str()).unwrap();
-            for &dep in factory.requires() {
-                if !requested.contains(dep) {
-                    return Err(PackLoadError::MissingDependency {
-                        pack: name.clone(),
-                        dep: dep.to_string(),
-                    });
-                }
-            }
-        }
+        Self::validate_pack_selection_from(factories, names)?;
 
         builder.kg_read_resolver = Some(Arc::new(crate::kg_read::KgReadResolver::new(
             default_runtime,

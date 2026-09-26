@@ -21,6 +21,7 @@ pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
 pub mod repo;
+mod supervisor;
 pub mod sync;
 pub mod vector;
 

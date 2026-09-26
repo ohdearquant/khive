@@ -225,14 +225,14 @@ pub fn recoverer_lock_path() -> PathBuf {
     khive_dir().join("khived.recoverer.lock")
 }
 
-/// Marker file a process supervisor (launchd, systemd, or any equivalent)
-/// writes beside the socket path before it starts a supervised `khived`, and
-/// removes on a clean stop. Its presence tells a client that this rendezvous
-/// is not the "any client may spawn on demand" case: a supervisor already
-/// owns the daemon's lifecycle for this socket, and a client racing it to
-/// bind the socket would only produce a second, unsupervised daemon that the
-/// supervisor's own instance then refuses to replace. Reading and acting on
-/// this file is entirely the client's decision (`khive-mcp`); this module
+/// Marker file the supervisor's launcher publishes before it execs `khived`.
+/// It records the job label, launcher/daemon PID, and restart interval in
+/// seconds (ADR-185 Amendment 1). The launcher or deliberate-stop procedure
+/// removes its own claim; the daemon never writes or removes it. A client
+/// waits up to three restart intervals before a logged degraded bootstrap,
+/// bounded by its caller deadline, rather than racing normal supervisor
+/// startup. Reading and acting on this file is the client's decision
+/// (`khive-mcp`); this module
 /// only resolves where it lives, matching the [`lock_path`] /
 /// [`recoverer_lock_path`] pattern.
 ///
@@ -2492,6 +2492,13 @@ where
         Incumbent::Stale => {}
     }
 
+    // Install signal streams before publishing either rendezvous file. A
+    // supervisor may stop us as soon as connect/pid checks succeed, before
+    // the accept loop or shutdown future has been polled. Keep these streams
+    // alive so a signal during the rest of startup reaches normal cleanup.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     let pid_file_guard = match write_pid_file_exclusive(&pid_file) {
         Ok(guard) => guard,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2607,13 +2614,6 @@ where
     let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
-        // REASON: signal handler registration can only fail if the global Tokio runtime
-        // is not running or the OS rejects the signal number — both are unrecoverable
-        // at this point in startup, so panic is the correct response.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("install SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),

@@ -100,6 +100,10 @@ enum Command {
     /// warm Unix-socket server; `--transport` selects a registered transport).
     Mcp(khive_mcp::args::Args),
 
+    /// Publish or release a supervisor's daemon ownership declaration.
+    #[command(subcommand)]
+    Supervisor(crate::supervisor::SupervisorCommand),
+
     /// Serve the dedicated events daemon (ADR-170): the resident writer of
     /// the events database, receiving observational events over its own Unix
     /// socket so telemetry never queues on the domain store's writer lane.
@@ -303,6 +307,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Kg(k) => kg::run_kg(k).await,
         Command::Repo(r) => repo::run_repo(r).await,
         Command::Db(d) => cmd_db(d).await,
+        Command::Supervisor(command) => crate::supervisor::run(command, &args.log).await,
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
@@ -1758,6 +1763,31 @@ mod tests {
         let args = Args::parse_from(["kkernel"]);
         let result = resolve_command_result(args.exec, args.command);
         assert!(matches!(result, Err(ResolveCommandError::Missing)));
+    }
+
+    #[test]
+    fn supervisor_subcommands_parse_through_the_full_cli() {
+        for tail in [
+            vec![
+                "launch",
+                "--label",
+                "job",
+                "--restart-interval-secs",
+                "10",
+                "--",
+                "--no-embed",
+            ],
+            vec!["release", "--label", "job"],
+        ] {
+            let parsed = Args::try_parse_from(
+                ["kkernel", "--log", "error", "supervisor"]
+                    .into_iter()
+                    .chain(tail),
+            )
+            .unwrap();
+            assert_eq!(parsed.log, "error");
+            assert!(matches!(parsed.command, Some(Command::Supervisor(_))));
+        }
     }
 
     #[test]
