@@ -82,6 +82,19 @@ async fn register_is_idempotent_by_name() {
     assert_eq!(listed["count"], json!(1));
 }
 
+#[tokio::test]
+async fn wide_list_limit_clamps_before_narrowing() {
+    let f = fixture();
+    for name in ["wide_limit_a", "wide_limit_b", "wide_limit_c"] {
+        f.call("tool.register", json!({"name": name})).await;
+    }
+
+    let listed = f
+        .call("tool.list", json!({"limit": 4_294_967_296_u64}))
+        .await;
+    assert_eq!(listed["count"], json!(3), "{listed}");
+}
+
 // Arm 2: capabilities are created once and linked with implements edges.
 #[tokio::test]
 async fn capabilities_are_created_once_and_linked() {
@@ -318,6 +331,49 @@ async fn expired_grant_is_ignored() {
         .await;
     assert_eq!(check["decision"], json!("ask"), "{check}");
     assert_eq!(check["source"], json!("default"));
+}
+
+async fn requested_grant_for_expiry_test() -> (Fixture, String) {
+    let f = fixture();
+    f.call("tool.register", json!({"name": "send_mail"})).await;
+    let request = f
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    (f, s(&request, "request_id"))
+}
+
+async fn assert_expiry_overflow_rejected(f: &Fixture, id: &str, seconds: i64) {
+    let err = f
+        .call_err("tool.grant", json!({"id": id, "expires_in_s": seconds}))
+        .await;
+    assert!(err.contains("expires_in_s is too large"), "{err}");
+
+    let pending = f
+        .call("tool.requests", json!({"status": "requested"}))
+        .await;
+    assert_eq!(pending["count"], json!(1), "{pending}");
+    let check = f
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    assert_eq!(check["decision"], json!("ask"), "{check}");
+}
+
+#[tokio::test]
+async fn grant_expiry_multiplication_overflow_is_rejected() {
+    let (f, id) = requested_grant_for_expiry_test().await;
+    assert_expiry_overflow_rejected(&f, &id, i64::MAX).await;
+}
+
+#[tokio::test]
+async fn grant_expiry_addition_overflow_is_rejected() {
+    let (f, id) = requested_grant_for_expiry_test().await;
+    assert_expiry_overflow_rejected(&f, &id, i64::MAX / 1_000_000).await;
 }
 
 // Arm 7: an illegal transition is refused with the current status in the message.

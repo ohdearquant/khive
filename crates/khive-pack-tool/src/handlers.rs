@@ -55,9 +55,12 @@ fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
 fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(default),
-        Some(v) => v.as_u64().map(|n| (n as u32).clamp(1, max)).ok_or_else(|| {
-            RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
-        }),
+        Some(v) => v
+            .as_u64()
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
+            }),
     }
 }
 
@@ -876,7 +879,16 @@ pub(crate) async fn decide_request(
     let decider = actor_label(token);
     policy::validate_transition(&current, status, &decider)?;
     let expires_at = if status == "granted" {
-        opt_i64(&params, "expires_in_s")?.map(|s| now_micros() + s.max(0) * 1_000_000)
+        opt_i64(&params, "expires_in_s")?
+            .map(|seconds| {
+                let duration = seconds.max(0).checked_mul(1_000_000).ok_or_else(|| {
+                    RuntimeError::InvalidInput("expires_in_s is too large".to_string())
+                })?;
+                now_micros().checked_add(duration).ok_or_else(|| {
+                    RuntimeError::InvalidInput("expires_in_s is too large".to_string())
+                })
+            })
+            .transpose()?
     } else {
         None
     };
