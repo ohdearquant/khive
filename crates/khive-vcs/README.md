@@ -44,9 +44,10 @@ async fn rebuild(repo_root: &Path, db_path: &Path) -> anyhow::Result<()> {
 ```
 
 `run_sync` reads `.khive/kg/{entities,edges}.ndjson` under `repo_root`, validates every
-edge relation before touching disk, builds the new database in a `.tmp` sibling file, and
-renames it over `db_path` only on success — a crash or parse error leaves the previous
-database intact. `run_sync_remote(repo_root, &RemoteConfig, repin)` fetches a remote KG
+edge relation and registered entity kind, then builds a new database in a unique sibling
+file. The target must be closed and have no SQLite `-wal`/`-shm` sidecars. Sync calls
+serialize on a sibling lock; errors before the final rename leave the previous database
+intact. `run_sync_remote(repo_root, &RemoteConfig, repin)` fetches a remote KG
 archive (sparse, depth-1 clone), verifies its content hash against `RemoteConfig::pin`
 when set, and populates `.khive/kg/remotes/<name>/` with a `meta.json` recording the
 resolved commit and hash.
