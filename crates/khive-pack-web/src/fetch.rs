@@ -671,6 +671,7 @@ pub(crate) async fn settle_content_body(
         });
     }
 
+    let no_body = body.is_none();
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
         Some(ContentBody::Received(buffer, truncated)) => {
@@ -687,22 +688,22 @@ pub(crate) async fn settle_content_body(
     };
     let content_ref = typed_ref.as_ref().map(ToString::to_string);
 
-    crate::entities::patch(
-        runtime,
-        token,
-        id,
-        Some(entity_type),
-        representation_patch(
-            request_url.as_ref(),
-            content_type,
-            status,
-            etag,
-            last_modified,
-            content_ref.as_deref(),
-            bytes,
-        ),
-    )
-    .await?;
+    let mut properties = representation_patch(
+        request_url.as_ref(),
+        content_type,
+        status,
+        etag,
+        last_modified,
+        content_ref.as_deref(),
+        bytes,
+    );
+    properties["truncated"] = json!(truncated);
+    if no_body {
+        // HEAD did not observe a representation length. Null also clears a
+        // legacy HEAD row that incorrectly reported an empty body as size 0.
+        properties["size"] = Value::Null;
+    }
+    crate::entities::patch(runtime, token, id, Some(entity_type), properties).await?;
     if let Some(typed_ref) = &typed_ref {
         root_body(
             runtime,
@@ -823,7 +824,7 @@ async fn settle(
         .map(|hop| json!({ "from": hop.from.to_string(), "to": hop.to.to_string(), "status": hop.status }))
         .collect();
 
-    let request_record = json!({
+    let mut request_record = json!({
         "verb": "web.fetch",
         "method": method_name,
         "final_url": final_url.to_string(),
@@ -832,12 +833,16 @@ async fn settle(
         "bytes": bytes,
         "truncated": truncated,
         "content_ref": content_ref,
-        "content_digest": content_digest,
-        "size": bytes,
         "fetched_at": fetched_at,
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
     });
+    if method_name == "GET" {
+        // A GET measures the body even when persist=false leaves the graph
+        // untouched. A HEAD has no bytes from which to infer either field.
+        request_record["content_digest"] = json!(content_digest);
+        request_record["size"] = json!(bytes);
+    }
     let receipt_id = write_receipt(
         runtime,
         token,
@@ -1510,6 +1515,15 @@ mod tests {
         .expect("settle stores + records receipt");
         assert_eq!(reply["truncated"], true);
         assert_eq!(reply["bytes"], max_bytes);
+        let persisted_id = Uuid::parse_str(reply["id"].as_str().unwrap()).unwrap();
+        let persisted = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(persisted_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.properties.unwrap()["truncated"], true);
         let content_ref = reply["content_ref"]
             .as_str()
             .expect("content_ref")
@@ -1699,6 +1713,104 @@ mod tests {
             1,
             "the GET control stores exactly one new object"
         );
+    }
+
+    #[tokio::test]
+    async fn head_receipt_and_row_leave_unread_size_unknown_get_transient_records_measured_size() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://example.test/head-receipt").unwrap();
+        let mut head_headers = reqwest::header::HeaderMap::new();
+        head_headers.insert("content-length", "42".parse().unwrap());
+        let head = settle(
+            &runtime,
+            &token,
+            "HEAD",
+            &url,
+            200,
+            &head_headers,
+            None,
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(head["bytes"], 0);
+        assert!(head["content_ref"].is_null());
+        let head_id = Uuid::parse_str(head["id"].as_str().unwrap()).unwrap();
+        let head_row = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(head_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let head_properties = head_row.properties.unwrap();
+        assert!(head_properties["content_digest"].is_null());
+        assert!(
+            head_properties["size"].is_null(),
+            "HEAD read no body length"
+        );
+
+        let head_receipt_id = Uuid::parse_str(head["receipt_id"].as_str().unwrap()).unwrap();
+        let head_receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(head_receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let head_request = &head_receipt.properties.as_ref().unwrap()["request"];
+        assert_eq!(head_request["headers"]["content-length"], "42");
+        assert_eq!(head_request["bytes"], 0);
+        assert!(head_request.get("content_digest").is_none());
+        assert!(head_request.get("size").is_none());
+
+        // An advertised length is not a measured size. A GET with
+        // persist=false reads bytes, stores no entity change, and records the
+        // body digest and the actual length in its standalone receipt.
+        let body = b"read bytes".to_vec();
+        let mut get_headers = reqwest::header::HeaderMap::new();
+        get_headers.insert("content-length", "999".parse().unwrap());
+        let get = settle(
+            &runtime,
+            &token,
+            "GET",
+            &url,
+            200,
+            &get_headers,
+            Some((body.clone(), false)),
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(get["id"].is_null());
+        let get_receipt_id = Uuid::parse_str(get["receipt_id"].as_str().unwrap()).unwrap();
+        let get_receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(get_receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let get_request = &get_receipt.properties.as_ref().unwrap()["request"];
+        assert_eq!(get_request["headers"]["content-length"], "999");
+        assert_eq!(get_request["bytes"], body.len() as u64);
+        assert_eq!(get_request["size"], body.len() as u64);
+        assert_eq!(
+            get_request["content_digest"],
+            blake3::hash(&body).to_hex().to_string()
+        );
+        assert!(get["content_ref"].is_null());
+        assert!(get_request["content_ref"].is_null());
+        let after = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(head_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.properties.unwrap(), head_properties);
     }
 
     // arm 19: a gzip response whose decompressed size exceeds the byte

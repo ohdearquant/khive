@@ -2,7 +2,6 @@
 //! GET body a mechanical 304 yields. No HTTP/egress coverage is claimed here.
 use super::*;
 use crate::fetch::{settle_content, RedirectHop};
-use khive_storage::{ContentRef, Direction};
 use khive_types::Namespace;
 use std::sync::Arc;
 
@@ -37,186 +36,141 @@ fn not_modified(final_url: &Url) -> HopOutcome {
     }
 }
 
-// Must fail when the redirected-304 restoration is removed: placeholder
-// blob_ref/status/type/root assertions fail. The same-ref control must keep
-// the complete terminal row and its existing metadata unchanged.
+// A 304 from a redirect target cannot validate the source address's body.
+// The terminal row, whether absent or already fetched, must remain unchanged.
 #[tokio::test]
-async fn redirected_304_restores_validated_cache_without_storing_empty_body() {
+async fn redirected_304_never_copies_the_source_representation() {
     for status in [301, 302, 307, 308] {
-        for terminal_state in ["absent", "placeholder", "different", "same"] {
+        for terminal_state in ["absent", "different"] {
             let (runtime, token, _dir) = fixture().await;
             let old_url = Url::parse("https://old.example/document").unwrap();
             let final_url = Url::parse("https://final.example/document").unwrap();
-            let body = b"<p>validated cached representation</p>";
             let source = settle_content(
                 &runtime,
                 &token,
                 &old_url,
-                Some("text/html; charset=utf-8"),
+                Some("text/html"),
                 200,
                 Some("source-etag"),
-                Some("Mon, 21 Sep 2026 12:00:00 GMT"),
-                Some((body.to_vec(), false)),
+                None,
+                Some((b"source body".to_vec(), false)),
             )
             .await
             .unwrap();
-            let reference = source.content_ref.as_ref().unwrap();
             let final_id = document_id(&final_url);
-            match terminal_state {
-                "placeholder" => {
-                    crate::fetch::mint_bare(&runtime, &token, &final_url)
-                        .await
-                        .unwrap();
-                }
-                "different" | "same" => {
-                    let prior_body = if terminal_state == "same" {
-                        body.as_slice()
-                    } else {
-                        b"<p>different terminal cache</p>".as_slice()
-                    };
-                    settle_content(
-                        &runtime,
-                        &token,
-                        &final_url,
-                        Some("text/html; charset=utf-8"),
-                        200,
-                        Some("terminal-etag"),
-                        None,
-                        Some((prior_body.to_vec(), false)),
-                    )
-                    .await
-                    .unwrap();
-                }
-                _ => {}
-            }
-            let before_terminal = runtime
-                .entities(&token)
-                .unwrap()
-                .get_entity(final_id)
+            if terminal_state == "different" {
+                settle_content(
+                    &runtime,
+                    &token,
+                    &final_url,
+                    Some("text/html"),
+                    200,
+                    Some("terminal-etag"),
+                    None,
+                    Some((b"terminal body".to_vec(), false)),
+                )
                 .await
                 .unwrap();
-            let before_source = runtime
+            }
+            let source_before = runtime
                 .entities(&token)
                 .unwrap()
                 .get_entity(source.id)
                 .await
                 .unwrap()
                 .unwrap();
-            let hop = RedirectHop {
-                from: old_url.clone(),
-                to: final_url.clone(),
-                status,
-            };
-            let reply = settle_refresh(
+            let terminal_before = runtime
+                .entities(&token)
+                .unwrap()
+                .get_entity(final_id)
+                .await
+                .unwrap();
+            let error = settle_refresh(
                 &runtime,
                 &token,
                 source.id,
                 old_url.as_str(),
-                reference,
+                source.content_ref.as_ref().unwrap(),
                 not_modified(&final_url),
-                &[hop],
+                &[RedirectHop {
+                    from: old_url.clone(),
+                    to: final_url.clone(),
+                    status,
+                }],
             )
             .await
-            .unwrap();
-            assert_eq!(reply["status"], 304);
-            assert_eq!(reply["final_id"], final_id.to_string());
-            assert_eq!(reply["changed"], terminal_state != "same");
-            let terminal = runtime
-                .entities(&token)
-                .unwrap()
-                .get_entity(final_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let properties = terminal.properties.as_ref().unwrap();
-            assert_eq!(properties["url"], final_url.as_str());
-            assert_eq!(properties["blob_ref"], reference.as_str());
-            assert_eq!(properties["content_digest"], reference.as_str());
-            assert_eq!(properties["size"], body.len() as u64);
-            assert_eq!(properties["status"], 200);
-            assert_eq!(properties["content_type"], "text/html; charset=utf-8");
-            assert!(properties["fetched_at"].as_str().is_some());
-            assert_eq!(terminal.entity_type.as_deref(), Some("page"));
-            if terminal_state == "same" {
-                assert_eq!(
-                    serde_json::to_value(&terminal).unwrap(),
-                    serde_json::to_value(before_terminal.unwrap()).unwrap()
-                );
-                assert_eq!(properties["etag"], "terminal-etag");
-            } else {
-                assert_eq!(properties["etag"], "source-etag");
-                assert_eq!(properties["last_modified"], "Mon, 21 Sep 2026 12:00:00 GMT");
-            }
-            let roots = runtime
-                .core()
-                .attachments()
-                .unwrap()
-                .list_attachments(final_id)
-                .await
-                .unwrap();
-            assert_eq!(roots.len(), 1);
-            assert_eq!(roots[0].content_ref.to_string(), *reference);
-            assert_eq!(roots[0].size_bytes, Some(body.len() as u64));
-            let empty_ref = ContentRef::from_hex(blake3::hash(&[]).to_hex().to_string()).unwrap();
-            assert!(crate::blob_store(&runtime)
-                .unwrap()
-                .size(&empty_ref)
-                .await
-                .unwrap()
-                .is_none());
-            let after_source = runtime
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("redirected_not_modified"),
+                "{error}"
+            );
+            let source_after = runtime
                 .entities(&token)
                 .unwrap()
                 .get_entity(source.id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                after_source.properties.as_ref().unwrap()["url"],
-                old_url.as_str()
-            );
-            assert_eq!(
-                after_source.properties.as_ref().unwrap()["blob_ref"],
-                reference.as_str()
-            );
-            if matches!(status, 302 | 307) {
-                assert_eq!(
-                    serde_json::to_value(after_source).unwrap(),
-                    serde_json::to_value(before_source).unwrap()
-                );
-            }
-            let receipt_id = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
-            let receipt = runtime
-                .notes(&token)
+            let terminal_after = runtime
+                .entities(&token)
                 .unwrap()
-                .get_note(receipt_id)
+                .get_entity(final_id)
                 .await
-                .unwrap()
                 .unwrap();
-            let request = &receipt.properties.as_ref().unwrap()["request"];
-            assert_eq!(request["status"], 304);
-            assert_eq!(request["redirect_chain"][0]["status"], status);
-            assert_eq!(request["redirect_chain"][0]["to"], final_url.as_str());
-            assert!(runtime
-                .neighbors(
-                    &token,
-                    receipt_id,
-                    Direction::Out,
-                    None,
-                    Some(vec![EdgeRelation::Annotates])
-                )
-                .await
-                .unwrap()
-                .iter()
-                .any(|hit| hit.node_id == final_id));
+            assert_eq!(
+                serde_json::to_value(source_after).unwrap(),
+                serde_json::to_value(source_before).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(terminal_after).unwrap(),
+                serde_json::to_value(terminal_before).unwrap()
+            );
         }
     }
 }
 
-// A source changed after sending its conditional headers cannot supply
-// metadata for the old validated reference. Refuse before any redirect write.
 #[tokio::test]
-async fn redirected_304_refuses_changed_source_cache_before_graph_settlement() {
+async fn redirected_304_is_refused_even_when_target_has_same_document_identity() {
+    let (runtime, token, _dir) = fixture().await;
+    let source_url = Url::parse("https://example.test/document").unwrap();
+    let fragment_url = Url::parse("https://example.test/document#section").unwrap();
+    assert_eq!(document_id(&source_url), document_id(&fragment_url));
+    let source = settle_content(
+        &runtime,
+        &token,
+        &source_url,
+        Some("text/html"),
+        200,
+        Some("source-etag"),
+        None,
+        Some((b"source body".to_vec(), false)),
+    )
+    .await
+    .unwrap();
+    let error = settle_refresh(
+        &runtime,
+        &token,
+        source.id,
+        source_url.as_str(),
+        source.content_ref.as_ref().unwrap(),
+        not_modified(&fragment_url),
+        &[RedirectHop {
+            from: source_url.clone(),
+            to: fragment_url,
+            status: 302,
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("redirected_not_modified"),
+        "{error}"
+    );
+}
+
+// A redirected 304 remains invalid even if the source changed meanwhile.
+#[tokio::test]
+async fn redirected_304_refuses_before_graph_settlement_after_source_changes() {
     let (runtime, token, _dir) = fixture().await;
     let old_url = Url::parse("https://source.example/document").unwrap();
     let final_url = Url::parse("https://new.example/document").unwrap();
@@ -266,7 +220,10 @@ async fn redirected_304_refuses_changed_source_cache_before_graph_settlement() {
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("cached_body_changed"), "{error}");
+    assert!(
+        error.to_string().contains("redirected_not_modified"),
+        "{error}"
+    );
     let after = runtime
         .entities(&token)
         .unwrap()
@@ -301,11 +258,10 @@ async fn redirected_304_refuses_changed_source_cache_before_graph_settlement() {
     );
 }
 
-// S1: each direct refresh read must refuse a foreign row before settlement.
-// Removing an individual guard must fail its corresponding branch here.
+// S1: the original and redirect target rows are namespace-scoped reads.
 #[tokio::test]
-async fn refresh_refuses_foreign_original_terminal_and_cached_source() {
-    for foreign_read in ["original", "terminal", "cached_source"] {
+async fn refresh_refuses_foreign_original_and_terminal() {
+    for foreign_read in ["original", "terminal"] {
         let (runtime, token, _dir) = fixture().await;
         let foreign = runtime
             .authorize(Namespace::parse("foreign").unwrap())
@@ -338,8 +294,7 @@ async fn refresh_refuses_foreign_original_terminal_and_cached_source() {
             .unwrap();
         let final_id = document_id(&final_url);
         if foreign_read == "terminal" {
-            // Matching cache bypasses body settlement; only the early
-            // terminal read guard can reject before receipt creation.
+            // The terminal read guard runs before body settlement.
             settle_content(
                 &runtime,
                 &foreign,
@@ -381,7 +336,13 @@ async fn refresh_refuses_foreign_original_terminal_and_cached_source() {
                 source.id,
                 old_url.as_str(),
                 source.content_ref.as_ref().unwrap(),
-                not_modified(&final_url),
+                HopOutcome {
+                    status: 200,
+                    final_url: final_url.clone(),
+                    headers: reqwest::header::HeaderMap::new(),
+                    redirect_to: None,
+                    body: Some((b"fresh terminal body".to_vec(), false)),
+                },
                 &[RedirectHop {
                     from: old_url.clone(),
                     to: final_url.clone(),

@@ -4,12 +4,13 @@
 //! `If-Modified-Since` are sent from the entity's own stored `etag`/
 //! `last_modified` (both already on `egress::ALLOWED_REQUEST_HEADERS`, so no
 //! policy change was needed to send them). A `304` response, or a `200`
-//! whose body content-addresses to the SAME `ContentRef` already stored
-//! (some origins ignore conditional headers), writes a receipt only — no
+//! whose body content-addresses to the SAME `ContentRef` already stored and
+//! has the same completeness flag (some origins ignore conditional headers),
+//! writes a receipt only — no
 //! entity patch, no new blob (the blob store's own `put` is idempotent, so
 //! "no blob change" falls out of that rather than needing separate logic).
-//! A redirected 304 also restores the validated cached representation at a
-//! terminal address that does not yet carry it, without a new blob put.
+//! Conditional headers are confined to their original resource. A redirected
+//! 304 is refused rather than treating one address's body as another's.
 //! A genuinely changed body puts the new blob and patches the entity in
 //! place, same as `fetch`. Every refresh receipt chains to the immediately
 //! prior one for the same entity via `note supersedes note` (D4's "receipt
@@ -66,6 +67,28 @@ fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
         .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))
 }
 
+fn conditional_headers_for_hop(
+    properties: &Value,
+    original_url: &Url,
+    current_url: &Url,
+    first_hop: bool,
+) -> Vec<(String, String)> {
+    if !first_hop
+        || current_url != original_url
+        || properties.get("truncated").and_then(Value::as_bool) == Some(true)
+    {
+        return Vec::new();
+    }
+    let mut headers = Vec::new();
+    if let Some(etag) = properties.get("etag").and_then(Value::as_str) {
+        headers.push(("If-None-Match".to_string(), etag.to_string()));
+    }
+    if let Some(last_modified) = properties.get("last_modified").and_then(Value::as_str) {
+        headers.push(("If-Modified-Since".to_string(), last_modified.to_string()));
+    }
+    headers
+}
+
 async fn run_refresh(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -113,19 +136,13 @@ async fn run_refresh(
     )?;
     let deadline = egress::request_deadline(timeout_s)?;
 
-    let mut headers: Vec<(String, String)> = Vec::new();
-    if let Some(etag) = properties.get("etag").and_then(Value::as_str) {
-        headers.push(("If-None-Match".to_string(), etag.to_string()));
-    }
-    if let Some(last_modified) = properties.get("last_modified").and_then(Value::as_str) {
-        headers.push(("If-Modified-Since".to_string(), last_modified.to_string()));
-    }
-
     // Same bounded chain, same per-hop egress checks as `web.fetch`
     // (`crate::fetch::run_hop_chain`) — a refresh that hits a moved resource
     // follows the redirect rather than conditional-GETing the old address
-    // forever. The conditional headers are resent unchanged on every hop,
-    // same as `web.fetch` resends its own fixed header set per hop.
+    // forever. Validators describe only the original resource and are not
+    // forwarded to another address after a redirect.
+    let original_url = url.clone();
+    let mut first_hop = true;
     let (outcome, redirect_hops) = crate::fetch::run_hop_chain(
         resolver,
         cfg,
@@ -133,7 +150,15 @@ async fn run_refresh(
         reqwest::Method::GET,
         max_bytes,
         deadline,
-        |_current_url| Ok(headers.clone()),
+        |current_url| {
+            let initial = std::mem::take(&mut first_hop);
+            Ok(conditional_headers_for_hop(
+                &properties,
+                &original_url,
+                current_url,
+                initial,
+            ))
+        },
     )
     .await?;
 
@@ -186,72 +211,42 @@ async fn settle_refresh(
             &crate::identity::path_and_query(&canonical),
         )
     };
-    let final_stored_content_ref = if redirect_hops.is_empty() {
-        Some(stored_content_ref.to_owned())
-    } else {
-        let terminal = runtime.entities(token)?.get_entity(final_id).await?;
-        if let Some(entity) = &terminal {
-            crate::entities::require_entity_namespace(token, entity)?;
-        }
-        terminal
-            .and_then(|entity| entity.properties)
-            .and_then(|properties| {
-                properties
-                    .get("blob_ref")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-    };
-
-    // A redirected 304 validates the representation whose conditional
-    // headers were sent, not an unfetched placeholder at the terminal URL.
-    // Capture its metadata before permanent-hop settlement patches the old
-    // address's status. Refuse a changed cache instead of pairing a stale
-    // validated reference with newer representation metadata.
-    let validated_cache = if outcome.status == 304
-        && final_id != id
-        && final_stored_content_ref.as_deref() != Some(stored_content_ref)
-    {
-        let source = runtime
-            .entities(token)?
-            .get_entity(id)
-            .await?
-            .ok_or_else(|| {
-                RuntimeError::from(Refusal::new(
-                    "cached_body_changed",
-                    "the refreshed document disappeared; fetch it again",
-                ))
-            })?;
-        crate::entities::require_entity_namespace(token, &source)?;
-        let reference = source
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.get("blob_ref"))
-            .and_then(Value::as_str);
-        if reference != Some(stored_content_ref) {
-            return Err(Refusal::new(
-                "cached_body_changed",
-                "the refreshed document's cached body changed; retry the refresh",
-            )
-            .into());
-        }
-        let content_ref =
-            khive_storage::ContentRef::from_hex(stored_content_ref).map_err(|error| {
-                RuntimeError::Internal(format!("cached content reference invalid: {error}"))
-            })?;
-        let size = crate::blob_store(runtime)?
-            .size(&content_ref)
-            .await?
-            .ok_or_else(|| {
-                RuntimeError::from(Refusal::new(
-                    "not_fetched",
-                    "the validated cached body is unavailable; fetch it again",
-                ))
-            })?;
-        Some((source, content_ref, size))
-    } else {
-        None
-    };
+    if outcome.status == 304 && !redirect_hops.is_empty() {
+        return Err(Refusal::new(
+            "redirected_not_modified",
+            "the redirect target did not return a representation; fetch it again",
+        )
+        .into());
+    }
+    let final_entity = runtime.entities(token)?.get_entity(final_id).await?;
+    if let Some(entity) = &final_entity {
+        crate::entities::require_entity_namespace(token, entity)?;
+    }
+    let final_properties = final_entity
+        .as_ref()
+        .and_then(|entity| entity.properties.as_ref());
+    let final_stored_content_ref = final_properties
+        .and_then(|properties| properties.get("blob_ref"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if final_id == id && final_stored_content_ref.as_deref() != Some(stored_content_ref) {
+        return Err(Refusal::new(
+            "cached_body_changed",
+            "the refreshed document's cached body changed; retry the refresh",
+        )
+        .into());
+    }
+    let prior_truncated = final_properties
+        .and_then(|properties| properties.get("truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if outcome.status == 304 && prior_truncated {
+        return Err(Refusal::new(
+            "partial_not_modified",
+            "a partial stored body cannot be validated by a bodyless response",
+        )
+        .into());
+    }
 
     let mut entities_touched: Vec<Uuid> = vec![id];
     for touched in crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await? {
@@ -264,45 +259,7 @@ async fn settle_refresh(
     }
 
     let mut changed = false;
-    if let Some((source, content_ref, size)) = validated_cache {
-        let properties = source
-            .properties
-            .as_ref()
-            .expect("validated cached properties");
-        let request_url = crate::identity::request_url(outcome.final_url.clone());
-        let (_, terminal) = crate::fetch::mint_bare(runtime, token, &request_url).await?;
-        debug_assert_eq!(terminal, final_id);
-        let content_type = properties.get("content_type").and_then(Value::as_str);
-        crate::entities::patch(
-            runtime,
-            token,
-            terminal,
-            source.entity_type.as_deref(),
-            json!({
-                "url": request_url.to_string(),
-                "blob_ref": content_ref.to_string(),
-                "content_digest": content_ref.to_string(),
-                "content_type": content_type,
-                "size": size,
-                "status": properties.get("status").and_then(Value::as_u64).filter(|status| (200..300).contains(status)).unwrap_or(200),
-                "fetched_at": properties.get("fetched_at").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!(chrono::Utc::now().to_rfc3339())),
-                "etag": properties.get("etag"),
-                "last_modified": properties.get("last_modified"),
-            }),
-        ).await?;
-        crate::fetch::root_body(
-            runtime,
-            terminal,
-            khive_storage::AttachmentSubstrate::Entity,
-            &content_ref,
-            content_type,
-            size,
-        )
-        .await?;
-        // The terminal representation changed from absent/different to the
-        // validated cache. No new body bytes were received or blob-put.
-        changed = true;
-    }
+    let mut was_truncated = prior_truncated;
     let body_bytes = outcome
         .body
         .as_ref()
@@ -310,10 +267,13 @@ async fn settle_refresh(
     let mut new_content_ref: Option<String> = None;
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
+            was_truncated = truncated;
             let store = crate::blob_store(runtime)?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
-            if Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref() {
+            if Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref()
+                || prior_truncated != truncated
+            {
                 changed = true;
                 let content_type = outcome
                     .headers
@@ -322,25 +282,21 @@ async fn settle_refresh(
                     .map(str::to_string);
                 if redirect_hops.is_empty() {
                     let entity_type = crate::fetch::classify_entity_type(content_type.as_deref());
-                    crate::entities::patch(
-                        runtime,
-                        token,
-                        id,
-                        Some(entity_type),
-                        crate::fetch::representation_patch(
-                            url_str,
-                            content_type.as_deref(),
-                            outcome.status,
-                            outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
-                            outcome
-                                .headers
-                                .get("last-modified")
-                                .and_then(|v| v.to_str().ok()),
-                            Some(&content_ref_str),
-                            body_bytes,
-                        ),
-                    )
-                    .await?;
+                    let mut properties = crate::fetch::representation_patch(
+                        url_str,
+                        content_type.as_deref(),
+                        outcome.status,
+                        outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
+                        outcome
+                            .headers
+                            .get("last-modified")
+                            .and_then(|v| v.to_str().ok()),
+                        Some(&content_ref_str),
+                        body_bytes,
+                    );
+                    properties["truncated"] = json!(truncated);
+                    crate::entities::patch(runtime, token, id, Some(entity_type), properties)
+                        .await?;
                     crate::fetch::root_body(
                         runtime,
                         id,
@@ -395,6 +351,7 @@ async fn settle_refresh(
         "status": outcome.status,
         "changed": changed,
         "content_ref": new_content_ref,
+        "truncated": was_truncated,
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
     });
@@ -426,6 +383,7 @@ async fn settle_refresh(
         "id": id.to_string(),
         "status": outcome.status,
         "changed": changed,
+        "truncated": was_truncated,
         "receipt_id": receipt_id.to_string(),
         "redirects": redirect_hops.len() as u32,
         "final_id": final_id.to_string(),
@@ -548,6 +506,76 @@ mod tests {
             .expect("install blob store");
         let token = runtime.authorize(Namespace::local()).expect("authorize");
         (runtime, token, dir)
+    }
+
+    #[test]
+    fn refresh_conditionals_stay_on_complete_original_resource() {
+        let original = Url::parse("https://example.test/original").unwrap();
+        let redirected = Url::parse("https://example.test/other").unwrap();
+        let complete = json!({ "etag": "\"v1\"", "last_modified": "Mon, 21 Sep 2026 12:00:00 GMT", "truncated": false });
+        assert_eq!(
+            conditional_headers_for_hop(&complete, &original, &original, true).len(),
+            2
+        );
+        assert!(conditional_headers_for_hop(&complete, &original, &redirected, false).is_empty());
+        assert!(conditional_headers_for_hop(&complete, &original, &original, false).is_empty());
+        let partial = json!({ "etag": "\"v1\"", "truncated": true });
+        assert!(conditional_headers_for_hop(&partial, &original, &original, true).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_replaces_partial_body_and_reports_completion() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://example.test/body").unwrap();
+        let full = vec![b'x'; 1_000];
+        let partial = crate::fetch::settle_content(
+            &runtime,
+            &token,
+            &url,
+            Some("text/plain"),
+            200,
+            Some("\"v1\""),
+            None,
+            Some((full[..100].to_vec(), true)),
+        )
+        .await
+        .unwrap();
+        let reference = partial.content_ref.unwrap();
+        let reply = settle_refresh(
+            &runtime,
+            &token,
+            partial.id,
+            url.as_str(),
+            &reference,
+            HopOutcome {
+                status: 200,
+                final_url: url.clone(),
+                headers: reqwest::header::HeaderMap::new(),
+                redirect_to: None,
+                body: Some((full, false)),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["truncated"], false);
+        assert_eq!(reply["changed"], true);
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(partial.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.properties.unwrap()["truncated"], false);
+        let receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.properties.unwrap()["request"]["truncated"], false);
     }
 
     fn http_response(
