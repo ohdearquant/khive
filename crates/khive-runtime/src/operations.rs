@@ -4306,6 +4306,34 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
+        self.search_notes_with_text_mode(
+            token,
+            query_text,
+            query_vector,
+            limit,
+            note_kind,
+            include_superseded,
+            tags_any,
+            properties_filter,
+            TextQueryMode::Plain,
+        )
+        .await
+    }
+
+    /// Note search with an explicit lexical mode for the text arm.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_notes_with_text_mode(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        note_kind: Option<&str>,
+        include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        text_mode: TextQueryMode,
+    ) -> RuntimeResult<Vec<NoteSearchHit>> {
         let (hits, _vector_error) = self
             .search_notes_inner(
                 token,
@@ -4316,6 +4344,7 @@ impl KhiveRuntime {
                 include_superseded,
                 tags_any,
                 properties_filter,
+                text_mode,
                 false,
             )
             .await?;
@@ -4339,6 +4368,32 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<NoteSearchOutcome> {
+        self.search_notes_outcome_with_text_mode(
+            token,
+            query_text,
+            limit,
+            note_kind,
+            include_superseded,
+            tags_any,
+            properties_filter,
+            TextQueryMode::Plain,
+        )
+        .await
+    }
+
+    /// Coordinator note-search variant with an explicit lexical mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_notes_outcome_with_text_mode(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        limit: u32,
+        note_kind: Option<&str>,
+        include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        text_mode: TextQueryMode,
+    ) -> RuntimeResult<NoteSearchOutcome> {
         let (hits, vector_error) = self
             .search_notes_inner(
                 token,
@@ -4349,6 +4404,7 @@ impl KhiveRuntime {
                 include_superseded,
                 tags_any,
                 properties_filter,
+                text_mode,
                 true,
             )
             .await?;
@@ -4366,6 +4422,7 @@ impl KhiveRuntime {
         include_superseded: bool,
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
+        text_mode: TextQueryMode,
         tolerate_vector_error: bool,
     ) -> RuntimeResult<(Vec<NoteSearchHit>, Option<String>)> {
         const RRF_K: usize = 60;
@@ -4410,7 +4467,7 @@ impl KhiveRuntime {
             self.text_for_notes(token)?
                 .search(TextSearchRequest {
                     query: query_text.to_string(),
-                    mode: TextQueryMode::Plain,
+                    mode: text_mode,
                     filter: Some(TextFilter {
                         namespaces: visible_ns.clone(),
                         // Push the note-kind filter into the FTS query. Without it the

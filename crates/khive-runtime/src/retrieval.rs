@@ -717,6 +717,34 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<SearchHit>> {
+        self.hybrid_search_with_text_mode(
+            token,
+            query_text,
+            query_vector,
+            limit,
+            entity_kind,
+            entity_type,
+            tags_any,
+            properties_filter,
+            TextQueryMode::Plain,
+        )
+        .await
+    }
+
+    /// Hybrid search with an explicit lexical mode for the text arm.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_with_text_mode(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        entity_kind: Option<&str>,
+        entity_type: Option<&str>,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        text_mode: TextQueryMode,
+    ) -> RuntimeResult<Vec<SearchHit>> {
         let (hits, _vector_error) = self
             .hybrid_search_inner(
                 token,
@@ -727,6 +755,7 @@ impl KhiveRuntime {
                 entity_type,
                 tags_any,
                 properties_filter,
+                text_mode,
                 None,
                 false,
             )
@@ -761,6 +790,7 @@ impl KhiveRuntime {
                 entity_type,
                 tags_any,
                 properties_filter,
+                TextQueryMode::Plain,
                 Some(vector_similarity_floor),
                 false,
             )
@@ -788,6 +818,32 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<HybridSearchOutcome> {
+        self.hybrid_search_outcome_with_text_mode(
+            token,
+            query_text,
+            limit,
+            entity_kind,
+            entity_type,
+            tags_any,
+            properties_filter,
+            TextQueryMode::Plain,
+        )
+        .await
+    }
+
+    /// Coordinator variant with an explicit lexical mode for the text arm.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_outcome_with_text_mode(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        limit: u32,
+        entity_kind: Option<&str>,
+        entity_type: Option<&str>,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        text_mode: TextQueryMode,
+    ) -> RuntimeResult<HybridSearchOutcome> {
         let (hits, vector_error) = self
             .hybrid_search_inner(
                 token,
@@ -798,6 +854,7 @@ impl KhiveRuntime {
                 entity_type,
                 tags_any,
                 properties_filter,
+                text_mode,
                 None,
                 true,
             )
@@ -816,6 +873,7 @@ impl KhiveRuntime {
         entity_type: Option<&str>,
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
+        text_mode: TextQueryMode,
         vector_similarity_floor: Option<f64>,
         tolerate_vector_error: bool,
     ) -> RuntimeResult<(Vec<SearchHit>, Option<String>)> {
@@ -833,7 +891,7 @@ impl KhiveRuntime {
             .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
-                mode: TextQueryMode::Plain,
+                mode: text_mode,
                 filter: Some(TextFilter {
                     namespaces: visible_ns.clone(),
                     ..TextFilter::default()

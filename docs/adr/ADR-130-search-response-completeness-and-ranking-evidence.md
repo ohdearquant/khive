@@ -5,9 +5,10 @@
 - Depends on: ADR-006 (deterministic scoring), ADR-012 (retrieval composition),
   ADR-029 (substrate coordinator), ADR-033 (recall pipeline),
   ADR-045 (verb response presentation)
-- Proposed amendment: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14).
-  Existing decisions remain accepted; Amendment 5 is unsigned and requires
-  acceptance before dependent implementation merges.
+- Proposed amendments: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14)
+  and [Amendment 7, selectable KG search text matching](#amendment-7-selectable-kg-search-text-matching-2026-09-25).
+  Existing decisions remain accepted; both amendments require acceptance
+  before their dependent implementations merge.
 
 ## Context
 
@@ -1028,3 +1029,103 @@ the reason write must restore the original dense-query result and fail the new
 assertion; separate wrong-condition and count mutations must fail their intended
 witnesses. Valid fixture controls and nonzero test selection are required; this
 proposed amendment records no executed acceptance result.
+
+## Amendment 7: selectable KG search text matching (2026-09-25)
+
+**Status: Proposed (2026-09-25).** Acceptance is required before dependent
+implementation merges. This amendment qualifies Amendment 3's fixed text-arm
+member shape and Amendment 6's single zero-contribution reason literal. It does
+not change Amendment 5's separate proposed limit-disclosure status.
+
+### Request and retrieval contract
+
+The KG `search` verb accepts `text_mode="all_terms" | "any_term"` for both entity
+and note search. Omitted or null `text_mode` means `all_terms`, preserving the
+conjunctive Plain text query. `any_term` uses the text store's disjunctive
+AnyTerm mode. Other values refuse as invalid input; no coercion or fallback is
+allowed. This parameter selects only the lexical arm. It does not change vector
+retrieval, result limits, filters, fusion, ranking, or the separate
+`knowledge.search` and `memory.recall` verbs.
+
+`ValidatedSearchRequest::from_value` validates the public input for KG search
+execution; `ValidatedSearchRequest::text_mode` supplies the text-store mode in
+`KgPack::handle_search` and `SubstrateCoordinator::fan_out_search`, for entity
+and note searches. Existing runtime callers that do not select a mode keep the
+Plain default through the `hybrid_search` and `search_notes` wrappers. The MCP
+registry and coordinator routes MUST derive the reported mode from a validated
+request. Registry routes re-run `ValidatedSearchRequest::from_value` on the
+forwarded arguments after dispatch; no other parser may determine response
+evidence.
+
+A single-backend MCP server dispatches KG `search` through the registry. An
+installed coordinator intercepts MCP search only when it serves multiple
+backends. `SubstrateCoordinator::fan_out_search` also supports direct calls with
+one or multiple registered backends; both paths must pass the selected mode to
+text storage, but the direct coordinator call does not itself produce an MCP
+envelope.
+
+### Arm evidence and reason
+
+`arm_participation` keeps exactly the outer keys `text` and `vector`. Its `text`
+object gains a required `mode` member with the normalized effective spelling
+`all_terms` or `any_term`. `mode` is present whenever search arm evidence is
+emitted, including text `ran` and `error`, successful search responses, and
+retained `error.search` evidence under Amendment 4. The current routes do not
+emit text `skipped`; if that status is added, its evidence must carry `mode`.
+An omitted or null request value reports `all_terms`. The vector object does
+not gain `mode`. This qualifies Amendment 3's two-member text shape; strict
+readers that validate an exact
+object schema must accept the new required member, while tolerant readers can
+ignore it. Raw pack result arrays and result-only client accessors remain
+without this envelope member.
+
+Successful registry dispatch adds the validated mode through
+`SearchDegradation::with_text_mode` after `SearchDegradation::complete`;
+`SearchDegradation::from_result` carries it for coordinated dispatch. Both
+provide that mode to `search_arm_participation_value` before the response is
+serialized. Coordinated error-diagnostic byte-budget admission includes that
+mode, including for retained partial and `search_incomplete` evidence.
+
+Amendment 6's condition remains exact: only text `status="ran"` with final
+`candidate_count=0` carries `reason`, including an explicit zero result limit.
+For effective `all_terms`, the reason remains byte-for-byte:
+
+> No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms.
+
+For effective `any_term`, the bounded literal is:
+
+> No text candidate survived matching, filtering, fusion, and the result limit.
+
+The any-term reason makes no conjunctive-matching claim. Both reasons describe
+final response contribution, not a specific elimination stage or corpus absence.
+Text `skipped` or `error`, text with a positive final count, and the vector arm
+omit `reason` as before.
+
+Amendment 3's entity-name presence check uses the default `all_terms` mode and
+still requires the matching row itself to have `source="text" | "both"`.
+Selecting `any_term` broadens lexical recall; a hit sharing only one token is
+not evidence that the full canonical name exists.
+
+### Acceptance
+
+Real entity and note rows sharing only part of a multi-term query must give no
+lexical hits for omitted or explicit `all_terms`; `any_term` must return the
+partial-token row, with text participation and its effective mode. Invalid
+values refuse. Complete-empty any-term responses carry the mode-neutral reason,
+while all-terms retains the exact Amendment 6 reason. Positive, skipped, and
+error text arms omit the reason. The `arm_participation` outer keys remain
+`text` and `vector`, and vector does not acquire a mode.
+
+The registry route must report its validated mode. Multi-backend MCP
+coordination must report the same validated mode on complete, partial, and
+`search_incomplete` results. Direct single- and multi-backend coordinator calls
+must carry the mode to entity and note text storage. Existing presentation and
+frame-budget omission preserve arm evidence, including the mode.
+
+Independent mutations of the default-mode parser, entity and note runtime
+storage paths,
+each direct coordinator storage branch, the coordinator's multi-backend mode
+capture, and the MCP mode report must fail their matching fixtures. The
+coordinator-report mutation must be observed on an any-term response. These
+controls are acceptance requirements, not an assertion that a particular run
+has passed.
