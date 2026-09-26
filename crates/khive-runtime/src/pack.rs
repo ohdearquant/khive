@@ -5745,6 +5745,92 @@ pub(crate) mod tests {
         }
     }
 
+    // The web macro emits its handler table from concrete declarations.
+    // Count macro entries independently of the census's literal scanner so
+    // an opaque declaration cannot silently disappear from its population.
+    #[test]
+    fn web_macro_handlers_remain_visible_to_admission_census() {
+        struct Declarations(Vec<syn::Ident>);
+        impl syn::parse::Parse for Declarations {
+            fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+                let mut handlers = Vec::new();
+                while !input.is_empty() {
+                    let _: syn::Ident = input.parse()?;
+                    let _: syn::Token![=>] = input.parse()?;
+                    handlers.push(input.parse()?);
+                    let content;
+                    syn::braced!(content in input);
+                    let _: proc_macro2::TokenStream = content.parse()?;
+                }
+                Ok(Self(handlers))
+            }
+        }
+
+        let source = include_str!("../../khive-pack-web/src/vocab.rs");
+        let file = syn::parse_file(source).unwrap();
+        let declarations: Vec<_> = file
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                syn::Item::Macro(item) if item.mac.path.is_ident("web_verbs") => {
+                    Some(syn::parse2::<Declarations>(item.mac.tokens).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "one web handler declaration inventory"
+        );
+        let declared = &declarations[0].0;
+        assert!(
+            !declared.is_empty(),
+            "web macro handler inventory must be nonempty"
+        );
+        for handler in declared {
+            assert_eq!(
+                handler.to_string(),
+                "HandlerDef",
+                "web handler declarations must stay census-visible"
+            );
+        }
+
+        let marker = "HandlerDef {";
+        let mut classified = 0;
+        for (start, _) in source.match_indices(marker) {
+            match classify_handler_def_occurrence(source, start, start + marker.len()) {
+                HandlerDefOccurrence::StructLiteral {
+                    name,
+                    visibility,
+                    category,
+                } => {
+                    assert!(
+                        name.starts_with("web."),
+                        "web handler name must retain its prefix"
+                    );
+                    assert_eq!(
+                        visibility.trim(),
+                        "Visibility::Verb,",
+                        "web handlers must remain public verbs"
+                    );
+                    assert_eq!(
+                        category.trim(),
+                        "VerbCategory::Commissive,",
+                        "web handlers must retain their admission category"
+                    );
+                    classified += 1;
+                }
+                other => panic!("web macro handler declaration is not census-visible: {other:?}"),
+            }
+        }
+        assert_eq!(
+            classified,
+            declared.len(),
+            "every web macro entry must reach the admission census"
+        );
+    }
+
     /// khive-oss#2311: before this fix, the live census's per-file
     /// `classified_count == raw_token_count` assertion incremented
     /// `classified_count` once per loop iteration — before any
