@@ -193,7 +193,7 @@ fn base_command(program: &Path) -> Command {
     command
 }
 
-fn git_command(
+pub(crate) fn git_command(
     program: &Path,
     repo: &Path,
     argv: &[&str],
