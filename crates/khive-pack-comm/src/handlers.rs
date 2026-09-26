@@ -531,6 +531,11 @@ pub(crate) async fn handle_inbox(
         )));
     }
     let raw_limit = p.limit.unwrap_or(20);
+    if raw_limit > 200 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "inbox: `limit` must be at most 200, got {raw_limit}"
+        )));
+    }
     let offset = p.offset.unwrap_or(0);
     if offset > i64::MAX as u64 {
         return Err(RuntimeError::InvalidInput(format!(
@@ -639,7 +644,7 @@ pub(crate) async fn handle_inbox(
             "has_more": false,
         }));
     }
-    let limit = raw_limit.clamp(1, 200) as usize;
+    let limit = raw_limit as usize;
 
     // Push direction + read-status into SQL for idx_comm_message_direction; json_type
     // read-check keeps only JSON boolean `true` as read (matches prior as_bool semantics).
