@@ -2240,9 +2240,19 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_db_diagnostics_supplies_both_contention_counter_sources() {
-        let rt = KhiveRuntime::memory().expect("memory runtime should create");
+        let dir = tempfile::tempdir().expect("diagnostics database directory");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = Some(dir.path().join("runtime-diagnostics.db"));
+        let rt = KhiveRuntime::new_for_test(config).expect("file-backed runtime should create");
 
         let report = rt.db_diagnostics().await.expect("diagnostics succeed");
+
+        #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(
+            report.wal_pin.reporting_process_is_holder,
+            Some(true),
+            "the runtime report identifies its own process as a database holder"
+        );
 
         assert!(
             report.writer_contention.writer_acquisitions >= 1,

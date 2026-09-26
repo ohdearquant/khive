@@ -127,6 +127,180 @@ pub struct RoutineWalObservation {
     pub observed_at_unix_ms: u64,
 }
 
+/// One backend's current checkpoint run: informative checkpoint results that
+/// stopped at the same frame while frames remained to backfill, allowing
+/// bounded neutral busy results between them. Reported by `db_diagnostics` as
+/// `oldest_pinned_frame_run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct CheckpointRun {
+    /// The checkpointed frame every result in the run stopped at.
+    pub frame: i64,
+    /// Unix time in milliseconds of the run's first checkpoint result.
+    pub first_observed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointRunStatus {
+    NoTask,
+    NoObservation,
+    Observed(CheckpointRun),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointRunEntry {
+    run: CheckpointRun,
+    last_log_frames: i64,
+    last_informative_at_unix_ms: u64,
+    busy_since_last_informative: bool,
+}
+
+#[derive(Debug, Default)]
+struct CheckpointRunState {
+    active_tasks: usize,
+    checkpoint_interval_ms: u64,
+    entry: Option<CheckpointRunEntry>,
+}
+
+static CHECKPOINT_RUNS: OnceLock<Mutex<HashMap<Option<PathBuf>, CheckpointRunState>>> =
+    OnceLock::new();
+
+fn checkpoint_runs() -> &'static Mutex<HashMap<Option<PathBuf>, CheckpointRunState>> {
+    CHECKPOINT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct CheckpointRunTaskGuard {
+    key: Option<PathBuf>,
+}
+
+impl CheckpointRunTaskGuard {
+    pub(crate) fn start(pool: &ConnectionPool, interval: Duration) -> Self {
+        let key = checkpoint_db_key(pool);
+        let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
+        let interval_ms = interval_ms.max(1);
+        let mut runs = checkpoint_runs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = runs.entry(key.clone()).or_default();
+        if state.active_tasks == 0 {
+            state.entry = None;
+            state.checkpoint_interval_ms = interval_ms;
+        } else {
+            // If two checkpoint owners overlap, the tighter bound is conservative.
+            state.checkpoint_interval_ms = state.checkpoint_interval_ms.min(interval_ms);
+        }
+        state.active_tasks = state.active_tasks.saturating_add(1);
+        Self { key }
+    }
+}
+
+impl Drop for CheckpointRunTaskGuard {
+    fn drop(&mut self) {
+        let mut runs = checkpoint_runs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = runs.get_mut(&self.key) else {
+            return;
+        };
+        state.active_tasks = state.active_tasks.saturating_sub(1);
+        if state.active_tasks == 0 {
+            runs.remove(&self.key);
+        }
+    }
+}
+
+fn advance_checkpoint_run(
+    entry: &mut Option<CheckpointRunEntry>,
+    observation: Option<(i64, i64, i64)>,
+    observed_at_unix_ms: u64,
+    checkpoint_interval_ms: u64,
+) {
+    let Some((busy, log_frames, checkpointed_frames)) = observation else {
+        *entry = None;
+        return;
+    };
+    // A busy row has no reliable reading of the ceiling, even if SQLite fills
+    // in the other columns. It cannot advance or end the current run.
+    if busy != 0 {
+        if let Some(current) = entry {
+            current.busy_since_last_informative = true;
+        }
+        return;
+    }
+    if log_frames < 0 || checkpointed_frames < 0 || checkpointed_frames >= log_frames {
+        *entry = None;
+        return;
+    }
+
+    match entry {
+        Some(current)
+            if current.run.frame == checkpointed_frames
+                && log_frames >= current.last_log_frames
+                && (!current.busy_since_last_informative
+                    || observed_at_unix_ms.saturating_sub(current.last_informative_at_unix_ms)
+                        <= checkpoint_interval_ms.saturating_mul(2)) =>
+        {
+            current.last_log_frames = log_frames;
+            current.last_informative_at_unix_ms = observed_at_unix_ms;
+            current.busy_since_last_informative = false;
+        }
+        _ => {
+            *entry = Some(CheckpointRunEntry {
+                run: CheckpointRun {
+                    frame: checkpointed_frames,
+                    first_observed_at_unix_ms: observed_at_unix_ms,
+                },
+                last_log_frames: log_frames,
+                last_informative_at_unix_ms: observed_at_unix_ms,
+                busy_since_last_informative: false,
+            });
+        }
+    }
+}
+
+pub(crate) fn record_checkpoint_run_result(
+    pool: &ConnectionPool,
+    observation: Option<(i64, i64, i64)>,
+) -> CheckpointRunStatus {
+    let mut runs = checkpoint_runs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = runs.get_mut(&checkpoint_db_key(pool)) else {
+        return CheckpointRunStatus::NoTask;
+    };
+    if state.active_tasks == 0 {
+        return CheckpointRunStatus::NoTask;
+    }
+    let checkpoint_interval_ms = state.checkpoint_interval_ms;
+    advance_checkpoint_run(
+        &mut state.entry,
+        observation,
+        observed_at_unix_ms(),
+        checkpoint_interval_ms,
+    );
+    state
+        .entry
+        .map_or(CheckpointRunStatus::NoObservation, |entry| {
+            CheckpointRunStatus::Observed(entry.run)
+        })
+}
+
+pub(crate) fn checkpoint_run_status(pool: &ConnectionPool) -> CheckpointRunStatus {
+    let runs = checkpoint_runs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = runs.get(&checkpoint_db_key(pool)) else {
+        return CheckpointRunStatus::NoTask;
+    };
+    if state.active_tasks == 0 {
+        return CheckpointRunStatus::NoTask;
+    }
+    state
+        .entry
+        .map_or(CheckpointRunStatus::NoObservation, |entry| {
+            CheckpointRunStatus::Observed(entry.run)
+        })
+}
+
 /// Process-lifetime totals for actual routine PASSIVE calls on one store.
 /// Skipped ticks and post-TRUNCATE probes are excluded. Busy counts only
 /// SQLite's returned busy flag, never an incomplete checkpoint's pending frames.
@@ -2014,6 +2188,7 @@ pub async fn run_checkpoint_task(
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     is_main: bool,
 ) {
+    let _checkpoint_run_guard = CheckpointRunTaskGuard::start(&pool, config.interval);
     // This task IS the dedicated checkpoint owner: claim the pool so writer
     // connections drop the bounded autocheckpoint fallback and routine
     // checkpoint I/O stays off application commit paths. Pools without a
@@ -2720,10 +2895,19 @@ fn checkpoint_once_core(
     let raw_observation = match checkpoint_result {
         Ok(observation) => observation,
         Err(e) => {
+            record_checkpoint_run_result(pool, None);
             tracing::warn!(error = %e, elapsed_us, "WAL checkpoint failed");
             return Err(e);
         }
     };
+    record_checkpoint_run_result(
+        pool,
+        Some((
+            raw_observation.busy,
+            raw_observation.log_frames,
+            raw_observation.checkpointed_frames,
+        )),
+    );
     let observation = record_routine_wal_observation(pool, raw_observation);
     let wal_pages = observation.log_frames;
     LAST_WAL_PAGES.store(wal_pages, Ordering::Relaxed);
@@ -2808,7 +2992,17 @@ fn maybe_truncate(
     truncate_state.last_attempt = Some(Instant::now());
 
     let start = Instant::now();
-    let outcome = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    let outcome = query_truncate_observation(conn);
+    record_checkpoint_run_result(
+        pool,
+        outcome.as_ref().ok().map(|observation| {
+            (
+                observation.busy,
+                observation.log_frames,
+                observation.checkpointed_frames,
+            )
+        }),
+    );
     let elapsed = start.elapsed();
 
     // Restore the pool's configured busy_timeout immediately after the
@@ -2818,8 +3012,8 @@ fn maybe_truncate(
     }
 
     match outcome {
-        Ok(()) => {
-            let wal_pages_after = query_wal_pages(conn);
+        Ok(_) => {
+            let wal_pages_after = query_wal_pages(pool, conn);
             tracing::info!(
                 wal_pages_before,
                 wal_pages_after,
@@ -2845,7 +3039,7 @@ fn maybe_truncate(
                     // async owner for an awaited `spawn_blocking` pass.
                     sidecar_attribution = holder_attribution.take();
                 }
-                log_wal_pin_depth(conn);
+                log_backfill_gap(pool, conn);
             }
 
             note_truncate_outcome(config, wal_pages_after, truncate_state);
@@ -3383,23 +3577,36 @@ fn log_walpin_sidecar_report(
 
 /// ADR-091 Amendment 2 Plank C: on a TRUNCATE no-progress event, run a fresh
 /// `PRAGMA wal_checkpoint(PASSIVE)` (never blocks readers or writers) and
-/// report pin depth as `log` minus `checkpointed` from its 3-column return
-/// row — the number of frames pinned behind the backfill boundary. Zero
-/// dependence on SQLite's shm WAL-index layout.
-fn log_wal_pin_depth(conn: &rusqlite::Connection) {
-    match query_wal_pin_depth(conn) {
-        Ok((log, checkpointed)) => {
+/// report the one-row backfill gap as `log` minus `checkpointed` from its
+/// 3-column return row. A gap alone does not establish a reader pin. Zero
+/// dependence on SQLite's shm WAL-index layout (ADR-091 Amendment 22).
+fn log_backfill_gap(pool: &ConnectionPool, conn: &rusqlite::Connection) {
+    match query_backfill_gap(conn) {
+        Ok(observation) => {
+            record_checkpoint_run_result(
+                pool,
+                Some((
+                    observation.busy,
+                    observation.log_frames,
+                    observation.checkpointed_frames,
+                )),
+            );
             tracing::warn!(
-                wal_log_frames = log,
-                wal_checkpointed_frames = checkpointed,
-                wal_pin_depth = (log - checkpointed).max(0),
-                "ADR-091 Amendment 2 Plank C: WAL pin depth after TRUNCATE no-progress"
+                busy = observation.busy,
+                wal_log_frames = observation.log_frames,
+                wal_checkpointed_frames = observation.checkpointed_frames,
+                backfill_gap_frames = observation
+                    .log_frames
+                    .saturating_sub(observation.checkpointed_frames)
+                    .max(0),
+                "ADR-091 Plank C: WAL backfill gap after TRUNCATE no-progress"
             );
         }
         Err(e) => {
+            record_checkpoint_run_result(pool, None);
             tracing::warn!(
                 error = %e,
-                "ADR-091 Amendment 2 Plank C: failed to query WAL pin depth"
+                "ADR-091 Plank C: failed to query WAL backfill gap"
             );
         }
     }
@@ -3407,13 +3614,17 @@ fn log_wal_pin_depth(conn: &rusqlite::Connection) {
 
 /// ADR-091 Amendment 2 Plank C: issue `PRAGMA wal_checkpoint(PASSIVE)` and
 /// return its `(log, checkpointed)` columns (index 1 and 2 of the 3-column
-/// return row). PASSIVE never blocks readers or writers. Pin depth is
+/// return row). PASSIVE never blocks readers or writers. The backfill gap is
 /// `log - checkpointed`; extracted as its own pure query so the arithmetic is
 /// unit-testable against a real SQLite connection without depending on
 /// `tracing` capture.
-fn query_wal_pin_depth(conn: &rusqlite::Connection) -> rusqlite::Result<(i64, i64)> {
+fn query_backfill_gap(conn: &rusqlite::Connection) -> rusqlite::Result<RawCheckpointObservation> {
     conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-        Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        Ok(RawCheckpointObservation {
+            busy: row.get(0)?,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
     })
 }
 
@@ -3423,8 +3634,8 @@ fn query_wal_pin_depth(conn: &rusqlite::Connection) -> rusqlite::Result<(i64, i6
 /// Returns `true` on a false→true transition in `now_above` (first observed
 /// above-threshold tick after a below-threshold tick), `false` on any other
 /// tick. The `was_above` flag is updated in-place to track state across calls.
-/// Used by `run_checkpoint_task` for both the `warn_pages` band and the
-/// `high_water_pages` threshold.
+/// `run_checkpoint_task` uses this for the `high_water_pages` threshold;
+/// `observe_wal_pages` owns the separate `warn_pages` severity ladder.
 fn crossing_warn(now_above: bool, was_above: &mut bool) -> bool {
     let fire = now_above && !*was_above;
     *was_above = now_above;
@@ -3453,13 +3664,36 @@ fn query_checkpoint_observation(
     })
 }
 
+fn query_truncate_observation(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<RawCheckpointObservation> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok(RawCheckpointObservation {
+            busy: row.get(0)?,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+}
+
 /// Query the current WAL frame count with one PASSIVE checkpoint.
 ///
 /// Used only for rare post-TRUNCATE outcome measurement. The ordinary
 /// periodic path calls [`query_checkpoint_observation`] directly and stores
 /// its complete row, avoiding the former double-checkpoint pass.
-fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
-    let pages = query_checkpoint_observation(conn)
+fn query_wal_pages(pool: &ConnectionPool, conn: &rusqlite::Connection) -> u64 {
+    let observation = query_checkpoint_observation(conn);
+    record_checkpoint_run_result(
+        pool,
+        observation.as_ref().ok().map(|observation| {
+            (
+                observation.busy,
+                observation.log_frames,
+                observation.checkpointed_frames,
+            )
+        }),
+    );
+    let pages = observation
         .map(|observation| observation.log_frames)
         .unwrap_or(0)
         .max(0) as u64;
@@ -3480,6 +3714,546 @@ mod tests {
     use serial_test::serial;
     use tracing::field::{Field, Visit};
 
+    #[test]
+    fn checkpoint_run_guard_captures_the_configured_interval_for_busy_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("busy_span_interval.db"));
+        let key = checkpoint_db_key(&pool);
+        let guard = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        let interval_ms = checkpoint_runs()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("active task has run state")
+            .checkpoint_interval_ms;
+        assert_eq!(interval_ms, 10);
+        drop(guard);
+        assert!(!checkpoint_runs().lock().unwrap().contains_key(&key));
+    }
+
+    #[test]
+    fn checkpoint_run_ends_on_full_backfill_before_a_later_pin() {
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 10, 7)), 100, 500);
+        advance_checkpoint_run(&mut entry, Some((0, 12, 7)), 200, 500);
+        assert_eq!(
+            entry.map(|value| value.run),
+            Some(CheckpointRun {
+                frame: 7,
+                first_observed_at_unix_ms: 100,
+            })
+        );
+
+        advance_checkpoint_run(&mut entry, Some((0, 12, 12)), 300, 500);
+        assert_eq!(entry, None, "a full backfill ends the prior run");
+
+        advance_checkpoint_run(&mut entry, Some((0, 18, 15)), 400, 500);
+        assert_eq!(
+            entry.map(|value| value.run),
+            Some(CheckpointRun {
+                frame: 15,
+                first_observed_at_unix_ms: 400,
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_run_restarts_when_log_frame_count_decreases() {
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 100, 500);
+        advance_checkpoint_run(&mut entry, Some((0, 22, 7)), 125, 500);
+        advance_checkpoint_run(&mut entry, Some((1, -1, -1)), 150, 500);
+        advance_checkpoint_run(&mut entry, Some((0, 21, 7)), 200, 500);
+
+        assert_eq!(
+            entry.map(|value| value.run),
+            Some(CheckpointRun {
+                frame: 7,
+                first_observed_at_unix_ms: 200,
+            }),
+            "a lower log count breaks the sequence and starts a new run"
+        );
+    }
+
+    #[test]
+    fn checkpoint_run_ends_on_error_negative_or_unpinned_results() {
+        for result in [Some((0, -1, -1)), Some((0, 20, 20)), None] {
+            let mut entry = None;
+            advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 100, 500);
+            advance_checkpoint_run(&mut entry, result, 200, 500);
+            assert_eq!(entry, None, "result {result:?} must end the run");
+        }
+    }
+
+    #[test]
+    fn checkpoint_run_keeps_held_pin_across_busy_rows_without_using_their_columns() {
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 100, 500);
+        let first = entry.expect("qualifying row begins a run");
+        advance_checkpoint_run(&mut entry, Some((1, -1, -1)), 500, 500);
+        advance_checkpoint_run(&mut entry, Some((1, 100, 99)), 700, 500);
+        assert_eq!(entry.expect("busy is neutral").run, first.run);
+
+        advance_checkpoint_run(&mut entry, Some((0, 21, 7)), 900, 500);
+        let resumed = entry.expect("the next informative row continues the run");
+        assert_eq!(resumed.run, first.run);
+        assert!(!resumed.busy_since_last_informative);
+        assert_eq!(resumed.last_log_frames, 21);
+    }
+
+    #[test]
+    fn checkpoint_run_survives_frequent_busy_results_for_a_one_second_pin() {
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 100, 20);
+        for step in 1..=70 {
+            let at = 100 + step * 16;
+            advance_checkpoint_run(&mut entry, Some((1, -1, -1)), at - 8, 20);
+            advance_checkpoint_run(&mut entry, Some((0, 20 + step as i64, 7)), at, 20);
+        }
+        let run = entry
+            .expect("the held pin remains observable through busy rows")
+            .run;
+        assert_eq!(run.frame, 7);
+        assert_eq!(run.first_observed_at_unix_ms, 100);
+    }
+
+    #[test]
+    fn checkpoint_run_restarts_only_after_busy_span_exceeds_two_configured_intervals() {
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 100, 10);
+        advance_checkpoint_run(&mut entry, Some((1, -1, -1)), 105, 10);
+        advance_checkpoint_run(&mut entry, Some((0, 21, 7)), 120, 10);
+        assert_eq!(
+            entry
+                .expect("busy span at the bound preserves the run")
+                .run
+                .first_observed_at_unix_ms,
+            100
+        );
+
+        advance_checkpoint_run(&mut entry, Some((1, -1, -1)), 125, 10);
+        advance_checkpoint_run(&mut entry, Some((0, 22, 7)), 141, 10);
+        assert_eq!(
+            entry
+                .expect("busy span past the bound starts a new run")
+                .run
+                .first_observed_at_unix_ms,
+            141
+        );
+    }
+
+    #[test]
+    fn checkpoint_run_long_nonbusy_interval_does_not_trigger_busy_span_bound() {
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 100, 500);
+        advance_checkpoint_run(&mut entry, Some((0, 21, 7)), 1_101, 500);
+        assert_eq!(
+            entry
+                .expect("the busy bound only applies after a busy row")
+                .run
+                .first_observed_at_unix_ms,
+            100
+        );
+    }
+
+    /// The bundled SQLite reuses the slot at the greatest read mark when all
+    /// frame-carrying slots are occupied. An upgrade that changes this must
+    /// fail here before the oldest-frame report relies on that behavior.
+    #[test]
+    fn wal_read_mark_slots_keep_the_fourth_frame_for_a_later_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_mark_slots.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER)")
+                .unwrap();
+            query_truncate_observation(writer.conn()).unwrap();
+        }
+
+        let observer = rusqlite::Connection::open(&path).unwrap();
+        let mut readers = Vec::new();
+        let mut previous_log = 0;
+        for value in 0..4 {
+            {
+                let writer = pool.writer().unwrap();
+                writer
+                    .conn()
+                    .execute("INSERT INTO t VALUES (?1)", [value])
+                    .unwrap();
+            }
+            // Take the snapshot before the checkpoint. If PASSIVE first copies
+            // every frame, this reader can use slot 0 (the main database),
+            // allowing the next write to restart the WAL at frame 1.
+            let reader = rusqlite::Connection::open(&path).unwrap();
+            reader.execute_batch("BEGIN DEFERRED").unwrap();
+            let rows: i64 = reader
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap();
+            assert_eq!(rows, i64::from(value) + 1);
+            readers.push(reader);
+
+            let observation = query_checkpoint_observation(&observer).unwrap();
+            assert!(observation.log_frames > previous_log);
+            previous_log = observation.log_frames;
+        }
+        let pinned_frame = previous_log;
+
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (4)", [])
+                .unwrap();
+        }
+        let fifth_reader = rusqlite::Connection::open(&path).unwrap();
+        fifth_reader.execute_batch("BEGIN DEFERRED").unwrap();
+        let rows: i64 = fifth_reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(rows, 5, "the fifth snapshot sees the newly committed frame");
+        drop(readers);
+
+        let observation = query_checkpoint_observation(&observer).unwrap();
+        assert_eq!(observation.busy, 0);
+        assert_eq!(observation.checkpointed_frames, pinned_frame);
+        assert!(observation.log_frames > pinned_frame);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
+    async fn db_diagnostics_reports_a_reader_pin_after_one_second_and_clears_after_backfill() {
+        let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
+        std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostic_pin_run.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (0)")
+                .unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let task_pool = Arc::clone(&pool);
+        let task = tokio::spawn(run_checkpoint_task(
+            task_pool,
+            CheckpointConfig {
+                interval: Duration::from_millis(2_500),
+                ..Default::default()
+            },
+            None,
+            shutdown_rx,
+            true,
+        ));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while routine_wal_observation(&pool).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the checkpoint task must record its initial sample");
+
+        // A reader opened immediately after a full checkpoint may use WAL
+        // slot 0 and cannot pin the next frame. Give it an uncheckpointed
+        // frame to read before the writer appends another one.
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (1)", [])
+                .unwrap();
+        }
+        let mut reader = ReaderProcess::spawn(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (2)", [])
+                .unwrap();
+        }
+
+        let first = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let first_probe = first.checkpoint_probe.as_ref().expect("probe row");
+        assert!(first_probe.checkpointed_frames > 0);
+        assert_eq!(
+            first.checkpoint_pin.backfill_ceiling,
+            Some(first_probe.checkpointed_frames)
+        );
+        assert!(first_probe.log_frames > first_probe.checkpointed_frames);
+        assert_eq!(first.checkpoint_pin.oldest_pinned_frame, None);
+        assert_eq!(first.checkpoint_pin.pin_depth, None);
+        assert!(first
+            .checkpoint_pin
+            .oldest_pinned_frame_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("less than one second")));
+
+        tokio::time::sleep(Duration::from_millis(1_010)).await;
+        let aged = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let aged_probe = aged.checkpoint_probe.as_ref().expect("probe row");
+        assert_eq!(
+            aged.checkpoint_pin.backfill_ceiling,
+            Some(aged_probe.checkpointed_frames)
+        );
+        assert_eq!(
+            aged.checkpoint_pin.oldest_pinned_frame,
+            Some(aged_probe.checkpointed_frames)
+        );
+        assert_eq!(
+            aged.checkpoint_pin.pin_depth,
+            Some(aged_probe.log_frames - aged_probe.checkpointed_frames)
+        );
+        let first_run = aged
+            .checkpoint_pin
+            .oldest_pinned_frame_run
+            .expect("matching run accompanies the reported frame");
+        assert_eq!(first_run.frame, aged_probe.checkpointed_frames);
+
+        reader.release();
+        let previous_tick = routine_wal_observation(&pool)
+            .expect("the checkpoint task has an initial sample")
+            .observed_at_unix_ms;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if routine_wal_observation(&pool)
+                    .is_some_and(|sample| sample.observed_at_unix_ms > previous_tick)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a later checkpoint tick must fully backfill after the reader ends");
+        let drained = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        assert_eq!(drained.checkpoint_pin.backfill_ceiling, None);
+        assert!(drained
+            .checkpoint_pin
+            .backfill_ceiling_unavailable_reason
+            .is_some());
+        assert_eq!(drained.checkpoint_pin.oldest_pinned_frame, None);
+        assert_eq!(drained.checkpoint_pin.pin_depth, None);
+        assert_eq!(drained.checkpoint_pin.oldest_pinned_frame_run, None);
+
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("INSERT INTO t VALUES (3); INSERT INTO t VALUES (4)")
+                .unwrap();
+        }
+        let second_reader = rusqlite::Connection::open(&path).unwrap();
+        second_reader.execute_batch("BEGIN DEFERRED").unwrap();
+        second_reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let second_pin_started_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (5)", [])
+                .unwrap();
+        }
+        let second_first = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let second_first_probe = second_first.checkpoint_probe.as_ref().expect("probe row");
+        assert!(second_first_probe.checkpointed_frames > 0);
+        assert!(second_first_probe.log_frames > second_first_probe.checkpointed_frames);
+        assert_eq!(second_first.checkpoint_pin.oldest_pinned_frame, None);
+        tokio::time::sleep(Duration::from_millis(1_010)).await;
+        let second_aged = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let second_aged_probe = second_aged.checkpoint_probe.as_ref().expect("probe row");
+        let second_run = second_aged
+            .checkpoint_pin
+            .oldest_pinned_frame_run
+            .expect("the second pin must begin a distinct observed run");
+        assert_eq!(
+            second_aged.checkpoint_pin.oldest_pinned_frame,
+            Some(second_aged_probe.checkpointed_frames)
+        );
+        // A full backfill ended the earlier run above. WAL frame numbers may
+        // restart, so distinctness is established by the new observation time.
+        assert!(second_run.first_observed_at_unix_ms > first_run.first_observed_at_unix_ms);
+        assert!(
+            second_run.first_observed_at_unix_ms >= second_pin_started_at_unix_ms,
+            "the new run begins after the second reader starts"
+        );
+        second_reader.execute_batch("ROLLBACK").unwrap();
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("checkpoint task shutdown must finish")
+            .expect("checkpoint task must not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
+    async fn db_diagnostics_commit_churn_without_readers_does_not_report_a_pin() {
+        let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
+        std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostic_commit_churn.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER)")
+                .unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let task = tokio::spawn(run_checkpoint_task(
+            Arc::clone(&pool),
+            CheckpointConfig {
+                interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+            None,
+            shutdown_rx,
+            true,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while routine_wal_observation(&pool).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the checkpoint task must record its initial sample");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_pool = Arc::clone(&pool);
+        let writer_stop = Arc::clone(&stop);
+        let writer_task = std::thread::spawn(move || {
+            let writer = writer_pool.writer().expect("writer checkout");
+            let mut value = 0_i64;
+            while !writer_stop.load(Ordering::SeqCst) {
+                writer
+                    .conn()
+                    .execute("INSERT INTO t VALUES (?1)", [value])
+                    .expect("commit loop row");
+                value += 1;
+                std::thread::yield_now();
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(1_200);
+        let mut saw_oldest_pinned_frame = false;
+        let mut saw_pin_depth = false;
+        while Instant::now() < deadline {
+            let report = crate::diagnostics::collect(
+                &pool,
+                crate::diagnostics::BuildIdentity::from_env("test", None),
+                Duration::from_secs(30),
+            );
+            saw_oldest_pinned_frame |= report.checkpoint_pin.oldest_pinned_frame.is_some();
+            saw_pin_depth |= report.checkpoint_pin.pin_depth.is_some();
+            tokio::task::yield_now().await;
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        writer_task.join().expect("commit loop must finish");
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("checkpoint task shutdown must finish")
+            .expect("checkpoint task must not panic");
+        assert!(
+            !saw_oldest_pinned_frame,
+            "short-lived backfill rows without a reader must not age into pins"
+        );
+        assert!(
+            !saw_pin_depth,
+            "writer-only backfill gaps are not pin depths"
+        );
+    }
+
+    #[test]
+    fn db_diagnostics_reports_short_reader_backfill_ceiling_without_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostic_short_reader_gap.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (1)")
+                .unwrap();
+        }
+
+        // The reader snapshots an uncheckpointed frame. A later commit must
+        // remain beyond that snapshot when the diagnostic PASSIVE probe runs.
+        // No checkpoint task races this fixture or can age the gap into a pin.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN DEFERRED").unwrap();
+        let visible_rows: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible_rows, 1);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (2)", [])
+                .unwrap();
+        }
+
+        let report = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let probe = report.checkpoint_probe.as_ref().expect("probe row");
+        assert_eq!(probe.busy, 0);
+        assert!(probe.checkpointed_frames > 0);
+        assert!(probe.log_frames > probe.checkpointed_frames);
+        assert_eq!(
+            report.checkpoint_pin.backfill_ceiling,
+            Some(probe.checkpointed_frames)
+        );
+        assert_eq!(report.checkpoint_pin.oldest_pinned_frame, None);
+        assert_eq!(report.checkpoint_pin.pin_depth, None);
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        let drained = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        assert_eq!(drained.checkpoint_pin.backfill_ceiling, None);
+    }
+
     #[derive(Clone, Debug, Default)]
     struct CapturedEvent {
         message: Option<String>,
@@ -3487,6 +4261,8 @@ mod tests {
         oldest_tx_age_secs: Option<String>,
         elapsed_us: Option<u64>,
         busy: Option<i64>,
+        backfill_gap_frames: Option<i64>,
+        legacy_wal_pin_depth: Option<i64>,
         oldest_tx_label: Option<String>,
         tx_label: Option<String>,
         census_only: Option<String>,
@@ -3505,8 +4281,11 @@ mod tests {
         }
 
         fn record_i64(&mut self, field: &Field, value: i64) {
-            if field.name() == "busy" {
-                self.0.busy = Some(value);
+            match field.name() {
+                "busy" => self.0.busy = Some(value),
+                "backfill_gap_frames" => self.0.backfill_gap_frames = Some(value),
+                "wal_pin_depth" => self.0.legacy_wal_pin_depth = Some(value),
+                _ => {}
             }
         }
 
@@ -4294,6 +5073,110 @@ mod tests {
             .expect("wait for release signal");
         conn.execute_batch("COMMIT")
             .expect("helper releases read snapshot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
+    async fn db_diagnostics_keeps_a_holder_started_after_the_run_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("post_observation_holder.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (0)")
+                .unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let task = tokio::spawn(run_checkpoint_task(
+            Arc::clone(&pool),
+            CheckpointConfig {
+                interval: Duration::from_secs(60),
+                ..Default::default()
+            },
+            None,
+            shutdown_rx,
+            true,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while routine_wal_observation(&pool).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the checkpoint task must record its initial sample");
+
+        let earlier_reader = rusqlite::Connection::open(&path).unwrap();
+        earlier_reader.execute_batch("BEGIN DEFERRED").unwrap();
+        earlier_reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (1)", [])
+                .unwrap();
+        }
+
+        let first = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let first_probe = first.checkpoint_probe.as_ref().expect("probe row");
+        assert!(first_probe.log_frames > first_probe.checkpointed_frames);
+        let run = checkpoint_run_status(&pool);
+        let first_observed_at_unix_ms = match run {
+            CheckpointRunStatus::Observed(run) => run.first_observed_at_unix_ms,
+            other => panic!("diagnostic probe must establish a checkpoint run: {other:?}"),
+        };
+
+        let mut later_reader = ReaderProcess::spawn(&path);
+        let later_pid = later_reader.pid();
+        let report = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let later_start = report
+            .wal_pin
+            .census_process_start_times
+            .iter()
+            .find(|process| process.pid == later_pid)
+            .expect("a post-observation holder must remain in the census");
+        assert_eq!(report.wal_pin.reporting_process_is_holder, Some(true));
+        assert!(
+            report.wal_pin.census_holder_pids.contains(&later_pid),
+            "the later process remains a confirmed holder"
+        );
+        assert_eq!(
+            later_start.process_start_time_secs,
+            crate::walpin::process_start_time_secs(later_pid)
+        );
+        assert!(later_start.process_start_time_secs.is_some());
+        assert_eq!(later_start.process_start_time_unavailable_reason, None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(report.wal_pin.start_time_resolution_secs, Some(2));
+        #[cfg(target_os = "macos")]
+        assert_eq!(report.wal_pin.start_time_resolution_secs, Some(1));
+        assert!(first_observed_at_unix_ms > 0);
+        assert!(!report
+            .wal_pin
+            .census_process_start_times
+            .iter()
+            .any(|process| process.pid == later_pid && process.process_start_time_secs.is_none()));
+
+        later_reader.release();
+        earlier_reader.execute_batch("ROLLBACK").unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("checkpoint task shutdown must finish")
+            .expect("checkpoint task must not panic");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7321,7 +8204,7 @@ mod tests {
     }
 
     // ── ADR-091 Amendment 2: Plank A (session sweep), Plank B (walpin
-    // sidecar), Plank C (pin-depth probe) ────────────────────────────────
+    // sidecar), Plank C (backfill-gap probe) ─────────────────────────────
 
     #[tokio::test]
     async fn session_sweep_task_exits_on_shutdown_signal() {
@@ -7871,9 +8754,9 @@ mod tests {
     }
 
     #[test]
-    fn wal_pin_depth_arithmetic_against_real_connection() {
+    fn backfill_gap_arithmetic_against_real_connection() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pin_depth.db");
+        let path = dir.path().join("backfill_gap.db");
         let pool = file_pool(&path);
         let writer = pool.try_writer().expect("acquire writer");
         let conn = writer.conn();
@@ -7881,26 +8764,51 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (v INTEGER)").unwrap();
         conn.execute_batch("INSERT INTO t (v) VALUES (1)").unwrap();
 
-        let (log, checkpointed) =
-            query_wal_pin_depth(conn).expect("PRAGMA wal_checkpoint(PASSIVE) must succeed");
+        let observation =
+            query_backfill_gap(conn).expect("PRAGMA wal_checkpoint(PASSIVE) must succeed");
         // Nothing pins the WAL open in this test (no concurrent reader), so a
-        // PASSIVE checkpoint must fully drain what it just wrote: pin depth
-        // (log - checkpointed) is zero.
+        // PASSIVE checkpoint fully drains what it just wrote: the one-row
+        // backfill gap (log - checkpointed) is zero.
         assert!(
-            log >= checkpointed,
+            observation.log_frames >= observation.checkpointed_frames,
             "checkpointed frames cannot exceed log frames"
         );
         assert_eq!(
-            log - checkpointed,
+            observation.log_frames - observation.checkpointed_frames,
             0,
             "an unpinned WAL must fully checkpoint under PASSIVE"
         );
     }
 
     #[test]
-    fn wal_pin_depth_arithmetic_on_in_memory_pool_errors_cleanly() {
+    fn truncate_no_progress_probe_logs_backfill_gap_without_a_pin_depth_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill_gap_log.db");
+        let pool = file_pool(&path);
+        let writer = pool.try_writer().expect("acquire writer");
+        writer
+            .conn()
+            .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)")
+            .unwrap();
+
+        let events = capture(|| log_backfill_gap(&pool, writer.conn()));
+        let event = events
+            .iter()
+            .find(|event| {
+                event
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("WAL backfill gap"))
+            })
+            .expect("a successful PASSIVE probe logs its backfill gap");
+        assert!(event.backfill_gap_frames.is_some());
+        assert_eq!(event.legacy_wal_pin_depth, None);
+    }
+
+    #[test]
+    fn backfill_gap_arithmetic_on_in_memory_pool_errors_cleanly() {
         // In-memory databases report `log = -1` (no WAL); the pragma read
-        // itself does not panic and the caller (`log_wal_pin_depth`) treats
+        // itself does not panic and the caller (`log_backfill_gap`) treats
         // any error as a logged warning, never a crash.
         let cfg = PoolConfig {
             path: None,
@@ -7910,7 +8818,7 @@ mod tests {
         let writer = pool.try_writer().expect("acquire writer");
         // Either an explicit error or a nonsensical negative `log` value is
         // acceptable here — the requirement is just "does not panic".
-        let _ = query_wal_pin_depth(writer.conn());
+        let _ = query_backfill_gap(writer.conn());
     }
 
     /// #1849: a canonical filesystem identity is an OS path, not a display
@@ -8251,7 +9159,7 @@ mod tests {
         assert_eq!(timing.ticks, 1);
         assert_eq!(timing.error_ticks, 1);
         assert_eq!(timing.busy_ticks, 0);
-        query_wal_pages(&conn);
+        query_wal_pages(&pool, &conn);
         assert_eq!(
             checkpoint_timing(&pool),
             timing,
