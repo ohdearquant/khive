@@ -35,6 +35,11 @@ values, with an `invalid_params` error naming the field. The response `result` c
 JSON object as `request(ops, plan=true)` and `Session.plan(ops)`. A grammar error is a successful
 response whose result has `parsed=false`; planning never grants permission or resolves `$prev`.
 
+An accepted socket has 30 seconds to supply its complete initial length-prefixed
+request frame. The bound includes the length header and body; an incomplete frame
+closes that connection without entering dispatch. The per-request read deadline
+starts after a complete frame is decoded and remains independent of this bound.
+
 ## try_acquire_flock_until
 
 Unlike `acquire_recovery_lock`/`acquire_daemon_boot_guard` (unbounded blocking `flock`, correct

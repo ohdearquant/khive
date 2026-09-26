@@ -47,6 +47,19 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u32 = 7;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// An accepted local socket must finish its first frame within this window.
+/// Dispatch deadlines start only after decoding, so they cannot reap peers
+/// that connect and then stop sending request bytes.
+#[cfg(unix)]
+const INITIAL_FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(unix)]
+fn next_accept_error_backoff(previous: Option<std::time::Duration>) -> std::time::Duration {
+    previous
+        .map(|delay| delay.saturating_mul(2))
+        .unwrap_or_else(|| std::time::Duration::from_millis(10))
+        .min(std::time::Duration::from_secs(1))
+}
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
@@ -879,6 +892,24 @@ where
     Ok(buf)
 }
 
+#[cfg(unix)]
+async fn read_initial_frame<R>(
+    stream: &mut R,
+    deadline: std::time::Duration,
+) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    tokio::time::timeout(deadline, read_frame(stream))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon initial request frame read timed out",
+            )
+        })?
+}
+
 /// Write one length-prefixed frame.
 #[cfg(unix)]
 pub async fn write_frame<W>(stream: &mut W, payload: &[u8]) -> std::io::Result<()>
@@ -1477,7 +1508,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     // Keeps the fallback receiver open in direct/test calls. Production owns
     // a sender at the daemon-run scope and passes its receiver above.
     let _local_shutdown_tx = local_shutdown_tx;
-    let raw = match read_frame(&mut stream).await {
+    let raw = match read_initial_frame(&mut stream, INITIAL_FRAME_READ_TIMEOUT).await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "failed to read daemon request frame");
@@ -2357,9 +2388,13 @@ where
 
     tokio::select! {
         _ = async {
+            let mut accept_error_backoff = None;
+            let mut last_accept_error_log: Option<std::time::Instant> = None;
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        accept_error_backoff = None;
+                        last_accept_error_log = None;
                         // Refuse a foreign uid before any frame is read.
                         // Fails CLOSED: an error reading peer credentials is
                         // "cannot prove same-uid", which is the same answer as
@@ -2406,7 +2441,26 @@ where
                         tasks.retain(|task| !task.is_finished());
                         tasks.push(handle);
                     }
-                    Err(e) => tracing::error!(error = %e, "accept failed"),
+                    Err(e) => {
+                        let delay = next_accept_error_backoff(accept_error_backoff);
+                        accept_error_backoff = Some(delay);
+                        let capacity_exhausted = matches!(
+                            e.raw_os_error(),
+                            Some(libc::EMFILE) | Some(libc::ENFILE)
+                        );
+                        if last_accept_error_log.is_none_or(|last| {
+                            last.elapsed() >= std::time::Duration::from_secs(30)
+                        }) {
+                            tracing::error!(
+                                error = %e,
+                                capacity_exhausted,
+                                retry_ms = delay.as_millis(),
+                                "daemon accept failed; retrying with bounded backoff"
+                            );
+                            last_accept_error_log = Some(std::time::Instant::now());
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
         } => {}
@@ -2875,6 +2929,40 @@ mod tests {
     }
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn incomplete_initial_frames_release_the_connection_deadline() {
+        for prefix in [&[][..], &[0, 0][..], &[0, 0, 0, 5][..]] {
+            let (mut peer, mut server) = tokio::io::duplex(64);
+            peer.write_all(prefix).await.expect("send partial frame");
+            let error = read_initial_frame(&mut server, std::time::Duration::from_millis(10))
+                .await
+                .expect_err("an idle peer cannot hold a daemon connection indefinitely");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+
+        let (mut peer, mut server) = tokio::io::duplex(64);
+        write_frame(&mut peer, b"{}")
+            .await
+            .expect("send full frame");
+        assert_eq!(
+            read_initial_frame(&mut server, std::time::Duration::from_secs(1))
+                .await
+                .expect("complete frame remains readable"),
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn repeated_accept_failures_back_off_and_cap_at_one_second() {
+        let mut previous = None;
+        for expected_ms in [10, 20, 40, 80, 160, 320, 640, 1000, 1000] {
+            let next = next_accept_error_backoff(previous);
+            assert_eq!(next.as_millis(), expected_ms);
+            previous = Some(next);
+        }
+        assert_eq!(next_accept_error_backoff(None).as_millis(), 10);
+    }
 
     #[derive(Debug)]
     struct DrainBlockingBlobStore {
