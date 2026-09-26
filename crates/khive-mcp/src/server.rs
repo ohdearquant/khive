@@ -3095,6 +3095,7 @@ async fn dispatch_via_coordinator_inner(
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             let metadata = args_value.get("metadata").cloned();
+            let dependency_kind = args_value.get("dependency_kind").cloned();
             let resurrect = args_value
                 .get("resurrect")
                 .and_then(Value::as_bool)
@@ -3106,6 +3107,20 @@ async fn dispatch_via_coordinator_inner(
                     args_value,
                     identity,
                     |namespace| async move {
+                        // The coordinator receives the same metadata as the KG
+                        // handler: a top-level dependency_kind fills the key only
+                        // when metadata does not already contain it.
+                        let dependency_kind = match dependency_kind {
+                            None | Some(Value::Null) => None,
+                            Some(Value::String(value)) => Some(value),
+                            Some(_) => {
+                                return Err(RuntimeError::InvalidInput(
+                                    "dependency_kind must be a string".into(),
+                                ));
+                            }
+                        };
+                        let metadata =
+                            khive_runtime::merge_entry_metadata(metadata, dependency_kind)?;
                         let coord_result = coord
                             .link(
                                 &namespace, source_id, target_id, relation, weight, metadata,
