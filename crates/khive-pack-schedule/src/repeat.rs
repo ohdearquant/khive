@@ -82,8 +82,8 @@ impl Repeat {
     /// The occurrence after `current`.
     pub fn next_after(&self, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
-            Repeat::Daily => Some(current + Duration::days(1)),
-            Repeat::Weekly => Some(current + Duration::weeks(1)),
+            Repeat::Daily => current.checked_add_signed(Duration::days(1)),
+            Repeat::Weekly => current.checked_add_signed(Duration::weeks(1)),
             // chrono::Months handles month-boundary arithmetic (Jan 31 + 1
             // month = Feb 28/29).
             Repeat::Monthly => current.checked_add_months(Months::new(1)),
@@ -238,5 +238,19 @@ mod tests {
             daily.first_after(original, at("2026-06-15T09:00:00Z")),
             Some(at("2026-06-16T09:00:00Z"))
         );
+    }
+
+    #[test]
+    fn no_representable_successor_returns_none_instead_of_panicking() {
+        for alias in ["daily", "weekly"] {
+            let repeat = parse_repeat(alias).unwrap();
+            assert_eq!(repeat.next_after(DateTime::<Utc>::MAX_UTC), None);
+            assert_eq!(
+                repeat.first_after(DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC),
+                None
+            );
+            let near_max = DateTime::<Utc>::MAX_UTC - Duration::hours(1);
+            assert_eq!(repeat.first_after(near_max, near_max), None);
+        }
     }
 }

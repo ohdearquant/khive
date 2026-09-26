@@ -20,14 +20,79 @@
 mod test_process;
 
 use async_trait::async_trait;
-use khive_runtime::daemon::{pid_path, run_daemon_with_boot_guard, socket_path};
+use khive_runtime::daemon::{
+    pid_path, read_frame, run_daemon_with_boot_guard, run_daemon_with_boot_guard_and_start,
+    socket_path, write_frame, DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
+};
 use khive_runtime::{DaemonDispatch, RequestIdentity};
 use serial_test::serial;
+use std::os::unix::fs::PermissionsExt;
 
 /// The phrase only the pairing refusal emits. Asserted present in the two
 /// unpaired cases and absent in the two paired ones, so the "boots" cases
 /// cannot pass merely because some other error occurred first.
 const PAIRING_REFUSAL_MARKER: &str = "two halves of one daemon rendezvous";
+const PID_TRUST_CHILD: &str = "KHIVE_PID_TRUST_CHILD";
+const PID_TRUST_ROOT: &str = "KHIVE_PID_TRUST_ROOT";
+
+fn run_in_pid_trust_child() -> bool {
+    let name = std::thread::current()
+        .name()
+        .expect("test thread has a name")
+        .to_string();
+    if std::env::var(PID_TRUST_CHILD).ok().as_deref() == Some(name.as_str()) {
+        return false;
+    }
+
+    let fixture = tempfile::Builder::new()
+        .prefix("kh-pid-trust-")
+        .tempdir_in("/tmp")
+        .expect("short isolated socket directory");
+    let home = fixture.path().join("home");
+    std::fs::create_dir(&home).expect("private HOME");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    let mut output = output;
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("KHIVE_") {
+            output.env_remove(key);
+        }
+    }
+    let output = output
+        .args(["--exact", name.as_str(), "--nocapture", "--test-threads=1"])
+        .env(PID_TRUST_CHILD, &name)
+        .env(PID_TRUST_ROOT, fixture.path())
+        .env("HOME", &home)
+        .env_remove("LATTICE_MODEL_CACHE")
+        .output()
+        .expect("run isolated daemon test");
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed;"),
+        "isolated daemon test must pass:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+fn configure_pid_trust_paths(root: &std::path::Path, pid_mode: u32) -> std::path::PathBuf {
+    let socket_dir = root.join("socket-dir");
+    let pid_dir = root.join("pid-dir");
+    std::fs::create_dir(&socket_dir).expect("socket parent");
+    std::fs::create_dir(&pid_dir).expect("PID parent");
+    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("private socket parent");
+    std::fs::set_permissions(&pid_dir, std::fs::Permissions::from_mode(pid_mode))
+        .expect("set PID parent mode");
+
+    std::env::set_var("KHIVE_SOCKET", socket_dir.join("khived.sock"));
+    let pid_file = pid_dir.join("khived.pid");
+    std::env::set_var("KHIVE_PID", &pid_file);
+    std::env::set_var("KHIVE_LOCK", root.join("boot.lock"));
+    std::env::set_var("KHIVE_RECOVERER_LOCK", root.join("recoverer.lock"));
+    pid_file
+}
 
 #[derive(Clone)]
 struct NeverDispatch;
@@ -292,4 +357,155 @@ async fn neither_override_set_boots_past_the_pairing_check_and_resolves_both_def
         !message.contains(PAIRING_REFUSAL_MARKER),
         "the default rendezvous must pass the pairing check and fail later, got: {message}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn group_writable_pid_parent_refuses_daemon_startup() {
+    if run_in_pid_trust_child() {
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os(PID_TRUST_ROOT).expect("fixture root"));
+    let pid_file = configure_pid_trust_paths(&root, 0o770);
+    // Bounded: with the refusal gone the daemon would start and serve, and an
+    // unbounded await would hang the test instead of failing it.
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_daemon_with_boot_guard(NeverDispatch, None),
+    )
+    .await
+    .expect("a group-writable PID parent must refuse startup, not start serving")
+    .expect_err("a group-writable PID parent must refuse startup");
+    let message = format!("{error:#}");
+
+    assert!(
+        message.contains("KHIVE_PID"),
+        "wrong variable in refusal: {message}"
+    );
+    assert!(
+        message.contains("PID-file directory") && message.contains("writable by group or other"),
+        "refusal must identify the unsafe PID-file directory: {message}"
+    );
+    assert!(
+        message.contains(&pid_file.parent().unwrap().display().to_string()),
+        "refusal must identify the configured PID parent: {message}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn other_writable_pid_parent_refuses_daemon_startup() {
+    if run_in_pid_trust_child() {
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os(PID_TRUST_ROOT).expect("fixture root"));
+    let pid_file = configure_pid_trust_paths(&root, 0o707);
+    // Bounded: with the refusal gone the daemon would start and serve, and an
+    // unbounded await would hang the test instead of failing it.
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_daemon_with_boot_guard(NeverDispatch, None),
+    )
+    .await
+    .expect("an other-writable PID parent must refuse startup, not start serving")
+    .expect_err("an other-writable PID parent must refuse startup");
+    let message = format!("{error:#}");
+
+    assert!(
+        message.contains("KHIVE_PID"),
+        "wrong variable in refusal: {message}"
+    );
+    assert!(
+        message.contains("PID-file directory") && message.contains("writable by group or other"),
+        "refusal must identify the unsafe PID-file directory: {message}"
+    );
+    assert!(
+        message.contains(&pid_file.parent().unwrap().display().to_string()),
+        "refusal must identify the configured PID parent: {message}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn trusted_private_socket_and_pid_parents_allow_daemon_startup() {
+    if run_in_pid_trust_child() {
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os(PID_TRUST_ROOT).expect("fixture root"));
+    let pid_file = configure_pid_trust_paths(&root, 0o700);
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_started = std::sync::Arc::clone(&started);
+    let _sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install child SIGTERM handler");
+    let mut daemon = tokio::spawn(run_daemon_with_boot_guard_and_start(
+        NeverDispatch,
+        None,
+        move |_| {
+            assert!(
+                socket_path().exists(),
+                "trusted socket parent must allow bind"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pid_file).expect("claimed PID file"),
+                std::process::id().to_string()
+            );
+            callback_started.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    ));
+
+    let sock = socket_path();
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if daemon.is_finished() {
+                (&mut daemon)
+                    .await
+                    .expect("trusted daemon task must not panic")
+                    .expect("trusted private paths must start");
+                panic!("trusted daemon exited before readiness");
+            }
+            if let Ok(stream) = tokio::net::UnixStream::connect(&sock).await {
+                break stream;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon must bind");
+    let request = DaemonRequestFrame {
+        namespace: "test".to_string(),
+        config_id: "test-config".to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        probe_only: true,
+        ..Default::default()
+    };
+    let payload = serde_json::to_vec(&request).expect("encode readiness probe");
+    write_frame(&mut stream, &payload)
+        .await
+        .expect("write readiness probe");
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .expect("daemon must serve readiness probe")
+        .expect("read readiness response");
+    let response: DaemonResponseFrame =
+        serde_json::from_slice(&response).expect("decode readiness response");
+    assert!(response.ok, "daemon readiness failed: {response:?}");
+    assert_eq!(response.served_config_id.as_deref(), Some("test-config"));
+    assert!(response.result.is_none());
+    assert!(response.error.is_none());
+    assert!(response.metrics.is_none());
+    drop(stream);
+
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+
+    // SAFETY: this test runs in an isolated child and has installed its SIGTERM handler.
+    let rc = unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+    assert_eq!(rc, 0, "signal isolated daemon child");
+    tokio::time::timeout(std::time::Duration::from_secs(5), daemon)
+        .await
+        .expect("trusted daemon must shut down after SIGTERM")
+        .expect("trusted daemon task must not panic")
+        .expect("trusted private paths must start");
 }

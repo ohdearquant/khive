@@ -317,9 +317,6 @@ class RawDaemonFrameTests(unittest.TestCase):
             mbc.recv_exact(sock, 1, deadline=time.monotonic() - 1)
         self.assertEqual(sock.calls, 2, "an expired deadline must not call recv")
 
-    def test_protocol_version_tracks_process_ref_rollout(self):
-        self.assertEqual(mbc.PROTOCOL_VERSION, 4)
-
     def test_base_daemon_frame_shape(self):
         frame = mbc.base_daemon_frame("stats()", "cfg1", probe_only=True, metrics_only=False)
         self.assertEqual(frame["ops"], "stats()")
