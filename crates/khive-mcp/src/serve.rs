@@ -13630,6 +13630,20 @@ backend = "kg-backend"
             let content_ref = quarantined["properties"]["quarantine_content_ref"]
                 .as_str()
                 .expect("quarantine ContentRef");
+            let note_id = quarantined["id"]
+                .as_str()
+                .expect("quarantine note id")
+                .parse::<uuid::Uuid>()
+                .expect("quarantine note UUID");
+            let owner = runtime
+                .attachments()
+                .expect("main attachment store")
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("quarantined original must be rooted for blob GC");
+            assert_eq!(owner.substrate, khive_storage::AttachmentSubstrate::Note);
+            assert_eq!(owner.content_ref.as_str(), content_ref);
             let fetched = registry
                 .dispatch("blob.get", json!({"content_ref": content_ref}))
                 .await
@@ -13641,6 +13655,43 @@ backend = "kg-backend"
                 replay, ORIGINAL_BYTES,
                 "the replay ContentRef must round-trip the byte-exact original message"
             );
+
+            // Simulate an older metadata-only quarantine, then retry the
+            // stable transport id. Dedup must restore the owner row before
+            // acknowledging the retry and advancing a channel cursor.
+            runtime
+                .attachments()
+                .unwrap()
+                .delete_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap();
+            let replay_envelope = ChannelEnvelope::new(
+                "email:maintainer@example.com",
+                "email:mailbox@example.com",
+                REFUSED_BODY,
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
+            quarantine_channel_ingest_failure(
+                &registry,
+                "test-ns",
+                "email",
+                Some("actor:test"),
+                &replay_envelope,
+                khive_runtime::ChannelIngestFailureClass::Permanent {
+                    reason: "SecretDetected",
+                },
+            )
+            .await
+            .expect("duplicate quarantine repairs its missing blob owner");
+            let repaired = runtime
+                .attachments()
+                .unwrap()
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .expect("retry restores the GC root");
+            assert_eq!(repaired.content_ref.as_str(), content_ref);
         }
 
         /// Restart-across-a-checkpoint round-trip (issue #449 part b): once a

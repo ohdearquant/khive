@@ -374,9 +374,10 @@ pub(crate) async fn handle_get(
         )));
     }
 
-    let verified = hydrator
-        .hydrate_verified(&content_ref, MAX_OBJECT_BYTES)
-        .await?;
+    // `size` was checked against the verb ceiling above. Reserve the bytes
+    // this immutable content-addressed object actually needs, not 64 MiB for
+    // every tiny read; the verified hydrator still rejects a larger payload.
+    let verified = hydrator.hydrate_verified(&content_ref, size).await?;
     let bytes = verified.bytes();
     let total_len = bytes.len();
     let (slice, range_out) = match range {

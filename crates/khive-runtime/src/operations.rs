@@ -3631,7 +3631,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, false)
+        self.try_create_note_impl(token, kind, name, content, properties, false, None)
             .await
     }
 
@@ -3659,8 +3659,34 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, true)
+        self.try_create_note_impl(token, kind, name, content, properties, true, None)
             .await
+    }
+
+    /// Publish a trusted inbound message and its original-byte attachment in
+    /// one database transaction. Channel quarantine must not advertise a
+    /// reference in note metadata before GC can see its attachment owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_create_note_as_trusted_ingest_with_attachment(
+        &self,
+        _capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        attachment: NewAttachment,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            Some(attachment),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3672,6 +3698,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
         allow_transport_owned_message_properties: bool,
+        attachment: Option<NewAttachment>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3681,6 +3708,23 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json_at(p, "note", "properties")?;
+        }
+        if let Some(ref attachment) = attachment {
+            // The note and its owner row must share the main database. A
+            // secondary pack backend cannot atomically root the reference.
+            drop(self.attachments()?);
+            attachment.validate()?;
+            let blob_store = self.blob_store().ok_or_else(|| {
+                RuntimeError::Unconfigured(
+                    "trusted ingest attachment requires an installed BlobStore".to_string(),
+                )
+            })?;
+            if !blob_store.exists(&attachment.content_ref).await? {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "trusted ingest attachment refers to an unpublished blob: {}",
+                    attachment.content_ref
+                )));
+            }
         }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
@@ -3711,7 +3755,21 @@ impl KhiveRuntime {
         // so this reaches storage directly rather than duplicate the check
         // through a wrapper that cannot see the trust decision this function
         // just made.
-        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
+        let inserted = if let Some(attachment) = attachment {
+            self.raw_notes(token)?
+                .try_insert_note_with_attachments(
+                    note.clone(),
+                    vec![Attachment::from_new(
+                        note.id,
+                        AttachmentSubstrate::Note,
+                        attachment,
+                        note.created_at,
+                    )],
+                )
+                .await?
+        } else {
+            self.raw_notes(token)?.try_insert_note(note.clone()).await?
+        };
         if !inserted {
             return Ok(None);
         }
