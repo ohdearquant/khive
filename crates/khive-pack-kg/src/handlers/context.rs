@@ -216,6 +216,15 @@ async fn fetch_directed_neighbors(
     }
 }
 
+fn missing_neighbor_anchor_as_empty<T>(
+    result: Result<Vec<T>, RuntimeError>,
+) -> Result<Vec<T>, RuntimeError> {
+    match result {
+        Err(RuntimeError::NotFound(_)) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
 fn compact_len(v: &Value) -> Result<usize, RuntimeError> {
     let s =
         serde_json::to_string(v).map_err(|e| RuntimeError::Internal(format!("serialize: {e}")))?;
@@ -381,15 +390,17 @@ impl KgPack {
 
             // hops=0 means anchors only — skip expansion entirely.
             if hops >= 1 {
-                let hop1_raw = fetch_directed_neighbors(
-                    &self.runtime,
-                    token,
-                    anchor,
-                    &direction,
-                    relations.as_deref(),
-                    fanout,
-                )
-                .await?;
+                let hop1_raw = missing_neighbor_anchor_as_empty(
+                    fetch_directed_neighbors(
+                        &self.runtime,
+                        token,
+                        anchor,
+                        &direction,
+                        relations.as_deref(),
+                        fanout,
+                    )
+                    .await,
+                )?;
 
                 for (id, relation, weight, dir) in hop1_raw {
                     if !visited.insert(id) {
@@ -410,15 +421,17 @@ impl KgPack {
             if hops == 2 {
                 let mut hop2_pool: Vec<(Uuid, Uuid, EdgeRelation, f64, &'static str)> = Vec::new();
                 for parent in &hop1_parents {
-                    let hop2_raw = fetch_directed_neighbors(
-                        &self.runtime,
-                        token,
-                        *parent,
-                        &direction,
-                        relations.as_deref(),
-                        fanout,
-                    )
-                    .await?;
+                    let hop2_raw = missing_neighbor_anchor_as_empty(
+                        fetch_directed_neighbors(
+                            &self.runtime,
+                            token,
+                            *parent,
+                            &direction,
+                            relations.as_deref(),
+                            fanout,
+                        )
+                        .await,
+                    )?;
                     for (id, relation, weight, dir) in hop2_raw {
                         hop2_pool.push((*parent, id, relation, weight, dir));
                     }

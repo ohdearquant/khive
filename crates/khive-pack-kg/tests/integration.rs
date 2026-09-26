@@ -1689,6 +1689,142 @@ async fn neighbors_accepts_id_alias_and_responds_with_id() {
     }
 }
 
+#[tokio::test]
+async fn neighbors_dispatch_accepts_foreign_full_uuid_and_scopes_edge_results() {
+    let rt = KhiveRuntime::memory().unwrap();
+    let owner = Namespace::parse("neighbor-dispatch-owner").unwrap();
+    let owner_token = rt
+        .authorize(owner.clone())
+        .expect("authorize owner namespace");
+    let src = rt
+        .create_entity(&owner_token, "concept", None, "Source", None, None, vec![])
+        .await
+        .unwrap();
+    let tgt = rt
+        .create_entity(&owner_token, "concept", None, "Target", None, None, vec![])
+        .await
+        .unwrap();
+    let isolated = rt
+        .create_entity(
+            &owner_token,
+            "concept",
+            None,
+            "Isolated",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let caller = Namespace::parse("neighbor-dispatch-caller").unwrap();
+    let caller_token = rt.authorize(caller.clone()).expect("authorize caller");
+    let caller_target = rt
+        .create_entity(
+            &caller_token,
+            "concept",
+            None,
+            "Caller target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    rt.link(
+        &owner_token,
+        src.id,
+        tgt.id,
+        EdgeRelation::Extends,
+        1.0,
+        None,
+    )
+    .await
+    .unwrap();
+    rt.link(
+        &caller_token,
+        src.id,
+        caller_target.id,
+        EdgeRelation::Extends,
+        1.0,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let fixture = Fixture {
+        registry: builder.build().unwrap(),
+    };
+    let visible = fixture
+        .dispatch(
+            "neighbors",
+            json!({"id": src.id, "namespace": owner.as_str(), "direction": "out"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible.as_array().unwrap().len(), 1);
+
+    for limit in [None, Some(1)] {
+        let mut args = json!({
+            "id": src.id,
+            "namespace": caller.as_str(),
+            "direction": "out"
+        });
+        if let Some(limit) = limit {
+            args["limit"] = json!(limit);
+        }
+        let response = fixture.dispatch("neighbors", args).await.unwrap();
+        let hits = if limit.is_some() {
+            response["neighbors"].as_array().unwrap()
+        } else {
+            response.as_array().unwrap()
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], json!(caller_target.id));
+    }
+
+    let foreign_empty = fixture
+        .dispatch(
+            "neighbors",
+            json!({"id": isolated.id, "namespace": caller.as_str(), "direction": "out"}),
+        )
+        .await
+        .unwrap();
+    assert!(foreign_empty.as_array().unwrap().is_empty());
+
+    let missing = uuid::Uuid::new_v4();
+    assert!(matches!(
+        fixture
+            .dispatch(
+                "neighbors",
+                json!({"id": missing, "namespace": caller.as_str(), "direction": "out"}),
+            )
+            .await,
+        Err(RuntimeError::NotFound(message)) if message.contains(&missing.to_string())
+    ));
+
+    let prefix = src.id.to_string()[..8].to_owned();
+    assert!(matches!(
+        fixture
+            .dispatch(
+                "neighbors",
+                json!({"id": prefix, "namespace": caller.as_str(), "direction": "out"}),
+            )
+            .await,
+        Err(RuntimeError::InvalidInput(message)) if message.contains("no record matches prefix")
+    ));
+
+    let empty = fixture
+        .dispatch(
+            "neighbors",
+            json!({"id": isolated.id, "namespace": owner.as_str(), "direction": "out"}),
+        )
+        .await
+        .unwrap();
+    assert!(empty.as_array().unwrap().is_empty());
+}
+
 /// Regression: neighbor hits include enriched `name` and `kind`
 /// from the corresponding entity record.
 #[tokio::test]

@@ -2988,8 +2988,12 @@ impl KhiveRuntime {
         neighbor_kinds: Option<Vec<String>>,
         enrich: bool,
     ) -> RuntimeResult<Vec<NeighborHit>> {
-        if !self.substrate_exists_in_ns(token, node_id).await? {
-            return Ok(Vec::new());
+        // A full-UUID anchor follows get's by-ID lookup. Only the adjacency
+        // expansion below is scoped to the caller's visible namespaces.
+        if !self.substrate_exists_by_id(token, node_id).await? {
+            return Err(RuntimeError::NotFound(format!(
+                "neighbor anchor {node_id} not found"
+            )));
         }
 
         query.direction =
@@ -3106,8 +3110,10 @@ impl KhiveRuntime {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> RuntimeResult<Vec<(NeighborHit, Direction)>> {
-        if !self.substrate_exists_in_ns(token, node_id).await? {
-            return Ok(Vec::new());
+        if !self.substrate_exists_by_id(token, node_id).await? {
+            return Err(RuntimeError::NotFound(format!(
+                "neighbor anchor {node_id} not found"
+            )));
         }
 
         let mut hits: Vec<DirectedNeighborHit> = Vec::new();
@@ -3165,7 +3171,8 @@ impl KhiveRuntime {
 
     /// Traverse the graph from a set of root nodes.
     ///
-    /// Roots in a foreign namespace are silently filtered before storage expansion.
+    /// Full-UUID roots use the by-ID contract; expansion and returned edges
+    /// remain scoped to the caller's visible namespaces. Missing roots refuse.
     /// Soft-deleted entity nodes are excluded from results.
     pub async fn traverse(
         &self,
@@ -3174,14 +3181,19 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<GraphPath>> {
         let mut request = request;
         request.validate().map_err(RuntimeError::InvalidInput)?;
-        let mut visible_roots = Vec::with_capacity(request.roots.len());
+        let mut roots = Vec::with_capacity(request.roots.len());
         let mut seen_roots = std::collections::HashSet::with_capacity(request.roots.len());
         for root in request.roots.drain(..) {
-            if seen_roots.insert(root) && self.substrate_exists_in_ns(token, root).await? {
-                visible_roots.push(root);
+            if seen_roots.insert(root) {
+                if !self.substrate_exists_by_id(token, root).await? {
+                    return Err(RuntimeError::NotFound(format!(
+                        "traverse root {root} not found"
+                    )));
+                }
+                roots.push(root);
             }
         }
-        request.roots = visible_roots;
+        request.roots = roots;
         if request.roots.is_empty() {
             return Ok(Vec::new());
         }
@@ -9683,6 +9695,119 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn neighbors_accepts_foreign_full_uuid_anchor_but_scopes_returned_edges() {
+        let rt = rt();
+        let ns_a = Namespace::parse("neighbor-owner").unwrap();
+        let ns_b = Namespace::parse("neighbor-caller").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        let src = rt
+            .create_entity(&tok_a, "concept", None, "Source", None, None, vec![])
+            .await
+            .unwrap();
+        let tgt = rt
+            .create_entity(&tok_a, "concept", None, "Target", None, None, vec![])
+            .await
+            .unwrap();
+        let isolated = rt
+            .create_entity(&tok_a, "concept", None, "Isolated", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(&tok_a, "observation", None, "Note", None, None, vec![])
+            .await
+            .unwrap();
+        let caller_target = rt
+            .create_entity(&tok_b, "concept", None, "Caller target", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok_a, src.id, tgt.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(
+            &tok_b,
+            src.id,
+            caller_target.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let own_hits = rt
+            .neighbors(&tok_a, src.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert_eq!(own_hits.len(), 1);
+        assert_eq!(own_hits[0].node_id, tgt.id);
+
+        // The full UUID is a by-ID anchor; only returned edges use the read
+        // scope. The owner edge is invisible, the caller edge is returned.
+        assert!(rt.get_entity(&tok_b, src.id).await.is_ok());
+        assert!(rt.get_edge(&tok_b, edge.id.0).await.unwrap().is_some());
+        let foreign_hits = rt
+            .neighbors(&tok_b, src.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert_eq!(foreign_hits.len(), 1);
+        assert_eq!(foreign_hits[0].node_id, caller_target.id);
+        for anchor in [note.id, edge.id.0, isolated.id] {
+            assert!(
+                rt.neighbors(&tok_b, anchor, Direction::Out, None, None)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "live foreign anchor without a caller-visible edge must be empty"
+            );
+        }
+        let missing = Uuid::new_v4();
+        assert!(matches!(
+            rt.neighbors(&tok_b, missing, Direction::Out, None, None)
+                .await,
+            Err(RuntimeError::NotFound(message)) if message.contains(&missing.to_string())
+        ));
+
+        let page = rt
+            .neighbors_with_query_page(
+                &tok_b,
+                src.id,
+                NeighborQuery {
+                    direction: Direction::Out,
+                    relations: None,
+                    limit: Some(1),
+                    min_weight: None,
+                },
+                None,
+                None,
+                true,
+            )
+            .await;
+        let page = page.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].node_id, caller_target.id);
+
+        let visible_from_b = rt.authorize_with_visibility(ns_b, vec![ns_a]).unwrap();
+        let shared_hits = rt
+            .neighbors(&visible_from_b, src.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert_eq!(shared_hits.len(), 2);
+        assert!(shared_hits.iter().any(|hit| hit.node_id == tgt.id));
+        assert!(shared_hits
+            .iter()
+            .any(|hit| hit.node_id == caller_target.id));
+
+        let isolated_hits = rt
+            .neighbors(&tok_a, isolated.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert!(isolated_hits.is_empty());
+    }
+
     // By-ID ops do not enforce namespace isolation. Shared-brain OSS model:
     // UUID is globally unique; get/update/delete find the record regardless
     // of caller's token namespace.
@@ -12764,14 +12889,27 @@ mod tests {
             search_hits.is_empty(),
             "compensation must clean the FTS index; got {search_hits:?}"
         );
+        // The deleted note is no longer a valid neighbor anchor. Inspect the
+        // surviving target to verify its incoming annotation edge was removed.
         let after_edges = rt
-            .neighbors(&tok, note.id, Direction::Out, None, None)
+            .neighbors(
+                &tok,
+                t1.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
             .await
             .unwrap();
         assert!(
             after_edges.is_empty(),
             "compensation must remove all partial edges; got {after_edges:?}"
         );
+        assert!(matches!(
+            rt.neighbors(&tok, note.id, Direction::Out, None, None)
+                .await,
+            Err(RuntimeError::NotFound(_))
+        ));
     }
 
     // ---- Hard-delete cascade for note and edge annotation targets (fix/annotates) ----
@@ -15192,11 +15330,10 @@ mod tests {
         drop(held);
     }
 
-    // get_entity finds any entity by UUID; traverse finds the root and returns paths
-    // scoped to the graph store's namespace filter for ns_b, even when the token's
-    // namespace differs from the root's.
+    // A full UUID identifies the root by ID, while traversal edges still come
+    // only from the caller's visible namespaces.
     #[tokio::test]
-    async fn traverse_cross_namespace_root_is_accepted() {
+    async fn traverse_foreign_full_uuid_root_uses_caller_edge_scope() {
         use khive_storage::types::TraversalOptions;
 
         let rt = rt();
@@ -15207,32 +15344,69 @@ mod tests {
             .create_entity(&ns_a, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
-        rt.create_entity(&ns_a, "concept", None, "B", None, None, vec![])
+        let owner_target = rt
+            .create_entity(&ns_a, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(&ns_a, a.id, a.id, EdgeRelation::Extends, 1.0, None)
+        let caller_target = rt
+            .create_entity(&ns_b, "concept", None, "C", None, None, vec![])
             .await
-            .ok(); // may conflict with self-loop check; we just need an entity
+            .unwrap();
+        rt.link(
+            &ns_a,
+            a.id,
+            owner_target.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &ns_b,
+            a.id,
+            caller_target.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
 
-        // substrate_exists_in_ns finds the ns_a root via get_entity
-        // (UUID-global lookup). The traverse proceeds; no panic.
-        let result = rt
+        let request = TraversalRequest {
+            roots: vec![a.id],
+            options: TraversalOptions {
+                max_depth: 1,
+                direction: Direction::Out,
+                ..Default::default()
+            },
+            include_roots: false,
+            include_properties: false,
+            execution_budget: Default::default(),
+        };
+        let paths = rt
+            .traverse(&ns_b, request.clone())
+            .await
+            .expect("foreign full-UUID root must be accepted");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes.len(), 1);
+        assert_eq!(paths[0].nodes[0].node_id, caller_target.id);
+
+        let missing = Uuid::new_v4();
+        let error = rt
             .traverse(
                 &ns_b,
                 TraversalRequest {
-                    roots: vec![a.id],
-                    options: TraversalOptions {
-                        max_depth: 1,
-                        direction: Direction::Out,
-                        ..Default::default()
-                    },
-                    include_roots: true,
-                    include_properties: false,
-                    execution_budget: Default::default(),
+                    roots: vec![a.id, missing],
+                    ..request
                 },
             )
-            .await;
-        assert!(result.is_ok(), "traverse must not error; got {:?}", result);
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::NotFound(message) if message.contains(&missing.to_string())
+        ));
     }
 
     // ── Single root visible in multiple namespaces must yield exactly one
