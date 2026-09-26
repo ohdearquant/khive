@@ -4590,7 +4590,11 @@ mod tests {
         .await
         .expect("expired accepted deadline must not start a fresh read window");
         let mut byte = [0u8; 1];
-        assert_eq!(client.read(&mut byte).await.expect("closed socket read"), 0);
+        match client.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected closed socket, got {other:?}"),
+        }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
