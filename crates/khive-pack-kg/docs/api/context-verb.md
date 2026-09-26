@@ -52,6 +52,5 @@ record landing exactly on the boundary still fits.
 - **Stage 4 (assembly)**: explicit `entity_ids` anchors are already verified to exist in
   Stage 1; the Stage 4 existence check only guards the residual race of an anchor deleted
   concurrently between resolution and this fetch, or a neighbor entity that vanished the same
-  way. Neighbors get the same lenient "missing node reads as absent" convention
-  `neighbors_with_query` already applies (it returns an empty Vec rather than erroring on a
-  nonexistent `node_id`) — they never enter the budget accounting.
+  way. During expansion, the handler treats `NotFound` for a node that vanished after discovery
+  as an empty neighbor list. Missing nodes never enter the budget accounting.
