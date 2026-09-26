@@ -65,12 +65,40 @@ impl KhiveRuntime {
     }
 
     pub(crate) async fn compensate_note_creation(&self, note: &Note) -> bool {
+        match self.compensate_note_creation_inner(note, false).await {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(note_id = %note.id, %error, "note creation compensation failed");
+                false
+            }
+        }
+    }
+
+    /// Roll back a partially linked note. Incident edges and the note row are
+    /// removed by one writer transaction, or both remain for reconciliation.
+    pub(crate) async fn compensate_note_creation_with_edges(
+        &self,
+        note: &Note,
+    ) -> RuntimeResult<bool> {
+        self.compensate_note_creation_inner(note, true).await
+    }
+
+    async fn compensate_note_creation_inner(
+        &self,
+        note: &Note,
+        purge_edges: bool,
+    ) -> RuntimeResult<bool> {
         let mut statements = khive_db::stores::text::delete_document_statements(
             "fts_notes",
             &note.namespace,
             note.id,
         )
         .to_vec();
+        if purge_edges {
+            statements.push(khive_db::stores::graph::purge_incident_edges_statement(
+                note.id,
+            ));
+        }
         statements.push(crate::note_write::statement(
             "DELETE FROM notes WHERE namespace=?1 AND id=?2",
             vec![
@@ -84,16 +112,8 @@ impl KhiveRuntime {
                 khive_storage::attachment::AttachmentSubstrate::Note,
             ),
         );
-        match self
-            .apply_note_revision_statements(note, statements, true)
+        self.apply_note_revision_statements(note, statements, true)
             .await
-        {
-            Ok(removed) => removed,
-            Err(error) => {
-                tracing::warn!(note_id = %note.id, %error, "note creation compensation failed");
-                false
-            }
-        }
     }
 
     async fn apply_note_revision_statements(
