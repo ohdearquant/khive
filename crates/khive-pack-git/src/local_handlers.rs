@@ -781,6 +781,13 @@ impl GitPack {
                     self.reconcile_remote(repo, &mut prior).await?;
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
+                if matches!(prior.verb.as_str(), "git.pr_open" | "git.pr_review") {
+                    // Neither platform operation has receipt-specific evidence. An absent PR or
+                    // review cannot prove that the original write did not happen, and a later
+                    // matching object cannot prove this receipt caused it. Preserve unknown
+                    // without resolving a credential or touching the platform.
+                    return Ok(json!({"receipt":prior.to_value()}));
+                }
                 if !matches!(
                     prior.verb.as_str(),
                     "git.branch" | "git.commit" | "git.update_ref"
