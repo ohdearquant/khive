@@ -1033,6 +1033,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 "KHIVE_PID",
                 "KHIVE_SOCKET",
                 "KHIVE_SUPERVISOR_MARKER",
+                "KHIVE_LOCK",
                 "KHIVE_LOCAL_NO_START",
                 "KHIVE_LOCAL_START_CWD",
             ):
@@ -1886,6 +1887,285 @@ class MakefileGateContractTests(unittest.TestCase):
             'python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"',
             CI_SCRIPT.read_text(encoding="utf-8"),
         )
+
+
+class MakeLocalMarkerContractTests(unittest.TestCase):
+    """Run the marker program embedded in the real local recipe on scratch paths."""
+
+    @staticmethod
+    def _program(makefile: str | None = None) -> str:
+        source = makefile or MAKEFILE.read_text(encoding="utf-8")
+        start = source.index("\tMARKER_PY=$$(printf '%s\\n' \\")
+        end = source.index("\tMARKER_OWNED=", start)
+        assignment = source[start:end].replace("$$", "$")
+        proc = subprocess.run(
+            ["sh", "-c", assignment + '\nprintf "%s" "$MARKER_PY"'],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout
+
+    @staticmethod
+    def _run(
+        program: str,
+        action: str,
+        marker: Path,
+        pid: str,
+        lock: Path,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", program, action, str(marker), pid, str(lock)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    @staticmethod
+    def _wait_for(path: Path) -> None:
+        deadline = time.monotonic() + 3
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if not path.exists():
+            raise AssertionError(f"subprocess never reached {path}")
+
+    @staticmethod
+    def _hook(root: Path) -> Path:
+        hook = root / "hook"
+        hook.mkdir()
+        (hook / "sitecustomize.py").write_text(
+            textwrap.dedent(
+                """\
+                import builtins
+                import os
+                from pathlib import Path
+                import time
+
+                target = os.environ["MARKER_TEST_TARGET"]
+                ready = Path(os.environ["MARKER_TEST_READY"])
+                go = Path(os.environ["MARKER_TEST_GO"])
+                lock_open = Path(os.environ["MARKER_TEST_LOCK_OPEN"])
+                original_open = builtins.open
+                original_replace = os.replace
+
+                def pause():
+                    ready.write_text("ready")
+                    deadline = time.monotonic() + 3
+                    while not go.exists() and time.monotonic() < deadline:
+                        time.sleep(0.005)
+                    if not go.exists():
+                        raise TimeoutError("test did not release marker writer")
+
+                def checked_open(path, mode="r", *args, **kwargs):
+                    stream = original_open(path, mode, *args, **kwargs)
+                    if mode == "a+b":
+                        lock_open.write_text("opened")
+                    return stream
+
+                def checked_replace(src, dst):
+                    if str(dst) == target:
+                        pause()
+                    return original_replace(src, dst)
+
+                builtins.open = checked_open
+                os.replace = checked_replace
+                """
+            ),
+            encoding="utf-8",
+        )
+        return hook
+
+    @staticmethod
+    def _env(
+        hook: Path, marker: Path, ready: Path, go: Path, lock_open: Path
+    ) -> dict[str, str]:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(hook)
+        env["MARKER_TEST_TARGET"] = str(marker)
+        env["MARKER_TEST_READY"] = str(ready)
+        env["MARKER_TEST_GO"] = str(go)
+        env["MARKER_TEST_LOCK_OPEN"] = str(lock_open)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        return env
+
+    @staticmethod
+    def _start(
+        program: str,
+        marker: Path,
+        pid: str,
+        lock: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [sys.executable, "-c", program, "claim", str(marker), pid, str(lock)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def test_claim_is_atomic_to_a_polling_reader(self) -> None:
+        # The control changes the rename to an in-place shell printf, pauses
+        # after its first byte, then appends the rest of the marker.
+        program = self._program()
+        old = "                os.replace(temporary, marker)"
+        variants = [("atomic", program, False)]
+        if old in program:
+            self.assertEqual(program.count(old), 1)
+            variants.append(
+                (
+                    "in-place-control",
+                    program.replace(
+                        old,
+                        '                __import__("subprocess").run('
+                        '["sh", "-c", "printf m > \\"$1\\"", "sh", marker], check=True)\n'
+                        '                __import__("sitecustomize").pause()\n'
+                        '                with open(marker, "ab") as direct:\n'
+                        '                    direct.write(open(temporary, "rb").read()[1:])',
+                    ),
+                    True,
+                )
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "marker"
+            lock = root / "lock"
+            hook = self._hook(root)
+            for name, candidate, expect_partial in variants:
+                ready = root / f"{name}.ready"
+                go = root / f"{name}.go"
+                env = self._env(hook, marker, ready, go, root / f"{name}.lock-open")
+                proc = self._start(candidate, marker, "101", lock, env)
+                try:
+                    self._wait_for(ready)
+                    observed = [marker.read_bytes() if marker.exists() else None for _ in range(30)]
+                    partial = any(
+                        value not in (None, b"make-local\n101\n10\n")
+                        for value in observed
+                    )
+                    self.assertEqual(partial, expect_partial, (name, observed))
+                finally:
+                    go.write_text("go")
+                    out, err = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 0, (name, out, err))
+                self.assertEqual(marker.read_bytes(), b"make-local\n101\n10\n")
+                marker.unlink()
+
+    def test_concurrent_claimers_share_the_runtime_flock(self) -> None:
+        # Removing the flock is the control: B reaches its rename while A is
+        # paused, and B's later rename erases A's claim.
+        program = self._program()
+        old = "    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)"
+        variants = [("locked", program, False)]
+        if old in program:
+            self.assertEqual(program.count(old), 1)
+            variants.append(("unlocked-control", program.replace(old, "    pass"), True))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "marker"
+            lock = root / "lock"
+            hook = self._hook(root)
+            for name, candidate, expect_second_ready in variants:
+                a_ready, a_go = root / f"{name}.a.ready", root / f"{name}.a.go"
+                b_ready, b_go = root / f"{name}.b.ready", root / f"{name}.b.go"
+                b_open = root / f"{name}.b.lock-open"
+                a = self._start(
+                    candidate,
+                    marker,
+                    "101",
+                    lock,
+                    self._env(hook, marker, a_ready, a_go, root / f"{name}.a.lock-open"),
+                )
+                b: subprocess.Popen[str] | None = None
+                try:
+                    self._wait_for(a_ready)
+                    b = self._start(
+                        candidate,
+                        marker,
+                        "202",
+                        lock,
+                        self._env(hook, marker, b_ready, b_go, b_open),
+                    )
+                    self._wait_for(b_open)
+                    if expect_second_ready:
+                        self._wait_for(b_ready)
+                    else:
+                        self.assertFalse(
+                            b_ready.exists(),
+                            "B entered the claim while A held the flock",
+                        )
+                    a_go.write_text("go")
+                    a_out, a_err = a.communicate(timeout=5)
+                    self.assertEqual((a.returncode, a_out.strip()), (0, "owned"), a_err)
+                    b_go.write_text("go")
+                    b_out, b_err = b.communicate(timeout=5)
+                    self.assertEqual(b.returncode, 0, b_err)
+                    self.assertEqual(b_out.strip(), "owned" if expect_second_ready else "foreign")
+                    self.assertEqual(
+                        marker.read_bytes(),
+                        b"make-local\n202\n10\n"
+                        if expect_second_ready
+                        else b"make-local\n101\n10\n",
+                    )
+                finally:
+                    a_go.write_text("go")
+                    b_go.write_text("go")
+                    if a.poll() is None:
+                        a.kill()
+                        a.wait()
+                    if b is not None and b.poll() is None:
+                        b.kill()
+                        b.wait()
+                marker.unlink()
+
+    def test_release_keeps_a_marker_whose_claim_changed(self) -> None:
+        # Replacing the owner comparison with True is the unconditional-rm
+        # control; it must delete the newly claimed foreign marker.
+        program = self._program()
+        old = "            if lines[:2] == [label, pid]:"
+        unconditional = None
+        if old in program:
+            self.assertEqual(program.count(old), 1)
+            unconditional = program.replace(old, "            if True:")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "marker"
+            lock = root / "lock"
+            claim = self._run(program, "claim", marker, "101", lock)
+            self.assertEqual((claim.returncode, claim.stdout.strip()), (0, "owned"), claim.stderr)
+            self.assertEqual(marker.read_bytes(), b"make-local\n101\n10\n")
+            own_release = self._run(program, "release", marker, "101", lock)
+            self.assertEqual(
+                (own_release.returncode, own_release.stdout.strip()),
+                (0, "released"),
+                own_release.stderr,
+            )
+            self.assertFalse(marker.exists())
+            claim = self._run(program, "claim", marker, "101", lock)
+            self.assertEqual((claim.returncode, claim.stdout.strip()), (0, "owned"), claim.stderr)
+            foreign = b"launchd\n202\n10\n"
+            marker.write_bytes(foreign)
+            release = self._run(program, "release", marker, "101", lock)
+            self.assertEqual(
+                (release.returncode, release.stdout.strip()),
+                (0, "kept"),
+                release.stderr,
+            )
+            self.assertEqual(marker.read_bytes(), foreign)
+            if unconditional is not None:
+                reverted = self._run(unconditional, "release", marker, "101", lock)
+                self.assertEqual(
+                    (reverted.returncode, reverted.stdout.strip()),
+                    (0, "released"),
+                    reverted.stderr,
+                )
+                self.assertFalse(
+                    marker.exists(),
+                    "unconditional removal control did not remove the foreign marker",
+                )
 
 
 if __name__ == "__main__":
