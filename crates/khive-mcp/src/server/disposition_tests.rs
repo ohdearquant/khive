@@ -1092,6 +1092,7 @@ impl ErrorConstructorCensus {
                 matches!(&field.member, syn::Member::Named(name) if name == "error_detail")
                     && (self.root_function("khive-mcp/src/daemon.rs", "daemon_mcp_error")
                         || self.root_function("khive-mcp/src/daemon.rs", "protocol_mismatch_error")
+                        || self.root_function("khive-mcp/src/daemon.rs", "request_too_large_error")
                         || self.root_function(
                             "khive-runtime/src/daemon.rs",
                             "handle_conn_with_shutdown",
