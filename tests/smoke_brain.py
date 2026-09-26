@@ -69,13 +69,19 @@ def _call_request_raw(proc, ops_string):
     if "error" in resp:
         raise RuntimeError(f"MCP error calling request: {resp['error']}")
     result = resp.get("result", {})
-    if result.get("isError"):
-        content = result.get("content", [])
-        text = content[0]["text"] if content else "(no text)"
-        raise RuntimeError(f"request returned protocol error: {text}")
     content = result.get("content", [])
     text = content[0]["text"] if content else ""
-    return json.loads(text) if text else None
+    try:
+        body = json.loads(text) if text else None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"request returned invalid JSON: {text}") from exc
+    if result.get("isError") and not (
+        isinstance(body, dict)
+        and isinstance(body.get("results"), list)
+        and isinstance(body.get("summary"), dict)
+    ):
+        raise RuntimeError(f"request returned protocol error: {text or '(no text)'}")
+    return body
 
 
 def call_verb(proc, name, args):

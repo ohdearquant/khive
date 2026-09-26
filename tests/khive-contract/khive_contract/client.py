@@ -23,9 +23,9 @@ class KhiveMcpError(RuntimeError):
 class KhiveRpcError(KhiveMcpError):
     """JSON-RPC or MCP boundary error.
 
-    Raised when the server returns a top-level JSON-RPC ``error``, when
-    ``tools/call`` returns ``result.isError``, when stdout closes unexpectedly,
-    or when a response cannot be parsed as JSON.
+    Raised on a top-level JSON-RPC ``error``, an ``isError`` tool result
+    without a request envelope, unexpected stdout closure, or invalid JSON.
+    A valid all-failed request envelope remains readable with ``isError`` set.
     """
 
     def __init__(
@@ -374,25 +374,24 @@ class KhiveMcpSession:
                 rpc_id=rpc_id,
             )
         result = resp.get("result", {})
-        if result.get("isError"):
-            content = result.get("content", [])
-            text = content[0]["text"] if content else ""
-            raise KhiveRpcError(
-                text or "tools/call returned isError",
-                code=-32603,
-                rpc_id=rpc_id,
-            )
         content = result.get("content", [])
         text = content[0]["text"] if content else ""
         if not text:
             raise KhiveRpcError("Empty content in tools/call response", rpc_id=rpc_id)
         try:
-            return json.loads(text)
+            envelope = json.loads(text)
         except json.JSONDecodeError as exc:
             raise KhiveRpcError(
                 f"Could not parse tools/call response as JSON: {text!r}",
                 rpc_id=rpc_id,
             ) from exc
+        if result.get("isError") and not (
+            isinstance(envelope, dict)
+            and isinstance(envelope.get("results"), list)
+            and isinstance(envelope.get("summary"), dict)
+        ):
+            raise KhiveRpcError(text, code=-32603, rpc_id=rpc_id)
+        return envelope
 
     def request_batch(
         self,
