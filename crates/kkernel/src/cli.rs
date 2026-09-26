@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::{
-    code_audit, code_ingest,
+    blob, code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
     engine, exec, git_ingest, kg, pack_introspect, reindex, repo, sync, vector,
 };
@@ -85,6 +85,10 @@ enum Command {
     /// Vector store capabilities and orphan sweep.
     #[command(subcommand)]
     Vector(vector::VectorCommand),
+
+    /// Inspect blob attachment rows on the canonical main backend.
+    #[command(subcommand)]
+    Blob(blob::BlobCommand),
 
     /// Re-embed entities, notes, and the knowledge corpus, fanning out across
     /// every configured embedding engine (resolved like `kkernel mcp`).
@@ -305,6 +309,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Db(d) => cmd_db(d).await,
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
+        Command::Blob(b) => blob::run_blob(b).await,
         Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::EntityTypeBackfill(args) => {
             crate::entity_type_backfill::run_entity_type_backfill(args).await
