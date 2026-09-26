@@ -25,6 +25,34 @@ use crate::config::{
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::pack::KindHook;
 
+#[cfg(all(test, target_os = "macos"))]
+const IN_PROCESS_TEST_NOFILE_LIMIT: libc::rlim_t = 4096;
+#[cfg(all(test, target_os = "macos"))]
+static IN_PROCESS_TEST_NOFILE_INIT: std::sync::Once = std::sync::Once::new();
+
+#[cfg(all(test, target_os = "macos"))]
+fn ensure_in_process_test_nofile_limit() {
+    IN_PROCESS_TEST_NOFILE_INIT.call_once(|| {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limits` is writable, and only this test binary's soft
+        // limit may change; the inherited hard limit is preserved.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) }, 0);
+        assert!(
+            limits.rlim_max >= IN_PROCESS_TEST_NOFILE_LIMIT,
+            "in-process SQLite tests require a hard open-file limit of at least {IN_PROCESS_TEST_NOFILE_LIMIT}"
+        );
+        if limits.rlim_cur < IN_PROCESS_TEST_NOFILE_LIMIT {
+            limits.rlim_cur = IN_PROCESS_TEST_NOFILE_LIMIT;
+            // SAFETY: the new soft limit does not exceed the observed hard
+            // limit, which is left unchanged.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        }
+    });
+}
+
 tokio::task_local! {
     static REQUEST_EMBEDDER_EXCLUSIONS: Arc<HashSet<String>>;
 }
@@ -338,6 +366,8 @@ impl KhiveRuntime {
         config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        #[cfg(all(test, target_os = "macos"))]
+        ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -388,6 +418,8 @@ impl KhiveRuntime {
         config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        #[cfg(all(test, target_os = "macos"))]
+        ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => open_file(path)?,
             None => StorageBackend::memory()?,
@@ -2140,6 +2172,25 @@ mod tests {
     use super::*;
     use khive_gate::GateRef;
     use serial_test::serial;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_process_runtime_tests_have_4096_open_file_slots() {
+        let _runtime = KhiveRuntime::memory().expect("test runtime");
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limits` is a writable local value.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(
+            limits.rlim_cur >= IN_PROCESS_TEST_NOFILE_LIMIT,
+            "a parallel runtime suite needs at least 4096 open-file slots"
+        );
+    }
 
     fn test_blob_hydrator() -> (tempfile::TempDir, Arc<crate::BlobHydrator>) {
         let root = tempfile::tempdir().expect("blob root");
