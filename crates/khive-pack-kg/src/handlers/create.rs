@@ -10,6 +10,7 @@ use khive_runtime::{
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
+use khive_types::pack::pack_registry_tag;
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
@@ -169,6 +170,19 @@ impl KgPack {
             fields = deser(args.clone())?;
         }
         super::common::require_object_param(fields.properties.as_ref(), "properties")?;
+        if fields.kind == "entity" {
+            if let Some(tag) = fields
+                .tags
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find_map(|tag| pack_registry_tag(tag))
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "create refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+                )));
+            }
+        }
         if fields.kind != "note"
             && (fields.key.is_some() || fields.embed.is_some() || fields.fence.is_some())
         {

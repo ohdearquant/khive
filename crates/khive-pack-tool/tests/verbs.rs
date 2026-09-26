@@ -492,6 +492,102 @@ async fn registry_rows_are_opaque_to_the_generic_entity_verbs() {
     assert_eq!(again["tool"]["full_id"], json!(id));
 }
 
+#[tokio::test]
+async fn generic_create_refuses_registry_tags_in_single_and_bulk_forms() {
+    let f = fixture();
+    let err = f
+        .call_err(
+            "create",
+            json!({
+                "kind": "entity", "entity_kind": "project", "name": "forged-tool",
+                "tags": ["ToOl-ReGiStRy"],
+                "properties": {"source": "mcp:other", "side_effect": "read"},
+            }),
+        )
+        .await;
+    assert!(err.contains("tool-registry"), "{err}");
+
+    let batch = f
+        .call(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "project", "name": "forged-bulk", "tags": ["tool-registry"]},
+                    {"kind": "concept", "name": "ordinary-bulk"},
+                ],
+                "atomic": false,
+            }),
+        )
+        .await;
+    assert_eq!(batch["results"][0]["ok"], json!(false), "{batch}");
+    assert_eq!(batch["results"][1]["ok"], json!(true), "{batch}");
+    let err = f
+        .call_err("tool.describe", json!({"tool": "forged-bulk"}))
+        .await;
+    assert!(err.contains("not registered"), "{err}");
+
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary-then-tagged"}),
+        )
+        .await;
+    let err = f
+        .call_err(
+            "update",
+            json!({"id": ordinary["id"], "tags": ["TOOL-REGISTRY"]}),
+        )
+        .await;
+    assert!(err.contains("tool-registry"), "{err}");
+    let err = f
+        .call_err("tool.describe", json!({"tool": "ordinary-then-tagged"}))
+        .await;
+    assert!(err.contains("not registered"), "{err}");
+}
+
+#[tokio::test]
+async fn id_references_require_a_registry_row() {
+    let f = fixture();
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary-project"}),
+        )
+        .await;
+    let id = ordinary["id"].as_str().expect("created id");
+    for reference in [id, &id[..8]] {
+        let err = f
+            .call_err("tool.describe", json!({"tool": reference}))
+            .await;
+        assert!(err.contains("not registered"), "{reference}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn generic_merge_cannot_rewrite_or_consume_a_registry_row() {
+    let f = fixture();
+    let registered = f.call("tool.register", json!({"name": "kept-tool"})).await;
+    let tool_id = s(&registered["tool"], "full_id");
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "merge-control"}),
+        )
+        .await;
+    let ordinary_id = ordinary["id"].as_str().expect("created id");
+    for (into_id, from_id) in [(&tool_id[..], ordinary_id), (ordinary_id, &tool_id[..])] {
+        let err = f
+            .call_err(
+                "merge",
+                json!({"kind": "entity", "into_id": into_id, "from_id": from_id, "force": true}),
+            )
+            .await;
+        assert!(err.contains("tool-registry"), "{err}");
+    }
+    let described = f.call("tool.describe", json!({"tool": "kept-tool"})).await;
+    assert_eq!(described["tool"]["full_id"], json!(tool_id));
+}
+
 // Arm 11 (control): the rule keys on the registry tag, not on the entity kind
 // or the pack that is loaded. An untagged entity of the same kind still
 // updates and still deletes.
