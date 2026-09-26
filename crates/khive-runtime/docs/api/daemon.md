@@ -37,8 +37,11 @@ response whose result has `parsed=false`; planning never grants permission or re
 
 An accepted socket has 30 seconds to supply its complete initial length-prefixed
 request frame. The bound includes the length header and body; an incomplete frame
-closes that connection without entering dispatch. The per-request read deadline
-starts after a complete frame is decoded and remains independent of this bound.
+closes that connection without entering dispatch. The deadline is captured at
+acceptance, before peer checks and connection-task scheduling. The per-request
+read deadline starts after a complete frame is decoded and remains independent
+of this bound. A frame buffered before a delayed task starts still expires at
+the original acceptance deadline.
 
 ## try_acquire_flock_until
 
