@@ -173,6 +173,199 @@ fn snapshot_roundtrip_preserves_search_results() {
 }
 
 #[test]
+fn legacy_snapshot_refuses_deleted_slots_while_portable_roundtrip_reuses_them() {
+    let vectors = rand_unit_vectors(8, 4, 0x3264);
+    let cfg = VamanaConfig::with_dimensions(4)
+        .with_max_degree(3)
+        .with_search_list_size(6);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let deleted = if idx.graph().medoid() == 0 { 1 } else { 0 };
+    idx.tombstone(deleted).unwrap();
+
+    let fingerprint = CorpusFingerprint {
+        vector_count: idx.num_vectors() as u64,
+        dimensions: 4,
+    };
+    let legacy_ids: Vec<String> = (0..idx.num_vectors()).map(|i| format!("id-{i}")).collect();
+    let error = idx
+        .to_snapshot("ns", "model", fingerprint, legacy_ids)
+        .expect_err("v1 snapshot cannot persist a tombstone");
+    assert!(error.to_string().contains("cannot represent tombstones"));
+
+    let portable_ids: Vec<(u32, String)> = (0..idx.num_vectors() as u32)
+        .filter(|&ordinal| ordinal != deleted)
+        .map(|ordinal| (ordinal, format!("id-{ordinal}")))
+        .collect();
+    let bytes = idx.to_bytes(&portable_ids).unwrap();
+    let (mut restored, restored_ids) = VamanaIndex::from_bytes(&bytes).unwrap();
+    assert_eq!(restored_ids, portable_ids);
+    assert_eq!(restored.tombstone_count(), 1);
+    assert_eq!(restored.live_count(), 7);
+    let assigned = restored.insert(&rand_unit_vectors(1, 4, 0x3265)).unwrap();
+    assert_eq!(
+        assigned, deleted,
+        "portable restore must recycle the deleted slot"
+    );
+}
+
+#[cfg(feature = "mmap")]
+#[test]
+fn legacy_save_refuses_deleted_slots_before_touching_destination() {
+    let vectors = rand_unit_vectors(8, 4, 0x3266);
+    let cfg = VamanaConfig::with_dimensions(4)
+        .with_max_degree(3)
+        .with_search_list_size(6);
+    let mut idx = VamanaIndex::build(&vectors, cfg).unwrap();
+    let deleted = if idx.graph().medoid() == 0 { 1 } else { 0 };
+    idx.tombstone(deleted).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["metadata.bin", "graph.bin", "vectors.bin"] {
+        fs::write(dir.path().join(name), format!("original {name}")).unwrap();
+    }
+    let before: Vec<Vec<u8>> = ["metadata.bin", "graph.bin", "vectors.bin"]
+        .iter()
+        .map(|name| fs::read(dir.path().join(name)).unwrap())
+        .collect();
+    let error = idx
+        .save(dir.path())
+        .expect_err("v1 save cannot persist a tombstone");
+    assert!(error.to_string().contains("cannot represent tombstones"));
+    let after: Vec<Vec<u8>> = ["metadata.bin", "graph.bin", "vectors.bin"]
+        .iter()
+        .map(|name| fs::read(dir.path().join(name)).unwrap())
+        .collect();
+    assert_eq!(
+        after, before,
+        "refusal must leave all existing files intact"
+    );
+    let absent = dir.path().join("absent");
+    assert!(idx.save(&absent).is_err());
+    assert!(!absent.exists(), "refusal must precede directory creation");
+
+    let v2_dir = dir.path().join("v2");
+    idx.save_atomic(&v2_dir).unwrap();
+    let mut restored = VamanaIndex::load(&v2_dir).unwrap();
+    assert_eq!(restored.tombstone_count(), 1);
+    assert_eq!(restored.live_count(), 7);
+    let assigned = restored.insert(&rand_unit_vectors(1, 4, 0x3267)).unwrap();
+    assert_eq!(
+        assigned, deleted,
+        "v2 restore must recycle the deleted slot"
+    );
+}
+
+/// The unsafe old save/load composition runs in a subprocess so removing the
+/// fresh-inode publication fix cannot crash the rest of this test suite.
+#[cfg(feature = "mmap")]
+#[test]
+fn legacy_overwrite_keeps_existing_mmap_reader_on_its_original_inode() {
+    const CHILD: &str = "KHIVE_VAMANA_LEGACY_OVERWRITE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "legacy_overwrite_keeps_existing_mmap_reader_on_its_original_inode",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated legacy overwrite failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index");
+    let vectors = rand_unit_vectors(8, 4, 0x3268);
+    let cfg = VamanaConfig::with_dimensions(4)
+        .with_max_degree(3)
+        .with_search_list_size(6);
+    let original = VamanaIndex::build(&vectors, cfg.clone()).unwrap();
+    original.save(&path).unwrap();
+    let loaded = VamanaIndex::load(&path).unwrap();
+    let old_vectors = loaded.vectors().unwrap().to_vec();
+
+    #[cfg(unix)]
+    let overwrite_path = {
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let overwrite_path = path.clone();
+
+    // This aliased self-save previously truncated loaded's mmap before it
+    // could write its borrowed vector slice. A distinct writer targeting the
+    // same directory could also mutate that old mapping.
+    let self_save = loaded.save(&overwrite_path);
+    // A platform that cannot rename over a mapped destination may refuse the
+    // overwrite. It must still leave the old mapping and canonical bytes safe.
+    #[cfg(windows)]
+    if let Err(error) = &self_save {
+        assert!(matches!(error, VamanaError::Io { .. }));
+        assert_eq!(loaded.vectors().unwrap(), old_vectors.as_slice());
+        assert_eq!(
+            fs::read(path.join("vectors.bin")).unwrap(),
+            bytemuck::cast_slice::<f32, u8>(&old_vectors)
+        );
+        return;
+    }
+    self_save.unwrap();
+    assert_eq!(loaded.vectors().unwrap(), old_vectors.as_slice());
+    assert_eq!(
+        VamanaIndex::load(&path).unwrap().vectors().unwrap(),
+        old_vectors.as_slice()
+    );
+
+    let new_vectors = rand_unit_vectors(8, 4, 0x3269);
+    let replacement = VamanaIndex::build(&new_vectors, cfg.clone()).unwrap();
+    replacement.save(&path).unwrap();
+    assert_eq!(loaded.vectors().unwrap(), old_vectors.as_slice());
+    assert_eq!(
+        VamanaIndex::load(&path).unwrap().vectors().unwrap(),
+        new_vectors.as_slice()
+    );
+
+    // Two cooperating v1 publishers must serialize on the same directory,
+    // including when a previous mmap reader remains alive.
+    let contender_a_vectors = rand_unit_vectors(8, 4, 0x3270);
+    let contender_b_vectors = rand_unit_vectors(8, 4, 0x3271);
+    let contender_a = VamanaIndex::build(&contender_a_vectors, cfg.clone()).unwrap();
+    let contender_b = VamanaIndex::build(&contender_b_vectors, cfg).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let contender_a_path = path.clone();
+    let contender_a_barrier = barrier.clone();
+    let first = std::thread::spawn(move || {
+        contender_a_barrier.wait();
+        contender_a.save(&contender_a_path)
+    });
+    let contender_b_path = path.clone();
+    let contender_b_barrier = barrier.clone();
+    let second = std::thread::spawn(move || {
+        contender_b_barrier.wait();
+        contender_b.save(&contender_b_path)
+    });
+    barrier.wait();
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+    assert_eq!(loaded.vectors().unwrap(), old_vectors.as_slice());
+    let final_vectors = VamanaIndex::load(&path)
+        .unwrap()
+        .vectors()
+        .unwrap()
+        .to_vec();
+    assert!(
+        final_vectors == contender_a_vectors || final_vectors == contender_b_vectors,
+        "concurrent publishers must leave one complete generation"
+    );
+}
+
+#[test]
 fn snapshot_rejects_bad_format() {
     let vectors = rand_unit_vectors(4, 4, 1);
     let cfg = VamanaConfig::with_dimensions(4)
