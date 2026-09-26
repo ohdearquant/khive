@@ -21,6 +21,8 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use khive_runtime::engine_config::WebSectionConfig;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
@@ -40,6 +42,10 @@ use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 /// operator-configurable — a fixed default with no override, unlike the
 /// byte/time ceilings.
 pub const MAX_REDIRECTS: u32 = 5;
+
+const INLINE_BODY_BUDGET: usize = khive_runtime::daemon::MAX_FRAME_BYTES - 4096;
+const INLINE_RESULT_BUDGET: usize = khive_runtime::daemon::MAX_FRAME_BYTES - 1024;
+const INLINE_RAW_BODY_LIMIT: u64 = (INLINE_BODY_BUDGET / 4 * 3) as u64;
 
 /// Response headers echoed to the caller and recorded in the receipt: a
 /// response header set is attacker-controlled, so only this allow-listed
@@ -251,6 +257,11 @@ async fn run_fetch(
         ceilings.max_bytes_max,
         "max_bytes",
     )?;
+    if !persist && method == reqwest::Method::GET && max_bytes > INLINE_RAW_BODY_LIMIT {
+        return Err(RuntimeError::InvalidInput(format!(
+            "web.fetch: max_bytes={max_bytes} exceeds the transient inline response budget of {INLINE_RAW_BODY_LIMIT} raw bytes; lower max_bytes or use persist=true"
+        )));
+    }
     let timeout_s = egress::check_ceiling(
         params.timeout_s,
         ceilings.timeout_default_s,
@@ -421,7 +432,8 @@ pub(crate) async fn mint_bare(
     token: &NamespaceToken,
     url: &Url,
 ) -> Result<(Uuid, Uuid), RuntimeError> {
-    let canonical = identity::canonicalize(url.clone());
+    let request_url = identity::request_url(url.clone());
+    let canonical = identity::canonicalize(request_url.clone());
     let site = canonical_site(runtime, token, &canonical).await?;
     let path_and_query = identity::path_and_query(&canonical);
     let id = identity::document_id(site, &path_and_query);
@@ -432,7 +444,7 @@ pub(crate) async fn mint_bare(
         "document",
         "resource",
         canonical.as_ref(),
-        json!({ "url": canonical.to_string(), "status": Value::Null }),
+        json!({ "url": request_url.to_string(), "status": Value::Null }),
     )
     .await?;
     runtime
@@ -537,13 +549,6 @@ pub(crate) async fn root_body(
         .map_err(|error| RuntimeError::Internal(format!("body attachment write failed: {error}")))
 }
 
-/// Parse a content reference the way the blob store spells it.
-fn parse_content_ref(value: &str) -> Result<ContentRef, RuntimeError> {
-    ContentRef::from_hex(value).map_err(|error| {
-        RuntimeError::Internal(format!("content_ref {value:?} unparseable: {error}"))
-    })
-}
-
 /// Mint (if absent), blob-store the body, and patch one page/resource
 /// entity's full row: identity resolve, `site contains {page|resource}`
 /// link (arm29: minted before the blob put, so a failing store still leaves
@@ -570,7 +575,6 @@ pub(crate) enum ContentBody {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn representation_patch(
     url: &str,
     content_type: Option<&str>,
@@ -579,7 +583,6 @@ pub(crate) fn representation_patch(
     last_modified: Option<&str>,
     content_ref: Option<&str>,
     bytes: u64,
-    truncated: bool,
 ) -> Value {
     json!({
         "url": url,
@@ -587,7 +590,6 @@ pub(crate) fn representation_patch(
         "blob_ref": content_ref,
         "content_digest": content_ref,
         "size": bytes,
-        "truncated": truncated,
         "status": status,
         "fetched_at": chrono::Utc::now().to_rfc3339(),
         "etag": etag,
@@ -630,7 +632,8 @@ pub(crate) async fn settle_content_body(
     last_modified: Option<&str>,
     body: Option<ContentBody>,
 ) -> Result<SettledContent, RuntimeError> {
-    let canonical = identity::canonicalize(url.clone());
+    let request_url = identity::request_url(url.clone());
+    let canonical = identity::canonicalize(request_url.clone());
     let site = canonical_site(runtime, token, &canonical).await?;
     let path_and_query = identity::path_and_query(&canonical);
     let id = identity::document_id(site, &path_and_query);
@@ -642,7 +645,7 @@ pub(crate) async fn settle_content_body(
         "document",
         entity_type,
         canonical.as_ref(),
-        json!({ "url": canonical.to_string() }),
+        json!({ "url": request_url.to_string() }),
     )
     .await?;
     runtime
@@ -686,15 +689,15 @@ pub(crate) async fn settle_content_body(
     let content_ref = typed_ref.as_ref().map(ToString::to_string);
 
     let mut properties = representation_patch(
-        canonical.as_ref(),
+        request_url.as_ref(),
         content_type,
         status,
         etag,
         last_modified,
         content_ref.as_deref(),
         bytes,
-        truncated,
     );
+    properties["truncated"] = json!(truncated);
     if no_body {
         // HEAD did not observe a representation length. Null also clears a
         // legacy HEAD row that incorrectly reported an empty body as size 0.
@@ -747,10 +750,40 @@ async fn settle(
     let response_headers_json = extract_allowed_headers(headers);
     let content_type = header_str(headers, "content-type").map(str::to_string);
 
-    // persist=false still blob-puts and reports the content_ref/bytes back
-    // to the caller (a dry-run-ish read) but never touches the graph, so it
-    // cannot go through `settle_content` (which always mints); persist=true
-    // delegates the whole mint+link+blob+patch sequence to it.
+    if !persist {
+        if let Some((bytes, truncated)) = body.as_ref() {
+            let encoded_size = base64::encoded_len(bytes.len(), true);
+            if encoded_size.is_none_or(|size| size > INLINE_BODY_BUDGET) {
+                return Err(RuntimeError::InvalidInput(
+                    "web.fetch: transient base64 body exceeds the inline response budget; lower max_bytes or use persist=true".into(),
+                ));
+            }
+            // An empty body string already includes its JSON quotes. Base64
+            // adds no escaping; a canonical receipt UUID has this fixed width.
+            let envelope = json!({
+                "final_url": final_url.to_string(), "status": status,
+                "headers": response_headers_json, "content_ref": null,
+                "bytes": bytes.len() as u64, "truncated": truncated,
+                "redirects": redirect_hops.len() as u32,
+                "receipt_id": Uuid::nil().to_string(), "id": null, "body": "",
+            });
+            let metadata_size = serde_json::to_vec(&envelope)
+                .map_err(|e| RuntimeError::Internal(format!("web.fetch: response metadata: {e}")))?
+                .len();
+            let fits = encoded_size
+                .and_then(|encoded| encoded.checked_add(metadata_size))
+                .is_some_and(|total| total <= INLINE_RESULT_BUDGET);
+            if !fits {
+                return Err(RuntimeError::InvalidInput(
+                    "web.fetch: transient base64 body and metadata exceed the inline response budget; lower max_bytes or use persist=true".into(),
+                ));
+            }
+        }
+    }
+
+    let fetched_at = chrono::Utc::now().to_rfc3339();
+    let mut content_digest = None;
+    let mut response_body = None;
     let (final_entity_id, content_ref, bytes, truncated) = if persist {
         let settled = settle_content(
             runtime,
@@ -776,13 +809,15 @@ async fn settle(
         match body {
             None => (None, None, 0u64, false),
             Some((buffer, truncated)) => {
-                let store = crate::blob_store(runtime)?;
                 let len = buffer.len() as u64;
-                let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
-                (None, Some(content_ref.to_string()), len, truncated)
+                content_digest = Some(blake3::hash(&buffer).to_hex().to_string());
+                response_body = Some(buffer);
+                (None, None, len, truncated)
             }
         }
     };
+
+    let content_digest = content_digest.or_else(|| content_ref.clone());
 
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()
@@ -798,13 +833,14 @@ async fn settle(
         "bytes": bytes,
         "truncated": truncated,
         "content_ref": content_ref,
+        "fetched_at": fetched_at,
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
     });
     if method_name == "GET" {
         // A GET measures the body even when persist=false leaves the graph
         // untouched. A HEAD has no bytes from which to infer either field.
-        request_record["content_digest"] = json!(content_ref.as_deref());
+        request_record["content_digest"] = json!(content_digest);
         request_record["size"] = json!(bytes);
     }
     let receipt_id = write_receipt(
@@ -817,22 +853,10 @@ async fn settle(
     .await
     .map_err(|error| {
         RuntimeError::Internal(format!(
-            "web.fetch: receipt write failed after a successful store (content_ref={:?}): {error}",
+            "web.fetch: receipt write failed after body settlement (content_ref={:?}): {error}",
             content_ref
         ))
     })?;
-    if let Some(content_ref) = &content_ref {
-        root_body(
-            runtime,
-            receipt_id,
-            AttachmentSubstrate::Note,
-            &parse_content_ref(content_ref)?,
-            headers.get("content-type").and_then(|v| v.to_str().ok()),
-            bytes,
-        )
-        .await?;
-    }
-
     Ok(json!({
         "final_url": final_url.to_string(),
         "status": status,
@@ -843,6 +867,7 @@ async fn settle(
         "redirects": redirect_hops.len() as u32,
         "receipt_id": receipt_id.to_string(),
         "id": final_entity_id.map(|id| id.to_string()),
+        "body": response_body.as_deref().map(|bytes| BASE64.encode(bytes)),
     }))
 }
 
@@ -1210,13 +1235,10 @@ mod tests {
     // request) returns the same blob reference, mints no new entity, and
     // writes a receipt only; a different body is the control that yields a
     // different reference.
-    // A fetched body is rooted on its entity and on its receipt through the
-    // attachments table, the reference source blob garbage collection reads;
-    // the property naming the blob is not. Control: a HEAD fetch stores no
-    // body and roots nothing.
+    // A1.2: receipts never own the fetched body. Must fail if receipt rooting
+    // returns or entity rooting is removed. Control: a fresh HEAD roots nothing.
     #[tokio::test]
-    async fn fetched_body_is_rooted_as_a_content_attachment_on_entity_and_receipt_head_roots_nothing(
-    ) {
+    async fn fetched_body_is_rooted_only_on_entity_head_roots_nothing() {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://rooted.example.test/page.html").unwrap();
         let body = b"<html><body>rooted body</body></html>".to_vec();
@@ -1252,8 +1274,10 @@ mod tests {
             .list_attachments(receipt_id)
             .await
             .expect("list receipt attachments");
-        assert_eq!(on_receipt.len(), 1, "the receipt roots the same body");
-        assert_eq!(on_receipt[0].content_ref.to_string(), content_ref);
+        assert!(
+            on_receipt.is_empty(),
+            "the receipt never roots a fetched body"
+        );
 
         let head_url = Url::parse("https://rooted.example.test/other.html").unwrap();
         let head_reply = settle(
@@ -1773,7 +1797,12 @@ mod tests {
         assert_eq!(get_request["headers"]["content-length"], "999");
         assert_eq!(get_request["bytes"], body.len() as u64);
         assert_eq!(get_request["size"], body.len() as u64);
-        assert_eq!(get_request["content_digest"], get["content_ref"]);
+        assert_eq!(
+            get_request["content_digest"],
+            blake3::hash(&body).to_hex().to_string()
+        );
+        assert!(get["content_ref"].is_null());
+        assert!(get_request["content_ref"].is_null());
         let after = runtime
             .entities(&token)
             .unwrap()

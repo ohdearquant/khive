@@ -441,7 +441,8 @@ async fn extract_links(
         let Some(target_url) = resolve_against(base_url, href) else {
             continue;
         };
-        let canonical = identity::canonicalize(target_url);
+        let request_url = identity::request_url(target_url);
+        let canonical = identity::canonicalize(request_url.clone());
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
@@ -450,12 +451,12 @@ async fn extract_links(
         }
         let site = identity::site_id(&canonical);
         let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
-        targets.push((canonical, site, target_id));
+        targets.push((request_url, canonical, site, target_id));
     }
 
     let processed = targets.len() as u32;
     let mut link_specs = Vec::with_capacity(targets.len() * 2);
-    for (canonical, site, target_id) in targets {
+    for (request_url, canonical, site, target_id) in targets {
         crate::entities::get_or_create(
             runtime,
             token,
@@ -477,7 +478,7 @@ async fn extract_links(
             "document",
             "resource",
             canonical.as_ref(),
-            json!({ "url": canonical.to_string(), "status": Value::Null }),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
         link_specs.push(LinkSpec {
@@ -537,7 +538,8 @@ async fn extract_entries(
             continue;
         }
         let Ok(url) = Url::parse(&raw) else { continue };
-        let canonical = identity::canonicalize(url);
+        let request_url = identity::request_url(url);
+        let canonical = identity::canonicalize(request_url.clone());
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
@@ -553,7 +555,7 @@ async fn extract_entries(
             "document",
             "resource",
             canonical.as_ref(),
-            json!({ "url": canonical.to_string(), "status": Value::Null }),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
         // Entries belong to the SITE that published the feed/sitemap, which
@@ -638,6 +640,15 @@ async fn extract_text(
             "blob_ref": content_ref.to_string(),
             "size": excerpt_bytes as u64,
         }),
+    )
+    .await?;
+    crate::fetch::root_body(
+        runtime,
+        text_id,
+        khive_storage::AttachmentSubstrate::Entity,
+        &content_ref,
+        Some("text/plain"),
+        excerpt_bytes as u64,
     )
     .await?;
     runtime
@@ -1451,6 +1462,22 @@ mod tests {
             .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
             .await
             .unwrap();
+        let roots = runtime
+            .core()
+            .attachments()
+            .unwrap()
+            .list_attachments(entity.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            roots.len(),
+            1,
+            "repeated extraction retains one content root"
+        );
+        assert_eq!(roots[0].role, "content");
+        assert_eq!(roots[0].content_ref, content_ref);
+        assert_eq!(roots[0].media_type.as_deref(), Some("text/plain"));
+        assert_eq!(roots[0].size_bytes, Some(bytes.len() as u64));
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("Hello world"), "{text:?}");
         assert!(

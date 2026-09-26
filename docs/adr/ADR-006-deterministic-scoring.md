@@ -42,7 +42,8 @@ Arithmetic is saturating: overflow clamps to `MAX` (= `i64::MAX`), underflow cla
 `NEG_INF` (= `i64::MIN + 1`). The raw value `i64::MIN` is a reserved sentinel (`MIN`)
 that is not produced by any public arithmetic or float-conversion path. This makes
 runtime-reachable scores disjoint from the sentinel — see the `DeterministicScore` total-order
-formal proof at `lean-proofs/Score/DeterministicScore.lean` (`MIN` vs `NEG_INF`, `RuntimeValid`).
+formal proof at `lean-proofs/Score/DeterministicScore.lean` (`MIN` vs `NEG_INF`, `RuntimeValid`;
+the proof file is not in this repository).
 
 NaN and infinity inputs to `from_f32`/`from_f64` are mapped to deterministic sentinel
 values (NaN → `ZERO`, `+∞` → `MAX`, `-∞` → `NEG_INF`).
@@ -57,7 +58,7 @@ The long-term plan is to host these primitives in `ruvector-core` upstream so mu
 ecosystems share a single implementation. That migration is deferred until `ruvector-core`
 ships our contributions; `khive-score` will become a re-export shim at that point. Until
 then, the formal contract is the one defined in this ADR and proved in
-`lean-proofs/Score/DeterministicScore.lean`.
+`lean-proofs/Score/DeterministicScore.lean` (not in this repository).
 
 ### Normative invariants
 
@@ -257,7 +258,8 @@ workload demonstrates need.
 - SQL column type: `INTEGER` (i64). No schema migration needed.
 - `QuantKey`: removed (file deleted, all re-exports dropped). Use `Ranked<T>` and
   `DeterministicScore` ordering for sort hot paths.
-- Formal model: `lean-proofs/Score/DeterministicScore.lean` (51 theorems, complete).
+- Formal model: `lean-proofs/Score/DeterministicScore.lean` (51 theorems, complete; not in
+  this repository).
   Future Rust changes must preserve the proven invariants or amend both the ADR and
   the Lean proof in the same PR.
 

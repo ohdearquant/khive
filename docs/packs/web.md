@@ -24,9 +24,17 @@ subtype — nothing about a document's id encodes whether it has been fetched ye
 body it turned out to have.
 
 Canonicalization (applied before any identity computation): scheme and host are lowercased, the
-default port for the scheme is dropped, the path is percent-normalized, query keys are sorted,
-and the fragment is dropped entirely — `https://Example.com/a?b=1&a=2#x` and
-`https://example.com/a?a=2&b=1` are the same resource.
+default port for the scheme is dropped, the path is percent-normalized, raw query pairs are
+stably sorted by their raw key bytes, and the fragment is dropped entirely. Query pairs are
+never form-decoded or re-encoded: `%FF` and `%FE`, `a+b` and `a%20b`, and `flag` and `flag=`
+remain distinct. Sorting still makes `https://Example.com/a?b=1&a=2#x` and
+`https://example.com/a?a=2&b=1` the same resource. Equal-key pairs retain their order.
+
+The document's `url` property keeps the actual parsed request address, with its fragment
+removed, independently of the sorted identity key. Refresh uses that address with its
+original query spelling and order. Newly fetched representations update this property;
+existing rows that only retain a previously rewritten address cannot recover its original
+spelling without being fetched again.
 
 ### Edge rules
 
@@ -56,11 +64,29 @@ Fetch one URL under egress policy. Follows up to 5 redirects; a 301/308 hop mint
 the hop and links `new supersedes old`, a 302/307 hop mints nothing beyond a receipt entry naming
 it. The terminal hop's body (if `GET`; `HEAD` carries none) is stored via the runtime's blob
 store, content-addressed; storing byte-identical content again is a no-op. `persist` defaults to
-`true`; `false` fetches without minting entities but still writes a metadata receipt.
-GET receipts record the digest and size of bytes read, including with `persist=false`.
-HEAD receipts record neither digest nor size; their `bytes` count is 0, and an advertised
-`Content-Length` remains a response header rather than a measured size.
-The document's `truncated` property records whether its stored body is a prefix.
+`true`; `false` stores no body or entities and returns the exact body as a standard-alphabet,
+padded base64 string in `body` (null for HEAD or a persisted fetch). It still writes a standalone
+receipt. A GET receipt records `final_url`, the measured BLAKE3 `content_digest`, measured `size`
+and RFC 3339 `fetched_at`, including with `persist=false`; `content_ref` is null for a transient
+fetch. A HEAD receipt has no digest or size, reports `bytes: 0`, and keeps an advertised
+`Content-Length` only as a response header. A persisted document's `truncated` property records
+whether its stored body is a prefix.
+A persisted body has one `content` attachment on its entity, on the main backend even when web
+records use a separate backend. Receipts never carry body attachments.
+The egress `max_bytes` ceiling bounds raw bytes; base64 uses `4 * ceil(bytes / 3)` characters.
+For a transient GET, the effective `max_bytes` (including an omitted argument's configured
+default) must be at most **6,288,384 raw bytes**. A higher value is refused as invalid input
+before DNS or network access, with no receipt; lower `max_bytes` or use `persist=true`.
+HEAD has no inline body and is exempt from this extra ceiling; persisted fetches retain their
+configured egress ceiling.
+
+The limit leaves 4 KiB below the 8 MiB daemon frame cap for base64 body encoding. Settlement
+checks both that encoded-body limit and the complete serialized verb result, including the
+actual URL and allowed response headers. The result may use up to 8 MiB minus 1 KiB, leaving
+3 KiB beyond the body budget for verb metadata and 1 KiB for the outer transport envelope.
+Large or heavily escaped metadata can therefore refuse an otherwise valid body before its
+receipt is written. The transport still checks the final frame, including responses that
+aggregate multiple operations.
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 
@@ -109,6 +135,14 @@ anything else short of a persisted document): a refused URL is named in the repl
 silently dropped from the crawl, so a caller can tell "nothing matched" apart from "some targets
 were refused." A separate `failed` array records `{id, url, stage, error}` when extraction or
 subsequent neighbor discovery fails after a document was persisted; its id remains in `ingested`.
+
+### Deleting routed entities
+
+Web entities are stored on the web backend while their body attachments are rooted on the main
+backend. A hard-delete retry that finds the entity row already absent can remove a remaining main
+backend attachment. Its response has `deleted: false` and `attachment_cleanup: true`. `deleted`
+reports whether this call removed the entity row; attachment-only cleanup does not establish
+whether an earlier attempt completed its index cleanup or appended its entity deletion event.
 
 ### `web.search(query, provider?, limit?, persist?)`
 

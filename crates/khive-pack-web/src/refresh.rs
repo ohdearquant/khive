@@ -57,6 +57,16 @@ async fn latest_receipt(
         .await
 }
 
+fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
+    let url = properties
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::Internal("stored document has no url property".to_string()))?;
+    Url::parse(url)
+        .map(crate::identity::request_url)
+        .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))
+}
+
 fn conditional_headers_for_hop(
     properties: &Value,
     original_url: &Url,
@@ -108,13 +118,8 @@ async fn run_refresh(
             ))
         })?
         .to_string();
-    let url_str = properties
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::Internal("stored document has no url property".to_string()))?
-        .to_string();
-    let url = Url::parse(&url_str)
-        .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
+    let url = stored_request_url(&properties)?;
+    let url_str = url.to_string();
 
     let ceilings = egress::resolve_ceilings(cfg)?;
     let max_bytes = egress::check_ceiling(
@@ -277,26 +282,21 @@ async fn settle_refresh(
                     .map(str::to_string);
                 if redirect_hops.is_empty() {
                     let entity_type = crate::fetch::classify_entity_type(content_type.as_deref());
-                    crate::entities::patch(
-                        runtime,
-                        token,
-                        id,
-                        Some(entity_type),
-                        crate::fetch::representation_patch(
-                            url_str,
-                            content_type.as_deref(),
-                            outcome.status,
-                            outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
-                            outcome
-                                .headers
-                                .get("last-modified")
-                                .and_then(|v| v.to_str().ok()),
-                            Some(&content_ref_str),
-                            body_bytes,
-                            truncated,
-                        ),
-                    )
-                    .await?;
+                    let mut properties = crate::fetch::representation_patch(
+                        url_str,
+                        content_type.as_deref(),
+                        outcome.status,
+                        outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
+                        outcome
+                            .headers
+                            .get("last-modified")
+                            .and_then(|v| v.to_str().ok()),
+                        Some(&content_ref_str),
+                        body_bytes,
+                    );
+                    properties["truncated"] = json!(truncated);
+                    crate::entities::patch(runtime, token, id, Some(entity_type), properties)
+                        .await?;
                     crate::fetch::root_body(
                         runtime,
                         id,
@@ -366,23 +366,6 @@ async fn settle_refresh(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.refresh: receipt write failed: {error}"))
     })?;
-    if let Some(content_ref) = &new_content_ref {
-        crate::fetch::root_body(
-            runtime,
-            receipt_id,
-            khive_storage::AttachmentSubstrate::Note,
-            &khive_storage::ContentRef::from_hex(content_ref.clone()).map_err(|error| {
-                RuntimeError::Internal(format!("content_ref {content_ref:?} unparseable: {error}"))
-            })?,
-            outcome
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            body_bytes,
-        )
-        .await?;
-    }
-
     if let Some(previous) = previous_receipt {
         runtime
             .link(
@@ -466,11 +449,8 @@ mod tests {
             .as_str()
             .expect("seeded entity carries blob_ref")
             .to_string();
-        let url_str = properties["url"]
-            .as_str()
-            .expect("seeded entity carries url")
-            .to_string();
-        let url = Url::parse(&url_str).expect("valid stored url");
+        let url = stored_request_url(&properties)?;
+        let url_str = url.to_string();
         let client = plain_client(Duration::from_secs(5));
         let outcome = run_one_hop(
             &client,
@@ -1229,3 +1209,7 @@ mod reuse_tests;
 #[cfg(test)]
 #[path = "refresh_receipt_tests.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "refresh_query_tests.rs"]
+mod query_tests;
