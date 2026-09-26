@@ -141,3 +141,66 @@ async fn ambiguous_legacy_and_unknown_slug_stay_pending() {
         assert_eq!(props(&runtime, &token, unknown).await, before_unknown);
     }
 }
+
+#[tokio::test]
+async fn held_channel_rows_cannot_fill_the_page_ahead_of_an_eligible_row() {
+    for kind in ["email", "telegram"] {
+        let (runtime, token) = fixture();
+        let a = Arc::new(RecordingChannel::new(
+            kind,
+            "a@example.com",
+            Outcome::Success,
+        ));
+        let b = Arc::new(RecordingChannel::new(
+            kind,
+            "b@example.com",
+            Outcome::Success,
+        ));
+        let mut registry = ChannelRegistry::new();
+        registry.register(a.clone());
+        registry.register(b.clone());
+
+        let eligible_id = seed(&runtime, &token, kind, Some("a@example.com")).await;
+        let store = runtime
+            .backend()
+            .notes_for_namespace(token.namespace().as_str())
+            .unwrap();
+        let mut eligible = store.get_note(eligible_id).await.unwrap().unwrap();
+        eligible.created_at -= 10_000_000;
+        eligible.updated_at = eligible.created_at;
+        store.upsert_note(eligible).await.unwrap();
+
+        // Before the channel-scoped SQL predicate, these 201 newer held
+        // rows filled the 200-row page on every pass, so the valid row was
+        // never handed to its adapter.
+        let mut held_ids = Vec::new();
+        for index in 0..201 {
+            held_ids.push(
+                seed(
+                    &runtime,
+                    &token,
+                    kind,
+                    (index % 2 == 0).then_some("missing@example.com"),
+                )
+                .await,
+            );
+        }
+
+        pass(&runtime, &registry, kind, "a@example.com").await;
+        assert_eq!(a.sent.lock().unwrap().len(), 1, "{kind} eligible send");
+        assert!(b.sent.lock().unwrap().is_empty(), "{kind} wrong adapter");
+        assert_eq!(
+            props(&runtime, &token, eligible_id).await["delivery"],
+            "delivered"
+        );
+        for held_id in held_ids {
+            assert!(
+                props(&runtime, &token, held_id)
+                    .await
+                    .get("delivery")
+                    .is_none(),
+                "{kind} held row remains pending"
+            );
+        }
+    }
+}

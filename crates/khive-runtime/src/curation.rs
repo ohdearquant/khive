@@ -27,6 +27,14 @@ use crate::event_store_guard::EventAttribution;
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+/// Restrict an outbox scan before its SQL page bound is applied. A held row
+/// for another or unconfigured channel must not consume a channel's page.
+enum OutboxSlugFilter<'a> {
+    Any,
+    Exact(&'a str),
+    Missing,
+}
+
 /// Test-only pause point at the read/write boundary of a guarded
 /// read-modify-write, so a race between two concurrent callers of the same
 /// PRODUCTION entry point (not the underlying store primitive) can be
@@ -2522,6 +2530,63 @@ impl KhiveRuntime {
         to_prefix: Option<&str>,
         limit: u32,
     ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
+        self.list_undelivered_outbound_messages_scoped(
+            token,
+            to_prefix,
+            limit,
+            OutboxSlugFilter::Any,
+        )
+        .await
+    }
+
+    /// Channel-specific scan for the delivery pass. An explicit slug belongs
+    /// only to its named adapter; a missing slug is eligible only when that
+    /// kind has exactly one configured adapter. Querying these disjoint
+    /// partitions before paging prevents held unknown or ambiguous rows from
+    /// crowding an eligible row out of the finite outbox scan window.
+    pub async fn list_undelivered_outbound_messages_for_channel(
+        &self,
+        token: &NamespaceToken,
+        to_prefix: &str,
+        channel_slug: &str,
+        include_legacy: bool,
+        limit: u32,
+    ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
+        let mut notes = self
+            .list_undelivered_outbound_messages_scoped(
+                token,
+                Some(to_prefix),
+                limit,
+                OutboxSlugFilter::Exact(channel_slug),
+            )
+            .await?;
+        if include_legacy {
+            notes.extend(
+                self.list_undelivered_outbound_messages_scoped(
+                    token,
+                    Some(to_prefix),
+                    limit,
+                    OutboxSlugFilter::Missing,
+                )
+                .await?,
+            );
+            notes.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            notes.truncate(limit as usize);
+        }
+        Ok(notes)
+    }
+
+    async fn list_undelivered_outbound_messages_scoped(
+        &self,
+        token: &NamespaceToken,
+        to_prefix: Option<&str>,
+        limit: u32,
+        slug_filter: OutboxSlugFilter<'_>,
+    ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
         const MAX_SCAN_TOTAL: u32 = 10_000;
         if limit == 0 {
             return Ok(Vec::new());
@@ -2553,6 +2618,19 @@ impl KhiveRuntime {
                 op: FilterOp::TextStartsWithIndexed,
                 value: SqlValue::Text(prefix.to_string()),
             });
+        }
+        match slug_filter {
+            OutboxSlugFilter::Any => {}
+            OutboxSlugFilter::Exact(slug) => property_filters.push(PropertyFilter {
+                json_path: "$.channel_slug".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(slug.to_string()),
+            }),
+            OutboxSlugFilter::Missing => property_filters.push(PropertyFilter {
+                json_path: "$.channel_slug".to_string(),
+                op: FilterOp::JsonTypeMissing,
+                value: SqlValue::Null,
+            }),
         }
         let filter = NoteFilter {
             kind: Some("message".to_string()),
