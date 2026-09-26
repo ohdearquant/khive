@@ -50,8 +50,12 @@ to 1,024 tools and 32 pages. Schemas must use local fragment references only.
 Each subprocess starts at boot, restarts once after a failure, and is terminated when
 its runtime registry is dropped. A second failure returns `tool_error` with
 `reason = "mount_down"` until the runtime restarts. Calls are never automatically
-retried. Enrollment and audit apply exactly as for native verbs. Pinned effect class
-and generation appear under `mounted_tool` on the ordinary audit row.
+retried. A queued call whose deadline expires is not forwarded to the source.
+Once a mutating `tools/call` has been sent, `tool_timeout` is an ambiguous
+outcome: the source may have applied it before the timeout, so callers must
+check its effect before retrying. Enrollment and audit apply exactly as for native
+verbs. Pinned effect class and generation appear under `mounted_tool` on the
+ordinary audit row.
 
 Select `agent` explicitly alongside the native packs you need, for example
 `kkernel mcp --pack kg --pack agent`. It is absent from the default pack set.

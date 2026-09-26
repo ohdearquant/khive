@@ -276,6 +276,47 @@ def _base_response(frame, **overrides):
 
 
 class RawDaemonFrameTests(unittest.TestCase):
+    def test_recv_exact_assembles_irregular_fragments_and_zero_length(self):
+        class FragmentedSocket:
+            def __init__(self):
+                self.fragments = [b"a", b"bc", b"d", b"efgh", b"ij"]
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def recv(self, size):
+                chunk = self.fragments.pop(0)
+                if len(chunk) > size:
+                    raise AssertionError("fixture fragment exceeds requested size")
+                return chunk
+
+        sock = FragmentedSocket()
+        self.assertEqual(mbc.recv_exact(sock, 10), b"abcdefghij")
+        self.assertEqual(mbc.recv_exact(sock, 0), b"")
+        self.assertEqual(sock.fragments, [])
+
+    def test_recv_exact_keeps_whole_frame_deadline_and_eof_error(self):
+        class ClosingSocket:
+            def __init__(self):
+                self.calls = 0
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def recv(self, size):
+                self.calls += 1
+                return b"x" if self.calls == 1 else b""
+
+        sock = ClosingSocket()
+        with self.assertRaisesRegex(RuntimeError, "mid-frame"):
+            mbc.recv_exact(sock, 2, deadline=time.monotonic() + 1)
+        self.assertEqual(len(sock.timeouts), 2)
+        with self.assertRaises(socketlib.timeout):
+            mbc.recv_exact(sock, 1, deadline=time.monotonic() - 1)
+        self.assertEqual(sock.calls, 2, "an expired deadline must not call recv")
+
     def test_protocol_version_tracks_process_ref_rollout(self):
         self.assertEqual(mbc.PROTOCOL_VERSION, 4)
 

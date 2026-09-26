@@ -161,6 +161,34 @@ def precision_at_k(contents, expected_topic):
         return 0.0
     return sum(1 for c in contents if expected_topic in c) / TOP_K
 
+
+def _validated_recall_contents(result):
+    """Reject fixture-shape regressions before they can inflate P@K."""
+    if isinstance(result, list):
+        rows = result
+    elif isinstance(result, dict):
+        has_results = "results" in result
+        has_items = "items" in result
+        if has_results == has_items:
+            raise ValueError("recall response must contain exactly one results list")
+        rows = result["results"] if has_results else result["items"]
+    else:
+        raise ValueError("recall response must be a list or results object")
+    if not isinstance(rows, list) or len(rows) > TOP_K:
+        raise ValueError("recall results must be a list within the requested limit")
+
+    contents = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("content"), str):
+            raise ValueError("recall result must have string content")
+        content = row["content"]
+        if content in seen:
+            raise ValueError("duplicate recall content in the distinct benchmark corpus")
+        seen.add(content)
+        contents.append(content)
+    return contents
+
 # ── Daemon engagement assertions (shared plumbing, mcp_bench_client.py, PR2)
 
 _read_pid_file = mbc.read_pid_file
@@ -295,15 +323,7 @@ def _query_once(proc, query_text, fusion_strategy=None):
     result = _call_verb(proc, "memory.recall", args)
     elapsed_us = (time.perf_counter_ns() - t0) // 1000
 
-    if isinstance(result, list):
-        arr = result
-    elif isinstance(result, dict):
-        arr = result.get("results") or result.get("items") or []
-    else:
-        arr = []
-
-    contents = [r["content"] for r in arr if isinstance(r, dict) and "content" in r]
-    return elapsed_us, contents
+    return elapsed_us, _validated_recall_contents(result)
 
 def _wait_for_ann_convergence(
     proc,

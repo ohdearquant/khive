@@ -15,7 +15,8 @@ description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
 bench = false
 
 [features]
-# serde: enables Serialize/Deserialize derives on all fold types.
+# serde: enables Serialize/Deserialize derives and the serialization-backed
+# checkpoint protocol. Other fold primitives remain available without it.
 # Enabled by default so existing callers compile without explicit opt-in.
 default = ["serde"]
 serde = ["dep:serde"]
