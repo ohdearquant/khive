@@ -1229,14 +1229,13 @@ async fn gate_blocked_project_name_reports_safe_manifest_path() {
         report.blocked.len(),
         "blocked_count must match the number of entries in blocked"
     );
-    let expected_manifest = root
-        .path()
+    let canonical_root = root.path().canonicalize().expect("canonical tempdir");
+    let expected_manifest = canonical_root
         .join("pkg_secret")
         .join("Cargo.toml")
         .display()
         .to_string();
-    let expected_source = root
-        .path()
+    let expected_source = canonical_root
         .join("pkg_secret")
         .join("src")
         .join("lib.rs")
@@ -1286,6 +1285,66 @@ async fn gate_blocked_project_name_reports_safe_manifest_path() {
         !names.iter().any(|n| n.contains("user:pass")),
         "the gate-blocked project name must never be written as an entity: {names:?}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gate_blocked_project_paths_use_one_spelling_through_symlinked_parent() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().expect("tempdir");
+    let real_parent = root.path().join("real_parent");
+    let real_source = real_parent.join("source");
+    std::fs::create_dir_all(&real_source).expect("real source directory");
+    write_gate_blocked_project_name_fixture(&real_source);
+    let alias_parent = root.path().join("alias_parent");
+    symlink(&real_parent, &alias_parent).expect("symlink parent");
+    let aliased_source = alias_parent.join("source");
+    let canonical_source = real_source
+        .canonicalize()
+        .expect("canonical source directory");
+    assert_ne!(aliased_source, canonical_source);
+    assert_eq!(
+        aliased_source.canonicalize().expect("canonical alias"),
+        canonical_source
+    );
+
+    let db = root.path().join("gate_blocked_alias.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &aliased_source,
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("ingest through symlinked parent");
+
+    let mut blocked_files: Vec<&str> = report.blocked.iter().map(|b| b.file.as_str()).collect();
+    blocked_files.sort_unstable();
+    let expected_manifest = canonical_source.join("pkg_secret/Cargo.toml");
+    let expected_source = canonical_source.join("pkg_secret/src/lib.rs");
+    let mut expected_files = vec![
+        expected_manifest.to_str().expect("UTF-8 temp path"),
+        expected_source.to_str().expect("UTF-8 temp path"),
+    ];
+    expected_files.sort_unstable();
+    assert_eq!(report.blocked_count, 2);
+    assert_eq!(blocked_files, expected_files);
+    assert!(report
+        .blocked
+        .iter()
+        .all(|entry| entry.detector == "url-userinfo"));
+    assert!(!serde_json::to_string(&report)
+        .expect("serializable report")
+        .contains("user:pass"));
 }
 
 #[tokio::test]

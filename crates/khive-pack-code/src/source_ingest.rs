@@ -1704,7 +1704,9 @@ pub async fn run_code_ingest(
     // to L1.5 without implying L1 output. No selected L1/L1.5 tier means no
     // manifest walk, preserving the zero-write and L2-only boundaries.
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
-        manifest::discover_manifests(opts.path, &opts.languages)
+        let canonical_ingest_root = fs::canonicalize(opts.path)
+            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+        manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
             .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?
     } else {
         Vec::new()
