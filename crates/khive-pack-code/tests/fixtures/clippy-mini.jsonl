@@ -1,0 +1,5 @@
+{"reason":"compiler-artifact","package_id":"example 0.1.0","target":{"name":"example"}}
+{"reason":"compiler-message","package_id":"example 0.1.0","message":{"message":"compilation note","code":null,"level":"note","spans":[]}}
+{"reason":"compiler-message","package_id":"example 0.1.0","message":{"message":"this borrow is unnecessary","code":{"code":"clippy::needless_borrow","explanation":null},"level":"warning","spans":[{"file_name":"src/lib.rs","line_start":12,"line_end":12,"column_start":5,"column_end":13,"is_primary":true,"text":[{"text":"    consume(&value);","highlight_start":5,"highlight_end":13}]}],"children":[]}}
+{"reason":"compiler-message","package_id":"example 0.1.0","message":{"message":"used `unwrap()` on a `Result` value","code":{"code":"clippy::unwrap_used","explanation":null},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":25,"line_end":25,"column_start":18,"column_end":26,"is_primary":true,"text":[{"text":"    let value = read().unwrap();","highlight_start":18,"highlight_end":26}]}],"children":[]}}
+{"reason":"build-finished","success":true}
