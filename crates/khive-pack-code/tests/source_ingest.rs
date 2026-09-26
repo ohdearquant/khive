@@ -164,6 +164,65 @@ async fn entity_count(rt: &KhiveRuntime) -> i64 {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn l1_5_skips_outside_symlink_and_non_regular_source() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+
+    let root = TempDir::new().expect("source root");
+    let outside = TempDir::new().expect("outside root");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"bounded_scan\"\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("lib.rs"), "pub fn safe() {}\n").unwrap();
+    symlink(src.join("lib.rs"), src.join("alias.rs")).unwrap();
+    let escaped = outside.path().join("escaped.rs");
+    std::fs::write(&escaped, "use private_project::secret;\n").unwrap();
+    symlink(&escaped, src.join("escaped.rs")).unwrap();
+    let _socket = UnixListener::bind(src.join("socket.rs")).unwrap();
+
+    let rt = rt_at(&root.path().join("bounded.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: ["rust"].into_iter().collect(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("bounded L1.5 ingest succeeds");
+
+    assert_eq!(
+        report.modules_created, 1,
+        "only one in-root file is scanned"
+    );
+    assert_eq!(report.files_dropped_without_source_path, 2);
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("outside the canonical ingest root") && warning.contains("escaped.rs")
+    }));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("non-regular source") && warning.contains("socket.rs")));
+    assert_eq!(
+        module_properties_for_path(&rt, "bounded_scan", "src/lib.rs")
+            .await
+            .len(),
+        1
+    );
+}
+
 async fn module_properties_for_path(
     rt: &KhiveRuntime,
     source_project: &str,
