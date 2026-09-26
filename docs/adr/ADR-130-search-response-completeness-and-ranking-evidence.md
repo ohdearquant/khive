@@ -5,10 +5,9 @@
 - Depends on: ADR-006 (deterministic scoring), ADR-012 (retrieval composition),
   ADR-029 (substrate coordinator), ADR-033 (recall pipeline),
   ADR-045 (verb response presentation)
-- Proposed amendments: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14)
-  and [Amendment 7, selectable KG search text matching](#amendment-7-selectable-kg-search-text-matching-2026-09-25).
-  Existing decisions remain accepted; both amendments require acceptance
-  before their dependent implementations merge.
+- Proposed amendment: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14).
+  Existing decisions remain accepted; Amendment 5 is unsigned and requires
+  acceptance before dependent implementation merges.
 
 ## Context
 
@@ -1032,10 +1031,9 @@ proposed amendment records no executed acceptance result.
 
 ## Amendment 7: selectable KG search text matching (2026-09-25)
 
-**Status: Proposed (2026-09-25).** Acceptance is required before dependent
-implementation merges. This amendment qualifies Amendment 3's fixed text-arm
-member shape and Amendment 6's single zero-contribution reason literal. It does
-not change Amendment 5's separate proposed limit-disclosure status.
+**Status: Accepted (2026-09-26).** This amendment qualifies Amendment 3's fixed
+text-arm member shape and Amendment 6's single zero-contribution reason literal.
+It does not change Amendment 5's separate proposed limit-disclosure status.
 
 ### Request and retrieval contract
 
