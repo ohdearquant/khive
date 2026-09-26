@@ -2306,6 +2306,7 @@ version = "0.8.0"
 dependencies = [
  "async-trait",
  "inventory",
+ "jsonschema",
  "khive-runtime",
  "khive-types",
  "serde_json",

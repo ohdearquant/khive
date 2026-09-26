@@ -1,0 +1,10 @@
+{
+  "format_version": 1,
+  "lean_toolchain": "leanprover/lean4:v4.34.1",
+  "lake_version": "5.0.0",
+  "lake_source": "bundled with the pinned Lean toolchain",
+  "module": "Mini",
+  "source": "Mini.lean",
+  "expected_extraction": "expected-extraction.json",
+  "schema": "expected-extraction.schema.json"
+}

@@ -20,3 +20,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+jsonschema = { workspace = true }
