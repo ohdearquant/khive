@@ -120,7 +120,7 @@ Pooled-reader admission refusals include `pool_identity: Some(...)` alongside
 the unchanged operation and timeout. File-backed pools report only the final
 file name of their canonical path, never a directory, on every server including
 local stdio. In-memory pools use `:memory:`. Display appends
-` (pool: {identity})`, and the structured error includes the same optional
+`(pool: {identity})`, and the structured error includes the same optional
 `pool_identity` string. File names render lossily when they are not UTF-8.
 
 If distinct canonical paths with the same rendered file name are open in the
@@ -221,6 +221,10 @@ to pooled routing for its next ordinary query.
 `db_diagnostics.reader_contention` is pool-scoped and resets only when the
 `ConnectionPool` is reconstructed. It reports:
 
+- `configured_reader_cap`, `configured_checkout_timeout_ms`, and
+  `configured_busy_timeout_ms` from the pool's resolved configuration; the
+  requested reader cap can exceed effective admission capacity when the pool
+  degrades to one shared connection;
 - `reader_admission_capacity` and the point-in-time
   `available_reader_admission_slots`;
 - aggregate request `reader_acquisitions`, split into
