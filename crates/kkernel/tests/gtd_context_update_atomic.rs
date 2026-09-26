@@ -381,9 +381,9 @@ async fn atomic_context_link_companion_missing_endpoint_rolls_back_the_whole_bat
         json!({"tool": "delete", "args": {"id": fixture.b, "hard": true}}),
         fixture.update(json!(fixture.b)),
     ]);
-    // Atomic execution reports a completed rollback with exit 0, even under
-    // --strict. The envelope and persisted snapshot below establish failure.
-    assert!(output.status.success(), "{envelope}");
+    // A rolled-back atomic unit exits non-zero, including under --strict.
+    // The envelope and persisted snapshot below establish the exact failure.
+    assert!(!output.status.success(), "{envelope}");
     assert_slots(&envelope, &["delete", "update"]);
     assert_eq!(envelope["atomic"]["committed"], false, "{envelope}");
     assert_eq!(envelope["atomic"]["rolled_back"], true, "{envelope}");
@@ -444,9 +444,9 @@ async fn atomic_existing_context_annotation_rechecks_endpoint_and_preserves_the_
         json!({"tool": "delete", "args": {"id": fixture.b, "hard": true}}),
         update.clone(),
     ]);
-    // Atomic execution reports a completed rollback with exit 0, even under
-    // --strict. The envelope and persisted snapshot below establish failure.
-    assert!(output.status.success(), "{envelope}");
+    // A rolled-back atomic unit exits non-zero, including under --strict.
+    // The envelope and persisted snapshot below establish the exact failure.
+    assert!(!output.status.success(), "{envelope}");
     assert_slots(&envelope, &["delete", "update"]);
     assert_eq!(envelope["atomic"]["committed"], false, "{envelope}");
     assert_eq!(envelope["atomic"]["rolled_back"], true, "{envelope}");

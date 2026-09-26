@@ -368,10 +368,10 @@ The observable failure contract stays mode-specific:
   timeout. Admissibility and prepare failures print a typed per-op result envelope over the real
   ops-file entries before returning their established non-zero exit. A plan-level guard or SQL
   failure likewise prints the additive envelope with `atomic.committed=false` and
-  `atomic.rolled_back=true`; the CLI preserves the existing atomic exit semantics for that
-  outcome. Under `--strict`, otherwise-unclassified not-committed rows receive the stable
-  `strict-op-failure` reason, but the flag does not alter the atomic process-exit behavior. Callers
-  must inspect `atomic.committed`. The op-count guard bounds the unit; operators should run a
+  `atomic.rolled_back=true`; the CLI prints that envelope and exits non-zero for the rollback,
+  with or without `--strict`. Under `--strict`, otherwise-unclassified not-committed rows receive
+  the stable `strict-op-failure` reason. A durable `committed_degraded` unit still exits zero. Callers
+  must inspect `atomic.committed` before retrying. The op-count guard bounds the unit; operators should run a
   large atomic file against an idle daemon or in a maintenance window.
 
 Routing these modes through the daemon remains rejected. `--save-file` is a trusted local output

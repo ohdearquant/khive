@@ -585,10 +585,10 @@ pub struct ExecArgs {
     /// batch still exits 0 — the per-op `results` entries and the
     /// `summary`/`status` fields in the printed output are the signal
     /// (#1220). A batch in which *every* op failed always exits non-zero,
-    /// with or without this flag (#1339). With `--atomic`, this flag does not
-    /// change the established atomic exit semantics, but it does annotate
-    /// otherwise-unclassified not-committed result rows with the stable
-    /// `strict-op-failure` reason.
+    /// with or without this flag (#1339). A rolled-back `--atomic` unit also
+    /// exits non-zero, while a durable `committed_degraded` unit exits zero.
+    /// Under `--atomic`, this flag additionally annotates otherwise-unclassified
+    /// not-committed result rows with the stable `strict-op-failure` reason.
     #[arg(long)]
     pub strict: bool,
 }
@@ -2658,7 +2658,7 @@ async fn run_exec_ops_file(
         }
     }
 
-    if dry_run {
+    if dry_run && !atomic {
         let summary = serde_json::json!({
             "dry_run": true,
             "total": validated.total,
@@ -2706,6 +2706,35 @@ async fn run_exec_ops_file(
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
         let ops =
             parse_atomic_validated_snapshot(&mut validated.snapshot, validated.total, max_ops)?;
+        if dry_run {
+            if let Err(error) =
+                crate::atomic_apply::preflight_atomic_ops_file(&ops, &cfg, &khive_cfg, max_ops)
+            {
+                if let Some(failure) =
+                    error.downcast_ref::<crate::atomic_apply::AtomicExecFailure>()
+                {
+                    let mut envelope = failure.envelope();
+                    annotate_and_emit_refusals(&mut envelope, strict);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&envelope)
+                            .expect("serialize atomic dry-run refusal envelope")
+                    );
+                }
+                return Err(error);
+            }
+            let summary = serde_json::json!({
+                "dry_run": true,
+                "atomic": true,
+                "total": validated.total,
+                "per_verb": validated.per_verb,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).expect("serialize atomic dry-run summary")
+            );
+            return Ok(());
+        }
         // Preflight a deterministic save target before the atomic unit can
         // commit. An execution error drops the unfinished sibling temp file
         // and leaves any prior complete destination untouched.
@@ -2744,6 +2773,9 @@ async fn run_exec_ops_file(
             }
         };
         println!("{output}");
+        if envelope["atomic"]["rolled_back"].as_bool() == Some(true) {
+            anyhow::bail!("atomic unit rolled back; inspect stdout for the failed operation");
+        }
         return Ok(());
     }
 
@@ -6202,6 +6234,76 @@ id = "lambda:fallback"
         assert_eq!(count, 0, "dry-run must not write any entities");
     }
 
+    #[tokio::test]
+    async fn atomic_dry_run_uses_the_real_read_only_admission() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("dry-run-target.db");
+        let config_path = dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let source_path = dir.path().join("ops.jsonl");
+        std::fs::write(
+            &source_path,
+            "{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"MustNotLand\"}}\n",
+        )
+        .expect("ops file");
+        let db_text = db_path.to_str().expect("utf8 db path").to_string();
+        let context = || ExecDbContext {
+            raw: Some(db_text.clone()),
+            anchor: Some(db_path.clone()),
+            config: Some(config_path.clone()),
+        };
+
+        for dry_run in [true, false] {
+            let error = run_exec_ops_file(
+                source_path.clone(),
+                atomic_cfg(&db_text),
+                None,
+                None,
+                None,
+                dry_run,
+                context(),
+                false,
+                true,
+                None,
+                false,
+            )
+            .await
+            .expect_err("create is inadmissible in an atomic unit");
+            assert!(
+                error
+                    .downcast_ref::<crate::atomic_apply::AtomicExecFailure>()
+                    .is_some(),
+                "dry_run={dry_run}: {error:#}"
+            );
+            assert!(!db_path.exists(), "preflight must not open the target db");
+        }
+
+        let over_limit = run_exec_ops_file(
+            source_path,
+            atomic_cfg(&db_text),
+            None,
+            None,
+            None,
+            true,
+            context(),
+            false,
+            true,
+            Some(0),
+            false,
+        )
+        .await
+        .expect_err("atomic dry-run must apply the configured op ceiling");
+        assert!(over_limit.to_string().contains("op count 1"));
+        assert!(
+            !db_path.exists(),
+            "over-limit preview must not open storage"
+        );
+    }
+
     #[derive(Debug)]
     struct DenyPinnedActorGate {
         observed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -8464,7 +8566,7 @@ backend = "sessions"
     }
 
     #[tokio::test]
-    async fn atomic_rollback_preserves_zero_exit_with_or_without_save_and_strict() {
+    async fn atomic_rollback_exits_nonzero_with_or_without_save_and_strict() {
         if crate::test_process::run_in_child() {
             return;
         }
@@ -8509,7 +8611,7 @@ backend = "sessions"
             config: Some(config_path.clone()),
         };
 
-        run_exec_ops_file(
+        let error = run_exec_ops_file(
             file.path().to_path_buf(),
             atomic_cfg(&db_path),
             None,
@@ -8520,14 +8622,15 @@ backend = "sessions"
             false,
             true,
             None,
-            true,
+            false,
         )
         .await
-        .expect("atomic rollback remains a successful CLI seam even with --strict");
+        .expect_err("atomic rollback must exit non-zero without --strict");
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
 
         let output_dir = tempfile::tempdir().unwrap();
         let save_path = output_dir.path().join("atomic-rollback.jsonl");
-        run_exec_ops_file(
+        let error = run_exec_ops_file(
             file.path().to_path_buf(),
             atomic_cfg(&db_path),
             None,
@@ -8541,7 +8644,8 @@ backend = "sessions"
             true,
         )
         .await
-        .expect("atomic save preserves the existing rollback exit contract");
+        .expect_err("atomic rollback must exit non-zero with --strict and --save-file");
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
         assert_eq!(
             std::fs::read_to_string(save_path).unwrap().lines().count(),
             2
@@ -9421,6 +9525,73 @@ backend = "sessions"
             get_resp["results"][0]["result"]["content"], "updated note",
             "the well-formed update must have landed: {get_resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_task_note_update_projects_status_like_canonical_handlers() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let task_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"gtd.assign(title="AtomicProjectionTask", status="next")"#,
+            )
+            .await;
+            response["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("task id")
+                .to_string()
+        };
+        let khive_cfg = KhiveConfig::default();
+        let update = || {
+            vec![atomic_op(
+                "update",
+                serde_json::json!({"id": task_id.clone(), "content": "projected body"}),
+            )]
+        };
+
+        let changed = crate::atomic_apply::execute_atomic_ops_file(
+            update(),
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic note update");
+        let changed_result = &changed["results"][0]["result"];
+        assert_eq!(changed_result["status"], "next", "{changed}");
+        assert_eq!(changed_result["lifecycle"], "active", "{changed}");
+        assert_eq!(
+            changed_result["display_name"], "AtomicProjectionTask",
+            "{changed}"
+        );
+        assert!(changed_result.get("unchanged").is_none(), "{changed}");
+
+        let server = isolated_server(&db_path);
+        let canonical_get = dispatch_json(&server, &format!(r#"get(id="{task_id}")"#)).await;
+        assert_eq!(changed_result, &canonical_get["results"][0]["result"]);
+
+        let unchanged = crate::atomic_apply::execute_atomic_ops_file(
+            update(),
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic note no-op update");
+        let unchanged_result = &unchanged["results"][0]["result"];
+        assert_eq!(unchanged_result["unchanged"], true, "{unchanged}");
+        let canonical_update = dispatch_json(
+            &server,
+            &format!(r#"update(id="{task_id}", content="projected body")"#),
+        )
+        .await;
+        assert_eq!(unchanged_result, &canonical_update["results"][0]["result"]);
     }
 
     /// `delete`: a typo'd key (`hardd` for `hard`) must be rejected before
