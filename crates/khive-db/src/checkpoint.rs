@@ -4169,7 +4169,6 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_millis(1_200);
-        let mut saw_backfill_ceiling = false;
         let mut saw_oldest_pinned_frame = false;
         let mut saw_pin_depth = false;
         while Instant::now() < deadline {
@@ -4178,7 +4177,6 @@ mod tests {
                 crate::diagnostics::BuildIdentity::from_env("test", None),
                 Duration::from_secs(30),
             );
-            saw_backfill_ceiling |= report.checkpoint_pin.backfill_ceiling.is_some();
             saw_oldest_pinned_frame |= report.checkpoint_pin.oldest_pinned_frame.is_some();
             saw_pin_depth |= report.checkpoint_pin.pin_depth.is_some();
             tokio::task::yield_now().await;
@@ -4192,10 +4190,6 @@ mod tests {
             .expect("checkpoint task shutdown must finish")
             .expect("checkpoint task must not panic");
         assert!(
-            saw_backfill_ceiling,
-            "transient backfill rows must be visible"
-        );
-        assert!(
             !saw_oldest_pinned_frame,
             "short-lived backfill rows without a reader must not age into pins"
         );
@@ -4203,6 +4197,61 @@ mod tests {
             !saw_pin_depth,
             "writer-only backfill gaps are not pin depths"
         );
+    }
+
+    #[test]
+    fn db_diagnostics_reports_short_reader_backfill_ceiling_without_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostic_short_reader_gap.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (1)")
+                .unwrap();
+        }
+
+        // The reader snapshots an uncheckpointed frame. A later commit must
+        // remain beyond that snapshot when the diagnostic PASSIVE probe runs.
+        // No checkpoint task races this fixture or can age the gap into a pin.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN DEFERRED").unwrap();
+        let visible_rows: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible_rows, 1);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (2)", [])
+                .unwrap();
+        }
+
+        let report = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let probe = report.checkpoint_probe.as_ref().expect("probe row");
+        assert_eq!(probe.busy, 0);
+        assert!(probe.checkpointed_frames > 0);
+        assert!(probe.log_frames > probe.checkpointed_frames);
+        assert_eq!(
+            report.checkpoint_pin.backfill_ceiling,
+            Some(probe.checkpointed_frames)
+        );
+        assert_eq!(report.checkpoint_pin.oldest_pinned_frame, None);
+        assert_eq!(report.checkpoint_pin.pin_depth, None);
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        let drained = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        assert_eq!(drained.checkpoint_pin.backfill_ceiling, None);
     }
 
     #[derive(Clone, Debug, Default)]
