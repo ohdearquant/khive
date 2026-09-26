@@ -539,8 +539,20 @@ impl Sq8Codec {
     ///
     /// The per-dimension scale term is accumulated directly in f64. A shared
     /// f32 mean plus residuals can cancel a small scale out entirely.
+    /// Panics if either encoded vector has a different length from this codec.
     #[inline]
     pub fn approx_dot(&self, a: &EncodedVector, b: &EncodedVector) -> f32 {
+        let dims = self.scale_sq.len();
+        assert_eq!(
+            a.codes.len(),
+            dims,
+            "approx_dot input codes must match codec dims"
+        );
+        assert_eq!(
+            b.codes.len(),
+            dims,
+            "approx_dot input codes must match codec dims"
+        );
         let weighted: f64 = self
             .scale_sq
             .iter()
@@ -574,11 +586,23 @@ impl Sq8Codec {
     /// Nonnegative terms are accumulated in f64 and rounded to f32 once.
     /// This avoids cancellation between a shared f32 mean and residuals in
     /// strongly anisotropic corpora.
+    /// Panics if either encoded vector has a different length from this codec.
     ///
     /// For Vamana L2 acquisition use [`GsSq8Codec::l2_sq`] — algebraically exact
     /// in code space and uses the integer NEON path.
     #[inline]
     pub fn approx_l2_sq(&self, a: &EncodedVector, b: &EncodedVector) -> f32 {
+        let dims = self.scale_sq.len();
+        assert_eq!(
+            a.codes.len(),
+            dims,
+            "approx_l2_sq input codes must match codec dims"
+        );
+        assert_eq!(
+            b.codes.len(),
+            dims,
+            "approx_l2_sq input codes must match codec dims"
+        );
         let weighted: f64 = self
             .scale_sq
             .iter()
@@ -1302,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "u8_dot_u32 inputs must have equal length")]
+    #[should_panic(expected = "approx_dot input codes must match codec dims")]
     fn approx_dot_rejects_mismatched_codes() {
         let vectors = rand_vecs(2, 16, 1);
         let codec = Sq8Codec::train(&vectors);
@@ -1311,6 +1335,42 @@ mod tests {
         b.codes.pop();
 
         let _ = codec.approx_dot(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "approx_dot input codes must match codec dims")]
+    fn approx_dot_rejects_longer_first_codes() {
+        let vectors = rand_vecs(2, 16, 1);
+        let codec = Sq8Codec::train(&vectors);
+        let mut a = codec.encode(&vectors[0]);
+        let b = codec.encode(&vectors[1]);
+        a.codes.push(0);
+
+        let _ = codec.approx_dot(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "approx_l2_sq input codes must match codec dims")]
+    fn approx_l2_sq_rejects_mismatched_codes() {
+        let vectors = rand_vecs(2, 16, 1);
+        let codec = Sq8Codec::train(&vectors);
+        let a = codec.encode(&vectors[0]);
+        let mut b = codec.encode(&vectors[1]);
+        b.codes.pop();
+
+        let _ = codec.approx_l2_sq(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "approx_l2_sq input codes must match codec dims")]
+    fn approx_l2_sq_rejects_longer_first_codes() {
+        let vectors = rand_vecs(2, 16, 1);
+        let codec = Sq8Codec::train(&vectors);
+        let mut a = codec.encode(&vectors[0]);
+        let b = codec.encode(&vectors[1]);
+        a.codes.push(0);
+
+        let _ = codec.approx_l2_sq(&a, &b);
     }
 
     #[test]
