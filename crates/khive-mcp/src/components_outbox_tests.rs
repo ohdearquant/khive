@@ -17,14 +17,16 @@ enum Outcome {
 }
 
 struct ScriptedChannel {
+    kind: &'static str,
     outcomes: Mutex<VecDeque<Outcome>>,
     sends: AtomicUsize,
     cancel_after_send: Option<CancellationToken>,
 }
 
 impl ScriptedChannel {
-    fn new(outcomes: impl IntoIterator<Item = Outcome>) -> Self {
+    fn new(kind: &'static str, outcomes: impl IntoIterator<Item = Outcome>) -> Self {
         Self {
+            kind,
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             sends: AtomicUsize::new(0),
             cancel_after_send: None,
@@ -35,7 +37,7 @@ impl ScriptedChannel {
 #[async_trait]
 impl Channel for ScriptedChannel {
     fn kind(&self) -> &'static str {
-        "outbox-test"
+        self.kind
     }
 
     async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
@@ -150,10 +152,10 @@ fn email_registration(
 #[tokio::test]
 async fn email_outbound_recovers_after_refreshable_auth_without_daemon_restart() {
     let (server, runtime, id) = fixture("email:recipient@example.com").await;
-    let channel = Arc::new(ScriptedChannel::new([
-        Outcome::RefreshableAuth,
-        Outcome::Delivered,
-    ]));
+    let channel = Arc::new(ScriptedChannel::new(
+        "email",
+        [Outcome::RefreshableAuth, Outcome::Delivered],
+    ));
     let health = HealthReporter::default();
     let cancellation = CancellationToken::new();
     let task = tokio::spawn(supervise(
@@ -185,10 +187,10 @@ async fn email_outbound_recovers_after_refreshable_auth_without_daemon_restart()
 #[tokio::test]
 async fn email_outbound_auth_budget_exhaustion_is_terminal_and_preserves_pending_mail() {
     let (server, runtime, id) = fixture("email:recipient@example.com").await;
-    let channel = Arc::new(ScriptedChannel::new([
-        Outcome::RefreshableAuth,
-        Outcome::RefreshableAuth,
-    ]));
+    let channel = Arc::new(ScriptedChannel::new(
+        "email",
+        [Outcome::RefreshableAuth, Outcome::RefreshableAuth],
+    ));
     let health = HealthReporter::default();
     let task = tokio::spawn(supervise(
         email_registration(runtime.clone(), channel.clone()),
@@ -213,7 +215,7 @@ async fn email_outbound_auth_budget_exhaustion_is_terminal_and_preserves_pending
 #[tokio::test]
 async fn email_outbound_fixed_credentials_stop_without_consuming_restart_budget() {
     let (server, runtime, id) = fixture("email:recipient@example.com").await;
-    let channel = Arc::new(ScriptedChannel::new([Outcome::FixedCredentials]));
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::FixedCredentials]));
     let health = HealthReporter::default();
     let task = tokio::spawn(supervise(
         email_registration(runtime.clone(), channel.clone()),
@@ -253,7 +255,7 @@ async fn telegram_outbound_cancellation_stamps_inflight_delivery_and_stops_befor
     let cancellation = CancellationToken::new();
     let channel = Arc::new(ScriptedChannel {
         cancel_after_send: Some(cancellation.clone()),
-        ..ScriptedChannel::new([Outcome::Delivered])
+        ..ScriptedChannel::new("telegram", [Outcome::Delivered])
     });
     let health = HealthReporter::default();
     let captured_channel = channel.clone();
@@ -307,7 +309,7 @@ async fn telegram_outbound_cancellation_stamps_inflight_delivery_and_stops_befor
 #[tokio::test]
 async fn email_outbound_allowlist_refusal_is_visible_in_sender_sent_mail() {
     let (server, runtime, id) = fixture("email:blocked@example.com").await;
-    let channel = Arc::new(ScriptedChannel::new([]));
+    let channel = Arc::new(ScriptedChannel::new("email", []));
     let health = HealthReporter::default();
     let cancellation = CancellationToken::new();
     let task = tokio::spawn(supervise(
@@ -344,4 +346,77 @@ async fn email_outbound_allowlist_refusal_is_visible_in_sender_sent_mail() {
         .is_empty());
     cancellation.cancel();
     task.await.unwrap();
+}
+
+#[cfg(all(feature = "channel-email", feature = "channel-telegram"))]
+#[tokio::test]
+async fn mismatched_outbox_kind_is_permanent_before_heartbeat() {
+    for kind in ["email", "telegram"] {
+        let (server, runtime, _) = fixture(if kind == "email" {
+            "email:recipient@example.com"
+        } else {
+            "telegram:123"
+        })
+        .await;
+        let channel = Arc::new(ScriptedChannel::new("outbox-test", []));
+        let health = HealthReporter::default();
+        let captured_channel = channel.clone();
+        let captured_runtime = runtime.clone();
+        let registration = channel_component_registration(
+            "mismatched-outbox",
+            Arc::new(move |ctx| {
+                let channel = captured_channel.clone();
+                let runtime = captured_runtime.clone();
+                Box::pin(async move {
+                    if kind == "email" {
+                        crate::serve::channel_outbox_loop(
+                            channel,
+                            runtime,
+                            "local".into(),
+                            "sender@example.com".into(),
+                            vec![],
+                            ctx,
+                        )
+                        .await
+                    } else {
+                        crate::serve::telegram_outbox_loop(channel, runtime, "local".into(), ctx)
+                            .await
+                    }
+                })
+            }),
+        );
+        let ctx = HostContext::new(
+            server.clone(),
+            CancellationToken::new(),
+            "mismatched-outbox",
+            health.clone(),
+        );
+        let outcome = tokio::select! {
+            biased;
+            outcome=(registration.start)(ctx)=>outcome,
+            _=std::future::ready(())=>panic!("mismatched adapter must fail before the first await"),
+        };
+        assert!(
+            matches!(outcome, Err(ComponentError::Permanent(_))),
+            "mismatched adapter must return permanent failure"
+        );
+        supervise(
+            registration,
+            server,
+            CancellationToken::new(),
+            health.clone(),
+        )
+        .await;
+        let status = health.status("mismatched-outbox").unwrap();
+        assert_eq!(
+            status.state,
+            ComponentState::Unhealthy,
+            "mismatched adapter must leave Running"
+        );
+        assert!(
+            status.last_heartbeat.is_none(),
+            "mismatched adapter must not heartbeat"
+        );
+        assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
+    }
 }

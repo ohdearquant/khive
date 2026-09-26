@@ -24,9 +24,17 @@ subtype — nothing about a document's id encodes whether it has been fetched ye
 body it turned out to have.
 
 Canonicalization (applied before any identity computation): scheme and host are lowercased, the
-default port for the scheme is dropped, the path is percent-normalized, query keys are sorted,
-and the fragment is dropped entirely — `https://Example.com/a?b=1&a=2#x` and
-`https://example.com/a?a=2&b=1` are the same resource.
+default port for the scheme is dropped, the path is percent-normalized, raw query pairs are
+stably sorted by their raw key bytes, and the fragment is dropped entirely. Query pairs are
+never form-decoded or re-encoded: `%FF` and `%FE`, `a+b` and `a%20b`, and `flag` and `flag=`
+remain distinct. Sorting still makes `https://Example.com/a?b=1&a=2#x` and
+`https://example.com/a?a=2&b=1` the same resource. Equal-key pairs retain their order.
+
+The document's `url` property keeps the actual parsed request address, with its fragment
+removed, independently of the sorted identity key. Refresh uses that address with its
+original query spelling and order. Newly fetched representations update this property;
+existing rows that only retain a previously rewritten address cannot recover its original
+spelling without being fetched again.
 
 ### Edge rules
 
@@ -56,28 +64,54 @@ Fetch one URL under egress policy. Follows up to 5 redirects; a 301/308 hop mint
 the hop and links `new supersedes old`, a 302/307 hop mints nothing beyond a receipt entry naming
 it. The terminal hop's body (if `GET`; `HEAD` carries none) is stored via the runtime's blob
 store, content-addressed; storing byte-identical content again is a no-op. `persist` defaults to
-`true`; `false` fetches and returns the result without minting entities or writing a receipt.
+`true`; `false` stores no body or entities and returns the exact body as a standard-alphabet,
+padded base64 string in `body` (null for HEAD or a persisted fetch). It still writes a standalone receipt recording
+`final_url`, the BLAKE3 `content_digest`, `size` and RFC 3339 `fetched_at`; `content_ref` is null.
+A persisted body has one `content` attachment on its entity, on the main backend even when web
+records use a separate backend. Receipts never carry body attachments.
+The egress `max_bytes` ceiling bounds raw bytes; base64 uses `4 * ceil(bytes / 3)` characters.
+For a transient GET, the effective `max_bytes` (including an omitted argument's configured
+default) must be at most **6,288,384 raw bytes**. A higher value is refused as invalid input
+before DNS or network access, with no receipt; lower `max_bytes` or use `persist=true`.
+HEAD has no inline body and is exempt from this extra ceiling; persisted fetches retain their
+configured egress ceiling.
+
+The limit leaves 4 KiB below the 8 MiB daemon frame cap for base64 body encoding. Settlement
+checks both that encoded-body limit and the complete serialized verb result, including the
+actual URL and allowed response headers. The result may use up to 8 MiB minus 1 KiB, leaving
+3 KiB beyond the body budget for verb metadata and 1 KiB for the outer transport envelope.
+Large or heavily escaped metadata can therefore refuse an otherwise valid body before its
+receipt is written. The transport still checks the final frame, including responses that
+aggregate multiple operations.
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 
-### `web.extract(id | url, kinds?)`
+### `web.extract(id | url, kinds?, namespace?, link_limit?)`
 
 Parse an already-fetched body — never fetches one itself. `kinds` is a subset of
 `{text, links, sitemap, feed}`, defaulting to whatever applies to the stored content-type.
 `links` yields `page links_to page|resource` edges to targets minted (if absent) as unfetched
-`resource` rows. `sitemap`/`feed` yield `site contains resource` edges for each entry, under the
-_publishing_ site. `text` mints a `resource` holding the tag-stripped body, linked
+`resource` rows. `link_limit` caps link targets processed from one page. It defaults to 100 and accepts integers
+from 0 through 1,000. Once the ceiling is reached, remaining matched `<a href>` attributes are
+left unresolved and their count is returned as `result.links.skipped`;
+`result.links.edges_created` reports the processed targets. `sitemap`/`feed` yield
+`site contains resource` edges for each entry under the _publishing_ site. `text` mints a
+`resource` holding the tag-stripped body, linked
 `derived_from` back to the original — keyed by the original document's id, so repeated
 extraction converges on one row rather than minting duplicates. Refuses `not_fetched` on a
 document with no stored body.
 
-### `web.ingest(source, origin?, depth?, limit?)`
+### `web.ingest(source, origin?, depth?, limit?, namespace?, extract_links?)`
 
 Fetch and extract over a single URL, a JSON array of URLs, or — with `origin` given — a
 directory on disk laid out as `origin` would serve it (`origin` then supplies the `site`
 identity for every file in the tree, and no network request is made for the disk case).
 `depth` bounds how many hops of `links`-extracted targets are followed beyond the seed URLs
-(default `0`: seeds only). `limit` bounds the total number of documents ingested in one call
+(default `0`: seeds only). In URL mode, depth zero does not extract links by default; set
+`extract_links=true` to record the page's links without following them. Positive depth extracts
+links only on pages below the requested depth so their targets can be followed. Across the whole
+call, link targets processed are capped by `limit`, and each page also uses the `web.extract`
+default ceiling of 100. `limit` bounds the total number of documents ingested in one call
 (default 100).
 
 The disk-mode `source` directory is confined to the operator's configured `[web] read_roots`
@@ -92,6 +126,14 @@ The URL-crawl mode's reply carries `ingested` (the minted document ids) and `ref
 anything else short of a persisted document): a refused URL is named in the reply rather than
 silently dropped from the crawl, so a caller can tell "nothing matched" apart from "some targets
 were refused."
+
+### Deleting routed entities
+
+Web entities are stored on the web backend while their body attachments are rooted on the main
+backend. A hard-delete retry that finds the entity row already absent can remove a remaining main
+backend attachment. Its response has `deleted: false` and `attachment_cleanup: true`. `deleted`
+reports whether this call removed the entity row; attachment-only cleanup does not establish
+whether an earlier attempt completed its index cleanup or appended its entity deletion event.
 
 ### `web.search(query, provider?, limit?, persist?)`
 

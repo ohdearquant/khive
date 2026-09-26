@@ -74,6 +74,10 @@ for network transports and is ignored by stdio.
 (`~/.khive/khived.sock`) and takes precedence over `--transport`. On first use, stdio
 clients auto-spawn `kkernel mcp --daemon` and forward request frames to it; set
 `KHIVE_NO_DAEMON=1` to force local dispatch (used by the smoke/contract tests).
+Once demand-mode retirement ([ADR-049](../../../docs/adr/ADR-049-khived-daemon.md)
+Amendment 11) ships, an automatically started daemon runs no email channel loops and no
+schedules; to run either, start the daemon yourself with `kkernel mcp --daemon` or under a
+supervisor.
 
 ### Supervised daemon startup
 

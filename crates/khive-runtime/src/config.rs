@@ -769,8 +769,9 @@ pub(crate) fn register_configured_embedding_models(
 /// - The engine flagged `default = true` becomes `RuntimeConfig::embedding_model`.
 /// - All other engines become `RuntimeConfig::additional_embedding_models`.
 ///
-/// Model name validity is checked here: any engine whose `model` field cannot
-/// be parsed via `parse_embedding_model_alias` is skipped with a warning.
+/// `KhiveConfig::validate()` rejects an unrecognized engine model at load time.
+/// A caller-constructed config that bypasses validation still skips an invalid
+/// engine with a warning here.
 ///
 /// If `khive_cfg.engines` is empty, the returned `RuntimeConfig` uses the
 /// env-var-derived defaults from `RuntimeConfig::default()`.

@@ -222,7 +222,7 @@ fn setup_file_store_with_origin_view() -> (
     let dir = tempfile::tempdir().unwrap();
     let config = PoolConfig {
         path: Some(dir.path().join("graph-test.db")),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
@@ -765,7 +765,7 @@ async fn observed_batch_upsert_later_refusal_preserves_earlier_replacement() {
                         .map(|dir| dir.path().join("batch-refusal.db")),
                     write_queue_enabled: Some(use_writer_task),
                     write_routing_strict: use_writer_task,
-                    ..PoolConfig::default()
+                    ..PoolConfig::for_test()
                 })
                 .unwrap(),
             );
@@ -2092,7 +2092,7 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
     let path = dir.path().join("traverse_secondary_origin.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -4381,7 +4381,7 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -4439,7 +4439,7 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -4946,7 +4946,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {

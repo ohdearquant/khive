@@ -246,7 +246,7 @@ fn prepare_commit(
 
 impl GitPack {
     /// Handler-level fail-closed precondition (ADR-108 Amendment), enforced
-    /// before any of the three write verbs mutate a repository: the write
+    /// before the legacy paths form of `git.commit` mutates a repository: write
     /// verbs are unavailable unless a `[git_write]` policy is configured,
     /// and even then `repo`/`branch` must resolve to an allowlisted entry.
     /// This runs in addition to, not instead of, the Gate (ADR-018) —

@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::io::Write as _;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -44,7 +44,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -495,6 +495,195 @@ pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
 
 // ── wire types ────────────────────────────────────────────────────────────────
 
+struct ConfigIdFields<'a> {
+    packs: &'a str,
+    db: &'a str,
+    embed: &'a str,
+    extra: &'a str,
+    fresh_tail: &'a str,
+    blob_hydration_bytes: &'a str,
+    backend: &'a str,
+    outbound: &'a str,
+    gate: &'a str,
+    git_write: &'a str,
+    brain: &'a str,
+    telemetry: &'a str,
+    display_timezone: &'a str,
+    backends: Option<&'a str>,
+    pack_backends: Option<&'a str>,
+}
+
+fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
+    let (base, backends, pack_backends) =
+        if let Some((before_routing, routing)) = config_id.rsplit_once("];pack_backends=[") {
+            let pack_backends = routing.strip_suffix(']')?;
+            let (base, backends) = before_routing.rsplit_once(";backends=[")?;
+            (base, Some(backends), Some(pack_backends))
+        } else {
+            (config_id, None, None)
+        };
+
+    let base = base.strip_prefix("packs=[")?;
+    let (packs, rest) = base.split_once("];db=")?;
+    let (rest, display_timezone) = rest
+        .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, telemetry) = rest
+        .rsplit_once(";telemetry=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, brain) = rest
+        .rsplit_once(";brain=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, git_write) = rest.rsplit_once(";git_write=")?;
+    let (rest, gate) = rest
+        .rsplit_once(";gate=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
+    let outbound = outbound.strip_suffix(']')?;
+    let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, blob_hydration_bytes) = rest
+        .rsplit_once(";blob_hydration_bytes=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
+    let (rest, extra) = rest.rsplit_once(";extra=[")?;
+    let extra = extra.strip_suffix(']')?;
+    let (db, embed) = rest.rsplit_once(";embed=")?;
+
+    Some(ConfigIdFields {
+        packs,
+        db,
+        embed,
+        extra,
+        fresh_tail,
+        blob_hydration_bytes,
+        backend,
+        outbound,
+        gate,
+        git_write,
+        brain,
+        telemetry,
+        display_timezone,
+        backends,
+        pack_backends,
+    })
+}
+
+fn extra_embedder_set(extra: &str) -> std::collections::BTreeSet<&str> {
+    extra.split(',').filter(|name| !name.is_empty()).collect()
+}
+
+/// Return daemon-configured extra models that are absent from a compatible client configuration.
+pub fn config_id_extra_embedder_exclusions(
+    client_id: &str,
+    daemon_id: &str,
+) -> Option<Vec<String>> {
+    if client_id == daemon_id {
+        return Some(Vec::new());
+    }
+    let client = parse_config_id(client_id)?;
+    let daemon = parse_config_id(daemon_id)?;
+    let mut client_available = extra_embedder_set(client.extra);
+    client_available.insert(client.embed);
+    let daemon_extras = extra_embedder_set(daemon.extra);
+    Some(
+        daemon_extras
+            .difference(&client_available)
+            .map(|name| {
+                serde_json::from_value::<lattice_embed::EmbeddingModel>(serde_json::Value::String(
+                    (*name).to_string(),
+                ))
+                .map(|model| model.to_string())
+                .unwrap_or_else(|_| (*name).to_string())
+            })
+            .collect(),
+    )
+}
+
+/// Whether a daemon configuration can serve a client's requested runtime.
+/// Every fingerprint field must match except that the daemon may have more
+/// configured extra embedding models than the client requested.
+pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
+    if client_id == daemon_id {
+        return true;
+    }
+    let (Some(client), Some(daemon)) = (parse_config_id(client_id), parse_config_id(daemon_id))
+    else {
+        return false;
+    };
+
+    let client_extras = extra_embedder_set(client.extra);
+    let mut daemon_available = extra_embedder_set(daemon.extra);
+    daemon_available.insert(daemon.embed);
+    let daemon_has_requested_extras = client_extras.is_subset(&daemon_available);
+
+    client.packs == daemon.packs
+        && client.db == daemon.db
+        && client.embed == daemon.embed
+        && daemon_has_requested_extras
+        && client.fresh_tail == daemon.fresh_tail
+        && client.blob_hydration_bytes == daemon.blob_hydration_bytes
+        && client.backend == daemon.backend
+        && client.outbound == daemon.outbound
+        && client.gate == daemon.gate
+        && client.git_write == daemon.git_write
+        && client.brain == daemon.brain
+        && client.telemetry == daemon.telemetry
+        && client.display_timezone == daemon.display_timezone
+        && client.backends == daemon.backends
+        && client.pack_backends == daemon.pack_backends
+}
+
+/// Name the first differing configuration component for diagnostics.
+pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> &'static str {
+    let Some(daemon_id) = daemon_id else {
+        return "unknown";
+    };
+    let (Some(client), Some(daemon)) = (parse_config_id(client_id), parse_config_id(daemon_id))
+    else {
+        return "unknown";
+    };
+    let client_extras = extra_embedder_set(client.extra);
+    let mut daemon_available = extra_embedder_set(daemon.extra);
+    daemon_available.insert(daemon.embed);
+
+    if client.packs != daemon.packs {
+        "packs"
+    } else if client.db != daemon.db {
+        "db"
+    } else if client.embed != daemon.embed {
+        "embed"
+    } else if !client_extras.is_subset(&daemon_available) {
+        "extra"
+    } else if client.fresh_tail != daemon.fresh_tail {
+        "fresh_tail"
+    } else if client.blob_hydration_bytes != daemon.blob_hydration_bytes {
+        "blob_hydration_bytes"
+    } else if client.backend != daemon.backend {
+        "backend"
+    } else if client.outbound != daemon.outbound {
+        "outbound"
+    } else if client.gate != daemon.gate {
+        "gate"
+    } else if client.git_write != daemon.git_write {
+        "git_write"
+    } else if client.brain != daemon.brain {
+        "brain"
+    } else if client.telemetry != daemon.telemetry {
+        "telemetry"
+    } else if client.display_timezone != daemon.display_timezone {
+        "display_tz"
+    } else if client.backends != daemon.backends {
+        "backends"
+    } else if client.pack_backends != daemon.pack_backends {
+        "pack_backends"
+    } else if client.extra != daemon.extra {
+        // A pre-v8 daemon compared exact ids and could refuse a safe superset.
+        "extra"
+    } else {
+        "unknown"
+    }
+}
+
 /// Request frame sent from a client to the daemon.
 #[derive(Serialize, Deserialize, Default)]
 pub struct DaemonRequestFrame {
@@ -537,9 +726,9 @@ pub struct DaemonRequestFrame {
     /// Fingerprint of the client's engine-coherence config: packs, db target,
     /// embedders, backend routing, and construction-baked outbound policy.
     /// Identity fields are carried separately in this frame. The daemon rejects
-    /// a request whose `config_id` differs from its own so a restricted client
-    /// (e.g. `--pack kg`, `--db :memory:`) never dispatches through the broader
-    /// default daemon. See ADR-027 / ADR-049 / ADR-096.
+    /// requests whose configuration differs, except when its extra-embedder set
+    /// is a superset of the client's and every other field matches. See
+    /// ADR-027 / ADR-049 / ADR-096.
     #[serde(default)]
     pub config_id: String,
     /// IPC protocol version sent by the client. Pre-versioning clients omit
@@ -1594,10 +1783,9 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     // `RequestIdentity` below) over its one shared warm registry, rather
     // than rejecting a differently-attributed same-uid connection to a cold
     // local-dispatch fallback. `config_id`: which governs packs/db/embed
-    // coherence for the shared warm engine: remains a hard reject; it is
-    // not an identity field and softening it would let a restricted client
-    // dispatch through an incompatible broader daemon.
-    } else if frame.config_id != dispatcher.config_id() {
+    // coherence for the shared warm engine: remains a hard reject for every
+    // field other than a daemon-side superset of the client's extra embedders.
+    } else if !config_ids_compatible(&frame.config_id, dispatcher.config_id()) {
         DaemonResponseFrame {
             ok: false,
             result: None,
@@ -1675,20 +1863,26 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         // nested scope keeps the earlier deadline, so the allowance must be
         // granted here or a long poll times out at the operator ceiling.
         let read_timeout = dispatcher.request_read_timeout(&frame.ops);
-        let dispatch = khive_storage::scope_request_read_cancellation(
-            shutdown,
+        let excluded_embedder_names =
+            config_id_extra_embedder_exclusions(&frame.config_id, dispatcher.config_id())
+                .expect("compatible configuration ids must expose their extra embedder sets");
+        let dispatch = crate::runtime::scope_request_embedder_exclusions(
+            excluded_embedder_names,
             khive_storage::scope_request_read_cancellation(
-                read_cancel_rx,
-                khive_storage::scope_request_read_deadline(
-                    read_timeout,
-                    dispatcher.dispatch_with_error_detail(
-                        frame.ops,
-                        frame.presentation,
-                        frame.presentation_per_op,
-                        frame.format,
-                        frame.format_per_op,
-                        frame.from_wire,
-                        Some(identity),
+                shutdown,
+                khive_storage::scope_request_read_cancellation(
+                    read_cancel_rx,
+                    khive_storage::scope_request_read_deadline(
+                        read_timeout,
+                        dispatcher.dispatch_with_error_detail(
+                            frame.ops,
+                            frame.presentation,
+                            frame.presentation_per_op,
+                            frame.format,
+                            frame.format_per_op,
+                            frame.from_wire,
+                            Some(identity),
+                        ),
                     ),
                 ),
             ),
@@ -1828,7 +2022,7 @@ where
 /// frames until SIGTERM/SIGINT.
 ///
 /// Fatally acquires its own startup lock, which only protects
-/// cleanup→bind→pid-write — `dispatcher` has already run migrations and
+/// cleanup→pid-claim→bind — `dispatcher` has already run migrations and
 /// applied pack schema plans while constructing itself, unguarded. Production
 /// boot must go through [`run_daemon_with_boot_guard`] instead, which extends
 /// the same lock back over construction. This entry point is for callers
@@ -1861,6 +2055,44 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
     run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true, |_| {}).await
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RendezvousPathRole {
+    Socket,
+    PidFile,
+}
+
+#[cfg(unix)]
+impl RendezvousPathRole {
+    fn env_name(self) -> &'static str {
+        match self {
+            Self::Socket => SOCKET_PATH_ENV,
+            Self::PidFile => PID_PATH_ENV,
+        }
+    }
+
+    fn directory_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket directory",
+            Self::PidFile => "PID-file directory",
+        }
+    }
+
+    fn path_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket path",
+            Self::PidFile => "PID-file path",
+        }
+    }
+
+    fn path_component_name(self) -> &'static str {
+        match self {
+            Self::Socket => "socket-path",
+            Self::PidFile => "PID-file-path",
+        }
+    }
+}
+
 /// Vet the socket's parent directory, re-permissioning it only when it is the
 /// directory khive owns by convention.
 ///
@@ -1887,24 +2119,52 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
     // SAFETY: `geteuid` is always successful and takes no arguments.
     let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::Socket, daemon_euid, true)
+}
 
-    if parent == khive_dir() {
+/// Vet the parent directory of a PID file before reading, locking, or writing
+/// it. The file's lock only protects the inode currently named by its path;
+/// every directory component must therefore be as swap-resistant as the
+/// socket rendezvous.
+#[cfg(unix)]
+pub fn ensure_pid_file_dir_is_trusted(pid_file: &std::path::Path) -> anyhow::Result<()> {
+    let parent = pid_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::PidFile, daemon_euid, false)
+}
+
+#[cfg(unix)]
+fn ensure_rendezvous_dir_is_trusted(
+    parent: &std::path::Path,
+    role: RendezvousPathRole,
+    daemon_euid: u32,
+    repair_owned_default: bool,
+) -> anyhow::Result<()> {
+    let env_name = role.env_name();
+    let directory_name = role.directory_name();
+
+    if repair_owned_default && parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             anyhow::anyhow!(
                 "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
-                 owner-only — it is half of the same-uid guarantee this daemon enforces.",
+                 owner-only as the {directory_name} for {env_name}; it is part of the \
+                 same-uid guarantee this daemon enforces.",
                 parent.display()
             )
         })?;
-        return ensure_socket_path_is_swap_resistant(parent, daemon_euid);
+        return ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role);
     }
 
     // Fail closed on the stat itself: not being able to read the metadata is
     // not the same as the directory passing.
     let meta = std::fs::metadata(parent).map_err(|e| {
         anyhow::anyhow!(
-            "refusing to start: cannot stat {}: {e}. The socket directory gates \
-             socket-takeover safety, and unreadable metadata is not a passing state.",
+            "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
+             It gates rendezvous-path safety, and unreadable metadata is not a passing state.",
             parent.display()
         )
     })?;
@@ -1913,10 +2173,10 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     let owner = meta.uid();
     if owner != daemon_euid && owner != 0 {
         anyhow::bail!(
-            "refusing to start: socket directory {} is owned by uid {owner}, not this \
-             daemon's uid ({daemon_euid}) or root. A directory owner can replace the \
-             socket regardless of mode bits. Point KHIVE_SOCKET at a directory you own, \
-             or unset it for the default.",
+            "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
+             not this daemon's uid ({daemon_euid}) or root. A directory owner can replace \
+             the rendezvous path regardless of mode bits. Point {env_name} at a directory \
+             you own, or unset it for the default.",
             parent.display()
         );
     }
@@ -1924,18 +2184,26 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     let mode = meta.permissions().mode();
     if mode & 0o022 != 0 {
         anyhow::bail!(
-            "refusing to start: socket directory {} is mode {:04o} — writable by group or \
-             other, so another local user could bind their own listener at the socket path \
-             (before this daemon starts, the sticky bit does not prevent creating the \
-             path). Use a directory only you can write, or unset KHIVE_SOCKET for the \
-             default. This daemon is not changing the permissions of a directory it does \
-             not own.",
+            "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
+             by group or other, so another local user could replace the rendezvous path. \
+             Use a directory only you can write, or unset {env_name} for the default. \
+             This daemon is not changing the permissions of a directory it does not own.",
             parent.display(),
             mode & 0o7777
         );
     }
 
-    ensure_socket_path_is_swap_resistant(parent, daemon_euid)
+    ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role)
+}
+
+/// Socket-role form of [`ensure_rendezvous_path_is_swap_resistant`], used by the
+/// socket-path tests.
+#[cfg(all(unix, test))]
+fn ensure_socket_path_is_swap_resistant(
+    parent: &std::path::Path,
+    daemon_euid: u32,
+) -> anyhow::Result<()> {
+    ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, RendezvousPathRole::Socket)
 }
 
 /// Walk the socket directory path exactly as the kernel will traverse it at
@@ -1963,11 +2231,17 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
 /// (who could rename the entry, or chmod the directory first), is refused.
 /// Every stat failure fails closed.
 #[cfg(unix)]
-fn ensure_socket_path_is_swap_resistant(
+fn ensure_rendezvous_path_is_swap_resistant(
     parent: &std::path::Path,
     daemon_euid: u32,
+    role: RendezvousPathRole,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
+
+    let env_name = role.env_name();
+    let directory_name = role.directory_name();
+    let path_name = role.path_name();
+    let component_name = role.path_component_name();
 
     let absolute = if parent.is_absolute() {
         parent.to_path_buf()
@@ -1976,7 +2250,7 @@ fn ensure_socket_path_is_swap_resistant(
             .map_err(|e| {
                 anyhow::anyhow!(
                     "refusing to start: cannot resolve the working directory to absolutize \
-                     socket directory {}: {e}.",
+                     {directory_name} {} for {env_name}: {e}.",
                     parent.display()
                 )
             })?
@@ -2011,8 +2285,8 @@ fn ensure_socket_path_is_swap_resistant(
         let candidate = resolved.join(&component);
         let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
             anyhow::anyhow!(
-                "refusing to start: cannot stat socket-path component {}: {e}. An \
-                 unreadable component is not a passing one.",
+                "refusing to start: cannot stat {component_name} component {} for {env_name}: \
+                 {e}. An unreadable component is not a passing one.",
                 candidate.display()
             )
         })?;
@@ -2022,24 +2296,24 @@ fn ensure_socket_path_is_swap_resistant(
             symlinks_followed += 1;
             if symlinks_followed > 40 {
                 anyhow::bail!(
-                    "refusing to start: socket path resolves through more than 40 symlinks \
-                     at {} — treating this as a loop.",
+                    "refusing to start: {path_name} for {env_name} resolves through more than \
+                     40 symlinks at {} — treating this as a loop.",
                     candidate.display()
                 );
             }
             if owner != daemon_euid && owner != 0 {
                 anyhow::bail!(
-                    "refusing to start: socket-path symlink component {} is owned by uid \
-                     {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
-                     could retarget it after this check and re-root the socket path. Point \
-                     KHIVE_SOCKET somewhere trusted end to end, or unset it for the \
-                     default.",
+                    "refusing to start: {component_name} symlink component {} for {env_name} \
+                     is owned by uid {owner}, not this daemon's uid ({daemon_euid}) or root — \
+                     its owner could retarget it after this check and re-root the {path_name}. \
+                     Point {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
                 );
             }
             let target = std::fs::read_link(&candidate).map_err(|e| {
                 anyhow::anyhow!(
-                    "refusing to start: cannot read socket-path symlink component {}: {e}.",
+                    "refusing to start: cannot read {component_name} symlink component {} \
+                     for {env_name}: {e}.",
                     candidate.display()
                 )
             })?;
@@ -2052,19 +2326,19 @@ fn ensure_socket_path_is_swap_resistant(
             let sticky = mode & 0o1000 != 0;
             if owner != daemon_euid && owner != 0 {
                 anyhow::bail!(
-                    "refusing to start: socket-path ancestor {} is owned by uid {owner}, not \
-                     this daemon's uid ({daemon_euid}) or root — its owner could rename the \
-                     next path component and re-root the socket path. Point KHIVE_SOCKET \
-                     somewhere trusted end to end, or unset it for the default.",
+                    "refusing to start: {component_name} ancestor {} for {env_name} is owned by \
+                     uid {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
+                     could rename the next path component and re-root the {path_name}. Point \
+                     {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
                 );
             }
             if mode & 0o022 != 0 && !sticky {
                 anyhow::bail!(
-                    "refusing to start: socket-path ancestor {} is mode {:04o} — writable by \
-                     group or other without the sticky bit, so another local user could rename \
-                     the next path component and re-root the socket path. Point KHIVE_SOCKET \
-                     somewhere trusted end to end, or unset it for the default.",
+                    "refusing to start: {component_name} ancestor {} for {env_name} is mode \
+                     {:04o} — writable by group or other without the sticky bit, so another \
+                     local user could rename the next path component and re-root the {path_name}. \
+                     Point {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display(),
                     mode & 0o7777
                 );
@@ -2074,8 +2348,8 @@ fn ensure_socket_path_is_swap_resistant(
         }
 
         anyhow::bail!(
-            "refusing to start: socket-path component {} is neither a directory nor a \
-             symlink — the socket path cannot traverse it.",
+            "refusing to start: {component_name} component {} for {env_name} is neither a \
+             directory nor a symlink — the {path_name} cannot traverse it.",
             candidate.display()
         );
     }
@@ -2091,7 +2365,7 @@ fn ensure_socket_path_is_swap_resistant(
 /// advisory boot lock to hold in the first place; every unix daemon-mode
 /// caller passes `Some`.
 ///
-/// The guard is held across cleanup → bind → pid-write, then dropped. The
+/// The guard is held across cleanup → pid-claim → bind, then dropped. The
 /// caller must not still be holding a *different* handle to the same lock
 /// file when this function is entered — see the "Deadlock note" on the
 /// `_startup_lock` binding below for why that would self-deadlock on `flock`.
@@ -2151,17 +2425,25 @@ where
 
     let sock = socket_path();
     let pid_file = pid_path();
+    let socket_parent = sock.parent();
+    let pid_parent = pid_file.parent();
 
-    if let Some(parent) = sock.parent() {
+    if let Some(parent) = socket_parent {
         std::fs::create_dir_all(parent)?;
         ensure_socket_dir_is_trusted(parent)?;
     }
+    // Identical parent paths traverse the same components, so the socket
+    // check above also vets the PID-file parent. Aliased paths are checked
+    // independently because each original path is traversed by file access.
+    if pid_parent != socket_parent {
+        ensure_pid_file_dir_is_trusted(&pid_file)?;
+    }
 
-    // Hold the startup lock across cleanup → bind → pid-write so a concurrent
-    // client's kill_and_respawn (which also holds this lock) cannot unlink the
-    // socket between our bind and our pid-write.  The lock is released once the
-    // listener is bound and the PID file is written — at that point any racing
-    // client will find a live socket+pid and skip the stale-cleanup path.
+    // Hold the startup lock across cleanup → pid-claim → bind so a concurrent
+    // client's kill_and_respawn (which also holds this lock) cannot remove the
+    // rendezvous paths during setup. The PID file's own lock is retained after
+    // this shared startup lock is released, including while the listener drains
+    // during shutdown.
     //
     // Deadlock note: the client holds this lock only during kill+spawn and
     // releases it before the spawned daemon process starts (the lock guard is
@@ -2172,10 +2454,8 @@ where
     // same process, which would self-deadlock on `flock`.
     let _startup_lock = boot_guard;
 
-    // #1874: a second daemon must refuse loudly (non-zero exit, pid named) rather
-    // than exit `Ok(())` — a silent success here is what let two detached daemons
-    // coexist on one store with neither side nor its caller ever noticing. Both
-    // live outcomes below refuse; only the message differs.
+    // A second daemon must refuse loudly rather than exit successfully while
+    // another daemon owns this rendezvous. Only `Stale` lets the caller proceed.
     match cleanup_stale_daemon(
         &sock,
         &pid_file,
@@ -2219,37 +2499,11 @@ where
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
-    let listener = UnixListener::bind(&sock)?;
-    // Fail closed, same reason as the directory above. If this chmod fails the
-    // socket is world-reachable in a way the accepted design never covered, so
-    // the bound listener is dropped and the entry removed rather than served.
-    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
-        drop(listener);
-        let _ = std::fs::remove_file(&sock);
-        return Err(anyhow::anyhow!(
-            "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
-             — it is half of the single-principal guarantee this daemon enforces.",
-            sock.display()
-        ));
-    }
-    // Captured while still holding the startup lock, immediately after
-    // bind, so shutdown cleanup can later prove "this is still the same socket
-    // I bound" rather than trusting the path alone.
-    let bound_identity = socket_identity(&sock);
-
-    if let Err(e) = write_pid_file_exclusive(&pid_file) {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            // A PID file appeared between our own `cleanup_stale_daemon`
-            // removing it and this write — only possible if the boot lock did
-            // not actually exclude a concurrent booter (e.g. `acquire_recovery_lock`
-            // failed for one side). Never touch the winner's files: drop only
-            // the socket entry we ourselves just bound (proven via identity,
-            // not path), then decide by checking whether the PID now on disk
-            // names a live, reachable daemon.
-            if bound_identity.is_some() && socket_identity(&sock) == bound_identity {
-                drop(listener);
-                let _ = std::fs::remove_file(&sock);
-            }
+    let pid_file_guard = match write_pid_file_exclusive(&pid_file) {
+        Ok(guard) => guard,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A PID file appeared between cleanup and our claim. Never touch
+            // the winner's files; defer only if it already answers as khived.
             if pid_file_names_a_reachable_daemon(
                 &pid_file,
                 &sock,
@@ -2268,13 +2522,38 @@ where
                  and does not name a reachable daemon"
             );
         }
-        return Err(e.into());
+        Err(e) => return Err(e.into()),
+    };
+
+    let listener = match UnixListener::bind(&sock) {
+        Ok(listener) => listener,
+        Err(e) => {
+            remove_pid_file_if_owned(&pid_file, &pid_file_guard);
+            return Err(e.into());
+        }
+    };
+    // Fail closed, same reason as the directory above. If this chmod fails the
+    // socket is world-reachable in a way the accepted design never covered, so
+    // the bound listener is dropped and the entry removed rather than served.
+    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        remove_pid_file_if_owned(&pid_file, &pid_file_guard);
+        return Err(anyhow::anyhow!(
+            "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
+             — it is half of the single-principal guarantee this daemon enforces.",
+            sock.display()
+        ));
     }
+    // Captured while still holding the startup lock, immediately after
+    // bind, so shutdown cleanup can later prove "this is still the same socket
+    // I bound" rather than trusting the path alone.
+    let bound_identity = socket_identity(&sock);
+
     start(&dispatcher);
 
-    // Release the startup lock now: the listener is bound and the PID file is
-    // written.  Any concurrent client or daemon startup will observe a live
-    // socket+pid and take the non-recovery path.
+    // Release the shared startup lock now that the listener is bound. The
+    // locked PID file continues to identify this daemon through shutdown.
     drop(_startup_lock);
     tracing::info!(
         socket = ?sock,
@@ -2569,8 +2848,8 @@ fn pid_can_name_incumbent(pid: u32, current_pid: u32, allow_same_process_incumbe
 const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Whether the listener at `sock` actually speaks the khived wire protocol
-/// **as the same khived this process would defer to** — identified by
-/// `expected_config_id`.
+/// **as a khived this process can defer to** — identified by a configuration
+/// compatible with `expected_config_id`.
 ///
 /// A live PID plus an accepting Unix socket is not proof of khived: any
 /// unrelated process that happens to have bound the same path also answers
@@ -2585,7 +2864,7 @@ const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// is distinguished only by carrying `metrics: Some(...)`. This sends a
 /// bounded `probe_only` frame (the same identity probe the client-side
 /// recovery path uses, `crates/khive-mcp/src/daemon.rs::probe_daemon_identity`)
-/// carrying this process's own `config_id`, and requires the exact
+/// carrying this process's own `config_id`, and requires a compatible
 /// probe-branch shape back: `ok=true`, `result=None`, `error=None`,
 /// `metrics=None`, `request_id=None` (this probe frame never sets one), no
 /// mismatch flags, matching protocol version, and matching
@@ -2632,7 +2911,23 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
         && !resp.namespace_mismatch
         && !resp.config_mismatch
         && resp.daemon_protocol_version == PROTOCOL_VERSION
-        && resp.served_config_id.as_deref() == Some(expected_config_id)
+        && resp
+            .served_config_id
+            .as_deref()
+            .is_some_and(|served| config_ids_compatible(expected_config_id, served))
+}
+
+/// Whether connecting to an existing socket path is definitely unreachable.
+/// Timeouts and other errors remain ambiguous so cleanup fails closed.
+#[cfg(unix)]
+async fn socket_is_unreachable(sock: &std::path::Path) -> bool {
+    match tokio::time::timeout(DUPLICATE_PROBE_TIMEOUT, UnixStream::connect(sock)).await {
+        Ok(Err(error)) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        _ => false,
+    }
 }
 
 /// What owns the daemon PID file, from the point of view of a process that wants
@@ -2643,7 +2938,7 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
 enum Incumbent {
     /// A live process that answered the khived protocol on the socket.
     Serving(u32),
-    /// A live process owns the PID file and nothing answered. Nothing removed.
+    /// A live PID still has an active or ambiguous rendezvous. Nothing removed.
     Live(u32),
     /// Nothing live owns the store; the socket and PID file were removed.
     Stale,
@@ -2652,10 +2947,9 @@ enum Incumbent {
 /// Check whether `pid_file`/`sock` already name a live daemon and, if not,
 /// remove the stale rendezvous files so the caller may bind fresh.
 ///
-/// Both live outcomes mean the caller must not bind and must refuse to start
-/// rather than silently deferring (#1874: a quiet `Ok(())` here is exactly what
-/// let two detached daemons coexist on one store). Only `Stale` clears the
-/// rendezvous and lets the caller proceed.
+/// A live protocol responder, reachable socket, or live holder of the PID-file
+/// lock means the caller must refuse to start. An unlocked PID with no listener
+/// is a reused PID and may be reclaimed.
 #[cfg(unix)]
 async fn cleanup_stale_daemon(
     sock: &std::path::Path,
@@ -2663,6 +2957,7 @@ async fn cleanup_stale_daemon(
     allow_same_process_incumbent: bool,
     expected_config_id: &str,
 ) -> Incumbent {
+    let mut stale_pid_file_guard = None;
     if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
@@ -2671,7 +2966,21 @@ async fn cleanup_stale_daemon(
                 if sock.exists() && socket_speaks_khived_protocol(sock, expected_config_id).await {
                     return Incumbent::Serving(pid);
                 }
-                return Incumbent::Live(pid);
+                if sock.exists() && !socket_is_unreachable(sock).await {
+                    return Incumbent::Live(pid);
+                }
+                match try_acquire_pid_file_lock(pid_file) {
+                    Ok(Some(guard)) => stale_pid_file_guard = Some(guard),
+                    Ok(None) => return Incumbent::Live(pid),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = ?pid_file,
+                            "cannot check daemon PID-file lock"
+                        );
+                        return Incumbent::Live(pid);
+                    }
+                }
             }
         }
     }
@@ -2685,28 +2994,70 @@ async fn cleanup_stale_daemon(
             tracing::warn!(error = %e, path = ?pid_file, "failed to remove stale PID file");
         }
     }
+    drop(stale_pid_file_guard);
     Incumbent::Stale
 }
 
-/// Create `pid_file` exclusively (`O_EXCL`) and write this process's PID.
+/// Create and lock `pid_file` exclusively (`O_EXCL`) and write this process's PID.
 ///
 /// Uses `create_new(true)` rather than `create(true).truncate(true)` so
 /// this can never silently overwrite a PID file another process created —
-/// under normal operation the boot lock already serializes cleanup → bind →
-/// pid-write across processes, but that guarantee depends on
-/// `acquire_recovery_lock` succeeding for every party. Exclusive creation is
-/// the defense that holds even if the lock itself is unavailable to one side:
-/// the loser observes `ErrorKind::AlreadyExists` instead of clobbering the
-/// winner's PID out from under it.
+/// the held file lock also identifies a starting or draining daemon when its
+/// socket is not yet reachable.
 #[cfg(unix)]
-fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<()> {
+fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     let mut f = opts.open(pid_file)?;
+    // SAFETY: flock is a POSIX advisory lock with no memory side effects.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     f.write_all(std::process::id().to_string().as_bytes())?;
-    Ok(())
+    Ok(f)
+}
+
+/// Try to lock an existing PID file without creating it. `Some(file)` means
+/// there is no daemon lock holder; `None` means a daemon still owns the file.
+#[cfg(unix)]
+fn try_acquire_pid_file_lock(pid_file: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pid_file)?;
+    // SAFETY: flock is a POSIX advisory lock with no memory side effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == Some(libc::EWOULDBLOCK)
+    {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// Remove the PID file on setup failure only while its path still names the
+/// file this start attempt created.
+#[cfg(unix)]
+fn remove_pid_file_if_owned(pid_file: &std::path::Path, guard: &std::fs::File) {
+    let Ok(owned) = guard.metadata() else {
+        return;
+    };
+    let Ok(current) = std::fs::metadata(pid_file) else {
+        return;
+    };
+    if owned.dev() == current.dev() && owned.ino() == current.ino() {
+        if let Err(e) = std::fs::remove_file(pid_file) {
+            tracing::warn!(error = %e, path = ?pid_file, "failed to remove unbound PID file");
+        }
+    }
 }
 
 /// Return `true` if `pid_file` currently names an eligible live process that
@@ -3001,7 +3352,7 @@ mod tests {
             });
         let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
         let secondary_backend =
-            khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
+            khive_db::StorageBackend::sqlite_for_test(secondary_dir.path().join("secondary.db"))
                 .expect("file-backed secondary backend");
 
         let mut tasks = checkpoint_task_specs(
@@ -3066,8 +3417,9 @@ mod tests {
         );
 
         let file_main_dir = tempfile::tempdir().expect("file-backed main tempdir");
-        let file_main = khive_db::StorageBackend::sqlite(file_main_dir.path().join("main.db"))
-            .expect("file-backed main backend");
+        let file_main =
+            khive_db::StorageBackend::sqlite_for_test(file_main_dir.path().join("main.db"))
+                .expect("file-backed main backend");
         let tasks = checkpoint_task_specs(
             Some(file_main.pool_arc()),
             vec![secondary_backend.pool_arc()],
@@ -3203,7 +3555,8 @@ mod tests {
                 }
             );
             let live_pid = std::process::id().to_string();
-            std::fs::write(&pid_file, &live_pid).expect("write live incumbent PID");
+            let _pid_file_guard = write_pid_file_exclusive(&pid_file)
+                .expect("claim and lock the live incumbent PID file");
 
             // Harness eligibility makes our own stable PID an incumbent;
             // ordinary same-PID rejection is covered separately above.
@@ -3220,6 +3573,142 @@ mod tests {
             );
             assert!(socket_identity(&sock) == identity);
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn live_foreign_pid_does_not_block_daemon_startup() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let stale_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("create stale socket path");
+        drop(stale_listener);
+
+        let mut foreign = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn live unrelated process");
+        std::fs::write(&pid_file, foreign.id().to_string()).expect("write unrelated PID");
+
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "foreign-pid-start-test".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let daemon = tokio::spawn(run_daemon_in_process_test(dispatcher));
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = UnixStream::connect(&sock).await {
+                    break Some(stream);
+                }
+                if daemon.is_finished() {
+                    break None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let response = if let Ok(Some(mut stream)) = connected {
+            let mut request = base_request_frame("foreign-pid-start-test");
+            request.probe_only = true;
+            let payload = serde_json::to_vec(&request).expect("encode probe request");
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                write_frame(&mut stream, &payload).await.ok()?;
+                let raw = read_frame(&mut stream).await.ok()?;
+                serde_json::from_slice::<DaemonResponseFrame>(&raw).ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let foreign_survived_start = foreign
+            .try_wait()
+            .expect("query unrelated process state")
+            .is_none();
+
+        daemon.abort();
+        let _ = daemon.await;
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_LOCK");
+
+        assert!(
+            response.is_some_and(|response| {
+                response.ok
+                    && response.served_config_id.as_deref() == Some("foreign-pid-start-test")
+            }),
+            "daemon must start and answer its identity probe"
+        );
+        assert!(
+            foreign_survived_start,
+            "starting khived must leave the unrelated live process running"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn second_start_refuses_while_pid_file_is_locked_before_bind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let _incumbent_startup_guard = write_pid_file_exclusive(&pid_file)
+            .expect("incumbent claims and locks its PID file before binding");
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "startup-lock-test".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_daemon_in_process_test(dispatcher),
+        )
+        .await;
+        let refused = matches!(second, Ok(Err(_)));
+        let pid_file_survived = pid_file.exists();
+        let socket_was_not_bound = !sock.exists();
+
+        std::env::remove_var("KHIVE_SOCKET");
+        std::env::remove_var("KHIVE_PID");
+        std::env::remove_var("KHIVE_LOCK");
+
+        assert!(
+            refused,
+            "a second start must refuse while an incumbent holds its pre-bind PID lock"
+        );
+        assert!(
+            pid_file_survived,
+            "the incumbent PID file must remain in place"
+        );
+        assert!(
+            socket_was_not_bound,
+            "the second start must not bind the socket"
+        );
     }
 
     #[test]
@@ -4520,6 +5009,36 @@ mod tests {
         );
     }
 
+    /// Pre-v8 bridges compare the served config id exactly and can replay a
+    /// successful write locally after a daemon accepts a compatible superset.
+    /// Reject their requests before dispatch so a rolling upgrade cannot write twice.
+    #[tokio::test]
+    async fn protocol_v7_frame_is_rejected_before_compatible_superset_dispatch() {
+        let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_id = config_id("p", "");
+        let daemon_id = config_id("p", "m");
+        assert!(super::config_ids_compatible(&client_id, &daemon_id));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: daemon_id,
+            dispatch_calls: Arc::clone(&dispatch_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut request = base_request_frame(&client_id);
+        request.protocol_version = 7;
+
+        let response = round_trip(dispatcher, &request).await;
+        assert!(!response.ok);
+        assert!(!response.version_mismatch);
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["code"],
+            "version_mismatch"
+        );
+        assert_eq!(response.daemon_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(dispatch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// A client above this protocol is answered with the explicit flag: that
     /// direction is the warm-old-daemon case, where the newer client's own
     /// handling replaces the daemon, and the implicit shape reserved for older
@@ -4741,9 +5260,8 @@ mod tests {
     /// owner). On macOS these fixtures also implicitly exercise the
     /// symlink-accept arm, since the platform temp root itself resolves
     /// through root-owned symlinks. Foreign ownership of a directory is
-    /// refused by the same helper, but a non-root test cannot chown a
-    /// directory away from itself, so that arm is exercised by the mode
-    /// checks' shared fail-closed path rather than a dedicated fixture.
+    /// refused by the same helper; a separate simulated-euid test covers
+    /// foreign ownership without requiring a privileged chown operation.
     #[test]
     fn trusted_socket_dirs_are_accepted_unmodified() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4763,6 +5281,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pid_directory_owned_by_another_uid_is_refused() {
+        let workspace = std::env::current_dir().expect("workspace directory");
+        let dir = tempfile::Builder::new()
+            .prefix("khive-pid-owner-")
+            .tempdir_in(workspace)
+            .expect("workspace-local tempdir");
+        let parent = dir.path().join("private");
+        std::fs::create_dir(&parent).expect("create private directory");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("set private mode");
+
+        // A non-root test cannot chown its directory to another uid. Injecting
+        // an euid that does not own this directory exercises that same refusal.
+        // SAFETY: `geteuid` is always successful and takes no arguments.
+        let daemon_euid = (unsafe { libc::geteuid() } as u32).wrapping_add(1);
+        let error = ensure_rendezvous_dir_is_trusted(
+            &parent,
+            RendezvousPathRole::PidFile,
+            daemon_euid,
+            false,
+        )
+        .expect_err("a PID parent owned by another uid must be refused");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("KHIVE_PID"),
+            "wrong variable in refusal: {message}"
+        );
+        assert!(
+            message.contains("PID-file directory") && message.contains("owned by uid"),
+            "refusal must identify foreign ownership of the PID parent: {message}"
+        );
+    }
+
     /// Test 2: `wal_pages` reflects a real
     /// checkpoint observation after writes, deterministically forced via a
     /// direct `checkpoint_once` call rather than waiting on the async
@@ -4774,7 +5327,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5028,7 +5581,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(path),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5133,7 +5686,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_enabled.db")),
                 write_queue_enabled: Some(true),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5155,7 +5708,7 @@ mod tests {
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_disabled.db")),
                 write_queue_enabled: Some(false),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -5878,5 +6431,140 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(background_task_count(), before);
+    }
+
+    fn config_id(primary: &str, extra: &str) -> String {
+        format!(
+            "packs=[kg];db=:memory:;embed={primary};extra=[{extra}];fresh_tail=true;blob_hydration_bytes=268435456;backend=Sqlite;outbound=[];git_write=policy;brain=readers;telemetry=default;display_tz=UTC"
+        )
+    }
+
+    #[test]
+    fn an_available_extra_embedder_does_not_block_daemon_reuse() {
+        let client = config_id("p", "");
+        let daemon = config_id("p", "m");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+    }
+
+    #[test]
+    fn a_missing_requested_extra_embedder_is_named_and_refused() {
+        let client = config_id("p", "m");
+        let daemon = config_id("p", "");
+
+        assert!(!super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(&client, Some(&daemon)),
+            "extra"
+        );
+    }
+
+    #[test]
+    fn extra_embedder_order_and_duplicates_do_not_block_daemon_reuse() {
+        let client = config_id("p", "a,b,a");
+        let daemon = config_id("p", "b,a,c,b");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+    }
+
+    #[test]
+    fn a_primary_repeated_as_an_extra_remains_available_to_the_client() {
+        let client = config_id("AllMiniLmL6V2", "");
+        let daemon = config_id("AllMiniLmL6V2", "AllMiniLmL6V2");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::config_id_extra_embedder_exclusions(&client, &daemon),
+            Some(vec![]),
+            "the request may still use its primary model"
+        );
+
+        let client_with_primary_extra = config_id("AllMiniLmL6V2", "AllMiniLmL6V2");
+        let daemon_without_extra = config_id("AllMiniLmL6V2", "");
+        assert!(super::config_ids_compatible(
+            &client_with_primary_extra,
+            &daemon_without_extra
+        ));
+    }
+
+    #[test]
+    fn a_daemon_extra_matching_the_primary_is_not_hidden_with_other_extras() {
+        let client = config_id("AllMiniLmL6V2", "BgeSmallEnV15");
+        let daemon = config_id("AllMiniLmL6V2", "AllMiniLmL6V2,BgeSmallEnV15");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::config_id_extra_embedder_exclusions(&client, &daemon),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn a_legacy_exact_match_refusal_names_an_extra_superset() {
+        let client = config_id("p", "");
+        let daemon = config_id("p", "m");
+
+        assert!(super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(&client, Some(&daemon)),
+            "extra"
+        );
+    }
+
+    /// The request-dispatch call site applies the superset rule, not only the
+    /// comparison helper: a daemon holding an extra embedder serves a client
+    /// that declares none, and a client requesting an extra the daemon lacks
+    /// is refused before dispatch.
+    #[tokio::test]
+    async fn dispatch_serves_a_client_whose_extra_embedders_the_daemon_covers() {
+        let covering_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let covering = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: config_id("p", "m"),
+            dispatch_calls: Arc::clone(&covering_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let served = round_trip(covering, &base_request_frame(&config_id("p", ""))).await;
+        assert!(
+            served.ok && !served.config_mismatch,
+            "a daemon extra-embedder superset must be served: {served:?}"
+        );
+        assert_eq!(
+            covering_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the covered request must reach dispatch"
+        );
+
+        let lacking_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lacking = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: config_id("p", ""),
+            dispatch_calls: Arc::clone(&lacking_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let refused = round_trip(lacking, &base_request_frame(&config_id("p", "m"))).await;
+        assert!(
+            !refused.ok && refused.config_mismatch,
+            "a requested extra the daemon lacks must be refused: {refused:?}"
+        );
+        assert_eq!(
+            lacking_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused request must not reach dispatch"
+        );
+    }
+
+    #[test]
+    fn a_different_primary_embedder_is_refused_even_with_extra_superset() {
+        let client = config_id("p", "a");
+        let daemon = config_id("q", "a,b");
+
+        assert!(!super::config_ids_compatible(&client, &daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(&client, Some(&daemon)),
+            "embed"
+        );
     }
 }

@@ -55,6 +55,14 @@
 # request parameter is a precise escape and is not widened by this list.
 # visible_namespaces = ["lambda:mybot", "local"]
 
+# Exact actor labels allowed to read this actor's explicitly selected mailbox.
+# For email routed to channel:email, configure the serving process with
+# id = "channel:email" and grant each reader here. The anonymous local caller
+# cannot read that mailbox. A listed reader selects it with
+# comm.inbox(mailbox_actor="channel:email").
+# The request must resolve to one of the listed reader actor labels.
+# mailbox_readers = ["lambda:email-reader"]
+
 # Namespaces this actor's comm.send / comm.reply may deliver INTO. Empty (default)
 # denies all cross-namespace delivery. Each entry must be a valid namespace.
 # allowed_outbound_namespaces = ["lambda:otherbot"]
@@ -312,6 +320,10 @@ fusion_weight = 0.5
 #                                Required. Comma-separated allowlist of senders whose inbound mail
 #                                is accepted; the first entry is primary.
 #   KHIVE_EMAIL_DEFAULT_ACTOR=local           Actor for new inbound mail with no thread match.
+#                                Set to channel:email to opt into a separate mailbox.
+#                                Anonymous local cannot read it; configure [actor].mailbox_readers
+#                                on the channel:email serving process and read with
+#                                comm.inbox(mailbox_actor="channel:email").
 #   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
 #   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
 #                                Comma-separated outbound allowlist. Default: the maintainer address.

@@ -118,13 +118,13 @@ mod tests {
             db_path: Some(dir.path().join("read-only-phase-events.db")),
             ..RuntimeConfig::no_embeddings()
         };
-        drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
+        drop(KhiveRuntime::new_for_test(config.clone()).expect("migrate snapshot source"));
         #[cfg(unix)]
         {
             let db_path = config.db_path.as_ref().expect("db path");
             khive_storage::test_support::freeze_snapshot_sidecars(db_path);
         }
-        let runtime = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
+        let runtime = KhiveRuntime::new_readonly_for_test(config).expect("open snapshot read-only");
         let token = runtime
             .authorize(crate::Namespace::local())
             .expect("authorize local");

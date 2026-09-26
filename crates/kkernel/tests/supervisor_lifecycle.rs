@@ -161,6 +161,15 @@ impl Fixture {
         command
     }
 
+    fn locked_pid_command(&self) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "supervisor_locked_pid_child", "--nocapture"])
+            .env("KHIVE_SUPERVISOR_STUB_PID_FILE", &self.pid_file)
+            .stdin(Stdio::null());
+        command
+    }
+
     fn spawn(&self, command: &mut Command, log_name: &str) -> (OwnedChild, PathBuf) {
         let log_path = self.root.path().join(log_name);
         let log = File::create(&log_path).unwrap();
@@ -570,6 +579,55 @@ fn supervisor_socket_stub_child() {
     }
 }
 
+#[test]
+fn supervisor_locked_pid_child() {
+    let Some(path) = std::env::var_os("KHIVE_SUPERVISOR_STUB_PID_FILE") else {
+        return;
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    // SAFETY: this child owns the file descriptor until its parent stops it.
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+    writeln!(file, "{}", std::process::id()).unwrap();
+    file.flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+fn wait_locked_pid_child(fixture: &Fixture, child: &mut OwnedChild, log_path: &Path) {
+    use std::os::fd::AsRawFd;
+
+    let deadline = Instant::now() + START_LIMIT;
+    let expected = format!("{}\n", child.0.id());
+    while std::fs::read_to_string(&fixture.pid_file).ok().as_deref() != Some(expected.as_str()) {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "PID lock child exited: {}",
+            std::fs::read_to_string(log_path).unwrap_or_default()
+        );
+        assert!(Instant::now() < deadline, "PID lock child did not publish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fixture.pid_file)
+        .unwrap();
+    // SAFETY: this is a nonblocking probe of a file owned by the fixture.
+    let rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, -1, "PID fixture did not hold its file lock");
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    assert!(
+        errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN),
+        "unexpected PID lock probe error: {errno:?}"
+    );
+}
+
 fn wait_stub_socket(fixture: &Fixture, stub: &mut OwnedChild, log_path: &Path) {
     let deadline = Instant::now() + START_LIMIT;
     while !fixture.socket.exists() {
@@ -818,12 +876,13 @@ fn supervisor_silent_same_uid_stub_is_not_signalled() {
 }
 
 // MUST-FAIL: replacing the peer PID with the PID-file PID in the handover
-// branch would signal the unrelated decoy, not the answering socket holder.
+// branch would signal the unrelated locked decoy, not the answering socket holder.
 #[test]
 fn supervisor_pid_file_decoy_never_selects_signal_target() {
     let fixture = Fixture::new();
-    let mut unrelated = OwnedChild(Command::new("sleep").arg("60").spawn().unwrap());
-    std::fs::write(&fixture.pid_file, format!("{}\n", unrelated.0.id())).unwrap();
+    let (mut unrelated, unrelated_log) =
+        fixture.spawn(&mut fixture.locked_pid_command(), "unrelated-pid.log");
+    wait_locked_pid_child(&fixture, &mut unrelated, &unrelated_log);
     let (status, log) = fixture.completed(
         &mut fixture.launch_command(&fixture.config),
         "pid-only-launch.log",
@@ -840,12 +899,16 @@ fn supervisor_pid_file_decoy_never_selects_signal_target() {
         unrelated.0.try_wait().unwrap().is_none(),
         "unrelated PID-file process was signalled"
     );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.pid_file).unwrap(),
+        format!("{}\n", unrelated.0.id())
+    );
 
     // Separate poison subcase: a probe-answering daemon-like stub owns the
     // socket while the PID file still names an unrelated live process.
     let poison = Fixture::new();
-    let mut decoy = OwnedChild(Command::new("sleep").arg("60").spawn().unwrap());
-    std::fs::write(&poison.pid_file, format!("{}\n", decoy.0.id())).unwrap();
+    let (mut decoy, decoy_log) = poison.spawn(&mut poison.locked_pid_command(), "decoy-pid.log");
+    wait_locked_pid_child(&poison, &mut decoy, &decoy_log);
     let (mut holder, holder_log) =
         poison.spawn(&mut poison.stub_command("answer"), "answer-stub.log");
     wait_stub_socket(&poison, &mut holder, &holder_log);
@@ -864,6 +927,10 @@ fn supervisor_pid_file_decoy_never_selects_signal_target() {
     assert!(
         decoy.0.try_wait().unwrap().is_none(),
         "decoy PID-file process was signalled"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&poison.pid_file).unwrap(),
+        format!("{}\n", decoy.0.id())
     );
     let deadline = Instant::now() + START_LIMIT;
     while holder.0.try_wait().unwrap().is_none() {
