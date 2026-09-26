@@ -464,7 +464,25 @@ impl Fixture {
         json!({"number":n,"method":"merge","subject":"Fixture merge","body":"","expected_head":self.head})
     }
     async fn open(&self) -> u64 {
-        self.call(&self.actor,"git.pr_open",json!({"head":"work","base":"main","title":"Fixture","body":"","expected_head":self.head})).await.unwrap()["number"].as_u64().unwrap()
+        let reply = self
+            .call(
+                &self.actor,
+                "git.pr_open",
+                json!({"head":"work","base":"main","title":"Fixture","body":"","expected_head":self.head}),
+            )
+            .await;
+        if let Err(error) = &reply {
+            let receipt = self.last(&self.actor).await;
+            eprintln!(
+                "remote fixture refusal: {error}; receipt_actor={:?} reason={:?} table={:?} key={:?} cause={:?}",
+                receipt.actor,
+                receipt.reason,
+                receipt.result["refusal"]["table"],
+                receipt.result["refusal"]["key"],
+                receipt.result["refusal"]["cause"],
+            );
+        }
+        reply.unwrap()["number"].as_u64().unwrap()
     }
     async fn review(&self, actor: &str, n: u64) -> Result<Value, RuntimeError> {
         self.call(

@@ -265,13 +265,12 @@ plus either `not in the object database` or `missing object`) so ordinary
 auth/network/`bad object`/spawn/local-source failures are never treated as
 corrupt-cache and never trigger a destructive repair.
 
-`walk_commits` shells out to `git log` with a stable, machine-parseable
-format (v0 choice per ADR-088 §5 — `git2`/`gix` are not workspace
-dependencies today, so shelling out avoids a new heavy dependency). Raw
-control-byte separators are embedded directly in the format string (not
-git's `%xHH` escape syntax) — passed as a single argv element (never
-through a shell), so the literal bytes survive intact and git's
-pretty-format engine emits any non-`%` character verbatim.
+`walk_commits` shells out to `git log` for Git-generated IDs and dates, then
+reads contributor-controlled author and message text through the byte-length
+framing of `git cat-file --batch` (v0 shell-out choice per ADR-088 §5 —
+`git2`/`gix` are not workspace dependencies). Control bytes in author names or
+messages cannot split a commit record; malformed metadata or batch framing is
+an error rather than a silent skipped commit.
 
 `touched_files` is a separate `--name-only` pass, kept apart from
 `walk_commits`'s custom `--pretty=format` — interleaving file-name lines
