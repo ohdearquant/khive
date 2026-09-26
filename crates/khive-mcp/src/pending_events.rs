@@ -5,9 +5,10 @@
 //! is at or before now, dispatches scheduled actions or delivers reminders to
 //! their creating actors through `comm.send`, and durably records each action
 //! outcome before finalizing the event lifecycle. Successful one-shots become
-//! `"fired"`; failed one-shots remain `"pending"` for recovery; named repeats
-//! advance to their next occurrence. Events overdue by more than the configured
-//! grace window are never dispatched, per the missed-event policy below.
+//! `"fired"`; failed one-shots retry only when the domain outcome permits it;
+//! named repeats advance to their next occurrence. Events overdue by more than
+//! the configured grace window are never dispatched, per the missed-event
+//! policy below.
 //!
 //! Full design rationale (module placement, invocation-mode tradeoffs,
 //! namespace-isolation and missed-event-policy background) lives in
@@ -264,6 +265,10 @@ impl std::fmt::Display for DispatchFailure {
 struct DispatchActionError {
     failure: DispatchFailure,
     outcome_uncertain: bool,
+    /// The only uncertainty is a domain disposition on a per-op error. Defer
+    /// its replay decision until finalization reads the current repeat value:
+    /// a repeat advances, while a one-shot must end indeterminate.
+    disposition_only_uncertain: bool,
 }
 
 impl std::fmt::Display for DispatchActionError {
@@ -277,6 +282,7 @@ impl DispatchActionError {
         Self {
             failure,
             outcome_uncertain: false,
+            disposition_only_uncertain: false,
         }
     }
 
@@ -284,6 +290,15 @@ impl DispatchActionError {
         Self {
             failure,
             outcome_uncertain: true,
+            disposition_only_uncertain: false,
+        }
+    }
+
+    fn disposition_uncertain(failure: DispatchFailure) -> Self {
+        Self {
+            failure,
+            outcome_uncertain: true,
+            disposition_only_uncertain: true,
         }
     }
 }
@@ -1933,8 +1948,22 @@ fn final_properties_after_dispatch(
                     (properties, FinalDisposition::Advanced)
                 }
                 None => {
-                    properties["status"] = json!("pending");
-                    (properties, FinalDisposition::RetryPending)
+                    if properties
+                        .pointer("/dispatch_receipt/error_payload")
+                        .is_some_and(action_error_disposition_may_have_committed)
+                    {
+                        // A repeat with a next occurrence can advance despite
+                        // this error. With no next occurrence, Failed would
+                        // replay this same action; the durable receipt must
+                        // instead say that its domain outcome is uncertain.
+                        properties["dispatch_receipt"]["state"] =
+                            json!(DispatchReceiptState::Indeterminate.as_str());
+                        properties["status"] = json!("failed");
+                        (properties, FinalDisposition::Failed)
+                    } else {
+                        properties["status"] = json!("pending");
+                        (properties, FinalDisposition::RetryPending)
+                    }
                 }
             }
         }
@@ -3001,7 +3030,7 @@ async fn dispatch_with_renewable_lease(
     } else {
         match dispatch_result {
             Ok(()) => DispatchCompletion::Succeeded,
-            Err(error) if error.outcome_uncertain => {
+            Err(error) if error.outcome_uncertain && !error.disposition_only_uncertain => {
                 DispatchCompletion::Indeterminate(error.failure)
             }
             Err(error) => DispatchCompletion::Failed(error.failure),
@@ -3075,17 +3104,47 @@ fn action_error_outcome_is_uncertain(error: &Value) -> bool {
                 || message.contains("comm.delivered")))
 }
 
+fn action_error_disposition_may_have_committed(error: &Value) -> bool {
+    match error {
+        Value::Array(errors) => errors
+            .iter()
+            .any(action_error_disposition_may_have_committed),
+        Value::Object(fields) => ["domain_disposition", "entry_domain_disposition"]
+            .into_iter()
+            .filter_map(|key| fields.get(key))
+            .any(|disposition| disposition.as_str() != Some("not_committed")),
+        _ => false,
+    }
+}
+
 fn action_failures(failures: &[&Value]) -> DispatchActionError {
     let errors: Vec<Value> = failures
         .iter()
         .map(|failure| {
-            failure
+            let mut error = failure
                 .get("error")
                 .cloned()
-                .unwrap_or_else(|| (*failure).clone())
+                .unwrap_or_else(|| (*failure).clone());
+            if let Some(disposition) = failure.get("domain_disposition") {
+                if let Some(fields) = error.as_object_mut() {
+                    // Preserve both values if the entry and error disagree:
+                    // either may say that the mutation already committed.
+                    fields.insert("entry_domain_disposition".into(), disposition.clone());
+                } else {
+                    error = json!({
+                        "message": action_error_message(&error),
+                        "original_error": error,
+                        "entry_domain_disposition": disposition,
+                    });
+                }
+            }
+            error
         })
         .collect();
-    let outcome_uncertain = errors.iter().any(action_error_outcome_is_uncertain);
+    let heuristic_uncertain = errors.iter().any(action_error_outcome_is_uncertain);
+    let disposition_uncertain = errors
+        .iter()
+        .any(action_error_disposition_may_have_committed);
     let messages = errors
         .iter()
         .map(action_error_message)
@@ -3102,8 +3161,10 @@ fn action_failures(failures: &[&Value]) -> DispatchActionError {
         ),
         payload,
     );
-    if outcome_uncertain {
+    if heuristic_uncertain {
         DispatchActionError::uncertain(failure)
+    } else if disposition_uncertain {
+        DispatchActionError::disposition_uncertain(failure)
     } else {
         DispatchActionError::known(failure)
     }
@@ -3611,6 +3672,57 @@ mod tests {
         marker: String,
         outbound_id: uuid::Uuid,
         invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct OrdinaryHandlerFailurePack {
+        invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl khive_types::Pack for OrdinaryHandlerFailurePack {
+        const NAME: &'static str = "ordinary-handler-failure-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "test.ordinary_handler_failure",
+            description: "return an ordinary error after handler admission",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for OrdinaryHandlerFailurePack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &khive_runtime::VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<Value, khive_runtime::RuntimeError> {
+            debug_assert_eq!(verb, "test.ordinary_handler_failure");
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(khive_runtime::RuntimeError::Internal(
+                "handler returned an ordinary error".into(),
+            ))
+        }
     }
 
     impl khive_types::Pack for AmbiguousSideEffectPack {
@@ -6187,6 +6299,177 @@ mod tests {
             2,
             "one failed invocation and one successful retry"
         );
+    }
+
+    #[test]
+    fn action_failure_disposition_distinguishes_committed_from_not_committed() {
+        for (disposition, uncertain) in [
+            ("committed", true),
+            ("unknown", true),
+            ("not_committed", false),
+        ] {
+            let entry = json!({
+                "ok": false,
+                "error": {
+                    "kind": "internal",
+                    "message": "post-commit maintenance failed",
+                    "domain_disposition": disposition,
+                },
+            });
+            let error = action_failures(&[&entry]);
+            assert_eq!(error.outcome_uncertain, uncertain, "{disposition}");
+            assert_eq!(error.disposition_only_uncertain, uncertain, "{disposition}");
+        }
+
+        let entry_only = json!({
+            "ok": false,
+            "domain_disposition": "committed",
+            "error": {"kind": "internal", "message": "obligation failed"},
+        });
+        let error = action_failures(&[&entry_only]);
+        assert!(error.disposition_only_uncertain);
+        assert_eq!(
+            error.failure.payload.as_ref().unwrap()["entry_domain_disposition"],
+            "committed"
+        );
+
+        let conflicting = json!({
+            "ok": false,
+            "domain_disposition": "unknown",
+            "error": {
+                "kind": "internal",
+                "message": "the entry is authoritative too",
+                "domain_disposition": "not_committed",
+            },
+        });
+        assert!(action_failures(&[&conflicting]).disposition_only_uncertain);
+
+        let legacy_hold = json!({
+            "ok": false,
+            "error": {
+                "code": "side_effects_unknown",
+                "message": "delivery outcome is uncertain",
+                "domain_disposition": "not_committed",
+            },
+        });
+        let error = action_failures(&[&legacy_hold]);
+        assert!(error.outcome_uncertain);
+        assert!(!error.disposition_only_uncertain);
+    }
+
+    #[test]
+    fn committed_error_without_next_occurrence_finishes_indeterminate() {
+        let trigger_at = Utc::now();
+        let failure = DispatchFailure::with_payload(
+            "post-commit maintenance failed",
+            json!({"kind": "internal", "domain_disposition": "committed"}),
+        );
+        let receipt = json!({
+            "state": "failed",
+            "completed_at": trigger_at.timestamp_micros(),
+            "error_payload": failure.payload.clone(),
+        });
+        let completion = DispatchCompletion::Failed(failure);
+        let (properties, disposition) = final_properties_after_dispatch(
+            json!({"event_type": "schedule"}),
+            receipt,
+            &completion,
+            trigger_at,
+            FixedOffset::east_opt(0).unwrap(),
+            &None,
+        );
+        assert_eq!(disposition, FinalDisposition::Failed);
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn one_shot_handler_error_runs_once_across_two_drains() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(OrdinaryHandlerFailurePack {
+            invocations: invocations.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("test.ordinary_handler_failure()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let first = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("first drain");
+        assert_eq!(first.invoked, 1);
+        assert_eq!(first.indeterminate, 1);
+        assert_eq!(first.retry_pending, 0);
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
+        assert_eq!(
+            properties["dispatch_receipt"]["error_payload"]["domain_disposition"],
+            "unknown"
+        );
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("second drain");
+        assert_eq!(second.invoked, 0);
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn repeating_handler_error_advances_with_error_recorded() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(OrdinaryHandlerFailurePack {
+            invocations: invocations.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("test.ordinary_handler_failure()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let first = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("first drain");
+        assert_eq!(first.invoked, 1);
+        assert_eq!(first.advanced, 1);
+        assert_eq!(first.indeterminate, 0);
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "pending");
+        assert_eq!(properties["dispatch_receipt"]["state"], "failed");
+        assert!(properties["dispatch_error"].as_str().is_some());
+        let next = properties["trigger_at"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        assert!(next.with_timezone(&Utc) > Utc::now());
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("second drain");
+        assert_eq!(second.invoked, 0);
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
