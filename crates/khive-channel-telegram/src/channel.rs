@@ -86,9 +86,30 @@ impl TelegramChannel {
 
         if message.chat.id != self.config.maintainer_chat_id {
             tracing::warn!(
+                reason = "chat_id_mismatch",
                 chat_id = message.chat.id,
                 update_id = update.update_id,
                 "telegram: update from unauthorized chat id, dropping"
+            );
+            return None;
+        }
+
+        let Some(sender) = message.from.as_ref() else {
+            tracing::warn!(
+                reason = "missing_sender",
+                chat_id = message.chat.id,
+                update_id = update.update_id,
+                "telegram: update without sender, dropping"
+            );
+            return None;
+        };
+        if sender.id != self.config.authorized_sender_id {
+            tracing::warn!(
+                reason = "sender_id_mismatch",
+                chat_id = message.chat.id,
+                sender_id = sender.id,
+                update_id = update.update_id,
+                "telegram: update from unauthorized sender, dropping"
             );
             return None;
         }
@@ -211,13 +232,14 @@ fn strip_kind_prefix<'a>(addr: &'a str, kind: &str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::{TelegramChat, TelegramMessage};
+    use crate::connector::{TelegramChat, TelegramMessage, TelegramUser};
     use std::sync::Mutex as StdMutex;
 
     fn make_config() -> TelegramChannelConfig {
         TelegramChannelConfig {
             bot_token: "test-token".to_string(), // gitleaks:allow
             maintainer_chat_id: 555,
+            authorized_sender_id: 555,
             maintainer_slug: "maintainer".to_string(),
             ingest_namespace: "local".to_string(),
         }
@@ -283,6 +305,7 @@ mod tests {
                 message_id: update_id,
                 date,
                 chat: TelegramChat { id: chat_id },
+                from: Some(TelegramUser { id: chat_id }),
                 text: Some(text.to_string()),
             }),
         }
@@ -402,6 +425,31 @@ mod tests {
             envs.is_empty(),
             "unauthorized chat id must be dropped with no note, not surfaced as an error"
         );
+    }
+
+    #[tokio::test]
+    async fn group_chat_accepts_only_configured_sender_and_skips_missing_sender() {
+        let mut config = make_config();
+        config.maintainer_chat_id = -100123;
+        config.authorized_sender_id = 42;
+        let mut other = text_update(12, -100123, "other", 1_700_000_000);
+        other.message.as_mut().unwrap().from = Some(TelegramUser { id: 99 });
+        let mut missing = text_update(13, -100123, "missing", 1_700_000_001);
+        missing.message.as_mut().unwrap().from = None;
+        let mut authorized = text_update(14, -100123, "authorized", 1_700_000_002);
+        authorized.message.as_mut().unwrap().from = Some(TelegramUser { id: 42 });
+        let ch = TelegramChannel::with_connector(
+            config,
+            Box::new(MockConnector::new(vec![vec![other, missing, authorized]])),
+        );
+
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "telegram:maintainer");
+        assert_eq!(envs[0].content, "authorized");
+        assert_eq!(envs[0].external_id.as_deref(), Some("tg:-100123:14"));
+        ch.commit_offset();
+        assert_eq!(ch.current_offset(), Some(15));
     }
 
     #[tokio::test]
@@ -546,6 +594,7 @@ mod tests {
                 message_id: 5,
                 date: 1_700_000_000,
                 chat: TelegramChat { id: 555 },
+                from: Some(TelegramUser { id: 555 }),
                 text: None,
             }),
         };
