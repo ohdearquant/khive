@@ -2902,6 +2902,7 @@ dependencies = [
  "libc",
  "lru 0.18.2",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
