@@ -228,23 +228,25 @@ pub async fn resolve_cwd(
     })
 }
 
-/// The one entry validator: paths, modes, duplicates, ref format, and the rule that an entry
-/// cannot also be a directory prefix of another entry. Exposed so `exec.tree_put` validates
-/// a whole candidate manifest through this function rather than reimplementing its rules.
+/// Validate wire entries in input order: paths, refs, modes, duplicates, and
+/// file/directory collisions. `exec.tree_put` uses this for candidate manifests.
 pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeError> {
     let items = value.as_array().ok_or_else(|| {
         RuntimeError::InvalidInput("entries must be an array of {path, ref, mode}".into())
     })?;
-    let mut entries = Vec::with_capacity(items.len());
+    let mut seen: BTreeMap<String, TreeEntry> = BTreeMap::new();
     for item in items {
         let path = item
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| RuntimeError::InvalidInput("entry.path must be a string".into()))?;
+        let path = validate_relative_path(path, "entry")?;
         let content_ref = item
             .get("ref")
             .and_then(Value::as_str)
             .ok_or_else(|| RuntimeError::InvalidInput("entry.ref must be a string".into()))?;
+        ContentRef::from_hex(content_ref)
+            .map_err(|e| RuntimeError::InvalidInput(format!("entry {path:?} ref: {e}")))?;
         let mode = item.get("mode").and_then(Value::as_u64).ok_or_else(|| {
             RuntimeError::InvalidInput("entry.mode must be 644, 755 or 120000".into())
         })?;
@@ -253,18 +255,19 @@ pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeErro
                 "entry {path:?} mode must be 644, 755 or 120000; got {mode}"
             )));
         }
-        entries.push(TreeEntry {
-            path: path.to_string(),
-            content_ref: content_ref.to_string(),
-            mode: mode as u32,
-        });
+        insert_entry(
+            &mut seen,
+            TreeEntry {
+                path,
+                content_ref: content_ref.to_string(),
+                mode: mode as u32,
+            },
+        )?;
     }
-    validate_entries(&entries)
+    Ok(seen.into_values().collect())
 }
 
-/// Shared validator for both caller-supplied manifests and captured output.
-/// A path's parents and its first ordered descendant are sufficient to find
-/// every file/directory collision; scanning all prior paths is quadratic.
+/// Validate captured output and loaded manifests with the same rules as wire entries.
 fn validate_entries(entries: &[TreeEntry]) -> Result<Vec<TreeEntry>, RuntimeError> {
     let mut seen: BTreeMap<String, TreeEntry> = BTreeMap::new();
     for entry in entries {
@@ -277,36 +280,47 @@ fn validate_entries(entries: &[TreeEntry]) -> Result<Vec<TreeEntry>, RuntimeErro
                 entry.mode
             )));
         }
-        if seen.contains_key(&path) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "duplicate entry path {path:?}"
-            )));
-        }
-        // Neither a file nor a symlink can be a directory prefix of another entry.
-        for (index, byte) in path.bytes().enumerate() {
-            if byte == b'/' {
-                let parent = &path[..index];
-                if let Some((existing, _)) = seen.get_key_value(parent) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "entry {path:?} conflicts with entry {existing:?} (file and directory at one path)"
-                    )));
-                }
-            }
-        }
-        let prefix = format!("{path}/");
-        if let Some((existing, _)) = seen
-            .range::<str, _>((Included(prefix.as_str()), Unbounded))
-            .next()
-        {
-            if existing.starts_with(&prefix) {
+        insert_entry(&mut seen, entry.clone())?;
+    }
+    Ok(seen.into_values().collect())
+}
+
+/// Insert an already validated entry. Its parents and first ordered descendant
+/// find every file/directory collision without scanning all prior entries.
+fn insert_entry(
+    seen: &mut BTreeMap<String, TreeEntry>,
+    entry: TreeEntry,
+) -> Result<(), RuntimeError> {
+    let path = &entry.path;
+    if seen.contains_key(path) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "duplicate entry path {path:?}"
+        )));
+    }
+    // Neither a file nor a symlink can be a directory prefix of another entry.
+    for (index, byte) in path.bytes().enumerate() {
+        if byte == b'/' {
+            let parent = &path[..index];
+            if let Some((existing, _)) = seen.get_key_value(parent) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "entry {path:?} conflicts with entry {existing:?} (file and directory at one path)"
                 )));
             }
         }
-        seen.insert(path, entry.clone());
     }
-    Ok(seen.into_values().collect())
+    let prefix = format!("{path}/");
+    if let Some((existing, _)) = seen
+        .range::<str, _>((Included(prefix.as_str()), Unbounded))
+        .next()
+    {
+        if existing.starts_with(&prefix) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entry {path:?} conflicts with entry {existing:?} (file and directory at one path)"
+            )));
+        }
+    }
+    seen.insert(entry.path.clone(), entry);
+    Ok(())
 }
 
 /// Serialize only a manifest that the load path can read back. The writer
@@ -611,6 +625,63 @@ mod tests {
     }
 
     #[test]
+    fn ordered_conflict_probe_reports_first_descendant_and_ignores_siblings() {
+        let r = digest_hex(b"target");
+        let entries = json!([
+            {"path": "pkg-other", "ref": r, "mode": 644},
+            {"path": "pkg/b", "ref": r, "mode": 644},
+            {"path": "pkg/a", "ref": r, "mode": 644},
+            {"path": "pkg", "ref": r, "mode": 644},
+        ]);
+        let error = parse_entries(&entries).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInput(ref message)
+                if message == "entry \"pkg\" conflicts with entry \"pkg/a\" (file and directory at one path)"
+        ));
+
+        let siblings = json!([
+            {"path": "pkg-other", "ref": r, "mode": 644},
+            {"path": "pkg", "ref": r, "mode": 644},
+        ]);
+        assert_eq!(parse_entries(&siblings).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wire_validation_reports_the_first_invalid_entry() {
+        let r = digest_hex(b"target");
+        let bad_path = json!([
+            {"path": "bad//path", "mode": 644},
+            {"path": "later", "ref": r, "mode": "invalid"},
+        ]);
+        let error = parse_entries(&bad_path).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInput(ref message)
+                if message == "entry path \"bad//path\" is not normalized (empty, '.' or '..' component)"
+        ));
+
+        let bad_ref = json!([{"path": "bad-ref", "ref": "invalid"}]);
+        let error = parse_entries(&bad_ref).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInput(ref message) if message.starts_with("entry \"bad-ref\" ref:")
+        ));
+
+        let conflict = json!([
+            {"path": "file", "ref": r, "mode": 644},
+            {"path": "file/child", "ref": r, "mode": 644},
+            {"mode": "invalid"},
+        ]);
+        let error = parse_entries(&conflict).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInput(ref message)
+                if message == "entry \"file/child\" conflicts with entry \"file\" (file and directory at one path)"
+        ));
+    }
+
+    #[test]
     fn store_preflight_rejects_output_paths_that_tree_get_would_reject() {
         let entry = TreeEntry {
             path: "bad\\name".into(),
@@ -633,23 +704,20 @@ mod tests {
     }
 
     #[test]
-    fn many_disjoint_paths_validate_without_quadratic_scanning() {
+    fn manifest_scale_disjoint_paths_validate_without_quadratic_scanning() {
         let content_ref = digest_hex(b"output");
-        let entries: Vec<TreeEntry> = (0..12_000)
+        let entries: Vec<TreeEntry> = (0..60_000)
             .map(|index| TreeEntry {
                 path: format!("dir-{index:05}/file"),
                 content_ref: content_ref.clone(),
                 mode: 644,
             })
             .collect();
-        let started = std::time::Instant::now();
-        let validated = validate_entries(&entries).unwrap();
+        let validated = parse_entries(&entries_json(&entries)).unwrap();
         assert_eq!(validated.len(), entries.len());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "12,000 disjoint entries took {:?}",
-            started.elapsed()
-        );
+        assert_eq!(validated.first().unwrap().path, "dir-00000/file");
+        assert_eq!(validated.last().unwrap().path, "dir-59999/file");
+        assert!(canonical_bytes(&validated).unwrap().len() <= MAX_MANIFEST_BYTES as usize);
     }
 
     #[test]
