@@ -1213,7 +1213,7 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
     let config = pool.config();
     let conn = pool
         .open_standalone_writer()
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_writer", e))?;
+        .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
 
     conn.busy_timeout(config.busy_timeout)
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
@@ -2516,7 +2516,7 @@ where
         operation,
         move |scope| {
             let guard = pool.try_writer().map_err(|error: SqliteError| {
-                StorageError::driver(StorageCapability::Sql, operation, error)
+                error.into_storage_error(StorageCapability::Sql, operation)
             })?;
             scope.with_pooled_writer(&pool, &guard, |conn| {
                 let interruptible = conn.is_autocommit();

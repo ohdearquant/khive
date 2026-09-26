@@ -7,6 +7,30 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+## SQLite write reserve
+
+Writable file-backed pools use `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` as their
+free-space reserve. The default is 1 GiB; `0` disables the check. The value is
+read once when the pool opens. An invalid byte count fails pool construction
+with `SqliteError::InvalidConfig`. In-memory and read-only pools do not sample
+disk space.
+
+Each pooled writer checkout, cancellable writer checkout, standalone operation
+writer open, and writer-task request samples available space on the canonical
+database parent directory. At or below the reserve, admission returns a typed
+capacity-floor error before running the operation. The writer task checks each
+dequeued request because its SQLite connection stays open for its lifetime.
+The sampled value is intentionally not cached across admissions.
+
+Checkpoint and diagnostics infrastructure connections, including the
+zero-wait checkpoint checkout, remain available below the floor so recovery
+can reclaim WAL space. Pool startup also remains available; opening and
+configuring SQLite connections may perform setup I/O before any operation is
+admitted. The check cannot predict the size of an arbitrary SQL transaction or
+writes by other processes, so a very large already-admitted transaction can
+still reach `SQLITE_FULL`. The reserve protects subsequent admissions and
+provides headroom for recovery; it is not a transaction-size quota.
+
 ## WAL autocheckpoint ownership
 
 Routine WAL reclamation has exactly two owners, selected by whether a dedicated

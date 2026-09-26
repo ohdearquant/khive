@@ -72,7 +72,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Sql, op, e)
+    e.into_storage_error(StorageCapability::Sql, op)
 }
 
 const AGENT_COLUMNS: &str = "agent_id, state, terminal_reason, provider, provider_session_id, \
