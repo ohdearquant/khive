@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::diff_local::EdgeKey;
 use crate::edge::{merge_edges, validate_dangling_edges};
 use crate::entity::merge_entities;
-use crate::strategy::{apply_ours, apply_theirs};
+use crate::strategy::{apply_ours_with_conflicts, apply_theirs_with_conflicts};
 use crate::types::{MergeConflict, MergeEngine, MergeError, MergeResult, SnapshotMergeStrategy};
 
 /// Validates namespace, finite-weight, and entity/edge uniqueness invariants.
@@ -104,8 +104,9 @@ fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::Date
 /// Merges `ours` and `theirs` against their common `base` under `strategy`.
 ///
 /// `Auto` performs entity and edge conflict detection; `Ours` and `Theirs`
-/// apply last-write-wins but still validate dangling endpoints. Clean output is
-/// deterministically sorted and stamped with the later branch timestamp.
+/// apply last-write-wins but still report durable edge-ID collisions and
+/// dangling endpoints. Clean output is validated, deterministically sorted,
+/// and stamped with the later branch timestamp.
 ///
 /// # Errors
 ///
@@ -122,12 +123,12 @@ pub fn three_way_merge(
 
     match strategy {
         SnapshotMergeStrategy::Ours => {
-            let merged = apply_ours(base, ours, theirs);
-            finish_shortcut_merge(merged, ours, theirs)
+            let (merged, conflicts) = apply_ours_with_conflicts(base, ours, theirs);
+            finish_shortcut_merge(merged, ours, theirs, conflicts)
         }
         SnapshotMergeStrategy::Theirs => {
-            let merged = apply_theirs(base, ours, theirs);
-            finish_shortcut_merge(merged, ours, theirs)
+            let (merged, conflicts) = apply_theirs_with_conflicts(base, ours, theirs);
+            finish_shortcut_merge(merged, ours, theirs, conflicts)
         }
         SnapshotMergeStrategy::Auto => three_way_merge_auto(base, ours, theirs),
     }
@@ -138,19 +139,19 @@ fn finish_shortcut_merge(
     mut merged: KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
+    mut conflicts: Vec<MergeConflict>,
 ) -> Result<MergeResult, MergeError> {
     sort_entities(&mut merged);
     sort_edges(&mut merged.edges);
     merged.exported_at = deterministic_timestamp(ours, theirs);
+    validate_archive(&merged)?;
 
     let entity_id_set: HashSet<Uuid> = merged.entities.iter().map(|e| e.id).collect();
-    let dangling = validate_dangling_edges(&merged.edges, &entity_id_set);
-    if dangling.is_empty() {
+    conflicts.extend(validate_dangling_edges(&merged.edges, &entity_id_set));
+    if conflicts.is_empty() {
         Ok(MergeResult::Clean { merged })
     } else {
-        Ok(MergeResult::Conflicts {
-            conflicts: dangling,
-        })
+        Ok(MergeResult::Conflicts { conflicts })
     }
 }
 
@@ -182,6 +183,7 @@ fn three_way_merge_auto(
         };
         sort_entities(&mut merged);
         sort_edges(&mut merged.edges);
+        validate_archive(&merged)?;
         Ok(MergeResult::Clean { merged })
     } else {
         Ok(MergeResult::Conflicts {
