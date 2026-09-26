@@ -668,6 +668,166 @@ async fn ingest_records_changed_paths_and_links_code_modules() {
     );
 }
 
+/// A commit note is shared by SHA, while commit cursors belong to each
+/// project. Reusing the note must still link the second project and the
+/// modules resolved from its snapshot before acknowledging its cursor.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn shared_commit_note_links_second_project_and_new_snapshot_module_once() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_a = create(&registry, json!({"kind": "project", "name": "shared-a"})).await;
+    let project_b = create(&registry, json!({"kind": "project", "name": "shared-b"})).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "src/lib.rs", "pub fn shared() {}\n");
+    commit(repo, &["src/lib.rs"], "Shared commit");
+    let sha = head_sha(repo);
+
+    let options = |project: Uuid| IngestOptions::unbounded(repo.to_path_buf(), project.to_string());
+    let first = run_ingest(&rt, &token, &registry, options(project_a))
+        .await
+        .expect("first project ingest");
+    assert_eq!(first.commits_ingested, 1, "{first:?}");
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let commit_id = Uuid::parse_str(list_items(&commits)[0]["id"].as_str().expect("commit id"))
+        .expect("commit UUID");
+
+    // The second project's module arrives only after the first ingest. The
+    // shared note cannot have acquired this annotation on its create path.
+    let module_b = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "shared_b_module",
+            "properties": {
+                "source_project": "shared-b",
+                "source_path": "src/lib.rs",
+                "source_revision": sha.clone(),
+            }
+        }),
+    )
+    .await;
+    assert!(incoming_annotating_ids(&registry, module_b)
+        .await
+        .is_empty());
+
+    let second = run_ingest(&rt, &token, &registry, options(project_b))
+        .await
+        .expect("second project ingest");
+    assert_eq!(second.commits_skipped_existing, 1, "{second:?}");
+    assert_eq!(second.commits_ingested, 0, "{second:?}");
+    assert_eq!(
+        read_git_cursor(&rt, project_b, "commits").await,
+        Some(sha.clone())
+    );
+    for target in [project_a, project_b, module_b] {
+        let neighbors = registry
+            .dispatch(
+                "neighbors",
+                json!({"id": target.to_string(), "direction": "incoming", "relations": ["annotates"]}),
+            )
+            .await
+            .expect("annotation neighbors");
+        let rows = neighbors.as_array().expect("neighbor array");
+        assert_eq!(rows.len(), 1, "one edge to {target}: {rows:?}");
+        assert_eq!(rows[0]["id"], commit_id.to_string());
+    }
+
+    let sql = rt.sql();
+    let mut writer = sql.writer().await.expect("cursor writer");
+    writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM git_mirror_cursor WHERE project_id=?1 AND kind IN ('commits','commits_checkpoint')".into(),
+            params: vec![SqlValue::Text(project_b.to_string())],
+            label: Some("test_rewalk_shared_commit".into()),
+        })
+        .await
+        .expect("reset project B cursor");
+    drop(writer);
+    let replay = run_ingest(&rt, &token, &registry, options(project_b))
+        .await
+        .expect("replay second project");
+    assert_eq!(replay.commits_skipped_existing, 1, "{replay:?}");
+    assert_eq!(
+        incoming_annotating_ids(&registry, project_b).await,
+        std::collections::BTreeSet::from([commit_id.to_string()]),
+    );
+    let rows = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits after replay");
+    assert_eq!(list_items(&rows).len(), 1, "the shared note stays singular");
+}
+
+/// A failed annotation upsert must leave the second project's cursor before
+/// the shared SHA, so a later pass can repair it instead of stranding it.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn shared_commit_link_refusal_stalls_second_project_cursor() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_a = create(&registry, json!({"kind": "project", "name": "link-a"})).await;
+    let project_b = create(&registry, json!({"kind": "project", "name": "link-b"})).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "src/lib.rs", "pub fn shared() {}\n");
+    commit(repo, &["src/lib.rs"], "Shared commit");
+    let sha = head_sha(repo);
+    let options = |project: Uuid| IngestOptions::unbounded(repo.to_path_buf(), project.to_string());
+    run_ingest(&rt, &token, &registry, options(project_a))
+        .await
+        .expect("first project ingest");
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let commit_id = list_items(&commits)[0]["id"].as_str().expect("commit id");
+
+    // An existing tombstone makes the natural-key upsert refuse implicit
+    // resurrection. This is a real link failure without a test-only hook.
+    let edge = registry
+        .dispatch(
+            "link",
+            json!({
+                "source_id": commit_id,
+                "target_id": project_b.to_string(),
+                "relation": "annotates",
+            }),
+        )
+        .await
+        .expect("seed second project edge");
+    let edge_id = Uuid::parse_str(edge["id"].as_str().expect("edge id")).expect("edge UUID");
+    assert!(rt
+        .delete_edge(&token, edge_id, false)
+        .await
+        .expect("soft delete edge"));
+
+    let refused = run_ingest(&rt, &token, &registry, options(project_b))
+        .await
+        .expect("refused link is reported as stalled ingest");
+    assert!(refused.cursor_stalled, "{refused:?}");
+    assert_eq!(refused.commits_skipped_existing, 0, "{refused:?}");
+    assert_eq!(read_git_cursor(&rt, project_b, "commits").await, None);
+
+    rt.restore_edge(&token, edge_id)
+        .await
+        .expect("restore edge")
+        .expect("edge exists");
+    let retried = run_ingest(&rt, &token, &registry, options(project_b))
+        .await
+        .expect("retry after link repair");
+    assert_eq!(retried.commits_skipped_existing, 1, "{retried:?}");
+    assert_eq!(read_git_cursor(&rt, project_b, "commits").await, Some(sha));
+}
+
 /// A shared revision can occur in two forks. Revision-plus-path narrows the
 /// repository snapshot, but it must not become an arbitrary tie-breaker when
 /// two live module rows still claim that identity.

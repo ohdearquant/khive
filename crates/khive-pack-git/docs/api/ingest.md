@@ -547,7 +547,7 @@ ids, or the case where at most one has a parseable id — a row whose `id` does
 not parse as a UUID is still a live row for the key, so it marks the pair
 ambiguous, but can never itself be the annotated candidate) and the
 single-row sub-case whose one row's id does not parse (not ambiguous — just
-no bindable candidate). Each skip is counted only when an ingested commit's
+no bindable candidate). Each skip is counted only when a walked commit's
 path actually hits the key, so unusable keys untouched by the pass never
 inflate the count, and the run's bounded warning names the first skipped
 paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
@@ -558,3 +558,12 @@ the durable fact. This makes module churn and repeated
 cross-project co-change derivable from incoming `annotates` graph reads while
 retaining `changed_paths` as a durable path fact when no matching code map
 exists.
+
+Commit notes are keyed by SHA within a namespace, while commit checkpoints
+belong to individual projects. When a later project walks an already stored
+SHA, the ingester reuses that note and resolves its annotations from the
+later project's frozen snapshot and path map. It upserts the note's links to
+that project and any matching module, document, or pull request before
+advancing the project's checkpoint. Existing live links retain their identity
+on a replay. A refused link freezes the cursor before that SHA so the next
+pass retries it; an explicitly deleted link is not silently resurrected.

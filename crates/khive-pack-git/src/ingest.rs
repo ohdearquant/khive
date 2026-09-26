@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    secret_gate, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_types::EdgeRelation;
 
 use crate::hook;
 use crate::refs;
@@ -2313,15 +2316,7 @@ async fn ingest_commits(
             ));
             break;
         }
-        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
-            local_sha_to_id.insert(c.sha.clone(), existing);
-            report.commits_skipped_existing += 1;
-            if !cursor_stalled {
-                checkpoint.last_completed_sha.clone_from(&c.sha);
-                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
-            }
-            continue;
-        }
+        let existing = find_commit_by_sha(runtime, token, &c.sha).await?;
 
         let masked = MaskedCommitFields::new(c);
         let content = if masked.body.trim().is_empty() {
@@ -2428,6 +2423,37 @@ async fn ingest_commits(
         };
         if let Some(pr_id) = pr_id {
             annotates.insert(pr_id.to_string());
+        }
+
+        if let Some(existing) = existing {
+            // A SHA is shared across project anchors. The natural-key hit
+            // skips note creation, but it must still materialize this
+            // project's annotations from the same snapshot/path map as the
+            // create path before advancing this project's checkpoint.
+            let links = annotates
+                .iter()
+                .map(|target| LinkSpec {
+                    namespace: None,
+                    source_id: existing,
+                    target_id: Uuid::parse_str(target).expect("annotation target is a UUID"),
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                })
+                .collect();
+            if let Err(error) = runtime.link_many(token, links).await {
+                record_write_failure(report, "link", "commit", c.sha.clone(), error);
+                stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+            local_sha_to_id.insert(c.sha.clone(), existing);
+            report.commits_skipped_existing += 1;
+            if !cursor_stalled {
+                checkpoint.last_completed_sha.clone_from(&c.sha);
+                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
+            }
+            continue;
         }
 
         let mut properties = json!({
