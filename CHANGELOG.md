@@ -277,13 +277,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processes with a 60-second deadline and bounded output, and a failed page
   reports its typed reason (timeout, output limit, missing program). Moodboard
   raster decode, resize and encode run off the async workers.
-- A quarantined inbound message's original bytes are now owned by an
-  attachment written in the same transaction as the quarantine note, so the
-  blob sweep can no longer delete an original the quarantine notice still
-  points to; a retried delivery repairs a missing attachment on an older
-  quarantine. `blob.get` reserves the object's own size from the shared read
-  budget instead of the full read ceiling, and committing a staged upload or
-  re-beginning a known reference restarts the publish grace period.
 - Pack schema ownership recognizes a table however its DDL spells the name
   (quoted, bracketed, `main.`-qualified, `TEMP`, or behind a comment), and
   every pack's tables are claimed before any DDL runs, so a collision between
