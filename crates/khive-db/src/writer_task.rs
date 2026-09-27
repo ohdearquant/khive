@@ -427,6 +427,12 @@ where
                     commit: Duration::ZERO,
                 },
                 RollbackDisposition::SideEffectsUnknown => {
+                    // SQLite may have already rolled back a failed transaction,
+                    // leaving no cause on the terminal error returned to callers.
+                    // Escalate SQLITE_FULL while the original error is still here.
+                    if let Some(db) = db {
+                        crate::timeout_sink::maybe_emit_sqlite_full(db, &operation_error);
+                    }
                     let request_state = WriterTaskRequestState::SideEffectsUnknown;
                     ProfiledWrappedTransaction {
                         result: Err(writer_task_terminated(request_state)),
