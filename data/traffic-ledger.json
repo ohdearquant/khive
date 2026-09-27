@@ -353,13 +353,73 @@
       "unique_clones": 281,
       "views": 58,
       "unique_views": 17
+    },
+    "2026-09-14": {
+      "clones": 2186,
+      "unique_clones": 139,
+      "views": 83,
+      "unique_views": 5
+    },
+    "2026-09-15": {
+      "clones": 2914,
+      "unique_clones": 223,
+      "views": 66,
+      "unique_views": 12
+    },
+    "2026-09-16": {
+      "clones": 2019,
+      "unique_clones": 249,
+      "views": 24,
+      "unique_views": 4
+    },
+    "2026-09-17": {
+      "clones": 2332,
+      "unique_clones": 276,
+      "views": 63,
+      "unique_views": 6
+    },
+    "2026-09-18": {
+      "clones": 2287,
+      "unique_clones": 290,
+      "views": 24,
+      "unique_views": 6
+    },
+    "2026-09-19": {
+      "clones": 2171,
+      "unique_clones": 148,
+      "views": 38,
+      "unique_views": 28
+    },
+    "2026-09-20": {
+      "clones": 886,
+      "unique_clones": 75,
+      "views": 21,
+      "unique_views": 8
+    },
+    "2026-09-21": {
+      "clones": 1958,
+      "unique_clones": 72,
+      "views": 59,
+      "unique_views": 40
+    },
+    "2026-09-22": {
+      "clones": 2653,
+      "unique_clones": 342,
+      "views": 71,
+      "unique_views": 5
+    },
+    "2026-09-23": {
+      "clones": 5204,
+      "unique_clones": 435,
+      "views": 63,
+      "unique_views": 4
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-09-14T10:46:28Z",
-    "clones_14d": 24582,
-    "unique_clones_14d": 1402,
-    "views_14d": 875,
-    "unique_views_14d": 94
+    "taken_at": "2026-09-27T10:36:26Z",
+    "clones_14d": 35515,
+    "unique_clones_14d": 2028,
+    "views_14d": 756,
+    "unique_views_14d": 141
   }
 }
