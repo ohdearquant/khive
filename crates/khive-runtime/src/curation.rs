@@ -397,6 +397,10 @@ pub struct MergeSummary {
     /// rather than silently destroyed by the row delete.
     #[serde(default)]
     pub self_loop_edge_preimages: Vec<MergeEdgePreimage>,
+    /// Recursive edge annotations removed with self-loop edges. The root
+    /// preimages remain in `self_loop_edge_preimages`.
+    #[serde(default)]
+    pub self_loop_incident_edge_preimages: Vec<MergeEdgePreimage>,
     /// Incident edges dropped instead of rewired because the rewired
     /// `(source, relation, target)` triple would violate the pack endpoint
     /// contract `link` enforces (khive#1216) — consistent with the existing
@@ -404,6 +408,12 @@ pub struct MergeSummary {
     /// contract-violating edge.
     #[serde(default)]
     pub edges_contract_skipped: usize,
+    /// Full preimages for the contract-violating root edges counted above.
+    #[serde(default)]
+    pub contract_drop_edge_preimages: Vec<MergeEdgePreimage>,
+    /// Recursive edge annotations removed with contract-violating edges.
+    #[serde(default)]
+    pub contract_drop_incident_edge_preimages: Vec<MergeEdgePreimage>,
     /// Full preimages for natural-key edge conflicts resolved by this merge.
     /// Each entry names the surviving row, the dropped duplicate, and every
     /// incident edge cascaded with it so the destructive step is reversible.
@@ -422,12 +432,12 @@ pub struct MergeSummary {
     #[serde(skip)]
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
     /// Error returned by the post-commit survivor reindex. A set value means
-    /// the note merge committed but the reindex did not.
+    /// the entity or note merge committed but the reindex did not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_commit_reindex_error: Option<String>,
 }
 
-/// Complete stored state of an edge removed while resolving a merge conflict.
+/// Complete stored state of an edge removed during a merge.
 ///
 /// Timestamps use the storage layer's microsecond representation. `relation`
 /// remains a string so a legacy row predating the closed relation enum can
@@ -794,7 +804,10 @@ fn append_merge_event_in_transaction(
         "edges_rewired": summary.edges_rewired,
         "edges_self_loop_dropped": summary.edges_self_loop_dropped,
         "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
+        "self_loop_incident_edge_preimages": &summary.self_loop_incident_edge_preimages,
         "edges_contract_skipped": summary.edges_contract_skipped,
+        "contract_drop_edge_preimages": &summary.contract_drop_edge_preimages,
+        "contract_drop_incident_edge_preimages": &summary.contract_drop_incident_edge_preimages,
         "edge_conflict_preimages": &summary.edge_conflict_preimages,
     });
     if let Some(reason) = context.reason {
@@ -955,12 +968,16 @@ fn edge_row_preimage(edge: &EdgeRow) -> Result<MergeEdgePreimage, SqliteError> {
 /// when `root_edge_id` is purged. The traversal is recursive because an
 /// `annotates` edge may itself be an annotation target. Rows that also touch a
 /// merge participant use their transaction-start snapshot from `original_edges`
-/// so the preimage never reflects an earlier rewire in the same merge.
-fn collect_conflict_incident_edge_preimages(
+/// so the preimage never reflects an earlier rewire in the same merge. Planned
+/// deletions are excluded before budget charging so dry runs match committed
+/// merges even when two cascades overlap.
+fn collect_merge_drop_incident_edge_preimages(
     conn: &rusqlite::Connection,
     root_edge_id: Uuid,
     original_edges: &HashMap<Uuid, EdgeRow>,
+    planned_deleted_edge_ids: &HashSet<Uuid>,
     budget: &mut MergeTxBudget,
+    budget_context: &str,
 ) -> Result<Vec<MergeEdgePreimage>, SqliteError> {
     let parse_id =
         |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
@@ -976,8 +993,12 @@ fn collect_conflict_incident_edge_preimages(
         )?;
         let mut rows = stmt.query(rusqlite::params![target_edge_id.to_string()])?;
         while let Some(row) = rows.next()? {
+            let id = parse_id(row.get(0)?)?;
+            if planned_deleted_edge_ids.contains(&id) {
+                continue;
+            }
             let edge = EdgeRow {
-                id: parse_id(row.get(0)?)?,
+                id,
                 namespace: row.get(1)?,
                 source_id: parse_id(row.get(2)?)?,
                 target_id: parse_id(row.get(3)?)?,
@@ -989,11 +1010,7 @@ fn collect_conflict_incident_edge_preimages(
                 target_backend: row.get(9)?,
                 metadata: row.get(10)?,
             };
-            budget.charge(
-                1,
-                edge_row_budget_bytes(&edge),
-                "collecting conflict cascade rows",
-            )?;
+            budget.charge(1, edge_row_budget_bytes(&edge), budget_context)?;
             if !seen.insert(edge.id) {
                 continue;
             }
@@ -1009,16 +1026,21 @@ fn collect_conflict_incident_edge_preimages(
     Ok(preimages)
 }
 
-fn delete_conflict_incident_edges(
+fn delete_merge_drop_edges(
     conn: &rusqlite::Connection,
-    preimages: &[MergeEdgePreimage],
+    root: &EdgeRow,
+    incident_preimages: &[MergeEdgePreimage],
 ) -> Result<(), SqliteError> {
-    for edge in preimages.iter().rev() {
+    for edge in incident_preimages.iter().rev() {
         conn.execute(
             khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
             rusqlite::params![&edge.namespace, edge.id.to_string()],
         )?;
     }
+    conn.execute(
+        khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+        rusqlite::params![&root.namespace, root.id.to_string()],
+    )?;
     Ok(())
 }
 
@@ -1457,12 +1479,6 @@ impl KhiveRuntime {
             Err(error) => return Err(RuntimeError::Storage(error.0)),
         }
 
-        let embedding_report = if reindex_required {
-            self.reindex_entity(token, &entity).await?
-        } else {
-            crate::retrieval::EmbeddingTruncationReport::default()
-        };
-
         let event_token =
             token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(|error| {
                 RuntimeError::Internal(format!("entity namespace invalid: {error}"))
@@ -1481,9 +1497,17 @@ impl KhiveRuntime {
             "namespace": entity.namespace,
             "changed_fields": changed_fields,
         }));
-        event_store.append_event(event).await.map_err(|e| {
+        let event_result = event_store.append_event(event).await.map_err(|e| {
             RuntimeError::Internal(format!("update_entity: event store write failed: {e}"))
-        })?;
+        });
+
+        let embedding_report = if reindex_required {
+            self.reindex_entity(token, &entity).await?
+        } else {
+            crate::retrieval::EmbeddingTruncationReport::default()
+        };
+
+        event_result?;
 
         Ok((entity, embedding_report))
     }
@@ -1733,9 +1757,21 @@ impl KhiveRuntime {
         // FTS and vec-deletes already committed inside the transaction above;
         // only the embedding re-insert needs an async step outside it.
         if !dry_run && !embedding_plan.is_empty() {
-            summary.embedding_truncation = self
+            match self
                 .reindex_entity_with_plan(token, &updated_entity, &embedding_plan)
-                .await?;
+                .await
+            {
+                Ok(report) => summary.embedding_truncation = report,
+                Err(error) => {
+                    tracing::warn!(
+                        into_id = %summary.kept_id,
+                        from_id = %summary.removed_id,
+                        error = %error,
+                        "merge_entity: committed merge but survivor reindex failed"
+                    );
+                    summary.post_commit_reindex_error = Some(error.to_string());
+                }
+            }
         }
 
         Ok(summary)
@@ -1876,6 +1912,12 @@ impl KhiveRuntime {
         entity: &Entity,
         embedding_plan: &EmbeddingModelPlan,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        // Test-only fault seam: force the post-commit FTS leg to fail after a
+        // merge or update has already persisted its entity row.
+        #[cfg(test)]
+        if crate::operations::consume_fts_fail_fault(&entity.namespace) {
+            return Err(RuntimeError::Internal("injected FTS failure".to_string()));
+        }
         // Use entity.namespace (authoritative) rather than token.namespace().as_str() (caller claim).
         let doc = entity_fts_document(entity);
         let embed_body = doc.body.clone();
@@ -3681,9 +3723,12 @@ fn merge_entity_sql(
     let mut edge_conflict_preimages = Vec::new();
     let mut edges_self_loop_dropped = 0usize;
     let mut self_loop_edge_preimages = Vec::new();
-    let mut conflict_deleted_edge_ids = HashSet::new();
+    let mut self_loop_incident_edge_preimages = Vec::new();
+    let mut contract_drop_edge_preimages = Vec::new();
+    let mut contract_drop_incident_edge_preimages = Vec::new();
+    let mut planned_deleted_edge_ids = HashSet::new();
     for edge in all_edges {
-        if conflict_deleted_edge_ids.contains(&edge.id) {
+        if planned_deleted_edge_ids.contains(&edge.id) {
             continue;
         }
         let raw_src = if edge.source_id == from_id {
@@ -3705,16 +3750,24 @@ fn merge_entity_sql(
         };
 
         if new_src == new_tgt {
-            // Capture the preimage unconditionally (dry_run and real runs
-            // must report the identical count and rows — khive#2934) before
-            // the write gate below decides whether the DELETE itself runs.
+            let incident_edge_preimages = collect_merge_drop_incident_edge_preimages(
+                conn,
+                edge.id,
+                &original_edges,
+                &planned_deleted_edge_ids,
+                &mut budget,
+                "collecting self-loop cascade rows",
+            )?;
+            for incident in &incident_edge_preimages {
+                planned_deleted_edge_ids.insert(incident.id);
+                rewired_edge_ids.remove(&incident.id);
+            }
+            planned_deleted_edge_ids.insert(edge.id);
             self_loop_edge_preimages.push(edge_row_preimage(&edge)?);
+            self_loop_incident_edge_preimages.extend(incident_edge_preimages.iter().cloned());
             edges_self_loop_dropped += 1;
             if !dry_run {
-                conn.execute(
-                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                    rusqlite::params![&edge.namespace, edge.id.to_string()],
-                )?;
+                delete_merge_drop_edges(conn, &edge, &incident_edge_preimages)?;
             }
             continue;
         }
@@ -3774,11 +3827,23 @@ fn merge_entity_sql(
             None => true,
         };
         if !contract_ok {
+            let incident_edge_preimages = collect_merge_drop_incident_edge_preimages(
+                conn,
+                edge.id,
+                &original_edges,
+                &planned_deleted_edge_ids,
+                &mut budget,
+                "collecting contract-drop cascade rows",
+            )?;
+            for incident in &incident_edge_preimages {
+                planned_deleted_edge_ids.insert(incident.id);
+                rewired_edge_ids.remove(&incident.id);
+            }
+            planned_deleted_edge_ids.insert(edge.id);
+            contract_drop_edge_preimages.push(edge_row_preimage(&edge)?);
+            contract_drop_incident_edge_preimages.extend(incident_edge_preimages.iter().cloned());
             if !dry_run {
-                conn.execute(
-                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                    rusqlite::params![&edge.namespace, edge.id.to_string()],
-                )?;
+                delete_merge_drop_edges(conn, &edge, &incident_edge_preimages)?;
             }
             tracing::warn!(
                 edge_id = %edge.id,
@@ -3824,25 +3889,23 @@ fn merge_entity_sql(
             // event contains enough state to restore every destroyed row.
             let surviving_edge_id = Uuid::parse_str(&conflict_id)
                 .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
-            let incident_edge_preimages = collect_conflict_incident_edge_preimages(
+            let incident_edge_preimages = collect_merge_drop_incident_edge_preimages(
                 conn,
                 edge.id,
                 &original_edges,
+                &planned_deleted_edge_ids,
                 &mut budget,
+                "collecting conflict cascade rows",
             )?;
             for incident in &incident_edge_preimages {
-                conflict_deleted_edge_ids.insert(incident.id);
+                planned_deleted_edge_ids.insert(incident.id);
                 rewired_edge_ids.remove(&incident.id);
             }
-            conflict_deleted_edge_ids.insert(edge.id);
+            planned_deleted_edge_ids.insert(edge.id);
             rewired_edge_ids.insert(edge.id);
 
             if !dry_run {
-                delete_conflict_incident_edges(conn, &incident_edge_preimages)?;
-                conn.execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-                    rusqlite::params![&edge.namespace, edge.id.to_string()],
-                )?;
+                delete_merge_drop_edges(conn, &edge, &incident_edge_preimages)?;
             }
             edge_conflict_preimages.push(MergeEdgeConflictPreimage {
                 surviving_edge_id,
@@ -4012,7 +4075,10 @@ fn merge_entity_sql(
         edges_rewired,
         edges_self_loop_dropped,
         self_loop_edge_preimages,
+        self_loop_incident_edge_preimages,
         edges_contract_skipped,
+        contract_drop_edge_preimages,
+        contract_drop_incident_edge_preimages,
         edge_conflict_preimages,
         properties_merged,
         tags_unioned,
@@ -4378,10 +4444,13 @@ fn merge_note_sql(
     let mut edge_conflict_preimages = Vec::new();
     let mut edges_self_loop_dropped = 0usize;
     let mut self_loop_edge_preimages = Vec::new();
-    let mut conflict_deleted_edge_ids = HashSet::new();
+    let mut self_loop_incident_edge_preimages = Vec::new();
+    let mut contract_drop_edge_preimages = Vec::new();
+    let mut contract_drop_incident_edge_preimages = Vec::new();
+    let mut planned_deleted_edge_ids = HashSet::new();
     {
         for edge in all_edges {
-            if conflict_deleted_edge_ids.contains(&edge.id) {
+            if planned_deleted_edge_ids.contains(&edge.id) {
                 continue;
             }
             let raw_src = if edge.source_id == from_id {
@@ -4401,17 +4470,24 @@ fn merge_note_sql(
                 None => (raw_src, raw_tgt),
             };
             if new_src == new_tgt {
-                // Capture the preimage unconditionally (dry_run and real runs
-                // must report the identical count and rows — khive#2934)
-                // before the write gate below decides whether the DELETE
-                // itself runs.
+                let incident_edge_preimages = collect_merge_drop_incident_edge_preimages(
+                    conn,
+                    edge.id,
+                    &original_edges,
+                    &planned_deleted_edge_ids,
+                    &mut budget,
+                    "collecting self-loop cascade rows",
+                )?;
+                for incident in &incident_edge_preimages {
+                    planned_deleted_edge_ids.insert(incident.id);
+                    rewired_edge_ids.remove(&incident.id);
+                }
+                planned_deleted_edge_ids.insert(edge.id);
                 self_loop_edge_preimages.push(edge_row_preimage(&edge)?);
+                self_loop_incident_edge_preimages.extend(incident_edge_preimages.iter().cloned());
                 edges_self_loop_dropped += 1;
                 if !dry_run {
-                    conn.execute(
-                        "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                        rusqlite::params![&edge.namespace, edge.id.to_string()],
-                    )?;
+                    delete_merge_drop_edges(conn, &edge, &incident_edge_preimages)?;
                 }
                 continue;
             }
@@ -4456,11 +4532,24 @@ fn merge_note_sql(
                 None => true,
             };
             if !contract_ok {
+                let incident_edge_preimages = collect_merge_drop_incident_edge_preimages(
+                    conn,
+                    edge.id,
+                    &original_edges,
+                    &planned_deleted_edge_ids,
+                    &mut budget,
+                    "collecting contract-drop cascade rows",
+                )?;
+                for incident in &incident_edge_preimages {
+                    planned_deleted_edge_ids.insert(incident.id);
+                    rewired_edge_ids.remove(&incident.id);
+                }
+                planned_deleted_edge_ids.insert(edge.id);
+                contract_drop_edge_preimages.push(edge_row_preimage(&edge)?);
+                contract_drop_incident_edge_preimages
+                    .extend(incident_edge_preimages.iter().cloned());
                 if !dry_run {
-                    conn.execute(
-                        "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                        rusqlite::params![&edge.namespace, edge.id.to_string()],
-                    )?;
+                    delete_merge_drop_edges(conn, &edge, &incident_edge_preimages)?;
                 }
                 tracing::warn!(
                     edge_id = %edge.id,
@@ -4500,25 +4589,23 @@ fn merge_note_sql(
                 // incident annotations, and preserve every removed row first.
                 let surviving_edge_id = Uuid::parse_str(&conflict_id)
                     .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
-                let incident_edge_preimages = collect_conflict_incident_edge_preimages(
+                let incident_edge_preimages = collect_merge_drop_incident_edge_preimages(
                     conn,
                     edge.id,
                     &original_edges,
+                    &planned_deleted_edge_ids,
                     &mut budget,
+                    "collecting conflict cascade rows",
                 )?;
                 for incident in &incident_edge_preimages {
-                    conflict_deleted_edge_ids.insert(incident.id);
+                    planned_deleted_edge_ids.insert(incident.id);
                     rewired_edge_ids.remove(&incident.id);
                 }
-                conflict_deleted_edge_ids.insert(edge.id);
+                planned_deleted_edge_ids.insert(edge.id);
                 rewired_edge_ids.insert(edge.id);
 
                 if !dry_run {
-                    delete_conflict_incident_edges(conn, &incident_edge_preimages)?;
-                    conn.execute(
-                        khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-                        rusqlite::params![&edge.namespace, edge.id.to_string()],
-                    )?;
+                    delete_merge_drop_edges(conn, &edge, &incident_edge_preimages)?;
                 }
                 edge_conflict_preimages.push(MergeEdgeConflictPreimage {
                     surviving_edge_id,
@@ -4677,7 +4764,10 @@ fn merge_note_sql(
         edges_rewired,
         edges_self_loop_dropped,
         self_loop_edge_preimages,
+        self_loop_incident_edge_preimages,
         edges_contract_skipped,
+        contract_drop_edge_preimages,
+        contract_drop_incident_edge_preimages,
         edge_conflict_preimages,
         properties_merged,
         tags_unioned: 0,
@@ -14353,5 +14443,531 @@ mod tests {
             .await
             .expect("no hook installed for this kind must not block the update");
         assert_eq!(updated.name, "Plain Renamed");
+    }
+
+    /// Search only complete edge preimage objects, regardless of which merge
+    /// payload field groups a cascade. This lets the regression specify the
+    /// audit contract without prescribing a new field name before the fix.
+    fn merge_payload_has_edge_preimage(value: &Value, id: Uuid) -> bool {
+        let id_string = id.to_string();
+        match value {
+            Value::Object(object) => {
+                (object.get("id").and_then(Value::as_str) == Some(id_string.as_str())
+                    && object.contains_key("source_id")
+                    && object.contains_key("target_id"))
+                    || object
+                        .values()
+                        .any(|child| merge_payload_has_edge_preimage(child, id))
+            }
+            Value::Array(items) => items
+                .iter()
+                .any(|child| merge_payload_has_edge_preimage(child, id)),
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_entity_merge_reports_reindex_failure_with_event_preimages() {
+        use crate::operations::arm_fts_fail_scoped;
+
+        let rt = rt();
+        rt.register_embedder(MergeTestVecProvider::new("entity-merge-reindex-failure", 4));
+        let namespace = format!("entity-merge-reindex-{}", Uuid::new_v4().as_simple());
+        let tok = NamespaceToken::for_namespace(crate::Namespace::parse(&namespace).unwrap());
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(&tok, into.id, from.id, EdgeRelation::Extends, 0.8, None)
+            .await
+            .unwrap();
+
+        let _arm = arm_fts_fail_scoped(&namespace);
+        let outcome = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.items.len(),
+            1,
+            "the merge event committed with the row"
+        );
+        assert!(merge_payload_has_edge_preimage(
+            &events.items[0].payload,
+            Uuid::from(dropped.id),
+        ));
+        let summary =
+            outcome.expect("a committed merge must return its summary after reindex failure");
+        assert_eq!(summary.kept_id, into.id);
+        assert_eq!(summary.removed_id, from.id);
+        assert!(
+            summary
+                .post_commit_reindex_error
+                .as_deref()
+                .is_some_and(|error| error.contains("injected FTS failure")),
+            "the committed summary must surface the post-commit error: {:?}",
+            summary.post_commit_reindex_error
+        );
+        assert!(rt
+            .entities(&tok)
+            .unwrap()
+            .get_entity_including_deleted(from.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn committed_entity_update_records_event_before_reindex_failure() {
+        use crate::operations::arm_fts_fail_scoped;
+
+        let rt = rt();
+        rt.register_embedder(MergeTestVecProvider::new(
+            "entity-update-reindex-failure",
+            4,
+        ));
+        let namespace = format!("entity-update-reindex-{}", Uuid::new_v4().as_simple());
+        let tok = NamespaceToken::for_namespace(crate::Namespace::parse(&namespace).unwrap());
+        let entity = rt
+            .create_entity(&tok, "concept", None, "Before", None, None, vec![])
+            .await
+            .unwrap();
+
+        let _arm = arm_fts_fail_scoped(&namespace);
+        let error = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    name: Some("After".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the injected reindex error must be surfaced");
+        assert!(error.to_string().contains("injected FTS failure"));
+        assert_eq!(rt.get_entity(&tok, entity.id).await.unwrap().name, "After");
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityUpdated],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.items.len(),
+            1,
+            "the committed update must retain its event"
+        );
+        assert_eq!(events.items[0].target_id, Some(entity.id));
+    }
+
+    async fn assert_merge_removed_edges_and_audited_preimages(
+        rt: &KhiveRuntime,
+        tok: &NamespaceToken,
+        kind: EventKind,
+        edge_ids: &[Uuid],
+    ) {
+        for id in edge_ids {
+            assert!(
+                rt.get_edge_including_deleted(tok, *id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "merge left a dangling edge row for {id}"
+            );
+        }
+        let events = rt
+            .events(tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![kind],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1, "one committed merge event");
+        for id in edge_ids {
+            assert!(
+                merge_payload_has_edge_preimage(&events.items[0].payload, *id),
+                "merge event omitted the deleted edge's complete preimage: {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_merge_cascades_annotated_self_loop_and_contract_drop_with_preimages() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.install_edge_rules(vec![EdgeEndpointRule {
+            relation: EdgeRelation::DependsOn,
+            source: EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "theorem",
+            },
+            target: EndpointKind::EntityOfType {
+                kind: "concept",
+                entity_type: "definition",
+            },
+        }]);
+        let definition = rt
+            .create_entity(
+                &tok,
+                "concept",
+                Some("definition"),
+                "Def",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", Some("theorem"), "From", None, None, vec![])
+            .await
+            .unwrap();
+        let into = rt
+            .create_entity(&tok, "concept", Some("lemma"), "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(&tok, "observation", None, "edge review", None, None, vec![])
+            .await
+            .unwrap();
+
+        let self_loop = rt
+            .link(&tok, into.id, from.id, EdgeRelation::Extends, 0.6, None)
+            .await
+            .unwrap();
+        let self_loop_annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                self_loop.id.into(),
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let contract_drop = rt
+            .link(
+                &tok,
+                from.id,
+                definition.id,
+                EdgeRelation::DependsOn,
+                0.7,
+                None,
+            )
+            .await
+            .unwrap();
+        let contract_annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                contract_drop.id.into(),
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.edges_self_loop_dropped, 1);
+        assert_eq!(summary.edges_contract_skipped, 1);
+        assert_merge_removed_edges_and_audited_preimages(
+            &rt,
+            &tok,
+            EventKind::EntityMerged,
+            &[
+                self_loop.id.into(),
+                self_loop_annotation.id.into(),
+                contract_drop.id.into(),
+                contract_annotation.id.into(),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn note_merge_cascades_annotated_self_loop_and_contract_drop_with_preimages() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.install_edge_rules(vec![EdgeEndpointRule {
+            relation: EdgeRelation::DependsOn,
+            source: EndpointKind::NoteOfKind("observation"),
+            target: EndpointKind::EntityOfKind("concept"),
+        }]);
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let target = rt
+            .create_entity(&tok, "concept", None, "Legacy target", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(&tok, "observation", None, "edge review", None, None, vec![])
+            .await
+            .unwrap();
+        let self_loop = rt
+            .link(&tok, into.id, from.id, EdgeRelation::Refutes, 0.6, None)
+            .await
+            .unwrap();
+        let self_loop_annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                self_loop.id.into(),
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let contract_drop = rt
+            .link(&tok, from.id, target.id, EdgeRelation::DependsOn, 0.7, None)
+            .await
+            .unwrap();
+        let contract_annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                contract_drop.id.into(),
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a legacy dangling endpoint without invoking the public hard
+        // delete cascade. The note rewire must take its contract-drop arm.
+        let mut writer = rt.sql().writer().await.unwrap();
+        assert_eq!(
+            writer
+                .execute(khive_storage::SqlStatement {
+                    sql: "DELETE FROM entities WHERE id = ?1".into(),
+                    params: vec![SqlValue::Text(target.id.to_string())],
+                    label: Some("seed-dangling-merge-endpoint".into()),
+                })
+                .await
+                .unwrap(),
+            1
+        );
+        drop(writer);
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.edges_self_loop_dropped, 1);
+        assert_eq!(summary.edges_contract_skipped, 1);
+        assert_merge_removed_edges_and_audited_preimages(
+            &rt,
+            &tok,
+            EventKind::NoteMerged,
+            &[
+                self_loop.id.into(),
+                self_loop_annotation.id.into(),
+                contract_drop.id.into(),
+                contract_annotation.id.into(),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn note_merge_dry_run_does_not_recapture_an_earlier_planned_cascade() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(&tok, "observation", None, "Review", None, None, vec![])
+            .await
+            .unwrap();
+        let self_loop = rt
+            .link(&tok, into.id, from.id, EdgeRelation::Refutes, 0.7, None)
+            .await
+            .unwrap();
+        let survivor_annotation = rt
+            .link(
+                &tok,
+                into.id,
+                self_loop.id.into(),
+                EdgeRelation::Annotates,
+                0.8,
+                None,
+            )
+            .await
+            .unwrap();
+        let duplicate_annotation = rt
+            .link(
+                &tok,
+                from.id,
+                self_loop.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                None,
+            )
+            .await
+            .unwrap();
+        let nested_annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                duplicate_annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.5,
+                None,
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, nested_annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let dry = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+        let committed = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dry.edges_self_loop_dropped, 1);
+        assert_eq!(
+            dry.self_loop_edge_preimages,
+            committed.self_loop_edge_preimages
+        );
+        assert_eq!(
+            dry.self_loop_incident_edge_preimages,
+            committed.self_loop_incident_edge_preimages
+        );
+        assert_eq!(
+            dry.edge_conflict_preimages,
+            committed.edge_conflict_preimages
+        );
+        assert_eq!(
+            dry.self_loop_incident_edge_preimages
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![Uuid::from(survivor_annotation.id)],
+            "the earlier conflict already planned the duplicate annotation's deletion"
+        );
+        let [conflict] = dry.edge_conflict_preimages.as_slice() else {
+            panic!("one annotation conflict expected");
+        };
+        assert_eq!(
+            conflict.dropped_edge.id,
+            Uuid::from(duplicate_annotation.id)
+        );
+        assert_eq!(
+            conflict
+                .incident_edge_preimages
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![Uuid::from(nested_annotation.id)]
+        );
+        assert_merge_removed_edges_and_audited_preimages(
+            &rt,
+            &tok,
+            EventKind::NoteMerged,
+            &[
+                self_loop.id.into(),
+                survivor_annotation.id.into(),
+                duplicate_annotation.id.into(),
+                nested_annotation.id.into(),
+            ],
+        )
+        .await;
     }
 }
