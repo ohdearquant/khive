@@ -75,7 +75,7 @@ fn conditional_headers_for_hop(
 ) -> Vec<(String, String)> {
     if !first_hop
         || current_url != original_url
-        || properties.get("truncated").and_then(Value::as_bool) == Some(true)
+        || properties.get("truncated").and_then(Value::as_bool) != Some(false)
     {
         return Vec::new();
     }
@@ -238,14 +238,25 @@ async fn settle_refresh(
     }
     let prior_truncated = final_properties
         .and_then(|properties| properties.get("truncated"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if outcome.status == 304 && prior_truncated {
-        return Err(Refusal::new(
-            "partial_not_modified",
-            "a partial stored body cannot be validated by a bodyless response",
-        )
-        .into());
+        .and_then(Value::as_bool);
+    if outcome.status == 304 {
+        match prior_truncated {
+            Some(false) => {}
+            Some(true) => {
+                return Err(Refusal::new(
+                    "partial_not_modified",
+                    "a partial stored body cannot be validated by a bodyless response",
+                )
+                .into());
+            }
+            None => {
+                return Err(Refusal::new(
+                    "unknown_completeness",
+                    "the stored body's completeness is unknown; fetch it again",
+                )
+                .into());
+            }
+        }
     }
 
     let mut entities_touched: Vec<Uuid> = vec![id];
@@ -267,14 +278,17 @@ async fn settle_refresh(
     let mut new_content_ref: Option<String> = None;
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
-            was_truncated = truncated;
+            was_truncated = Some(truncated);
             let store = crate::blob_store(runtime)?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
-            if Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref()
-                || prior_truncated != truncated
-            {
-                changed = true;
+            let body_changed =
+                Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref();
+            let completeness_changed = prior_truncated != Some(truncated);
+            if body_changed || completeness_changed {
+                // Learning completeness on a legacy capture is a metadata
+                // update; `changed` describes the body/reference only.
+                changed = body_changed;
                 let content_type = outcome
                     .headers
                     .get("content-type")
@@ -297,15 +311,17 @@ async fn settle_refresh(
                     properties["truncated"] = json!(truncated);
                     crate::entities::patch(runtime, token, id, Some(entity_type), properties)
                         .await?;
-                    crate::fetch::root_body(
-                        runtime,
-                        id,
-                        khive_storage::AttachmentSubstrate::Entity,
-                        &content_ref,
-                        content_type.as_deref(),
-                        body_bytes,
-                    )
-                    .await?;
+                    if body_changed {
+                        crate::fetch::root_body(
+                            runtime,
+                            id,
+                            khive_storage::AttachmentSubstrate::Entity,
+                            &content_ref,
+                            content_type.as_deref(),
+                            body_bytes,
+                        )
+                        .await?;
+                    }
                 } else {
                     // Identity is by address: the body served at the terminal
                     // hop belongs to that address's own row. Permanent hops
@@ -509,6 +525,168 @@ mod tests {
     }
 
     #[test]
+    fn legacy_capture_without_completeness_does_not_send_validators() {
+        let url = Url::parse("https://legacy-capture.example.test/body").unwrap();
+        let legacy = json!({
+            "etag": "\"legacy-v1\"",
+            "last_modified": "Mon, 21 Sep 2026 12:00:00 GMT"
+        });
+        assert!(
+            conditional_headers_for_hop(&legacy, &url, &url, true).is_empty(),
+            "missing completeness is unknown, not evidence of a complete body"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_304_does_not_claim_a_complete_capture() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://legacy-capture.example.test/body").unwrap();
+        let prefix = b"synthetic prefix only";
+        let store = crate::blob_store(&runtime).unwrap();
+        let content_ref = store.put(prefix.to_vec()).await.unwrap();
+        let reference = content_ref.to_string();
+        let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
+            .await
+            .unwrap();
+        // Reconstruct the actual pre-flag property shape, not a new marked capture.
+        let legacy = crate::fetch::representation_patch(
+            url.as_str(),
+            Some("text/plain"),
+            200,
+            Some("\"legacy-v1\""),
+            None,
+            Some(&reference),
+            prefix.len() as u64,
+        );
+        assert!(legacy.get("truncated").is_none());
+        crate::entities::patch(&runtime, &token, id, Some("resource"), legacy)
+            .await
+            .unwrap();
+        crate::fetch::root_body(
+            &runtime,
+            id,
+            khive_storage::AttachmentSubstrate::Entity,
+            &content_ref,
+            Some("text/plain"),
+            prefix.len() as u64,
+        )
+        .await
+        .unwrap();
+        let result = settle_refresh(
+            &runtime,
+            &token,
+            id,
+            url.as_str(),
+            &reference,
+            HopOutcome {
+                status: 304,
+                final_url: url.clone(),
+                headers: reqwest::header::HeaderMap::new(),
+                redirect_to: None,
+                body: None,
+            },
+            &[],
+        )
+        .await;
+        match result {
+            Ok(reply) => assert_ne!(
+                reply["truncated"],
+                json!(false),
+                "a bodyless validation cannot establish missing completeness"
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("partial_not_modified")
+                        || message.contains("unknown_completeness"),
+                    "expected an explicit completeness refusal, not a fixture failure: {message}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_same_body_refresh_records_completeness_without_body_change() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://legacy-capture.example.test/complete").unwrap();
+        let body = b"synthetic complete body";
+        let store = crate::blob_store(&runtime).unwrap();
+        let content_ref = store.put(body.to_vec()).await.unwrap();
+        let reference = content_ref.to_string();
+        let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
+            .await
+            .unwrap();
+        let legacy = crate::fetch::representation_patch(
+            url.as_str(),
+            Some("text/plain"),
+            200,
+            None,
+            None,
+            Some(&reference),
+            body.len() as u64,
+        );
+        assert!(legacy.get("truncated").is_none());
+        crate::entities::patch(&runtime, &token, id, Some("resource"), legacy)
+            .await
+            .unwrap();
+        crate::fetch::root_body(
+            &runtime,
+            id,
+            khive_storage::AttachmentSubstrate::Entity,
+            &content_ref,
+            Some("text/plain"),
+            body.len() as u64,
+        )
+        .await
+        .unwrap();
+
+        let response = || HopOutcome {
+            status: 200,
+            final_url: url.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            redirect_to: None,
+            body: Some((body.to_vec(), false)),
+        };
+        let first = settle_refresh(
+            &runtime,
+            &token,
+            id,
+            url.as_str(),
+            &reference,
+            response(),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["changed"], false);
+        assert_eq!(first["truncated"], false);
+        let entities = runtime.entities(&token).unwrap();
+        let after_first = entities.get_entity(id).await.unwrap().unwrap();
+        let first_properties = after_first.properties.as_ref().unwrap();
+        assert_eq!(
+            first_properties["blob_ref"].as_str(),
+            Some(reference.as_str())
+        );
+        assert_eq!(first_properties["truncated"], false);
+
+        let second = settle_refresh(
+            &runtime,
+            &token,
+            id,
+            url.as_str(),
+            &reference,
+            response(),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["changed"], false);
+        let after_second = entities.get_entity(id).await.unwrap().unwrap();
+        assert_eq!(after_second.properties, after_first.properties);
+        assert_eq!(after_second.updated_at, after_first.updated_at);
+    }
+
+    #[test]
     fn refresh_conditionals_stay_on_complete_original_resource() {
         let original = Url::parse("https://example.test/original").unwrap();
         let redirected = Url::parse("https://example.test/other").unwrap();
@@ -645,7 +823,7 @@ mod tests {
             token,
             id,
             Some("resource"),
-            json!({ "url": canonical.to_string(), "blob_ref": content_ref.to_string() }),
+            json!({ "url": canonical.to_string(), "blob_ref": content_ref.to_string(), "truncated": false }),
         )
         .await
         .unwrap();

@@ -20,6 +20,7 @@
 //!   repeated extraction over an unchanged document converges on one row.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use khive_runtime::{KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
@@ -746,6 +747,8 @@ async fn run_extract_with_link_selection(
             )));
         }
     }
+    let mut seen = HashSet::new();
+    kinds.retain(|kind| seen.insert(kind.clone()));
 
     // Text consumes raw UTF-8 lazily, including replacement characters. Only
     // the other extraction kinds need a fully decoded body; a text-only
@@ -1326,6 +1329,53 @@ mod tests {
                 "unfetched target starts as resource"
             );
             assert_eq!(entity.properties.unwrap()["status"], Value::Null);
+        }
+    }
+
+    // Set-like kind selection must not hide work committed by an earlier pass.
+    #[tokio::test]
+    async fn duplicate_sitemap_kind_preserves_admitted_count() {
+        for repetitions in [1usize, 2] {
+            let (runtime, token, _dir) = test_runtime().await;
+            let document = seed_page(
+                &runtime,
+                &token,
+                "https://duplicate-kind.example.test/map.xml",
+                "application/xml",
+                b"<urlset><url><loc>https://duplicate-kind.example.test/entry</loc></url></urlset>",
+            )
+            .await;
+            let kinds = vec!["sitemap"; repetitions];
+            let pack = crate::WebPack::new(runtime.clone());
+            let reply = pack
+                .handle_extract(
+                    &token,
+                    json!({ "id": document, "kinds": kinds, "link_limit": 1 }),
+                )
+                .await
+                .unwrap();
+            let site = identity::site_id(
+                &Url::parse("https://duplicate-kind.example.test/map.xml").unwrap(),
+            );
+            let neighbors = runtime
+                .neighbors(
+                    &token,
+                    site,
+                    khive_storage::Direction::Out,
+                    None,
+                    Some(vec![EdgeRelation::Contains]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                neighbors.len(),
+                1,
+                "the admitted target remains in the graph"
+            );
+            assert_eq!(
+                reply["result"]["sitemap"]["entries"], 1,
+                "duplicate kind must not overwrite earlier admitted work with zero"
+            );
         }
     }
 
