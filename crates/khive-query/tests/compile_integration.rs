@@ -2046,6 +2046,44 @@ mod substrate_labels {
     }
 
     #[test]
+    fn sparql_substrate_and_granular_kinds_filter_together_in_both_orders() {
+        let conn = fixture_db_with_edge();
+        conn.execute_batch(
+            "INSERT INTO graph_edges
+                (namespace, id, source_id, target_id, relation, weight,
+                 created_at, updated_at, deleted_at, metadata, target_backend)
+             VALUES
+                ('local', 'edge-project', 'e-fixture-spaces', 'e-fixture-2',
+                 'extends', 1.0, 0, 0, NULL, NULL, NULL);",
+        )
+        .unwrap();
+
+        for relation in ["extends", "extends+"] {
+            for kinds in [":entity . ?a a :concept", ":concept . ?a a :entity"] {
+                let source = format!("SELECT ?a WHERE {{ ?a a {kinds} . ?a :{relation} ?b . }}");
+                let query = parse(QueryLanguage::Sparql, &source).unwrap();
+                let compiled = compile(&query, &opts()).unwrap();
+                assert!(
+                    compiled.sql.contains("substrate_kind = ?"),
+                    "missing substrate filter for {source}: {}",
+                    compiled.sql
+                );
+                assert!(
+                    compiled.sql.contains(".kind = ?"),
+                    "missing granular filter for {source}: {}",
+                    compiled.sql
+                );
+                assert_eq!(
+                    run(&conn, &compiled),
+                    vec!["e-fixture-1"],
+                    "only concept entities should match {source}: {}",
+                    compiled.sql
+                );
+            }
+        }
+    }
+
+    #[test]
     fn variable_length_entity_substrate_label_filters_substrate_kind() {
         let q = parse(
             QueryLanguage::Gql,

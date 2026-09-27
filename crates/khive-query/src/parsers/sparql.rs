@@ -2,7 +2,7 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 struct Triple {
     subject: String,
@@ -354,7 +354,8 @@ fn triples_to_ast(
 ) -> Result<GqlQuery, QueryError> {
     let return_items: Vec<ReturnItem> =
         return_items.into_iter().map(ReturnItem::Variable).collect();
-    let mut node_kinds: HashMap<String, String> = HashMap::new();
+    let mut substrate_kinds: BTreeMap<String, String> = BTreeMap::new();
+    let mut granular_kinds: BTreeMap<String, String> = BTreeMap::new();
     let mut node_props: HashMap<String, HashMap<String, ConditionValue>> = HashMap::new();
     let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new(); // (src, tgt, rel, min, max)
     let mut where_cond_list: Vec<Condition> = Vec::new();
@@ -363,7 +364,12 @@ fn triples_to_ast(
         match triple.predicate {
             Predicate::Type => {
                 if let Object::Kind(kind) = triple.object {
-                    if let Some(existing) = node_kinds.get(&triple.subject) {
+                    let kinds = if matches!(kind.as_str(), "entity" | "note" | "event" | "edge") {
+                        &mut substrate_kinds
+                    } else {
+                        &mut granular_kinds
+                    };
+                    if let Some(existing) = kinds.get(&triple.subject) {
                         if existing != &kind {
                             return Err(QueryError::Parse {
                                 position: 0,
@@ -374,7 +380,7 @@ fn triples_to_ast(
                             });
                         }
                     } else {
-                        node_kinds.insert(triple.subject, kind);
+                        kinds.insert(triple.subject, kind);
                     }
                 } else {
                     return Err(QueryError::Parse {
@@ -407,6 +413,24 @@ fn triples_to_ast(
                     insert_string_property_constraint(&mut node_props, triple.subject, name, val)?;
                 }
             },
+        }
+    }
+
+    // The AST has one kind slot, so retain the substrate there and filter its granular kind.
+    let mut node_kinds = substrate_kinds;
+    for (variable, kind) in granular_kinds {
+        match node_kinds.entry(variable) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                where_cond_list.push(Condition {
+                    variable: entry.key().clone(),
+                    property: PropertyRef::Field("kind".into()),
+                    op: CompareOp::Eq,
+                    value: ConditionValue::String(kind),
+                });
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(kind);
+            }
         }
     }
 
@@ -703,6 +727,38 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
         assert!(err.to_string().contains("conflicting kind"), "{err}");
+    }
+
+    #[test]
+    fn substrate_and_granular_kinds_constrain_the_same_node_in_both_orders() {
+        for kinds in [":entity . ?a a :concept", ":concept . ?a a :entity"] {
+            let query = parse(&format!(
+                "SELECT ?a WHERE {{ ?a a {kinds} . ?a :extends ?b . }}"
+            ))
+            .unwrap();
+            let start = query.pattern.nodes().next().unwrap();
+            assert_eq!(start.kind.as_deref(), Some("entity"));
+            let conditions: Vec<_> = query.where_clause.conditions().collect();
+            assert_eq!(conditions.len(), 1);
+            assert_eq!(conditions[0].variable, "a");
+            assert_eq!(conditions[0].property, PropertyRef::Field("kind".into()));
+            assert_eq!(
+                conditions[0].value,
+                ConditionValue::String("concept".into())
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_substrate_kinds_are_rejected_in_both_orders() {
+        for kinds in [":entity . ?a a :note", ":note . ?a a :entity"] {
+            let err = parse(&format!(
+                "SELECT ?a WHERE {{ ?a a {kinds} . ?a :extends ?b . }}"
+            ))
+            .unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting kind"), "{err}");
+        }
     }
 
     #[test]
