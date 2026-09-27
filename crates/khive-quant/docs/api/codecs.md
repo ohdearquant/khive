@@ -12,34 +12,34 @@ Encoding: `code_d = round((x_d - min_d) / scale_d)`, clamped to `[0, 255]`.
 
 Fields:
 
-| Field                | Meaning                                                          |
-| --------------------- | ----------------------------------------------------------------- |
-| `min`                 | per-dimension minimum observed at train time                     |
-| `scale`               | per-dimension `(max - min) / 255`                                 |
-| `scale_sq`            | f32 `scale²` per dimension, precomputed for L2                     |
-| `scale_sq_f64`        | f64 `scale²` per dimension, precomputed for dot product            |
-| `mean_scale_sq`       | legacy shared mean retained for public-field compatibility       |
-| `scale_sq_residual`   | legacy residual retained for public-field compatibility          |
-| `offset_sq_sum`       | legacy f32 `Σ min_i²`, retained for public-field compatibility    |
-| `offset_sq_sum_f64`   | f64 `Σ min_i²`, precomputed for dot-product correction              |
+| Field               | Meaning                                                        |
+| ------------------- | -------------------------------------------------------------- |
+| `min`               | per-dimension minimum observed at train time                   |
+| `scale`             | per-dimension `(max - min) / 255`                              |
+| `scale_sq`          | f32 `scale²` per dimension, precomputed for L2                 |
+| `scale_sq_f64`      | legacy f64 `scale²` per dimension, retained for compatibility  |
+| `mean_scale_sq`     | legacy shared mean retained for public-field compatibility     |
+| `scale_sq_residual` | legacy residual retained for public-field compatibility        |
+| `offset_sq_sum`     | legacy f32 `Σ min_i²`, retained for public-field compatibility |
+| `offset_sq_sum_f64` | legacy f64 `Σ min_i²` cache, retained for compatibility        |
 
-`EncodedVector` carries `codes`, `norm`, and the f64 `soc_sum_f64` correction
-computed while encoding, so dot product needs no second pass over each vector.
-The f32 `soc_sum` and `residual_dot_bias` fields remain for public-field
-compatibility.
+`EncodedVector` carries `codes` and `norm`. The f32 `soc_sum` and
+`residual_dot_bias` fields and f64 `soc_sum_f64` cache remain for
+public-field compatibility.
 
 ### `approx_dot`
 
-Full-precision correction identity (both vectors share one codec's min/scale):
+Each dimension is reconstructed and multiplied in f64 before dimensions are
+summed (both vectors share one codec's min/scale):
 
 ```text
-dot(a, b) = Σ scale_i² · a_i · b_i + soc_a + soc_b + offset_sq_sum
+dot(a, b) = Σ (scale_i · a_i + min_i) · (scale_i · b_i + min_i)
 ```
 
-The weighted term uses the precomputed f64 `scale_sq_f64` values and is
-accumulated in f64. Both corrections are also accumulated in f64 when the
-codec or vector is built; widening the legacy f32 caches at query time would
-leave their lost narrow terms missing. The sum is rounded to f32 once.
+The affine correction is completed within each dimension before the sum.
+Adding global weighted and correction totals can cancel large offsets only
+after a narrow dimension's contribution has already rounded away. The
+resulting sum is rounded to f32 once.
 
 ### `approx_cosine_dist`
 
@@ -69,7 +69,7 @@ documented trade-off (see `../design.md`), not an oversight.
 ||a-b||² ≈ gs² · Σ (a_i - b_i)²
 ```
 
-This is *exact* in code space (offset terms cancel, `gs²` factorizes) once
+This is _exact_ in code space (offset terms cancel, `gs²` factorizes) once
 the lossy `f32→u8` encode has already happened — but the round-trip error
 relative to the true `f32` L2² can reach roughly 15% for anisotropic or
 out-of-distribution (OOD) data. Recall safety is established empirically by
@@ -99,13 +99,13 @@ already guarantee valid input and want to skip the `Result`; it calls the
 
 `QuantError` variants:
 
-| Variant                     | Raised when                                                          |
-| ---------------------------- | --------------------------------------------------------------------- |
-| `EmptyCorpus`                | training corpus has zero rows                                        |
-| `ZeroDims`                   | `dims` is zero (flat API) or row 0 is empty (row API)                |
-| `FlatLengthNotDivisible`     | a flat vector's length isn't a multiple of `dims`                    |
-| `RaggedRow`                  | a training row's length doesn't match the dims fixed by row 0        |
-| `EncodeLengthMismatch`       | a vector passed to `encode`/`encode_flat_par` doesn't match trained dims |
+| Variant                  | Raised when                                                              |
+| ------------------------ | ------------------------------------------------------------------------ |
+| `EmptyCorpus`            | training corpus has zero rows                                            |
+| `ZeroDims`               | `dims` is zero (flat API) or row 0 is empty (row API)                    |
+| `FlatLengthNotDivisible` | a flat vector's length isn't a multiple of `dims`                        |
+| `RaggedRow`              | a training row's length doesn't match the dims fixed by row 0            |
+| `EncodeLengthMismatch`   | a vector passed to `encode`/`encode_flat_par` doesn't match trained dims |
 
 ### Why the fallible variants exist (QUANT-AUD-002)
 

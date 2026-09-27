@@ -70,8 +70,7 @@ fn large_signed_zero_endpoint_self_dot_is_zero() {
     assert_eq!(codec.approx_dot(&zero, &zero), 0.0);
 }
 
-// This failure was already present at the PR parent. The same precision
-// correction necessarily closes it; keep it pinned beside the new failure.
+// The zero-valued wide coordinate leaves the narrow signed self-dot intact.
 #[test]
 fn signed_nonzero_endpoint_self_dot_is_preserved() {
     let codec = Sq8Codec::train(&[vec![-255.0, -NARROW], vec![0.0, 0.0]]);
@@ -79,6 +78,22 @@ fn signed_nonzero_endpoint_self_dot_is_preserved() {
     assert_eq!(q.codes, vec![255, 0]);
     assert_exact_reconstruction(&codec, &q, &[0.0, -NARROW]);
     assert_eq!(codec.approx_dot(&q, &q), NARROW_SQ);
+}
+
+#[test]
+fn anisotropic_endpoint_self_dot_preserves_tiny_dimension() {
+    let codec = Sq8Codec::train(&[vec![-255.0 * 1_048_576.0, -NARROW], vec![0.0, 0.0]]);
+    let q = codec.encode(&[0.0, -NARROW]);
+    assert_eq!(codec.scale, vec![1_048_576.0, 1.0 / 16_384.0]);
+    assert_eq!(q.codes, vec![255, 0]);
+    assert_exact_reconstruction(&codec, &q, &[0.0, -NARROW]);
+
+    let dot = codec.approx_dot(&q, &q);
+    let error = (dot - NARROW_SQ).abs();
+    assert!(
+        error <= 1e-8,
+        "expected narrow self-dot {NARROW_SQ}, got {dot}, error {error}"
+    );
 }
 
 #[test]

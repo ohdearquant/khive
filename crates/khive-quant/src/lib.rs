@@ -5,8 +5,8 @@
 //! ## `Sq8Codec` — per-dimension affine, for dot product / cosine
 //!
 //! Each dimension is mapped to [0, 255] using its own observed min/max.
-//! Dot product and cosine use per-dimension weights accumulated in f64 before
-//! returning f32, preserving small dimensions beside a much wider one.
+//! Dot product and cosine reconstruct each dimension in f64 before summing,
+//! preserving small dimensions beside a much wider one.
 //!
 //! ## `GsSq8Codec` — global-scale affine, for L2 (Vamana acquisition)
 //!
@@ -334,7 +334,7 @@ pub struct Sq8Codec {
     pub scale: Vec<f32>,
     /// Per-dimension `scale²` precomputed for fast L2.
     pub scale_sq: Vec<f32>,
-    /// Per-dimension `scale²` retained in f64 for the dot product.
+    /// Legacy per-dimension f64 `scale²` cache, retained for public-field compatibility.
     pub scale_sq_f64: Vec<f64>,
     /// Legacy mean of `scale_sq`; retained for public-field compatibility.
     pub mean_scale_sq: f32,
@@ -342,7 +342,7 @@ pub struct Sq8Codec {
     pub scale_sq_residual: Vec<f32>,
     /// Legacy f32 `Σ_i min_i²` correction, retained for public-field compatibility.
     pub offset_sq_sum: f32,
-    /// `Σ_i min_i²` accumulated in f64 for the dot product.
+    /// Legacy f64 `Σ_i min_i²` cache, retained for public-field compatibility.
     pub offset_sq_sum_f64: f64,
 }
 
@@ -355,7 +355,7 @@ pub struct EncodedVector {
     pub norm: f32,
     /// Legacy f32 `Σ_i scale_i * min_i * code_i` correction.
     pub soc_sum: f32,
-    /// `Σ_i scale_i * min_i * code_i` accumulated in f64 for the dot product.
+    /// Legacy f64 `Σ_i scale_i * min_i * code_i` cache, retained for compatibility.
     pub soc_sum_f64: f64,
     /// Legacy `Σ_i scale_sq_residual_i * code_i` precomputed at encode time.
     pub residual_dot_bias: f32,
@@ -547,12 +547,10 @@ impl Sq8Codec {
 
     /// Approximate dot product between two encoded vectors (same codec).
     ///
-    /// Full-precision correction identity (same min/scale for both):
-    /// `dot(a, b) = Σ s²·a·b + soc_a + soc_b + offset_sq_sum`
-    ///
-    /// Scale weights and both correction terms are accumulated in f64 at
-    /// train/encode time. Widening f32 correction caches only at query time
-    /// cannot recover narrow terms they already rounded away.
+    /// Each dimension contributes `(s·a + min)·(s·b + min)` in f64 before
+    /// dimensions are summed. Keeping the affine correction within each
+    /// dimension avoids cancellation that erases a narrow dimension when
+    /// another dimension has much larger offsets.
     /// Panics if either encoded vector has a different length from this codec.
     #[inline]
     pub fn approx_dot(&self, a: &EncodedVector, b: &EncodedVector) -> f32 {
@@ -567,14 +565,21 @@ impl Sq8Codec {
             dims,
             "approx_dot input codes must match codec dims"
         );
-        let weighted: f64 = self
-            .scale_sq_f64
+        let dot: f64 = self
+            .scale
             .iter()
+            .zip(self.min.iter())
             .zip(a.codes.iter())
             .zip(b.codes.iter())
-            .map(|((&weight, &ac), &bc)| weight * f64::from(ac) * f64::from(bc))
+            .map(|(((&scale, &min), &ac), &bc)| {
+                let scale = f64::from(scale);
+                let min = f64::from(min);
+                let a_value = scale.mul_add(f64::from(ac), min);
+                let b_value = scale.mul_add(f64::from(bc), min);
+                a_value * b_value
+            })
             .sum();
-        (weighted + a.soc_sum_f64 + b.soc_sum_f64 + self.offset_sq_sum_f64) as f32
+        dot as f32
     }
 
     /// Approximate cosine distance between two encoded vectors (same codec).
