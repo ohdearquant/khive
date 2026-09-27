@@ -1,5 +1,6 @@
 //! Code concept vocabulary, finding-note lifecycle, and deterministic audit ingest (ADR-085).
 
+pub mod clippy_adapter;
 mod db_target;
 mod error;
 // L2 symbol-tier scanner/extractor (ADR-085 Amendment 2 B2), wired into
@@ -15,6 +16,9 @@ pub(crate) mod scanner_rust;
 pub mod source_ingest;
 pub(crate) mod vocab;
 
+pub use clippy_adapter::{
+    ingest_clippy_json_lines, ClippyAdapterError, ClippyProvenance, CLIPPY_PRODUCER_ID,
+};
 pub use error::CodeIngestError;
 pub use ingest::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions, CODE_INGEST_NAMESPACE};
 pub use pack::CodePack;
