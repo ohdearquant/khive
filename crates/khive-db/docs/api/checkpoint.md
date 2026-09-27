@@ -281,7 +281,11 @@ does not continue the same frame with a non-decreasing `log_frames` value. A `bu
 row is neutral regardless of its other columns: it neither extends nor ends the run.
 The next `busy=0` row is compared against the last informative row. If busy rows intervened
 and more than two configured checkpoint intervals elapsed since that row, the old run
-ends before the next result is applied. The scheduled
+ends before the next result is applied. This gap uses a monotonic clock; the Unix
+timestamp on the run is retained for reporting. The one-second age required before
+`db_diagnostics` reports `oldest_pinned_frame` also uses elapsed monotonic time.
+When checkpoint tasks overlap on one backend, the shortest interval among the active
+owners sets this budget and is recomputed when an owner leaves. The scheduled
 PASSIVE row, the TRUNCATE row and its post-attempt PASSIVE probes, the top-level WAL
 checkpoint operation, and each `db_diagnostics` probe feed the same backend-scoped run.
 A process without a scheduled checkpoint task reports that no task is present. This is

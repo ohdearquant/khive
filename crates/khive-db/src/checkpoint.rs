@@ -41,7 +41,7 @@
 //! incremental merge work and uses a zero busy timeout, so this best-effort
 //! derived-index maintenance cannot queue behind application writes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -149,8 +149,9 @@ pub(crate) enum CheckpointRunStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CheckpointRunEntry {
     run: CheckpointRun,
+    first_observed_at: Instant,
     last_log_frames: i64,
-    last_informative_at_unix_ms: u64,
+    last_informative_at: Instant,
     busy_since_last_informative: bool,
 }
 
@@ -158,6 +159,7 @@ struct CheckpointRunEntry {
 struct CheckpointRunState {
     active_tasks: usize,
     checkpoint_interval_ms: u64,
+    owner_intervals_ms: BTreeMap<u64, usize>,
     entry: Option<CheckpointRunEntry>,
 }
 
@@ -170,6 +172,7 @@ fn checkpoint_runs() -> &'static Mutex<HashMap<Option<PathBuf>, CheckpointRunSta
 
 pub(crate) struct CheckpointRunTaskGuard {
     key: Option<PathBuf>,
+    interval_ms: u64,
 }
 
 impl CheckpointRunTaskGuard {
@@ -183,13 +186,15 @@ impl CheckpointRunTaskGuard {
         let state = runs.entry(key.clone()).or_default();
         if state.active_tasks == 0 {
             state.entry = None;
-            state.checkpoint_interval_ms = interval_ms;
-        } else {
-            // If two checkpoint owners overlap, the tighter bound is conservative.
-            state.checkpoint_interval_ms = state.checkpoint_interval_ms.min(interval_ms);
         }
+        *state.owner_intervals_ms.entry(interval_ms).or_default() += 1;
         state.active_tasks = state.active_tasks.saturating_add(1);
-        Self { key }
+        state.checkpoint_interval_ms = *state
+            .owner_intervals_ms
+            .first_key_value()
+            .expect("active owner has an interval")
+            .0;
+        Self { key, interval_ms }
     }
 }
 
@@ -201,17 +206,31 @@ impl Drop for CheckpointRunTaskGuard {
         let Some(state) = runs.get_mut(&self.key) else {
             return;
         };
+        let Some(count) = state.owner_intervals_ms.get_mut(&self.interval_ms) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            state.owner_intervals_ms.remove(&self.interval_ms);
+        }
         state.active_tasks = state.active_tasks.saturating_sub(1);
         if state.active_tasks == 0 {
             runs.remove(&self.key);
+        } else {
+            state.checkpoint_interval_ms = *state
+                .owner_intervals_ms
+                .first_key_value()
+                .expect("surviving owner has an interval")
+                .0;
         }
     }
 }
 
-fn advance_checkpoint_run(
+fn advance_checkpoint_run_at(
     entry: &mut Option<CheckpointRunEntry>,
     observation: Option<(i64, i64, i64)>,
     observed_at_unix_ms: u64,
+    observed_at: Instant,
     checkpoint_interval_ms: u64,
 ) {
     let Some((busy, log_frames, checkpointed_frames)) = observation else {
@@ -236,11 +255,15 @@ fn advance_checkpoint_run(
             if current.run.frame == checkpointed_frames
                 && log_frames >= current.last_log_frames
                 && (!current.busy_since_last_informative
-                    || observed_at_unix_ms.saturating_sub(current.last_informative_at_unix_ms)
-                        <= checkpoint_interval_ms.saturating_mul(2)) =>
+                    || observed_at
+                        .checked_duration_since(current.last_informative_at)
+                        .is_some_and(|elapsed| {
+                            elapsed
+                                <= Duration::from_millis(checkpoint_interval_ms.saturating_mul(2))
+                        })) =>
         {
             current.last_log_frames = log_frames;
-            current.last_informative_at_unix_ms = observed_at_unix_ms;
+            current.last_informative_at = observed_at;
             current.busy_since_last_informative = false;
         }
         _ => {
@@ -249,12 +272,34 @@ fn advance_checkpoint_run(
                     frame: checkpointed_frames,
                     first_observed_at_unix_ms: observed_at_unix_ms,
                 },
+                first_observed_at: observed_at,
                 last_log_frames: log_frames,
-                last_informative_at_unix_ms: observed_at_unix_ms,
+                last_informative_at: observed_at,
                 busy_since_last_informative: false,
             });
         }
     }
+}
+
+#[cfg(test)]
+fn advance_checkpoint_run(
+    entry: &mut Option<CheckpointRunEntry>,
+    observation: Option<(i64, i64, i64)>,
+    observed_at_unix_ms: u64,
+    checkpoint_interval_ms: u64,
+) {
+    static TEST_ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let observed_at = TEST_ORIGIN
+        .get_or_init(Instant::now)
+        .checked_add(Duration::from_millis(observed_at_unix_ms))
+        .expect("test monotonic timestamp");
+    advance_checkpoint_run_at(
+        entry,
+        observation,
+        observed_at_unix_ms,
+        observed_at,
+        checkpoint_interval_ms,
+    );
 }
 
 pub(crate) fn record_checkpoint_run_result(
@@ -271,10 +316,11 @@ pub(crate) fn record_checkpoint_run_result(
         return CheckpointRunStatus::NoTask;
     }
     let checkpoint_interval_ms = state.checkpoint_interval_ms;
-    advance_checkpoint_run(
+    advance_checkpoint_run_at(
         &mut state.entry,
         observation,
         observed_at_unix_ms(),
+        Instant::now(),
         checkpoint_interval_ms,
     );
     state
@@ -284,20 +330,32 @@ pub(crate) fn record_checkpoint_run_result(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn checkpoint_run_status(pool: &ConnectionPool) -> CheckpointRunStatus {
+    checkpoint_run_snapshot(pool).0
+}
+
+/// A run and its monotonic age from the same state snapshot. The Unix timestamp
+/// on `CheckpointRun` is display metadata and must not gate pin detection.
+pub(crate) fn checkpoint_run_snapshot(
+    pool: &ConnectionPool,
+) -> (CheckpointRunStatus, Option<Duration>) {
     let runs = checkpoint_runs()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(state) = runs.get(&checkpoint_db_key(pool)) else {
-        return CheckpointRunStatus::NoTask;
+        return (CheckpointRunStatus::NoTask, None);
     };
     if state.active_tasks == 0 {
-        return CheckpointRunStatus::NoTask;
+        return (CheckpointRunStatus::NoTask, None);
     }
     state
         .entry
-        .map_or(CheckpointRunStatus::NoObservation, |entry| {
-            CheckpointRunStatus::Observed(entry.run)
+        .map_or((CheckpointRunStatus::NoObservation, None), |entry| {
+            (
+                CheckpointRunStatus::Observed(entry.run),
+                Some(entry.first_observed_at.elapsed()),
+            )
         })
 }
 
@@ -3713,6 +3771,152 @@ mod tests {
     use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
     use tracing::field::{Field, Visit};
+
+    fn pr3409_active_interval(pool: &ConnectionPool) -> u64 {
+        let key = checkpoint_db_key(pool);
+        checkpoint_runs()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("an owner is active")
+            .checkpoint_interval_ms
+    }
+
+    #[test]
+    fn pr3409_retiring_fast_owner_restores_live_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("pr3409_retired_fast.db"));
+        let slow = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(1_000));
+        let fast = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        assert_eq!(pr3409_active_interval(&pool), 10);
+        drop(fast);
+        assert_eq!(
+            pr3409_active_interval(&pool),
+            1_000,
+            "the remaining owner, not a departed owner, defines the budget"
+        );
+        drop(slow);
+        assert_eq!(checkpoint_run_status(&pool), CheckpointRunStatus::NoTask);
+    }
+
+    #[test]
+    fn checkpoint_run_interval_tracks_duplicate_fast_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("duplicate_intervals.db"));
+        let slow = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(1_000));
+        let fast_one = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        let fast_two = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        drop(fast_one);
+        assert_eq!(pr3409_active_interval(&pool), 10);
+        drop(fast_two);
+        assert_eq!(pr3409_active_interval(&pool), 1_000);
+        drop(slow);
+        assert_eq!(checkpoint_run_status(&pool), CheckpointRunStatus::NoTask);
+    }
+
+    #[test]
+    fn pr3409_busy_gap_uses_surviving_owner_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("pr3409_surviving_budget.db"));
+        let _slow = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(1_000));
+        let fast = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        drop(fast);
+        let interval = pr3409_active_interval(&pool);
+        let mut entry = None;
+        advance_checkpoint_run(&mut entry, Some((0, 20, 7)), 1_000, interval);
+        advance_checkpoint_run(&mut entry, Some((1, -1, -1)), 1_050, interval);
+        advance_checkpoint_run(&mut entry, Some((0, 21, 7)), 1_100, interval);
+        assert_eq!(
+            entry
+                .expect("matching informative row")
+                .run
+                .first_observed_at_unix_ms,
+            1_000,
+            "a 100ms busy gap fits the surviving 1000ms owner's budget"
+        );
+    }
+
+    #[test]
+    fn pr3409_retiring_slow_owner_keeps_fast_budget_and_cleans_last_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("pr3409_retired_slow.db"));
+        let fast = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        let slow = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(1_000));
+        drop(slow);
+        assert_eq!(pr3409_active_interval(&pool), 10);
+        drop(fast);
+        assert_eq!(checkpoint_run_status(&pool), CheckpointRunStatus::NoTask);
+    }
+
+    #[test]
+    fn pr3409_new_lifecycle_does_not_inherit_retired_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("pr3409_new_lifecycle.db"));
+        let fast = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        drop(fast);
+        let _slow = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(1_000));
+        assert_eq!(pr3409_active_interval(&pool), 1_000);
+        assert_eq!(
+            checkpoint_run_status(&pool),
+            CheckpointRunStatus::NoObservation
+        );
+    }
+
+    #[test]
+    fn verify_3409_backward_wall_clock_step_bypasses_busy_gap_budget() {
+        let mut entry = None;
+        let start = Instant::now();
+        advance_checkpoint_run_at(&mut entry, Some((0, 20, 7)), 100_000, start, 10);
+        advance_checkpoint_run_at(
+            &mut entry,
+            Some((1, -1, -1)),
+            100_005,
+            start + Duration::from_millis(5),
+            10,
+        );
+        advance_checkpoint_run_at(
+            &mut entry,
+            Some((0, 21, 7)),
+            90_000,
+            start + Duration::from_millis(50),
+            10,
+        );
+        let observed = entry.expect("an entry exists after the third sample");
+        assert_eq!(
+            observed.run.first_observed_at_unix_ms, 90_000,
+            "a backward wall-clock step must not let the busy-gap budget check \
+             silently treat a large elapsed gap as zero and continue the stale run"
+        );
+    }
+
+    #[test]
+    fn checkpoint_run_snapshot_uses_monotonic_age_with_future_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("monotonic_pin_age.db"));
+        let _guard = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(10));
+        let key = checkpoint_db_key(&pool);
+        let observed_at = Instant::now() - Duration::from_secs(2);
+        {
+            let mut runs = checkpoint_runs().lock().unwrap();
+            let state = runs.get_mut(&key).expect("active checkpoint task");
+            advance_checkpoint_run_at(
+                &mut state.entry,
+                Some((0, 20, 7)),
+                u64::MAX,
+                observed_at,
+                10,
+            );
+        }
+        let (status, age) = checkpoint_run_snapshot(&pool);
+        assert_eq!(
+            status,
+            CheckpointRunStatus::Observed(CheckpointRun {
+                frame: 7,
+                first_observed_at_unix_ms: u64::MAX,
+            })
+        );
+        assert!(age.expect("observed run has an age") >= Duration::from_secs(2));
+    }
 
     #[test]
     fn checkpoint_run_guard_captures_the_configured_interval_for_busy_spans() {

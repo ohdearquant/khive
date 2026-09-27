@@ -62,8 +62,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use khive_storage::error::StorageError;
 use khive_storage::types::StorageResult;
@@ -1503,19 +1502,15 @@ fn checkpoint_pin_diagnostics(
     probe: Option<&CheckpointProbe>,
     probe_error: Option<&str>,
 ) -> CheckpointPinDiagnostics {
-    checkpoint_pin_diagnostics_for_run(
-        probe,
-        probe_error,
-        checkpoint::checkpoint_run_status(pool),
-        unix_time_ms(),
-    )
+    let (run_status, run_age) = checkpoint::checkpoint_run_snapshot(pool);
+    checkpoint_pin_diagnostics_for_run(probe, probe_error, run_status, run_age)
 }
 
 fn checkpoint_pin_diagnostics_for_run(
     probe: Option<&CheckpointProbe>,
     probe_error: Option<&str>,
     run_status: checkpoint::CheckpointRunStatus,
-    now_unix_ms: u64,
+    run_age: Option<Duration>,
 ) -> CheckpointPinDiagnostics {
     let (backfill_ceiling, backfill_reason) = match probe {
         None => (
@@ -1567,8 +1562,8 @@ fn checkpoint_pin_diagnostics_for_run(
                         Some(reason.to_string()),
                     )
                 }
-                checkpoint::CheckpointRunStatus::Observed(run)
-                    if now_unix_ms.saturating_sub(run.first_observed_at_unix_ms) < 1000 =>
+                checkpoint::CheckpointRunStatus::Observed(_)
+                    if run_age.is_none_or(|age| age < Duration::from_secs(1)) =>
                 {
                     let reason = "checkpoint run has been observed for less than one second";
                     (
@@ -1607,13 +1602,6 @@ fn checkpoint_pin_diagnostics_for_run(
         pin_depth,
         pin_depth_unavailable_reason: pin_depth_reason,
     }
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Assemble the report for `pool`'s database.
@@ -1941,14 +1929,15 @@ fn split_fts_segments_result(
 fn record_diagnostic_checkpoint_probe(
     pool: &ConnectionPool,
     result: &rusqlite::Result<CheckpointProbe>,
-) -> checkpoint::CheckpointRunStatus {
+) -> (checkpoint::CheckpointRunStatus, Option<Duration>) {
     checkpoint::record_checkpoint_run_result(
         pool,
         result
             .as_ref()
             .ok()
             .map(|probe| (probe.busy, probe.log_frames, probe.checkpointed_frames)),
-    )
+    );
+    checkpoint::checkpoint_run_snapshot(pool)
 }
 
 fn inspect_pool_interruptibly(
@@ -1982,7 +1971,7 @@ fn inspect_pool_interruptibly(
 
     // PASSIVE can perform write I/O. Never install sqlite3_interrupt for it.
     let probe_result = checkpoint_probe(&conn);
-    let run_status = record_diagnostic_checkpoint_probe(pool, &probe_result);
+    let (run_status, run_age) = record_diagnostic_checkpoint_probe(pool, &probe_result);
     let (checkpoint_probe, checkpoint_probe_error) = match probe_result {
         Ok(probe) => (Some(probe), None),
         Err(e) => (
@@ -1994,7 +1983,7 @@ fn inspect_pool_interruptibly(
         checkpoint_probe.as_ref(),
         checkpoint_probe_error.as_deref(),
         run_status,
-        unix_time_ms(),
+        run_age,
     );
     #[cfg(test)]
     if TEST_PAUSE_AFTER_PASSIVE.load(Ordering::SeqCst) {
@@ -2216,7 +2205,7 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
     };
 
     let probe_result = checkpoint_probe(&conn);
-    let run_status = record_diagnostic_checkpoint_probe(pool, &probe_result);
+    let (run_status, run_age) = record_diagnostic_checkpoint_probe(pool, &probe_result);
     let (checkpoint_probe, checkpoint_probe_error) = match probe_result {
         Ok(probe) => (Some(probe), None),
         Err(e) => (
@@ -2228,7 +2217,7 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
         checkpoint_probe.as_ref(),
         checkpoint_probe_error.as_deref(),
         run_status,
-        unix_time_ms(),
+        run_age,
     );
     let (graph_edge_integrity, graph_edge_integrity_error) = match graph_edge_integrity(&conn) {
         Ok(integrity) => (Some(integrity), None),
@@ -2735,6 +2724,54 @@ mod tests {
     }
 
     #[test]
+    fn pin_age_does_not_depend_on_the_wall_clock_epoch() {
+        let probe = CheckpointProbe {
+            busy: 0,
+            log_frames: 12,
+            checkpointed_frames: 7,
+        };
+        let future_epoch = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
+            frame: 7,
+            first_observed_at_unix_ms: 10_000,
+        });
+        let past_epoch = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
+            frame: 7,
+            first_observed_at_unix_ms: 1,
+        });
+        let young = checkpoint_pin_diagnostics_for_run(
+            Some(&probe),
+            None,
+            future_epoch,
+            Some(Duration::from_millis(10)),
+        );
+        let forward = checkpoint_pin_diagnostics_for_run(
+            Some(&probe),
+            None,
+            future_epoch,
+            Some(Duration::from_millis(1010)),
+        );
+        let backward = checkpoint_pin_diagnostics_for_run(
+            Some(&probe),
+            None,
+            past_epoch,
+            Some(Duration::from_millis(1010)),
+        );
+        assert_eq!(young.oldest_pinned_frame, None);
+        assert_eq!(forward.oldest_pinned_frame, Some(7));
+        assert_eq!(forward.pin_depth, Some(5));
+        assert_eq!(backward.oldest_pinned_frame, Some(7));
+        let busy = CheckpointProbe { busy: 1, ..probe };
+        let unavailable = checkpoint_pin_diagnostics_for_run(
+            Some(&busy),
+            None,
+            future_epoch,
+            Some(Duration::from_millis(1010)),
+        );
+        assert_eq!(unavailable.oldest_pinned_frame, None);
+        assert_eq!(unavailable.pin_depth, None);
+    }
+
+    #[test]
     fn checkpoint_pin_report_waits_one_second_for_a_matching_run() {
         let probe = CheckpointProbe {
             busy: 0,
@@ -2746,7 +2783,12 @@ mod tests {
             first_observed_at_unix_ms: 1_000,
         });
 
-        let young = checkpoint_pin_diagnostics_for_run(Some(&probe), None, run, 1_999);
+        let young = checkpoint_pin_diagnostics_for_run(
+            Some(&probe),
+            None,
+            run,
+            Some(Duration::from_millis(999)),
+        );
         assert_eq!(young.backfill_ceiling, Some(7));
         assert_eq!(young.oldest_pinned_frame, None);
         assert!(young
@@ -2757,7 +2799,12 @@ mod tests {
         assert_eq!(young.pin_depth, None);
         assert!(young.pin_depth_unavailable_reason.is_some());
 
-        let aged = checkpoint_pin_diagnostics_for_run(Some(&probe), None, run, 2_000);
+        let aged = checkpoint_pin_diagnostics_for_run(
+            Some(&probe),
+            None,
+            run,
+            Some(Duration::from_secs(1)),
+        );
         assert_eq!(aged.backfill_ceiling, Some(7));
         assert_eq!(aged.oldest_pinned_frame, Some(7));
         assert_eq!(aged.pin_depth, Some(5));
@@ -2794,7 +2841,12 @@ mod tests {
                 checkpointed_frames: 12,
             }),
         ] {
-            let result = checkpoint_pin_diagnostics_for_run(probe.as_ref(), None, run, 2_000);
+            let result = checkpoint_pin_diagnostics_for_run(
+                probe.as_ref(),
+                None,
+                run,
+                Some(Duration::from_secs(1)),
+            );
             assert_eq!(result.backfill_ceiling, None);
             assert!(result.backfill_ceiling_unavailable_reason.is_some());
             assert_eq!(result.oldest_pinned_frame, None);
@@ -2805,7 +2857,12 @@ mod tests {
             assert!(result.pin_depth_unavailable_reason.is_some());
         }
 
-        let error = checkpoint_pin_diagnostics_for_run(None, Some("probe failed"), run, 2_000);
+        let error = checkpoint_pin_diagnostics_for_run(
+            None,
+            Some("probe failed"),
+            run,
+            Some(Duration::from_secs(1)),
+        );
         assert_eq!(error.backfill_ceiling, None);
         assert_eq!(
             error.backfill_ceiling_unavailable_reason.as_deref(),
