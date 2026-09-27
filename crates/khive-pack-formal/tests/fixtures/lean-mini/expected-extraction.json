@@ -1,0 +1,68 @@
+[
+  {
+    "name": "LeanMini.double",
+    "kind": "definition",
+    "type_expr": "Nat → Nat",
+    "refs": [],
+    "doc": "Add a natural number to itself.",
+    "module": "Mini",
+    "source_location": { "path": "Mini.lean", "line": 4, "column": 1 },
+    "provenance": { "origin": "hand-authored-fixture", "lean_toolchain": "leanprover/lean4:v4.34.1", "lake_version": "5.0.0" },
+    "incomplete": false
+  },
+  {
+    "name": "LeanMini.Pair",
+    "kind": "structure",
+    "type_expr": "Type",
+    "refs": [],
+    "doc": "A small record with two natural-number fields.",
+    "module": "Mini",
+    "source_location": { "path": "Mini.lean", "line": 7, "column": 1 },
+    "provenance": { "origin": "hand-authored-fixture", "lean_toolchain": "leanprover/lean4:v4.34.1", "lake_version": "5.0.0" },
+    "incomplete": false
+  },
+  {
+    "name": "LeanMini.pairInhabited",
+    "kind": "instance",
+    "type_expr": "Inhabited LeanMini.Pair",
+    "refs": ["LeanMini.Pair"],
+    "doc": "Give the record a concrete default value.",
+    "module": "Mini",
+    "source_location": { "path": "Mini.lean", "line": 12, "column": 1 },
+    "provenance": { "origin": "hand-authored-fixture", "lean_toolchain": "leanprover/lean4:v4.34.1", "lake_version": "5.0.0" },
+    "incomplete": false
+  },
+  {
+    "name": "LeanMini.shift_identity",
+    "kind": "axiom",
+    "type_expr": "(n : Nat) → n + 0 = n",
+    "refs": [],
+    "doc": "A postulate, deliberately distinct from an incomplete theorem.",
+    "module": "Mini",
+    "source_location": { "path": "Mini.lean", "line": 16, "column": 1 },
+    "provenance": { "origin": "hand-authored-fixture", "lean_toolchain": "leanprover/lean4:v4.34.1", "lake_version": "5.0.0" },
+    "incomplete": false
+  },
+  {
+    "name": "LeanMini.double_zero",
+    "kind": "theorem",
+    "type_expr": "LeanMini.double 0 = 0",
+    "refs": ["LeanMini.double"],
+    "doc": "A theorem whose proof is deliberately unfinished.",
+    "module": "Mini",
+    "source_location": { "path": "Mini.lean", "line": 19, "column": 1 },
+    "provenance": { "origin": "hand-authored-fixture", "lean_toolchain": "leanprover/lean4:v4.34.1", "lake_version": "5.0.0" },
+    "incomplete": true
+  },
+  {
+    "name": null,
+    "kind": "goal",
+    "type_expr": "(n : Nat) → n = n",
+    "refs": [],
+    "doc": "An anonymous, goal-shaped statement with a complete proof.",
+    "module": "Mini",
+    "source_location": { "path": "Mini.lean", "line": 23, "column": 1 },
+    "provenance": { "origin": "hand-authored-fixture", "lean_toolchain": "leanprover/lean4:v4.34.1", "lake_version": "5.0.0" },
+    "incomplete": false
+  }
+]

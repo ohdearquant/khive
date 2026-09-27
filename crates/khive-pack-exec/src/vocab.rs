@@ -146,7 +146,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     },
     HandlerDef {
         name: "exec.identity",
-        description: "Effective exec configuration identity: resolved read roots and their digest, the profile template digest, limits and caps.",
+        description: "Effective exec configuration identity: resolved read roots and their digest, the profile template digest, limits and caps. The never set lists canonical path matches, not forbidden program capabilities.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],

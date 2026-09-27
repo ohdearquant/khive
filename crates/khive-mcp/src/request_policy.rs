@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use khive_request::{parse_request, ArgValue, ParsedRequest};
 #[cfg(unix)]
-use khive_runtime::{classify_operation, OperationAccess};
+use khive_runtime::{classify_operation, OperationAccess, VerbRegistry};
 
 /// Connect/write, scheduling and response serialization allowance beyond the
 /// handler's intentional wait. This is not an unbounded slow-peer exemption.
@@ -14,10 +14,10 @@ const LONG_POLL_MARGIN: Duration = Duration::from_secs(5);
 pub(crate) fn read_replay_safe(ops: &str) -> bool {
     parse_request(ops).is_ok_and(|parsed| {
         !parsed.ops.is_empty()
-            && parsed
-                .ops
-                .iter()
-                .all(|op| classify_operation(&op.tool) == Some(OperationAccess::Read))
+            && parsed.ops.iter().all(|op| {
+                classify_operation(&op.tool) == Some(OperationAccess::Read)
+                    && !VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&op.tool.as_str())
+            })
     })
 }
 
@@ -98,13 +98,16 @@ mod tests {
         for ops in [
             "comm.inbox()",
             "get(id=\"x\")",
-            "[list(), search(query=\"x\")]",
+            "[list(), get(id=\"x\")]",
             "stats() | comm.unread()",
         ] {
             assert!(read_replay_safe(ops), "{ops}");
         }
         for ops in [
             "comm.read(id=\"x\")",
+            "memory.recall(query=\"x\")",
+            "search(query=\"x\")",
+            "[list(), search(query=\"x\")]",
             "comm.send(to=\"x\", content=\"x\")",
             "[stats(), comm.mark_read(ids=[])]",
             "stats() | unknown.read()",

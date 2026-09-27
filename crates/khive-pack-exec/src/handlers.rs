@@ -19,7 +19,7 @@ use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
-use crate::capture::{drain, walk, Tail};
+use crate::capture::{drain, walk, CaptureRead, Tail};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
@@ -368,6 +368,10 @@ struct Receipt {
     pids: Option<Value>,
     started_at: Option<i64>,
     finished_at: Option<i64>,
+    // Set after materialization to the canonical root used for the run.
+    // A pre-existing UUID root is not ours to delete.
+    #[cfg(unix)]
+    owned_run_dir: Option<PathBuf>,
 }
 
 impl Receipt {
@@ -415,6 +419,14 @@ impl Receipt {
             },
         })
     }
+}
+
+fn append_failure_reason(receipt: &mut Receipt, detail: String) {
+    receipt.success = false;
+    receipt.reason = Some(match receipt.reason.take() {
+        Some(existing) => format!("{existing}; {detail}"),
+        None => detail,
+    });
 }
 
 /// Parsed and validated run request, before any policy decision.
@@ -566,11 +578,33 @@ pub async fn run(
         pids: None,
         started_at: None,
         finished_at: None,
+        #[cfg(unix)]
+        owned_run_dir: None,
     };
 
     match preflight(rt, token, cfg, &req, &mut receipt).await {
         Ok(ready) => {
-            execute(rt, &ns, cfg, &req, ready, &mut receipt).await?;
+            if let Err(error) = execute(rt, &ns, cfg, &req, ready, &mut receipt).await {
+                // Hydration, profile/blob writes and spawn can fail after
+                // policy allowed the call. They still need a durable receipt.
+                receipt.success = false;
+                receipt.tree_out = None;
+                receipt.changed.clear();
+                receipt.undeclared.clear();
+                // Unconfigured is a wire error category whose Display suffix
+                // ("is not set") is misleading for filesystem failures.
+                let detail = match error {
+                    RuntimeError::Unconfigured(detail) => detail,
+                    other => other.to_string(),
+                };
+                append_failure_reason(&mut receipt, detail);
+                receipt.finished_at.get_or_insert_with(receipts::now_micros);
+                #[cfg(unix)]
+                if let Some(run_dir) = receipt.owned_run_dir.clone() {
+                    let profile_path = run_dir.with_extension("sb");
+                    finish_cleanup(&mut receipt, &run_dir, &profile_path, false);
+                }
+            }
             let mut value = receipt.to_json();
             let seq = receipts::insert(rt, &ns, &value).await?;
             value["seq"] = seq.map_or(Value::Null, Value::from);
@@ -708,12 +742,21 @@ fn materialize(
 ) -> std::io::Result<()> {
     std::fs::create_dir(run_dir)?;
     let result = materialize_entries(run_dir, entries, bytes);
-    if result.is_err() {
+    if let Err(error) = result {
         // Remove only the fresh root we own, never a pre-existing root whose
         // create_dir failed. A partial input tree is not a keepable run.
-        let _ = std::fs::remove_dir_all(run_dir);
+        if let Err(cleanup) = std::fs::remove_dir_all(run_dir) {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; cleanup of partially materialized {} failed: {cleanup}",
+                    run_dir.display()
+                ),
+            ));
+        }
+        return Err(error);
     }
-    result
+    Ok(())
 }
 
 fn materialize_entries(
@@ -783,6 +826,93 @@ type RlimitResource = libc::__rlimit_resource_t;
 #[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
 type RlimitResource = libc::c_int;
 
+#[cfg(unix)]
+const LIMIT_REPORT_LEN: usize = 1 + 4 * std::mem::size_of::<u64>();
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct PreparedLimits {
+    entries: [Option<(RlimitResource, u64)>; 4],
+}
+
+#[cfg(unix)]
+impl PreparedLimits {
+    fn new(limits: &sandbox::Limits) -> Self {
+        Self {
+            entries: [
+                limits.cpu_seconds.map(|v| (libc::RLIMIT_CPU, v)),
+                limits.file_size.map(|v| (libc::RLIMIT_FSIZE, v)),
+                #[cfg(not(target_os = "macos"))]
+                limits.address_space.map(|v| (libc::RLIMIT_AS, v)),
+                #[cfg(target_os = "macos")]
+                None,
+                #[cfg(not(target_os = "macos"))]
+                limits.nproc.map(|v| (libc::RLIMIT_NPROC, v)),
+                #[cfg(target_os = "macos")]
+                None,
+            ],
+        }
+    }
+}
+
+#[cfg(unix)]
+fn encode_limit_report(
+    prepared: PreparedLimits,
+    mut apply: impl FnMut(RlimitResource, u64) -> std::io::Result<u64>,
+) -> std::io::Result<[u8; LIMIT_REPORT_LEN]> {
+    let mut report = [0u8; LIMIT_REPORT_LEN];
+    for (index, entry) in prepared.entries.into_iter().enumerate() {
+        if let Some((resource, value)) = entry {
+            let enforced = apply(resource, value)?;
+            report[0] |= 1 << index;
+            let start = 1 + index * std::mem::size_of::<u64>();
+            report[start..start + std::mem::size_of::<u64>()]
+                .copy_from_slice(&enforced.to_ne_bytes());
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(unix)]
+fn set_and_read_limit(resource: RlimitResource, value: u64) -> std::io::Result<u64> {
+    let lim = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    let mut back = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: both pointers refer to stack-owned rlimit values.
+    unsafe {
+        if libc::setrlimit(resource, &lim) != 0 || libc::getrlimit(resource, &mut back) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // `rlim_t` varies in width and signedness across Unix targets. The cast
+    // preserves the report's u64 wire format even when it is redundant here.
+    #[allow(clippy::unnecessary_cast)]
+    let enforced = back.rlim_cur as u64;
+    Ok(enforced)
+}
+
+#[cfg(unix)]
+fn decode_limit_report(report: &[u8; LIMIT_REPORT_LEN]) -> Value {
+    let mut enforced = serde_json::Map::new();
+    for (index, name) in ["cpu_seconds", "file_size", "address_space", "nproc"]
+        .into_iter()
+        .enumerate()
+    {
+        if report[0] & (1 << index) != 0 {
+            let start = 1 + index * std::mem::size_of::<u64>();
+            let mut bytes = [0u8; std::mem::size_of::<u64>()];
+            bytes.copy_from_slice(&report[start..start + std::mem::size_of::<u64>()]);
+            enforced.insert(name.into(), json!(u64::from_ne_bytes(bytes)));
+        }
+    }
+    Value::Object(enforced)
+}
+
 /// Launching a tool needs a process group, resource limits, a close-on-exec
 /// pipe for the limit report and the sandbox: unix facilities. On any other
 /// host `exec.run` refuses before touching the store or the filesystem.
@@ -833,20 +963,23 @@ async fn execute(
     })?;
     let run_dir = root.join(&receipt.id);
     if let Err(error) = materialize(&run_dir, &ready.entries, &bytes) {
-        receipt.success = false;
-        receipt.reason = Some(format!("materialize {}: {error}", run_dir.display()));
-        receipt.finished_at = Some(receipts::now_micros());
-        // No profile or child exists yet. Return through run's receipt insertion.
-        return Ok(());
+        return Err(RuntimeError::Unconfigured(format!(
+            "materialize {}: {error}",
+            run_dir.display()
+        )));
     }
-    receipts::event(
+    receipt.owned_run_dir = Some(run_dir.clone());
+    if let Err(error) = receipts::event(
         rt,
         ns,
         &receipt.id,
         "materialized",
         json!({ "run_dir": run_dir.to_string_lossy(), "entries": ready.entries.len() }),
     )
-    .await?;
+    .await
+    {
+        append_failure_reason(receipt, format!("materialized event write failed: {error}"));
+    }
 
     // Profile: rendered per run, stored as a blob, written beside the run
     // directory for sandbox-exec to read, removed with it.
@@ -894,62 +1027,27 @@ async fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let limits = cfg.limits.clone();
+    let prepared_limits = PreparedLimits::new(&cfg.limits);
     let (limit_reader, limit_writer) = limit_pipe()?;
-    // SAFETY: the closure runs in the forked child before exec and only
-    // calls async-signal-safe libc functions.
+    // SAFETY: the forked child uses fixed-size stack storage and only calls
+    // async-signal-safe libc functions before exec.
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut report = String::from("{");
-            let mut first = true;
-            let mut apply =
-                |name: &str, resource: RlimitResource, value: u64| -> std::io::Result<()> {
-                    let lim = libc::rlimit {
-                        rlim_cur: value as libc::rlim_t,
-                        rlim_max: value as libc::rlim_t,
-                    };
-                    if libc::setrlimit(resource, &lim) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    let mut back = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::getrlimit(resource, &mut back) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if !first {
-                        report.push(',');
-                    }
-                    first = false;
-                    report.push_str(&format!("\"{name}\":{}", back.rlim_cur));
-                    Ok(())
-                };
-            if let Some(v) = limits.cpu_seconds {
-                apply("cpu_seconds", libc::RLIMIT_CPU, v)?;
-            }
-            if let Some(v) = limits.file_size {
-                apply("file_size", libc::RLIMIT_FSIZE, v)?;
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                if let Some(v) = limits.address_space {
-                    apply("address_space", libc::RLIMIT_AS, v)?;
-                }
-                if let Some(v) = limits.nproc {
-                    apply("nproc", libc::RLIMIT_NPROC, v)?;
-                }
-            }
-            report.push('}');
-            let bytes = report.as_bytes();
-            libc::write(
+            let report = encode_limit_report(prepared_limits, set_and_read_limit)?;
+            let written = libc::write(
                 limit_writer,
-                bytes.as_ptr() as *const libc::c_void,
-                bytes.len(),
+                report.as_ptr() as *const libc::c_void,
+                report.len(),
             );
+            if written < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if written as usize != report.len() {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
             libc::close(limit_writer);
             Ok(())
         });
@@ -968,7 +1066,6 @@ async fn execute(
             unsafe {
                 libc::close(limit_reader);
             }
-            cleanup(&run_dir, &profile_path, cfg.keep);
             return Err(RuntimeError::Unconfigured(format!(
                 "spawning sandbox-exec for {}: {e}",
                 ready.registered
@@ -979,14 +1076,17 @@ async fn execute(
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
     let pid = child.id().unwrap_or_default() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
-    receipts::event(
+    if let Err(error) = receipts::event(
         rt,
         ns,
         &receipt.id,
         "launched",
         json!({ "pid": pid, "pgid": pid, "argv": receipt.argv }),
     )
-    .await?;
+    .await
+    {
+        append_failure_reason(receipt, format!("launched event write failed: {error}"));
+    }
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -1020,14 +1120,17 @@ async fn execute(
     let out: Tail = out_task.await.unwrap_or_else(|_| Tail::new(cap));
     let err: Tail = err_task.await.unwrap_or_else(|_| Tail::new(cap));
     receipt.finished_at = Some(receipts::now_micros());
-    receipts::event(
+    if let Err(error) = receipts::event(
         rt,
         ns,
         &receipt.id,
         "exited",
         json!({ "pid": pid, "timed_out": receipt.timed_out, "elapsed_ms": started.elapsed().as_millis() as u64 }),
     )
-    .await?;
+    .await
+    {
+        append_failure_reason(receipt, format!("exited event write failed: {error}"));
+    }
 
     if let Some(status) = status {
         use std::os::unix::process::ExitStatusExt;
@@ -1066,11 +1169,39 @@ async fn execute(
         let mut out_entries: Vec<TreeEntry> = Vec::new();
         let mut changes: Vec<Change> = Vec::new();
         let mut undeclared: BTreeSet<String> = BTreeSet::new();
+        let mut refused_count = 0usize;
+        let mut first_refusal: Option<String> = None;
         for (path, file) in &found {
-            let data = file
-                .read_content()
+            // A host filename can contain a backslash even though a tree
+            // path cannot. Do not publish an output tree that its own load
+            // path will reject; retain the input entry if there was one.
+            if let Err(error) = tree::validate_relative_path(path, "capture entry") {
+                receipt.skipped.push(path.clone());
+                refused_count += 1;
+                first_refusal.get_or_insert_with(|| error.to_string());
+                if let Some(old) = input.get(path.as_str()) {
+                    out_entries.push((*old).clone());
+                }
+                continue;
+            }
+            let captured = file
+                .read_content_bounded(khive_storage::MAX_BLOB_WHOLE_BYTES)
                 .map_err(|e| RuntimeError::Unconfigured(format!("capture entry {path:?}: {e}")))?;
-            let digest = digest_hex(&data);
+            let (data, digest) = match captured {
+                CaptureRead::Complete(content) => (content.bytes, content.digest),
+                CaptureRead::TooLarge { observed_at_least } => {
+                    receipt.skipped.push(path.clone());
+                    refused_count += 1;
+                    first_refusal.get_or_insert_with(|| format!(
+                        "capture entry {path:?} exceeds the {}-byte whole-blob limit (observed at least {observed_at_least} bytes)",
+                        khive_storage::MAX_BLOB_WHOLE_BYTES
+                    ));
+                    if let Some(old) = input.get(path.as_str()) {
+                        out_entries.push((*old).clone());
+                    }
+                    continue;
+                }
+            };
             match input.get(path.as_str()) {
                 Some(old) if old.content_ref == digest && old.mode == file.mode => {
                     out_entries.push((*old).clone());
@@ -1131,32 +1262,62 @@ async fn execute(
         receipt.changed = changes;
         receipt.undeclared = undeclared.into_iter().collect();
         receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
-        receipt.success =
-            !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+        receipt.success = !receipt.timed_out
+            && receipt.exit_code == Some(0)
+            && receipt.undeclared.is_empty()
+            && refused_count == 0
+            && receipt.reason.is_none();
+        if let Some(first) = first_refusal {
+            let detail = format!("capture refused {refused_count} output path(s); first: {first}");
+            append_failure_reason(receipt, detail);
+        }
 
         Ok(())
     }
     .await;
     if let Err(error) = captured {
-        receipt.success = false;
-        receipt.reason = Some(error.to_string());
+        append_failure_reason(receipt, error.to_string());
         receipt.tree_out = None;
         receipt.changed.clear();
         receipt.undeclared.clear();
         // A partial capture is never retained as a purported output tree,
         // including when successful runs would otherwise be kept.
-        cleanup(&run_dir, &profile_path, false);
+        finish_cleanup(receipt, &run_dir, &profile_path, false);
         return Ok(());
     }
 
-    cleanup(&run_dir, &profile_path, cfg.keep);
+    finish_cleanup(receipt, &run_dir, &profile_path, cfg.keep);
     Ok(())
 }
 
-fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) {
-    let _ = std::fs::remove_file(profile_path);
+#[cfg(unix)]
+fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Err(error) = std::fs::remove_file(profile_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            failures.push(format!(
+                "remove profile {}: {error}",
+                profile_path.display()
+            ));
+        }
+    }
     if !keep {
-        let _ = std::fs::remove_dir_all(run_dir);
+        if let Err(error) = std::fs::remove_dir_all(run_dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failures.push(format!(
+                    "remove run directory {}: {error}",
+                    run_dir.display()
+                ));
+            }
+        }
+    }
+    failures
+}
+
+#[cfg(unix)]
+fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, keep: bool) {
+    for failure in cleanup(run_dir, profile_path, keep) {
+        append_failure_reason(receipt, format!("exec cleanup failed: {failure}"));
     }
 }
 
@@ -1196,9 +1357,11 @@ fn read_limit_report(reader: libc::c_int) -> Value {
     use std::os::unix::io::FromRawFd;
     // SAFETY: we own the descriptor and close it exactly once through File.
     let mut file = unsafe { std::fs::File::from_raw_fd(reader) };
-    let mut text = String::new();
-    let _ = file.read_to_string(&mut text);
-    serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+    let mut report = [0u8; LIMIT_REPORT_LEN];
+    if file.read_exact(&mut report).is_err() {
+        return json!({});
+    }
+    decode_limit_report(&report)
 }
 
 #[cfg(all(test, unix))]
@@ -1209,6 +1372,50 @@ mod grant_pin_tests;
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn limit_report_uses_values_prepared_before_spawn() {
+        let mut limits = sandbox::Limits {
+            cpu_seconds: Some(5),
+            file_size: Some(1_048_576),
+            address_space: Some(4_096),
+            nproc: Some(2),
+        };
+        let prepared = PreparedLimits::new(&limits);
+        limits.cpu_seconds = Some(99);
+        limits.file_size = None;
+        assert_eq!((limits.cpu_seconds, limits.file_size), (Some(99), None));
+
+        let mut applied = Vec::new();
+        let report = encode_limit_report(prepared, |resource, value| {
+            applied.push((resource, value));
+            Ok(value + 1)
+        })
+        .unwrap();
+        assert_eq!(applied[0], (libc::RLIMIT_CPU, 5));
+        assert_eq!(applied[1], (libc::RLIMIT_FSIZE, 1_048_576));
+
+        let expected = json!({ "cpu_seconds": 6, "file_size": 1_048_577 });
+        #[cfg(not(target_os = "macos"))]
+        let expected = {
+            assert_eq!(applied[2], (libc::RLIMIT_AS, 4_096));
+            assert_eq!(applied[3], (libc::RLIMIT_NPROC, 2));
+            let mut expected = expected;
+            expected["address_space"] = json!(4_097);
+            expected["nproc"] = json!(3);
+            expected
+        };
+        #[cfg(target_os = "macos")]
+        assert_eq!(applied.len(), 2);
+        assert_eq!(decode_limit_report(&report), expected);
+
+        let empty =
+            encode_limit_report(PreparedLimits::new(&sandbox::Limits::default()), |_, _| {
+                panic!("unset limit must not be applied")
+            })
+            .unwrap();
+        assert_eq!(decode_limit_report(&empty), json!({}));
+    }
 
     #[test]
     fn materialize_preserves_literal_symlink_targets() {

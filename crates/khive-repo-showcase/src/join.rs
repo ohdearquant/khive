@@ -91,9 +91,9 @@ pub(crate) fn head_committed_at(repo: &Path) -> Result<String, ExportError> {
     git_text(repo, &["show", "-s", "--format=%cI", "HEAD"])
 }
 
-pub(crate) fn tracked_paths(repo: &Path) -> Result<Vec<String>, ExportError> {
+pub(crate) fn tracked_paths(repo: &Path, head: &str) -> Result<Vec<String>, ExportError> {
     let mut paths = decode_nul_paths(
-        git_output(repo, &["ls-files", "-z"])?,
+        git_output(repo, &["ls-tree", "-r", "-z", "--name-only", head])?,
         "tracked repository path",
     )?;
     paths.sort();
@@ -470,6 +470,49 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("must not be a symlink"), "{error}");
+    }
+
+    #[test]
+    fn tracked_paths_follow_head_even_when_index_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        fs::create_dir(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn live() {}\n").unwrap();
+        fs::write(repo.join("src/gone.rs"), "pub fn still_in_head() {}\n").unwrap();
+        git(&["add", "src/lib.rs", "src/gone.rs"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+        let head = head_sha(repo).unwrap();
+
+        fs::write(repo.join("src/extra.rs"), "pub fn staged_only() {}\n").unwrap();
+        fs::remove_file(repo.join("src/gone.rs")).unwrap();
+        git(&["add", "-A"]);
+
+        assert_eq!(
+            tracked_paths(repo, &head).unwrap(),
+            vec!["src/gone.rs", "src/lib.rs"]
+        );
     }
 
     #[test]
