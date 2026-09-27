@@ -81,6 +81,59 @@ mod tests {
         assert_eq!(db_hash, ndjson_hash, "hashes must match after sync");
     }
 
+    /// A symmetric edge may be authored in either direction. Sync stores its
+    /// canonical endpoint order; status must compare the same canonical triple.
+    #[tokio::test]
+    async fn status_hashes_clean_after_sync_with_reversed_symmetric_edge() {
+        for relation in ["competes_with", "composed_with"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path();
+            let low = "11111111-1111-1111-1111-111111111111";
+            let high = "22222222-2222-2222-2222-222222222222";
+            let entities = [
+                format!(
+                    r#"{{"id":"{low}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#
+                ),
+                format!(
+                    r#"{{"id":"{high}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#
+                ),
+            ]
+            .join("\n");
+            let edge_id = "33333333-3333-3333-3333-333333333333";
+            let edge = format!(
+                r#"{{"edge_id":"{edge_id}","source":"{high}","target":"{low}","relation":"{relation}","weight":0.7}}"#
+            );
+            let kg_dir = repo.join(".khive/kg");
+            std::fs::create_dir_all(&kg_dir).unwrap();
+            std::fs::write(kg_dir.join("entities.ndjson"), format!("{entities}\n")).unwrap();
+            std::fs::write(kg_dir.join("edges.ndjson"), format!("{edge}\n")).unwrap();
+
+            let db = repo.join(".khive/state/working.db");
+            crate::sync::run_sync(repo, &db, "test-ns").await.unwrap();
+            let ns = Namespace::parse("test-ns").unwrap();
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: Some(db),
+                default_namespace: ns.clone(),
+                embedding_model: None,
+                ..Default::default()
+            })
+            .unwrap();
+            let token = runtime.authorize(ns).unwrap();
+            let db_archive = runtime.export_kg(&token).await.unwrap();
+            let ndjson_archive = archive_from_ndjson_repo(repo, "test-ns").unwrap();
+            assert_eq!(db_archive.edges.len(), 1);
+            assert_eq!(db_archive.edges[0].source.to_string(), low);
+            assert_eq!(db_archive.edges[0].target.to_string(), high);
+            assert_eq!(ndjson_archive.edges[0].source.to_string(), high);
+            assert_eq!(ndjson_archive.edges[0].target.to_string(), low);
+            assert_eq!(
+                khive_vcs::hash::snapshot_id_for_archive(&db_archive).unwrap(),
+                khive_vcs::hash::snapshot_id_for_archive(&ndjson_archive).unwrap(),
+                "{relation} must report clean immediately after sync"
+            );
+        }
+    }
+
     /// #473 exposed a sibling gap: `run_sync` now preserves `entity_type` into
     /// the DB, but `archive_from_ndjson_repo` (the status command's NDJSON-side
     /// reader) hardcoded `entity_type: None`, so a repo with typed entities
