@@ -121,6 +121,26 @@ pub fn classify_address(addr: IpAddr) -> Option<(&'static str, &'static str)> {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return classify_address(IpAddr::V4(v4));
             }
+            if segments[0] == 0x0064 && segments[1] == 0xff9b {
+                // RFC 8215's local-use /48 has no single mandated position
+                // for IPv4 bits, so the whole prefix is refused.
+                if segments[2] == 0x0001 {
+                    return Some(("address_translation_prefix", "translation-prefix"));
+                }
+                // RFC 6052's well-known /96 fixes the last 32 bits as the
+                // IPv4 address. Apply the ordinary IPv4 refusal rules to it.
+                if segments[2..6].iter().all(|segment| *segment == 0) {
+                    let octets = v6.octets();
+                    let embedded = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                    return classify_address(IpAddr::V4(embedded));
+                }
+            }
+            // RFC 3056's 6to4 /16 embeds an IPv4 router address in the next
+            // 32 bits. Even a public router can lead to a non-public endpoint,
+            // so classifying just those bits would not establish safe egress.
+            if segments[0] == 0x2002 {
+                return Some(("address_6to4", "6to4"));
+            }
             None
         }
     }
@@ -525,6 +545,9 @@ impl PinnedClients {
 /// validated — never a fresh resolution of the name (A1.2.2).
 pub fn pinned_client(host: &str, addr: IpAddr, port: u16) -> Result<reqwest::Client, Refusal> {
     reqwest::Client::builder()
+        // Reqwest otherwise installs a system/environment proxy matcher.
+        // A proxy would bypass the checked address supplied to `resolve`.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         // run_one_hop owns the absolute request deadline and its refusal code.
         // A1.2.5: the byte bound is on decompressed bytes — a small
@@ -619,6 +642,36 @@ mod tests {
         assert!(classify_address(IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255))).is_none());
         // 100.128.0.0 is one above the /10 block.
         assert!(classify_address(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0))).is_none());
+    }
+
+    #[test]
+    fn ipv4_bearing_ipv6_addresses_follow_signed_translation_rules() {
+        for (address, expected_code) in [
+            ("64:ff9b::7f00:1", "address_loopback"),
+            ("64:ff9b::127.0.0.1", "address_loopback"),
+            ("64:ff9b::10.0.0.1", "address_private"),
+            ("64:ff9b:1::a00:1", "address_translation_prefix"),
+            ("64:ff9b:1:abcd::1", "address_translation_prefix"),
+            ("2002:0a00:0001::1", "address_6to4"),
+            ("2002:5db8:d822::1", "address_6to4"),
+        ] {
+            let address = IpAddr::V6(address.parse::<Ipv6Addr>().unwrap());
+            assert_eq!(
+                classify_address(address).map(|(code, _)| code),
+                Some(expected_code),
+                "{address} must not bypass the IPv4 egress policy"
+            );
+        }
+        for ordinary_public in [
+            "64:ff9b::808:808",
+            "64:ff9b::93.184.216.34",
+            "2001:4860:4860::8888",
+            "2003::1",
+            "64:ff9b:2::1",
+        ] {
+            let address = IpAddr::V6(ordinary_public.parse().unwrap());
+            assert_eq!(classify_address(address), None, "{address}");
+        }
     }
 
     // arm 8: file:// refuses.
@@ -923,6 +976,44 @@ mod tests {
         assert_eq!(addr, public_addr(1));
     }
 
+    #[tokio::test]
+    async fn resolver_rejects_translation_prefix_before_connection_pin() {
+        for (address, expected_code) in [
+            ("64:ff9b::10.0.0.1", "address_private"),
+            ("64:ff9b:1::1", "address_translation_prefix"),
+            ("2002:0a00:0001::1", "address_6to4"),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let resolver = MapResolver {
+                answers: std::sync::Mutex::new(vec![vec![address.parse().unwrap()]]),
+                calls: calls.clone(),
+            };
+            let refusal = resolve_and_pin(&resolver, "translation.example")
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.code, expected_code, "{address}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_accepts_public_ipv4_in_well_known_nat64_prefix() {
+        let address: IpAddr = "64:ff9b::808:808".parse().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = MapResolver {
+            answers: std::sync::Mutex::new(vec![vec![address], vec![address]]),
+            calls: calls.clone(),
+        };
+        assert_eq!(
+            resolve_and_pin(&resolver, "public-nat64.example")
+                .await
+                .unwrap(),
+            address
+        );
+        // Acceptance requires a stable second DNS answer before pinning.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
     // arm 9 (integration half): resolving to loopback refuses through the
     // full resolve_and_pin path, naming the resolved address.
     #[tokio::test]
@@ -978,5 +1069,26 @@ mod tests {
     #[test]
     fn normalize_host_lowercases_and_strips_trailing_dot() {
         assert_eq!(normalize_host("Example.COM."), "example.com");
+    }
+
+    #[tokio::test]
+    async fn pinned_client_disables_automatic_proxy_matcher_without_network() {
+        let host = "example.test";
+        let address = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let socket = SocketAddr::new(address, 443);
+        // In pinned reqwest 0.12, a plain builder installs a system proxy
+        // matcher even when no proxy variable is set. This is the control
+        // proving the debug seam can observe that matcher without I/O.
+        let ordinary = reqwest::Client::builder()
+            .resolve(host, socket)
+            .build()
+            .unwrap();
+        assert!(format!("{ordinary:?}").contains("proxies:"));
+
+        let pinned = pinned_client(host, address, 443).unwrap();
+        assert!(
+            !format!("{pinned:?}").contains("proxies:"),
+            "the egress client must have no proxy matcher that can bypass its DNS pin"
+        );
     }
 }

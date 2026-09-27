@@ -379,6 +379,17 @@ fn insert_event_with_observations(
     Ok(())
 }
 
+/// Append an event on the caller's existing SQLite transaction, including the
+/// same observation projection as `SqlEventStore::append_event`. This does
+/// not open or commit a transaction: the caller must roll back its domain
+/// changes if this insert fails.
+pub fn append_event_in_transaction(
+    conn: &rusqlite::Connection,
+    event: &Event,
+) -> Result<(), rusqlite::Error> {
+    insert_event_with_observations(conn, event)
+}
+
 /// DML-only batch append loop shared by both the legacy (flag-off) and
 /// WriterTask-routed (flag-on) `append_events` paths (ADR-067 Component A).
 ///
