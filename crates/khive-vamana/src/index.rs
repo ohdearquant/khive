@@ -3604,15 +3604,6 @@ fn read_metadata(path: &Path) -> Result<IndexMetadata> {
 }
 
 #[cfg(feature = "mmap")]
-fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()> {
-    let buf = encode_graph(graph, max_degree)?;
-    let mut f = File::create(path)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
-    Ok(())
-}
-
-#[cfg(feature = "mmap")]
 fn encode_graph(graph: &VamanaGraph, max_degree: usize) -> Result<Vec<u8>> {
     encode_graph_inner(graph, Some(max_degree))
 }
@@ -3813,15 +3804,6 @@ fn parse_graph(data: &[u8], max_degree: usize, num_vectors: usize) -> Result<Vam
             .expect("bounds checked above") = neighbors;
     }
     Ok(graph)
-}
-
-#[cfg(feature = "mmap")]
-fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
-    let bytes: &[u8] = cast_slice(vectors);
-    let mut f = File::create(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(())
 }
 
 #[cfg(feature = "mmap")]
