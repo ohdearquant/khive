@@ -238,10 +238,13 @@ fn finding_from_message(
 
 /// Convert Cargo's Clippy JSON-lines output to validated, unpersisted finding records.
 ///
-/// Only `clippy::` compiler messages become findings. Other documented Cargo records and
-/// non-Clippy compiler messages are ignored. Invalid JSON and incomplete Clippy records fail
-/// the whole conversion with an input-line reason. The finding fingerprint omits line numbers;
-/// the versioned note ID still follows `ingest_findings_json`'s content identity contract.
+/// Only `clippy::` compiler messages become findings. The Cargo terminal marker is retained as
+/// `audit_extra.clippy_build_outcome` on the project entity (`finished_ok`, `finished_failed`, or
+/// `no_marker`); a missing marker still yields usable diagnostics but never attests completeness.
+/// Other documented Cargo records and non-Clippy compiler messages are ignored. Invalid JSON
+/// and incomplete Clippy records fail the whole conversion with an input-line reason. The finding
+/// fingerprint omits line numbers; the versioned note ID still follows
+/// `ingest_findings_json`'s content identity contract.
 pub fn ingest_clippy_json_lines(
     input: &[u8],
     provenance: ClippyProvenance<'_>,
@@ -271,8 +274,15 @@ pub fn ingest_clippy_json_lines(
 
     let mut findings = Vec::new();
     let mut seen = BTreeMap::new();
+    let mut build_outcome = None;
     for (index, raw) in input.lines().enumerate() {
         let line_number = index + 1;
+        if build_outcome.is_some() {
+            return Err(line_error(
+                line_number,
+                "record after terminal build-finished marker",
+            ));
+        }
         if raw.trim().is_empty() {
             return Err(line_error(line_number, "empty JSON line"));
         }
@@ -295,10 +305,20 @@ pub fn ingest_clippy_json_lines(
                     findings.push(finding);
                 }
             }
-            "compiler-artifact"
-            | "build-script-executed"
-            | "build-finished"
-            | "future-incompat-report" => {}
+            "build-finished" => {
+                let success = envelope
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        line_error(line_number, "build-finished.success must be a boolean")
+                    })?;
+                build_outcome = Some(if success {
+                    "finished_ok"
+                } else {
+                    "finished_failed"
+                });
+            }
+            "compiler-artifact" | "build-script-executed" | "future-incompat-report" => {}
             reason => {
                 return Err(line_error(
                     line_number,
@@ -318,6 +338,7 @@ pub fn ingest_clippy_json_lines(
             "commit": provenance.commit,
             "standards_file": "Clippy lint registry",
             "producer_id": CLIPPY_PRODUCER_ID,
+            "clippy_build_outcome": build_outcome.unwrap_or("no_marker"),
         },
         "findings": findings,
     });

@@ -109,6 +109,10 @@ fn maps_fixture_to_validated_findings_without_persistence() {
         batch.entities[0].properties.as_ref().unwrap()["audit_extra"]["producer_id"],
         CLIPPY_PRODUCER_ID
     );
+    assert_eq!(
+        batch.entities[0].properties.as_ref().unwrap()["audit_extra"]["clippy_build_outcome"],
+        "finished_ok"
+    );
 
     let warning = properties(&batch.notes[0]);
     assert_eq!(warning["severity"], "medium");

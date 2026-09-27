@@ -73,6 +73,13 @@ fn props(batch: &CodeIngestBatch, index: usize) -> &Value {
         .expect("finding properties")
 }
 
+fn build_outcome(batch: &CodeIngestBatch) -> &Value {
+    &batch.entities[0]
+        .properties
+        .as_ref()
+        .expect("project properties")["audit_extra"]["clippy_build_outcome"]
+}
+
 #[test]
 fn literal_whitespace_edits_change_fingerprint() {
     assert_ne!(SOURCE_A, SOURCE_B);
@@ -263,8 +270,48 @@ fn failed_build_marker_is_not_a_success_attestation() {
         &[json!({"reason": "build-finished", "success": false})],
         "synthetic-commit",
     )
-    .expect("known non-diagnostic record is intentionally ignored");
+    .expect("a failed build still returns its diagnostic batch");
     assert_eq!(batch.entities.len(), 1);
     assert!(batch.notes.is_empty());
     assert!(batch.edges.is_empty());
+    assert_eq!(build_outcome(&batch), "finished_failed");
+}
+
+#[test]
+fn successful_and_unfinished_streams_have_distinct_build_outcomes() {
+    let finding = diagnostic(SOURCE_A, 12);
+    let complete = ingest(
+        &[
+            finding.clone(),
+            json!({"reason": "build-finished", "success": true}),
+        ],
+        "synthetic-commit",
+    )
+    .expect("successful terminal marker");
+    let unfinished = ingest(&[finding], "synthetic-commit")
+        .expect("partial diagnostics remain available without an attestation");
+    assert_eq!(complete.notes.len(), 1);
+    assert_eq!(unfinished.notes.len(), 1);
+    assert_eq!(build_outcome(&complete), "finished_ok");
+    assert_eq!(build_outcome(&unfinished), "no_marker");
+}
+
+#[test]
+fn malformed_or_nonterminal_build_marker_is_refused() {
+    for records in [
+        vec![json!({"reason": "build-finished"})],
+        vec![json!({"reason": "build-finished", "success": "false"})],
+        vec![
+            json!({"reason": "build-finished", "success": true}),
+            diagnostic(SOURCE_A, 12),
+        ],
+    ] {
+        let error = ingest(&records, "synthetic-commit")
+            .expect_err("the terminal marker must be typed and final");
+        let message = error.to_string();
+        assert!(
+            message.contains("build-finished"),
+            "marker refusal must explain the defect: {message}"
+        );
+    }
 }

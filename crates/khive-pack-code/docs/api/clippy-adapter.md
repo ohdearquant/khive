@@ -7,8 +7,26 @@ a database or writes records. The existing `ingest_findings_json` validator and
 record mapper remain the final boundary.
 
 The producer ID is `cargo-clippy/json/v1`. Only `compiler-message` records with a
-`clippy::` lint code produce findings. Cargo artifact, build-script, build-finished,
-and future-incompat records are ignored. Unknown record reasons, malformed JSON,
+`clippy::` lint code produce findings. Cargo artifact, build-script, and
+future-incompat records are ignored. The terminal `build-finished` record is
+validated and its outcome is carried in the project entity's
+`audit_extra.clippy_build_outcome` property:
+
+- `finished_ok`: Cargo emitted `success: true`; this stream has a successful build attestation.
+- `finished_failed`: Cargo emitted `success: false`; findings remain usable, but this could be an
+  ordinary deny-level lint under `-D warnings` or an early compile failure, so absence of findings
+  does not prove every crate was scanned.
+- `no_marker`: no terminal record was present. The adapter returns partial diagnostics for
+  investigation, but the stream may be truncated and has no completeness attestation.
+
+A `build-finished` record requires a boolean `success` and must be the final record. The outcome
+uses the existing tolerated audit-extension field of `findings.json`; it does not change finding
+identity. A caller that persists a batch can inspect the project properties before writing it and
+must not use a non-success outcome as evidence that the scan is complete. The generic code-ingest
+path consumes deterministic project IDs once, so a later run does not revise an already persisted
+project entity's prior outcome.
+
+Unknown record reasons, malformed JSON,
 missing lint fields, ambiguous primary spans, and paths outside the repository are
 reported with the input line number. The caller must supply repo, branch, commit,
 and scope strings. A run without an explicit `source_run` uses the producer ID and
