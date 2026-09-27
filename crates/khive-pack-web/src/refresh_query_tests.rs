@@ -160,67 +160,59 @@ async fn refresh_preserves_original_query_in_request() {
     }
 }
 
-// Both a changed response and a redirected 304 must retain the terminal address.
+// A redirected 200 must retain the terminal address and its original query bytes.
+// Redirected 304 is refused before settlement by the R2 controls.
 #[tokio::test]
 async fn redirected_refresh_preserves_terminal_request_query() {
     for redirect_status in [301, 302, 307, 308] {
-        for response_status in [200, 304] {
-            let (runtime, token, _dir) = fixture().await;
-            let source_url = Url::parse("https://query.example/old?z=2&id=%FE").unwrap();
-            let terminal_url = Url::parse("https://query.example/new?z=1&id=%FF&flag").unwrap();
-            let source = settle_content(
-                &runtime,
-                &token,
-                &source_url,
-                Some("text/plain"),
-                200,
-                Some("query-test"),
-                None,
-                Some((b"cached body".to_vec(), false)),
-            )
-            .await
-            .unwrap();
-            let reply = settle_refresh(
-                &runtime,
-                &token,
-                source.id,
-                source_url.as_str(),
-                source.content_ref.as_deref().unwrap(),
-                HopOutcome {
-                    status: response_status,
-                    final_url: terminal_url.clone(),
-                    headers: reqwest::header::HeaderMap::new(),
-                    redirect_to: None,
-                    body: Some((
-                        if response_status == 200 {
-                            b"changed body".to_vec()
-                        } else {
-                            vec![]
-                        },
-                        false,
-                    )),
-                },
-                &[RedirectHop {
-                    from: source_url.clone(),
-                    to: terminal_url.clone(),
-                    status: redirect_status,
-                }],
-            )
-            .await
-            .unwrap();
-            let final_id = Uuid::parse_str(reply["final_id"].as_str().unwrap()).unwrap();
-            for (id, expected) in [(source.id, &source_url), (final_id, &terminal_url)] {
-                let entity = runtime
-                    .entities(&token)
-                    .unwrap()
-                    .get_entity(id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let properties = entity.properties.unwrap();
-                assert_eq!(properties["url"], expected.as_str());
-                assert_eq!(stored_request_url(&properties).unwrap(), *expected);
-            }
+        let (runtime, token, _dir) = fixture().await;
+        let source_url = Url::parse("https://query.example/old?z=2&id=%FE").unwrap();
+        let terminal_url = Url::parse("https://query.example/new?z=1&id=%FF&flag").unwrap();
+        let source = settle_content(
+            &runtime,
+            &token,
+            &source_url,
+            Some("text/plain"),
+            200,
+            Some("query-test"),
+            None,
+            Some((b"cached body".to_vec(), false)),
+        )
+        .await
+        .unwrap();
+        let reply = settle_refresh(
+            &runtime,
+            &token,
+            source.id,
+            source_url.as_str(),
+            source.content_ref.as_deref().unwrap(),
+            HopOutcome {
+                status: 200,
+                final_url: terminal_url.clone(),
+                headers: reqwest::header::HeaderMap::new(),
+                redirect_to: None,
+                body: Some((b"changed body".to_vec(), false)),
+            },
+            &[RedirectHop {
+                from: source_url.clone(),
+                to: terminal_url.clone(),
+                status: redirect_status,
+            }],
+        )
+        .await
+        .unwrap();
+        let final_id = Uuid::parse_str(reply["final_id"].as_str().unwrap()).unwrap();
+        for (id, expected) in [(source.id, &source_url), (final_id, &terminal_url)] {
+            let entity = runtime
+                .entities(&token)
+                .unwrap()
+                .get_entity(id)
+                .await
+                .unwrap()
+                .unwrap();
+            let properties = entity.properties.unwrap();
+            assert_eq!(properties["url"], expected.as_str());
+            assert_eq!(stored_request_url(&properties).unwrap(), *expected);
         }
     }
 }
