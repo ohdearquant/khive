@@ -332,14 +332,18 @@ pub struct Sq8Codec {
     pub min: Vec<f32>,
     /// Per-dimension scale: `(max - min) / 255`.
     pub scale: Vec<f32>,
-    /// Per-dimension `scale²` precomputed for fast L2 and dot product.
+    /// Per-dimension `scale²` precomputed for fast L2.
     pub scale_sq: Vec<f32>,
+    /// Per-dimension `scale²` retained in f64 for the dot product.
+    pub scale_sq_f64: Vec<f64>,
     /// Legacy mean of `scale_sq`; retained for public-field compatibility.
     pub mean_scale_sq: f32,
     /// Legacy residual: `scale_sq_i - mean_scale_sq`; distance methods do not use it.
     pub scale_sq_residual: Vec<f32>,
-    /// `Σ_i min_i²` precomputed for dot-product correction.
+    /// Legacy f32 `Σ_i min_i²` correction, retained for public-field compatibility.
     pub offset_sq_sum: f32,
+    /// `Σ_i min_i²` accumulated in f64 for the dot product.
+    pub offset_sq_sum_f64: f64,
 }
 
 /// A corpus vector encoded by [`Sq8Codec`].
@@ -349,8 +353,10 @@ pub struct EncodedVector {
     pub codes: Vec<u8>,
     /// L2 norm of the original f32 vector (for cosine distance).
     pub norm: f32,
-    /// `Σ_i scale_i * min_i * code_i` — per-vector correction term for dot product.
+    /// Legacy f32 `Σ_i scale_i * min_i * code_i` correction.
     pub soc_sum: f32,
+    /// `Σ_i scale_i * min_i * code_i` accumulated in f64 for the dot product.
+    pub soc_sum_f64: f64,
     /// Legacy `Σ_i scale_sq_residual_i * code_i` precomputed at encode time.
     pub residual_dot_bias: f32,
 }
@@ -360,17 +366,21 @@ impl Sq8Codec {
         let dims = min.len();
         let scale: Vec<f32> = (0..dims).map(|d| (max[d] - min[d]) / 255.0).collect();
         let scale_sq: Vec<f32> = scale.iter().map(|s| s * s).collect();
+        let scale_sq_f64: Vec<f64> = scale.iter().map(|&s| f64::from(s) * f64::from(s)).collect();
         let mean_scale_sq = scale_sq.iter().sum::<f32>() / dims as f32;
         let scale_sq_residual: Vec<f32> = scale_sq.iter().map(|&ss| ss - mean_scale_sq).collect();
         let offset_sq_sum: f32 = min.iter().map(|o| o * o).sum();
+        let offset_sq_sum_f64: f64 = min.iter().map(|&o| f64::from(o) * f64::from(o)).sum();
 
         Self {
             min,
             scale,
             scale_sq,
+            scale_sq_f64,
             mean_scale_sq,
             scale_sq_residual,
             offset_sq_sum,
+            offset_sq_sum_f64,
         }
     }
 
@@ -434,6 +444,7 @@ impl Sq8Codec {
         let dims = self.min.len();
         let mut codes = Vec::with_capacity(dims);
         let mut soc_sum = 0.0f32;
+        let mut soc_sum_f64 = 0.0f64;
         let mut residual_dot_bias = 0.0f32;
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
 
@@ -444,6 +455,7 @@ impl Sq8Codec {
             let code = raw.round().clamp(0.0, 255.0) as u8;
             codes.push(code);
             soc_sum += s * self.min[d] * code as f32;
+            soc_sum_f64 += f64::from(s) * f64::from(self.min[d]) * f64::from(code);
             residual_dot_bias += self.scale_sq_residual[d] * code as f32;
         }
 
@@ -451,6 +463,7 @@ impl Sq8Codec {
             codes,
             norm,
             soc_sum,
+            soc_sum_f64,
             residual_dot_bias,
         }
     }
@@ -537,8 +550,9 @@ impl Sq8Codec {
     /// Full-precision correction identity (same min/scale for both):
     /// `dot(a, b) = Σ s²·a·b + soc_a + soc_b + offset_sq_sum`
     ///
-    /// The per-dimension scale term is accumulated directly in f64. A shared
-    /// f32 mean plus residuals can cancel a small scale out entirely.
+    /// Scale weights and both correction terms are accumulated in f64 at
+    /// train/encode time. Widening f32 correction caches only at query time
+    /// cannot recover narrow terms they already rounded away.
     /// Panics if either encoded vector has a different length from this codec.
     #[inline]
     pub fn approx_dot(&self, a: &EncodedVector, b: &EncodedVector) -> f32 {
@@ -554,14 +568,13 @@ impl Sq8Codec {
             "approx_dot input codes must match codec dims"
         );
         let weighted: f64 = self
-            .scale_sq
+            .scale_sq_f64
             .iter()
             .zip(a.codes.iter())
             .zip(b.codes.iter())
-            .map(|((&weight, &ac), &bc)| f64::from(weight) * f64::from(ac) * f64::from(bc))
+            .map(|((&weight, &ac), &bc)| weight * f64::from(ac) * f64::from(bc))
             .sum();
-        (weighted + f64::from(a.soc_sum) + f64::from(b.soc_sum) + f64::from(self.offset_sq_sum))
-            as f32
+        (weighted + a.soc_sum_f64 + b.soc_sum_f64 + self.offset_sq_sum_f64) as f32
     }
 
     /// Approximate cosine distance between two encoded vectors (same codec).

@@ -16,15 +16,17 @@ Fields:
 | --------------------- | ----------------------------------------------------------------- |
 | `min`                 | per-dimension minimum observed at train time                     |
 | `scale`               | per-dimension `(max - min) / 255`                                 |
-| `scale_sq`            | `scale²` per dimension, precomputed for L2/dot                    |
+| `scale_sq`            | f32 `scale²` per dimension, precomputed for L2                     |
+| `scale_sq_f64`        | f64 `scale²` per dimension, precomputed for dot product            |
 | `mean_scale_sq`       | legacy shared mean retained for public-field compatibility       |
 | `scale_sq_residual`   | legacy residual retained for public-field compatibility          |
-| `offset_sq_sum`       | `Σ min_i²`, precomputed for the dot-product correction term       |
+| `offset_sq_sum`       | legacy f32 `Σ min_i²`, retained for public-field compatibility    |
+| `offset_sq_sum_f64`   | f64 `Σ min_i²`, precomputed for dot-product correction              |
 
-`EncodedVector` carries, alongside `codes`, the per-vector correction terms
-(`norm`, `soc_sum`) needed to reconstruct a corrected dot product from two
-encoded vectors without re-touching the original `f32` data.
-`residual_dot_bias` is retained for public-field compatibility.
+`EncodedVector` carries `codes`, `norm`, and the f64 `soc_sum_f64` correction
+computed while encoding, so dot product needs no second pass over each vector.
+The f32 `soc_sum` and `residual_dot_bias` fields remain for public-field
+compatibility.
 
 ### `approx_dot`
 
@@ -34,10 +36,10 @@ Full-precision correction identity (both vectors share one codec's min/scale):
 dot(a, b) = Σ scale_i² · a_i · b_i + soc_a + soc_b + offset_sq_sum
 ```
 
-The weighted term `Σ scale_i² · a_i · b_i` is accumulated directly in f64.
-The precomputed `soc_sum` and `offset_sq_sum` corrections are added in f64,
-then the result is rounded to f32 once. Splitting the weighted term into a
-shared f32 mean and residual could erase small dimensions by cancellation.
+The weighted term uses the precomputed f64 `scale_sq_f64` values and is
+accumulated in f64. Both corrections are also accumulated in f64 when the
+codec or vector is built; widening the legacy f32 caches at query time would
+leave their lost narrow terms missing. The sum is rounded to f32 once.
 
 ### `approx_cosine_dist`
 

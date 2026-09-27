@@ -46,11 +46,11 @@ exact `f32` distance for out-of-distribution queries — see
 
 ## Hot-loop kernels
 
-`u8_dot_u32` and `u8_l2sq_u32` are the shared inner loops both codecs use:
-`u8_dot_u32` computes `sum(a_i * b_i)` as a `u32` accumulator via NEON
-`vmull_u8` (aarch64) or a chunked portable widening fallback elsewhere;
-`u8_l2sq_u32` computes `sum((a_i - b_i)^2)` via NEON `vabdq_u8` + `vmull_u8`
-squaring, or the equivalent portable fallback.
+`GsSq8Codec` uses `u8_l2sq_u32` for squared L2: NEON `vabdq_u8` +
+`vmull_u8` on aarch64, or a chunked portable fallback elsewhere.
+`Sq8Codec` computes dot product and squared L2 with per-dimension weighted
+`f64` sums. The `u8_dot_u32` integer helper remains test-only because a shared
+scale loses narrow dimensions.
 
 ## Where this sits
 
