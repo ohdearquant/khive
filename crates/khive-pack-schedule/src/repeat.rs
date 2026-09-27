@@ -4,7 +4,7 @@
 //! time that the pending-events drain cannot advance, and a stored recurrence
 //! never degrades silently to one-shot delivery.
 
-use chrono::{DateTime, Duration, Months, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, Utc};
 use std::str::FromStr;
 
 /// A recurrence the executor can advance.
@@ -45,13 +45,72 @@ pub fn parse_repeat(text: &str) -> Result<Repeat, String> {
             .map_err(|why| format!("invalid repeat expression {text:?}: {why}"));
     }
     if text.split_whitespace().count() == 5 {
-        return croner::Cron::from_str(text)
-            .map(|cron| Repeat::Cron(Box::new(cron)))
-            .map_err(|e| format!("invalid repeat expression {text:?}: cron did not parse ({e})"));
+        let cron = croner::Cron::from_str(text)
+            .map_err(|e| format!("invalid repeat expression {text:?}: cron did not parse ({e})"))?;
+        if !cron_has_occurrence(&cron).map_err(|e| {
+            format!("invalid repeat expression {text:?}: cron could not be evaluated ({e})")
+        })? {
+            return Err(format!(
+                "invalid repeat expression {text:?}: cron has no occurrence in a Gregorian 400-year cycle"
+            ));
+        }
+        return Ok(Repeat::Cron(Box::new(cron)));
     }
     Err(format!(
         "invalid repeat expression {text:?}: supported forms are {REPEAT_FORMS}"
     ))
+}
+
+/// Five-field cron has no year selector. Gregorian dates (including weekday,
+/// leap-day and month-end patterns) repeat every 400 years, so one fixed cycle
+/// proves whether the expression can ever fire. Check one permitted time on
+/// each real date rather than asking croner to search toward its year-5000
+/// limit for an impossible combination such as February 30.
+fn cron_has_occurrence(cron: &croner::Cron) -> Result<bool, croner::errors::CronError> {
+    let first_matching =
+        |limit, matches: &dyn Fn(u32) -> Result<bool, croner::errors::CronError>| {
+            (0..limit)
+                .map(|value| matches(value).map(|yes| yes.then_some(value)))
+                .find_map(|result| match result {
+                    Ok(Some(value)) => Some(Ok(value)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .transpose()
+        };
+    let Some(hour) = first_matching(24, &|value| cron.pattern.hour_match(value))? else {
+        return Ok(false);
+    };
+    let Some(minute) = first_matching(60, &|value| cron.pattern.minute_match(value))? else {
+        return Ok(false);
+    };
+    let Some(second) = first_matching(60, &|value| cron.pattern.second_match(value))? else {
+        return Ok(false);
+    };
+
+    for year in 2000..2400 {
+        if !cron.pattern.year_match(year)? {
+            continue;
+        }
+        for month in 1..=12 {
+            if !cron.pattern.month_match(month)? {
+                continue;
+            }
+            for day in 1..=31 {
+                let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+                    break;
+                };
+                let at = date
+                    .and_hms_opt(hour, minute, second)
+                    .expect("validated time fields are in range")
+                    .and_utc();
+                if cron.is_time_matching(&at)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn parse_every(spec: &str) -> Result<Duration, String> {
@@ -193,6 +252,16 @@ mod tests {
             let err = parse_repeat(text).expect_err(text);
             assert!(err.contains("invalid repeat expression"), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn cron_calendar_combinations_must_have_a_real_occurrence() {
+        for text in ["0 9 30 2 *", "0 9 31 2 *", "0 9 31 4,6,9,11 *"] {
+            let error = parse_repeat(text).expect_err(text);
+            assert!(error.contains("no occurrence"), "{text}: {error}");
+        }
+        assert!(matches!(parse_repeat("0 9 29 2 *"), Ok(Repeat::Cron(_))));
+        assert!(matches!(parse_repeat("0 9 L 2 *"), Ok(Repeat::Cron(_))));
     }
 
     #[test]

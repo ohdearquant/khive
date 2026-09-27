@@ -1,21 +1,24 @@
 //! NDJSON-to-SQLite sync library boundary.
 //!
 //! Rebuilds the SQLite database from `.khive/kg/entities.ndjson` and `edges.ndjson`.
-//! Builds atomically into a `.tmp` file then renames. Also supports remote archive
+//! Builds into a unique sibling file then renames. Also supports remote archive
 //! fetch with SHA-256 pin verification via [`run_sync_remote`].
 
 use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
+use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
 use khive_storage::types::Edge;
 use khive_storage::LinkId;
-use khive_types::{EdgeRelation, EntityKind};
+use khive_types::{EdgeRelation, Pack};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -265,9 +268,9 @@ pub async fn run_sync_remote(
         let entities_path = staging_path.join(".khive/kg/entities.ndjson");
         let edges_path = staging_path.join(".khive/kg/edges.ndjson");
 
-        entities_ndjson = read_entities(&entities_path)
+        entities_ndjson = read_remote_entities(&entities_path)
             .with_context(|| format!("reading staged {}", entities_path.display()))?;
-        edges_ndjson = read_edges(&edges_path)
+        edges_ndjson = read_remote_edges(&edges_path)
             .with_context(|| format!("reading staged {}", edges_path.display()))?;
     }
     // `staging` tempdir is still alive here — we drop it after moving files.
@@ -690,18 +693,36 @@ fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
 
 /// Full ADR-020 structural validation of parsed NDJSON records (#476).
 ///
-/// Checks entity kind validity, entity/edge timestamp validity, entity/edge
+/// Checks registered, canonical entity kinds and reserved property validity,
+/// entity/edge timestamp validity, entity/edge
 /// sort order (matching `write_sorted_entities`/`write_sorted_edges`), duplicate
-/// entity ids, duplicate edge ids, duplicate semantic edge triples
+/// entity ids, duplicate edge ids, duplicate canonical semantic edge triples
 /// (source, target, relation), dangling edge endpoints, and edge relation/weight
 /// validity. Called before any temp DB is created so a violation here leaves
 /// the existing target DB completely untouched.
 fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> Result<()> {
+    let valid_entity_kinds = registered_entity_kinds()?;
     let mut entity_ids: HashSet<Uuid> = HashSet::with_capacity(entities.len());
     let mut prev_entity_key: Option<String> = None;
     for (i, e) in entities.iter().enumerate() {
-        EntityKind::from_str(&e.kind)
-            .map_err(|_| anyhow!("entity {i} ({}): unknown kind {:?}", e.id, e.kind))?;
+        if !valid_entity_kinds.contains(e.kind.as_str()) {
+            let kind = khive_types::EntityKind::from_str(&e.kind)
+                .map_err(|_| anyhow!("entity {i} ({}): unknown kind {:?}", e.id, e.kind))?;
+            // The parser accepts aliases for interactive callers, but NDJSON
+            // is a canonical archive. Pack-registered kinds are already exact.
+            if e.kind != kind.name() {
+                bail!(
+                    "entity {i} ({}): non-canonical kind {:?}; use {:?}",
+                    e.id,
+                    e.kind,
+                    kind.name()
+                );
+            }
+        }
+        // ADR-115 Amendment 1 §3 reserves this runtime-owned key on every
+        // properties-bearing write path, including pack-defined entity kinds.
+        khive_runtime::secret_gate::reject_reserved_secret_gate_property(e.properties.as_ref())
+            .map_err(|error| anyhow!("entity {i} ({}) properties rejected: {error}", e.id))?;
         if e.name.trim().is_empty() {
             bail!("entity {i} ({}): name must be a non-blank name", e.id);
         }
@@ -766,7 +787,12 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
                 .map_err(|e| anyhow!("edge {i} ({}) properties rejected: {e}", r.edge_id))?;
         }
 
-        if !triples.insert((r.source, r.target, relation)) {
+        let (source, target) = if relation.is_symmetric() && r.target < r.source {
+            (r.target, r.source)
+        } else {
+            (r.source, r.target)
+        };
+        if !triples.insert((source, target, relation)) {
             bail!(
                 "edge {i} ({}): duplicate edge triple (source={}, target={}, relation={:?})",
                 r.edge_id,
@@ -817,11 +843,38 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
     Ok(())
 }
 
+/// Use the same merged pack vocabulary as the CLI's KG validator. The KG pack
+/// is also named directly because `khive-vcs` is usable as a library without
+/// the binary's inventory-linked packs.
+fn registered_entity_kinds() -> Result<HashSet<&'static str>> {
+    let runtime = KhiveRuntime::memory().context("building sync kind-validation runtime")?;
+    let mut builder = VerbRegistryBuilder::new();
+    let names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    PackRegistry::register_packs(&names, runtime, &mut builder)
+        .map_err(|e| anyhow!("building sync pack vocabulary: {e}"))?;
+    let registry = builder
+        .build_metadata()
+        .context("building sync pack metadata")?;
+    let mut kinds: HashSet<&'static str> = registry.all_entity_kinds().into_iter().collect();
+    kinds.extend(
+        <khive_pack_kg::KgPack as Pack>::ENTITY_KINDS
+            .iter()
+            .copied(),
+    );
+    Ok(kinds)
+}
+
 /// Rebuild `db_path` from `.khive/kg/{entities,edges}.ndjson` under `repo_root`.
 ///
-/// The operation is atomic: the database is built in a `.tmp` sibling file and
-/// renamed over `db_path` only on success. A crash or error leaves the previous
-/// `db_path` intact.
+/// The target must be closed by all SQLite clients. Sync serializes other sync
+/// calls with a sibling lock file and refuses any existing target `-wal` or
+/// `-shm` sidecar rather than pairing old WAL frames with a new main file.
+/// It builds in a unique sibling file and renames only after checkpointing;
+/// errors before that rename leave the previous database intact. A later
+/// verification error means the replacement may already be visible.
 ///
 /// `namespace` is applied to all imported records.
 ///
@@ -843,8 +896,15 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
         "validating ADR-020 KG NDJSON before DB rebuild — sync aborted before any DB write",
     )?;
 
-    let tmp_path = with_extension_suffix(db_path, ".tmp");
-    let _ = std::fs::remove_file(&tmp_path);
+    let parent = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let _target_lock = lock_sync_target(db_path)?;
+    refuse_target_sidecars(db_path)?;
+    let tmp_db = SyncTempDb::new(parent)?;
+    let tmp_path = tmp_db.path().to_path_buf();
 
     // Build the runtime against the tmp file. Vector embedding is disabled
     // because sync runs without an embedding model loaded — vectors are
@@ -875,18 +935,114 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     // Drop the runtime so SQLite releases its file handles before rename.
     drop(runtime);
 
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+    let temp_wal = with_extension_suffix(&tmp_path, "-wal");
+    match fs::metadata(&temp_wal) {
+        Ok(metadata) if metadata.len() > 0 => bail!(
+            "sync temp database still has uncheckpointed WAL frames in {}",
+            temp_wal.display()
+        ),
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("checking {}", temp_wal.display())),
     }
-    std::fs::rename(&tmp_path, db_path)
+    refuse_target_sidecars(db_path)?;
+    fs::rename(&tmp_path, db_path)
         .with_context(|| format!("renaming {} -> {}", tmp_path.display(), db_path.display()))?;
+    verify_replaced_db(db_path, entity_count, edge_count)?;
 
     Ok(SyncReport {
         entities: entity_count,
         edges: edge_count,
         db_path: db_path.to_string_lossy().into_owned(),
     })
+}
+
+/// The lock file is deliberately retained after release: unlinking it would
+/// let a waiter acquire a different inode while the first sync still runs.
+fn lock_sync_target(db_path: &Path) -> Result<File> {
+    let lock_path = with_extension_suffix(db_path, ".sync.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening sync lock {}", lock_path.display()))?;
+    fs4::FileExt::try_lock(&lock)
+        .with_context(|| format!("sync already owns target {}", db_path.display()))?;
+    Ok(lock)
+}
+
+fn refuse_target_sidecars(db_path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = with_extension_suffix(db_path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => bail!(
+                "sync target {} has SQLite sidecar {}; close all clients and recover/checkpoint the target before retrying",
+                db_path.display(),
+                sidecar.display()
+            ),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("checking {}", sidecar.display())),
+        }
+    }
+    Ok(())
+}
+
+/// A unique same-directory SQLite build. Its guard removes the main file and
+/// both SQLite sidecars on every failure path, including an upsert error.
+struct SyncTempDb(tempfile::TempPath);
+
+impl SyncTempDb {
+    fn new(parent: &Path) -> Result<Self> {
+        let file = tempfile::Builder::new()
+            .prefix(".khive-sync-")
+            .tempfile_in(parent)
+            .with_context(|| format!("creating sync temp database in {}", parent.display()))?;
+        Ok(Self(file.into_temp_path()))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for SyncTempDb {
+    fn drop(&mut self) {
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(with_extension_suffix(self.path(), suffix));
+        }
+        // TempPath's own Drop removes the main file if it was not renamed.
+    }
+}
+
+fn verify_replaced_db(
+    db_path: &Path,
+    expected_entities: usize,
+    expected_edges: usize,
+) -> Result<()> {
+    let db = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("reopening replaced database {}", db_path.display()))?;
+    for (table, expected) in [
+        ("entities", expected_entities),
+        ("graph_edges", expected_edges),
+    ] {
+        let actual: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("verifying {table} count in {}", db_path.display()))?;
+        if actual != i64::try_from(expected).context("sync count exceeds i64")? {
+            bail!(
+                "replaced database {} has {actual} {table}, expected {expected}",
+                db_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn with_extension_suffix(p: &Path, suffix: &str) -> PathBuf {
@@ -900,6 +1056,10 @@ fn read_entities(path: &Path) -> Result<Vec<NdjsonEntity>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path)?;
+    parse_entities(&text)
+}
+
+fn parse_entities(text: &str) -> Result<Vec<NdjsonEntity>> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -918,6 +1078,10 @@ fn read_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path)?;
+    parse_edges(&text)
+}
+
+fn parse_edges(text: &str) -> Result<Vec<NdjsonEdge>> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -929,6 +1093,173 @@ fn read_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
         out.push(e);
     }
     Ok(out)
+}
+
+/// A checked-out remote member is untrusted. Keep the read bound to an opened
+/// regular file, without traversing links in the clone-controlled path.
+fn read_remote_regular_file(path: &Path) -> Result<Option<String>> {
+    let Some(mut file) = open_remote_member(path)? else {
+        return Ok(None);
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading remote NDJSON member {}", path.display()))?;
+    Ok(Some(text))
+}
+
+#[cfg(unix)]
+fn open_remote_member(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn open_component(
+        parent_fd: RawFd,
+        name: &CStr,
+        path: &Path,
+        directory: bool,
+    ) -> Result<Option<File>> {
+        // Each clone-controlled component is opened relative to the already
+        // opened parent, so a link swap cannot redirect a later component.
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || error.raw_os_error() == Some(libc::ENOTDIR)
+            {
+                bail!(
+                    "remote NDJSON {} {} is not a regular {}",
+                    if directory { "directory" } else { "member" },
+                    path.display(),
+                    if directory { "directory" } else { "file" }
+                );
+            }
+            return Err(error).with_context(|| format!("opening remote path {}", path.display()));
+        }
+        // SAFETY: openat returned a newly owned descriptor, transferred once to File.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("stat opened remote path {}", path.display()))?;
+        if directory && !metadata.is_dir() {
+            bail!(
+                "remote NDJSON directory {} is not a regular directory",
+                path.display()
+            );
+        }
+        if !directory && !metadata.is_file() {
+            bail!(
+                "remote NDJSON member {} is not a regular file",
+                path.display()
+            );
+        }
+        Ok(Some(file))
+    }
+
+    let kg = path
+        .parent()
+        .context("remote NDJSON member has no parent")?;
+    let khive = kg.parent().context("remote NDJSON kg has no parent")?;
+    let staging = khive
+        .parent()
+        .context("remote NDJSON .khive has no parent")?;
+    if kg.file_name() != Some(std::ffi::OsStr::new("kg"))
+        || khive.file_name() != Some(std::ffi::OsStr::new(".khive"))
+    {
+        bail!(
+            "remote NDJSON member {} is outside .khive/kg",
+            path.display()
+        );
+    }
+    let staging_name = CString::new(staging.as_os_str().as_bytes())?;
+    let khive_name = CString::new(".khive")?;
+    let kg_name = CString::new("kg")?;
+    let member_name = CString::new(
+        path.file_name()
+            .context("remote NDJSON member has no name")?
+            .as_bytes(),
+    )?;
+
+    // The staging directory is a private TempDir; all clone-controlled path
+    // components below it are opened by dirfd with O_NOFOLLOW.
+    let Some(staging_dir) = open_component(libc::AT_FDCWD, &staging_name, staging, true)? else {
+        return Ok(None);
+    };
+    let Some(khive_dir) = open_component(staging_dir.as_raw_fd(), &khive_name, khive, true)? else {
+        return Ok(None);
+    };
+    let Some(kg_dir) = open_component(khive_dir.as_raw_fd(), &kg_name, kg, true)? else {
+        return Ok(None);
+    };
+    open_component(kg_dir.as_raw_fd(), &member_name, path, false)
+}
+
+#[cfg(not(unix))]
+fn open_remote_member(path: &Path) -> Result<Option<std::fs::File>> {
+    // The portable fallback checks every clone-controlled component before
+    // opening the member. Unix uses dirfds above to bind those checks to opens.
+    let kg = path
+        .parent()
+        .context("remote NDJSON member has no parent")?;
+    let khive = kg.parent().context("remote NDJSON kg has no parent")?;
+    for directory in [khive, kg] {
+        let metadata = match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", directory.display()))
+            }
+        };
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "remote NDJSON directory {} is not a regular directory",
+                directory.display()
+            );
+        }
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "remote NDJSON member {} is not a regular file",
+            path.display()
+        );
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening remote NDJSON member {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!(
+            "remote NDJSON member {} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(Some(file))
+}
+
+fn read_remote_entities(path: &Path) -> Result<Vec<NdjsonEntity>> {
+    match read_remote_regular_file(path)? {
+        Some(text) => parse_entities(&text),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn read_remote_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
+    match read_remote_regular_file(path)? {
+        Some(text) => parse_edges(&text),
+        None => Ok(Vec::new()),
+    }
 }
 
 async fn checkpoint_wal(runtime: &KhiveRuntime) -> Result<()> {
@@ -1104,7 +1435,7 @@ async fn upsert_edges(
 // INLINE TEST JUSTIFICATION: Tests access private helpers (build_kg_archive,
 // read_entities, read_edges, compute_pin) that cannot be exposed in crate-level
 // tests/ without promoting them to pub(crate), which would widen the internal API.
-// Production code above this line is ~625 LOC (under the 700-line gate).
+// The local and remote paths share private validation helpers above this line.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,6 +1543,117 @@ mod tests {
             bytes.starts_with(b"SQLite format 3\0"),
             "DB file must start with SQLite magic header, got {:?}",
             &bytes[..bytes.len().min(20)]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_live_target_wal_before_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join("working.db");
+        write_repo(repo, "", "");
+
+        // Keep an actual SQLite writer open with uncheckpointed WAL frames.
+        // Replacing only the main file here would pair those frames with the
+        // newly built DB on the next open.
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE old_data (value TEXT);
+             INSERT INTO old_data VALUES ('still-open');",
+        )
+        .unwrap();
+        let wal_path = with_extension_suffix(&db_path, "-wal");
+        assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+        let original = fs::read(&db_path).unwrap();
+
+        let err = run_sync(repo, &db_path, "test-ns")
+            .await
+            .expect_err("live WAL must stop sync before replacement");
+        assert!(err.to_string().contains("SQLite sidecar"), "{err:#}");
+        assert_eq!(fs::read(&db_path).unwrap(), original);
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_target_held_by_another_sync() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join("working.db");
+        write_repo(repo, "", "");
+        let lock_path = with_extension_suffix(&db_path, ".sync.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&lock).unwrap();
+
+        let err = run_sync(repo, &db_path, "test-ns")
+            .await
+            .expect_err("another sync's lock must stop this call");
+        assert!(
+            err.to_string().contains("sync already owns target"),
+            "{err:#}"
+        );
+        assert!(!db_path.exists());
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_reuse_crashed_fixed_temp_name() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join("working.db");
+        write_repo(repo, "", "");
+        let old_temp = with_extension_suffix(&db_path, ".tmp");
+        let old_wal = with_extension_suffix(&old_temp, "-wal");
+        fs::write(&old_temp, b"old temporary database").unwrap();
+        fs::write(&old_wal, b"old temporary WAL").unwrap();
+
+        run_sync(repo, &db_path, "test-ns").await.unwrap();
+        assert_eq!(fs::read(old_temp).unwrap(), b"old temporary database");
+        assert_eq!(fs::read(old_wal).unwrap(), b"old temporary WAL");
+    }
+
+    #[tokio::test]
+    async fn sync_accepts_registered_resource_kind_and_rejects_nonsense() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join("working.db");
+        let entity_id = "11111111-1111-1111-1111-111111111111";
+        let resource = format!(r#"{{"id":"{entity_id}","kind":"resource","name":"Runbook"}}"#);
+        write_repo(repo, &resource, "");
+
+        let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
+        assert_eq!(report.entities, 1);
+        let db = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let stored_kind: String = db
+            .query_row(
+                "SELECT kind FROM entities WHERE id = ?1",
+                [entity_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_kind, "resource");
+        drop(db);
+
+        let nonsense = format!(r#"{{"id":"{entity_id}","kind":"nonsense","name":"Bad"}}"#);
+        write_repo(repo, &nonsense, "");
+        let invalid_db = repo.join("invalid.db");
+        let err = run_sync(repo, &invalid_db, "test-ns")
+            .await
+            .expect_err("unknown pack kind must be rejected");
+        assert!(format!("{err:#}").contains("unknown kind \"nonsense\""));
+        assert!(
+            !invalid_db.exists(),
+            "invalid input must fail before DB build"
         );
     }
 
@@ -1550,6 +1992,47 @@ mod tests {
         assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "unknown kind").await;
     }
 
+    /// The normal parser accepts aliases, but sync must not store one as the
+    /// base kind: kind-filtered reads and a subsequent export use canonical
+    /// names. Both the subtype alias and a case variant failed open before.
+    #[tokio::test]
+    async fn sync_rejects_noncanonical_entity_kind_before_db_write() {
+        let id = "11111111-1111-1111-1111-111111111111";
+        for (input, canonical) in [("Paper", "document"), ("Concept", "concept")] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path();
+            let db_path = repo.join(".khive/state/working.db");
+            let entities = format!(
+                r#"{{"id":"{id}","kind":"{input}","name":"Alias","properties":{{}},"tags":[]}}"#
+            );
+            let expected = format!("non-canonical kind {input:?}; use {canonical:?}");
+            assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", &expected).await;
+        }
+    }
+
+    /// ADR-115 Amendment 1 §3 applies to entity properties as well as edge
+    /// properties. The sentinel proves this is rejected before DB replacement.
+    #[tokio::test]
+    async fn sync_rejects_entity_with_reserved_secret_gate_property_before_db_write() {
+        let id = "11111111-1111-1111-1111-111111111111";
+        for kind in ["concept", "resource"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path();
+            let db_path = repo.join(".khive/state/working.db");
+            let entities = format!(
+                r#"{{"id":"{id}","kind":"{kind}","name":"A","properties":{{"khive:secret_gate":"exempted:content-sha256-manifest-v1"}},"tags":[]}}"#
+            );
+            assert_sync_rejected_before_db_write(
+                repo,
+                &db_path,
+                &entities,
+                "",
+                "khive:secret_gate",
+            )
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn sync_rejects_whitespace_only_entity_name_before_db_write() {
         let tmp = TempDir::new().unwrap();
@@ -1658,6 +2141,39 @@ mod tests {
             "duplicate edge triple",
         )
         .await;
+    }
+
+    /// Both lateral relations are symmetric in storage. A reversed pair is
+    /// therefore the same semantic triple even when edge IDs differ.
+    #[tokio::test]
+    async fn sync_rejects_reversed_symmetric_edge_triples_before_db_write() {
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edge_id_1 = "33333333-3333-3333-3333-333333333333";
+        let edge_id_2 = "44444444-4444-4444-4444-444444444444";
+        for relation in ["competes_with", "composed_with"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path();
+            let db_path = repo.join(".khive/state/working.db");
+            let edges = [
+                format!(r#"{{"edge_id":"{edge_id_1}","source":"{id_a}","target":"{id_b}","relation":"{relation}","weight":0.5,"properties":{{}}}}"#),
+                format!(r#"{{"edge_id":"{edge_id_2}","source":"{id_b}","target":"{id_a}","relation":"{relation}","weight":0.9,"properties":{{}}}}"#),
+            ]
+            .join("\n");
+            assert_sync_rejected_before_db_write(
+                repo,
+                &db_path,
+                &entities,
+                &edges,
+                "duplicate edge triple",
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -2484,6 +3000,100 @@ mod tests {
             cache.join("meta.json").exists(),
             "meta.json must be written even when pin is absent"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_fetch_rejects_symlinked_ndjson_members_before_publish() {
+        use std::os::unix::fs::symlink;
+
+        let entities = r#"{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","kind":"concept","name":"Outside","properties":{},"tags":[]}"#;
+        for member in ["entities.ndjson", "edges.ndjson"] {
+            let source = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let bare_parent = TempDir::new().unwrap();
+            let client = TempDir::new().unwrap();
+            make_git_remote(source.path(), entities, "");
+
+            let outside_file = outside.path().join(member);
+            std::fs::write(
+                &outside_file,
+                if member == "entities.ndjson" {
+                    entities
+                } else {
+                    ""
+                },
+            )
+            .unwrap();
+            let member_path = source.path().join(".khive/kg").join(member);
+            std::fs::remove_file(&member_path).unwrap();
+            symlink(&outside_file, &member_path).unwrap();
+            run_git(source.path(), &["add", "-A"]);
+            run_git(source.path(), &["commit", "-m", "link remote member"]);
+
+            let bare = bare_parent.path().join("remote.git");
+            run_git(
+                source.path(),
+                &["clone", "--bare", ".", bare.to_str().unwrap()],
+            );
+            let remote = RemoteConfig {
+                name: RemoteName::parse("outside").unwrap(),
+                url: format!("file://{}", bare.display()),
+                git_ref: "main".to_string(),
+                namespace: "remote-ns".to_string(),
+                pin: None,
+            };
+
+            let err = run_sync_remote(client.path(), &remote, false)
+                .await
+                .expect_err("a checked-out symlink must not be read");
+            assert!(
+                format!("{err:#}").contains("not a regular file"),
+                "{member}: {err:#}"
+            );
+            assert!(
+                !client.path().join(".khive/kg/remotes/outside").exists(),
+                "{member} must not publish an external file"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_reader_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let entity =
+            r#"{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","kind":"concept","name":"Outside"}"#;
+        for ancestor in [".khive", ".khive/kg"] {
+            let staging = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let outside_kg = if ancestor == ".khive" {
+                outside.path().join("kg")
+            } else {
+                outside.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&outside_kg).unwrap();
+            std::fs::write(outside_kg.join("entities.ndjson"), entity).unwrap();
+            if ancestor == ".khive/kg" {
+                std::fs::create_dir(staging.path().join(".khive")).unwrap();
+            }
+            let link = staging.path().join(ancestor);
+            symlink(outside.path(), &link).unwrap();
+
+            let member = staging.path().join(".khive/kg/entities.ndjson");
+            let err =
+                read_remote_entities(&member).expect_err("a symlinked ancestor must be refused");
+            assert!(
+                format!("{err:#}").contains("not a regular directory"),
+                "{ancestor}: {err:#}"
+            );
+
+            std::fs::remove_file(&link).unwrap();
+            std::fs::create_dir_all(staging.path().join(".khive/kg")).unwrap();
+            std::fs::write(&member, entity).unwrap();
+            assert_eq!(read_remote_entities(&member).unwrap().len(), 1);
+        }
     }
 
     /// F201-4: `--repin` skips pin comparison and returns the actual hash,

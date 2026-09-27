@@ -1,0 +1,6 @@
+name = "leanMini"
+version = "0.1.0"
+defaultTargets = ["Mini"]
+
+[[lean_lib]]
+name = "Mini"

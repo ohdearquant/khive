@@ -12,8 +12,8 @@ categories.workspace = true
 description = "Configured telemetry routing and bounded rollups over existing streams"
 
 [dependencies]
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 inventory = { workspace = true }
@@ -22,6 +22,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
 tokio = { workspace = true }

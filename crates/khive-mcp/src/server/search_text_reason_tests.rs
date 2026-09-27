@@ -15,6 +15,11 @@ mod search_text_reason_tests {
             .as_object_mut()
             .expect("text arm object")
             .remove("reason");
+        assert_eq!(legacy["text"]["mode"], "all_terms");
+        legacy["text"]
+            .as_object_mut()
+            .expect("text arm object")
+            .remove("mode");
         assert_eq!(
             legacy,
             json!({
@@ -52,6 +57,7 @@ mod search_text_reason_tests {
                     let arms = crate::server::search_arm_participation_value(SearchArmParticipation {
                         text: SearchArmEvidence { status: text_status, candidate_count: count },
                         vector: SearchArmEvidence { status: vector_status, candidate_count: 0 },
+                        text_mode: "all_terms",
                     });
                     legacy_arms(&arms, text_name, count, vector_name, 0);
                     rows.push((
@@ -140,7 +146,7 @@ mod search_text_reason_tests {
         vector_only.per_backend[0].vector_error = Some("embedding unavailable".to_string());
         let vector_entry = ok_envelope("search".to_string(), OpSuccess {
             result: json!([]),
-            degradation: SearchDegradation::from_result(&vector_only, &json!([])),
+            degradation: SearchDegradation::from_result(&vector_only, &json!([]), "all_terms"),
         });
         assert_eq!(vector_entry["ok"], true);
         assert_eq!(vector_entry["status"], "complete");
@@ -156,7 +162,7 @@ mod search_text_reason_tests {
         let surviving = json!([{"id": "11111111-1111-1111-1111-111111111111", "source": "vector"}]);
         let partial = ok_envelope("search".to_string(), OpSuccess {
             result: surviving.clone(),
-            degradation: SearchDegradation::from_result(&failed, &surviving),
+            degradation: SearchDegradation::from_result(&failed, &surviving, "all_terms"),
         });
         assert_eq!(partial["ok"], true);
         assert_eq!(partial["result"], surviving);
@@ -166,7 +172,7 @@ mod search_text_reason_tests {
         assert_eq!(partial["backend_errors"], json!({"archive": {"kind": "backend_error", "message": "storage unavailable"}}));
         legacy_arms(&partial["arm_participation"], "error", 0, "error", 1);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&failed, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&failed, &json!([]), "all_terms"));
         assert_eq!(diagnostic["kind"], "search_incomplete");
         assert_eq!(diagnostic["message"], "no-match was not established because selected backends failed");
         assert_eq!(diagnostic["retryable"], false);
@@ -224,6 +230,38 @@ mod search_text_reason_tests {
         }
         assert_eq!(rows.len(), 6);
         reasons("T4", rows);
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn any_term_mode_survives_frame_omission() {
+        let registry = frame_budget_category_test_registry();
+        let entry = present_ok_envelope_or_depth_error(
+            "search".to_string(),
+            OpSuccess {
+                result: json!([]),
+                degradation: SearchDegradation::complete(&json!([]), false)
+                    .with_text_mode("any_term"),
+            },
+            PresentationMode::Agent,
+            0,
+            khive_types::VerbPresentationPolicy::Standard,
+            khive_runtime::presentation::NoteContentScope::None,
+        );
+        let arms = &entry["arm_participation"];
+        assert_eq!(arms["text"]["mode"], "any_term");
+        assert_eq!(
+            arms["text"]["reason"],
+            "No text candidate survived matching, filtering, fusion, and the result limit."
+        );
+        assert!(arms["vector"].get("mode").is_none());
+
+        let omitted = frame_budget_omission(&entry, &registry);
+        assert_eq!(omitted["ok"], false);
+        assert_eq!(
+            omitted["error"]["search"]["arm_participation"],
+            entry["arm_participation"]
+        );
     }
 
     #[cfg(feature = "bench-embedder")]

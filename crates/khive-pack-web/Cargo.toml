@@ -12,10 +12,10 @@ categories.workspace = true
 description = "Web pack: site/page/resource ontology and fetch/extract/ingest/search/refresh verbs (ADR-191)"
 
 [dependencies]
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
-khive-db = { version = "0.8.0", path = "../khive-db" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-db = { version = "0.9.0", path = "../khive-db" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -33,7 +33,7 @@ reqwest = { workspace = true, features = ["gzip"] }
 libc = { workspace = true }
 
 [dev-dependencies]
-khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 flate2 = "1"

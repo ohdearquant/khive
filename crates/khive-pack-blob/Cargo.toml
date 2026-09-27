@@ -12,10 +12,10 @@ categories.workspace = true
 description = "Blob verb pack — content-addressed reads and staged uploads"
 
 [dependencies]
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
-khive-request = { version = "0.8.0", path = "../khive-request" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-request = { version = "0.9.0", path = "../khive-request" }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 tokio = { workspace = true }
@@ -26,7 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.8.0", path = "../khive-db" }
+khive-db = { version = "0.9.0", path = "../khive-db" }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
 
