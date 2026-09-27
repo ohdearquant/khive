@@ -24,7 +24,6 @@ fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
 /// One row of `brain_serve_ledger` (ADR-081 §4 normative schema).
 pub struct ServeLedgerRow {
     pub id: String,
-    #[allow(dead_code)]
     pub namespace: String,
     #[allow(dead_code)]
     pub consumer_kind: String,
@@ -40,7 +39,6 @@ pub struct ServeLedgerRow {
     /// `None` for a legacy row written before the column existed, or one
     /// where the marker was unrecognized.
     pub serve_attribution: Option<ServeAttribution>,
-    #[allow(dead_code)]
     pub target_id: String,
     #[allow(dead_code)]
     pub query_class: String,
@@ -301,15 +299,15 @@ pub async fn backfill_grade(
 /// Outcome of resolving a `(scorer_run_id, serve_ledger_id)` pair against the
 /// ledger, before the fold gate runs.
 pub enum ServeLedgerResolution {
-    /// This exact `(scorer_run_id, serve_ledger_id)` pair was already graded —
-    /// the caller must treat this emission as a no-op (ADR-081 §2 dedup).
-    AlreadyGraded,
-    /// Row found and not yet graded by this `scorer_run_id`. Carries the
-    /// accounting profile id to fold under, or `None` if unresolved (the
+    /// Row found with matching namespace, target, and requested attribution.
+    /// `already_graded` is a non-atomic shortcut for a same-run replay; the
+    /// atomic scorer claim remains authoritative for concurrent submissions.
+    /// Carries the accounting profile id to fold under, or `None` if unresolved (the
     /// caller must force a zero-weight fold — ADR-081 §4 fail-safe) — unless
     /// `serve_attribution` is the stored `unspecified` marker, which keeps the
     /// legacy binding/default fallback permitted instead of forcing zero.
-    Proceed {
+    Found {
+        already_graded: bool,
         accounting_profile_id: Option<String>,
         serve_attribution: Option<ServeAttribution>,
     },
@@ -322,14 +320,30 @@ pub async fn resolve(
     sql: &dyn SqlAccess,
     serve_ledger_id: &str,
     scorer_run_id: &str,
+    namespace: &str,
+    target_id: &str,
+    requested_profile_id: Option<&str>,
 ) -> Result<ServeLedgerResolution, RuntimeError> {
     let Some(row) = get_serve_row(sql, serve_ledger_id).await? else {
         return Ok(ServeLedgerResolution::NotFound);
     };
-    if row.scorer_run_id.as_deref() == Some(scorer_run_id) {
-        return Ok(ServeLedgerResolution::AlreadyGraded);
+    // Validate before the AlreadyGraded shortcut: a replay with a different
+    // target or attribution must not be reported as a successful no-op.
+    if row.namespace != namespace || row.target_id != target_id {
+        return Err(RuntimeError::InvalidInput(format!(
+            "serve_ledger_id {serve_ledger_id:?} does not match feedback namespace and target_id"
+        )));
     }
-    Ok(ServeLedgerResolution::Proceed {
+    let conflicting_profile = requested_profile_id
+        .zip(row.accounting_profile_id.as_deref())
+        .filter(|(requested, accounting)| requested != accounting);
+    if let Some((requested, accounting)) = conflicting_profile {
+        return Err(RuntimeError::InvalidInput(format!(
+            "served_by_profile_id {requested:?} does not match serve_ledger_id {serve_ledger_id:?} accounting_profile_id {accounting:?}"
+        )));
+    }
+    Ok(ServeLedgerResolution::Found {
+        already_graded: row.scorer_run_id.as_deref() == Some(scorer_run_id),
         accounting_profile_id: row.accounting_profile_id,
         serve_attribution: row.serve_attribution,
     })

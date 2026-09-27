@@ -48,6 +48,14 @@ or missing dependency) rather than silently dropping packs. Once built, `serve_s
 consumes the server and serves over stdio — the path `StdioTransport::serve` and `kkernel
 mcp` both call.
 
+The stdio reader caps each raw JSON-RPC line at 8,454,144 bytes by default,
+enough for a fully escaped 1 MiB `ops` string plus envelope overhead. Set
+`KHIVE_MCP_STDIO_MAX_LINE_BYTES` to an integer from 1 through 67,108,864 to
+override it. Invalid values fail startup. An overlong line gets a JSON-RPC
+parse error as soon as it crosses the cap; the server discards through that
+line's newline and continues with the next request. The cap includes the
+newline byte when present.
+
 Production callers must obtain that runtime from the async host builders. They inventory
 secondaries, install the shared bounded hydrator, and finish the resumable V21 attachment/GC
 cutover before exposing a server. Direct `KhiveRuntime::from_backend` plus

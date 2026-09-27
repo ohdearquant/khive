@@ -47,6 +47,19 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u32 = 8;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// An accepted local socket must finish its first frame within this window.
+/// Dispatch deadlines start only after decoding, so they cannot reap peers
+/// that connect and then stop sending request bytes.
+#[cfg(unix)]
+const INITIAL_FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(unix)]
+fn next_accept_error_backoff(previous: Option<std::time::Duration>) -> std::time::Duration {
+    previous
+        .map(|delay| delay.saturating_mul(2))
+        .unwrap_or_else(|| std::time::Duration::from_millis(10))
+        .min(std::time::Duration::from_secs(1))
+}
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
@@ -1068,6 +1081,37 @@ where
     Ok(buf)
 }
 
+#[cfg(unix)]
+fn initial_frame_timeout_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "daemon initial request frame read timed out",
+    )
+}
+
+#[cfg(unix)]
+async fn read_initial_frame<R>(
+    stream: &mut R,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // Tokio polls the inner future before checking its timer. A frame already
+    // buffered when a delayed connection task first runs would otherwise pass
+    // even though its acceptance-time deadline has expired.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(initial_frame_timeout_error());
+    }
+    let raw = tokio::time::timeout_at(deadline, read_frame(stream))
+        .await
+        .map_err(|_| initial_frame_timeout_error())??;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(initial_frame_timeout_error());
+    }
+    Ok(raw)
+}
+
 /// Write one length-prefixed frame.
 #[cfg(unix)]
 pub async fn write_frame<W>(stream: &mut W, payload: &[u8]) -> std::io::Result<()>
@@ -1624,13 +1668,25 @@ async fn wait_for_peer_disconnect(read: &mut tokio::net::unix::OwnedReadHalf) {
 
 #[cfg(all(unix, test))]
 async fn handle_conn<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
-    handle_conn_with_shutdown(stream, dispatcher, None).await;
+    handle_conn_with_shutdown(
+        stream,
+        dispatcher,
+        None,
+        tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+    )
+    .await;
 }
 
 #[cfg(all(unix, feature = "fault-injection"))]
 #[doc(hidden)]
 pub async fn handle_conn_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
-    handle_conn_with_shutdown(stream, dispatcher, None).await;
+    handle_conn_with_shutdown(
+        stream,
+        dispatcher,
+        None,
+        tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+    )
+    .await;
 }
 
 #[cfg(unix)]
@@ -1660,13 +1716,14 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     mut stream: UnixStream,
     dispatcher: D,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    initial_frame_deadline: tokio::time::Instant,
 ) {
     let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown = shutdown.unwrap_or(local_shutdown_rx);
     // Keeps the fallback receiver open in direct/test calls. Production owns
     // a sender at the daemon-run scope and passes its receiver above.
     let _local_shutdown_tx = local_shutdown_tx;
-    let raw = match read_frame(&mut stream).await {
+    let raw = match read_initial_frame(&mut stream, initial_frame_deadline).await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "failed to read daemon request frame");
@@ -2636,9 +2693,15 @@ where
 
     tokio::select! {
         _ = async {
+            let mut accept_error_backoff = None;
+            let mut last_accept_error_log: Option<std::time::Instant> = None;
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let initial_frame_deadline =
+                            tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT;
+                        accept_error_backoff = None;
+                        last_accept_error_log = None;
                         // Refuse a foreign uid before any frame is read.
                         // Fails CLOSED: an error reading peer credentials is
                         // "cannot prove same-uid", which is the same answer as
@@ -2674,10 +2737,18 @@ where
                                 continue;
                             }
                         }
+                        // Keep the acceptance-time deadline across the
+                        // credential check and connection-task scheduling.
                         let d = dispatcher.clone();
                         let shutdown = request_shutdown_rx.clone();
                         let handle = spawn_connection_task(Arc::clone(&active), async move {
-                            handle_conn_with_shutdown(stream, d, Some(shutdown)).await;
+                            handle_conn_with_shutdown(
+                                stream,
+                                d,
+                                Some(shutdown),
+                                initial_frame_deadline,
+                            )
+                            .await;
                         });
                         let mut tasks = connection_tasks
                             .lock()
@@ -2685,7 +2756,26 @@ where
                         tasks.retain(|task| !task.is_finished());
                         tasks.push(handle);
                     }
-                    Err(e) => tracing::error!(error = %e, "accept failed"),
+                    Err(e) => {
+                        let delay = next_accept_error_backoff(accept_error_backoff);
+                        accept_error_backoff = Some(delay);
+                        let capacity_exhausted = matches!(
+                            e.raw_os_error(),
+                            Some(libc::EMFILE) | Some(libc::ENFILE)
+                        );
+                        if last_accept_error_log.is_none_or(|last| {
+                            last.elapsed() >= std::time::Duration::from_secs(30)
+                        }) {
+                            tracing::error!(
+                                error = %e,
+                                capacity_exhausted,
+                                retry_ms = delay.as_millis(),
+                                "daemon accept failed; retrying with bounded backoff"
+                            );
+                            last_accept_error_log = Some(std::time::Instant::now());
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
         } => {}
@@ -3215,7 +3305,13 @@ mod khive_root_tests {
 #[cfg(all(unix, any(test, feature = "test-internals")))]
 #[doc(hidden)]
 pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
-    handle_conn_with_shutdown(stream, dispatcher, None).await;
+    handle_conn_with_shutdown(
+        stream,
+        dispatcher,
+        None,
+        tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+    )
+    .await;
 }
 
 #[cfg(all(test, unix))]
@@ -3226,6 +3322,44 @@ mod tests {
     }
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn incomplete_initial_frames_release_the_connection_deadline() {
+        for prefix in [&[][..], &[0, 0][..], &[0, 0, 0, 5][..]] {
+            let (mut peer, mut server) = tokio::io::duplex(64);
+            peer.write_all(prefix).await.expect("send partial frame");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+            let error = read_initial_frame(&mut server, deadline)
+                .await
+                .expect_err("an idle peer cannot hold a daemon connection indefinitely");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+
+        let (mut peer, mut server) = tokio::io::duplex(64);
+        write_frame(&mut peer, b"{}")
+            .await
+            .expect("send full frame");
+        assert_eq!(
+            read_initial_frame(
+                &mut server,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("complete frame remains readable"),
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn repeated_accept_failures_back_off_and_cap_at_one_second() {
+        let mut previous = None;
+        for expected_ms in [10, 20, 40, 80, 160, 320, 640, 1000, 1000] {
+            let next = next_accept_error_backoff(previous);
+            assert_eq!(next.as_millis(), expected_ms);
+            previous = Some(next);
+        }
+        assert_eq!(next_accept_error_backoff(None).as_millis(), 10);
+    }
 
     #[derive(Debug)]
     struct DrainBlockingBlobStore {
@@ -4428,6 +4562,80 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    #[tokio::test]
+    async fn expired_accepted_deadline_refuses_even_buffered_complete_frame() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".into(),
+            config_id: "expired-accept-test".into(),
+            dispatch_calls: Arc::clone(&calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        let frame = base_request_frame("expired-accept-test");
+        write_frame(&mut client, &serde_json::to_vec(&frame).unwrap())
+            .await
+            .expect("buffer complete frame before handler starts");
+        // Model a task first polled after its acceptance-time deadline. Tokio
+        // polls a ready frame before its timer, so timeout_at alone would
+        // wrongly dispatch this already-buffered request.
+        let accepted_deadline = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_conn_with_shutdown(server, dispatcher, None, accepted_deadline),
+        )
+        .await
+        .expect("expired accepted deadline must not start a fresh read window");
+        let mut byte = [0u8; 1];
+        match client.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected closed socket, got {other:?}"),
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Supplies the entire frame without registering readiness or yielding.
+    /// `timeout_at` must not be allowed to accept this ready first poll after
+    /// the connection's acceptance-time deadline has already passed.
+    struct ReadyFrameReader {
+        frame: Vec<u8>,
+        offset: usize,
+        polls: usize,
+    }
+
+    impl tokio::io::AsyncRead for ReadyFrameReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let reader = self.get_mut();
+            reader.polls += 1;
+            let remaining = &reader.frame[reader.offset..];
+            let count = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..count]);
+            reader.offset += count;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_accepted_deadline_refuses_a_frame_ready_on_first_poll() {
+        let mut reader = ReadyFrameReader {
+            frame: [2_u32.to_be_bytes().as_slice(), b"{}"].concat(),
+            offset: 0,
+            polls: 0,
+        };
+        let accepted_deadline = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+        let error = read_initial_frame(&mut reader, accepted_deadline)
+            .await
+            .expect_err("a fully ready frame must not outlive its acceptance deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(reader.polls, 0, "an expired frame must not be polled");
     }
 
     /// #2230 review (Medium): duplicate-daemon detection must not treat any
