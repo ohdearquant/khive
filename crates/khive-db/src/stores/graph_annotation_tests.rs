@@ -245,3 +245,76 @@ fn latest_annotation_query_work_does_not_grow_with_older_receipt_history() {
         "older receipts must not be enumerated or sorted: small={small_steps}, large={large_steps}"
     );
 }
+
+#[test]
+fn latest_annotation_sparse_target_work_ignores_unrelated_notes() {
+    let (pool, _store) = fixture();
+    let target = Uuid::from_u128(1);
+    let receipt = Uuid::from_u128(2);
+    let writer = pool.writer().unwrap();
+    let conn = writer.conn();
+    note(
+        conn,
+        receipt,
+        100,
+        "observation",
+        json!(["web.receipt"]),
+        false,
+    );
+    edge(conn, receipt, target, "visible", "annotates", false);
+    let (small_id, small_steps) = query_steps(conn, target);
+
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..10_000 {
+        let id = Uuid::from_u128(100 + i);
+        note(
+            conn,
+            id,
+            1_000 + i as i64,
+            "observation",
+            json!(["web.receipt"]),
+            false,
+        );
+        // Intentionally no annotation edge to the queried target.
+    }
+    conn.execute_batch("COMMIT; ANALYZE").unwrap();
+    let (large_id, large_steps) = query_steps(conn, target);
+    assert_eq!(small_id, receipt);
+    assert_eq!(large_id, receipt);
+    assert!(
+        large_steps <= small_steps + 200,
+        "unrelated notes must not make a complete singleton probe scan the corpus: small={small_steps}, large={large_steps}"
+    );
+}
+
+#[tokio::test]
+async fn latest_annotation_probe_overflow_preserves_eligible_third_edge() {
+    let (pool, store) = fixture();
+    let target = Uuid::from_u128(1);
+    let receipt = Uuid::from_u128(4);
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        for source in [Uuid::from_u128(2), Uuid::from_u128(3)] {
+            note(conn, source, 10, "observation", json!([]), false);
+            edge(conn, source, target, "visible", "annotates", false);
+        }
+        note(
+            conn,
+            receipt,
+            20,
+            "observation",
+            json!(["web.receipt"]),
+            false,
+        );
+        edge(conn, receipt, target, "visible", "annotates", false);
+    }
+    assert_eq!(
+        store
+            .latest_annotating_note(target, "observation", "web.receipt")
+            .await
+            .unwrap(),
+        Some((receipt, 20)),
+        "an overflowing probe is not a complete candidate set"
+    );
+}

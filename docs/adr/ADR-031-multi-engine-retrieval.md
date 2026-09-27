@@ -325,7 +325,7 @@ key bridge; behavior is unchanged.
 
 HNSW indexes are dimension-fixed (a 384d node and a 1024d node cannot share a graph).
 Per-(model, dim) table sharding is for correctness, not optimization — it is the INV-1
-invariant from `foundation/embed/DESIGN.md`.
+invariant from `foundation/embed/DESIGN.md` (earlier implementation, not in this repository).
 
 **Migration shim for `vec_default`**: deployments predating this ADR have data in a
 `vec_default` table. At first startup post-D3:
@@ -526,7 +526,7 @@ in `khive-embed`, shared across packs. `FusionStrategy::Weighted` for engine fus
 **`SparseStore` trait** extends `khive-storage` (parallel to `VectorStore` from ADR-005):
 
 ```rust
-// crates/khive-storage/src/traits.rs
+// crates/khive-storage/src/sparse.rs (implemented shape: see Amendment 2)
 #[async_trait]
 pub trait SparseStore: Send + Sync {
     async fn insert_sparse(
@@ -798,8 +798,10 @@ existing single-engine deployments see no behavior change.
   pattern from D5
 - [ADR-035](ADR-035-cli-config-and-auto-embed.md) — project-vs-user TOML override semantics
   that D3 extends
-- `deploy/engine.toml` — canonical multi-engine schema being restored
-- `foundation/embed/DESIGN.md` — INV-1..INV-8 invariants; per-(model, dim)
+- `deploy/engine.toml` (earlier implementation, not in this repository) — canonical multi-engine
+  schema being restored
+- `foundation/embed/DESIGN.md` (earlier implementation, not in this repository) — INV-1..INV-8
+  invariants; per-(model, dim)
   table sharding rationale; asymmetric retrieval prefix invariant
 - `apps/cli/src/server/unified.rs:414-664` — `resolve_embed_models`,
   historical multi-engine wiring; D2 pattern source
@@ -957,3 +959,132 @@ need changes.
 | `crates/khive-runtime/src/lib.rs`                          | `pub mod embedder_registry`; re-exports                                                                                                      |
 | `crates/khive-runtime/tests/integration.rs`                | 4 new integration tests in `embedder_registry_tests` module                                                                                  |
 | — Chinese-blindspot crisis; per-engine calibration history |                                                                                                                                              |
+
+---
+
+## Amendment 2 (2026-09-25): implementation record for D1, D2 and D6
+
+Status: Accepted (2026-09-25)
+
+### Context
+
+D1 and D2 place the embedder trait, the lattice adapter and the registry in a new `khive-embed`
+crate (`crates/khive-embed/src/trait.rs`, `lattice.rs`, `registry.rs`), Migration Phase A creates
+that crate, D3 moves `vec_model_key` into it, and D4 says `khive-runtime` drops its direct
+`lattice-embed` dependency. No `khive-embed` crate exists in this repository or in its history.
+The registry was built inside `khive-runtime`, as the Addendum "Pack-extensible EmbedderRegistry
+(PR #397)" above records:
+
+- `crates/khive-runtime/src/embedder_registry.rs` defines `EmbedderProvider` (the provider trait:
+  `name`, `dimensions`, and an async `build` returning an `EmbeddingService`), `EmbedderRegistry`,
+  and `LatticeEmbedderProvider`. No trait named `Embedder` exists.
+- `vec_model_key` stays in `khive-runtime` (`crates/khive-runtime/src/config.rs`, crate-private).
+- `lattice-embed` is a direct, non-optional dependency of `khive-runtime`
+  (`crates/khive-runtime/Cargo.toml`). There is no `lattice` feature, so the lattice-free build
+  described in D1 and D4 is not available.
+
+D6 specifies a two-method `SparseStore` in `crates/khive-storage/src/traits.rs`, implemented in
+`khive-db-ruvector`. The trait is defined in `crates/khive-storage/src/sparse.rs` with a different
+shape: `insert_sparse(subject_id, kind, namespace, field, vector)`,
+`insert_batch(Vec<SparseRecord>)`, `delete(subject_id)`, `search_sparse(SparseSearchRequest)` and
+`count()`. Its implementation is `SqliteSparseStore` in `crates/khive-db/src/stores/sparse.rs`.
+There is no `khive-db-ruvector` crate.
+
+### Decision
+
+Record the implemented placement as the current state of D1, D2 and D6:
+
+1. The provider-agnostic embedding seam D1 calls for is `EmbedderProvider` together with
+   `EmbeddingService`, and the process-wide registry D2 calls for is `EmbedderRegistry`, both in
+   `khive-runtime`. This ADR no longer plans the separate `khive-embed` crate, the `Embedder` trait
+   name or the `lattice` feature. Extracting the registry into its own crate later needs its own
+   amendment.
+2. The `SparseStore` contract is the trait in `crates/khive-storage/src/sparse.rs`. The code block
+   in D6 is the original sketch and stays in place as the record of what was first proposed.
+
+This amendment changes no code and does not restate or change D3's `[[engines]]` schema, D4's
+`model_id` routing or D5's fan-out.
+
+### Alternatives considered
+
+- **Extract `khive-embed` as Phase A specifies.** This moves the registry and its lattice adapter
+  into a new crate and changes every import of the registry types. No current consumer needs a
+  lattice-free build, and the Addendum's pack-extensible registry already admits non-lattice
+  providers without it.
+- **Leave D1, D2 and D6 as written.** A reader following them looks for a crate, a trait and a
+  file that do not exist.
+
+### Consequences
+
+- Readers find the embedder seam in `khive-runtime` and the sparse contract in
+  `crates/khive-storage/src/sparse.rs`.
+- Migration Phase A reads as delivered by the Addendum's registry rather than by a new crate.
+
+### Refs
+
+- The Addendum "Pack-extensible EmbedderRegistry (PR #397)" above.
+
+---
+
+## Amendment 3 (2026-09-25): a configured `fusion_weight` is refused until retrieval applies it
+
+Status: Accepted (2026-09-25)
+
+### Context
+
+The `[[engines]]` Addendum above validates "`fusion_weight` > 0 when present (error:
+`ConfigError::InvalidFusionWeight`)" and notes that "Pack handlers are responsible for reading
+`EngineConfig.fusion_weight` and building the appropriate fusion strategy; no automatic wiring
+exists yet."
+
+At this revision:
+
+- `KhiveConfig::validate` (`crates/khive-runtime/src/engine_config.rs`) refuses a non-finite or
+  non-positive `fusion_weight` with `ConfigError::InvalidFusionWeight` and accepts any finite
+  positive value.
+- `runtime_config_from_khive_config` (`crates/khive-runtime/src/config.rs`) turns each engine into
+  `RuntimeConfig::embedding_model` or an entry of `additional_embedding_models` and never reads
+  `fusion_weight`. `RuntimeConfig` holds no per-engine weight, so no pack handler can reach the
+  value, and no retrieval path reads it.
+- The doc comment on `EngineConfig::fusion_weight` says the weights are injected into
+  `FusionStrategy::Weighted`, and `docs/khive-config-example.toml` describes the weight as scaling
+  each engine's contribution. That example sets `fusion_weight = 0.5` on both of its active
+  engines.
+
+A weight an operator sets is therefore validated and then has no effect, while the documentation
+says it is applied (#3246).
+
+### Decision
+
+1. Validation keeps its existing first step: a non-finite or non-positive `fusion_weight` fails with
+   `ConfigError::InvalidFusionWeight`.
+2. While no retrieval path applies the value, a finite positive `fusion_weight` on any engine is
+   then refused at load with `ConfigError::UnsupportedFusionWeight`, which names the engine and
+   states that per-engine weights are not wired into retrieval. A configuration that omits the
+   key loads as before.
+3. The `EngineConfig::fusion_weight` doc comment and `docs/khive-config-example.toml` state that
+   the key is refused until it is applied, and the example config no longer sets it.
+4. The change that wires per-engine weights into multi-engine fusion (D5) removes the refusal and
+   records the applied semantics in a further amendment.
+
+### Alternatives considered
+
+- **Load the value and warn that it is not applied.** Nothing breaks on upgrade, but a key that
+  loads and then does nothing tells the operator the ranking follows their weights when it does
+  not. A warning in a log is easy to miss; a refusal at load is not. Rejected.
+- **Apply the weights now (D5).** Carry per-engine weights into `RuntimeConfig` and fuse
+  multi-engine results with them. This is the intended end state and stays open, but it is a
+  larger change than the reporting defect.
+- **Keep accepting the value silently.** This leaves #3246 in place.
+
+### Consequences
+
+- A configuration that sets `fusion_weight` on any engine, including a copy of the previous
+  `docs/khive-config-example.toml`, stops loading after the upgrade until the key is removed. The
+  error names the first engine found that sets it.
+- Rankings do not change: the value was never applied.
+- Wiring the weights (D5) lifts the refusal; no stored data depends on this rule.
+
+### Refs
+
+- #3246

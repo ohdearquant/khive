@@ -35,7 +35,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -116,37 +115,12 @@ fn parse_paths_param(params: &Value) -> Result<Vec<String>, RuntimeError> {
     }
 }
 
-/// Runs `git -C <repo> <argv...>`, argv-only (no shell), returning stdout on
-/// success or a `RuntimeError` carrying git's stderr on failure.
-///
-/// Every invocation disables repo-configured hooks via
-/// `-c core.hooksPath=/dev/null` (ADR-108 Amendment), mirroring
-/// `crate::cache`'s hardened clone/fetch invocations: this function runs in
-/// the daemon's own credential context, so a hook script committed into an
-/// allowlisted repo (e.g. `.git/hooks/pre-commit`) must never get a chance
-/// to execute as a side effect of a khive-mediated write. `GIT_CONFIG_GLOBAL`
-/// / `GIT_CONFIG_SYSTEM` are deliberately left untouched here, unlike the
-/// test harness's hermetic `git_command` helper: these are real,
-/// operator-owned repos, and a commit/push needs the operator's actual
-/// author identity and credential helpers (SSH keys, `credential.helper`)
-/// configured in global/system git config to work at all — neutralizing
-/// that config would break the legitimate write path along with the attack
-/// surface it does not itself pose (hooks are the RCE risk; identity/
-/// credential config is not). Unit-test builds override both config sources
-/// below so handler tests remain hermetic; that override is not compiled into
-/// production builds.
+/// Runs the paths form under the same environment and repository-configuration
+/// hardening as local object plumbing. Identity still comes from the repository
+/// unless the caller supplied the paths form's validated `--author` argument.
 fn run_git(program: &Path, repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
-    let mut command = Command::new(program);
-    command
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("-C")
-        .arg(repo)
-        .args(argv);
-    #[cfg(test)]
-    command
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut command = crate::local_git::git_command(program, repo, &argv_refs, None);
     let output = command
         .output()
         .map_err(|e| RuntimeError::InvalidInput(format!("spawning git {argv:?}: {e}")))?;

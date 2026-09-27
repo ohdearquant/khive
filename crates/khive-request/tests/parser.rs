@@ -197,6 +197,20 @@ fn json_form_rejects_literal_newline_in_string() {
     assert!(matches!(err, DslError::InvalidJson { .. }));
 }
 
+#[test]
+fn json_form_rejects_unknown_entry_keys_before_defaulting_args() {
+    for src in [
+        r#"{"tool":"memory.prune","arg":{"dry_run":true}}"#,
+        r#"[{"tool":"get","args":{"id":"known"}},{"tool":"memory.prune","arg":{}}]"#,
+    ] {
+        let error = parse_request(src).unwrap_err();
+        assert!(
+            matches!(error, DslError::InvalidJson { ref error } if error.contains("arg")),
+            "misspelled operation key must be refused: {error:?}"
+        );
+    }
+}
+
 // ── ADR-016 grammar-boundary matrix (round-1 review, PR #957) ────────────────
 
 #[test]
