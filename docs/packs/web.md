@@ -65,8 +65,12 @@ the hop and links `new supersedes old`, a 302/307 hop mints nothing beyond a rec
 it. The terminal hop's body (if `GET`; `HEAD` carries none) is stored via the runtime's blob
 store, content-addressed; storing byte-identical content again is a no-op. `persist` defaults to
 `true`; `false` stores no body or entities and returns the exact body as a standard-alphabet,
-padded base64 string in `body` (null for HEAD or a persisted fetch). It still writes a standalone receipt recording
-`final_url`, the BLAKE3 `content_digest`, `size` and RFC 3339 `fetched_at`; `content_ref` is null.
+padded base64 string in `body` (null for HEAD or a persisted fetch). It still writes a standalone
+receipt. A GET receipt records `final_url`, the measured BLAKE3 `content_digest`, measured `size`
+and RFC 3339 `fetched_at`, including with `persist=false`; `content_ref` is null for a transient
+fetch. A HEAD receipt has no digest or size, reports `bytes: 0`, and keeps an advertised
+`Content-Length` only as a response header. A persisted document's `truncated` property records
+whether its stored body is a prefix.
 A persisted body has one `content` attachment on its entity, on the main backend even when web
 records use a separate backend. Receipts never carry body attachments.
 The egress `max_bytes` ceiling bounds raw bytes; base64 uses `4 * ceil(bytes / 3)` characters.
@@ -91,11 +95,13 @@ aggregate multiple operations.
 Parse an already-fetched body — never fetches one itself. `kinds` is a subset of
 `{text, links, sitemap, feed}`, defaulting to whatever applies to the stored content-type.
 `links` yields `page links_to page|resource` edges to targets minted (if absent) as unfetched
-`resource` rows. `link_limit` caps link targets processed from one page. It defaults to 100 and accepts integers
-from 0 through 1,000. Once the ceiling is reached, remaining matched `<a href>` attributes are
-left unresolved and their count is returned as `result.links.skipped`;
-`result.links.edges_created` reports the processed targets. `sitemap`/`feed` yield
-`site contains resource` edges for each entry under the _publishing_ site. `text` mints a
+`resource` rows. `link_limit` is a shared target budget across `links`, `sitemap`, and `feed`
+in one extraction, applied in requested kind order. It defaults to 100 and accepts integers
+from 0 through 1,000. Once the ceiling is reached, remaining matched entries are left unresolved
+and counted in `result.<kind>.skipped`; `result.links.edges_created` and
+`result.sitemap.entries` / `result.feed.entries` report admitted targets. Sitemap/feed edges
+are batched per kind. `sitemap`/`feed` yield `site contains resource` edges for admitted entries
+under the _publishing_ site. `text` mints a
 `resource` holding the tag-stripped body, linked
 `derived_from` back to the original — keyed by the original document's id, so repeated
 extraction converges on one row rather than minting duplicates. Refuses `not_fetched` on a
@@ -110,22 +116,25 @@ identity for every file in the tree, and no network request is made for the disk
 (default `0`: seeds only). In URL mode, depth zero does not extract links by default; set
 `extract_links=true` to record the page's links without following them. Positive depth extracts
 links only on pages below the requested depth so their targets can be followed. Across the whole
-call, link targets processed are capped by `limit`, and each page also uses the `web.extract`
-default ceiling of 100. `limit` bounds the total number of documents ingested in one call
+call, link, sitemap, and feed targets processed are capped by `limit`, and each page also uses the
+`web.extract` default ceiling of 100. `limit` bounds the total number of documents ingested in one call
 (default 100).
 
 The disk-mode `source` directory is confined to the operator's configured `[web] read_roots`
 (modeled on `[exec] read_roots`): absent or empty refuses every disk ingest outright, and a
 `source` that is not itself one of the configured roots or nested under one is refused before
 anything is read. Every path discovered while walking the tree — including a symlink target —
-is re-canonicalized and re-checked against the same roots, so a symlink planted inside an
-allowed root cannot serve content from outside it.
+is opened through a descriptor walk that refuses symlinks and checks the opened inode, so a
+symlink planted inside an allowed root cannot serve content from outside it. Each already-confined
+file is read on a blocking worker through a `max_bytes_default + 1` byte bound. A file larger than the configured
+`[web] max_bytes_default` refuses with `ingest_file_too_large` before its document or blob is written.
 
 The URL-crawl mode's reply carries `ingested` (the minted document ids) and `refused` (one
 `{url, error}` entry per URL that `web.fetch` refused — an egress refusal, a transport error, or
 anything else short of a persisted document): a refused URL is named in the reply rather than
 silently dropped from the crawl, so a caller can tell "nothing matched" apart from "some targets
-were refused."
+were refused." A separate `failed` array records `{id, url, stage, error}` when extraction or
+subsequent neighbor discovery fails after a document was persisted; its id remains in `ingested`.
 
 ### Deleting routed entities
 
@@ -147,10 +156,13 @@ BLAKE3 digest over it. `persist` defaults to `false`; `true` mints each hit's UR
 
 ### `web.refresh(id)`
 
-Conditionally re-fetch an already-fetched document using its stored `etag`/`last_modified` as
-`If-None-Match`/`If-Modified-Since`. A `304`, or a `200` whose body content-addresses to the
-_same_ reference already stored, writes a receipt only — no entity or blob change. A genuinely
-changed body puts the new blob and patches the entity in place. Every refresh's receipt
+Conditionally re-fetch an already-fetched complete document using its stored `etag`/`last_modified` as
+`If-None-Match`/`If-Modified-Since`. A partial (`truncated`) body is re-fetched without validators,
+and source validators are dropped when a redirect changes the address. A redirected `304` is
+refused rather than copying the source body onto the target. The reply and receipt report `truncated`.
+A `304`, or a `200` whose body content-addresses to the
+_same_ reference already stored with unchanged completeness, writes a receipt only — no entity or
+blob change. A changed body or completeness flag patches the entity in place. Every refresh's receipt
 supersedes the immediately prior receipt for the same document, so the note history is the
 resource's refresh timeline. Follows the same bounded redirect chain `fetch` does, through the
 same egress checks on every hop: identity is by address, so the terminal address's own row
