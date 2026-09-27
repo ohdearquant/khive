@@ -458,6 +458,101 @@ async fn default_mmr_keeps_higher_composite_duplicate_in_both_id_orders() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn finite_adjustments_keep_rank_scores_numeric_through_mmr_and_final_sort() {
+    let rt = make_runtime();
+    rt.register_embedder(ConstVecProvider::new("finite-adjustment-enc", 4, 0.9));
+    let registry = make_registry(rt.clone());
+
+    let mut episodic_id = String::new();
+    for (content, memory_type) in [
+        ("Alpha rank score arithmetic memory", "episodic"),
+        ("Beta rank score arithmetic memory", "semantic"),
+    ] {
+        let remembered = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": content,
+                    "memory_type": memory_type,
+                    "salience": 0.8
+                }),
+            )
+            .await
+            .expect("remember memory with vector embedding");
+        if memory_type == "episodic" {
+            episodic_id = remembered["id"].as_str().expect("episodic ID").to_owned();
+        }
+    }
+
+    let pack = MemoryPack::new(rt.clone());
+    pack.warm().await;
+    let token = rt.authorize(Namespace::local()).expect("local token");
+
+    // A vector hit supplies raw_score, so the scored candidate reaches both sorts.
+    let control = pack
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "rank score arithmetic",
+                "limit": 2,
+                "config": {"scoring": {
+                    "mmr_penalty": 0.1,
+                    "mmr_prefix_len": 1,
+                    "adjustments": []
+                }}
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("control recall");
+    let control_hits = control.as_array().expect("control hits");
+    assert_eq!(control_hits.len(), 2, "control must retrieve both memories");
+    assert!(
+        control_hits
+            .iter()
+            .all(|hit| hit["raw_score"].as_f64().is_some()),
+        "both candidates must have vector raw scores: {control_hits:?}"
+    );
+
+    let episodic_condition = json!({"type": "memory_type", "kind": "episodic"});
+    let config = json!({"scoring": {
+        "mmr_penalty": 0.1,
+        "mmr_prefix_len": 1,
+        "adjustments": [
+            {"condition": episodic_condition, "operation": {"type": "add", "value": 3.0e38_f32}},
+            {"condition": episodic_condition, "operation": {"type": "add", "value": 3.0e38_f32}},
+            {"condition": episodic_condition, "operation": {"type": "multiply", "factor": 0.0}}
+        ]
+    }});
+    khive_pack_memory::config::RecallConfig::try_from_value(config.clone())
+        .expect("finite nested adjustments are accepted by RecallConfig");
+
+    let recalled = pack
+        .dispatch(
+            "memory.recall",
+            json!({"query": "rank score arithmetic", "limit": 2, "config": config}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("recall with finite nested adjustments");
+    let hits = recalled.as_array().expect("recall hits");
+    assert_eq!(hits.len(), 2, "both memories must reach the scored results");
+    let episodic = hits
+        .iter()
+        .find(|hit| hit["id"].as_str() == Some(episodic_id.as_str()))
+        .expect("episodic memory in results");
+    assert!(
+        episodic["rank_score"]
+            .as_f64()
+            .is_some_and(|score| score.is_finite()),
+        "finite accepted adjustments must yield a numeric rank_score: {episodic:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_memory_type_filter() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
