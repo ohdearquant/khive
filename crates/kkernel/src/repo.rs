@@ -950,7 +950,15 @@ fn canonical_repo(path: &Path) -> Result<PathBuf> {
 }
 
 fn ensure_clean_snapshot(repo: &Path) -> Result<()> {
-    let status = git_output(repo, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let status = git_output(
+        repo,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ],
+    )?;
     let relevant: Vec<&str> = status
         .lines()
         .filter(|line| line.trim() != "?? .khive-last-used")

@@ -38,6 +38,7 @@ pub fn hardened_git_command() -> Command {
         )
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
