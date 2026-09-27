@@ -2243,6 +2243,39 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
     );
 }
 
+#[tokio::test]
+async fn try_insert_note_pk_collision_is_not_other_channel_dedup() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.writer().unwrap();
+        let v42 = crate::migrations::MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 42)
+            .expect("channel-scoped external ID migration");
+        writer.conn().execute_batch(v42.up).unwrap();
+    }
+
+    let existing =
+        make_note("ns1", "message", "lowercase channel").with_properties(serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "email",
+            "channel_slug": "user@example.com",
+        }));
+    assert!(store.try_insert_note(existing.clone()).await.unwrap());
+
+    let mut colliding_id =
+        make_note("ns1", "message", "other channel").with_properties(serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "email",
+            "channel_slug": "User@Example.com",
+        }));
+    colliding_id.id = existing.id;
+    assert!(
+        store.try_insert_note(colliding_id).await.is_err(),
+        "a primary-key collision must not be called deduplication merely because another channel owns the external ID"
+    );
+}
+
 // ── #827: single-note insert + notes_seq assignment atomicity ────────────
 
 /// Regression for #827: on the default flag-off (pool-mutex) path,

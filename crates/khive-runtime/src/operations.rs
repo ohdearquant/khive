@@ -3620,8 +3620,8 @@ impl KhiveRuntime {
     /// Insert a note using `INSERT OR IGNORE` semantics for atomic deduplication.
     ///
     /// Returns `Ok(Some(note))` when the note was newly written.  Returns
-    /// `Ok(None)` when a unique constraint (e.g. the `external_id` partial
-    /// index on comm message notes) was already satisfied by an existing row,
+    /// `Ok(None)` when a unique constraint (e.g. the channel-scoped `external_id`
+    /// partial index on comm message notes) was already satisfied by an existing row,
     /// making this call a no-op.  FTS indexing and vector embedding are
     /// attempted on success but treated as best-effort: failures are logged
     /// and do not abort the write.
