@@ -262,6 +262,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently dropped when the git pack derives a GitHub `owner/repo` slug for
   policy checks.
 
+- Knowledge-graph sync now refuses an entity carrying the reserved
+  `khive:secret_gate` property before it can replace the database, stores an
+  entity kind given as an alias or case variant under its canonical name, and
+  hashes a symmetric edge (`competes_with`, `composed_with`) the same way in
+  either endpoint order, so status no longer reports a change right after a
+  clean sync.
+- `neighbors` and `traverse` resolve a full-id anchor or root by id, the same
+  way `get` does. An absent anchor or root is now a not-found error, naming the
+  missing root for `traverse`, instead of an empty result; the edges and
+  neighbor records returned stay scoped to the caller's visible namespaces.
+- Remote issue and pull-request ingest no longer blocks a runtime worker on a
+  slow or hung `gh` call: the probe and page fetches run as async child
+  processes with a 60-second deadline and bounded output, and a failed page
+  reports its typed reason (timeout, output limit, missing program). Moodboard
+  raster decode, resize and encode run off the async workers.
+- A quarantined inbound message's original bytes are now owned by an
+  attachment written in the same transaction as the quarantine note, so the
+  blob sweep can no longer delete an original the quarantine notice still
+  points to; a retried delivery repairs a missing attachment on an older
+  quarantine. `blob.get` reserves the object's own size from the shared read
+  budget instead of the full read ceiling, and committing a staged upload or
+  re-beginning a known reference restarts the publish grace period.
+- Pack schema ownership recognizes a table however its DDL spells the name
+  (quoted, bracketed, `main.`-qualified, `TEMP`, or behind a comment), and
+  every pack's tables are claimed before any DDL runs, so a collision between
+  two packs fails boot by name with nothing applied. A repeated named-vector
+  lookup reuses the verified store instead of re-scanning the vector table and
+  taking the writer on every call.
+- Brain profile accounting: the dispatch hook no longer holds a namespace lock
+  across unrelated requests, and pending signals are bounded (drops are counted
+  in `brain.state`). Feedback that names a served row must match that row's
+  namespace, target and accounting profile. An archived profile no longer
+  accumulates automatic updates, an explicit recall naming an archived profile
+  is refused, and the default profile can no longer be deactivated or archived.
+
 ### Security
 
 - Staged upload filesystem operations are race-free on Unix and are not on other
@@ -292,6 +327,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup-key labels match whole rather than by suffix, masking is scoped to
   inline credential values, and a technical reference (a path or a hash)
   beside a credential word no longer triggers a false refusal.
+- A generic `create` or update of a `message` note now refuses a
+  caller-supplied `external_id`. The value is set only by inbound ingest and
+  by the outbound delivery claim, so a caller can no longer choose an
+  outgoing `Message-ID` or steer reply threading into another conversation.
 
 ## [0.8.0] - 2026-08-27
 
