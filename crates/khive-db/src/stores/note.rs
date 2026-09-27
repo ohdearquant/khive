@@ -1506,7 +1506,7 @@ impl NoteStore for SqlNoteStore {
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
-        // Extract external_id (if any) for dedup verification after a zero-row insert.
+        // Capture the durable dedup key for verification after a zero-row insert.
         let ext_id_opt: Option<String> = note
             .properties
             .as_ref()
@@ -1514,6 +1514,20 @@ impl NoteStore for SqlNoteStore {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let channel_kind = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.get("channel_kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let channel_slug = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.get("channel_slug"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
 
         self.with_writer_tx("try_insert_note", move |conn| {
             let rows = conn.execute(
@@ -1546,7 +1560,8 @@ impl NoteStore for SqlNoteStore {
 
             // Zero rows: the INSERT was silently skipped by OR IGNORE.
             // Only treat this as a dedup hit when a live note with the same
-            // non-empty external_id already exists in this namespace and kind.
+            // non-empty external_id and exact channel provenance already exists
+            // in this namespace and kind.
             // Any other ignored constraint (e.g. a PRIMARY KEY collision) must
             // surface as an error rather than being misreported as a duplicate.
             if let Some(ref ext_id) = ext_id_opt {
@@ -1555,8 +1570,10 @@ impl NoteStore for SqlNoteStore {
                      WHERE namespace = ?1 \
                        AND kind = ?2 \
                        AND json_extract(properties, '$.external_id') = ?3 \
+                       AND ifnull(json_extract(properties, '$.channel_kind'), '') = ?4 \
+                       AND ifnull(json_extract(properties, '$.channel_slug'), '') = ?5 \
                        AND deleted_at IS NULL",
-                    rusqlite::params![namespace, kind_str, ext_id],
+                    rusqlite::params![namespace, kind_str, ext_id, channel_kind, channel_slug],
                     |row| row.get(0),
                 )?;
                 if is_dedup {

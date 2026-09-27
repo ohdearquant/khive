@@ -596,10 +596,11 @@ note's own UUID becomes the canonical root per ADR-040.
 back to the sending actor), (2) caller-supplied `default_inbound_actor` (fresh
 email landing actor), (3) `p.to.trim()` (back-compat: raw recipient address).
 
-Deduplication: when `external_id` is supplied, `try_create_note` uses a
-verify-after-insert check on the durable unique index on `external_id`. A
-confirmed duplicate returns `Ok(None)` without error; only an external_id
-collision is treated as dedup, other constraint violations surface as errors.
+Deduplication: when `external_id` is supplied, the trusted ingest insert uses a
+verify-after-insert check on the durable unique index over the external ID
+and exact `(channel_kind, channel_slug)` provenance. Missing channel fields
+occupy the empty index partition. A confirmed duplicate returns `Ok(None)`
+without error; other constraint violations surface as errors.
 For the #3228 IMAP account-key migration, an email poll also supplies its
 pre-account `legacy_external_id`. During one release window, `comm.ingest`
 reads that key before writing, restricted to an existing inbound email row
@@ -724,6 +725,8 @@ value, and direction; its partial predicate matches the unread filter. The type
 key excludes malformed object/array recipients before the cap-limited scan, even
 when their JSON text equals an allowed actor label.
 
-The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
-created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
-is the sole durable authority for that index.
+The `idx_comm_message_external_id` UNIQUE index is NOT listed here; V5
+introduced it, and the V42 schema migration
+(`042-comm-external-id-channel-scope.sql`) replaces it with exact channel
+provenance in the key. Versioned migrations are the durable authority for
+that index.

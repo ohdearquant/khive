@@ -2201,6 +2201,40 @@ fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
     ack
 }
 
+/// Match the same channel-scoped key enforced by the durable external-ID index.
+/// An absent channel field occupies the empty index partition; transport-owned
+/// fields on a validated ingest are non-empty and compared exactly.
+fn ingest_external_id_filter(
+    external_id: &str,
+    channel_kind: Option<&str>,
+    channel_slug: Option<&str>,
+) -> NoteFilter {
+    let mut property_filters = vec![PropertyFilter {
+        json_path: "$.external_id".to_string(),
+        op: FilterOp::Eq,
+        value: SqlValue::Text(external_id.to_string()),
+    }];
+    for (json_path, value) in [
+        ("$.channel_kind", channel_kind),
+        ("$.channel_slug", channel_slug),
+    ] {
+        property_filters.push(PropertyFilter {
+            json_path: json_path.to_string(),
+            op: if value.is_some() {
+                FilterOp::Eq
+            } else {
+                FilterOp::EqOrMissingIndexed
+            },
+            value: SqlValue::Text(value.unwrap_or_default().to_string()),
+        });
+    }
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters,
+        ..Default::default()
+    }
+}
+
 /// `ingest` — write a single inbound message note from a channel adapter.
 /// `Visibility::Subhandler`: not accessible via the MCP wire, only callable
 /// in-process (e.g. the polling loop in `khive-mcp`); the authoritative write
@@ -2315,15 +2349,7 @@ pub(crate) async fn handle_ingest(
         // Prefer a row already stored under the account-scoped key. This
         // explicit read also keeps the migration lookup order observable;
         // the unique index below remains the final atomic race guard.
-        let new_filter = NoteFilter {
-            kind: Some("message".to_string()),
-            property_filters: vec![PropertyFilter {
-                json_path: "$.external_id".to_string(),
-                op: FilterOp::Eq,
-                value: SqlValue::Text(new_id.to_string()),
-            }],
-            ..Default::default()
-        };
+        let new_filter = ingest_external_id_filter(new_id, p.channel_kind.as_deref(), Some(slug));
         let new_page = store
             .query_notes_filtered_count_free(
                 ns,
@@ -2599,15 +2625,11 @@ pub(crate) async fn handle_ingest(
                     "comm.ingest: storage reported a duplicate without an external_id".into(),
                 )
             })?;
-            let duplicate_filter = NoteFilter {
-                kind: Some("message".to_string()),
-                property_filters: vec![PropertyFilter {
-                    json_path: "$.external_id".to_string(),
-                    op: FilterOp::Eq,
-                    value: SqlValue::Text(external_id.to_string()),
-                }],
-                ..Default::default()
-            };
+            let duplicate_filter = ingest_external_id_filter(
+                external_id,
+                p.channel_kind.as_deref(),
+                p.channel_slug.as_deref(),
+            );
             let duplicate_page = store
                 .query_notes_filtered_count_free(
                     ns,
