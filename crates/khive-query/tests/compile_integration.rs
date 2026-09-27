@@ -1670,6 +1670,150 @@ mod substrate_labels {
         conn
     }
 
+    #[test]
+    fn repeated_name_predicates_with_ascii_case_variants_preserve_matches() {
+        let conn = fixture_db_with_edge();
+        for relation in ["extends", "extends+"] {
+            for (var, expected, upper, lower) in [
+                ("a", "e-fixture-1", "X", "x"),
+                ("b", "e-fixture-2", "Y", "y"),
+            ] {
+                for (first, second) in [(upper, lower), (lower, upper)] {
+                    let single = format!(
+                        "SELECT ?{var} WHERE {{ ?a :{relation} ?b . \
+                         ?{var} :name '{first}' . }}"
+                    );
+                    let control = parse(QueryLanguage::Sparql, &single).unwrap();
+                    assert_eq!(
+                        run(&conn, &compile(&control, &scoped("local")).unwrap()),
+                        vec![expected.to_string()],
+                        "single predicate must match: {single}"
+                    );
+                    let repeated = format!(
+                        "SELECT ?{var} WHERE {{ ?a :{relation} ?b . \
+                         ?{var} :name '{first}' . ?{var} :name '{second}' . }}"
+                    );
+                    let query = parse(QueryLanguage::Sparql, &repeated).unwrap_or_else(|e| {
+                        panic!("NOCASE-equivalent predicates: {repeated}: {e}")
+                    });
+                    assert_eq!(
+                        run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                        vec![expected.to_string()],
+                        "a redundant equivalent predicate must preserve matches: {repeated}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_json_string_predicates_with_ascii_case_variants_preserve_matches() {
+        let conn = fixture_db_with_edge();
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET properties = ?1 WHERE id = ?2",
+                rusqlite::params![r#"{"domain":"Attention"}"#, "e-fixture-1"],
+            )
+            .unwrap(),
+            1
+        );
+        for relation in ["extends", "extends+"] {
+            let control_text =
+                format!("SELECT ?a WHERE {{ ?a :{relation} ?b . ?a :domain 'attention' . }}");
+            let control = parse(QueryLanguage::Sparql, &control_text).unwrap();
+            assert_eq!(
+                run(&conn, &compile(&control, &scoped("local")).unwrap()),
+                vec!["e-fixture-1"]
+            );
+            for constraints in [
+                "?a :domain 'Attention' . ?a :domain 'attention' .",
+                "?a :domain 'attention' . ?a :domain 'Attention' .",
+                "?a :domain :attention . ?a :domain 'ATTENTION' .",
+                "?a :domain 'ATTENTION' . ?a :domain :attention .",
+            ] {
+                let text = format!("SELECT ?a WHERE {{ ?a :{relation} ?b . {constraints} }}");
+                let query = parse(QueryLanguage::Sparql, &text)
+                    .unwrap_or_else(|e| panic!("equivalent JSON-property predicates: {text}: {e}"));
+                assert_eq!(
+                    run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                    vec!["e-fixture-1"],
+                    "query: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_entity_type_predicates_remain_case_sensitive() {
+        let conn = fixture_db_with_edge();
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET entity_type = 'Widget' WHERE id = 'e-fixture-1'",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        for (literal, should_match) in [("Widget", true), ("widget", false)] {
+            let text =
+                format!("SELECT ?a WHERE {{ ?a :entity_type '{literal}' . ?a :extends ?b . }}");
+            let query = parse(QueryLanguage::Sparql, &text).unwrap();
+            let expected: Vec<String> = if should_match {
+                vec!["e-fixture-1".into()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                expected
+            );
+        }
+        for (first, second) in [("Widget", "widget"), ("widget", "Widget")] {
+            let text = format!(
+                "SELECT ?a WHERE {{ ?a :entity_type '{first}' . \
+                 ?a :entity_type '{second}' . ?a :extends ?b . }}"
+            );
+            let err = parse(QueryLanguage::Sparql, &text).unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting constraints"), "{err}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_case_and_distinct_name_predicates_remain_conflicting() {
+        let conn = fixture_db_with_edge();
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET name = ?1 WHERE id = ?2",
+                rusqlite::params!["É", "e-fixture-1"],
+            )
+            .unwrap(),
+            1
+        );
+        for (literal, should_match) in [("É", true), ("é", false)] {
+            let text = format!("SELECT ?a WHERE {{ ?a :name '{literal}' . ?a :extends ?b . }}");
+            let query = parse(QueryLanguage::Sparql, &text).unwrap();
+            let expected: Vec<String> = if should_match {
+                vec!["e-fixture-1".into()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                expected
+            );
+        }
+        for (first, second) in [("É", "é"), ("x", "y")] {
+            let text = format!(
+                "SELECT ?a WHERE {{ ?a :name '{first}' . \
+                 ?a :name '{second}' . ?a :extends ?b . }}"
+            );
+            let err = parse(QueryLanguage::Sparql, &text).unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting constraints"), "{err}");
+        }
+    }
+
     fn insert_path_node(conn: &Connection, id: &str, namespace: &str, deleted_at: Option<i64>) {
         conn.execute(
             "INSERT INTO entities

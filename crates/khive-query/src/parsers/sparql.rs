@@ -20,7 +20,15 @@ fn insert_string_property_constraint(
     let constraint = ConditionValue::String(value);
     let props = node_props.entry(subject.clone()).or_default();
     if let Some(existing) = props.get(&name) {
-        if existing != &constraint {
+        let equivalent = match (existing, &constraint) {
+            (ConditionValue::String(left), ConditionValue::String(right))
+                if name != "entity_type" =>
+            {
+                left.eq_ignore_ascii_case(right)
+            }
+            _ => existing == &constraint,
+        };
+        if !equivalent {
             return Err(QueryError::Parse {
                 position: 0,
                 message: format!(
