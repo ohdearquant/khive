@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 6] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 7] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -31,6 +31,10 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 6] = [
         json_extract(properties, '$.to_actor'), \
         created_at DESC, id ASC) \
         WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_quarantine_expiry \
+        ON notes(namespace, kind, json_extract(properties, '$.channel_kind'), \
+        json_extract(properties, '$.channel_slug'), expires_at, id) \
+        WHERE deleted_at IS NULL AND expires_at IS NOT NULL",
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
 ];
 
@@ -48,7 +52,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
@@ -504,6 +508,35 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 param_type: "object",
                 required: false,
                 description: "Optional transport-layer metadata passthrough, merged additively into the stored note's properties (never overrides an already-set field). Generic and channel-agnostic; the email channel uses it for quarantine markers (quarantined, quarantine_reason, quarantine_claimed_from — ADR-056 Amendment 2026-07-02).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.cleanup_expired_quarantine",
+        description: "Remove one bounded page of expired quarantine notes for a channel credential. Internal daemon subhandler; not callable on the MCP wire.",
+        visibility: Visibility::Subhandler,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "channel_kind",
+                param_type: "string",
+                required: true,
+                description: "Exact channel kind owning the quarantine notes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "channel_slug",
+                param_type: "string",
+                required: true,
+                description: "Exact channel credential slug owning the quarantine notes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "as_of_micros",
+                param_type: "integer",
+                required: false,
+                description: "Internal test cutoff in UTC microseconds; omitted by production pollers.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

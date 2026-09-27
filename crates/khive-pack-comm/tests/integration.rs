@@ -9,7 +9,7 @@ use khive_runtime::{
 };
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_storage::Note;
-use khive_types::Pack;
+use khive_types::{Pack, Visibility};
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
@@ -107,12 +107,12 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_fourteen_handlers() {
+fn comm_pack_declares_fifteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        14,
-        "comm pack must declare 14 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
-         thread, ingest, heartbeat, health, probe, cursor_get, cursor_commit \
+        15,
+        "comm pack must declare 15 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
+         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
@@ -139,6 +139,16 @@ fn comm_pack_declares_fourteen_handlers() {
     assert!(
         names.contains(&"comm.ingest"),
         "comm.ingest verb must be registered"
+    );
+    assert!(names.contains(&"comm.cleanup_expired_quarantine"));
+    let cleanup = CommPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "comm.cleanup_expired_quarantine")
+        .unwrap();
+    assert_eq!(cleanup.visibility, Visibility::Subhandler);
+    assert!(
+        !cleanup.params.iter().any(|param| param.name == "namespace"),
+        "namespace is a registry routing key, not a cleanup handler parameter"
     );
     assert!(
         names.contains(&"comm.heartbeat"),

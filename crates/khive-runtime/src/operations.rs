@@ -3631,7 +3631,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, false, None)
+        self.try_create_note_impl(token, kind, name, content, properties, false, None, None)
             .await
     }
 
@@ -3650,6 +3650,7 @@ impl KhiveRuntime {
     /// exclusively to channel-transport packs. Every other write path uses
     /// `try_create_note`, which rejects those three properties
     /// unconditionally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_create_note_as_trusted_ingest(
         &self,
         _capability: &crate::pack::ChannelIngestCapability,
@@ -3658,9 +3659,19 @@ impl KhiveRuntime {
         name: Option<&str>,
         content: &str,
         properties: Option<serde_json::Value>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, true, None)
-            .await
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            None,
+            expires_after,
+        )
+        .await
     }
 
     /// Publish a trusted inbound message and its original-byte attachment in
@@ -3676,6 +3687,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
         attachment: NewAttachment,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
         self.try_create_note_impl(
             token,
@@ -3685,6 +3697,7 @@ impl KhiveRuntime {
             properties,
             true,
             Some(attachment),
+            expires_after,
         )
         .await
     }
@@ -3699,6 +3712,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         allow_transport_owned_message_properties: bool,
         attachment: Option<NewAttachment>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3742,6 +3756,16 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str();
         let mut note = Note::new(ns, kind, content);
+        if let Some(retention) = expires_after {
+            let duration_us = i64::try_from(retention.as_micros()).map_err(|_| {
+                RuntimeError::InvalidInput(
+                    "trusted ingest retention exceeds i64 microseconds".into(),
+                )
+            })?;
+            note.expires_at = Some(note.created_at.checked_add(duration_us).ok_or_else(|| {
+                RuntimeError::InvalidInput("trusted ingest expiry exceeds i64 microseconds".into())
+            })?);
+        }
         if let Some(n) = name {
             note = note.with_name(n);
         }

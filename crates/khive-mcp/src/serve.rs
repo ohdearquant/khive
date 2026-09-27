@@ -737,6 +737,7 @@ async fn quarantine_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
     channel_kind: &str,
+    channel_slug: &str,
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     classification: khive_runtime::ChannelIngestFailureClass,
@@ -781,8 +782,9 @@ async fn quarantine_channel_ingest_failure(
         "namespace": ingest_namespace,
         "from": quarantine_sender,
         "to": notification_to,
-        "content": "Inbound channel message quarantined. Original bytes are available through the attached content reference.",
+        "content": "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference.",
         "channel_kind": channel_kind,
+        "channel_slug": channel_slug,
         "external_id": external_id,
         "metadata": {
             "quarantined": "true",
@@ -804,12 +806,13 @@ async fn quarantine_channel_ingest_failure(
 async fn handle_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
-    channel_kind: &str,
+    channel: (&str, &str),
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     error: &khive_runtime::RuntimeError,
     unknown_attempts: &mut std::collections::HashMap<String, u8>,
 ) -> bool {
+    let (channel_kind, channel_slug) = channel;
     let classification = error.channel_ingest_failure_class();
     match channel_ingest_disposition(
         classification,
@@ -834,6 +837,7 @@ async fn handle_channel_ingest_failure(
                 registry,
                 ingest_namespace,
                 channel_kind,
+                channel_slug,
                 default_inbound_actor,
                 envelope,
                 classification,
@@ -855,6 +859,31 @@ async fn handle_channel_ingest_failure(
             }
         }
     }
+}
+
+/// This maintenance verb is deliberately separate from `comm.heartbeat`:
+/// heartbeat rows live in `CHANNEL_HEALTH_NAMESPACE`, while quarantine notes
+/// live in the explicitly configured ingest namespace.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn cleanup_expired_channel_quarantine(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    channel_kind: &str,
+    channel_slug: &str,
+) -> Result<(), khive_runtime::RuntimeError> {
+    use serde_json::json;
+
+    registry
+        .dispatch(
+            "comm.cleanup_expired_quarantine",
+            json!({
+                "namespace": ingest_namespace,
+                "channel_kind": channel_kind,
+                "channel_slug": channel_slug,
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Wait `interval` between channel-loop cycles, unless the caller's shutdown
@@ -982,6 +1011,28 @@ async fn channel_poll_loop(
             )
             .await;
 
+            // One bounded expiry page per credential per tick, including
+            // empty polls. A failure must hold this cycle before a success
+            // heartbeat or cursor advance can be recorded.
+            if let Err(error) =
+                cleanup_expired_channel_quarantine(&registry, &ingest_namespace, kind, slug).await
+            {
+                tracing::warn!(channel = kind, slug, error = %error,
+                    "quarantine retention cleanup failed; holding channel poll");
+                record_channel_heartbeat(
+                    &registry,
+                    kind,
+                    slug,
+                    HeartbeatOutcome::Failure {
+                        class: "retention",
+                        message: error.to_string(),
+                    },
+                    event_store.as_ref(),
+                )
+                .await;
+                continue;
+            }
+
             // Durable checkpoint path (issue #449): cursor_get -> poll_page ->
             // every comm.ingest -> cursor_commit, committing only when the
             // whole page durably ingested. A cursor_get failure means we
@@ -1093,7 +1144,7 @@ async fn channel_poll_loop(
                             let handled = handle_channel_ingest_failure(
                                 &registry,
                                 &ingest_namespace,
-                                kind,
+                                (kind, slug),
                                 Some(&default_inbound_actor),
                                 &env,
                                 &error,
@@ -1826,6 +1877,18 @@ async fn telegram_poll_loop(
             tracing::info!("telegram channel polling loop: daemon shutdown observed, stopping");
             return;
         }
+        let kind = telegram_channel.kind();
+        let slug = telegram_channel.slug();
+        if let Err(error) =
+            cleanup_expired_channel_quarantine(&registry, &ingest_namespace, kind, &slug).await
+        {
+            tracing::warn!(channel = kind, slug, error = %error,
+                "quarantine retention cleanup failed; holding telegram poll");
+            if !channel_cycle_wait(ERROR_BACKOFF, &shutdown).await {
+                return;
+            }
+            continue;
+        }
         #[cfg(all(test, feature = "test-channel-timing"))]
         poll_timing_tests::at(poll_timing_tests::Boundary::TelegramBeforePoll).await;
         // Dropping getUpdates leaves the confirmed offset unchanged; an
@@ -1840,8 +1903,6 @@ async fn telegram_poll_loop(
         };
         match polled {
             Ok(envelopes) => {
-                let kind = telegram_channel.kind();
-                let slug = telegram_channel.slug();
                 let batch_attempt_keys: Vec<String> = envelopes
                     .iter()
                     .filter_map(|env| channel_ingest_attempt_key(kind, env.external_id.as_deref()))
@@ -1862,7 +1923,7 @@ async fn telegram_poll_loop(
                         let handled = handle_channel_ingest_failure(
                             &registry,
                             &ingest_namespace,
-                            kind,
+                            (kind, &slug),
                             None,
                             &env,
                             &error,
@@ -12948,7 +13009,8 @@ backend = "kg-backend"
             Channel, ChannelCheckpoint, ChannelEnvelope, ChannelError, ChannelPollPage,
             ChannelRegistry, StoredChannelCheckpoint,
         };
-        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+        use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+        use khive_storage::types::{SqlStatement, SqlValue};
         use serde_json::json;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -13660,6 +13722,7 @@ backend = "kg-backend"
                 &registry,
                 "test-ns",
                 "email",
+                "mailbox@example.com",
                 Some("actor:test"),
                 &replay_envelope,
                 khive_runtime::ChannelIngestFailureClass::Permanent {
@@ -13676,6 +13739,178 @@ backend = "kg-backend"
                 .unwrap()
                 .expect("retry restores the GC root");
             assert_eq!(repaired.content_ref.as_str(), content_ref);
+        }
+
+        /// A real quarantine note plus GC-rooted original in one isolated
+        /// runtime, shared by the retention deadline tests.
+        async fn retained_quarantine_fixture() -> (
+            tempfile::TempDir,
+            KhiveRuntime,
+            khive_runtime::VerbRegistry,
+            uuid::Uuid,
+            String,
+        ) {
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store = Arc::new(
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("blob store"),
+            );
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(blob_store.clone())
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+            let original = b"retained quarantine original";
+            let put = registry
+                .dispatch("blob.put", json!({"bytes": BASE64.encode(original)}))
+                .await
+                .expect("publish original");
+            let content_ref = put["content_ref"].as_str().unwrap().to_string();
+            let ingested = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "retention-ns",
+                        "from": "email:quarantine",
+                        "to": "email:maintainer@example.com",
+                        "content": "Inbound message quarantined",
+                        "channel_kind": "email",
+                        "channel_slug": "mailbox@example.com",
+                        "external_id": "imap:retention:1:1",
+                        "metadata": {
+                            "quarantined": "true",
+                            "quarantine_content_ref": content_ref,
+                        }
+                    }),
+                )
+                .await
+                .expect("ingest quarantine");
+            let note_id = ingested["full_id"].as_str().unwrap().parse().unwrap();
+            (blob_dir, runtime, registry, note_id, content_ref)
+        }
+
+        #[tokio::test]
+        async fn expired_quarantine_removes_note_and_blob_attachment_reference() {
+            let (_blob_dir, runtime, registry, note_id, content_ref) =
+                retained_quarantine_fixture().await;
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            let notes = runtime.notes(&token).unwrap();
+            let note = notes.get_note(note_id).await.unwrap().unwrap();
+            let expires_at = note
+                .expires_at
+                .expect("quarantine note has a retention deadline");
+            assert_eq!(
+                expires_at,
+                note.created_at + 14 * 24 * 60 * 60 * 1_000_000,
+                "the default retention is fourteen days from note creation"
+            );
+
+            let before = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "mailbox@example.com",
+                        "as_of_micros": expires_at - 1,
+                    }),
+                )
+                .await
+                .expect("pre-deadline cleanup");
+            assert_eq!(before["deleted"], 0);
+            assert!(notes.get_note(note_id).await.unwrap().is_some());
+            assert!(runtime
+                .attachments()
+                .unwrap()
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_some());
+
+            let after = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "mailbox@example.com",
+                        "as_of_micros": expires_at,
+                    }),
+                )
+                .await
+                .expect("expired cleanup");
+            assert_eq!(after["deleted"], 1);
+            assert!(notes.get_note(note_id).await.unwrap().is_none());
+            assert!(runtime
+                .attachments()
+                .unwrap()
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_none());
+
+            let blob_attachment_refs = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(SqlStatement {
+                    sql: "SELECT record_uuid FROM attachments WHERE content_ref = ?1".into(),
+                    params: vec![SqlValue::Text(content_ref)],
+                    label: Some("quarantine_retention_attachment_refs".into()),
+                })
+                .await
+                .unwrap();
+            assert!(blob_attachment_refs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn quarantine_original_is_readable_before_retention_deadline() {
+            let (_blob_dir, runtime, registry, note_id, content_ref) =
+                retained_quarantine_fixture().await;
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let expires_at = note.expires_at.expect("quarantine retention deadline");
+            let cleanup = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "mailbox@example.com",
+                        "as_of_micros": expires_at - 1,
+                    }),
+                )
+                .await
+                .expect("inside-retention cleanup");
+            assert_eq!(cleanup["deleted"], 0);
+            let fetched = registry
+                .dispatch("blob.get", json!({"content_ref": content_ref}))
+                .await
+                .expect("original remains readable inside retention");
+            assert_eq!(
+                BASE64.decode(fetched["bytes"].as_str().unwrap()).unwrap(),
+                b"retained quarantine original"
+            );
         }
 
         /// Restart-across-a-checkpoint round-trip (issue #449 part b): once a

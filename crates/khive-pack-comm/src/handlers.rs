@@ -15,7 +15,7 @@ use khive_runtime::{
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
-use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, DeleteMode, NewAttachment};
 
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
@@ -25,9 +25,9 @@ use crate::message::{
     COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
-    deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
-    IngestParams, MarkReadParams, ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams,
-    UnreadParams,
+    deser, CleanupExpiredQuarantineParams, CursorCommitParams, CursorGetParams, DeliveredParams,
+    HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, ReadParams,
+    ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
 fn add_embedding_truncation_warning(
@@ -2175,6 +2175,7 @@ pub(crate) async fn handle_ingest(
     channel_ingest_capability: Option<&khive_runtime::ChannelIngestCapability>,
     token: &NamespaceToken,
     params: Value,
+    quarantine_retention: std::time::Duration,
 ) -> Result<Value, RuntimeError> {
     // Note: IngestParams does not use deny_unknown_fields.
     let mut p: IngestParams = serde_json::from_value(params)
@@ -2493,6 +2494,7 @@ pub(crate) async fn handle_ingest(
                 p.content.trim(),
                 Some(props),
                 attachment,
+                is_quarantined.then_some(quarantine_retention),
             )
             .await?
     } else {
@@ -2504,6 +2506,7 @@ pub(crate) async fn handle_ingest(
                 p.subject.as_deref(),
                 p.content.trim(),
                 Some(props),
+                is_quarantined.then_some(quarantine_retention),
             )
             .await?
     };
@@ -2660,6 +2663,99 @@ pub(crate) async fn handle_ingest(
         "external_id": p.external_id,
         "deduplicated": false,
     }))
+}
+
+/// Internal channel-poller maintenance. One bounded page per tick ensures an
+/// empty poll still makes progress without monopolizing the writer. The token
+/// carries the ingest namespace explicitly; heartbeat rows use a different
+/// namespace and must not be used as the maintenance scope.
+pub(crate) async fn handle_cleanup_expired_quarantine(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: CleanupExpiredQuarantineParams = deser(params)?;
+    if p.channel_kind.trim().is_empty() || p.channel_slug.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cleanup_expired_quarantine: channel_kind and channel_slug must be nonblank".into(),
+        ));
+    }
+    let as_of = p
+        .as_of_micros
+        .unwrap_or_else(|| Utc::now().timestamp_micros());
+    let namespace = token.namespace().as_str();
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT id FROM notes \
+                  WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
+                    AND expires_at IS NOT NULL AND expires_at <= ?2 \
+                    AND json_extract(properties, '$.channel_kind') = ?3 \
+                    AND json_extract(properties, '$.channel_slug') = ?4 \
+                    AND (json_extract(properties, '$.quarantined') = 'true' \
+                         OR json_type(properties, '$.quarantined') = 'true') \
+                  ORDER BY expires_at, id LIMIT 128"
+                .into(),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(as_of),
+                SqlValue::Text(p.channel_kind.clone()),
+                SqlValue::Text(p.channel_slug.clone()),
+            ],
+            label: Some("comm_cleanup_expired_quarantine".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    drop(reader);
+
+    // NoteStore by-ID deletion is not namespace-scoped. Re-read each UUID
+    // through the authorized store and enforce the query's full predicate
+    // before hard deletion. Hard delete removes the note and its attachment
+    // row in one transaction; blob GC reclaims the orphan after its grace.
+    let store = runtime.notes(token)?;
+    let mut deleted = 0usize;
+    for row in rows {
+        let id = match row.get("id") {
+            Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|error| {
+                RuntimeError::Internal(format!(
+                    "cleanup_expired_quarantine: invalid stored note id: {error}"
+                ))
+            })?,
+            _ => {
+                return Err(RuntimeError::Internal(
+                    "cleanup_expired_quarantine: query returned no text id".into(),
+                ));
+            }
+        };
+        let Some(note) = store.get_note(id).await? else {
+            continue;
+        };
+        let properties = note.properties.as_ref();
+        let still_due = note.namespace == namespace
+            && note.kind == "message"
+            && note.expires_at.is_some_and(|expires| expires <= as_of)
+            && properties
+                .and_then(|props| props.get("channel_kind"))
+                .and_then(Value::as_str)
+                == Some(p.channel_kind.as_str())
+            && properties
+                .and_then(|props| props.get("channel_slug"))
+                .and_then(Value::as_str)
+                == Some(p.channel_slug.as_str())
+            && (properties.and_then(|props| props.get("quarantined")) == Some(&Value::Bool(true))
+                || properties
+                    .and_then(|props| props.get("quarantined"))
+                    .and_then(Value::as_str)
+                    == Some("true"));
+        if still_due && store.delete_note(id, DeleteMode::Hard).await? {
+            deleted += 1;
+        }
+    }
+    Ok(json!({"ok": true, "deleted": deleted}))
 }
 
 /// Deterministic UUID identifying the `channel_health` row for one
@@ -3927,10 +4023,16 @@ mod tests {
             "external_id": "imap:long-poll:dedup:1",
         });
 
-        let first =
-            super::handle_ingest(&runtime, &signal, Some(&capability), &token, body.clone())
-                .await
-                .expect("first ingest succeeds");
+        let first = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &token,
+            body.clone(),
+            std::time::Duration::from_secs(14 * 24 * 60 * 60),
+        )
+        .await
+        .expect("first ingest succeeds");
         assert_eq!(first["deduplicated"].as_bool(), Some(false));
         let generation_after_commit = signal.snapshot();
         assert_ne!(
@@ -3938,9 +4040,16 @@ mod tests {
             "a newly committed ingest must publish a wake"
         );
 
-        let second = super::handle_ingest(&runtime, &signal, Some(&capability), &token, body)
-            .await
-            .expect("deduplicated ingest succeeds");
+        let second = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &token,
+            body,
+            std::time::Duration::from_secs(14 * 24 * 60 * 60),
+        )
+        .await
+        .expect("deduplicated ingest succeeds");
         assert_eq!(second["deduplicated"].as_bool(), Some(true));
         assert_eq!(
             signal.snapshot(),
@@ -4016,10 +4125,16 @@ mod tests {
             },
         });
 
-        let first =
-            super::handle_ingest(&runtime, &signal, Some(&capability), &token, body.clone())
-                .await
-                .expect("initial quarantine ingest");
+        let first = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &token,
+            body.clone(),
+            std::time::Duration::from_secs(14 * 24 * 60 * 60),
+        )
+        .await
+        .expect("initial quarantine ingest");
         let note_id = Uuid::parse_str(first["full_id"].as_str().expect("full note id"))
             .expect("canonical note id");
         let attachments = runtime.core().attachments().expect("attachment store");
@@ -4041,7 +4156,15 @@ mod tests {
                     let capability =
                         khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
                     let signal = crate::inbox_signal::InboxSignal::new();
-                    super::handle_ingest(&runtime, &signal, Some(&capability), &token, body).await
+                    super::handle_ingest(
+                        &runtime,
+                        &signal,
+                        Some(&capability),
+                        &token,
+                        body,
+                        std::time::Duration::from_secs(14 * 24 * 60 * 60),
+                    )
+                    .await
                 },
             ))
         };

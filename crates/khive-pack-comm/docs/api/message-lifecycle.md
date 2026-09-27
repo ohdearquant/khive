@@ -643,6 +643,25 @@ note's transaction. This attachment is the blob sweep's liveness root; metadata
 alone does not own stored bytes. A duplicate transport id repairs a missing
 legacy attachment only when its stored reference matches the replayed bytes.
 
+Quarantine notes receive `expires_at` at creation, computed from their own
+`created_at` plus the comm pack's `quarantine_retention` (14 days by default;
+embedders may configure it with `CommPack::with_quarantine_retention`). Before
+each email or Telegram channel poll, an internal, bounded cleanup pass selects
+expired quarantine messages in that channel's ingest namespace and exact
+`channel_kind`/`channel_slug`, then hard-deletes each note and its attachment.
+Subsequent polls continue through the backlog, including when no new messages
+arrive. The blob sweep reclaims an unowned original after its grace period;
+an unexpired quarantine note and its attachment remain available. This follows
+[ADR-121](../../../../docs/adr/ADR-121-attachments-first-class.md)'s rule that
+a live note owns its attachment and hard deletion releases that ownership.
+Cleanup failure holds the channel poll and is reported as a failure, so it
+cannot produce a success heartbeat or advance transport progress.
+
+A future promote or release path would need to clear the expiry before the
+deadline; no such path exists today. Older quarantine notes without
+`expires_at` or `channel_slug` are outside this bounded cleanup and require a
+separate audited migration before the same retention guarantee can cover them.
+
 ## Message-ID / References header helpers (#403)
 
 - `message_id_match_candidates`: outbound mail stores its Message-ID in wire
@@ -710,6 +729,9 @@ then `created_at DESC, id ASC`. The prefix is in the statement because every
 actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
 scan that pages first and filters the recipient afterwards stops reaching a
 channel's rows once enough other rows sort ahead of them.
+
+`idx_comm_quarantine_expiry` supports the daemon's bounded, channel-scoped
+expiry page by namespace, kind, channel identity, and expiry timestamp.
 
 `idx_notes_unread_probe_recipient_type_direction` is a base-store index serving
 delegated unread counts (ADR-187); migration
