@@ -1911,6 +1911,7 @@ dependencies = [
  "criterion",
  "hex",
  "khive-runtime",
+ "lru 0.18.2",
  "rand 0.8.7",
  "serde",
  "serde_json",
