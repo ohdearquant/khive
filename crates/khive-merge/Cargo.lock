@@ -1193,6 +1193,7 @@ version = "0.9.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "bytes",
  "chrono",
  "crossbeam-queue",
  "fs4",
