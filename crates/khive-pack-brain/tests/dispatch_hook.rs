@@ -9,7 +9,9 @@ use std::sync::Arc;
 use khive_pack_brain::BrainPack;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
-use khive_runtime::{DispatchHook, KhiveRuntime, Namespace, PackRuntime, VerbRegistryBuilder};
+use khive_runtime::{
+    DispatchHook, KhiveRuntime, Namespace, PackRuntime, VerbRegistry, VerbRegistryBuilder,
+};
 use serde_json::json;
 
 /// Promote `namespace` on `brain` via the production dispatch path.
@@ -32,6 +34,20 @@ async fn promote_namespace(brain: &BrainPack, rt: &KhiveRuntime, namespace: &str
         .expect("brain.profiles must succeed to promote namespace via production path");
 }
 
+/// A successful, empty recall is a real useful hook signal (`RecallMiss`).
+/// KG `create` is intentionally `Irrelevant` to the brain interpreter.
+async fn dispatch_recall_miss(registry: &VerbRegistry, query: &str) {
+    let hits = registry
+        .dispatch("memory.recall", json!({ "query": query, "limit": 1 }))
+        .await
+        .expect("empty memory.recall must succeed");
+    assert_eq!(
+        hits.as_array().map(Vec::len),
+        Some(0),
+        "expected no recall hits"
+    );
+}
+
 /// Cold-path regression: the hook must update brain state even when no namespace
 /// has been pre-activated.  Before the fix, `on_dispatch` returned early whenever
 /// `active_namespace != event.namespace`, silently dropping the first (and all
@@ -52,22 +68,13 @@ async fn dispatch_hook_fires_on_cold_namespace_no_prior_activation() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
     let hook: Arc<dyn DispatchHook> = brain.clone();
     builder.with_dispatch_hook(hook);
     let registry = builder.build().expect("registry builds");
 
-    // Fire a real verb with the default "local" namespace.
-    registry
-        .dispatch(
-            "create",
-            json!({
-                "kind": "entity",
-                "name": "ColdHookProbe",
-                "entity_kind": "concept"
-            }),
-        )
-        .await
-        .expect("create entity must succeed");
+    // Fire a real useful verb with the default "local" namespace.
+    dispatch_recall_miss(&registry, "cold hook no matching memory").await;
 
     // Promote via the production dispatch path (acquires gate, runs ensure_loaded,
     // drains the pending queue).
@@ -104,6 +111,7 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
         let ns_owned = ns.to_string();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt2));
+        builder.register(MemoryPack::new(rt.clone()));
         builder.with_default_namespace(ns_owned);
         let hook: Arc<dyn DispatchHook> = brain2;
         builder.with_dispatch_hook(hook);
@@ -113,25 +121,13 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
     let reg_alpha = build_registry("ns-alpha");
     let reg_beta = build_registry("ns-beta");
 
-    // 2 dispatches to ns-alpha.
+    // 2 useful dispatches to ns-alpha.
     for i in 0..2u32 {
-        reg_alpha
-            .dispatch(
-                "create",
-                json!({"kind":"entity","name":format!("AlphaE{i}"),"entity_kind":"concept"}),
-            )
-            .await
-            .expect("alpha dispatch");
+        dispatch_recall_miss(&reg_alpha, &format!("alpha cold hook miss {i}")).await;
     }
-    // 3 dispatches to ns-beta.
+    // 3 useful dispatches to ns-beta.
     for i in 0..3u32 {
-        reg_beta
-            .dispatch(
-                "create",
-                json!({"kind":"entity","name":format!("BetaE{i}"),"entity_kind":"concept"}),
-            )
-            .await
-            .expect("beta dispatch");
+        dispatch_recall_miss(&reg_beta, &format!("beta cold hook miss {i}")).await;
     }
 
     // Promote ns-alpha via the production dispatch path.
@@ -202,7 +198,7 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
 ///   3. Construct brain_b = BrainPack::new(rt.clone()), a fresh instance over
 ///      the same runtime/DB with empty in-memory state.  brain_a is no longer
 ///      used; its in-memory state is not accessible to brain_b.
-///   4. Fire one KG hook signal through brain_b for the "local" namespace.
+///   4. Fire one empty memory-recall hook signal through brain_b for "local".
 ///      Because brain_b has never loaded "local", route_signal enqueues it in
 ///      pending_hook_signals (true cold pending path).
 ///   5. Promote "local" in brain_b via the production dispatch path
@@ -289,23 +285,18 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     drop(brain_a);
     let brain_b = Arc::new(BrainPack::new(rt.clone()));
 
-    // --- Step 4: fire one KG hook signal through brain_b ---
+    // --- Step 4: fire one useful memory hook signal through brain_b ---
     // brain_b has never seen "local"; route_signal must enqueue the signal in
     // pending_hook_signals (cold pending path, not the saved_states path).
     let mut hook_builder = VerbRegistryBuilder::new();
     hook_builder.register(KgPack::new(rt.clone()));
+    hook_builder.register(MemoryPack::new(rt.clone()));
     hook_builder.with_default_namespace("local".to_string());
     let hook_arc: Arc<dyn DispatchHook> = brain_b.clone();
     hook_builder.with_dispatch_hook(hook_arc);
     let hook_registry = hook_builder.build().expect("hook registry for brain_b");
 
-    hook_registry
-        .dispatch(
-            "create",
-            json!({"kind":"entity","name":"ColdReplayProbe","entity_kind":"concept"}),
-        )
-        .await
-        .expect("kg dispatch through brain_b hook must succeed");
+    dispatch_recall_miss(&hook_registry, "cold replay no matching memory").await;
 
     // --- Step 5: promote "local" in brain_b via the production dispatch path ---
     // ensure_loaded must:
