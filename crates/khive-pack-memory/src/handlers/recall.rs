@@ -39,6 +39,15 @@ use super::common::{
 /// number of superseding edges.
 const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
 
+fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (true, true) => std::cmp::Ordering::Equal,
+        (false, false) => right.total_cmp(&left),
+    }
+}
+
 fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, RuntimeError> {
     if scoring_cfg.default_token_budget == 0 {
         return Err(RuntimeError::InvalidInput(
@@ -753,6 +762,11 @@ impl MemoryPack {
                 rank_score
             };
             let final_score = pre_entity_term_score * entity_term;
+            let final_score = if final_score.is_finite() {
+                final_score
+            } else {
+                0.0
+            };
 
             let raw_score_opt = raw_vec_scores.get(&id).copied();
             let absolute_relevance = raw_score_opt.unwrap_or(final_score).clamp(0.0, 1.0);
@@ -786,6 +800,11 @@ impl MemoryPack {
         }
 
         if scoring_cfg.mmr_penalty > 0.0 && scoring_cfg.mmr_prefix_len > 0 {
+            // Choose the duplicate keeper from the full composite score, not
+            // the fused retrieval order that populated `ranked`.
+            ranked.sort_by(|a, b| {
+                compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
+            });
             let prefix_len = scoring_cfg.mmr_prefix_len;
             let prefixes: Vec<String> = ranked
                 .iter()
@@ -884,10 +903,7 @@ impl MemoryPack {
         }
 
         ranked.sort_by(|a, b| {
-            b.rank_score
-                .partial_cmp(&a.rank_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.id.cmp(&b.id))
+            compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
         });
         ranked.truncate(limit);
 
@@ -1356,6 +1372,23 @@ mod tests {
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[test]
+    fn rank_sort_keeps_nan_last_and_breaks_equal_scores_by_id() {
+        let mut scores = [
+            (f32::NAN, "nan-b"),
+            (0.5, "mid-b"),
+            (0.75, "high"),
+            (f32::NAN, "nan-a"),
+            (0.5, "mid-a"),
+            (-0.25, "low"),
+        ];
+        scores.sort_by(|a, b| super::compare_rank_scores_desc(a.0, b.0).then(a.1.cmp(b.1)));
+        assert_eq!(
+            scores.map(|(_, id)| id),
+            ["high", "mid-a", "mid-b", "low", "nan-a", "nan-b"]
+        );
+    }
 
     /// Keeps a file-backed test runtime alive before removing its database directory.
     /// Fields are declared in drop order: the runtime closes before the guard cleans up.

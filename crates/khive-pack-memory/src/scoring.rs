@@ -495,7 +495,8 @@ pub struct ScoringConfig {
 
     // ── MMR diversity penalty ──────────────────────────────────────────────
     /// Score penalty applied to results whose first `mmr_prefix_len` characters
-    /// match an earlier result. Default: 0.1.
+    /// match a higher-ranked result in pre-penalty composite-score order.
+    /// Equal scores use the result ID as the keeper tie-break. Default: 0.1.
     pub mmr_penalty: f32,
     /// Character prefix length used for MMR duplicate detection. Default: 100.
     pub mmr_prefix_len: usize,
@@ -775,7 +776,7 @@ pub struct ScoreInput<'a> {
 ///   `score = w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × salience)`
 ///
 /// Then each `ScoreAdjustment` in `config.adjustments` is evaluated and applied in order.
-/// Result is clamped to `[0, 1]`.
+/// Non-finite results fall to zero; finite results are clamped to `[0, 1]`.
 pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     let w = &config.weights;
     let semantic_base = w.relevance * input.relevance_score;
@@ -804,6 +805,11 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
         score = adj.apply(score, &ctx);
     }
 
+    // Individually finite adjustments can overflow before a later operation
+    // (for example, +Inf * 0) produces NaN. Keep the rank score numeric.
+    if !score.is_finite() {
+        return 0.0;
+    }
     score.clamp(0.0, 1.0)
 }
 
@@ -941,6 +947,44 @@ mod tests {
             &config,
         );
         assert!((0.0..=1.0).contains(&score), "score {score} out of [0,1]");
+    }
+
+    #[test]
+    fn calculate_score_floors_nonfinite_adjustment_chain() {
+        let episodic = AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        };
+        let config = ScoringConfig {
+            adjustments: vec![
+                ScoreAdjustment {
+                    condition: episodic.clone(),
+                    operation: AdjustmentOp::Add { value: 3.0e38 },
+                },
+                ScoreAdjustment {
+                    condition: episodic.clone(),
+                    operation: AdjustmentOp::Add { value: 3.0e38 },
+                },
+                ScoreAdjustment {
+                    condition: episodic,
+                    operation: AdjustmentOp::Multiply { factor: 0.0 },
+                },
+            ],
+            ..ScoringConfig::default()
+        };
+        let score = calculate_score(
+            &ScoreInput {
+                salience: 0.8,
+                memory_type_str: "episodic",
+                content: "overflow adjustment chain",
+                created_at_millis: 0,
+                decay_factor: 0.01,
+                now_millis: 1_000,
+                relevance_score: 0.8,
+                entity_names: &[],
+            },
+            &config,
+        );
+        assert_eq!(score, 0.0, "non-finite composite must rank at the floor");
     }
 
     #[test]
