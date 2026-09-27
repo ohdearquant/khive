@@ -1226,8 +1226,8 @@ impl VamanaIndex {
             // commit record carries a codes_hash: a missing or altered codes segment
             // must never reach load_v2_fast's mmap parse, which trusts its header.
             if let Some(expected) = commit.codes_hash {
-                let codes_ok = fs::read(path.join("codes.bin"))
-                    .map(|d| *blake3::hash(&d).as_bytes() == expected)
+                let codes_ok = hash_file_mmap(&path.join("codes.bin"))
+                    .map(|hash| hash == expected)
                     .unwrap_or(false);
                 if !codes_ok {
                     let config = VamanaConfig {
@@ -1339,8 +1339,7 @@ impl VamanaIndex {
             ));
         }
         if let Some(expected) = commit.codes_hash {
-            let codes_data = fs::read(path.join("codes.bin"))?;
-            if *blake3::hash(&codes_data).as_bytes() != expected {
+            if hash_file_mmap(&path.join("codes.bin"))? != expected {
                 return Err(VamanaError::invalid_format(
                     "v2 codes segment checksum mismatch".into(),
                 ));
@@ -3733,6 +3732,19 @@ fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
     f.write_all(bytes)?;
     f.sync_all()?;
     Ok(())
+}
+
+#[cfg(feature = "mmap")]
+fn hash_file_mmap(path: &Path) -> Result<[u8; 32]> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Ok(*blake3::hash(&[]).as_bytes());
+    }
+
+    // SAFETY: this is a read-only mapping under the caller's publication lock.
+    // A live segment must not be mutated or truncated, as on the load path.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    Ok(*blake3::hash(mmap.as_ref()).as_bytes())
 }
 
 #[cfg(feature = "mmap")]
