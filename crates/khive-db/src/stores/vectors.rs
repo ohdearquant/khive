@@ -850,12 +850,6 @@ fn orphan_sweep_dml(
                      UNION ALL \
                      SELECT id FROM knowledge_atoms WHERE deleted_at IS NULL";
 
-    let orphan_pred = format!(
-        "subject_id NOT IN ({live}) AND {f}",
-        live = live_subq,
-        f = filter_pred,
-    );
-
     // 1. Scanned: rows matching the caller's filters (before orphan check).
     let scan_sql = format!(
         "SELECT COUNT(*) FROM {t} WHERE {f}",
@@ -867,6 +861,21 @@ fn orphan_sweep_dml(
         rusqlite::params![ns_json, kind_json, allow_json],
         |row| row.get(0),
     )?;
+
+    // Snapshot the live registry once for this sweep. Each bounded delete
+    // batch consults this temp table instead of rescanning all three source
+    // tables. The caller's transaction owns the snapshot and any rollback.
+    conn.execute_batch("CREATE TEMP TABLE khive_orphan_sweep_live_ids(id TEXT)")?;
+    conn.execute_batch(&format!(
+        "INSERT INTO temp.khive_orphan_sweep_live_ids(id) {live_subq}"
+    ))?;
+    conn.execute_batch(
+        "CREATE INDEX temp.khive_orphan_sweep_live_ids_idx \
+         ON khive_orphan_sweep_live_ids(id)",
+    )?;
+    let orphan_pred = format!(
+        "subject_id NOT IN (SELECT id FROM temp.khive_orphan_sweep_live_ids) AND {filter_pred}"
+    );
 
     // 2. Would-delete: orphaned rows among the scanned set.
     let count_sql = format!(
@@ -938,6 +947,8 @@ fn orphan_sweep_dml(
         total
     };
 
+    conn.execute_batch("DROP TABLE temp.khive_orphan_sweep_live_ids")?;
+
     Ok(OrphanSweepResult {
         scanned: scanned as u64,
         would_delete: would_delete as u64,
@@ -945,6 +956,10 @@ fn orphan_sweep_dml(
         max_delete_hit,
     })
 }
+
+#[cfg(all(test, feature = "vectors"))]
+#[path = "orphan_sweep_dml_tests.rs"]
+mod orphan_sweep_dml_tests;
 
 #[async_trait]
 impl VectorStore for SqliteVecStore {
@@ -4158,6 +4173,16 @@ mod orphan_sweep_tests {
             .expect("query remaining vectors")
             .collect::<Result<_, _>>()
             .expect("read remaining vectors");
+        let log_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM ann_write_log \
+                 WHERE op = 'delete' AND namespace = 'ns:batches' \
+                   AND embedding_model = 'sw_batches' AND kind = 'entity' AND field = 'body'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count delete logs");
+        assert_eq!(log_rows, result.deleted as i64, "one log row per deletion");
         assert_eq!(logged.len(), 403, "every deleted vector must have one log");
         assert_eq!(remaining.len(), 2);
         assert!(logged.is_disjoint(&remaining));
