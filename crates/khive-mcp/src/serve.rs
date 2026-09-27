@@ -6416,6 +6416,22 @@ id = "lambda:project-actor"
             .dispatch("stats", serde_json::json!({}))
             .await
             .expect("kg.stats dispatch succeeds");
+        let after_irrelevant = multi
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch after irrelevant stats");
+        assert_eq!(after_irrelevant["balanced_recall"]["total_events"], 0);
+
+        // Search is a relevant BrainSignal even when the corpus is empty.
+        multi
+            .registry
+            .dispatch(
+                "search",
+                serde_json::json!({"kind": "entity", "query": "hook-wiring-regression"}),
+            )
+            .await
+            .expect("kg.search dispatch succeeds");
 
         let state = multi
             .registry
@@ -6425,8 +6441,8 @@ id = "lambda:project-actor"
         let total_events = state["balanced_recall"]["total_events"]
             .as_u64()
             .unwrap_or(0);
-        assert!(
-            total_events > 0,
+        assert_eq!(
+            total_events, 1,
             "multi-backend dispatch hook must update the same BrainPack instance \
              the registry dispatches brain.* verbs to; got snapshot {state:?}"
         );
