@@ -13,12 +13,14 @@ async fn pass(runtime: &KhiveRuntime, registry: &ChannelRegistry, kind: &str, sl
     } else {
         outbox::OutboxPolicy::Telegram(std::marker::PhantomData)
     };
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Registered { registry, slug },
         policy,
         runtime,
         &khive_runtime::Namespace::local(),
         &tokio_util::sync::CancellationToken::new(),
+        &mut pause_until,
     )
     .await
     .unwrap();

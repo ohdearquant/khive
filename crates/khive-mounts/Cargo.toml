@@ -9,10 +9,10 @@ repository.workspace = true
 description = "Pinned stdio MCP tool sources for the khive verb registry"
 
 [dependencies]
-khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
-khive-db = { version = "0.8.0", path = "../khive-db" }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
+khive-db = { version = "0.9.0", path = "../khive-db" }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,8 +24,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
-khive-gate = { version = "0.8.0", path = "../khive-gate" }
+khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-gate = { version = "0.9.0", path = "../khive-gate" }
 
 [[test]]
 name = "fixture"
