@@ -2275,6 +2275,22 @@ pub(crate) async fn handle_ingest(
         None => Utc::now().to_rfc3339(),
     };
 
+    // Trusted-ingest entry point: comm.ingest is the sole legitimate writer of
+    // transport-owned quarantine disposition and channel provenance (`quarantined`,
+    // `channel_kind`, `channel_slug`), derived above from the inbound transport
+    // itself. Every other write path uses `try_create_note`, which refuses them.
+    // A missing grant is a composition/startup defect (this `CommPack` instance
+    // was never granted the capability), not a caller input error — classified
+    // as `Unconfigured` so it is not confused with a malformed request.
+    // Check before duplicate acknowledgements as well as the trusted write.
+    let capability = channel_ingest_capability.ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "comm pack instance holds no channel-ingest capability grant; refusing to \
+             establish transport-owned message properties"
+                .to_string(),
+        )
+    })?;
+
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
 
@@ -2561,20 +2577,6 @@ pub(crate) async fn handle_ingest(
         }
     }
 
-    // Trusted-ingest entry point: comm.ingest is the sole legitimate writer of
-    // transport-owned quarantine disposition and channel provenance (`quarantined`,
-    // `channel_kind`, `channel_slug`), derived above from the inbound transport
-    // itself. Every other write path uses `try_create_note`, which refuses them.
-    // A missing grant is a composition/startup defect (this `CommPack` instance
-    // was never granted the capability), not a caller input error — classified
-    // as `Unconfigured` so it is not confused with a malformed request.
-    let capability = channel_ingest_capability.ok_or_else(|| {
-        RuntimeError::Unconfigured(
-            "comm pack instance holds no channel-ingest capability grant; refusing to \
-             establish transport-owned message properties"
-                .to_string(),
-        )
-    })?;
     let note = match runtime
         .try_create_note_as_trusted_ingest(
             capability,
