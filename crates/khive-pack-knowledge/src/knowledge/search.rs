@@ -143,7 +143,7 @@ async fn merge_fresh_tail_for_search(
     };
     match vamana::fresh_tail_leg(runtime, ann, key, query_embedding, k, watermark).await {
         vamana::FreshTailOutcome::Ops(ops) => FreshTailSearchState {
-            hits: vamana::merge_fresh_tail(candidates, query_embedding, ops),
+            hits: vamana::merge_fresh_tail_off_thread(candidates, query_embedding, ops).await,
             source_exhausted,
         },
         vamana::FreshTailOutcome::Replace {
@@ -463,6 +463,15 @@ impl FtsTermBudget {
     fn truncated(&self) -> bool {
         self.truncated.load(Ordering::Relaxed)
     }
+
+    /// Count only terms this pass can actually admit. Decomposed passes share
+    /// the request allowance, so a pass after exhaustion must not acquire a
+    /// larger deadline just because its raw query contains many terms.
+    fn available_for(&self, raw_query: &str) -> usize {
+        fts5_candidate_terms(raw_query)
+            .len()
+            .min(self.remaining.load(Ordering::Relaxed))
+    }
 }
 
 fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
@@ -563,8 +572,26 @@ const PHASE_A_WIDEN_CEILING: usize = 8000;
 /// itself is out of time — only that this one stage's own budget is.
 pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
 
-/// Share of the lexical stage budget the rarity probe may spend before it is
-/// cut off and the terms are used in the order they arrived.
+/// The fixed 2 s stage allowance leaves the same time for one or many
+/// sequential bounded term reads. Give each additional admitted term one
+/// quarter of the base budget, capped at 4x for a pass. The request's outer
+/// read deadline remains authoritative (normally 30 s), and the 32-term
+/// request-wide admission bound still limits actual FTS work.
+const LEXICAL_STAGE_EXTRA_TERM_QUARTERS: usize = 12;
+
+fn lexical_stage_budget_for_terms(
+    base: std::time::Duration,
+    admitted_terms: usize,
+) -> std::time::Duration {
+    let quarters = 4 + admitted_terms
+        .saturating_sub(1)
+        .min(LEXICAL_STAGE_EXTRA_TERM_QUARTERS);
+    base.saturating_mul(quarters as u32) / 4
+}
+
+/// Share of the base lexical budget the rarity probe may spend before it is
+/// cut off and the terms are used in the order they arrived. Multi-term
+/// candidate fetches gain time; the optional ordering probe does not.
 ///
 /// `rarest_fts_terms_first` fetches no candidates. It issues one bounded
 /// `count(*)` per term, sequentially, and its entire product is an ORDERING of
@@ -586,8 +613,8 @@ pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
 const RARITY_PROBE_BUDGET_NUMERATOR: u32 = 1;
 const RARITY_PROBE_BUDGET_DENOMINATOR: u32 = 4;
 
-/// The rarity probe's own deadline, derived from whatever stage budget is in
-/// force (including the test override) rather than from a second constant that
+/// The rarity probe's own deadline, derived from the base budget in force
+/// (including the test override) rather than from a second constant that
 /// could drift away from it.
 fn rarity_probe_budget() -> std::time::Duration {
     lexical_stage_budget() / RARITY_PROBE_BUDGET_DENOMINATOR * RARITY_PROBE_BUDGET_NUMERATOR
@@ -606,6 +633,19 @@ fn rarity_probe_budget() -> std::time::Duration {
 tokio::task_local! {
     static LEXICAL_STAGE_BUDGET_OVERRIDE_MS: u64;
     static PHASE_A_WIDEN_CEILING_OVERRIDE: usize;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    // Expire only sizing after ANN and lexical candidate work has finished.
+    static MEMBER_SIZING_READ_TIMEOUT: ();
+}
+
+#[cfg(test)]
+pub(crate) async fn with_member_sizing_read_timeout<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    MEMBER_SIZING_READ_TIMEOUT.scope((), future).await
 }
 
 fn lexical_stage_budget() -> std::time::Duration {
@@ -1418,7 +1458,10 @@ async fn search_core(
     // deadline governs everything that runs after it (rerank, body-line
     // counts, member sizing) — a lexical-stage timeout no longer spends the
     // whole request.
-    let configured_budget = lexical_stage_budget();
+    let configured_budget = lexical_stage_budget_for_terms(
+        lexical_stage_budget(),
+        ctx.term_budget.available_for(&raw_query),
+    );
     let stage_started = tokio::time::Instant::now();
     let FtsFetchOutcome {
         atoms,
@@ -2258,6 +2301,93 @@ async fn search_eligible_ann_with_refill(
         }
         request_k = next_k;
     }
+}
+
+struct CandidateStageOutcome {
+    ann_hits: Vec<ScoredHit>,
+    ann_availability: Option<AnnAvailability>,
+    hydration_failures: usize,
+    query_embedding: QueryEmbeddingCache,
+}
+
+struct CandidateStageOptions {
+    query_embedding: QueryEmbeddingCache,
+    ann_target: usize,
+    ann_initial_k: usize,
+    operation: &'static str,
+}
+
+async fn run_candidate_stages<F>(
+    ctx: &SearchCtx<'_>,
+    token: &NamespaceToken,
+    ann: &vamana::SharedAnn,
+    raw_query: &str,
+    options: CandidateStageOptions,
+    lexical: F,
+) -> Result<(SearchCoreOutcome, CandidateStageOutcome), RuntimeError>
+where
+    F: std::future::Future<Output = Result<SearchCoreOutcome, RuntimeError>>,
+{
+    vamana::ensure_ann_background(ctx.runtime, token, ann);
+    let ann_stage = async {
+        let mut query_embedding = options.query_embedding;
+        let mut ann_hits = Vec::new();
+        let mut ann_availability = None;
+        let mut hydration_failures = 0;
+
+        if query_embedding.role_specific.is_not_attempted() {
+            query_embedding.role_specific = match khive_storage::await_request_read_phase(
+                options.operation,
+                ctx.runtime.embed_query(raw_query),
+            )
+            .await
+            {
+                Ok(Ok(vector)) => RoleSpecificEmbedding::Vector(vector),
+                Ok(Err(_)) => RoleSpecificEmbedding::Failed,
+                Err(error) if is_timeout(&error) => RoleSpecificEmbedding::Failed,
+                Err(error) => return Err(error.into()),
+            };
+        }
+
+        if let Some(vector) = query_embedding.role_specific.as_deref() {
+            let key = vamana::AnnKey::new(ctx.ns, ctx.runtime.default_embedder_name());
+            match khive_storage::await_request_read_phase(
+                options.operation,
+                search_eligible_ann_with_refill(
+                    ctx,
+                    token,
+                    ann,
+                    &key,
+                    vector,
+                    options.ann_target,
+                    options.ann_initial_k,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(state)) => {
+                    ann_hits = state.hits;
+                    ann_availability = Some(state.availability);
+                    hydration_failures = state.hydration_failures;
+                }
+                Ok(Err(error)) if is_read_timeout(&error) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(error) if is_timeout(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(CandidateStageOutcome {
+            ann_hits,
+            ann_availability,
+            hydration_failures,
+            query_embedding,
+        })
+    };
+
+    let (ann_result, lexical_result) = tokio::join!(ann_stage, lexical);
+    let ann_result = ann_result?;
+    Ok((lexical_result?, ann_result))
 }
 
 // ─── compose helpers ──────────────────────────────────────────────────────────
@@ -3222,75 +3352,39 @@ impl KnowledgeHandlers {
             term_budget: &term_budget,
         };
 
-        // Trigger background warm — never block search on the ANN rebuild.
-        vamana::ensure_ann_background(runtime, token, ann);
-
-        // Fetch ANN candidates BEFORE the lexical stage. The lexical fetch is
-        // now bounded (issue #1930) but still non-zero cost; running ANN
-        // first means a lexical read-deadline timeout afterward cannot
-        // discard ANN results that were already safely computed — the
-        // degraded arm below can then report ANN-backed results instead of
-        // erroring the whole verb. A read timeout in this ANN stage itself
-        // is likewise fail-open, never propagated as a verb-level error.
-        let mut ann_hits: Vec<ScoredHit> = Vec::new();
-        let mut ann_availability: Option<AnnAvailability> = None;
-        let mut hydration_failures = 0usize;
-        // One query vector is shared by ANN retrieval and the optional
-        // embedding rerank. Candidate embeddings remain stage-specific, but
-        // the request never pays to embed the same query twice (#2232).
-        let mut query_embedding = QueryEmbeddingCache::default();
         let ann_k = fetch_limit.max(20);
-        match khive_storage::await_request_read_phase(
-            "knowledge.search",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                query_embedding.role_specific = RoleSpecificEmbedding::Vector(query_emb);
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx,
-                    token,
-                    ann,
-                    &key,
-                    query_embedding
-                        .role_specific
-                        .as_deref()
-                        .expect("query embedding was just populated"),
-                    ann_k,
-                    ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
+        let (
+            SearchCoreOutcome {
+                mut hits,
+                lexical_timeouts,
+                lexical_state,
+            },
+            CandidateStageOutcome {
+                ann_hits,
+                ann_availability,
+                hydration_failures,
+                mut query_embedding,
+            },
+        ) = run_candidate_stages(
+            &ctx,
+            token,
+            ann,
+            &raw_query,
+            CandidateStageOptions {
+                query_embedding: QueryEmbeddingCache::default(),
+                ann_target: ann_k,
+                ann_initial_k: ann_k,
+                operation: "knowledge.search",
+            },
+            async {
+                if do_decompose && non_stop_count >= decompose_threshold {
+                    search_decomposed(&ctx, &raw_query, intersection_bonus).await
+                } else {
+                    search_core(&ctx, &raw_query, LexicalPass::Full).await
                 }
-            }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        let SearchCoreOutcome {
-            mut hits,
-            lexical_timeouts,
-            lexical_state,
-        } = if do_decompose && non_stop_count >= decompose_threshold {
-            search_decomposed(&ctx, &raw_query, intersection_bonus).await?
-        } else {
-            search_core(&ctx, &raw_query, LexicalPass::Full).await?
-        };
+            },
+        )
+        .await?;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -3434,7 +3528,7 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
         ann: &vamana::SharedAnn,
-        mut query_embedding: QueryEmbeddingCache,
+        query_embedding: QueryEmbeddingCache,
     ) -> Result<(Value, QueryEmbeddingCache), RuntimeError> {
         khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
@@ -3471,69 +3565,37 @@ impl KnowledgeHandlers {
             term_budget: &term_budget,
         };
 
-        // Fetch ANN candidates BEFORE the lexical stage — same rationale as
-        // `search`: the lexical fetch is bounded (issue #1930) but still
-        // non-zero cost, so computing ANN first means a lexical read-deadline
-        // timeout afterward cannot discard ANN results already in hand.
-        vamana::ensure_ann_background(runtime, token, ann);
-        let mut ann_hits: Vec<ScoredHit> = Vec::new();
-        let mut ann_availability: Option<AnnAvailability> = None;
-        let mut hydration_failures = 0usize;
         // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
         // limit*3 would return mostly atoms that all get dropped after type filtering.
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        if query_embedding.role_specific.is_not_attempted() {
-            match khive_storage::await_request_read_phase(
-                "knowledge.suggest",
-                runtime.embed_query(&raw_query),
-            )
-            .await
-            {
-                Ok(Ok(query_emb)) => {
-                    query_embedding.role_specific = RoleSpecificEmbedding::Vector(query_emb)
-                }
-                Ok(Err(_)) => query_embedding.role_specific = RoleSpecificEmbedding::Failed,
-                Err(e) if is_timeout(&e) => {
-                    query_embedding.role_specific = RoleSpecificEmbedding::Failed
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if let Some(query_emb) = query_embedding.role_specific.as_deref() {
-            let model = runtime.default_embedder_name();
-            let key = vamana::AnnKey::new(&ns, model);
-            match search_eligible_ann_with_refill(
-                &ctx,
-                token,
-                ann,
-                &key,
-                query_emb,
-                ctx.fetch_limit,
-                ann_k,
-            )
-            .await
-            {
-                Ok(EligibleAnnSearchState {
-                    hits,
-                    availability,
-                    hydration_failures: ann_hydration_failures,
-                }) => {
-                    hydration_failures += ann_hydration_failures;
-                    ann_hits = hits;
-                    ann_availability = Some(availability);
-                }
-                Err(e) if is_read_timeout(&e) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        let SearchCoreOutcome {
-            mut hits,
-            lexical_timeouts,
-            ..
-        } = search_core(&ctx, &raw_query, LexicalPass::Full).await?;
+        let (
+            SearchCoreOutcome {
+                mut hits,
+                lexical_timeouts,
+                ..
+            },
+            CandidateStageOutcome {
+                ann_hits,
+                ann_availability,
+                hydration_failures,
+                mut query_embedding,
+            },
+        ) = run_candidate_stages(
+            &ctx,
+            token,
+            ann,
+            &raw_query,
+            CandidateStageOptions {
+                query_embedding,
+                ann_target: ctx.fetch_limit,
+                ann_initial_k: ann_k,
+                operation: "knowledge.suggest",
+            },
+            search_core(&ctx, &raw_query, LexicalPass::Full),
+        )
+        .await?;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -3579,7 +3641,19 @@ impl KnowledgeHandlers {
             if khive_storage::request_read_is_cancelled() {
                 (HashMap::new(), !domain_ids.is_empty())
             } else {
-                load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
+                #[cfg(test)]
+                let measured = if MEMBER_SIZING_READ_TIMEOUT.try_with(|_| ()).is_ok() {
+                    khive_storage::scope_request_read_deadline(
+                        std::time::Duration::ZERO,
+                        load_domain_member_token_sizes(runtime, &ns, &domain_ids),
+                    )
+                    .await
+                } else {
+                    load_domain_member_token_sizes(runtime, &ns, &domain_ids).await
+                };
+                #[cfg(not(test))]
+                let measured = load_domain_member_token_sizes(runtime, &ns, &domain_ids).await;
+                measured?
             };
         if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
@@ -5389,6 +5463,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lexical_stage_allowance_scales_only_with_admitted_terms_and_is_capped() {
+        let base = lexical_stage_budget();
+        let budget = FtsTermBudget::new();
+        assert_eq!(
+            lexical_stage_budget_for_terms(base, budget.available_for("zzmass")),
+            base,
+        );
+        assert_eq!(
+            lexical_stage_budget_for_terms(base, budget.available_for("zzmass zzlass")),
+            std::time::Duration::from_millis(2_500),
+        );
+        let many = distinct_term_query(FTS_TERM_COUNT_LIMIT * 2);
+        assert_eq!(
+            lexical_stage_budget_for_terms(base, budget.available_for(&many)),
+            std::time::Duration::from_millis(8_000),
+        );
+        budget.admit(fts5_candidate_terms(&many));
+        assert_eq!(budget.available_for("zzmass zzlass"), 0);
+        assert_eq!(lexical_stage_budget_for_terms(base, 0), base);
+    }
+
+    /// A second bounded term read must have time to run after the original
+    /// 2 s single-term allowance has elapsed. The clock moves only after the
+    /// first term's rows are collected, so the old fixed 2 s stage returned a
+    /// partial timeout here even though both local terms have cheap matches.
+    #[tokio::test(start_paused = true)]
+    async fn multi_term_search_keeps_lexical_candidates_after_single_term_budget() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) \
+                      VALUES \
+                      ('92700000-0000-0000-0000-000000000011', 'local', 'zzmass-row', \
+                       'First term', 'zzmass content', '[]', 1, 'reviewed', 0, 0), \
+                      ('92700000-0000-0000-0000-000000000012', 'local', 'zzlass-row', \
+                       'Second term', 'zzlass content', '[]', 1, 'reviewed', 0, 0)"
+                    .into(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed two independently matching terms");
+        drop(writer);
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let response = with_fts_deadline_advance_after_term(
+            1,
+            std::time::Duration::from_millis(2_100),
+            KnowledgeHandlers::search(
+                &runtime,
+                &token,
+                json!({"query": "zzmass zzlass", "rerank": false}),
+                &vamana::new_shared(),
+            ),
+        )
+        .await
+        .expect("multi-term search");
+        assert_eq!(response["candidate_provenance"]["lexical"], "matched");
+        assert_eq!(response["total"], 2);
+    }
+
     /// Companion pair for issue #1930 Amendment 2's phase-A overfetch/widen
     /// behavior. A term whose top bm25/rowid page is entirely status-
     /// ineligible must still surface its eligible rows once widening looks
@@ -6770,9 +6909,8 @@ mod tests {
     }
 
     // ── embed-intent regression ───────────────────────────────────────────────
-    // Guard that the query-embedding call sites in `search`, `suggest`, and
-    // `compose` (ANN retrieval for the first two; the KG-blend gate for the
-    // third) use the query-intent embedding call, not the generic
+    // Guard that the shared ANN candidate runner and the compose KG-blend gate
+    // use the query-intent embedding call, not the generic
     // `runtime.embed(...)`. Uses include_str! so the assertion runs on the
     // actual source bytes, but splits the needle to avoid matching the
     // needle itself in test source.
@@ -6780,12 +6918,13 @@ mod tests {
     fn knowledge_ann_query_paths_use_query_intent_embed() {
         let src = include_str!("search.rs");
         // Build needle at runtime to avoid self-match in include_str.
-        let generic_needle: String = [".embed(", "&raw_query)"].concat();
+        let generic_needle: String = [".embed(", "raw_query)"].concat();
+        let generic_borrowed_needle: String = [".embed(", "&raw_query)"].concat();
         let generic_count = src
             .lines()
             // Skip lines that are part of this test body (contain "concat" or "needle").
             .filter(|l| !l.contains("concat") && !l.contains("needle"))
-            .filter(|l| l.contains(&generic_needle))
+            .filter(|l| l.contains(&generic_needle) || l.contains(&generic_borrowed_needle))
             .count();
         assert_eq!(
             generic_count, 0,
@@ -6799,19 +6938,21 @@ mod tests {
         // `embed_document`) would still pass it, since that mutation never
         // introduces the generic-embed needle either. Count the query-intent
         // call sites directly so a silent removal (or mutation-away) of one
-        // is caught: `search`'s ANN fetch, `suggest`'s ANN fetch, and
-        // `compose`'s KG-blend gate (immediately before its
-        // `rerank_text_items` call) are the only three production call sites.
-        let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
+        // is caught: the shared ANN candidate runner and `compose`'s
+        // KG-blend gate are the only two production call sites.
+        let query_intent_needle: String = [".embed_query(", "raw_query)"].concat();
+        let query_intent_borrowed_needle: String = [".embed_query(", "&raw_query)"].concat();
         let query_intent_count = src
             .lines()
             .filter(|l| !l.contains("concat") && !l.contains("needle"))
-            .filter(|l| l.contains(&query_intent_needle))
+            .filter(|l| {
+                l.contains(&query_intent_needle) || l.contains(&query_intent_borrowed_needle)
+            })
             .count();
         assert_eq!(
-            query_intent_count, 3,
-            "expected exactly 3 {query_intent_needle} call sites \
-             (search ANN + suggest ANN + compose KG-blend gate), found {query_intent_count}"
+            query_intent_count, 2,
+            "expected exactly 2 query-intent call sites \
+             (shared ANN runner + compose KG-blend gate), found {query_intent_count}"
         );
     }
 
@@ -6973,6 +7114,7 @@ mod tests {
     struct RoleAwareRecordingCalls {
         query: Vec<String>,
         generic: Vec<String>,
+        query_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     }
 
     struct RoleAwareRecordingService {
@@ -7003,11 +7145,17 @@ mod tests {
             texts: &[String],
             _model: lattice_embed::EmbeddingModel,
         ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-            self.calls
-                .lock()
-                .expect("recording lock")
-                .query
-                .extend(texts.iter().cloned());
+            let gate = {
+                let mut calls = self.calls.lock().expect("recording lock");
+                calls.query.extend(texts.iter().cloned());
+                calls.query_gate.clone()
+            };
+            if let Some(gate) = gate {
+                gate.acquire()
+                    .await
+                    .expect("query gate remains open")
+                    .forget();
+            }
             if self.fail_query.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(lattice_embed::EmbedError::InferenceFailed(
                     "forced query-embedding failure".into(),
@@ -7088,6 +7236,164 @@ mod tests {
             fail_query: std::sync::Arc::clone(&fail_query),
         });
         (runtime, calls, fail_query)
+    }
+
+    #[tokio::test]
+    async fn search_and_suggest_start_lexical_reads_while_query_embedding_waits() {
+        for suggest in [false, true] {
+            let (runtime, calls, _) = rt_with_role_aware_recording_embedder();
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms \
+                          (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) \
+                          VALUES ('94000000-0000-0000-0000-000000000238', 'local', \
+                                  'candidate-overlap', 'Candidate Overlap', \
+                                  'graph traversal caching strategies distributed knowledge retrieval', \
+                                  '[]', 1, 'reviewed', 0, 0)"
+                        .into(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed lexical hit");
+            drop(writer);
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            calls.lock().expect("recording lock").query_gate = Some(Arc::clone(&gate));
+            let token = runtime.authorize(Namespace::local()).expect("token");
+            let ann = vamana::new_shared_for_role(false);
+            let probes = Arc::new(Mutex::new(Vec::new()));
+            let query = "graph traversal caching strategies distributed knowledge retrieval";
+            let future = TERM_PROBES.scope(probes.clone(), async {
+                if suggest {
+                    KnowledgeHandlers::suggest(&runtime, &token, json!({"query": query}), &ann)
+                        .await
+                } else {
+                    KnowledgeHandlers::search(
+                        &runtime,
+                        &token,
+                        json!({"query": query, "rerank": false}),
+                        &ann,
+                    )
+                    .await
+                }
+            });
+            tokio::pin!(future);
+            let overlapped = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let embedding_started = !calls.lock().expect("recording lock").query.is_empty();
+                    let lexical_started = !probes.lock().expect("term probes").is_empty();
+                    if embedding_started && lexical_started {
+                        break;
+                    }
+                    tokio::select! {
+                        result = &mut future => panic!("candidate stages finished before gate release: {result:?}"),
+                        () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
+            })
+            .await;
+            gate.add_permits(1);
+            assert!(
+                overlapped.is_ok(),
+                "lexical read waited for embedding: suggest={suggest}"
+            );
+            let response = future
+                .await
+                .expect("candidate stages complete after gate release");
+            if !suggest {
+                assert_eq!(response["results"][0]["slug"], "candidate-overlap");
+                assert_eq!(response["candidate_provenance"]["lexical"], "matched");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_embedding_and_timed_out_lexical_stage_return_degraded_search() {
+        let (runtime, _, fail_query) = rt_with_role_aware_recording_embedder();
+        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        let ann = vamana::new_shared_for_role(false);
+        let response = crate::knowledge::lexical_timeout::tests::with_timeout(
+            vec![LexicalPhase::ReaderOpen],
+            std::time::Duration::from_millis(1),
+            KnowledgeHandlers::search(
+                &runtime,
+                &token,
+                json!({"query": "graph traversal caching strategies", "rerank": false}),
+                &ann,
+            ),
+        )
+        .await
+        .expect("both recoverable candidate failures remain a response");
+        assert_eq!(response["total"], 0);
+        assert_eq!(response["candidate_provenance"]["lexical"], "timed_out");
+        assert_eq!(response["degraded"]["lexical_timeout"], true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_ann_candidate_survives_lexical_stage_timeout() {
+        let (runtime, _, _) = rt_with_role_aware_recording_embedder();
+        let runtime = runtime.with_ann_fresh_tail_enabled(false);
+        let atom_id = Uuid::from_u128(0x94000000000000000000000000000239);
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) \
+                      VALUES (?1, 'local', 'ann-timeout-survivor', 'ANN Timeout Survivor', \
+                              'dense candidate outside this lexical query', '[]', 1, 'reviewed', 0, 0)"
+                    .into(),
+                params: vec![SqlValue::Text(atom_id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("seed ANN hydration row");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES ('knowledge:knowledge.atom', 'local', ?1, 0)"
+                    .into(),
+                params: vec![SqlValue::Text(ROLE_RECORDING_MODEL_KEY.into())],
+                label: None,
+            })
+            .await
+            .expect("register loaded ANN consumer");
+        drop(writer);
+
+        let ann = vamana::new_shared_for_role(false);
+        let key = vamana::AnnKey::new("local", ROLE_RECORDING_MODEL_KEY);
+        let bridge = vamana::AnnBridge::build(
+            vec![0.25; ROLE_RECORDING_DIM],
+            ROLE_RECORDING_DIM,
+            vec![atom_id],
+        )
+        .expect("build loaded bridge");
+        vamana::install_if_fresher(&ann, &key, bridge).await;
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        let response = crate::knowledge::lexical_timeout::tests::with_timeout(
+            vec![LexicalPhase::ReaderOpen],
+            std::time::Duration::from_millis(1),
+            KnowledgeHandlers::search(
+                &runtime,
+                &token,
+                json!({"query": "graph traversal caching strategies", "rerank": false}),
+                &ann,
+            ),
+        )
+        .await
+        .expect("lexical timeout retains completed ANN result");
+        assert_eq!(response["total"], 1);
+        assert_eq!(response["results"][0]["slug"], "ann-timeout-survivor");
+        assert_eq!(
+            response["results"][0]["score_provenance"]["sources"],
+            json!(["ann"])
+        );
+        assert_eq!(response["candidate_provenance"]["fallback"], "ann");
+        assert_eq!(response["degraded"]["lexical_timeout"], true);
     }
 
     fn build_role_recording_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {

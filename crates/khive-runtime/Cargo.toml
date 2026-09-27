@@ -17,15 +17,15 @@ fault-injection = []
 test-internals = ["khive-db/test-support"]
 
 [dependencies]
-khive-channel = { version = "0.8.0", path = "../khive-channel" }
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde", "blake3"] }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
-khive-score = { version = "0.8.0", path = "../khive-score" }
-khive-fusion = { version = "0.8.0", path = "../khive-fusion" }
-khive-fold = { version = "0.8.0", path = "../khive-fold" }
-khive-db = { version = "0.8.0", path = "../khive-db", features = ["vectors"] }
-khive-query = { version = "0.8.0", path = "../khive-query" }
-khive-gate = { version = "0.8.0", path = "../khive-gate" }
+khive-channel = { version = "0.9.0", path = "../khive-channel" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde", "blake3"] }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-score = { version = "0.9.0", path = "../khive-score" }
+khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
+khive-fold = { version = "0.9.0", path = "../khive-fold" }
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["vectors"] }
+khive-query = { version = "0.9.0", path = "../khive-query" }
+khive-gate = { version = "0.9.0", path = "../khive-gate" }
 inventory = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -49,8 +49,8 @@ sha2 = { workspace = true }
 ring = "0.17.14"
 
 [dev-dependencies]
-khive-db = { version = "0.8.0", path = "../khive-db", features = ["test-support"] }
-khive-request = { version = "0.8.0", path = "../khive-request" }
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }
+khive-request = { version = "0.9.0", path = "../khive-request" }
 # Self dev-dependency: requests this crate's own `fault-injection` and
 # `test-internals` features for its `tests/` integration binaries. Those link
 # the lib as an external crate, so items gated on `any(test, feature =
@@ -60,8 +60,8 @@ khive-request = { version = "0.8.0", path = "../khive-request" }
 # tests (e.g. `tests/adr133_audit_batch.rs`,
 # `tests/read_verb_admission_exhaustion.rs`) with no extra `--features` flag.
 khive-runtime = { path = ".", features = ["fault-injection", "test-internals"] }
-khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
-khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
+khive-gate-rego = { version = "0.9.0", path = "../khive-gate-rego" }
+khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

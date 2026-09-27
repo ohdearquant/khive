@@ -1887,6 +1887,13 @@ fn check_entropy_candidate<'a>(
         return None;
     }
 
+    // A fixed-width SHA-256 digest has an independent, explicit source label.
+    // Defer its admission until after bridge reconstruction: a digest-shaped
+    // fragment must still be checked as part of a larger candidate.
+    let labeled_sha256_digest = near_trigger
+        && candidate.inline_trigger.is_none()
+        && is_labeled_sha256_digest(text, token_offset, token);
+
     // VCS-marker exemption is a flag over the hex-credential-shape checks only,
     // never an early skip of fragment reconstruction below (see doc).
     if is_vcs_marker_before_hex(text, candidate.member)
@@ -1934,6 +1941,7 @@ fn check_entropy_candidate<'a>(
     // 4.0 bits/char, below ENTROPY_THRESHOLD 4.5); flag credential-shaped hex directly.
     if !vcs_reference_exempt
         && near_trigger
+        && !labeled_sha256_digest
         && is_pure_hex(token)
         && HEX_CREDENTIAL_LENGTHS.contains(&token.len())
     {
@@ -1952,6 +1960,7 @@ fn check_entropy_candidate<'a>(
                 continue;
             }
             if !vcs_reference_exempt
+                && !labeled_sha256_digest
                 && is_pure_hex(run)
                 && HEX_CREDENTIAL_LENGTHS.contains(&run.len())
             {
@@ -1965,7 +1974,7 @@ fn check_entropy_candidate<'a>(
         // Step 5 (#1062): concatenate consecutive pure-hex runs (dropping
         // separators) and re-check against HEX_CREDENTIAL_LENGTHS — catches a
         // hex payload split into multiple sub-floor runs. See doc.
-        if !vcs_reference_exempt {
+        if !vcs_reference_exempt && !labeled_sha256_digest {
             if let Some(candidate) = normalized_hex_credential_span(token) {
                 return Some((candidate, "hex-credential-token", trigger));
             }
@@ -2013,6 +2022,18 @@ fn check_entropy_candidate<'a>(
         {
             return None;
         }
+
+        // Step 8. These shapes are references in technical prose. The prefix, per-run,
+        // normalized-hex, and bridge detectors above retain priority over
+        // them; an opaque value inside any of those carriers still refuses.
+        if labeled_sha256_digest
+            || is_prose_code_reference(candidate.member, token)
+            || is_environment_name(token)
+            || is_latex_prose_macro(token)
+            || is_aws_resource_name(token)
+        {
+            return None;
+        }
     }
 
     // Canonical repository links and href commit targets are source
@@ -2023,7 +2044,7 @@ fn check_entropy_candidate<'a>(
         return None;
     }
 
-    // Step 8: structured-identifier exemption, off-trigger only. Must run after the
+    // Step 9: structured-identifier exemption, off-trigger only. Must run after the
     // UUID/hex checks and before the entropy computation (an identifier can exceed
     // ENTROPY_THRESHOLD on Shannon entropy alone).
     if !near_trigger && is_structured_identifier(token) {
@@ -2608,6 +2629,141 @@ fn is_latex_fragment_without_credential_run(token: &str) -> bool {
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|run| run.len() >= MIN_ENTROPY_LEN)
         .any(|run| shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD)
+}
+
+/// A SHA-256 value is admitted only with a nearby checksum designation, not
+/// with a credential field that merely happens to describe its encoding.
+fn is_labeled_sha256_digest(text: &str, token_offset: usize, token: &str) -> bool {
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let before = text[..token_offset]
+        .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ':' | '='));
+    let marker = ["sha256 key digest", "sha256 digest", "sha256"]
+        .into_iter()
+        .find(|marker| {
+            before
+                .get(before.len().saturating_sub(marker.len())..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(marker))
+        });
+    let Some(marker) = marker else {
+        return false;
+    };
+    let marker_start = before.len() - marker.len();
+    if marker_start > 0
+        && text[..marker_start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return false;
+    }
+    !has_clause_credential_label_with_inline(text, marker_start, false, ClauseValueKind::FilePath)
+}
+
+/// Inline Rust call references have syntax that an opaque credential does not:
+/// backticks, a qualified symbol, and an empty argument list. Arguments are
+/// excluded because their values would otherwise become part of the exemption.
+fn is_prose_code_reference(member: &str, token: &str) -> bool {
+    let Some(code) = member.strip_prefix('`').and_then(|s| s.strip_suffix('`')) else {
+        return false;
+    };
+    if code != token || !code.ends_with("()") {
+        return false;
+    }
+    let Some((owner, method)) = code[..code.len() - 2].split_once("::") else {
+        return false;
+    };
+    owner
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic())
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && method
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'<' | b'>'))
+        && !method.contains("::")
+}
+
+/// Uppercase environment references are names, not values, when their final
+/// component names a conventional non-secret field. The run checks above
+/// still refuse any credential-shaped component inside the name.
+fn is_environment_name(token: &str) -> bool {
+    let mut components = token.split('_');
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if first.is_empty() || !first.bytes().all(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    let mut count = 0;
+    let mut last = "";
+    for part in components {
+        if part.is_empty()
+            || part.len() > 16
+            || !part
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return false;
+        }
+        count += 1;
+        last = part;
+    }
+    count >= 3 && matches!(last, "PATH" | "FILE" | "NAME" | "TTL")
+}
+
+/// Closed, familiar math commands keep this exemption on notation rather
+/// than arbitrary backslash-prefixed strings.
+fn is_latex_prose_macro(token: &str) -> bool {
+    [
+        "\\mathsf{",
+        "\\mathbf{",
+        "\\mathcal{",
+        "\\mathrm{",
+        "\\operatorname{",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
+        && is_latex_fragment_without_credential_run(token)
+}
+
+/// Recognize two unambiguous AWS resource address forms. The resource path
+/// is restricted to short name segments; an embedded long credential run is
+/// refused before this predicate is reached.
+fn is_aws_resource_name(token: &str) -> bool {
+    let mut parts = token.splitn(6, ':');
+    let (Some("arn"), Some("aws"), Some(service), Some(region), Some(account), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    let valid_resource = !resource.is_empty()
+        && resource.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment.len() <= 24
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        });
+    valid_resource
+        && ((service == "s3" && region.is_empty() && account.is_empty())
+            || (service == "iam"
+                && region.is_empty()
+                && account.len() == 12
+                && account.bytes().all(|b| b.is_ascii_digit())
+                && (resource.starts_with("role/") || resource.starts_with("policy/"))))
 }
 
 fn is_line_location_suffix(suffix: &str) -> bool {

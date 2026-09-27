@@ -215,27 +215,29 @@ pub(crate) async fn list_policies(
     actor: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PolicyRow>, RuntimeError> {
+    let mut sql = format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1");
+    let mut params = vec![SqlValue::Text(ns.to_string())];
+    if let Some(actor) = actor {
+        params.push(SqlValue::Text(actor.to_string()));
+        sql.push_str(&format!(
+            " AND {}",
+            pattern_match_sql("actor", params.len())
+        ));
+    }
+    params.push(SqlValue::Integer(i64::from(limit)));
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT ?{}",
+        params.len()
+    ));
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: format!(
-                "SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 \
-                 ORDER BY created_at DESC LIMIT ?2"
-            ),
-            params: vec![
-                SqlValue::Text(ns.to_string()),
-                SqlValue::Integer(i64::from(limit)),
-            ],
+            sql,
+            params,
             label: Some("tool_policy_list".into()),
         })
         .await?;
-    Ok(rows
-        .iter()
-        .map(PolicyRow::from_row)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|p| actor.is_none_or(|a| pattern_matches(&p.actor, a) || p.actor == a))
-        .collect())
+    rows.iter().map(PolicyRow::from_row).collect()
 }
 
 /// SQL for `pattern_matches(<col>, ?<param>)`: the pattern stored in `col`
@@ -519,6 +521,10 @@ pub(crate) async fn list_grants(
         params.push(SqlValue::Text(tool.to_string()));
         sql.push_str(&format!(" AND tool = ?{}", params.len()));
     }
+    if let Some(actor) = actor {
+        params.push(SqlValue::Text(actor.to_string()));
+        sql.push_str(&format!(" AND actor = ?{}", params.len()));
+    }
     params.push(SqlValue::Integer(i64::from(limit)));
     sql.push_str(&format!(
         " ORDER BY requested_at DESC, id ASC LIMIT ?{}",
@@ -532,11 +538,7 @@ pub(crate) async fn list_grants(
             label: Some("tool_grants_list".into()),
         })
         .await?;
-    Ok(rows
-        .iter()
-        .filter_map(GrantRow::from_row)
-        .filter(|g| actor.is_none_or(|a| g.actor == a))
-        .collect())
+    Ok(rows.iter().filter_map(GrantRow::from_row).collect())
 }
 
 pub(crate) async fn get_grant(
@@ -544,6 +546,11 @@ pub(crate) async fn get_grant(
     ns: &str,
     id: &str,
 ) -> Result<GrantRow, RuntimeError> {
+    if id.len() < 8 || !id.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
+        return Err(RuntimeError::InvalidInput(
+            "tool grant id must be a UUID or a prefix of at least 8 hex/dash characters".into(),
+        ));
+    }
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
