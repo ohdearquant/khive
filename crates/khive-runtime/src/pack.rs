@@ -1793,6 +1793,12 @@ impl std::error::Error for PackSchemaCollisionError {}
 /// Handles SQL trivia, SQLite identifier quoting, optional TEMP/VIRTUAL and a
 /// `main.` qualifier. Index and other non-table DDL return no table names.
 fn extract_table_names(stmt: &str) -> Vec<String> {
+    enum SqlToken {
+        Bare(String),
+        Quoted(String),
+        Punctuation(char),
+    }
+
     let mut tokens = Vec::new();
     let mut chars = stmt.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1834,29 +1840,30 @@ fn extract_table_names(stmt: &str) -> Vec<String> {
                     token.push(next);
                 }
             }
-            tokens.push(token);
+            tokens.push(SqlToken::Quoted(token));
             continue;
         }
         if matches!(ch, '.' | '(' | ';') {
-            tokens.push(ch.to_string());
+            tokens.push(SqlToken::Punctuation(ch));
             continue;
         }
         let mut token = ch.to_string();
         while let Some(next) = chars.peek().copied() {
-            if next.is_whitespace() || matches!(next, '.' | '(' | ';' | '"' | '`' | '[') {
+            let begins_comment = (next == '-' && chars.clone().nth(1) == Some('-'))
+                || (next == '/' && chars.clone().nth(1) == Some('*'));
+            if next.is_whitespace()
+                || matches!(next, '.' | '(' | ';' | '"' | '`' | '[')
+                || begins_comment
+            {
                 break;
             }
             token.push(next);
             chars.next();
         }
-        tokens.push(token);
+        tokens.push(SqlToken::Bare(token));
     }
 
-    let keyword = |index: usize, word: &str| {
-        tokens
-            .get(index)
-            .is_some_and(|token| token.eq_ignore_ascii_case(word))
-    };
+    let keyword = |index: usize, word: &str| matches!(tokens.get(index), Some(SqlToken::Bare(token)) if token.eq_ignore_ascii_case(word));
     if !keyword(0, "CREATE") {
         return Vec::new();
     }
@@ -1874,11 +1881,15 @@ fn extract_table_names(stmt: &str) -> Vec<String> {
     if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
         index += 3;
     }
-    if keyword(index, "main") && tokens.get(index + 1).is_some_and(|t| t == ".") {
+    let main_qualifier = matches!(
+        tokens.get(index),
+        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if name.eq_ignore_ascii_case("main")
+    );
+    if main_qualifier && matches!(tokens.get(index + 1), Some(SqlToken::Punctuation('.'))) {
         index += 2;
     }
     match tokens.get(index) {
-        Some(name) if !name.is_empty() && !matches!(name.as_str(), "." | "(" | ";") => {
+        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if !name.is_empty() => {
             vec![name.to_ascii_lowercase()]
         }
         _ => Vec::new(),
@@ -16083,11 +16094,14 @@ mod help_tests {
 
     #[test]
     fn schema_collision_normalizes_sql_identifiers_before_any_ddl() {
-        let spellings: [&'static [&'static str]; 4] = [
+        let spellings: [&'static [&'static str]; 7] = [
             &["CREATE TABLE IF NOT EXISTS \"shared\"(id INTEGER)"],
             &["-- pack table\nCREATE TABLE IF NOT EXISTS shared(id INTEGER)"],
             &["CREATE TABLE IF NOT EXISTS main.shared(id INTEGER)"],
             &["CREATE TEMP TABLE IF NOT EXISTS shared(id INTEGER)"],
+            &["CREATE/**/TABLE IF NOT EXISTS shared(id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS/**/shared(id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS shared/**/(id INTEGER)"],
         ];
         for statements in spellings {
             let backend = khive_db::StorageBackend::memory().expect("memory backend");
@@ -16116,6 +16130,51 @@ mod help_tests {
                 .query_row(
                     "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'shared'",
                     [],
+                    |row| row.get(0),
+                )
+                .expect("schema count");
+            assert_eq!(table_count, 0, "collision must precede all pack DDL");
+        }
+    }
+
+    #[test]
+    fn quoted_punctuation_table_names_cannot_evade_ownership() {
+        let cases: [(&'static str, &'static [&'static str]); 3] = [
+            (".", &[r#"CREATE TABLE IF NOT EXISTS "." (id INTEGER)"#]),
+            ("(", &[r#"CREATE TABLE IF NOT EXISTS "(" (id INTEGER)"#]),
+            (";", &[r#"CREATE TABLE IF NOT EXISTS ";" (id INTEGER)"#]),
+        ];
+        for (table, statements) in cases {
+            // Control: the quoted-punctuation identifier is valid SQLite on its
+            // own, so a refusal below must be an ownership-collision refusal,
+            // not a generic SQL-syntax rejection.
+            let control = khive_db::StorageBackend::memory().expect("control backend");
+            control
+                .apply_pack_ddl_statements(statements)
+                .expect("quoted punctuation is valid SQLite");
+
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            let mut builder = VerbRegistryBuilder::new();
+            for pack_name in ["pack_alpha", "pack_beta"] {
+                builder.register_boxed(Box::new(SchemaPack {
+                    pack_name,
+                    statements,
+                    column_additions: &[],
+                }));
+            }
+            let registry = builder.build().expect("registry builds");
+            let error = registry
+                .apply_schema_plans_with_map(&HashMap::new(), &backend)
+                .expect_err("quoted punctuation must remain an owned table");
+            let message = error.to_string();
+            assert!(message.contains("pack_alpha") && message.contains("pack_beta"));
+            let table_count: i64 = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [table],
                     |row| row.get(0),
                 )
                 .expect("schema count");
