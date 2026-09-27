@@ -39,7 +39,7 @@
 
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
@@ -77,11 +77,17 @@ use crate::daemon::{read_frame, write_frame};
 /// field, silently broadening a query, so both peers must speak version 4.
 pub const EVENTS_PROTOCOL_VERSION: u32 = 4;
 
-/// Default bound on the fire-and-forget append queue, in batches. The loss
-/// window on overflow is this depth times the batch size in flight; the value
-/// is deliberately generous because entries are pointers, not rows.
+/// Default bound on the fire-and-forget append queue, in batches. The byte
+/// bound below also applies, so a large batch cannot multiply this depth
+/// into unbounded retained event memory.
 #[cfg(unix)]
 pub const DEFAULT_APPEND_QUEUE_BATCHES: usize = 4096;
+
+/// Maximum serialized append-request bytes retained by the fire-and-forget
+/// queue and its one in-flight delivery. A single request must also fit the
+/// daemon's per-frame cap; the queue budget covers several such requests.
+#[cfg(unix)]
+pub const DEFAULT_APPEND_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Timeout for one synchronous round-trip (idempotent appends, reads).
 /// Covers the WHOLE attempt — connect, peer verification, write, read —
@@ -152,7 +158,9 @@ const EVENTS_SYMLINK_HOP_BOUND: u32 = 40;
 /// Public (and defined on every platform) because in-tree consumers that
 /// read events through a possibly-split store must size their page requests
 /// under it — a deep read is a `before`-cursor walk at `offset: 0` in pages
-/// of at most this many rows, never one wide page.
+/// of at most this many rows, never one wide page. Even a page under this row
+/// cap can exceed the IPC frame cap; the daemon then returns a non-retryable
+/// `response_frame_size_limit` refusal so the caller can narrow the page.
 pub const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
 
 /// Default events database file, beside the main database file.
@@ -1283,6 +1291,29 @@ async fn serve_events_conn(
                 return;
             }
         };
+        let bytes = if bytes.len() > crate::daemon::MAX_FRAME_BYTES {
+            // A page can obey the row cap yet exceed the framing cap. Reply
+            // with a small, non-retryable refusal instead of closing the
+            // socket and making a healthy daemon look unreachable.
+            let refusal = EventsResponse::Error {
+                message: format!(
+                    "response_frame_size_limit: {} response bytes exceed the {}-byte events IPC frame cap; request a narrower page",
+                    bytes.len(),
+                    crate::daemon::MAX_FRAME_BYTES
+                ),
+                retryable: false,
+                writer_task_failure: None,
+            };
+            match serde_json::to_vec(&refusal) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::error!(error = %error, "events daemon frame-size refusal serialization failed");
+                    return;
+                }
+            }
+        } else {
+            bytes
+        };
         // Same deadline on the response write: a peer that stops reading
         // would otherwise park this task in a full socket buffer.
         match tokio::time::timeout(CONN_IO_TIMEOUT, write_frame(&mut stream, &bytes)).await {
@@ -1444,6 +1475,8 @@ pub struct EventsForwardingMetrics {
     pub forwarded_events: u64,
     pub dropped_batches: u64,
     pub dropped_events: u64,
+    /// Serialized request bytes reserved by queued and in-flight batches.
+    pub queued_bytes: usize,
 }
 
 #[cfg(unix)]
@@ -1453,6 +1486,107 @@ struct ForwardingCounters {
     forwarded_events: AtomicU64,
     dropped_batches: AtomicU64,
     dropped_events: AtomicU64,
+    queued_bytes: AtomicUsize,
+}
+
+/// A reservation lives with the batch until delivery or a counted drop.
+/// Dropping a forwarder mid-delivery also returns its byte budget.
+#[cfg(unix)]
+#[derive(Debug)]
+struct AppendByteReservation {
+    counters: Arc<ForwardingCounters>,
+    bytes: usize,
+}
+
+#[cfg(unix)]
+impl Drop for AppendByteReservation {
+    fn drop(&mut self) {
+        self.counters
+            .queued_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct QueuedAppend {
+    request: EventsRequest,
+    count: u64,
+    _reservation: AppendByteReservation,
+}
+
+#[cfg(all(test, unix))]
+impl QueuedAppend {
+    fn unmetered(namespace: &str, events: Vec<Event>, counters: Arc<ForwardingCounters>) -> Self {
+        let count = events.len() as u64;
+        Self {
+            request: EventsRequest::AppendEvents {
+                protocol_version: EVENTS_PROTOCOL_VERSION,
+                namespace: namespace.to_string(),
+                events,
+            },
+            count,
+            _reservation: AppendByteReservation { counters, bytes: 0 },
+        }
+    }
+}
+
+/// Measure the actual wire request without retaining a second, potentially
+/// huge serialized copy of the caller's batch. Serde stops at the frame cap.
+#[cfg(unix)]
+#[derive(Default)]
+struct BoundedFrameCounter {
+    bytes: usize,
+    exceeded: bool,
+}
+
+#[cfg(unix)]
+impl std::io::Write for BoundedFrameCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.saturating_add(buf.len());
+        if next > crate::daemon::MAX_FRAME_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "events append request exceeds IPC frame cap",
+            ));
+        }
+        self.bytes = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn reserve_append_bytes(
+    counters: &Arc<ForwardingCounters>,
+    bytes: usize,
+    budget: usize,
+) -> Option<AppendByteReservation> {
+    let mut used = counters.queued_bytes.load(Ordering::Acquire);
+    loop {
+        let next = used.checked_add(bytes)?;
+        if next > budget {
+            return None;
+        }
+        match counters.queued_bytes.compare_exchange_weak(
+            used,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(AppendByteReservation {
+                    counters: Arc::clone(counters),
+                    bytes,
+                });
+            }
+            Err(observed) => used = observed,
+        }
+    }
 }
 
 /// One per domain process: the connection to the events daemon plus the
@@ -1465,7 +1599,8 @@ struct ForwardingCounters {
 #[cfg(unix)]
 pub struct EventsSplitClient {
     socket_path: PathBuf,
-    append_tx: tokio::sync::mpsc::Sender<(String, Vec<Event>)>,
+    append_tx: tokio::sync::mpsc::Sender<QueuedAppend>,
+    append_queue_byte_budget: usize,
     counters: Arc<ForwardingCounters>,
     /// Flipped by the forwarder while the daemon is unreachable so the drop
     /// log fires once per outage, not once per batch.
@@ -1507,19 +1642,33 @@ impl EventsSplitClient {
         queue_depth: usize,
         delivery_timeout: Duration,
     ) -> crate::error::RuntimeResult<Arc<Self>> {
+        Self::new_with_limits_and_delivery_timeout(
+            socket_path,
+            queue_depth,
+            DEFAULT_APPEND_QUEUE_BYTES,
+            delivery_timeout,
+        )
+    }
+
+    fn new_with_limits_and_delivery_timeout(
+        socket_path: PathBuf,
+        queue_depth: usize,
+        byte_budget: usize,
+        delivery_timeout: Duration,
+    ) -> crate::error::RuntimeResult<Arc<Self>> {
         let preflight_backend = StorageBackend::memory()?;
         let preflight_store = preflight_backend.events()?;
         // The in-memory backend must outlive the store handle; the store holds
         // the pool Arc internally, so dropping the backend wrapper here is fine.
 
-        let (append_tx, append_rx) =
-            tokio::sync::mpsc::channel::<(String, Vec<Event>)>(queue_depth.max(1));
+        let (append_tx, append_rx) = tokio::sync::mpsc::channel::<QueuedAppend>(queue_depth.max(1));
         let counters = Arc::new(ForwardingCounters::default());
         let outage_logged = Arc::new(AtomicBool::new(false));
 
         let client = Arc::new(Self {
             socket_path: socket_path.clone(),
             append_tx,
+            append_queue_byte_budget: byte_budget,
             counters: Arc::clone(&counters),
             outage_logged: Arc::clone(&outage_logged),
             preflight_store,
@@ -1546,6 +1695,7 @@ impl EventsSplitClient {
             forwarded_events: self.counters.forwarded_events.load(Ordering::Relaxed),
             dropped_batches: self.counters.dropped_batches.load(Ordering::Relaxed),
             dropped_events: self.counters.dropped_events.load(Ordering::Relaxed),
+            queued_bytes: self.counters.queued_bytes.load(Ordering::Acquire),
         }
     }
 
@@ -1553,22 +1703,59 @@ impl EventsSplitClient {
     /// queue is a counted, logged drop.
     fn enqueue(&self, namespace: &str, events: Vec<Event>) {
         let count = events.len() as u64;
-        match self.append_tx.try_send((namespace.to_string(), events)) {
+        let request = EventsRequest::AppendEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: namespace.to_string(),
+            events,
+        };
+        let mut frame_size = BoundedFrameCounter::default();
+        if let Err(error) = serde_json::to_writer(&mut frame_size, &request) {
+            self.count_append_drop(
+                count,
+                if frame_size.exceeded {
+                    "frame cap"
+                } else {
+                    "serialization"
+                },
+            );
+            tracing::warn!(error = %error, "events append batch could not fit a wire frame");
+            return;
+        }
+        let Some(reservation) = reserve_append_bytes(
+            &self.counters,
+            frame_size.bytes,
+            self.append_queue_byte_budget,
+        ) else {
+            self.count_append_drop(count, "queue byte budget");
+            return;
+        };
+        let batch = QueuedAppend {
+            request,
+            count,
+            _reservation: reservation,
+        };
+        match self.append_tx.try_send(batch) {
             Ok(()) => {}
             Err(_) => {
-                self.counters
-                    .dropped_batches
-                    .fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .dropped_events
-                    .fetch_add(count, Ordering::Relaxed);
-                if !self.outage_logged.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        dropped_events = count,
-                        "events append queue full; dropping loss-tolerant events until it drains"
-                    );
-                }
+                // The rejected batch drops here and releases its reservation.
+                self.count_append_drop(count, "queue batch limit");
             }
+        }
+    }
+
+    fn count_append_drop(&self, count: u64, reason: &'static str) {
+        self.counters
+            .dropped_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .dropped_events
+            .fetch_add(count, Ordering::Relaxed);
+        if !self.outage_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                dropped_events = count,
+                reason,
+                "events append queue rejected loss-tolerant batch"
+            );
         }
     }
 
@@ -1584,18 +1771,32 @@ impl EventsSplitClient {
         })?;
 
         let attempt = async {
-            let mut stream = connect_verified(&self.socket_path).await?;
-            write_frame(&mut stream, &payload).await?;
-            let bytes = read_frame(&mut stream).await?;
-            std::io::Result::Ok(bytes)
+            let mut stream = connect_verified(&self.socket_path)
+                .await
+                .map_err(|error| ("connect", error))?;
+            write_frame(&mut stream, &payload)
+                .await
+                .map_err(|error| ("write", error))?;
+            read_frame(&mut stream)
+                .await
+                .map_err(|error| ("read", error))
         };
         let bytes = match tokio::time::timeout(REQUEST_TIMEOUT, attempt).await {
             Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => {
+            Ok(Err(("read", error))) => {
+                return Err(StorageError::Serialization {
+                    capability: khive_storage::StorageCapability::Events,
+                    message: format!(
+                        "events daemon closed or broke the response after connection at {}: {error}",
+                        self.socket_path.display()
+                    ),
+                });
+            }
+            Ok(Err((stage, error))) => {
                 return Err(StorageError::Pool {
                     operation: op.into(),
                     message: format!(
-                        "events daemon unreachable at {}: {error}",
+                        "events daemon {stage} failed at {}: {error}",
                         self.socket_path.display()
                     ),
                 });
@@ -1624,14 +1825,15 @@ impl EventsSplitClient {
 /// (temporarily) empties even though the sender half is still live.
 #[cfg(unix)]
 fn drain_dropped_queue(
-    rx: &mut tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
+    rx: &mut tokio::sync::mpsc::Receiver<QueuedAppend>,
     counters: &ForwardingCounters,
 ) {
     let mut dropped_batches = 0u64;
     let mut dropped_events = 0u64;
-    while let Ok((_, events)) = rx.try_recv() {
+    while let Ok(batch) = rx.try_recv() {
         dropped_batches += 1;
-        dropped_events += events.len() as u64;
+        dropped_events += batch.count;
+        // `batch` drops its byte reservation at the end of this iteration.
     }
     if dropped_batches > 0 {
         counters
@@ -1655,7 +1857,7 @@ fn drain_dropped_queue(
 #[cfg(unix)]
 async fn run_forwarder(
     socket_path: PathBuf,
-    mut rx: tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
+    mut rx: tokio::sync::mpsc::Receiver<QueuedAppend>,
     counters: Arc<ForwardingCounters>,
     outage_logged: Arc<AtomicBool>,
     delivery_timeout: Duration,
@@ -1670,7 +1872,7 @@ async fn run_forwarder(
     // implied by the comment.
     let mut conn: Option<UnixStream> = None;
     loop {
-        let (namespace, events) = tokio::select! {
+        let batch = tokio::select! {
             _ = shutdown.cancelled() => {
                 drain_dropped_queue(&mut rx, &counters);
                 break;
@@ -1680,13 +1882,8 @@ async fn run_forwarder(
                 None => break,
             },
         };
-        let count = events.len() as u64;
-        let request = EventsRequest::AppendEvents {
-            protocol_version: EVENTS_PROTOCOL_VERSION,
-            namespace,
-            events,
-        };
-        let payload = match serde_json::to_vec(&request) {
+        let count = batch.count;
+        let payload = match serde_json::to_vec(&batch.request) {
             Ok(payload) => payload,
             Err(error) => {
                 counters.dropped_batches.fetch_add(1, Ordering::Relaxed);
@@ -3180,7 +3377,7 @@ mod tests {
             }
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<Event>)>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<QueuedAppend>(8);
         let counters = Arc::new(ForwardingCounters::default());
         let outage_logged = Arc::new(AtomicBool::new(false));
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -3204,21 +3401,30 @@ mod tests {
             )
         }
 
-        tx.try_send(("test".to_string(), vec![probe_event("in-flight")]))
-            .expect("queue has room for the in-flight batch");
+        tx.try_send(QueuedAppend::unmetered(
+            "test",
+            vec![probe_event("in-flight")],
+            Arc::clone(&counters),
+        ))
+        .expect("queue has room for the in-flight batch");
         // No externally observable "delivery started" signal exists short of
         // instrumenting the forwarder; a short sleep reliably lands inside
         // the delivery `select!` arm before shutdown cancels it, given the
         // 30s delivery timeout has no chance to fire first.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        tx.try_send((
-            "test".to_string(),
+        tx.try_send(QueuedAppend::unmetered(
+            "test",
             vec![probe_event("queued-1"), probe_event("queued-2")],
+            Arc::clone(&counters),
         ))
         .expect("queue has room for the first queued batch");
-        tx.try_send(("test".to_string(), vec![probe_event("queued-3")]))
-            .expect("queue has room for the second queued batch");
+        tx.try_send(QueuedAppend::unmetered(
+            "test",
+            vec![probe_event("queued-3")],
+            Arc::clone(&counters),
+        ))
+        .expect("queue has room for the second queued batch");
 
         shutdown.cancel();
 
@@ -3256,7 +3462,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("no-listener.sock");
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<Event>)>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<QueuedAppend>(8);
         let counters = Arc::new(ForwardingCounters::default());
         let outage_logged = Arc::new(AtomicBool::new(false));
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -3280,8 +3486,12 @@ mod tests {
             )
         }
 
-        tx.try_send(("test".to_string(), vec![probe_event("failed-delivery")]))
-            .expect("queue has room for the first batch");
+        tx.try_send(QueuedAppend::unmetered(
+            "test",
+            vec![probe_event("failed-delivery")],
+            Arc::clone(&counters),
+        ))
+        .expect("queue has room for the first batch");
 
         // Wait for the failed-delivery drop to land, which proves the
         // forwarder has moved on to the `FORWARDER_BACKOFF` sleep.
@@ -3297,12 +3507,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        tx.try_send((
-            "test".to_string(),
+        tx.try_send(QueuedAppend::unmetered(
+            "test",
             vec![
                 probe_event("queued-during-backoff-1"),
                 probe_event("queued-during-backoff-2"),
             ],
+            Arc::clone(&counters),
         ))
         .expect("queue has room for the batch queued during backoff");
 
@@ -3740,6 +3951,145 @@ mod tests {
         store
             .preflight_event(&test_event("local"))
             .expect("offline preflight validates a well-formed event");
+    }
+
+    /// A connected peer that consumed the request but sent no response is a
+    /// broken response, not evidence that no daemon answered the socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connected_events_peer_closing_without_response_is_not_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("closes-after-request.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_frame(&mut stream)
+                .await
+                .expect("complete request arrives");
+            // Drop the connection without writing a response frame.
+        });
+        let client = EventsSplitClient::new(socket).unwrap();
+        let store = ForwardingEventStore::new("local", client);
+        let error = store.get_event(Uuid::new_v4()).await.unwrap_err();
+        assert!(
+            matches!(error, StorageError::Serialization { .. }),
+            "a post-connect response failure must not be Pool/unreachable: {error:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// 4096 ordinary 3-KiB events obey the row limit yet exceed one IPC
+    /// frame. The daemon must answer with a non-retryable size refusal so a
+    /// caller can use a narrower page on the same healthy socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn query_page_over_frame_cap_returns_typed_size_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("large-query.sock");
+        let backend = Arc::new(StorageBackend::memory().unwrap());
+        let event_store = backend.events_for_namespace("local").unwrap();
+        let events: Vec<_> = (0..MAX_QUERY_EVENTS_PAGE_ROWS)
+            .map(|_| {
+                test_event("local").with_payload(serde_json::json!({"data": "x".repeat(3 * 1024)}))
+            })
+            .collect();
+        event_store
+            .append_events(events)
+            .await
+            .expect("seed large page");
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let stores: NamespaceStores =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_events_conn(
+                stream,
+                backend,
+                stores,
+                Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_REQUEST_BYTES)),
+            )
+            .await;
+        });
+        let client = EventsSplitClient::new(socket).unwrap();
+        let store = ForwardingEventStore::new("local", client);
+        let error = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: MAX_QUERY_EVENTS_PAGE_ROWS,
+                },
+            )
+            .await
+            .expect_err("the full page cannot fit one frame");
+        assert!(
+            matches!(error, StorageError::InvalidInput { .. }),
+            "expected non-retryable frame-size refusal, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("response_frame_size_limit"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("request a narrower page"),
+            "{error}"
+        );
+        server.abort();
+    }
+
+    /// The byte budget counts the in-flight batch as well as queued batches.
+    /// A stalled daemon therefore cannot retain another large batch just
+    /// because the mpsc channel still has spare batch slots.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forwarding_queue_enforces_serialized_byte_and_frame_limits_with_drop_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stalled-forwarder.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _hold_open = stream;
+            std::future::pending::<()>().await;
+        });
+        let event = test_event("local").with_payload(serde_json::json!({"data": "x".repeat(4096)}));
+        let first = vec![event.clone(), event.clone()];
+        let request_bytes = serde_json::to_vec(&EventsRequest::AppendEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: "local".into(),
+            events: first.clone(),
+        })
+        .unwrap()
+        .len();
+        let byte_budget = request_bytes + 64;
+        let client = EventsSplitClient::new_with_limits_and_delivery_timeout(
+            socket,
+            8,
+            byte_budget,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let store = ForwardingEventStore::new("local", Arc::clone(&client));
+        store.append_events(first.clone()).await.unwrap();
+        assert_eq!(client.metrics().queued_bytes, request_bytes);
+
+        store.append_events(first).await.unwrap();
+        let metrics = client.metrics();
+        assert_eq!(metrics.dropped_batches, 1);
+        assert_eq!(metrics.dropped_events, 2);
+        assert_eq!(metrics.queued_bytes, request_bytes);
+        assert!(metrics.queued_bytes <= byte_budget);
+
+        // One append request larger than the daemon frame cannot ever be
+        // delivered; it must be refused before occupying a queue slot.
+        let oversized = test_event("local")
+            .with_payload(serde_json::json!({"data": "x".repeat(crate::daemon::MAX_FRAME_BYTES)}));
+        store.append_event(oversized).await.unwrap();
+        let metrics = client.metrics();
+        assert_eq!(metrics.dropped_batches, 2);
+        assert_eq!(metrics.dropped_events, 3);
+        assert_eq!(metrics.queued_bytes, request_bytes);
+        server.abort();
     }
 
     /// Version-skew arm: a frame carrying an unknown protocol version gets a

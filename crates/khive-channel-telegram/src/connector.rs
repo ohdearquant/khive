@@ -28,6 +28,9 @@ pub(crate) struct TelegramMessage {
     /// Unix timestamp (seconds) the message was sent.
     pub date: i64,
     pub chat: TelegramChat,
+    /// Channel posts and some service messages omit the sender.
+    #[serde(default)]
+    pub from: Option<TelegramUser>,
     /// Absent for non-text messages (media, stickers, etc. — out of scope
     /// for v1, ADR-056 "Out of scope (v1)").
     #[serde(default)]
@@ -36,6 +39,11 @@ pub(crate) struct TelegramMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TelegramChat {
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TelegramUser {
     pub id: i64,
 }
 
@@ -48,6 +56,14 @@ struct TelegramApiResponse<T> {
     error_code: Option<u16>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    parameters: Option<TelegramResponseParameters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramResponseParameters {
+    #[serde(default)]
+    retry_after: Option<u32>,
 }
 
 /// Classify a failed Bot API call by HTTP status, falling back to the
@@ -68,7 +84,19 @@ fn telegram_api_error<T>(
     let message = format!(
         "{method} failed: status={status}, error_code={error_code:?}, description={description:?}"
     );
-    if code == 408 || code == 429 || code >= 500 {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || code == 429 {
+        if let Some(retry_after) = response
+            .and_then(|r| r.parameters.as_ref())
+            .and_then(|p| p.retry_after)
+        {
+            return ChannelError::RateLimited {
+                message,
+                retry_after: std::time::Duration::from_secs(u64::from(retry_after)),
+            };
+        }
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || code == 408 || code == 429 || code >= 500
+    {
         ChannelError::Transport(message)
     } else if (400..500).contains(&code) {
         ChannelError::PermanentTransport(message)
@@ -256,6 +284,7 @@ mod tests {
                 "message_id": 7,
                 "date": 1_700_000_000,
                 "chat": { "id": 555 },
+                "from": { "id": 42 },
                 "text": "hello"
             }
         });
@@ -263,6 +292,7 @@ mod tests {
         assert_eq!(update.update_id, 42);
         let message = update.message.unwrap();
         assert_eq!(message.chat.id, 555);
+        assert_eq!(message.from.unwrap().id, 42);
         assert_eq!(message.text.as_deref(), Some("hello"));
     }
 
@@ -282,6 +312,7 @@ mod tests {
             "chat": { "id": 555 }
         });
         let message: TelegramMessage = serde_json::from_value(raw).unwrap();
+        assert!(message.from.is_none());
         assert!(message.text.is_none());
     }
 
@@ -336,7 +367,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_classifies_rate_limit_as_transient() {
+    async fn send_message_carries_retry_after_from_rate_limit() {
+        let base_url = spawn_one_shot_server_with_status(
+            "429 Too Many Requests",
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":2}}"#,
+        );
+        let connector = LiveTelegramConnector::with_base_url("token".to_string(), base_url);
+
+        let error = connector.send_message(555, "hi").await.unwrap_err();
+        assert!(matches!(
+            &error,
+            ChannelError::RateLimited { retry_after, .. }
+                if *retry_after == std::time::Duration::from_secs(2)
+        ));
+        assert_eq!(
+            error.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_rate_limit_without_retry_after_stays_transient() {
         let base_url = spawn_one_shot_server_with_status(
             "429 Too Many Requests",
             r#"{"ok":false,"error_code":429,"description":"Too Many Requests"}"#,
@@ -345,10 +396,6 @@ mod tests {
 
         let error = connector.send_message(555, "hi").await.unwrap_err();
         assert!(matches!(error, ChannelError::Transport(_)));
-        assert_eq!(
-            error.delivery_failure_class(),
-            khive_channel::DeliveryFailureClass::Transient
-        );
     }
 
     #[tokio::test]
