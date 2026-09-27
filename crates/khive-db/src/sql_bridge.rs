@@ -1975,6 +1975,24 @@ struct SqliteWriter {
 }
 
 impl SqliteWriter {
+    /// A standalone handle holds its connection across calls, so opening it
+    /// cannot serve as admission for every later write on that connection.
+    fn admit_standalone_write(
+        &self,
+        operation: &'static str,
+    ) -> khive_storage::types::StorageResult<()> {
+        if self.handle.is_none() {
+            return Err(StorageError::Pool {
+                operation: operation.into(),
+                message: "connection already consumed".into(),
+            });
+        }
+        self.pool
+            .write_admission()
+            .check()
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, operation))
+    }
+
     async fn use_queue_read_transaction_handle(
         &mut self,
         transaction_control: Option<CachedReadTransactionControl>,
@@ -2271,6 +2289,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
+        self.admit_standalone_write("execute")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
             message: "connection already consumed".into(),
@@ -2328,6 +2347,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
+        self.admit_standalone_write("execute_batch")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_batch".into(),
             message: "connection already consumed".into(),
@@ -2386,6 +2406,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
+        self.admit_standalone_write("execute_script")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script".into(),
             message: "connection already consumed".into(),
@@ -2432,7 +2453,11 @@ impl khive_storage::SqlWriter for SqliteWriter {
 
         // Flag off / no writer task: identical to `execute_script`'s own
         // flag-off path — a bare `execute_batch` on the standalone
-        // connection, already transaction-free.
+        // connection, already transaction-free. This is a request-path
+        // maintenance operation, so it has the same reserve check as an
+        // ordinary standalone write. Only infrastructure checkpoint
+        // connections are exempt.
+        self.admit_standalone_write("execute_script_top_level")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script_top_level".into(),
             message: "connection already consumed".into(),
@@ -9152,6 +9177,99 @@ mod tests {
             assert!(
                 matches!(&val, Some(SqlValue::Text(v)) if *v == format!("marked-{i}")),
                 "mark row {i} must reflect the persisted UPDATE after release; got {val:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_writer_handle_resamples_reserve_before_each_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for operation in [
+            "execute",
+            "execute_batch",
+            "execute_script",
+            "top_level_vacuum",
+            "top_level_checkpoint",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut pool = ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join(format!("reserve-{operation}.db"))),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap();
+            let samples = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&samples);
+            pool.set_test_write_admission(100, move |_| {
+                match observed.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => Ok(101), // Handle open, then first operation.
+                    2 => Ok(100),     // The same handle's next operation.
+                    extra => panic!("unexpected capacity sample {extra}"),
+                }
+            });
+            let bridge = SqlBridge::new(Arc::new(pool), true);
+            let mut writer = bridge.writer().await.unwrap();
+            writer
+                .execute(SqlStatement {
+                    sql: "CREATE TABLE reserve_test (id INTEGER PRIMARY KEY)".into(),
+                    params: vec![],
+                    label: None,
+                })
+                .await
+                .unwrap();
+
+            let insert = || SqlStatement {
+                sql: "INSERT INTO reserve_test (id) VALUES (1)".into(),
+                params: vec![],
+                label: None,
+            };
+            let error = match operation {
+                "execute" => writer.execute(insert()).await.map(|_| ()),
+                "execute_batch" => writer.execute_batch(vec![insert()]).await.map(|_| ()),
+                "execute_script" => {
+                    writer
+                        .execute_script("INSERT INTO reserve_test (id) VALUES (1)".into())
+                        .await
+                }
+                "top_level_vacuum" => {
+                    writer
+                        .execute_script_top_level(TopLevelMaintenance::Vacuum)
+                        .await
+                }
+                "top_level_checkpoint" => {
+                    writer
+                        .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .expect_err("the second operation must see the new reserve sample");
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::CapacityFloor {
+                        available_bytes,
+                        floor_bytes,
+                        ..
+                    } if *available_bytes == 100 && *floor_bytes == 100
+                ),
+                "{operation} must retain typed capacity-floor classification: {error:?}"
+            );
+            assert_eq!(samples.load(Ordering::SeqCst), 3, "{operation}");
+            assert!(
+                matches!(
+                    writer
+                        .query_scalar(SqlStatement {
+                            sql: "SELECT COUNT(*) FROM reserve_test".into(),
+                            params: vec![],
+                            label: None,
+                        })
+                        .await
+                        .unwrap(),
+                    Some(SqlValue::Integer(0))
+                ),
+                "{operation} must not write after the reserve refusal"
             );
         }
     }

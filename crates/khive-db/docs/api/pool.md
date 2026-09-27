@@ -15,18 +15,24 @@ read once when the pool opens. An invalid byte count fails pool construction
 with `SqliteError::InvalidConfig`. In-memory and read-only pools do not sample
 disk space.
 
-Each pooled writer checkout, cancellable writer checkout, standalone operation
-writer open, and writer-task request samples available space on the canonical
-database parent directory. At or below the reserve, admission returns a typed
-capacity-floor error before running the operation. The writer task checks each
-dequeued request because its SQLite connection stays open for its lifetime.
-The sampled value is intentionally not cached across admissions.
+Each pooled writer checkout, cancellable writer checkout, standalone writer
+open, standalone writer-handle operation, and writer-task request samples
+available space on the canonical database parent directory. At or below the
+reserve, admission returns a typed capacity-floor error before running the
+operation. Both a standalone writer handle and the writer task keep their
+SQLite connections open across operations, so each operation gets a fresh
+check after the handle was opened. The sampled value is not cached across
+admissions.
 
 Checkpoint and diagnostics infrastructure connections, including the
 zero-wait checkpoint checkout, remain available below the floor so recovery
 can reclaim WAL space. Pool startup also remains available; opening and
 configuring SQLite connections may perform setup I/O before any operation is
-admitted. The check cannot predict the size of an arbitrary SQL transaction or
+admitted. A caller's `execute_script_top_level` is still a request-path
+operation, including `khive-vcs` sync's `WalCheckpointTruncate`; it is refused
+at or below the floor on both writer-task and standalone-handle routes. That
+request path does not use the infrastructure checkpoint connection and is not
+exempt. The check cannot predict the size of an arbitrary SQL transaction or
 writes by other processes, so a very large already-admitted transaction can
 still reach `SQLITE_FULL`. The reserve protects subsequent admissions and
 provides headroom for recovery; it is not a transaction-size quota.
