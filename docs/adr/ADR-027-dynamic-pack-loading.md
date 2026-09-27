@@ -1,8 +1,8 @@
 # ADR-027: Dynamic Pack Loading via Self-Registration
 
-**Status**: accepted, and partly superseded by Amendment 4 (2026-09-12), which keeps this
-record's answer for packs linked into the binary and supersedes it for independently
-installed pack distributions. Native dynamic loading stays rejected.\
+**Status**: accepted. Amendment 4 (2026-09-12), which would keep this record's answer for
+packs linked into the binary and supersede it for independently installed pack distributions,
+is proposed and not yet accepted. Native dynamic loading stays rejected.\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
 

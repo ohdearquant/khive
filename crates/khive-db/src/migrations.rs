@@ -28,8 +28,9 @@ pub struct Migration {
     pub up_sql: &'static str,
     /// SQL to revert (optional).
     pub down_sql: Option<&'static str>,
-    /// Optional predicate: returns true if migration was already applied
-    /// through a mechanism other than the migration tracker.
+    /// Optional read-only predicate: returns true if migration was already
+    /// applied through a mechanism other than the migration tracker. It runs
+    /// while this connection holds the SQLite write lock.
     pub is_already_applied: Option<fn(&Connection) -> bool>,
 }
 
@@ -50,15 +51,21 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
     conn.execute_batch(SCHEMA_VERSION_TABLE)?;
 
     for migration in plan.sqlite {
+        // Serialize the admission decision with other writers. Checking the
+        // predicate or ledger before BEGIN IMMEDIATE lets a second opener see
+        // stale state and replay a migration after the first one commits.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+
         // Check if custom predicate says it's already applied
         if let Some(check) = migration.is_already_applied {
-            if check(conn) {
+            if check(&tx) {
                 continue;
             }
         }
 
         // Check if tracked as applied
-        let already: bool = conn.query_row(
+        let already: bool = tx.query_row(
             "SELECT COUNT(*) > 0 FROM _schema_versions WHERE service = ?1 AND migration_id = ?2",
             rusqlite::params![plan.service, migration.id],
             |row| row.get(0),
@@ -68,8 +75,6 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
             continue;
         }
 
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(migration.up_sql)?;
 
         tx.execute(

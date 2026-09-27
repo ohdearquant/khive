@@ -1,11 +1,51 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c, 2026-09-14, 2026-09-15)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c, 2026-09-14, 2026-09-15, 2026-09-25)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-09-25): compose response reports the rendered atoms
+
+**Status: Accepted (2026-09-25).** Related issue: #3235. It is intended to land together with #3349, which
+implements it alongside [ADR-051](ADR-051-section-embeddings-hybrid-compose.md) Amendment 2.
+
+§2 "`knowledge.compose` — namespace-consistent briefing composition" specifies the output only as
+`→ {status, data}`. At this revision the handler
+(`crates/khive-pack-knowledge/src/knowledge/search.rs`) builds `data.atoms` from every reranked
+candidate atom and sets `data.count` to its length, while `data.markdown`, `data.sections` and
+`data.entities` hold only what was packed under `max_tokens`; the request timing also records the
+candidate count. Within one response the fields disagree, and a caller that reads `atoms` as the
+evidence behind the briefing sees atoms the briefing does not contain.
+
+A successful `knowledge.compose` returns `data` with:
+
+- `query`: the full query as given;
+- `markdown`: the briefing, bounded as ADR-051 Amendment 2 specifies;
+- `domains`: every resolved domain, each `{id, slug, name}`;
+- `atoms`: exactly the distinct atoms rendered in `markdown`, through at least one packed section
+  or as a whole-atom entry, in atom rerank order, each `{id, slug, name, score}` with its rerank
+  score;
+- `count`: the number of entries in `atoms`;
+- `sections` and `section_count`, only with `explain` and only when a section is packed: the
+  packed sections;
+- `entities`, only when a blended entity is rendered: as ADR-051 Amendment 1 specifies.
+
+Reranked candidates that the briefing does not contain are not reported, and no candidate-count
+field is added. The request timing records the rendered count. The existing advisory fields
+(`ann_unavailable` and the hydration-degradation fields) are unchanged. The verb help for
+`knowledge.compose` and its `max_tokens` parameter states these semantics.
+
+Alternatives considered: keeping `atoms` and `count` as the candidate list and adding a separate
+rendered list leaves the fields callers already read describing something other than the
+briefing; exposing the candidates (for example a `candidate_count`, or `candidates` under
+`explain`) is a possible later addition and is not needed to make the fields agree, so it is not
+added here.
+
+Consequences: this is a response-semantics change. For the same request `count` can be lower than
+before, and a caller that treated `count` as the size of the candidate pool has to change.
 
 ## Amendment (2026-09-23): refusal events for existing atoms
 

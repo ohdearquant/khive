@@ -112,17 +112,64 @@ fn span_text<T: quote::ToTokens>(node: &T) -> String {
     quote::ToTokens::to_token_stream(node).to_string()
 }
 
-/// The qualified `::`-joined path of a type reference as written at the impl
-/// site (e.g. `"a::T"` for `impl a::T { .. }`), not just its last segment --
-/// two distinct types that happen to share a final segment name (`a::T` and
-/// `b::T`) must not collapse onto the same `T::method` declaration name.
+/// The qualified path of an impl self type, retaining generic arguments so
+/// `S<u8>::f` and `S<u16>::f` do not share one declaration identity.
 fn type_name_of(ty: &Type) -> Option<String> {
-    type_path_segments(ty).map(|segs| segs.join("::"))
+    match ty {
+        Type::Path(_) => Some(render_type_for_identity(ty)),
+        _ => None,
+    }
 }
 
-/// The full path segments of a type reference, e.g. `["types", "S"]` for
-/// `types::S` — `None` for a non-path type (`&T`, tuples, etc.), which has
-/// no D3 rule 13 target regardless.
+fn render_type_for_identity(ty: &Type) -> String {
+    match ty {
+        Type::Path(path) if path.qself.is_none() => render_path_for_identity(&path.path),
+        _ => span_text(ty),
+    }
+}
+
+fn render_path_for_identity(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| {
+            let args = match &segment.arguments {
+                syn::PathArguments::None => String::new(),
+                syn::PathArguments::AngleBracketed(args) => format!(
+                    "<{}>",
+                    args.args
+                        .iter()
+                        .map(|arg| match arg {
+                            syn::GenericArgument::Type(ty) => render_type_for_identity(ty),
+                            _ => span_text(arg),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                syn::PathArguments::Parenthesized(args) => {
+                    let inputs = args
+                        .inputs
+                        .iter()
+                        .map(render_type_for_identity)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let output = match &args.output {
+                        syn::ReturnType::Default => String::new(),
+                        syn::ReturnType::Type(_, ty) => {
+                            format!("->{}", render_type_for_identity(ty))
+                        }
+                    };
+                    format!("({inputs}){output}")
+                }
+            };
+            format!("{}{args}", segment.ident)
+        })
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// The identifier-only path used for D3 rule 13 target resolution; generic
+/// arguments distinguish method identities above, but do not name different
+/// datatype or interface declarations in the project-wide symbol index.
 fn type_path_segments(ty: &Type) -> Option<Vec<String>> {
     match ty {
         Type::Path(p) => Some(
@@ -136,8 +183,7 @@ fn type_path_segments(ty: &Type) -> Option<Vec<String>> {
     }
 }
 
-/// The full path segments of a trait reference, e.g. `["traits", "T"]` for
-/// `impl traits::T for ..`.
+/// Identifier-only trait path for D3 rule 13 resolution.
 fn trait_path_segments(path: &syn::Path) -> Vec<String> {
     path.segments.iter().map(|s| s.ident.to_string()).collect()
 }
@@ -227,12 +273,12 @@ fn scan_item(item: &Item, module_segments: &[String], out: &mut RustFileScan) {
         Item::Impl(imp) => {
             // `impl Trait for Type` only — an inherent `impl Type { .. }`
             // (imp.trait_ is None) has no D3 rule 13 target. The qualified
-            // (`::`-joined) trait path is used, not just its last segment,
-            // for the same collision reason as `type_name_of`.
+            // trait path, including generic arguments, distinguishes method
+            // identities; relation targets below still use identifiers only.
             let trait_name = imp
                 .trait_
                 .as_ref()
-                .map(|(_, path, _)| trait_path_segments(path).join("::"));
+                .map(|(_, path, _)| render_path_for_identity(path));
             // `impl !Trait for Type` (negative impl, first tuple element
             // `Some(bang)`) asserts the ABSENCE of the relation, not its
             // presence — recording it as a positive `implements` edge would
@@ -569,6 +615,45 @@ mod tests {
             !names.contains(&"S::f"),
             "trait-impl methods must never collapse onto the bare Type::method form"
         );
+    }
+
+    #[test]
+    fn generic_trait_and_inherent_impls_have_distinct_method_names() {
+        let src = r#"
+            struct S;
+            impl From<u8> for S { fn from(_: u8) -> Self { S } }
+            impl From<u16> for S { fn from(_: u16) -> Self { S } }
+            struct G<T>(T);
+            impl G<u8> { fn f() {} }
+            impl G<u16> { fn f() {} }
+        "#;
+        let scan = scan_rust_source(src).expect("parses");
+        let names: Vec<&str> = scan.declarations.iter().map(|d| d.name.as_str()).collect();
+        for name in [
+            "<S as From<u8>>::from",
+            "<S as From<u16>>::from",
+            "G<u8>::f",
+            "G<u16>::f",
+        ] {
+            assert!(names.contains(&name), "missing {name}: {names:?}");
+        }
+        assert_eq!(scan.impls.len(), 2);
+        for imp in &scan.impls {
+            assert_eq!(imp.type_path, vec!["S".to_string()]);
+            assert_eq!(imp.trait_path, vec!["From".to_string()]);
+        }
+    }
+
+    #[test]
+    fn nested_generic_path_arguments_are_rendered_in_method_identity() {
+        let src = r#"
+            impl outer::G<inner::T<u8>> { fn f() {} }
+            impl outer::G<inner::T<u16>> { fn f() {} }
+        "#;
+        let scan = scan_rust_source(src).expect("parses");
+        let names: Vec<&str> = scan.declarations.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"outer::G<inner::T<u8>>::f"));
+        assert!(names.contains(&"outer::G<inner::T<u16>>::f"));
     }
 
     /// Inline `mod inner { .. }` recurses at a nested module path; a module

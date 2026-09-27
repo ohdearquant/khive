@@ -2059,72 +2059,80 @@ pub async fn apply_post_commit_effects_with_report(
     effects: CommittedPostCommitEffects,
 ) -> RuntimeResult<Vec<PostCommitEmbeddingOutcome>> {
     let mut embedding_outcomes = Vec::new();
-    for effect in effects.into_effects() {
-        match effect {
-            PostCommitEffect::None => {}
-            PostCommitEffect::NoteChanged { note_id, kind } => {
-                runtime.fire_note_mutation_hook(&kind, note_id).await;
-            }
-            PostCommitEffect::ReindexEntity { entity_id } => {
-                if let Some(entity) = runtime.entities(token)?.get_entity(entity_id).await? {
-                    let truncation = runtime.reindex_entity(token, &entity).await?;
-                    embedding_outcomes.push(PostCommitEmbeddingOutcome {
-                        effect: PostCommitEffect::ReindexEntity { entity_id },
-                        truncation,
-                    });
-                }
-            }
-            PostCommitEffect::ReindexNote { note_id, version } => {
-                if let Some(note) = runtime.notes(token)?.get_note(note_id).await? {
-                    if note.version != version {
-                        continue;
-                    }
-                    let truncation = runtime.reindex_note(token, &note).await?;
-                    if runtime
-                        .notes(token)?
-                        .get_note(note_id)
-                        .await?
-                        .is_none_or(|current| current.version != version)
-                    {
-                        continue;
-                    }
-                    embedding_outcomes.push(PostCommitEmbeddingOutcome {
-                        effect: PostCommitEffect::ReindexNote { note_id, version },
-                        truncation,
-                    });
-                    // This handler calls `reindex_note` directly, bypassing
-                    // `update_note()` and the note-mutation hook it fires
-                    // after its own reindex (see `curation.rs`). Fire it
-                    // here so any in-process consumer (e.g.
-                    // khive-pack-memory's warm ANN cache) sees a bumped
-                    // generation after a committed atomic note update,
-                    // matching the non-atomic path.
-                    runtime.fire_note_mutation_hook(&note.kind, note.id).await;
-                }
-            }
-            PostCommitEffect::NoteDeleted { note_id, kind } => {
-                // Unlike `operations.rs`'s `delete_note`, which fires
-                // `fire_note_mutation_hook` directly (with the already-known
-                // kind, no refetch) after a successful row delete, an atomic
-                // note delete needs this post-commit pass to reach it. The
-                // note row is gone (hard delete) or tombstoned (soft
-                // delete) by the time this runs, so it mirrors
-                // `delete_note`'s direct-fire shape rather than
-                // `ReindexNote`'s refetch-then-fire shape.
-                runtime.fire_note_mutation_hook(&kind, note_id).await;
-            }
-            PostCommitEffect::GtdAudit { .. } => {
-                // Applied by the `kkernel` caller's own post-commit pass,
-                // not here: `khive-pack-gtd` (owner of
-                // `ensure_audit_schema`/`write_audit_record_with_status`)
-                // depends on
-                // `khive-runtime`, not the other way around, so this crate
-                // cannot act on the effect itself. See
-                // `PostCommitEffect::GtdAudit`'s doc comment.
-            }
+    let mut failures = Vec::new();
+    for (index, effect) in effects.into_effects().into_iter().enumerate() {
+        let identity = format!("{effect:?}");
+        match apply_one_post_commit_effect(runtime, token, effect).await {
+            Ok(Some(outcome)) => embedding_outcomes.push(outcome),
+            Ok(None) => {}
+            Err(error) => failures.push(format!("effect[{index}] {identity}: {error}")),
         }
     }
-    Ok(embedding_outcomes)
+    if failures.is_empty() {
+        Ok(embedding_outcomes)
+    } else {
+        Err(RuntimeError::Internal(format!(
+            "post-commit effects failed after commit: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+async fn apply_one_post_commit_effect(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    effect: PostCommitEffect,
+) -> RuntimeResult<Option<PostCommitEmbeddingOutcome>> {
+    match effect {
+        PostCommitEffect::None => Ok(None),
+        PostCommitEffect::NoteChanged { note_id, kind } => {
+            runtime.fire_note_mutation_hook(&kind, note_id).await;
+            Ok(None)
+        }
+        PostCommitEffect::ReindexEntity { entity_id } => {
+            let Some(entity) = runtime.entities(token)?.get_entity(entity_id).await? else {
+                return Ok(None);
+            };
+            let truncation = runtime.reindex_entity(token, &entity).await?;
+            Ok(Some(PostCommitEmbeddingOutcome {
+                effect: PostCommitEffect::ReindexEntity { entity_id },
+                truncation,
+            }))
+        }
+        PostCommitEffect::ReindexNote { note_id, version } => {
+            let Some(note) = runtime.notes(token)?.get_note(note_id).await? else {
+                return Ok(None);
+            };
+            if note.version != version {
+                return Ok(None);
+            }
+            let truncation = runtime.reindex_note(token, &note).await?;
+            if runtime
+                .notes(token)?
+                .get_note(note_id)
+                .await?
+                .is_none_or(|current| current.version != version)
+            {
+                return Ok(None);
+            }
+            // Atomic note updates bypass the regular update_note hook. Notify
+            // in-process consumers only after the current version was indexed.
+            runtime.fire_note_mutation_hook(&note.kind, note.id).await;
+            Ok(Some(PostCommitEmbeddingOutcome {
+                effect: PostCommitEffect::ReindexNote { note_id, version },
+                truncation,
+            }))
+        }
+        PostCommitEffect::NoteDeleted { note_id, kind } => {
+            // The committed row may already be gone; use the captured kind.
+            runtime.fire_note_mutation_hook(&kind, note_id).await;
+            Ok(None)
+        }
+        PostCommitEffect::GtdAudit { .. } => {
+            // The kkernel caller owns the GTD pack's separate audit side write.
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2808,6 +2816,121 @@ mod tests {
             ],
             "each committed token must execute its note-mutation effect exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_post_commit_reindexes_do_not_skip_later_note_mutation_hook() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let fired: std::sync::Arc<std::sync::Mutex<Vec<uuid::Uuid>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fired_for_hook = fired.clone();
+        runtime.install_note_mutation_hook(std::sync::Arc::new(
+            move |_kind: String, id: uuid::Uuid| {
+                let fired = fired_for_hook.clone();
+                Box::pin(async move {
+                    fired.lock().expect("lock").push(id);
+                })
+            },
+        ));
+
+        let mut plans = Vec::new();
+        let mut failed_ids = Vec::new();
+        for name in ["first", "second"] {
+            let note = khive_storage::note::Note::new("local", "observation", name);
+            let id = note.id;
+            runtime
+                .notes(&token)
+                .expect("notes store")
+                .upsert_note(note)
+                .await
+                .expect("seed reindex target");
+            plans.push(
+                prepare_update(
+                    &runtime,
+                    &token,
+                    // Explicit embedding is required here: with embed=None
+                    // and no existing vector row, atomic_runner legitimately
+                    // replaces ReindexNote with NoteChanged (inheritance
+                    // policy), leaving no reindex for the fault to fail.
+                    &json!({"id": id.to_string(), "content": format!("{name} revised"), "embed": true}),
+                    None,
+                )
+                .await
+                .expect("prepare note update"),
+            );
+            failed_ids.push(id);
+        }
+        let deleted = khive_storage::note::Note::new("local", "observation", "deleted");
+        let deleted_id = deleted.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(deleted)
+            .await
+            .expect("seed delete target");
+        plans.push(
+            prepare_delete(
+                &runtime,
+                &token,
+                &json!({"id": deleted_id.to_string(), "hard": false}),
+                None,
+            )
+            .await
+            .expect("prepare note delete"),
+        );
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), plans)
+            .await
+            .expect("commit atomic unit");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[
+                PostCommitEffect::ReindexNote {
+                    note_id: failed_ids[0],
+                    version: 2,
+                },
+                PostCommitEffect::ReindexNote {
+                    note_id: failed_ids[1],
+                    version: 2,
+                },
+                PostCommitEffect::NoteDeleted {
+                    note_id: deleted_id,
+                    kind: "observation".into(),
+                },
+            ],
+            "the fixture must commit two reindexes before the deletion hook"
+        );
+
+        // The already-committed note rows remain intact, but both deferred
+        // reindexes now fail. The following deletion hook must still fire.
+        let mut writer = runtime.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "DROP TABLE fts_notes".into(),
+                params: Vec::new(),
+                label: Some("test_remove_fts_notes_after_commit".into()),
+            })
+            .await
+            .expect("remove FTS table");
+        drop(writer);
+
+        let error = apply_post_commit_effects_with_report(&runtime, &token, post_commit)
+            .await
+            .expect_err("both reindexes must fail")
+            .to_string();
+        assert!(error.contains("effect[0]"), "{error}");
+        assert!(error.contains("effect[1]"), "{error}");
+        for id in failed_ids {
+            assert!(error.contains(&id.to_string()), "{error}");
+        }
+        assert_eq!(*fired.lock().expect("lock"), vec![deleted_id]);
     }
 
     /// Atomic delete must purge the note's FTS row and vector row for both

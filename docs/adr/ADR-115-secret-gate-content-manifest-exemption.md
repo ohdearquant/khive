@@ -297,7 +297,7 @@ and export preserve and expose `khive:secret_gate` on every projection that alre
 properties. None of these consumers hide or down-rank an exempted record by default under this ADR.
 Consumers may build an explicit filter or ranking adjustment over the property; that is a separate
 view-layer decision requiring its own evidence, per the data-vs-view principle this codebase already
-follows (`docs/adr/../CLAUDE.md` — data records history and marks state, the query/view layer decides
+follows (root `CLAUDE.md`, "Data vs. view" — data records history and marks state, the query/view layer decides
 what is shown).
 
 ### 6. Fail-closed, unconditionally
