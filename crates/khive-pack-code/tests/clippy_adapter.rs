@@ -4,7 +4,76 @@ use khive_pack_code::{
 };
 use serde_json::{json, Value};
 
-const FIXTURE: &str = include_str!("fixtures/clippy-mini.jsonl");
+fn fixture() -> String {
+    [
+        json!({
+            "reason": "compiler-artifact",
+            "package_id": "example 0.1.0",
+            "target": {"name": "example"}
+        }),
+        json!({
+            "reason": "compiler-message",
+            "package_id": "example 0.1.0",
+            "message": {
+                "message": "compilation note",
+                "code": null,
+                "level": "note",
+                "spans": []
+            }
+        }),
+        json!({
+            "reason": "compiler-message",
+            "package_id": "example 0.1.0",
+            "message": {
+                "message": "this borrow is unnecessary",
+                "code": {"code": "clippy::needless_borrow", "explanation": null},
+                "level": "warning",
+                "spans": [{
+                    "file_name": "src/lib.rs",
+                    "line_start": 12,
+                    "line_end": 12,
+                    "column_start": 5,
+                    "column_end": 13,
+                    "is_primary": true,
+                    "text": [{
+                        "text": "    consume(&value);",
+                        "highlight_start": 5,
+                        "highlight_end": 13
+                    }]
+                }],
+                "children": []
+            }
+        }),
+        json!({
+            "reason": "compiler-message",
+            "package_id": "example 0.1.0",
+            "message": {
+                "message": "used `unwrap()` on a `Result` value",
+                "code": {"code": "clippy::unwrap_used", "explanation": null},
+                "level": "error",
+                "spans": [{
+                    "file_name": "src/lib.rs",
+                    "line_start": 25,
+                    "line_end": 25,
+                    "column_start": 18,
+                    "column_end": 26,
+                    "is_primary": true,
+                    "text": [{
+                        "text": "    let value = read().unwrap();",
+                        "highlight_start": 18,
+                        "highlight_end": 26
+                    }]
+                }],
+                "children": []
+            }
+        }),
+        json!({"reason": "build-finished", "success": true}),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
 
 fn provenance() -> ClippyProvenance<'static> {
     ClippyProvenance {
@@ -30,7 +99,8 @@ fn properties(note: &khive_storage::Note) -> &Value {
 
 #[test]
 fn maps_fixture_to_validated_findings_without_persistence() {
-    let batch = ingest_clippy_json_lines(FIXTURE.as_bytes(), provenance(), options())
+    let fixture = fixture();
+    let batch = ingest_clippy_json_lines(fixture.as_bytes(), provenance(), options())
         .expect("valid fixture");
     assert_eq!(batch.entities.len(), 1);
     assert_eq!(batch.notes.len(), 2);
@@ -66,9 +136,10 @@ fn maps_fixture_to_validated_findings_without_persistence() {
 
 #[test]
 fn fingerprint_survives_unrelated_lines_added_elsewhere() {
-    let first = ingest_clippy_json_lines(FIXTURE.as_bytes(), provenance(), options())
+    let fixture = fixture();
+    let first = ingest_clippy_json_lines(fixture.as_bytes(), provenance(), options())
         .expect("first ingest");
-    let shifted = FIXTURE
+    let shifted = fixture
         .lines()
         .map(|line| {
             let mut record: Value = serde_json::from_str(line).expect("fixture line");
@@ -105,7 +176,7 @@ fn fingerprint_survives_unrelated_lines_added_elsewhere() {
             properties(after)["evidence"]
         );
     }
-    let replay = ingest_clippy_json_lines(FIXTURE.as_bytes(), provenance(), options())
+    let replay = ingest_clippy_json_lines(fixture.as_bytes(), provenance(), options())
         .expect("exact replay");
     assert_eq!(first.notes[0].id, replay.notes[0].id);
 }
@@ -129,7 +200,7 @@ fn malformed_lines_and_incomplete_lints_are_refused_with_line_reasons() {
 
 #[test]
 fn primary_span_must_stay_inside_repository() {
-    let outside = FIXTURE.replace("src/lib.rs", "/outside/src/lib.rs");
+    let outside = fixture().replace("src/lib.rs", "/outside/src/lib.rs");
     let error = ingest_clippy_json_lines(outside.as_bytes(), provenance(), options())
         .expect_err("absolute diagnostic path must fail");
     assert!(error.to_string().contains("relative repository path"));
@@ -146,9 +217,10 @@ fn invalid_utf8_names_the_affected_line() {
 
 #[test]
 fn repo_scope_and_local_source_text_affect_identity() {
+    let fixture = fixture();
     let original =
-        ingest_clippy_json_lines(FIXTURE.as_bytes(), provenance(), options()).expect("original");
-    let changed_text = FIXTURE.replace("consume(&value);", "consume(value);");
+        ingest_clippy_json_lines(fixture.as_bytes(), provenance(), options()).expect("original");
+    let changed_text = fixture.replace("consume(&value);", "consume(value);");
     let edited = ingest_clippy_json_lines(changed_text.as_bytes(), provenance(), options())
         .expect("edited source");
     assert_ne!(
@@ -156,7 +228,7 @@ fn repo_scope_and_local_source_text_affect_identity() {
         properties(&edited.notes[0])["finding_id"]
     );
     let elsewhere = ingest_clippy_json_lines(
-        FIXTURE.as_bytes(),
+        fixture.as_bytes(),
         ClippyProvenance {
             repo: "other",
             ..provenance()

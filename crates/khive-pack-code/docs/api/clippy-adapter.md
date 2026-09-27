@@ -18,12 +18,13 @@ Severity mapping is `error` → `high`, `warning` → `medium`, and
 `note`/`help`/`failure-note` → `info`; other levels are refused. The primary span
 provides repository-relative path, start/end lines, and start/end columns in
 evidence. The stable producer fingerprint uses producer ID, repository, normalized path,
-lint code, diagnostic message, source snippet, and columns. It excludes line
-numbers, so lines inserted elsewhere in the file do not change it. The existing
+lint code, diagnostic message, verbatim primary-span source text, and columns.
+It excludes line numbers, so lines inserted elsewhere in the file do not change it;
+edits within the source snippet, including literal whitespace, do. The existing
 finding note ID remains content-versioned and can change when the evidence line
 changes; the fingerprint in `finding_id` and `raw.fingerprint` is the stable
 cross-run correlation key. Identical duplicate diagnostic records are collapsed;
 different spans that collide on the stable fingerprint are refused.
 
-The committed `tests/fixtures/clippy-mini.jsonl` is a hand-checked miniature
-stream. It contains only repository-relative example paths and no host paths.
+The adapter test builds a miniature JSON-lines stream from synthetic records in
+code. It contains only repository-relative example paths and no host paths.

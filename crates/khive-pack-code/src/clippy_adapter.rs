@@ -189,8 +189,8 @@ fn finding_from_message(
                 .ok_or_else(|| line_error(line, "message.spans[].text[].text must be a string"))?,
         );
     }
-    let snippet = normalized_text(&source_text.join("\n"));
-    if snippet.is_empty() {
+    let snippet = source_text.join("\n");
+    if snippet.trim().is_empty() {
         return Err(line_error(
             line,
             "primary span has no source text for a stable fingerprint",
