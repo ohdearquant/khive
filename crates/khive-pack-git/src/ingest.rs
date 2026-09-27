@@ -1322,6 +1322,154 @@ mod gh_command_tests {
             Some(&IngestCommandError::StdoutTooLarge)
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_timeout_reason_survives_plain_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "exec sleep 5");
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_millis(200),
+            128,
+        )
+        .await
+        .expect_err("timeout fixture must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::TimedOut)
+        );
+        assert!(
+            error.to_string().contains("command timed out"),
+            "public report loses timeout cause: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_stdout_limit_reason_survives_plain_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(
+            dir.path(),
+            "printf '1234567890123456789012345678901234567890'",
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["pr", "list"],
+            &program,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("overflow fixture must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::StdoutTooLarge)
+        );
+        assert!(
+            error.to_string().contains("command stdout exceeded limit"),
+            "public report loses stdout limit cause: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_stderr_limit_reason_survives_plain_display_without_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "SYNTHETIC_STDERR_NOT_A_SECRET";
+        let payload = format!("{sentinel}{}", "x".repeat(super::GH_STDERR_LIMIT + 1));
+        let program = executable(
+            dir.path(),
+            &format!("printf '%s' '{payload}' >&2\nprintf '[]'"),
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("stderr overflow must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::StderrTooLarge)
+        );
+        let display = error.to_string();
+        assert!(
+            display.contains("command stderr exceeded limit"),
+            "public report loses stderr limit cause: {display}"
+        );
+        assert!(
+            !display.contains(sentinel),
+            "stderr payload must remain private"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_missing_program_reason_survives_plain_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent-synthetic-gh");
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &missing,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("missing program must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::NotFound)
+        );
+        assert!(
+            error.to_string().contains("command not found on PATH"),
+            "public report loses start failure cause: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_exact_stdout_limit_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "printf '[]'");
+        let output = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_secs(5),
+            2,
+        )
+        .await
+        .expect("exact-limit output must remain accepted");
+        assert_eq!(output, "[]");
+    }
+
+    #[tokio::test]
+    async fn page_nonzero_exit_still_omits_stderr_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "SYNTHETIC_STDERR_NOT_A_SECRET";
+        let program = executable(
+            dir.path(),
+            &format!("printf '%s' '{sentinel}' >&2\nexit 23"),
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("nonzero fixture must fail");
+        assert_eq!(error.to_string(), "gh issue list failed");
+        assert!(!error.to_string().contains(sentinel));
+    }
 }
 
 /// Look up an existing `commit` note by its `properties.sha` (natural-key
@@ -2901,7 +3049,12 @@ async fn gh_json_with_command(
         .env("GH_PROMPT_DISABLED", "1");
     let output = run_ingest_command(command, timeout, stdout_limit)
         .await
-        .context("running gh")?;
+        .map_err(|error| {
+            // IngestCommandError displays only fixed, credential-safe reasons.
+            // Public ingest reports use ordinary Display, not the cause chain.
+            let context = format!("running gh: {error}");
+            anyhow::Error::new(error).context(context)
+        })?;
     if !output.status.success() {
         let operation = args.get(0..2).unwrap_or(args).join(" ");
         return Err(anyhow!("gh {operation} failed"));
