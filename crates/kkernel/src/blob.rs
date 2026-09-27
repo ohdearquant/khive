@@ -4,10 +4,7 @@ use crate::sql::sql;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::Metadata;
-use std::path::PathBuf;
-
-#[cfg(all(test, unix))]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -298,6 +295,7 @@ fn open_roster(paths: Vec<(String, PathBuf)>) -> Result<Vec<Member>> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("roster member {name:?}: resolve {}", path.display()))?;
+        ensure_reportable_path(&name, &canonical)?;
         let metadata = canonical
             .metadata()
             .with_context(|| format!("roster member {name:?}: stat {}", canonical.display()))?;
@@ -344,6 +342,15 @@ fn open_roster(paths: Vec<(String, PathBuf)>) -> Result<Vec<Member>> {
         });
     }
     Ok(members)
+}
+
+fn ensure_reportable_path(name: &str, canonical: &Path) -> Result<()> {
+    if canonical.to_str().is_none() {
+        bail!(
+            "roster member {name:?}: canonical path {canonical:?} contains non-UTF-8 bytes and cannot be represented in the JSON report"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -468,6 +475,21 @@ mod tests {
 
     use super::*;
     use khive_db::StorageBackend;
+
+    #[test]
+    fn non_utf8_canonical_path_is_refused_with_member_context() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"/roster/archive_\xff.db".to_vec()));
+        assert!(non_utf8.to_str().is_none());
+        let error = ensure_reportable_path("--with-db archive", &non_utf8)
+            .expect_err("the JSON report cannot represent a byte-named roster member");
+        let message = error.to_string();
+        assert!(message.contains("--with-db archive"), "{message}");
+        assert!(message.contains("non-UTF-8"), "{message}");
+        assert!(ensure_reportable_path("main", Path::new("/roster/archive.db")).is_ok());
+    }
 
     fn fixture(path: &Path) -> StorageBackend {
         let backend = StorageBackend::sqlite(path).expect("create fixture database");

@@ -497,7 +497,9 @@ database with a writable `-shm` is refused; a nonempty `-wal` without a frozen
 read-only `-shm` is also refused. The writable `-shm` permission check is an
 open-time heuristic, not proof that no writer can start later. A missing or
 unreadable member or a probe error fails the whole command without printing a
-partial row list.
+partial row list. A member whose canonical path is not UTF-8 is refused before
+opening, with its roster name in the error, because that path cannot be
+represented in the JSON header.
 
 The report records which members were probed and when. Its counters describe
 observations over stable inputs, not one atomic snapshot across all databases.
