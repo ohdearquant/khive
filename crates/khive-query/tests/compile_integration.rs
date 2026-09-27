@@ -1671,6 +1671,212 @@ mod substrate_labels {
     }
 
     #[test]
+    fn repeated_name_predicates_with_ascii_case_variants_preserve_matches() {
+        let conn = fixture_db_with_edge();
+        for relation in ["extends", "extends+"] {
+            for (var, expected, upper, lower) in [
+                ("a", "e-fixture-1", "X", "x"),
+                ("b", "e-fixture-2", "Y", "y"),
+            ] {
+                for (first, second) in [(upper, lower), (lower, upper)] {
+                    let single = format!(
+                        "SELECT ?{var} WHERE {{ ?a :{relation} ?b . \
+                         ?{var} :name '{first}' . }}"
+                    );
+                    let control = parse(QueryLanguage::Sparql, &single).unwrap();
+                    assert_eq!(
+                        run(&conn, &compile(&control, &scoped("local")).unwrap()),
+                        vec![expected.to_string()],
+                        "single predicate must match: {single}"
+                    );
+                    let repeated = format!(
+                        "SELECT ?{var} WHERE {{ ?a :{relation} ?b . \
+                         ?{var} :name '{first}' . ?{var} :name '{second}' . }}"
+                    );
+                    let query = parse(QueryLanguage::Sparql, &repeated).unwrap_or_else(|e| {
+                        panic!("NOCASE-equivalent predicates: {repeated}: {e}")
+                    });
+                    assert_eq!(
+                        run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                        vec![expected.to_string()],
+                        "a redundant equivalent predicate must preserve matches: {repeated}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_json_string_predicates_with_ascii_case_variants_preserve_matches() {
+        let conn = fixture_db_with_edge();
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET properties = ?1 WHERE id = ?2",
+                rusqlite::params![r#"{"domain":"Attention"}"#, "e-fixture-1"],
+            )
+            .unwrap(),
+            1
+        );
+        for relation in ["extends", "extends+"] {
+            let control_text =
+                format!("SELECT ?a WHERE {{ ?a :{relation} ?b . ?a :domain 'attention' . }}");
+            let control = parse(QueryLanguage::Sparql, &control_text).unwrap();
+            assert_eq!(
+                run(&conn, &compile(&control, &scoped("local")).unwrap()),
+                vec!["e-fixture-1"]
+            );
+            for constraints in [
+                "?a :domain 'Attention' . ?a :domain 'attention' .",
+                "?a :domain 'attention' . ?a :domain 'Attention' .",
+                "?a :domain :attention . ?a :domain 'ATTENTION' .",
+                "?a :domain 'ATTENTION' . ?a :domain :attention .",
+            ] {
+                let text = format!("SELECT ?a WHERE {{ ?a :{relation} ?b . {constraints} }}");
+                let query = parse(QueryLanguage::Sparql, &text)
+                    .unwrap_or_else(|e| panic!("equivalent JSON-property predicates: {text}: {e}"));
+                assert_eq!(
+                    run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                    vec!["e-fixture-1"],
+                    "query: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_entity_type_predicates_remain_case_sensitive() {
+        let conn = fixture_db_with_edge();
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET entity_type = 'Widget' WHERE id = 'e-fixture-1'",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        for (literal, should_match) in [("Widget", true), ("widget", false)] {
+            let text =
+                format!("SELECT ?a WHERE {{ ?a :entity_type '{literal}' . ?a :extends ?b . }}");
+            let query = parse(QueryLanguage::Sparql, &text).unwrap();
+            let expected: Vec<String> = if should_match {
+                vec!["e-fixture-1".into()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                expected
+            );
+        }
+        for (first, second) in [("Widget", "widget"), ("widget", "Widget")] {
+            let text = format!(
+                "SELECT ?a WHERE {{ ?a :entity_type '{first}' . \
+                 ?a :entity_type '{second}' . ?a :extends ?b . }}"
+            );
+            let err = parse(QueryLanguage::Sparql, &text).unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting constraints"), "{err}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_case_and_distinct_name_predicates_remain_conflicting() {
+        let conn = fixture_db_with_edge();
+        assert_eq!(
+            conn.execute(
+                "UPDATE entities SET name = ?1 WHERE id = ?2",
+                rusqlite::params!["É", "e-fixture-1"],
+            )
+            .unwrap(),
+            1
+        );
+        for (literal, should_match) in [("É", true), ("é", false)] {
+            let text = format!("SELECT ?a WHERE {{ ?a :name '{literal}' . ?a :extends ?b . }}");
+            let query = parse(QueryLanguage::Sparql, &text).unwrap();
+            let expected: Vec<String> = if should_match {
+                vec!["e-fixture-1".into()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                run(&conn, &compile(&query, &scoped("local")).unwrap()),
+                expected
+            );
+        }
+        for (first, second) in [("É", "é"), ("x", "y")] {
+            let text = format!(
+                "SELECT ?a WHERE {{ ?a :name '{first}' . \
+                 ?a :name '{second}' . ?a :extends ?b . }}"
+            );
+            let err = parse(QueryLanguage::Sparql, &text).unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting constraints"), "{err}");
+        }
+    }
+
+    fn insert_path_node(conn: &Connection, id: &str, namespace: &str, deleted_at: Option<i64>) {
+        conn.execute(
+            "INSERT INTO entities
+                (id, namespace, kind, name, description, properties, tags,
+                 created_at, updated_at, deleted_at, entity_type)
+             VALUES (?1, ?2, 'concept', ?1, NULL, '{}', '[]', 0, 0, ?3, NULL)",
+            rusqlite::params![id, namespace, deleted_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_local_path_edge(conn: &Connection, id: &str, source: &str, target: &str) {
+        conn.execute(
+            "INSERT INTO graph_edges
+                (namespace, id, source_id, target_id, relation, weight,
+                 created_at, updated_at, deleted_at, metadata, target_backend)
+             VALUES ('local', ?1, ?2, ?3, 'extends', 1.0, 0, 0, NULL, NULL, NULL)",
+            rusqlite::params![id, source, target],
+        )
+        .unwrap();
+    }
+
+    fn depth_two_from_fixture(conn: &Connection) -> Vec<String> {
+        let query = parse(
+            QueryLanguage::Gql,
+            "MATCH (a)-[:extends*2..2]->(b) \
+             WHERE a.id = 'e-fixture-1' RETURN b.id",
+        )
+        .unwrap();
+        run(conn, &compile(&query, &scoped("local")).unwrap())
+    }
+
+    #[test]
+    fn variable_length_seed_hop_cannot_cross_soft_deleted_node() {
+        let conn = fixture_db();
+        insert_path_node(&conn, "seed-deleted", "local", Some(1));
+        insert_path_node(&conn, "behind-deleted", "local", None);
+        insert_path_node(&conn, "seed-live", "local", None);
+        insert_path_node(&conn, "behind-live", "local", None);
+        insert_local_path_edge(&conn, "edge-deleted-1", "e-fixture-1", "seed-deleted");
+        insert_local_path_edge(&conn, "edge-deleted-2", "seed-deleted", "behind-deleted");
+        insert_local_path_edge(&conn, "edge-live-1", "e-fixture-1", "seed-live");
+        insert_local_path_edge(&conn, "edge-live-2", "seed-live", "behind-live");
+
+        assert_eq!(depth_two_from_fixture(&conn), vec!["behind-live"]);
+    }
+
+    #[test]
+    fn variable_length_seed_hop_cannot_cross_out_of_scope_node() {
+        let conn = fixture_db();
+        insert_path_node(&conn, "seed-foreign", "other", None);
+        insert_path_node(&conn, "behind-foreign", "local", None);
+        insert_path_node(&conn, "seed-live", "local", None);
+        insert_path_node(&conn, "behind-live", "local", None);
+        insert_local_path_edge(&conn, "edge-foreign-1", "e-fixture-1", "seed-foreign");
+        insert_local_path_edge(&conn, "edge-foreign-2", "seed-foreign", "behind-foreign");
+        insert_local_path_edge(&conn, "edge-live-1", "e-fixture-1", "seed-live");
+        insert_local_path_edge(&conn, "edge-live-2", "seed-live", "behind-live");
+
+        assert_eq!(depth_two_from_fixture(&conn), vec!["behind-live"]);
+    }
+
+    #[test]
     fn entity_substrate_label_compiles_without_unsatisfiable_kind_filter() {
         let q = parse(
             QueryLanguage::Gql,
