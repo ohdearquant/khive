@@ -499,3 +499,47 @@ update their import from `khive_db::EmbeddingModelRegistryRecord` to
 The `_embedding_models` table schema, migration versions V14/V16/V17, the registry query
 logic, and all other ADR-043 mechanics are unchanged. Only the return type of the one public
 API method changes.
+
+## Amendment A2: Amendment A1's `EmbeddingModelRecord` is not implemented (2026-09-25)
+
+**Status**: Accepted (2026-09-25)
+
+**Context.** Amendment A1 says that "ADR-071 §5 introduces a runtime-owned type,
+`EmbeddingModelRecord`, in `crates/khive-runtime/src/embedding.rs`" and that
+`KhiveRuntime::list_embedding_models` "returns `RuntimeResult<Vec<EmbeddingModelRecord>>`
+after this change". A1 landed with ADR-071 in #330. The change it describes has not been
+made:
+
+- `crates/khive-runtime/src/embedding.rs` has no history in this repository.
+- `EmbeddingModelRecord` and `EmbeddingModelStatus` have no match under `crates/`, and no
+  commit has ever added either name there.
+- `KhiveRuntime::list_embedding_models` (`crates/khive-runtime/src/runtime.rs`) returns
+  `RuntimeResult<Vec<khive_db::EmbeddingModelRegistryRecord>>`. The record type is defined in
+  `crates/khive-db/src/migrations.rs` and re-exported from `khive-db`.
+- The callers named in A1, `kkernel engine list` and `kkernel engine status`, read the
+  registry through that method (`fetch_model_records` in `crates/kkernel/src/engine.rs`).
+
+ADR-071 §5 and Phase 5 of its Boundary-Repair Plan specify the type change, and ADR-071 owns
+it. A1 records the effect on this ADR in the past tense, so it reads as completed.
+
+**Decision (accepted).** A1 describes a deferred change owned by ADR-071 §5 and is not yet
+implemented. Until ADR-071 Phase 5 lands, the shipped contract of the Implementation section
+is the sentence A1 quotes: the runtime exposes read access through
+`KhiveRuntime::list_embedding_models`, whose element type is
+`khive_db::EmbeddingModelRegistryRecord`. When Phase 5 lands, A1 applies as written. This
+amendment does not change ADR-071.
+
+**Alternatives considered.**
+
+- Retract A1 and declare the `khive-db` record type the permanent API. ADR-071 §5 is accepted
+  and owns this decision, so a consumer ADR overruling it would leave the two records in
+  conflict. ADR-071's reason, that the runtime's public API should not expose a backend
+  crate's type, still applies to the code as it stands.
+- Leave A1 unmarked. It names a file and a type that do not exist, and a reader following it
+  looks for code that is not there.
+
+**Consequences.** A1 reads as pending. Callers of `list_embedding_models` keep using the
+`khive-db` record type until ADR-071 Phase 5 changes it. ADR-071's own text still presents
+§5 as a decision without an implementation note; recording that belongs to ADR-071.
+
+**Refs.** #330.

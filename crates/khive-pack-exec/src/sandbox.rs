@@ -29,9 +29,9 @@ pub const SYSTEM_READ_ROOTS: &[&str] = &[
     "/dev",
 ];
 
-/// Binaries the run verb refuses by canonical file name regardless of the
-/// registry label (ADR-181 Amendment 1 item 8): version control never runs
-/// inside a sandbox, it runs through the git verbs.
+/// Registered binaries the run verb refuses by canonical file name regardless
+/// of registry label (ADR-181 Amendment 1 item 8). The seatbelt also refuses
+/// launches under these names; other names and paths are outside these matches.
 pub const FORBIDDEN_BASENAMES: &[&str] = &["git", "gh"];
 
 /// The sandbox launcher. Every run is a child of this binary, so its absence
@@ -170,6 +170,22 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
         reads.push(format!("(subpath {})", quote(root)));
     }
     reads.push(format!("(subpath {})", quote(run_dir)));
+    // Metadata is a read too. Permit it for the same trees and their exact
+    // ancestor directories, which dyld and pathname traversal must inspect.
+    // A bare file-read-metadata allowance would expose every host path.
+    let mut metadata = reads.clone();
+    for root in SYSTEM_READ_ROOTS
+        .iter()
+        .map(|root| Path::new(*root))
+        .chain(read_roots.iter().map(PathBuf::as_path))
+        .chain(std::iter::once(run_dir))
+    {
+        for ancestor in root.ancestors().skip(1) {
+            metadata.push(format!("(literal {})", quote(ancestor)));
+        }
+    }
+    metadata.sort();
+    metadata.dedup();
     let mut maps: Vec<String> = ["/System", "/usr", "/Library"]
         .iter()
         .map(|p| format!("(subpath {})", quote(Path::new(p))))
@@ -179,8 +195,8 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
     }
     let run = format!("(subpath {})", quote(run_dir));
     maps.push(run.clone());
-    // ADR-181 Amendment 3 item 3: version control and the never set are
-    // refused by the kernel, not only at the registered binary.
+    // ADR-181 Amendment 9: these name and path matches apply to each sandboxed
+    // launch, not only to the registered binary.
     let mut denies: Vec<String> = vec![
         "(regex #\"(^|/)(git|gh)$\")".to_string(),
         "(regex #\"/git-[^/]+$\")".to_string(),
@@ -199,13 +215,14 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
          (allow sysctl-read)\n\
          (allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n\
          (allow file-ioctl (literal \"/dev/dtracehelper\"))\n\
-         (allow file-read-metadata)\n\
+         (allow file-read-metadata {metadata})\n\
          (allow file-read* file-test-existence (literal \"/\") {reads})\n\
          (allow file-map-executable {maps})\n\
          (allow file-write* {run})\n\
          (allow file-write-data (literal \"/dev/null\"))\n",
         denies = denies.join(" "),
         reads = reads.join(" "),
+        metadata = metadata.join(" "),
         maps = maps.join(" "),
         run = run,
     )
@@ -236,10 +253,13 @@ impl std::fmt::Display for BinaryRefusal {
                 basename,
             } => write!(
                 f,
-                "binary resolves to {canonical:?} ({basename}); version control never runs inside exec.run"
+                "registered binary resolves to forbidden path {canonical:?} ({basename})"
             ),
             BinaryRefusal::Never { canonical } => {
-                write!(f, "binary resolves to {canonical:?} which is in the [exec] never set")
+                write!(
+                    f,
+                    "binary resolves to {canonical:?} which is in the [exec] never set"
+                )
             }
         }
     }
@@ -308,6 +328,63 @@ mod tests {
         assert!(p.contains("(subpath \"/opt/py\")"));
         assert!(!p.contains("/Users"));
         assert!(!p.contains("network"));
+    }
+
+    #[test]
+    fn profile_metadata_reads_use_allowed_trees_and_exact_ancestors() {
+        let profile = render_profile(
+            Path::new("/private/tmp/run-1"),
+            &[PathBuf::from("/opt/py")],
+            &[],
+        );
+        let metadata_rule = profile
+            .lines()
+            .find(|line| line.trim_start().starts_with("(allow file-read-metadata "))
+            .expect("scoped metadata rule");
+        assert!(metadata_rule.contains("(subpath \"/private/tmp/run-1\")"));
+        assert!(metadata_rule.contains("(subpath \"/opt/py\")"));
+        assert!(metadata_rule.contains("(literal \"/private/tmp\")"));
+        assert!(metadata_rule.contains("(literal \"/opt\")"));
+        assert!(!profile.contains("(allow file-read-metadata)"));
+        assert!(!metadata_rule.contains("(subpath \"/Users\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_metadata_probe_is_limited_to_the_run_tree() {
+        if !Path::new(SANDBOX_EXEC).exists() {
+            return;
+        }
+        let run = tempfile::tempdir().expect("run directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let run_dir = std::fs::canonicalize(run.path()).expect("canonical run directory");
+        let inside_file = run_dir.join("inside");
+        let outside_file = outside.path().join("outside");
+        std::fs::write(&inside_file, b"inside").expect("inside fixture");
+        std::fs::write(&outside_file, b"outside").expect("outside fixture");
+        let outside_file = std::fs::canonicalize(outside_file).expect("canonical outside file");
+        let profile_path = run_dir.join("profile.sb");
+        std::fs::write(&profile_path, render_profile(&run_dir, &[], &[])).expect("write profile");
+
+        let stat = |path: &Path| {
+            std::process::Command::new(SANDBOX_EXEC)
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/usr/bin/stat")
+                .arg("-f")
+                .arg("%z")
+                .arg(path)
+                .output()
+                .expect("launch sandboxed stat")
+        };
+        assert!(
+            stat(&inside_file).status.success(),
+            "run-tree control must work"
+        );
+        assert!(
+            !stat(&outside_file).status.success(),
+            "metadata outside the allowed tree must be refused"
+        );
     }
 
     #[test]

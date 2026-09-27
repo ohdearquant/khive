@@ -1,17 +1,171 @@
 //! `BrainPack` struct and inventory factory.
 
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_types::{HandlerDef, Pack};
 
-use khive_brain_core::{BrainSignal, BrainState, ServeAttribution};
+use khive_brain_core::{BrainSignal, BrainState, ProfileLifecycle, ServeAttribution};
 
 use crate::handlers::BRAIN_HANDLERS;
 use crate::persist;
 
 /// Default entity cache capacity for the `balanced-recall-v1` per-entity posterior state.
 pub const ENTITY_CACHE_CAPACITY: usize = 10_000;
+
+/// A contended dispatch hook never waits behind a brain handler's SQL work.
+/// The handoff is process-local, like the hook's existing in-memory updates.
+pub(crate) const MAX_DEFERRED_HOOK_SIGNALS: usize = 1024;
+
+struct HookQueueState {
+    pending: VecDeque<(String, BrainSignal)>,
+    worker_running: bool,
+    dropped: u64,
+}
+
+pub(crate) struct HookQueue(Mutex<HookQueueState>);
+
+impl HookQueue {
+    fn new() -> Self {
+        Self(Mutex::new(HookQueueState {
+            pending: VecDeque::new(),
+            worker_running: false,
+            dropped: 0,
+        }))
+    }
+
+    /// Keep the most recent bounded handoff signals and elect one drainer.
+    fn enqueue(&self, namespace: String, signal: BrainSignal) -> bool {
+        let mut queue = self.0.lock().unwrap();
+        if queue.pending.len() == MAX_DEFERRED_HOOK_SIGNALS {
+            queue.pending.pop_front();
+            queue.dropped = queue.dropped.saturating_add(1);
+        }
+        queue.pending.push_back((namespace, signal));
+        if queue.worker_running {
+            false
+        } else {
+            queue.worker_running = true;
+            true
+        }
+    }
+
+    pub(crate) fn worker_running(&self) -> bool {
+        self.0.lock().unwrap().worker_running
+    }
+
+    /// The empty check and worker reset share the queue lock, so an enqueue
+    /// after the reset always elects a new drainer rather than stranding rows.
+    fn take_batch_or_stop(&self) -> Option<Vec<(String, BrainSignal)>> {
+        let mut queue = self.0.lock().unwrap();
+        if queue.pending.is_empty() {
+            queue.worker_running = false;
+            None
+        } else {
+            Some(queue.pending.drain(..).collect())
+        }
+    }
+
+    /// A brain dispatch that owns the gate may claim queued signals before its
+    /// handler reads state. Leave the worker elected: it will observe an empty
+    /// queue and retire, or process signals that arrived during the handler.
+    pub(crate) fn drain_pending(&self) -> Vec<(String, BrainSignal)> {
+        self.0.lock().unwrap().pending.drain(..).collect()
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.0.lock().unwrap().dropped
+    }
+}
+
+#[cfg(test)]
+mod hook_queue_tests {
+    use super::*;
+    use khive_runtime::{Namespace, PackRuntime, VerbRegistryBuilder};
+    use serde_json::json;
+
+    #[test]
+    fn hook_queue_worker_status_tracks_election_and_drain() {
+        let queue = HookQueue::new();
+        assert!(!queue.worker_running());
+        assert!(queue.enqueue("local".to_string(), BrainSignal::Irrelevant));
+        assert!(queue.worker_running());
+        assert_eq!(queue.take_batch_or_stop().unwrap().len(), 1);
+        assert!(
+            queue.worker_running(),
+            "worker remains elected until empty check"
+        );
+        assert!(queue.take_batch_or_stop().is_none());
+        assert!(!queue.worker_running());
+    }
+
+    #[tokio::test]
+    async fn hook_queue_caps_pending_signals_and_reports_drops() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let brain = BrainPack::new(runtime);
+        for index in 0..(MAX_DEFERRED_HOOK_SIGNALS + 3) {
+            brain
+                .hook_queue
+                .enqueue(format!("namespace-{index}"), BrainSignal::Irrelevant);
+        }
+
+        let state = brain.handle_state(json!({})).await.expect("brain state");
+        assert_eq!(
+            state["dispatch_counters"]["contended_hook_signals_dropped"],
+            json!(3)
+        );
+        let pending = brain
+            .hook_queue
+            .take_batch_or_stop()
+            .expect("pending batch");
+        assert_eq!(pending.len(), MAX_DEFERRED_HOOK_SIGNALS);
+        assert_eq!(pending.first().unwrap().0, "namespace-3");
+        assert_eq!(
+            pending.last().unwrap().0,
+            format!("namespace-{}", MAX_DEFERRED_HOOK_SIGNALS + 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_dispatch_applies_queued_cold_signal_before_handler_reads_state() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let brain = BrainPack::new(runtime.clone());
+        // Model a contended hook after worker election but before the worker
+        // acquires the dispatch gate. The brain dispatch wins that gate.
+        assert!(brain
+            .hook_queue
+            .enqueue("local".into(), BrainSignal::RecallMiss));
+
+        let registry = VerbRegistryBuilder::new()
+            .build()
+            .expect("minimal registry");
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        brain
+            .dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .expect("promote local namespace");
+
+        assert_eq!(brain.snapshot().balanced_recall.total_events, 1);
+        assert!(brain.hook_queue.drain_pending().is_empty());
+    }
+}
+
+fn apply_hook_signal(
+    persistence: &Mutex<persist::PersistenceTracker>,
+    state: &Mutex<BrainState>,
+    namespace: &str,
+    signal: &BrainSignal,
+) {
+    let target = {
+        let mut tracker = persistence.lock().unwrap();
+        tracker.route_signal(namespace, signal, ENTITY_CACHE_CAPACITY)
+    };
+    if matches!(target, persist::ApplyTarget::ActiveSlot) {
+        let mut state = state.lock().unwrap();
+        crate::apply_dispatch_signal(&mut state, signal);
+    }
+}
 
 // Test-only hook that fires inside dispatch(), after ensure_loaded returns and
 // before the handler acquires self.state.  Lets tests inject a concurrent
@@ -113,6 +267,15 @@ pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal
         _ => None,
     };
 
+    let credited_profile = serving_profile.unwrap_or("balanced-recall-v1");
+    if state
+        .profiles
+        .get(credited_profile)
+        .is_some_and(|record| record.lifecycle == ProfileLifecycle::Archived)
+    {
+        return;
+    }
+
     match serving_profile {
         None | Some("balanced-recall-v1") => {
             state.balanced_recall.apply_signal(signal);
@@ -145,9 +308,9 @@ pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal
 pub struct BrainPack {
     pub(crate) runtime: KhiveRuntime,
     /// Profile registry + active balanced-recall state.
-    pub(crate) state: Mutex<BrainState>,
+    pub(crate) state: Arc<Mutex<BrainState>>,
     /// Tracks loaded namespaces, durable snapshot generations, and dirty counts.
-    pub(crate) persistence: Mutex<persist::PersistenceTracker>,
+    pub(crate) persistence: Arc<Mutex<persist::PersistenceTracker>>,
     /// Serialises the (ensure_loaded → handler) pair so no namespace swap can
     /// occur between the two steps.  Must be a tokio async mutex because the
     /// guard is held across .await points inside dispatch().
@@ -155,7 +318,8 @@ pub struct BrainPack {
     /// Lock order: dispatch_gate (outermost) → persistence → state.
     /// Nothing inside ensure_loaded or any handler acquires dispatch_gate,
     /// so there is no cycle and no deadlock risk.
-    pub(crate) dispatch_gate: tokio::sync::Mutex<()>,
+    pub(crate) dispatch_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) hook_queue: Arc<HookQueue>,
 }
 
 impl Pack for BrainPack {
@@ -174,10 +338,45 @@ impl BrainPack {
         let state = BrainState::new(ENTITY_CACHE_CAPACITY);
         Self {
             runtime,
-            state: Mutex::new(state),
-            persistence: Mutex::new(persist::PersistenceTracker::new()),
-            dispatch_gate: tokio::sync::Mutex::new(()),
+            state: Arc::new(Mutex::new(state)),
+            persistence: Arc::new(Mutex::new(persist::PersistenceTracker::new())),
+            dispatch_gate: Arc::new(tokio::sync::Mutex::new(())),
+            hook_queue: Arc::new(HookQueue::new()),
         }
+    }
+
+    /// Called only while holding `dispatch_gate`; the namespace slot cannot
+    /// change between the tracker routing decision and state application.
+    pub(crate) fn apply_hook_signal(&self, namespace: &str, signal: &BrainSignal) {
+        apply_hook_signal(&self.persistence, &self.state, namespace, signal);
+    }
+
+    /// A contended hook hands its typed signal to one bounded background
+    /// drainer. The worker takes the same gate before routing, preserving the
+    /// existing namespace and serving-profile attribution checks.
+    pub(crate) fn defer_hook_signal(&self, namespace: String, signal: BrainSignal) {
+        if !self.hook_queue.enqueue(namespace, signal) {
+            return;
+        }
+        let queue = Arc::clone(&self.hook_queue);
+        let gate = Arc::clone(&self.dispatch_gate);
+        let persistence = Arc::clone(&self.persistence);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            loop {
+                let _gate = gate.lock().await;
+                let Some(batch) = queue.take_batch_or_stop() else {
+                    break;
+                };
+                for (namespace, signal) in batch {
+                    apply_hook_signal(&persistence, &state, &namespace, &signal);
+                }
+                // Relinquish the gate after each bounded batch so a hot hook
+                // stream cannot indefinitely starve brain verb dispatches.
+                drop(_gate);
+                tokio::task::yield_now().await;
+            }
+        });
     }
 
     #[cfg(test)]
