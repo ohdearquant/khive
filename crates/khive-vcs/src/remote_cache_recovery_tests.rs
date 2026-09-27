@@ -1,4 +1,4 @@
-use super::{publish_remote_cache, MetaJson, PublishFailAt, RemoteName};
+use super::{publish_remote_cache, MetaJson, PublishFailAt, RemoteName, REMOTE_BACKUP_OWNER_FILE};
 use std::path::{Path, PathBuf};
 
 fn fixture_meta(label: &str) -> MetaJson {
@@ -28,6 +28,98 @@ fn snapshot(path: &Path) -> Vec<Vec<u8>> {
 
 fn distinct_remote_name() -> String {
     format!("upstream.replaced-{}", u64::from(std::process::id()) + 1)
+}
+
+fn contributor_directory(root: &Path) -> PathBuf {
+    let directory = root.join("upstream.replaced~7");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("notes.md"), "contributor content\n").unwrap();
+    directory
+}
+
+#[test]
+fn backup_named_contributor_directory_survives_with_existing_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("remotes");
+    let target = publish(&root, "upstream", "old-target");
+    let contributor = contributor_directory(&root);
+
+    publish(&root, "upstream", "new-target");
+
+    assert_eq!(
+        std::fs::read_to_string(contributor.join("notes.md")).unwrap(),
+        "contributor content\n"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&snapshot(&target)[2]).unwrap()["git_ref"],
+        "new-target"
+    );
+}
+
+#[test]
+fn backup_named_contributor_directory_survives_without_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("remotes");
+    std::fs::create_dir_all(&root).unwrap();
+    let contributor = contributor_directory(&root);
+
+    let target = publish(&root, "upstream", "first-target");
+
+    assert_eq!(
+        std::fs::read_to_string(contributor.join("notes.md")).unwrap(),
+        "contributor content\n"
+    );
+    assert!(!target.join("notes.md").exists());
+    assert!(target.join("meta.json").exists());
+}
+
+#[test]
+fn unrecognized_marker_does_not_authorize_backup_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("remotes");
+    std::fs::create_dir_all(&root).unwrap();
+    let contributor = contributor_directory(&root);
+    std::fs::write(
+        contributor.join(REMOTE_BACKUP_OWNER_FILE),
+        "not a cache marker\n",
+    )
+    .unwrap();
+
+    let target = publish(&root, "upstream", "first-target");
+
+    assert!(contributor.join("notes.md").exists());
+    assert!(contributor.join(REMOTE_BACKUP_OWNER_FILE).exists());
+    assert!(!target.join("notes.md").exists());
+}
+
+#[test]
+fn backup_path_collision_never_replaces_contributor_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("remotes");
+    let target = publish(&root, "upstream", "old-target");
+    let backup = root.join(format!("upstream.replaced~{}", std::process::id()));
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("notes.md"), "contributor content\n").unwrap();
+
+    let error = publish_remote_cache(
+        &root,
+        "upstream",
+        &[],
+        &[],
+        &fixture_meta("new-target"),
+        None,
+    )
+    .expect_err("an occupied backup path must stop the swap");
+
+    assert!(error.to_string().contains("already exists"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(backup.join("notes.md")).unwrap(),
+        "contributor content\n"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&snapshot(&target)[2]).unwrap()["git_ref"],
+        "old-target"
+    );
 }
 
 #[test]

@@ -1503,6 +1503,34 @@ async fn find_commit_by_sha(
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
+/// Include tombstones: a deleted annotation is a deliberate curation choice,
+/// not a missing link for replay to recreate.
+async fn commit_annotation_targets(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    commit_id: Uuid,
+) -> Result<BTreeSet<Uuid>> {
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.map_err(anyhow::Error::new)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: sql!("commit_annotation_targets_select").into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(commit_id.to_string()),
+            ],
+            label: Some("git_ingest_commit_annotation_targets".into()),
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
+    rows.iter()
+        .map(|row| {
+            row_uuid(row)
+                .ok_or_else(|| anyhow!("stored commit annotation has an invalid target ID"))
+        })
+        .collect()
+}
+
 /// Look up an existing `issue`/`pull_request` note by its `properties.number`,
 /// scoped by kind + namespace + `project_id` (GitHub numbers are
 /// repository-scoped — see crates/khive-pack-git/docs/api/ingest.md).
@@ -2847,15 +2875,18 @@ async fn ingest_commits(
 
         if let Some(existing) = existing {
             // A SHA is shared across project anchors. The natural-key hit
-            // skips note creation, but it must still materialize this
-            // project's annotations from the same snapshot/path map as the
-            // create path before advancing this project's checkpoint.
+            // skips note creation, but still adds this project's missing
+            // annotations before advancing its checkpoint. Existing live
+            // edges may have curated fields; tombstones stay deleted.
+            let existing_targets = commit_annotation_targets(runtime, token, existing).await?;
             let links = annotates
                 .iter()
-                .map(|target| LinkSpec {
+                .map(|target| Uuid::parse_str(target).expect("annotation target is a UUID"))
+                .filter(|target| !existing_targets.contains(target))
+                .map(|target_id| LinkSpec {
                     namespace: None,
                     source_id: existing,
-                    target_id: Uuid::parse_str(target).expect("annotation target is a UUID"),
+                    target_id,
                     relation: EdgeRelation::Annotates,
                     weight: 1.0,
                     metadata: None,

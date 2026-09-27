@@ -740,6 +740,32 @@ async fn shared_commit_note_links_second_project_and_new_snapshot_module_once() 
         assert_eq!(rows[0]["id"], commit_id.to_string());
     }
 
+    let curated = registry
+        .dispatch(
+            "link",
+            json!({
+                "source_id": commit_id.to_string(),
+                "target_id": project_b.to_string(),
+                "relation": "annotates",
+                "weight": 0.35,
+                "metadata": {"curator": "retained on replay"},
+            }),
+        )
+        .await
+        .expect("curate second project annotation");
+    let curated_id = Uuid::parse_str(curated["id"].as_str().expect("curated edge id"))
+        .expect("curated edge UUID");
+    let before_replay = rt
+        .get_edge_including_deleted(&token, curated_id)
+        .await
+        .expect("read curated edge")
+        .expect("curated edge exists");
+    assert_eq!(before_replay.weight, 0.35);
+    assert_eq!(
+        before_replay.metadata,
+        Some(json!({"curator": "retained on replay"}))
+    );
+
     let sql = rt.sql();
     let mut writer = sql.writer().await.expect("cursor writer");
     writer
@@ -755,6 +781,16 @@ async fn shared_commit_note_links_second_project_and_new_snapshot_module_once() 
         .await
         .expect("replay second project");
     assert_eq!(replay.commits_skipped_existing, 1, "{replay:?}");
+    let after_replay = rt
+        .get_edge_including_deleted(&token, curated_id)
+        .await
+        .expect("read edge after replay")
+        .expect("curated edge remains");
+    assert_eq!(after_replay.id, before_replay.id);
+    assert_eq!(after_replay.created_at, before_replay.created_at);
+    assert_eq!(after_replay.updated_at, before_replay.updated_at);
+    assert_eq!(after_replay.weight, before_replay.weight);
+    assert_eq!(after_replay.metadata, before_replay.metadata);
     assert_eq!(
         incoming_annotating_ids(&registry, project_b).await,
         std::collections::BTreeSet::from([commit_id.to_string()]),
@@ -766,11 +802,11 @@ async fn shared_commit_note_links_second_project_and_new_snapshot_module_once() 
     assert_eq!(list_items(&rows).len(), 1, "the shared note stays singular");
 }
 
-/// A failed annotation upsert must leave the second project's cursor before
-/// the shared SHA, so a later pass can repair it instead of stranding it.
+/// A tombstoned annotation is a curation choice. Replaying a shared commit
+/// must skip it, create other missing annotations, and advance the cursor.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-async fn shared_commit_link_refusal_stalls_second_project_cursor() {
+async fn shared_commit_replay_skips_tombstone_and_creates_missing_module_link() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project_a = create(&registry, json!({"kind": "project", "name": "link-a"})).await;
@@ -791,8 +827,21 @@ async fn shared_commit_link_refusal_stalls_second_project_cursor() {
         .expect("list commits");
     let commit_id = list_items(&commits)[0]["id"].as_str().expect("commit id");
 
-    // An existing tombstone makes the natural-key upsert refuse implicit
-    // resurrection. This is a real link failure without a test-only hook.
+    let module_b = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "link_b_module",
+            "properties": {
+                "source_project": "link-b",
+                "source_path": "src/lib.rs",
+                "source_revision": sha.clone(),
+            }
+        }),
+    )
+    .await;
+
     let edge = registry
         .dispatch(
             "link",
@@ -810,22 +859,25 @@ async fn shared_commit_link_refusal_stalls_second_project_cursor() {
         .await
         .expect("soft delete edge"));
 
-    let refused = run_ingest(&rt, &token, &registry, options(project_b))
+    let replay = run_ingest(&rt, &token, &registry, options(project_b))
         .await
-        .expect("refused link is reported as stalled ingest");
-    assert!(refused.cursor_stalled, "{refused:?}");
-    assert_eq!(refused.commits_skipped_existing, 0, "{refused:?}");
-    assert_eq!(read_git_cursor(&rt, project_b, "commits").await, None);
-
-    rt.restore_edge(&token, edge_id)
-        .await
-        .expect("restore edge")
-        .expect("edge exists");
-    let retried = run_ingest(&rt, &token, &registry, options(project_b))
-        .await
-        .expect("retry after link repair");
-    assert_eq!(retried.commits_skipped_existing, 1, "{retried:?}");
+        .expect("tombstone is skipped during replay");
+    assert!(!replay.cursor_stalled, "{replay:?}");
+    assert_eq!(replay.commits_skipped_existing, 1, "{replay:?}");
     assert_eq!(read_git_cursor(&rt, project_b, "commits").await, Some(sha));
+    assert!(incoming_annotating_ids(&registry, project_b)
+        .await
+        .is_empty());
+    assert_eq!(
+        incoming_annotating_ids(&registry, module_b).await,
+        std::collections::BTreeSet::from([commit_id.to_string()]),
+    );
+    let tombstone = rt
+        .get_edge_including_deleted(&token, edge_id)
+        .await
+        .expect("read tombstone")
+        .expect("tombstone remains");
+    assert!(tombstone.deleted_at.is_some());
 }
 
 /// A shared revision can occur in two forks. Revision-plus-path narrows the

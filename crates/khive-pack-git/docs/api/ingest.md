@@ -570,8 +570,9 @@ exists.
 Commit notes are keyed by SHA within a namespace, while commit checkpoints
 belong to individual projects. When a later project walks an already stored
 SHA, the ingester reuses that note and resolves its annotations from the
-later project's frozen snapshot and path map. It upserts the note's links to
+later project's frozen snapshot and path map. It creates only absent links to
 that project and any matching module, document, or pull request before
-advancing the project's checkpoint. Existing live links retain their identity
-on a replay. A refused link freezes the cursor before that SHA so the next
-pass retries it; an explicitly deleted link is not silently resurrected.
+advancing the project's checkpoint. Existing live links retain their identity,
+weight, and metadata on a replay. An explicitly deleted link remains deleted
+without freezing the cursor; a failure to create a missing link freezes the
+cursor before that SHA so the next pass retries it.

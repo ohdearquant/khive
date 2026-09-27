@@ -59,9 +59,11 @@ batching path intact.
    entities, edges, and `meta.json` are written to a staging directory (a
    sibling of the cache dir), then switched into place with one directory
    rename. If the target cache directory already exists, the old one is
-   first renamed to a sibling backup, the new one renamed into place, and
-   the backup removed only after the swap succeeds; if the second rename
-   fails, the backup is restored. Both renames are individually atomic
+   first marked as an owned cache backup and renamed to a sibling backup,
+   the new one renamed into place, and the backup removed only after the swap
+   succeeds; if the second rename fails, the backup is restored. Recovery
+   ignores and reports backup-shaped directories without the ownership marker.
+   Both renames are individually atomic
    `rename(2)` calls, so a reader never observes a mix of old and new
    files — at every instant the cache dir is either the complete old
    directory, briefly absent, or the complete new directory.

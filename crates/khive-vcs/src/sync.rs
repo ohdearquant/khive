@@ -361,6 +361,8 @@ enum PublishFailAt {
 /// the next publish recovers that sibling before replacing it. A reader never
 /// observes a mix of old and new files within the target directory.
 const REMOTE_BACKUP_MARKER: &str = ".replaced~";
+const REMOTE_BACKUP_OWNER_FILE: &str = ".khive-backup-owner";
+const REMOTE_BACKUP_OWNER_HEADER: &str = "khive-vcs remote cache backup v1\n";
 
 fn publish_remote_cache(
     remotes_root: &Path,
@@ -429,6 +431,64 @@ fn atomic_replace_dir(new_dir: &Path, target_dir: &Path) -> Result<()> {
     })
 }
 
+fn backup_owner_contents(backup: &Path) -> Result<String> {
+    let name = backup
+        .file_name()
+        .and_then(|part| part.to_str())
+        .context("cache backup has no UTF-8 name")?;
+    Ok(format!("{REMOTE_BACKUP_OWNER_HEADER}{name}\n"))
+}
+
+fn is_owned_backup(backup: &Path) -> Result<bool> {
+    let marker = backup.join(REMOTE_BACKUP_OWNER_FILE);
+    let metadata = match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", marker.display())),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let contents = std::fs::read_to_string(&marker)
+        .with_context(|| format!("reading {}", marker.display()))?;
+    Ok(contents == backup_owner_contents(backup)?)
+}
+
+fn mark_cache_for_backup(target_dir: &Path, backup: &Path) -> Result<()> {
+    let marker = target_dir.join(REMOTE_BACKUP_OWNER_FILE);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                bail!("cache backup marker {} is not a file", marker.display());
+            }
+            let previous = std::fs::read_to_string(&marker)
+                .with_context(|| format!("reading {}", marker.display()))?;
+            let name = target_dir
+                .file_name()
+                .and_then(|part| part.to_str())
+                .context("cache target has no UTF-8 name")?;
+            let prefix = format!("{REMOTE_BACKUP_OWNER_HEADER}{name}{REMOTE_BACKUP_MARKER}");
+            let suffix = previous
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix('\n'));
+            if !suffix.is_some_and(|value| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                bail!("cache backup marker {} is unrecognized", marker.display());
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("reading {}", marker.display())),
+    }
+    std::fs::write(&marker, backup_owner_contents(backup)?)
+        .with_context(|| format!("writing {}", marker.display()))?;
+    std::fs::File::open(&marker)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("syncing {}", marker.display()))?;
+    fsync_dir_best_effort(target_dir);
+    Ok(())
+}
+
 fn recover_stale_backups(
     target_dir: &Path,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
@@ -454,9 +514,14 @@ fn recover_stale_backups(
             continue;
         };
         if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            // Never follow or remove a symlink that merely resembles our backup.
-            if !entry.file_type()?.is_dir() {
-                bail!("cache backup {} is not a directory", entry.path().display());
+            // The name alone is not proof: repository content may include a
+            // backup-shaped directory. Never follow a symlink while checking.
+            if !entry.file_type()?.is_dir() || !is_owned_backup(&entry.path())? {
+                eprintln!(
+                    "warning: leaving unverified cache backup {} untouched",
+                    entry.path().display()
+                );
+                continue;
             }
             stale.push(entry.path());
         }
@@ -474,6 +539,9 @@ fn recover_stale_backups(
                 stale[0].display(),
                 target_dir.display()
             )
+        })?;
+        std::fs::remove_file(target_dir.join(REMOTE_BACKUP_OWNER_FILE)).with_context(|| {
+            format!("clearing restored cache marker in {}", target_dir.display())
         })?;
     } else {
         // A present target is the published generation; these are leftovers of
@@ -508,27 +576,55 @@ fn atomic_replace_dir_with(
         std::process::id()
     ));
 
-    rename(target_dir, &backup).with_context(|| {
-        format!(
-            "backing up existing cache {} -> {}",
-            target_dir.display(),
+    match std::fs::symlink_metadata(&backup) {
+        Ok(_) => bail!(
+            "cache backup path {} already exists; manual recovery required",
             backup.display()
-        )
-    })?;
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", backup.display())),
+    }
+    mark_cache_for_backup(target_dir, &backup)?;
+
+    if let Err(error) = rename(target_dir, &backup) {
+        let _ = std::fs::remove_file(target_dir.join(REMOTE_BACKUP_OWNER_FILE));
+        return Err(error).with_context(|| {
+            format!(
+                "backing up existing cache {} -> {}",
+                target_dir.display(),
+                backup.display()
+            )
+        });
+    }
 
     match rename(new_dir, target_dir) {
         Ok(()) => {
             // The new generation is already published. A cleanup failure is
             // recoverable on the next publish and must not report this commit
             // as failed.
-            let _ = std::fs::remove_dir_all(&backup);
+            match is_owned_backup(&backup) {
+                Ok(true) => {
+                    let _ = std::fs::remove_dir_all(&backup);
+                }
+                Ok(false) => eprintln!(
+                    "warning: leaving unverified cache backup {} untouched",
+                    backup.display()
+                ),
+                Err(error) => eprintln!(
+                    "warning: leaving cache backup {} untouched: {error:#}",
+                    backup.display()
+                ),
+            }
             Ok(())
         }
         Err(e) => {
             match rename(&backup, target_dir) {
-                Ok(()) => Err(e).with_context(|| {
-                    format!("renaming {} -> {} (old cache restored)", new_dir.display(), target_dir.display())
-                }),
+                Ok(()) => {
+                    let _ = std::fs::remove_file(target_dir.join(REMOTE_BACKUP_OWNER_FILE));
+                    Err(e).with_context(|| {
+                        format!("renaming {} -> {} (old cache restored)", new_dir.display(), target_dir.display())
+                    })
+                }
                 Err(restore) => Err(anyhow!(
                     "renaming {} -> {} failed: {e}; restoring old cache failed: {restore}; old cache remains at {}",
                     new_dir.display(), target_dir.display(), backup.display()
@@ -2820,12 +2916,28 @@ mod tests {
         let remotes_root = tmp.path().join("remotes");
         let cache_dir = publish_old_generation(&remotes_root, "upstream");
         let backup = remotes_root.join("upstream.replaced~99999");
+        mark_cache_for_backup(&cache_dir, &backup).unwrap();
         std::fs::rename(&cache_dir, &backup).unwrap();
+        assert!(is_owned_backup(&backup).unwrap());
 
         let entities = vec![sample_entity(
             "22222222-2222-2222-2222-222222222222",
             "NewEntity",
         )];
+        let error = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &entities,
+            &[],
+            &sample_meta("new"),
+            Some(PublishFailAt::BeforeSwap),
+        )
+        .expect_err("staging failure must follow backup restoration");
+        assert!(error.to_string().contains("injected failure before swap"));
+        assert_cache_is_old_generation(&cache_dir);
+        assert!(!cache_dir.join(REMOTE_BACKUP_OWNER_FILE).exists());
+        assert!(!backup.exists());
+
         publish_remote_cache(
             &remotes_root,
             "upstream",
@@ -2869,6 +2981,7 @@ mod tests {
         let backup = remotes_root.join(format!("upstream.replaced~{}", std::process::id()));
         assert!(!cache_dir.exists());
         assert_cache_is_old_generation(&backup);
+        assert!(is_owned_backup(&backup).unwrap());
         let message = error.to_string();
         assert!(message.contains("restoring old cache failed"), "{message}");
         assert!(message.contains(&backup.display().to_string()), "{message}");
