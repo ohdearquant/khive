@@ -23,6 +23,10 @@ use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
 use crate::types::SnapshotId;
 
+#[cfg(test)]
+#[path = "remote_cache_recovery_tests.rs"]
+mod remote_cache_recovery_tests;
+
 /// Per-record entity shape in NDJSON sources.
 #[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEntity {
@@ -350,9 +354,11 @@ enum PublishFailAt {
 /// Builds a complete staging directory (a sibling of the cache directory,
 /// under `remotes_root`) containing all three files, then switches visibility
 /// with [`atomic_replace_dir`]. A crash between its two renames can leave the
-/// target briefly absent and the old generation in a `.replaced-*` sibling;
+/// target briefly absent and the old generation in a `.replaced~*` sibling;
 /// the next publish recovers that sibling before replacing it. A reader never
 /// observes a mix of old and new files within the target directory.
+const REMOTE_BACKUP_MARKER: &str = ".replaced~";
+
 fn publish_remote_cache(
     remotes_root: &Path,
     name: &str,
@@ -429,7 +435,9 @@ fn recover_stale_backups(
         .file_name()
         .and_then(|part| part.to_str())
         .context("cache target has no UTF-8 name")?;
-    let backup_prefix = format!("{name}.replaced-");
+    // '~' cannot occur in a RemoteName; older ".replaced-" siblings may be
+    // live remotes and must be left for manual recovery.
+    let backup_prefix = format!("{name}{REMOTE_BACKUP_MARKER}");
     let mut stale = Vec::new();
     for entry in
         std::fs::read_dir(parent).with_context(|| format!("reading {}", parent.display()))?
@@ -492,7 +500,10 @@ fn atomic_replace_dir_with(
         .file_name()
         .and_then(|part| part.to_str())
         .context("cache target has no UTF-8 name")?;
-    let backup = target_dir.with_file_name(format!("{name}.replaced-{}", std::process::id()));
+    let backup = target_dir.with_file_name(format!(
+        "{name}{REMOTE_BACKUP_MARKER}{}",
+        std::process::id()
+    ));
 
     rename(target_dir, &backup).with_context(|| {
         format!(
@@ -2292,7 +2303,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let remotes_root = tmp.path().join("remotes");
         let cache_dir = publish_old_generation(&remotes_root, "upstream");
-        let backup = remotes_root.join("upstream.replaced-99999");
+        let backup = remotes_root.join("upstream.replaced~99999");
         std::fs::rename(&cache_dir, &backup).unwrap();
 
         let entities = vec![sample_entity(
@@ -2318,7 +2329,7 @@ mod tests {
                 .filter(|entry| entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("upstream.replaced-"))
+                    .starts_with("upstream.replaced~"))
                 .count(),
             0
         );
@@ -2339,7 +2350,7 @@ mod tests {
             std::fs::rename(from, to)
         })
         .unwrap_err();
-        let backup = remotes_root.join(format!("upstream.replaced-{}", std::process::id()));
+        let backup = remotes_root.join(format!("upstream.replaced~{}", std::process::id()));
         assert!(!cache_dir.exists());
         assert_cache_is_old_generation(&backup);
         let message = error.to_string();

@@ -168,9 +168,10 @@ kkernel kg fetch upstream --url https://github.com/org/kg-data.git --ref main \
 - Output: `.khive/kg/remotes/<remote>/{entities.ndjson, edges.ndjson, meta.json}`, published via a
   staged directory replacement (`khive-vcs/src/sync.rs`, `publish_remote_cache` and
   `atomic_replace_dir`); a crash between the two renames may leave the target briefly absent,
-  with the old directory in a `.replaced-*` sibling recovered by the next publish. A reader never
+  with the old directory in a `.replaced~*` sibling recovered by the next publish. A reader never
   sees a mix of old and new files within the target. `meta.json` records `fetched_at`, the resolved
-  `git_ref`, `commit_sha`, and `content_hash`.
+  `git_ref`, `commit_sha`, and `content_hash`. An older `.replaced-<digits>` sibling is
+  left untouched because it may be a valid remote cache; inspect it before manual recovery.
 - Git remote URLs and any embedded credentials are redacted from error messages before they reach
   stdout/stderr (`khive-vcs/src/sync.rs:462-523`).
 - Remote validation uses the same full deterministic gate as local sync. Edge properties are part

@@ -271,6 +271,11 @@ framing of `git cat-file --batch` (v0 shell-out choice per ADR-088 §5 —
 `git2`/`gix` are not workspace dependencies). Control bytes in author names or
 messages cannot split a commit record; malformed metadata or batch framing is
 an error rather than a silent skipped commit.
+An explicit commit `encoding` header controls message decoding. Supported
+encodings are decoded without replacement; an unsupported label or invalid
+declared byte sequence fails the walk. Without a header, the existing lossy
+UTF-8 behavior remains. The subject is the first nonempty paragraph with
+its lines folded to spaces; the body begins after the separating blank line.
 
 `touched_files` is a separate `--name-only` pass, kept apart from
 `walk_commits`'s custom `--pretty=format` — interleaving file-name lines

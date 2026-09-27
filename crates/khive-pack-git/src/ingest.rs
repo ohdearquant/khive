@@ -26,6 +26,10 @@ use crate::refs;
 use crate::source::remote_url_to_slug;
 use crate::sql::sql;
 
+#[cfg(test)]
+#[path = "commit_text_tests.rs"]
+mod commit_text_tests;
+
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
 }
@@ -1618,6 +1622,29 @@ fn walk_commits(
 
 type CommitMetadata = (String, String, String, Vec<String>);
 
+fn decode_commit_message(headers: &[u8], raw: &[u8]) -> Result<String> {
+    let Some(label) = headers
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"encoding "))
+    else {
+        return Ok(String::from_utf8_lossy(raw).into_owned());
+    };
+    // WHATWG labels map ISO-8859-1 to Windows-1252; Git's declared Latin-1 is literal.
+    if label.eq_ignore_ascii_case(b"iso-8859-1")
+        || label.eq_ignore_ascii_case(b"iso8859-1")
+        || label.eq_ignore_ascii_case(b"latin1")
+        || label.eq_ignore_ascii_case(b"latin-1")
+    {
+        return Ok(raw.iter().map(|byte| char::from(*byte)).collect());
+    }
+    let encoding = encoding_rs::Encoding::for_label_no_replacement(label)
+        .context("git commit declares unsupported message encoding")?;
+    let decoded = encoding
+        .decode_without_bom_handling_and_without_replacement(raw)
+        .context("git commit message is invalid for its declared encoding")?;
+    Ok(decoded.into_owned())
+}
+
 fn parse_batch_commits(metadata: &[CommitMetadata], bytes: &[u8]) -> Result<Vec<RawCommit>> {
     let mut offset = 0;
     let mut commits = Vec::with_capacity(metadata.len());
@@ -1664,8 +1691,18 @@ fn parse_batch_commits(metadata: &[CommitMetadata], bytes: &[u8]) -> Result<Vec<
             .context("git commit author has no email start")?;
         let author = author_text[..email_start].to_string();
         let author_email = author_text[email_start + 2..email_end].to_string();
-        let message = String::from_utf8_lossy(&object[separator + 2..]);
-        let (subject, body) = message.split_once('\n').unwrap_or((message.as_ref(), ""));
+        let message = decode_commit_message(headers, &object[separator + 2..])?;
+        let mut lines = message.lines().skip_while(|line| line.trim().is_empty());
+        let subject = lines
+            .by_ref()
+            .take_while(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = lines
+            .skip_while(|line| line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         commits.push(RawCommit {
             sha: sha.clone(),
             short_sha: short_sha.clone(),
@@ -1673,11 +1710,8 @@ fn parse_batch_commits(metadata: &[CommitMetadata], bytes: &[u8]) -> Result<Vec<
             author_email,
             committed_at: committed_at.clone(),
             parents: parents.clone(),
-            subject: subject.to_string(),
-            body: body
-                .trim_start_matches('\n')
-                .trim_end_matches('\n')
-                .to_string(),
+            subject,
+            body: body.trim_end_matches('\n').to_string(),
         });
     }
     if offset != bytes.len() {
