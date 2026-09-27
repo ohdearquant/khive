@@ -16,6 +16,7 @@ on:
   pull_request:
     paths:
       - "crates/khive-pack-memory/**"
+      - "crates/khive-pack-kg/**"
       - "crates/khive-runtime/**"
       - "crates/khive-db/**"
       - "crates/khive-retrieval/**"
