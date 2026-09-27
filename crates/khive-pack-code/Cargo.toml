@@ -33,3 +33,6 @@ quote = { workspace = true }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+same-file = "1.0.6"

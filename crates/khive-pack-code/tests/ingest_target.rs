@@ -2,6 +2,7 @@
 //! deliberately creatable workspace default. These do not model path races.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use khive_pack_code::CodePack;
 use khive_pack_kg::KgPack;
@@ -62,6 +63,64 @@ fn registry(runtime: KhiveRuntime) -> VerbRegistry {
     let registry = builder.build().unwrap();
     runtime.install_edge_rules(registry.all_edge_rules());
     registry
+}
+
+fn file_backed_registry(main: &Path, declared_backend_db_paths: Vec<PathBuf>) -> VerbRegistry {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(main.to_path_buf()),
+        packs: vec!["kg".into(), "code".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap()
+    .with_declared_backend_db_paths(declared_backend_db_paths.into());
+    registry(runtime)
+}
+
+fn create_runtime_database(path: &Path) {
+    drop(
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(path.to_path_buf()),
+            packs: vec!["kg".into(), "code".into()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap(),
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    len: u64,
+    modified: SystemTime,
+}
+
+fn file_snapshot(path: &Path) -> FileSnapshot {
+    let metadata = std::fs::metadata(path).unwrap();
+    FileSnapshot {
+        bytes: std::fs::read(path).unwrap(),
+        len: metadata.len(),
+        modified: metadata.modified().unwrap(),
+    }
+}
+
+async fn assert_protected_target_refused(
+    registry: &VerbRegistry,
+    source: &Path,
+    target: &Path,
+    matched_member: &Path,
+) {
+    let before = file_snapshot(target);
+    let error = registry
+        .dispatch("code.ingest", json!({"path":source,"db":target,"tiers":[]}))
+        .await
+        .expect_err("production store must be refused before opening the target");
+    assert!(
+        matches!(&error, RuntimeError::InvalidInput(message)
+            if message.contains("shared production database")
+                && message.contains(&matched_member.display().to_string())),
+        "refusal must name the matched production store: {error:?}"
+    );
+    assert_eq!(file_snapshot(target), before, "refusal mutated the target");
 }
 
 fn directory_listing(root: &Path) -> Vec<PathBuf> {
@@ -224,6 +283,96 @@ async fn explicit_current_runtime_database_is_still_refused() {
         "{error:?}"
     );
     assert_eq!(directory_listing(fixture.root.path()), before);
+}
+
+#[tokio::test]
+async fn explicit_events_database_beside_runtime_main_is_refused_before_mutation() {
+    let fixture = Fixture::new();
+    let main = fixture.root.path().join("production.db");
+    create_runtime_database(&main);
+    let events = khive_runtime::events_split::events_db_path_beside(&main);
+    create_runtime_database(&events);
+    let registry = file_backed_registry(&main, vec![]);
+
+    assert_protected_target_refused(&registry, &fixture.source, &events, &events).await;
+}
+
+#[tokio::test]
+async fn explicit_declared_secondary_backend_is_refused_before_mutation() {
+    let fixture = Fixture::new();
+    let main = fixture.root.path().join("production.db");
+    let secondary = fixture.root.path().join("secondary.db");
+    create_runtime_database(&secondary);
+    let registry = file_backed_registry(&main, vec![secondary.clone()]);
+
+    assert_protected_target_refused(&registry, &fixture.source, &secondary, &secondary).await;
+}
+
+#[tokio::test]
+async fn default_map_target_colliding_with_declared_backend_is_refused_before_mutation() {
+    let fixture = Fixture::new();
+    let main = fixture.root.path().join("production.db");
+    let default_map = fixture.source.join(".khive").join("code-map.db");
+    std::fs::create_dir_all(default_map.parent().unwrap()).unwrap();
+    create_runtime_database(&default_map);
+    let registry = file_backed_registry(&main, vec![default_map.clone()]);
+    let before = file_snapshot(&default_map);
+
+    let error = registry
+        .dispatch("code.ingest", json!({"path":fixture.source,"tiers":[]}))
+        .await
+        .expect_err("the default must not bypass the production deny set");
+    assert!(
+        matches!(&error, RuntimeError::InvalidInput(message)
+            if message.contains("shared production database")
+                && message.contains(&default_map.display().to_string())),
+        "refusal must name the declared backend: {error:?}"
+    );
+    assert_eq!(file_snapshot(&default_map), before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hardlink_to_runtime_main_is_refused_but_fresh_inode_copy_is_accepted() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::new();
+    let main = fixture.root.path().join("production.db");
+    let alias = fixture.root.path().join("unrelated-name.db");
+    let copy = fixture.root.path().join("independent-map.db");
+    create_runtime_database(&main);
+    std::fs::hard_link(&main, &alias).unwrap();
+    std::fs::copy(&main, &copy).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&main).unwrap());
+    drop(
+        KhiveRuntime::new_readonly(RuntimeConfig {
+            db_path: Some(copy.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("closed source runtime leaves a standalone, readable database copy"),
+    );
+    let main_identity = std::fs::metadata(&main).unwrap();
+    let alias_identity = std::fs::metadata(&alias).unwrap();
+    let copy_identity = std::fs::metadata(&copy).unwrap();
+    assert_eq!(
+        (alias_identity.dev(), alias_identity.ino()),
+        (main_identity.dev(), main_identity.ino())
+    );
+    assert_ne!(
+        (copy_identity.dev(), copy_identity.ino()),
+        (main_identity.dev(), main_identity.ino())
+    );
+
+    let registry = file_backed_registry(&main, vec![]);
+    assert_protected_target_refused(&registry, &fixture.source, &alias, &main).await;
+    let response = registry
+        .dispatch(
+            "code.ingest",
+            json!({"path":fixture.source,"db":copy,"tiers":[]}),
+        )
+        .await
+        .expect("a byte copy with a new inode is a distinct target");
+    assert_eq!(response["db_path"], json!(copy));
 }
 
 #[tokio::test]

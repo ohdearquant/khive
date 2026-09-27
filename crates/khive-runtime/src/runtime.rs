@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use khive_db::StorageBackend;
@@ -274,6 +275,9 @@ pub struct KhiveRuntime {
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
+    /// All SQLite backends declared by the host process, including those
+    /// assigned to other packs. The code pack fences these from ingest.
+    declared_backend_db_paths: Arc<[PathBuf]>,
     /// ADR-118 exact-leg policy, sampled once at runtime construction.
     /// Request-time memory/knowledge serving must never re-read the process
     /// environment because tests and embedded runtimes share one process.
@@ -518,6 +522,7 @@ impl KhiveRuntime {
             core_named_vector_stores: None,
             core_backend: None,
             config,
+            declared_backend_db_paths: Vec::new().into(),
             ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
@@ -651,6 +656,7 @@ impl KhiveRuntime {
                     core_named_vector_stores: None,
                     core_backend: None,
                     config: core_config,
+                    declared_backend_db_paths: self.declared_backend_db_paths.clone(),
                     ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
                     embedder_registry,
                     default_embedder_name,
@@ -702,6 +708,17 @@ impl KhiveRuntime {
     /// Return a reference to the runtime config.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// Install the host's full declared SQLite topology before pack registration.
+    pub fn with_declared_backend_db_paths(mut self, paths: Arc<[PathBuf]>) -> Self {
+        self.declared_backend_db_paths = paths;
+        self
+    }
+
+    /// All declared SQLite backend paths known to this runtime's host.
+    pub fn declared_backend_db_paths(&self) -> &[PathBuf] {
+        &self.declared_backend_db_paths
     }
 
     /// Whether this runtime selects the vector arm for a hybrid search —

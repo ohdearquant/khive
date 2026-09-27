@@ -2762,6 +2762,16 @@ struct PreparedStorageTopology {
     shared_hydrator: Option<Arc<BlobHydrator>>,
 }
 
+fn declared_backend_db_paths(config: &KhiveConfig) -> Arc<[PathBuf]> {
+    config
+        .backends
+        .iter()
+        .filter(|backend| backend.kind == BackendKind::Sqlite)
+        .filter_map(|backend| backend.path.as_deref().map(khive_runtime::expand_tilde))
+        .collect::<Vec<_>>()
+        .into()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageTopologyPurpose {
     Serving,
@@ -3031,6 +3041,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     )
     .await?;
 
+    // Every pack sees the whole serving topology, including stores assigned
+    // to other packs, before handlers can accept a code.ingest target.
+    let declared_backend_db_paths = declared_backend_db_paths(khive_cfg);
+
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
     // main's models even when the pack itself is `no_embed`.
@@ -3038,7 +3052,8 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         let mut cfg = base_config.clone();
         cfg.backend_id = BackendId::main();
         cfg
-    });
+    })
+    .with_declared_backend_db_paths(declared_backend_db_paths.clone());
 
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
@@ -3070,6 +3085,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
                 rt_config,
                 &main_backend,
                 &default_runtime,
+                declared_backend_db_paths.clone(),
             ),
         );
     }
@@ -3953,7 +3969,8 @@ async fn build_single_backend_runtime_with_max_readers(
     )
     .await?;
 
-    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?;
+    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?
+        .with_declared_backend_db_paths(declared_backend_db_paths(khive_cfg));
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
     }
@@ -4056,11 +4073,14 @@ fn build_pack_runtime(
     rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
+    declared_backend_db_paths: Arc<[PathBuf]>,
 ) -> KhiveRuntime {
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
-    let rt = KhiveRuntime::from_backend(backend, rt_config).with_core_embedders_from(main_runtime);
+    let rt = KhiveRuntime::from_backend(backend, rt_config)
+        .with_declared_backend_db_paths(declared_backend_db_paths)
+        .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -7687,6 +7707,47 @@ region = "us-east-1"
             },
             ..KhiveConfig::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_path = temp.path().join("main.db");
+        let secondary_path = temp.path().join("secondary.db");
+        let mut config = sqlite_multi_backend_config(main_path.clone(), secondary_path.clone());
+        config.packs.clear();
+        config.packs.insert(
+            "code".to_string(),
+            khive_runtime::PackConfig {
+                backend: "secondary".to_string(),
+                no_embed: false,
+            },
+        );
+        config.backends.push(BackendConfig {
+            name: "volatile".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: None,
+            read_only: false,
+        });
+        let mut base = base_runtime_config_for_multi_backend();
+        base.packs = vec!["kg".into(), "code".into()];
+
+        let multi = build_registry_for_multi_backend(base, &config, None)
+            .await
+            .expect("multi-backend code pack boots");
+        let expected = [main_path, secondary_path];
+        assert_eq!(
+            multi.default_runtime.declared_backend_db_paths(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            multi.per_pack_runtimes["code"].declared_backend_db_paths(),
+            expected.as_slice()
+        );
     }
 
     #[tokio::test]
