@@ -28,6 +28,9 @@ pub(crate) struct TelegramMessage {
     /// Unix timestamp (seconds) the message was sent.
     pub date: i64,
     pub chat: TelegramChat,
+    /// Channel posts and some service messages omit the sender.
+    #[serde(default)]
+    pub from: Option<TelegramUser>,
     /// Absent for non-text messages (media, stickers, etc. — out of scope
     /// for v1, ADR-056 "Out of scope (v1)").
     #[serde(default)]
@@ -36,6 +39,11 @@ pub(crate) struct TelegramMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TelegramChat {
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TelegramUser {
     pub id: i64,
 }
 
@@ -276,6 +284,7 @@ mod tests {
                 "message_id": 7,
                 "date": 1_700_000_000,
                 "chat": { "id": 555 },
+                "from": { "id": 42 },
                 "text": "hello"
             }
         });
@@ -283,6 +292,7 @@ mod tests {
         assert_eq!(update.update_id, 42);
         let message = update.message.unwrap();
         assert_eq!(message.chat.id, 555);
+        assert_eq!(message.from.unwrap().id, 42);
         assert_eq!(message.text.as_deref(), Some("hello"));
     }
 
@@ -302,6 +312,7 @@ mod tests {
             "chat": { "id": 555 }
         });
         let message: TelegramMessage = serde_json::from_value(raw).unwrap();
+        assert!(message.from.is_none());
         assert!(message.text.is_none());
     }
 

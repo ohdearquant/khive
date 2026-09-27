@@ -764,14 +764,16 @@ pub struct ExecLimitsConfig {
 }
 
 /// `[exec]` section (ADR-181): where runs materialize, what they may read,
-/// which caller environment keys pass through, which binaries never run,
-/// output caps, wall-clock defaults and resource limits.
+/// which caller environment keys pass through, which executable paths the
+/// `never` list matches, and the output caps, wall-clock defaults and resource
+/// limits. `never` matches paths, not a program's capabilities (ADR-181 A9).
 ///
 /// ```toml
 /// [exec]
 /// root = "/var/lib/khive/exec"
 /// read_roots = ["/opt/toolchains/python3.11"]
 /// env = ["SOURCE_DATE_EPOCH"]
+/// # The never list matches resolved executable paths, not renamed copies.
 /// never = ["/usr/bin/curl"]
 /// max_output_bytes = 1048576
 /// timeout_default_s = 30

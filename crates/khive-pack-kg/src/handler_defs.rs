@@ -798,6 +798,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "text_mode",
+                param_type: "string",
+                required: false,
+                description: "Lexical matching: all_terms (default, every normalized term group must match) | any_term (one or more term groups may match). Changes only the text arm of entity and note search.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "limit",
                 param_type: "integer",
                 required: false,
