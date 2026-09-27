@@ -2581,14 +2581,33 @@ pub(crate) async fn handle_ingest(
                                     .to_string(),
                             ));
                         }
-                        store
-                            .upsert_attachment(Attachment::from_new(
+                        #[cfg(test)]
+                        race_seam::pause_after_quarantine_role_read().await;
+                        if !store
+                            .try_insert_attachment(Attachment::from_new(
                                 duplicate.id,
                                 AttachmentSubstrate::Note,
-                                attachment,
+                                attachment.clone(),
                                 duplicate.created_at,
                             ))
-                            .await?;
+                            .await?
+                        {
+                            // A writer installed the role after our first read.
+                            // A matching reference is an idempotent replay; a
+                            // different one must not be acknowledged as repaired.
+                            let current = store
+                                .get_attachment(duplicate.id, "quarantine-original")
+                                .await?;
+                            if !matches!(current, Some(ref existing)
+                                if existing.substrate == AttachmentSubstrate::Note
+                                    && existing.content_ref == attachment.content_ref)
+                            {
+                                return Err(RuntimeError::Internal(
+                                    "ingest: duplicate quarantine attachment changed during repair"
+                                        .to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -3741,11 +3760,19 @@ mod race_seam {
 
     tokio::task_local! {
         pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+        pub(crate) static AFTER_QUARANTINE_ROLE_READ: (Arc<Barrier>, Arc<Barrier>);
     }
 
     pub(crate) async fn pause_after_read() {
         if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
             barrier.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_after_quarantine_role_read() {
+        if let Ok((arrived, resume)) = AFTER_QUARANTINE_ROLE_READ.try_with(Clone::clone) {
+            arrived.wait().await;
+            resume.wait().await;
         }
     }
 }
@@ -3919,6 +3946,141 @@ mod tests {
             signal.snapshot(),
             generation_after_commit,
             "a deduplicated ingest must not publish a wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_quarantine_repair_preserves_a_competing_attachment() {
+        use std::sync::Arc;
+
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use khive_storage::{Attachment, AttachmentSubstrate, BlobStore as _, NewAttachment};
+        use tokio::sync::Barrier;
+        use uuid::Uuid;
+
+        let namespace = format!("ingest-quarantine-race-{}", Uuid::new_v4().simple());
+        let runtime = Arc::new(
+            super::KhiveRuntime::new(RuntimeConfig {
+                web: Default::default(),
+                telemetry: Default::default(),
+                mounts: Vec::new(),
+                brain: Default::default(),
+                git_write: Default::default(),
+                display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+                events_split: None,
+                db_path: None,
+                blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+                default_namespace: Namespace::parse(&namespace).unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                gate: Arc::new(AllowAllGate),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                backend_id: BackendId::main(),
+                brain_profile: None,
+                visible_namespaces: vec![],
+                allowed_outbound_namespaces: vec![],
+                actor_id: None,
+                exec: Default::default(),
+            })
+            .expect("in-memory runtime"),
+        );
+        let blob_root = tempfile::tempdir().expect("blob root");
+        let blob_store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("blob store"),
+        );
+        let original_ref = blob_store
+            .put(b"quarantine original".to_vec())
+            .await
+            .expect("publish original");
+        let competing_ref = blob_store
+            .put(b"competing original".to_vec())
+            .await
+            .expect("publish competing bytes");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+        let token = runtime
+            .authorize(Namespace::parse(&namespace).unwrap())
+            .expect("authorize");
+        let signal = crate::inbox_signal::InboxSignal::new();
+        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+        let body = json!({
+            "from": "email:sender@example.com",
+            "to": "local",
+            "content": "quarantined message",
+            "external_id": "imap:quarantine:race:1",
+            "metadata": {
+                "quarantined": true,
+                "quarantine_content_ref": original_ref.to_string(),
+            },
+        });
+
+        let first =
+            super::handle_ingest(&runtime, &signal, Some(&capability), &token, body.clone())
+                .await
+                .expect("initial quarantine ingest");
+        let note_id = Uuid::parse_str(first["full_id"].as_str().expect("full note id"))
+            .expect("canonical note id");
+        let attachments = runtime.core().attachments().expect("attachment store");
+        assert!(attachments
+            .delete_attachment(note_id, "quarantine-original")
+            .await
+            .expect("leave legacy metadata-only row"));
+
+        let arrived = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let replay = {
+            let runtime = Arc::clone(&runtime);
+            let token = token.clone();
+            let arrived = Arc::clone(&arrived);
+            let resume = Arc::clone(&resume);
+            tokio::spawn(super::race_seam::AFTER_QUARANTINE_ROLE_READ.scope(
+                (arrived, resume),
+                async move {
+                    let capability =
+                        khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+                    let signal = crate::inbox_signal::InboxSignal::new();
+                    super::handle_ingest(&runtime, &signal, Some(&capability), &token, body).await
+                },
+            ))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), arrived.wait())
+            .await
+            .expect("replay must reach the post-read pause");
+
+        let competing = Attachment::from_new(
+            note_id,
+            AttachmentSubstrate::Note,
+            NewAttachment {
+                role: "quarantine-original".to_string(),
+                content_ref: competing_ref,
+                media_type: None,
+                size_bytes: None,
+            },
+            1,
+        );
+        attachments
+            .upsert_attachment(competing.clone())
+            .await
+            .expect("competing writer installs role");
+        resume.wait().await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), replay)
+            .await
+            .expect("replay must finish")
+            .expect("replay task");
+        assert!(
+            matches!(&result, Err(khive_runtime::RuntimeError::Internal(_))),
+            "a stale replay must refuse rather than acknowledge a different owner: {result:?}"
+        );
+        assert_eq!(
+            attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("stored attachment"),
+            Some(competing),
+            "the competing writer's role must survive the replay"
         );
     }
 
