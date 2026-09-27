@@ -169,21 +169,29 @@ async fn refresh_moves_body_once_and_roots_the_same_reference() {
                 body
             );
             let receipt = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
-            for record in [final_id, receipt] {
-                let roots = runtime
+            assert!(
+                runtime
                     .attachments()
                     .unwrap()
-                    .list_attachments(record)
+                    .list_attachments(receipt)
                     .await
-                    .unwrap();
-                assert_eq!(roots.len(), 1);
-                assert_eq!(roots[0].content_ref, reference);
-                assert_eq!(
-                    roots[0].size_bytes,
-                    Some(body.len() as u64),
-                    "received length survives moving body"
-                );
-            }
+                    .unwrap()
+                    .is_empty(),
+                "refresh receipts never own fetched bodies"
+            );
+            let roots = runtime
+                .attachments()
+                .unwrap()
+                .list_attachments(final_id)
+                .await
+                .unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].content_ref, reference);
+            assert_eq!(
+                roots[0].size_bytes,
+                Some(body.len() as u64),
+                "received length survives moving body"
+            );
         }
     }
 }

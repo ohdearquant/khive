@@ -13,7 +13,7 @@ Entity merging classifies each UUID relative to the common base and reconciles t
 | present | structurally equal     | `Unchanged`                            |
 | present | structurally different | `Modified` with base and branch values |
 
-Structural equality compares ID, kind, governed entity type, name, description, tags, and properties. It deliberately excludes creation and update timestamps. The modified form retains the base value for future “was → now” conflict displays even though the current merge patterns consume only the branch value.
+Structural equality compares ID, kind, governed entity type, name, description, tags, and properties. It deliberately excludes creation and update timestamps. The modified form retains the base value for three-way property reconciliation and future “was → now” conflict displays.
 
 UUIDs are processed in sorted order before insertion into the returned map, supporting deterministic downstream handling.
 
@@ -41,19 +41,16 @@ For a conflicting double modification, the lower-level result retains the ours v
 
 Name and kind disagreements produce `NameConflict` and `KindConflict`. A governed `entity_type` disagreement uses `PropertyMismatch` with the key `entity_type` and JSON representations of both values.
 
-Descriptions are annotations rather than identity, so an unequal description resolves to ours without a conflict. Tags are set-unioned and sorted. Properties are merged per key:
+Descriptions are annotations rather than identity, so an unequal description resolves to ours without a conflict. Tags are set-unioned and sorted. Object properties are reconciled per key against the common base; an absent key participates as a value:
 
-| Ours value       | Theirs value     | Result                                      |
-| ---------------- | ---------------- | ------------------------------------------- |
-| absent           | absent           | absent properties                           |
-| object           | absent           | ours object                                 |
-| absent           | object           | theirs object                               |
-| equal values     | equal values     | one value                                   |
-| different values | different values | `PropertyMismatch`; keep ours provisionally |
-| absent key       | present key      | take theirs                                 |
-| present key      | absent key       | keep ours                                   |
+| Comparison against base                           | Result                                      |
+| ------------------------------------------------- | ------------------------------------------- |
+| ours and theirs equal                              | keep that value or absence                  |
+| only ours differs from base                        | take ours, including a removed key          |
+| only theirs differs from base                      | take theirs, including a removed key        |
+| both differ from base and disagree with each other | `PropertyMismatch`; keep ours provisionally |
 
-Non-object JSON property payloads are treated like absent property maps by this merge layer.
+`None` behaves as an empty map for per-key reconciliation, with an empty result represented as `None` when either branch used `None`. Identical or one-sided non-object legacy payloads are preserved atomically; divergent double changes to such payloads report a `PropertyMismatch` for `properties` rather than silently discarding data.
 
 ## Duplicate additions
 

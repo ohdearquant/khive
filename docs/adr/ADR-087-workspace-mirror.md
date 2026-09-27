@@ -173,8 +173,8 @@ config, defaulting to the high-value subpaths, avoids both.
 - `crates/khive-runtime/src/secret_gate.rs` — `mask_secrets` vs `check`/`check_json`
 - ADR-086 — `document`-entity shape this mirror populates
 - ADR-010 — NDJSON snapshot scope (why `.khive/kg/*` is excluded)
-- `docs/adr/feedback-data-vs-view-not-mutation` principle (khive `docs/adr/README.md`
-  "Data vs view" cross-cutting principle) — governs the supersedes-not-overwrite behavior
+- "Data vs view" cross-cutting principle ([README](README.md#cross-cutting-principles)) — governs
+  the supersedes-not-overwrite behavior
 
 ## Amendment 1 (2026-07-15): self-standing content convention, blob-backed binaries, durability separation
 

@@ -143,3 +143,67 @@ documented limitation, consistent with hard-delete cascade semantics.
   visible for deliberate curation.
 - Deleting an anchor while its corpus remains live is surfaced to the caller
   instead of silently duplicated around.
+
+## Rider: three anchor-resolution behaviours (2026-09-25)
+
+Status: Accepted (2026-09-25). Refs #3176. It adds to the resolution
+rules above and replaces none of them.
+
+### Context
+
+Three behaviours of `git.digest` anchor resolution are not covered by the text above, and no test pins
+the choice the code makes (read in `crates/khive-pack-git/src/handlers.rs` and
+`crates/khive-pack-git/src/ingest.rs`):
+
+1. With no `project` argument, every candidate lookup filters on the caller's namespace
+   (`projects_by_slug_select.sql`, `projects_by_legacy_repo_url_select.sql`,
+   `projects_without_canonical_slug_select.sql`, each `namespace=?1`). With an explicit `project`,
+   `resolve_project_id` takes a full UUID as given and resolves an id prefix through
+   `resolve_prefix_unfiltered`, with no namespace filter.
+2. Resolution runs before the ingest, and step 2 can write the canonical `repo_slug` onto the selected
+   anchor. The duplicate-anchor warning, the orphaned-corpus fields and `project_created` are added to
+   the report only after the ingest returns successfully, so a failed ingest returns its error without
+   them.
+3. `find_orphaned_anchor` sorts soft-deleted candidates by `deleted_at` alone, newest first, with a
+   stable sort over rows from two queries that have no `ORDER BY` (`orphaned_projects_select.sql`,
+   `soft_deleted_projects_without_canonical_slug_select.sql`). Two tombstones with the same
+   `deleted_at` keep the order the queries returned, so the anchor the signal names can change
+   between runs.
+
+### Decision
+
+1. **An explicit `project` is an id, not a lookup.** When the caller supplies `project`, the anchor is
+   the entity that argument names, by full UUID or unique id prefix, in any namespace; the caller's
+   namespace scopes only the derived resolution of steps 1 to 3. This records the current behaviour. It
+   is consistent with the by-id access the pack already follows and with namespace as attribution
+   rather than isolation (ADR-007), and the Gate still authorizes the call (ADR-018). Whether a full
+   UUID that names no live `project` entity should be refused is outside this rider; the code does not
+   check it today.
+2. **Resolution facts reach the caller on failure too.** Step 1's rule that the handler "never picks
+   arbitrarily or silently" holds on the failure path. When the ingest fails after resolution, the
+   error names the selected anchor, any duplicate or conflicting anchor ids in the words of the
+   success-path warning, whether step 2 backfilled `repo_slug`, whether step 3 created the anchor, and
+   the orphaned-corpus signal when it fired. This changes the code.
+3. **Tombstone order is total.** Soft-deleted candidates are ordered by `deleted_at` descending, then by
+   `id` ascending, matching the `id` tie-break step 2 already uses for `created_at`. The signal names
+   the first candidate in that order that still has a live annotating note. This changes the code.
+
+### Alternatives considered
+
+- _Scope an explicit `project` to the caller's namespace._ Rejected: an explicit id is a deliberate
+  choice by the caller, and refusing it would make a cross-namespace anchor reachable only by moving
+  records, which the namespace model does not require.
+- _Defer the step-2 backfill until the ingest succeeds, so a failed digest writes nothing during
+  resolution._ Rejected: the ingest itself can fail after writing notes, so a failed digest is not
+  write-free either way, and the backfill is an identity correction step 2 applies on contact.
+- _Leave the tie order to the database._ Rejected: the signal would name a different anchor between
+  runs of the same input, which the deterministic rules above exist to prevent.
+
+### Acceptance
+
+1. A caller in namespace A passing `project` equal to the id of an anchor in namespace B digests into
+   that anchor; the same digest without `project` does not match it.
+2. A digest whose resolution finds a duplicate anchor and whose ingest is made to fail returns an error
+   that names the selected and the duplicate anchor ids.
+3. Two soft-deleted anchors with the same identity and the same `deleted_at`, each with a live
+   annotating note, yield a signal naming the lower `id`, whichever order the rows were inserted in.

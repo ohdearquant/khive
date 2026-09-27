@@ -37,9 +37,11 @@ use rayon::prelude::*;
 /// `Σ a_i * b_i` over equal-length `u8` slices as a `u32` accumulator (NEON on
 /// aarch64, chunked portable fallback elsewhere). See `docs/api/codecs.md`.
 ///
-/// Safety: both slices must have the same length.
+/// Panics if the slices have different lengths.
 #[inline(always)]
 fn u8_dot_u32(a: &[u8], b: &[u8]) -> u32 {
+    assert_eq!(a.len(), b.len(), "u8_dot_u32 inputs must have equal length");
+
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::aarch64::*;
@@ -1252,6 +1254,36 @@ mod tests {
             .map(|(&x, &y)| x as u32 * y as u32)
             .sum();
         assert_eq!(u8_dot_u32(&a, &b), scalar, "u8_dot_u32 mismatch");
+    }
+
+    #[test]
+    #[should_panic(expected = "u8_dot_u32 inputs must have equal length")]
+    fn u8_dot_u32_rejects_shorter_second_slice() {
+        let a = [1u8; 16];
+        let b = [2u8; 1];
+
+        let _ = u8_dot_u32(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "u8_dot_u32 inputs must have equal length")]
+    fn u8_dot_u32_rejects_longer_second_slice() {
+        let a = [1u8; 1];
+        let b = [2u8; 16];
+
+        let _ = u8_dot_u32(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "u8_dot_u32 inputs must have equal length")]
+    fn approx_dot_rejects_mismatched_codes() {
+        let vectors = rand_vecs(2, 16, 1);
+        let codec = Sq8Codec::train(&vectors);
+        let a = codec.encode(&vectors[0]);
+        let mut b = codec.encode(&vectors[1]);
+        b.codes.pop();
+
+        let _ = codec.approx_dot(&a, &b);
     }
 
     #[test]

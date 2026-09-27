@@ -829,17 +829,7 @@ impl VamanaIndex {
                 "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
             )));
         }
-        let mut free_slots = HashSet::with_capacity(parsed.free_slots.len());
-        for &slot in &parsed.free_slots {
-            if slot as usize >= num_vectors
-                || !is_tombstoned_bit(&parsed.tombstones, slot as usize)
-                || !free_slots.insert(slot)
-            {
-                return Err(VamanaError::invalid_format(format!(
-                    "lifecycle.bin invalid free slot {slot}"
-                )));
-            }
-        }
+        validate_free_slots(&parsed.free_slots, &parsed.tombstones, num_vectors)?;
 
         let (gs_codec, gs_codes) = train_codec_and_encode(&vectors, config.dimensions);
         Ok(Self {
@@ -1019,61 +1009,38 @@ impl VamanaIndex {
         acquire_lock: impl FnOnce(&File) -> Result<()>,
     ) -> Result<()> {
         fs::create_dir_all(path)?;
-        let publication_lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.join(".checkpoint.lock"))?;
+        let checkpoint = crate::checkpoint_io::CheckpointDirectory::open(path)?;
+        let publication_lock = checkpoint.open_lock()?;
         acquire_lock(&publication_lock)?;
         reject_checkpoint_sequence_regression(path, self.last_applied_seq)?;
 
         // Stage under .v2new so a crash before the metadata rename leaves the previous
-        // segments (v1 or v2) intact and readable.
-        let vectors_new = path.join("vectors.bin.v2new");
-        let graph_new = path.join("graph.bin.v2new");
-        let lifecycle_new = path.join("lifecycle.bin.v2new");
-        let codes_new = path.join("codes.bin.v2new");
-        let vectors_path = path.join("vectors.bin");
-        let graph_path = path.join("graph.bin");
-        let lifecycle_path = path.join("lifecycle.bin");
-        let codes_path = path.join("codes.bin");
-        let metadata_path = path.join("metadata.bin");
-        let metadata_tmp = path.join("metadata.bin.tmp");
+        // segments (v1 or v2) intact and readable. Every staging operation is
+        // relative to the pinned directory and rejects planted links.
+        let vectors_data: &[u8] = cast_slice(self.vectors()?);
+        checkpoint.stage("vectors.bin.v2new", vectors_data)?;
 
-        write_vectors(&vectors_new, self.vectors()?)?;
+        let graph_data = encode_graph(&self.graph, self.config.max_degree)?;
+        checkpoint.stage("graph.bin.v2new", &graph_data)?;
 
-        write_graph(&graph_new, &self.graph, self.config.max_degree)?;
-
-        // write_graph caps the medoid's forward list at max_degree before serializing;
+        // encode_graph caps the medoid's forward list at max_degree before serializing;
         // build reverse_adj from that same capped view so lifecycle.bin stays consistent
         // with graph.bin after restore.
         let capped_reverse_adj = capped_reverse_adjacency(self);
 
-        write_lifecycle(
-            &lifecycle_new,
+        let lifecycle_data = encode_lifecycle(
             &self.tombstones,
             &self.free_slots,
             &capped_reverse_adj,
             self.ops_since_consolidation,
-        )?;
+        );
+        checkpoint.stage("lifecycle.bin.v2new", &lifecycle_data)?;
 
         // codes.bin.v2new persists the SQ8 codec + codes so load never retrains.
-        {
-            let buf = encode_codes_bin(&self.gs_codec, self.gs_codes.view());
-            let file = File::create(&codes_new)?;
-            let mut w = std::io::BufWriter::new(file);
-            w.write_all(&buf)?;
-            let file = w.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
-        }
+        let codes_data = encode_codes_bin(&self.gs_codec, self.gs_codes.view());
+        checkpoint.stage("codes.bin.v2new", &codes_data)?;
 
-        let vectors_data = fs::read(&vectors_new)?;
-        let graph_data = fs::read(&graph_new)?;
-        let lifecycle_data = fs::read(&lifecycle_new)?;
-        let codes_data = fs::read(&codes_new)?;
-
-        let vectors_hash = blake3::hash(&vectors_data);
+        let vectors_hash = blake3::hash(vectors_data);
         let graph_hash = blake3::hash(&graph_data);
         let lifecycle_hash = blake3::hash(&lifecycle_data);
         let codes_hash = blake3::hash(&codes_data);
@@ -1090,8 +1057,7 @@ impl VamanaIndex {
         // so long-lived mmap readers can distinguish the new file generation
         // and release the unlinked predecessor (#2081).
         let publication_nonce = *uuid::Uuid::new_v4().as_bytes();
-        write_v2_commit_full(
-            &metadata_tmp,
+        let metadata_data = encode_v2_commit_full(
             vectors_hash.as_bytes(),
             graph_hash.as_bytes(),
             lifecycle_hash.as_bytes(),
@@ -1104,24 +1070,21 @@ impl VamanaIndex {
             self.last_applied_seq,
             Some(codes_hash.as_bytes()),
             Some(&publication_nonce),
-        )?;
-        fs::rename(&metadata_tmp, &metadata_path)?;
+        );
+        checkpoint.stage("metadata.bin.tmp", &metadata_data)?;
+        checkpoint.rename("metadata.bin.tmp", "metadata.bin")?;
 
         // Commit gate is metadata.bin: fsync it durable before promoting segments, so any
         // post-crash state is either (old metadata + old segments) or (new metadata +
         // maybe-stale segments) — the latter is checksum-guarded and safe-degrades to rebuild.
-        {
-            let dir_file = File::open(path)?;
-            dir_file.sync_all()?;
-        }
+        checkpoint.sync()?;
 
-        fs::rename(&vectors_new, &vectors_path)?;
-        fs::rename(&graph_new, &graph_path)?;
-        fs::rename(&lifecycle_new, &lifecycle_path)?;
-        fs::rename(&codes_new, &codes_path)?;
+        checkpoint.rename("vectors.bin.v2new", "vectors.bin")?;
+        checkpoint.rename("graph.bin.v2new", "graph.bin")?;
+        checkpoint.rename("lifecycle.bin.v2new", "lifecycle.bin")?;
+        checkpoint.rename("codes.bin.v2new", "codes.bin")?;
 
-        let dir_file = File::open(path)?;
-        dir_file.sync_all()?;
+        checkpoint.sync()?;
 
         Ok(())
     }
@@ -2845,6 +2808,21 @@ struct ParsedLifecycle {
     ops_since_consolidation: usize,
 }
 
+fn validate_free_slots(free_slots: &[u32], tombstones: &[u64], num_vectors: usize) -> Result<()> {
+    let mut seen = HashSet::with_capacity(free_slots.len());
+    for &slot in free_slots {
+        if slot as usize >= num_vectors
+            || !is_tombstoned_bit(tombstones, slot as usize)
+            || !seen.insert(slot)
+        {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin invalid free slot {slot}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Rejects a rebuild candidate only against a structurally valid incumbent (see
 /// [`validate_v2_structural`]); a corrupt incumbent is treated as no incumbent, or a
 /// repair checkpoint could never publish below its sequence. See
@@ -3015,12 +2993,14 @@ fn validate_v2_structural(
         )));
     }
 
+    validate_free_slots(&lifecycle.free_slots, &lifecycle.tombstones, num_vectors)?;
+
     Ok(tombstone_count)
 }
 
 /// Write the KHVVAMG2 commit record including embedded v1 metadata fields.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "mmap")]
+#[cfg(all(feature = "mmap", test))]
 fn write_v2_commit_full(
     path: &Path,
     vectors_hash: &[u8; 32],
@@ -3238,25 +3218,6 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
         last_applied_seq,
         codes_hash,
     })
-}
-
-/// Write lifecycle.bin. See crates/khive-vamana/docs/api/persistence.md#lifecyclebin-format
-/// for the full byte layout.
-#[cfg(feature = "mmap")]
-fn write_lifecycle(
-    path: &Path,
-    tombstones: &[u64],
-    free_slots: &[u32],
-    reverse_adj: &[Vec<u32>],
-    ops_since_consolidation: usize,
-) -> Result<()> {
-    let buf = encode_lifecycle(tombstones, free_slots, reverse_adj, ops_since_consolidation);
-    let file = File::create(path)?;
-    let mut w = std::io::BufWriter::new(file);
-    w.write_all(&buf)?;
-    let file = w.into_inner().map_err(|e| e.into_error())?;
-    file.sync_all()?;
-    Ok(())
 }
 
 fn encode_lifecycle(
@@ -5475,6 +5436,60 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "mmap", unix))]
+    #[test]
+    fn checkpoint_rejects_planted_links_at_lock_and_every_staging_name() {
+        use std::os::unix::fs::symlink;
+
+        let vectors = rand_unit_vectors(8, 4, 0x3282);
+        let config = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+
+        for name in [
+            ".checkpoint.lock",
+            "vectors.bin.v2new",
+            "graph.bin.v2new",
+            "lifecycle.bin.v2new",
+            "codes.bin.v2new",
+            "metadata.bin.tmp",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            fs::write(&sentinel, b"outside bytes must remain intact").unwrap();
+            symlink(&sentinel, dir.path().join(name)).unwrap();
+
+            assert!(
+                index.save_atomic(dir.path()).is_err(),
+                "planted symlink at {name} must stop checkpoint publication"
+            );
+            assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                b"outside bytes must remain intact",
+                "checkpoint staging must never write through {name}"
+            );
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked_directory = parent.path().join("linked-index");
+        symlink(outside.path(), &linked_directory).unwrap();
+        assert!(index.save_atomic(&linked_directory).is_err());
+        assert!(!outside.path().join("metadata.bin").exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("vectors.bin.v2new"), b"stale regular file").unwrap();
+        index
+            .save_atomic(dir.path())
+            .expect("regular stale staging files remain replaceable");
+        assert_eq!(
+            VamanaIndex::load(dir.path()).unwrap().num_vectors(),
+            index.num_vectors()
+        );
+    }
+
     #[cfg(feature = "mmap")]
     #[test]
     fn overlapping_checkpoint_writers_linearize_sequence_validation() {
@@ -5861,6 +5876,82 @@ mod tests {
         let persisted = VamanaIndex::load(dir.path()).unwrap();
         assert_eq!(persisted.last_applied_seq(), Some(100));
         assert_eq!(persisted.vectors().unwrap(), repair_vectors);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn directory_load_rejects_invalid_free_slots_and_allows_repair() {
+        let vectors = rand_unit_vectors(8, 4, 0x3285);
+        let config = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        for (case, slots) in [
+            ("live", vec![1]),
+            ("out of range", vec![8]),
+            ("duplicate", vec![0, 0]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut incumbent = VamanaIndex::build(&vectors, config.clone()).unwrap();
+            incumbent.tombstone(0).unwrap();
+            incumbent.set_last_applied_seq(Some(500));
+            incumbent.save_atomic(dir.path()).unwrap();
+
+            let metadata = fs::read(dir.path().join("metadata.bin")).unwrap();
+            let commit = parse_v2_commit(&metadata).unwrap();
+            let lifecycle_bytes = fs::read(dir.path().join("lifecycle.bin")).unwrap();
+            let mut lifecycle = parse_lifecycle(
+                &lifecycle_bytes,
+                commit.index_meta.num_vectors,
+                commit.index_meta.max_degree,
+            )
+            .unwrap();
+            lifecycle.free_slots = slots;
+            let corrupted = encode_lifecycle(
+                &lifecycle.tombstones,
+                &lifecycle.free_slots,
+                &lifecycle.reverse_adj,
+                lifecycle.ops_since_consolidation,
+            );
+            fs::write(dir.path().join("lifecycle.bin"), &corrupted).unwrap();
+            let hash = *blake3::hash(&corrupted).as_bytes();
+            write_v2_commit_full(
+                &dir.path().join("metadata.bin"),
+                &commit.vectors_hash,
+                &commit.graph_hash,
+                &hash,
+                &V2CorpusFingerprint {
+                    vector_count: commit.fingerprint.vector_count,
+                    dimensions: commit.fingerprint.dimensions,
+                    content_hash: commit.fingerprint.content_hash,
+                },
+                commit.index_meta.num_vectors,
+                commit.index_meta.dimensions,
+                commit.index_meta.max_degree,
+                commit.index_meta.search_list_size,
+                commit.index_meta.alpha,
+                commit.last_applied_seq,
+                commit.codes_hash.as_ref(),
+                None,
+            )
+            .unwrap();
+
+            let load = VamanaIndex::load(dir.path());
+            assert!(
+                matches!(&load, Err(VamanaError::InvalidFormat { reason })
+                    if reason.contains("invalid free slot")),
+                "{case} free slot must fail at load, got {load:?}"
+            );
+
+            let mut repair = VamanaIndex::build(&vectors, config.clone()).unwrap();
+            repair.set_last_applied_seq(Some(100));
+            repair
+                .save_atomic(dir.path())
+                .expect("corrupt incumbent is no sequence barrier");
+            assert_eq!(
+                VamanaIndex::load(dir.path()).unwrap().last_applied_seq(),
+                Some(100)
+            );
+        }
     }
 
     #[cfg(feature = "mmap")]
