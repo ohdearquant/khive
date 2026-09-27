@@ -358,7 +358,12 @@ records terminal `delivery="failed"`, `failed_at`, and `last_error`. Network
 failures, token-endpoint pressure, SMTP 4xx responses, Telegram 408/429/5xx
 responses, and similar transient errors leave the note pending, increment
 `delivery_attempts`, and set `next_attempt_at` using exponential backoff from
-5 seconds to a 30-minute ceiling. Polls skip the note until that deadline.
+5 seconds to a 30-minute ceiling. A Telegram 429 with `retry_after` raises the
+retry delay to at least that interval and pauses the Telegram outbound pass;
+polls skip the note until its deadline. Telegram outbound delivery is
+at-least-once without receiver-side deduplication: if Telegram accepts a send
+but its response is lost, or the daemon stops before recording delivery, a
+retry can post the same message twice.
 There is no attempt-count promotion to failure; a later successful delivery
 clears `delivery_attempts` and `next_attempt_at`.
 

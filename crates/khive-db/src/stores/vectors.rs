@@ -850,12 +850,6 @@ fn orphan_sweep_dml(
                      UNION ALL \
                      SELECT id FROM knowledge_atoms WHERE deleted_at IS NULL";
 
-    let orphan_pred = format!(
-        "subject_id NOT IN ({live}) AND {f}",
-        live = live_subq,
-        f = filter_pred,
-    );
-
     // 1. Scanned: rows matching the caller's filters (before orphan check).
     let scan_sql = format!(
         "SELECT COUNT(*) FROM {t} WHERE {f}",
@@ -867,6 +861,21 @@ fn orphan_sweep_dml(
         rusqlite::params![ns_json, kind_json, allow_json],
         |row| row.get(0),
     )?;
+
+    // Snapshot the live registry once for this sweep. Each bounded delete
+    // batch consults this temp table instead of rescanning all three source
+    // tables. The caller's transaction owns the snapshot and any rollback.
+    conn.execute_batch("CREATE TEMP TABLE khive_orphan_sweep_live_ids(id TEXT)")?;
+    conn.execute_batch(&format!(
+        "INSERT INTO temp.khive_orphan_sweep_live_ids(id) {live_subq}"
+    ))?;
+    conn.execute_batch(
+        "CREATE INDEX temp.khive_orphan_sweep_live_ids_idx \
+         ON khive_orphan_sweep_live_ids(id)",
+    )?;
+    let orphan_pred = format!(
+        "subject_id NOT IN (SELECT id FROM temp.khive_orphan_sweep_live_ids) AND {filter_pred}"
+    );
 
     // 2. Would-delete: orphaned rows among the scanned set.
     let count_sql = format!(
@@ -889,9 +898,10 @@ fn orphan_sweep_dml(
     // delete subject_ids returned by a capped SELECT subquery.  SQLite
     // materialises the inner SELECT before running the outer DELETE, so there
     // is no self-referential conflict.
-    // Materialize the capped victim set first: the same `LIMIT` subquery
-    // evaluated twice (once to log deletes, once to delete) has no ordering
-    // guarantee, so logging and deleting must share one explicit id list.
+    // Select one bounded batch at a time. The same explicit IDs feed its log
+    // insert and delete: evaluating a `LIMIT` subquery twice would not
+    // guarantee that the logged and deleted rows are identical. The enclosing
+    // writer transaction keeps later batches from racing another writer.
     let deleted: i64 = if dry_run {
         0
     } else {
@@ -900,34 +910,44 @@ fn orphan_sweep_dml(
             t = table,
             p = orphan_pred,
         );
-        let mut stmt = conn.prepare(&select_sql)?;
-        let victim_ids: Vec<String> = stmt
-            .query_map(
-                rusqlite::params![ns_json, kind_json, allow_json, max_delete],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
-
+        let mut select_stmt = conn.prepare(&select_sql)?;
         let mut total: i64 = 0;
-        for chunk in victim_ids.chunks(400) {
-            let placeholders: String = (1..=chunk.len())
+        let mut remaining = max_delete;
+        while remaining > 0 {
+            let batch_limit = remaining.min(400);
+            let victim_ids: Vec<String> = select_stmt
+                .query_map(
+                    rusqlite::params![ns_json, kind_json, allow_json, batch_limit],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<_, _>>()?;
+            if victim_ids.is_empty() {
+                break;
+            }
+
+            let placeholders: String = (1..=victim_ids.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let in_clause = format!("subject_id IN ({placeholders})");
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-            log_vector_deletes(conn, table, &in_clause, &params)?;
+            let params: Vec<&dyn rusqlite::ToSql> = victim_ids
+                .iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .collect();
+            let log_sql = format!(
+                "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                 FROM {table} WHERE {in_clause}"
+            );
+            conn.prepare_cached(&log_sql)?.execute(params.as_slice())?;
             let del_sql = format!("DELETE FROM {t} WHERE {in_clause}", t = table);
-            let mut del_stmt = conn.prepare(&del_sql)?;
-            for (i, id_str) in chunk.iter().enumerate() {
-                del_stmt.raw_bind_parameter(i + 1, id_str.as_str())?;
-            }
-            total += del_stmt.raw_execute()? as i64;
+            total += conn.prepare_cached(&del_sql)?.execute(params.as_slice())? as i64;
+            remaining -= victim_ids.len() as i64;
         }
         total
     };
+
+    conn.execute_batch("DROP TABLE temp.khive_orphan_sweep_live_ids")?;
 
     Ok(OrphanSweepResult {
         scanned: scanned as u64,
@@ -936,6 +956,10 @@ fn orphan_sweep_dml(
         max_delete_hit,
     })
 }
+
+#[cfg(all(test, feature = "vectors"))]
+#[path = "orphan_sweep_dml_tests.rs"]
+mod orphan_sweep_dml_tests;
 
 #[async_trait]
 impl VectorStore for SqliteVecStore {
@@ -4095,6 +4119,74 @@ mod orphan_sweep_tests {
             }
         }
         assert_eq!(surviving, 3, "3 orphans must survive after cap");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_batches_over_400_with_matching_delete_logs() {
+        use std::collections::HashSet;
+
+        let pool = make_pool();
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "sw_batches", 4);
+        let store = make_store(Arc::clone(&pool), "sw_batches", 4, "ns:batches");
+
+        let ids: Vec<Uuid> = (0..405).map(|_| Uuid::new_v4()).collect();
+        for &id in &ids {
+            store
+                .insert(
+                    id,
+                    SubstrateKind::Entity,
+                    "ns:batches",
+                    "body",
+                    vec![vec4(0.1, 0.2, 0.3, 0.4)],
+                )
+                .await
+                .expect("insert orphan vector");
+        }
+
+        let result = store
+            .orphan_sweep(&sweep_all(403, false))
+            .await
+            .expect("sweep full and partial batches");
+        assert_eq!(result.scanned, 405);
+        assert_eq!(result.would_delete, 405);
+        assert_eq!(result.deleted, 403);
+        assert!(result.max_delete_hit);
+
+        let writer = pool.try_writer().expect("writer");
+        let conn = writer.conn();
+        let logged: HashSet<String> = conn
+            .prepare(
+                "SELECT subject_id FROM ann_write_log \
+                 WHERE op = 'delete' AND namespace = 'ns:batches' \
+                   AND embedding_model = 'sw_batches' AND kind = 'entity' AND field = 'body'",
+            )
+            .expect("prepare log query")
+            .query_map([], |row| row.get(0))
+            .expect("query delete logs")
+            .collect::<Result<_, _>>()
+            .expect("read delete logs");
+        let remaining: HashSet<String> = conn
+            .prepare("SELECT subject_id FROM vec_sw_batches")
+            .expect("prepare remaining query")
+            .query_map([], |row| row.get(0))
+            .expect("query remaining vectors")
+            .collect::<Result<_, _>>()
+            .expect("read remaining vectors");
+        let log_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM ann_write_log \
+                 WHERE op = 'delete' AND namespace = 'ns:batches' \
+                   AND embedding_model = 'sw_batches' AND kind = 'entity' AND field = 'body'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count delete logs");
+        assert_eq!(log_rows, result.deleted as i64, "one log row per deletion");
+        assert_eq!(logged.len(), 403, "every deleted vector must have one log");
+        assert_eq!(remaining.len(), 2);
+        assert!(logged.is_disjoint(&remaining));
+        assert_eq!(logged.union(&remaining).count(), ids.len());
     }
 
     // ── test 6: namespace filter ──────────────────────────────────────────────

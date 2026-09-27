@@ -98,13 +98,23 @@ def _request_raw(proc: subprocess.Popen, ops_string: str) -> dict:
     if "error" in resp:
         return {"_rpc_error": resp["error"]}
     result = resp.get("result", {})
-    if result.get("isError"):
-        content = result.get("content", [])
-        text = content[0]["text"] if content else ""
-        return {"_rpc_error": {"message": text, "code": -32603}}
     content = result.get("content", [])
     text = content[0]["text"] if content else ""
-    return json.loads(text) if text else {}
+    try:
+        body = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        if result.get("isError"):
+            return {"_rpc_error": {"message": text, "code": -32603}}
+        raise
+    # ADR-020 keeps the per-op envelope readable even when every op failed.
+    # #3245 additionally marks that outcome at the MCP tool-result boundary.
+    if result.get("isError") and not (
+        isinstance(body, dict)
+        and isinstance(body.get("results"), list)
+        and isinstance(body.get("summary"), dict)
+    ):
+        return {"_rpc_error": {"message": text, "code": -32603}}
+    return body
 
 
 def _tool_raw(proc: subprocess.Popen, name: str, args: dict) -> dict:

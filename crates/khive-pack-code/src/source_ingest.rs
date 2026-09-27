@@ -44,6 +44,8 @@ use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
 
+const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
+
 #[cfg(test)]
 mod race_seam {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -890,6 +892,40 @@ fn ts(dt: DateTime<Utc>) -> i64 {
     dt.timestamp_micros()
 }
 
+/// Capture the old project/language clock before any tier in this invocation
+/// advances it. A missing or malformed clock cannot authorize refreshing
+/// historical L2 edges.
+async fn capture_previous_l2_sweep_stamp(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+    language: &str,
+    previous_stamps: &mut PreviousL2SweepStamps,
+) -> Result<(), CodeSourceIngestError> {
+    let owner = L2OwnerKey {
+        source_project: name.to_string(),
+        language: language.to_string(),
+    };
+    if previous_stamps.contains_key(&owner) {
+        return Ok(());
+    }
+    let stamp = get_entity_opt(rt, token, project_uuid(name))
+        .await?
+        .and_then(|project| {
+            project
+                .properties
+                .and_then(|properties| properties.get("sweep_clock").cloned())
+                .and_then(|clock| {
+                    clock
+                        .get(language)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        });
+    previous_stamps.insert(owner, stamp);
+    Ok(())
+}
+
 /// Upsert (create or refresh) the `project` entity for `name`, merging the
 /// per-`(source_project, language)` sweep clock (B5) with any prior sweeps
 /// for a different language recorded on the same entity.
@@ -907,9 +943,15 @@ async fn upsert_project(
     source_label: &str,
     language: &str,
     sweep_time: DateTime<Utc>,
+    capture_previous_l2_sweep: bool,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let id = project_uuid(name);
+    if capture_previous_l2_sweep {
+        capture_previous_l2_sweep_stamp(rt, token, name, language, previous_l2_sweep_stamps)
+            .await?;
+    }
     let now = ts(sweep_time);
     let outcome = mutate_entity(rt, token, id, source_label, report, |current| {
         let mut entity = current
@@ -970,6 +1012,7 @@ async fn ensure_project_id(
     language: &str,
     per_language_project_stamps: bool,
     sweep_time: DateTime<Utc>,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let key = project_cache_key(proj_name, language, per_language_project_stamps);
@@ -977,7 +1020,15 @@ async fn ensure_project_id(
         return Ok(Some(*id));
     }
     let Some(id) = upsert_project(
-        rt, token, proj_name, file_label, language, sweep_time, report,
+        rt,
+        token,
+        proj_name,
+        file_label,
+        language,
+        sweep_time,
+        per_language_project_stamps,
+        previous_l2_sweep_stamps,
+        report,
     )
     .await?
     else {
@@ -1056,7 +1107,12 @@ async fn upsert_module(
             .entry("import_scan_status".to_string())
             .or_insert_with(|| json!("unscanned"));
         if !preserve_l2_state {
-            for key in ["declaration_ids", "l2_pending_impls", "l2_content_hash"] {
+            for key in [
+                "declaration_ids",
+                "l2_pending_impls",
+                "l2_content_hash",
+                "l2_scanner_identity_version",
+            ] {
                 props.remove(key);
             }
         }
@@ -1524,54 +1580,65 @@ const SOURCE_SKIP_DIRS: &[&str] = &[
     "build",
 ];
 
-fn collect_source_files(root: &Path, ext: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
-                continue;
-            }
-            collect_source_files(&path, ext, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// L2's source walk resolves symlinks but never crosses the canonical ingest
+/// Both source tiers resolve symlinks without crossing the canonical ingest
 /// root. Canonical directory de-duplication also prevents symlink cycles.
-fn collect_l2_source_files(
+fn collect_source_files(
     root: &Path,
     ext: &str,
     out: &mut Vec<PathBuf>,
     skipped_outside_root: &mut Vec<PathBuf>,
+    skipped_non_regular: &mut Vec<PathBuf>,
+    skipped_non_source: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
-    fn visit(
-        path: &Path,
-        canonical_root: &Path,
-        ext: &str,
-        visited_dirs: &mut BTreeSet<PathBuf>,
-        out: &mut Vec<PathBuf>,
-        skipped: &mut Vec<PathBuf>,
-    ) -> std::io::Result<()> {
+    struct SourceWalk<'a> {
+        canonical_root: &'a Path,
+        ext: &'a str,
+        visited_dirs: BTreeSet<PathBuf>,
+        out: &'a mut Vec<PathBuf>,
+        skipped_outside_root: &'a mut Vec<PathBuf>,
+        skipped_non_regular: &'a mut Vec<PathBuf>,
+        skipped_non_source: &'a mut Vec<PathBuf>,
+    }
+
+    fn visit(path: &Path, walk: &mut SourceWalk<'_>) -> std::io::Result<()> {
         let canonical = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(_) => {
-                skipped.push(path.to_path_buf());
+                if path.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+                    walk.skipped_outside_root.push(path.to_path_buf());
+                } else {
+                    walk.skipped_non_source.push(path.to_path_buf());
+                }
                 return Ok(());
             }
         };
-        if !canonical.starts_with(canonical_root) {
-            skipped.push(path.to_path_buf());
+        if !canonical.starts_with(walk.canonical_root) {
+            if path.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+                walk.skipped_outside_root.push(path.to_path_buf());
+            } else {
+                walk.skipped_non_source.push(path.to_path_buf());
+            }
+            return Ok(());
+        }
+        // An alias must not re-enter a directory excluded by its canonical
+        // location. Components are relative to the explicitly chosen root,
+        // so a caller may still choose an excluded-name directory as root.
+        if canonical
+            .strip_prefix(walk.canonical_root)
+            .expect("canonical path was checked within the ingest root")
+            .components()
+            .any(|component| match component {
+                std::path::Component::Normal(name) => {
+                    let name = name.to_string_lossy();
+                    SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.')
+                }
+                _ => false,
+            })
+        {
             return Ok(());
         }
         if canonical.is_dir() {
-            if !visited_dirs.insert(canonical.clone()) {
+            if !walk.visited_dirs.insert(canonical.clone()) {
                 return Ok(());
             }
             for entry in fs::read_dir(&canonical)? {
@@ -1582,25 +1649,31 @@ fn collect_l2_source_files(
                 if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
                     continue;
                 }
-                visit(&entry_path, canonical_root, ext, visited_dirs, out, skipped)?;
+                visit(&entry_path, walk)?;
             }
-        } else if canonical.extension().and_then(|value| value.to_str()) == Some(ext) {
-            out.push(canonical);
+        } else if canonical.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+            if canonical.is_file() {
+                walk.out.push(canonical);
+            } else {
+                walk.skipped_non_regular.push(path.to_path_buf());
+            }
         }
         Ok(())
     }
 
     let canonical_root = fs::canonicalize(root)?;
-    visit(
-        &canonical_root,
-        &canonical_root,
+    let mut walk = SourceWalk {
+        canonical_root: &canonical_root,
         ext,
-        &mut BTreeSet::new(),
+        visited_dirs: BTreeSet::new(),
         out,
         skipped_outside_root,
-    )?;
-    out.sort();
-    out.dedup();
+        skipped_non_regular,
+        skipped_non_source,
+    };
+    visit(&canonical_root, &mut walk)?;
+    walk.out.sort();
+    walk.out.dedup();
     Ok(())
 }
 
@@ -1646,12 +1719,15 @@ pub async fn run_code_ingest(
     // `project_cache_key` collapses its language component for default
     // L1/L1.5 calls to preserve their established write/counter behavior.
     let mut project_ids: HashMap<(String, String), Uuid> = HashMap::new();
+    let mut previous_l2_sweep_stamps = PreviousL2SweepStamps::new();
 
     // Manifest discovery supplies bounded identity, alias, and scope context
     // to L1.5 without implying L1 output. No selected L1/L1.5 tier means no
     // manifest walk, preserving the zero-write and L2-only boundaries.
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
-        manifest::discover_manifests(opts.path, &opts.languages)
+        let canonical_ingest_root = fs::canonicalize(opts.path)
+            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+        manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
             .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?
     } else {
         Vec::new()
@@ -1691,6 +1767,8 @@ pub async fn run_code_ingest(
                 &file_label,
                 m.language,
                 opts.sweep_time,
+                opts.enable_l2,
+                &mut previous_l2_sweep_stamps,
                 &mut report,
             )
             .await?
@@ -1753,6 +1831,7 @@ pub async fn run_code_ingest(
                 opts.enable_l2,
                 opts.sweep_time,
                 &mut project_ids,
+                &mut previous_l2_sweep_stamps,
                 &mut module_scans,
                 &mut report,
             )
@@ -1786,15 +1865,26 @@ pub async fn run_code_ingest(
         let mut state = run_l2_sweep(
             rt,
             token,
-            opts.path,
-            &snapshot,
-            opts.sweep_time,
+            L2SweepInputs {
+                ingest_root: opts.path,
+                snapshot: &snapshot,
+                sweep_time: opts.sweep_time,
+            },
             &mut project_ids,
+            &mut previous_l2_sweep_stamps,
             &mut report,
         )
         .await?;
         l2_reresolve_pass(rt, token, opts.sweep_time, &mut state, &mut report).await?;
-        refresh_unchanged_l2_edges(rt, token, opts.sweep_time, &mut state, &mut report).await?;
+        refresh_unchanged_l2_edges(
+            rt,
+            token,
+            opts.sweep_time,
+            &previous_l2_sweep_stamps,
+            &mut state,
+            &mut report,
+        )
+        .await?;
         if let Some(l2) = report.l2.as_mut() {
             l2.symbol_edges_stamped = state.stamped_edge_ids.len() as u64;
         }
@@ -1824,20 +1914,63 @@ async fn run_import_scan(
     per_language_project_stamps: bool,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<(String, String), Uuid>,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     module_scans: &mut HashMap<Uuid, ModuleScan>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
+    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
+        Ok(path) => path,
+        Err(error) => {
+            report.warnings.push(format!(
+                "canonicalizing L1.5 ingest root {}: {error}",
+                ingest_root.display()
+            ));
+            return Ok(());
+        }
+    };
     let mut files = Vec::new();
-    if let Err(e) = collect_source_files(ingest_root, ext, &mut files) {
+    let mut skipped_outside_root = Vec::new();
+    let mut skipped_non_regular = Vec::new();
+    let mut skipped_non_source = Vec::new();
+    if let Err(e) = collect_source_files(
+        &canonical_ingest_root,
+        ext,
+        &mut files,
+        &mut skipped_outside_root,
+        &mut skipped_non_regular,
+        &mut skipped_non_source,
+    ) {
         report
             .warnings
             .push(format!("walking {}: {e}", ingest_root.display()));
         return Ok(());
     }
-    files.sort();
+    for skipped in skipped_outside_root {
+        report.warnings.push(format!(
+            "L1.5 skipped source outside the canonical ingest root: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_regular {
+        report.warnings.push(format!(
+            "L1.5 skipped non-regular source: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_source {
+        let warning = format!(
+            "L1.5 skipped non-source traversal entry: {}",
+            skipped.display()
+        );
+        if !report.warnings.contains(&warning) {
+            report.warnings.push(warning);
+        }
+    }
     if !files.is_empty() {
         record_observed_language(report, language);
     }
@@ -1847,19 +1980,19 @@ async fn run_import_scan(
             continue;
         };
         let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, ingest_root, language).unwrap_or_else(
-                || {
+            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, language)
+                .unwrap_or_else(|| {
                     (
-                        ingest_root.to_path_buf(),
+                        canonical_ingest_root.clone(),
                         basename_project_name(ingest_root),
                     )
-                },
-            );
+                });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) = derive_source_path(&file, ingest_root, &snapshot.root, report)
+        let Some(source_path) =
+            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
         else {
             continue;
         };
@@ -1875,6 +2008,7 @@ async fn run_import_scan(
             language,
             per_language_project_stamps,
             sweep_time,
+            previous_l2_sweep_stamps,
             report,
         )
         .await?
@@ -1992,11 +2126,13 @@ async fn run_import_scan(
 // `crate::extractor`; this module consumes that language-neutral contract
 // rather than defining a parallel copy.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct L2OwnerKey {
     source_project: String,
     language: String,
 }
+
+type PreviousL2SweepStamps = HashMap<L2OwnerKey, Option<String>>;
 
 #[derive(Debug, Default)]
 struct L2SweepState {
@@ -2093,18 +2229,17 @@ fn declaration_owner_id(
     }
 }
 
-/// Decide whether an L2-selected file needs (re)parsing this sweep
-/// unchanged content with a valid
-/// existing ownership stamp reuses that stamp without reparsing; anything
-/// else — changed content, or no stamp yet even with unchanged content —
-/// parses. Pure and independent of storage so the boundary is directly
-/// testable.
+/// Unchanged content reuses its ownership stamp only when that stamp was
+/// produced by this Rust scanner identity version. Older generic method IDs
+/// must be recomputed even when the source bytes have not changed.
 fn l2_needs_reparse(
     existing_content_hash: Option<&str>,
     existing_declaration_ids: Option<&Value>,
+    existing_identity_version: Option<u64>,
     new_content_hash: &str,
 ) -> bool {
     existing_content_hash != Some(new_content_hash)
+        || existing_identity_version != Some(RUST_L2_SCANNER_IDENTITY_VERSION)
         || existing_declaration_ids
             .and_then(read_declaration_ids)
             .is_none()
@@ -2785,9 +2920,14 @@ async fn clear_l2_ownership(
             .properties
             .clone()
             .and_then(|value| value.as_object().cloned())?;
-        let changed = ["declaration_ids", "l2_pending_impls", "l2_content_hash"]
-            .into_iter()
-            .any(|key| props.remove(key).is_some());
+        let changed = [
+            "declaration_ids",
+            "l2_pending_impls",
+            "l2_content_hash",
+            "l2_scanner_identity_version",
+        ]
+        .into_iter()
+        .any(|key| props.remove(key).is_some());
         if !changed {
             return None;
         }
@@ -2799,8 +2939,7 @@ async fn clear_l2_ownership(
 }
 
 /// Stamp the module's current-coverage `declaration_ids` (sorted, deduped)
-/// after a successful parse — the authoritative "this module's declarations
-/// as of `content_hash`/`source_revision`" marker.
+/// and scanner identity version after a successful parse.
 async fn stamp_l2_declarations(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -2827,6 +2966,10 @@ async fn stamp_l2_declarations(
                 .collect::<Vec<_>>()),
         );
         props.insert("l2_content_hash".into(), json!(content_hash));
+        props.insert(
+            "l2_scanner_identity_version".into(),
+            json!(RUST_L2_SCANNER_IDENTITY_VERSION),
+        );
         module.properties = Some(Value::Object(props));
         Some(module)
     })
@@ -3103,6 +3246,12 @@ async fn persist_l2_file(
     Ok(Some(declaration_ids))
 }
 
+struct L2SweepInputs<'a> {
+    ingest_root: &'a Path,
+    snapshot: &'a SourceSnapshot,
+    sweep_time: DateTime<Utc>,
+}
+
 /// Walk every `.rs` file under `ingest_root`, ensure its project/module L2
 /// ownership scaffolding exists, and (re)parse it when needed
 /// Rust-only; other-language selections
@@ -3111,12 +3260,16 @@ async fn persist_l2_file(
 async fn run_l2_sweep(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    ingest_root: &Path,
-    snapshot: &SourceSnapshot,
-    sweep_time: DateTime<Utc>,
+    inputs: L2SweepInputs<'_>,
     project_ids: &mut HashMap<(String, String), Uuid>,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     report: &mut CodeSourceIngestReport,
 ) -> Result<L2SweepState, CodeSourceIngestError> {
+    let L2SweepInputs {
+        ingest_root,
+        snapshot,
+        sweep_time,
+    } = inputs;
     const LANGUAGE: &str = "rust";
     let mut state = L2SweepState::default();
     let Some(ext) = imports::extension_for_language(LANGUAGE) else {
@@ -3134,11 +3287,15 @@ async fn run_l2_sweep(
     };
     let mut files = Vec::new();
     let mut skipped_outside_root = Vec::new();
-    if let Err(e) = collect_l2_source_files(
+    let mut skipped_non_regular = Vec::new();
+    let mut skipped_non_source = Vec::new();
+    if let Err(e) = collect_source_files(
         &canonical_ingest_root,
         ext,
         &mut files,
         &mut skipped_outside_root,
+        &mut skipped_non_regular,
+        &mut skipped_non_source,
     ) {
         report
             .warnings
@@ -3151,6 +3308,19 @@ async fn run_l2_sweep(
             skipped.display()
         ));
         report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_regular {
+        report.warnings.push(format!(
+            "L2 skipped non-regular source: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_source {
+        report.warnings.push(format!(
+            "L2 skipped non-source traversal entry: {}",
+            skipped.display()
+        ));
     }
     if !files.is_empty() {
         record_observed_language(report, LANGUAGE);
@@ -3188,6 +3358,7 @@ async fn run_l2_sweep(
             LANGUAGE,
             true,
             sweep_time,
+            previous_l2_sweep_stamps,
             report,
         )
         .await?
@@ -3218,6 +3389,11 @@ async fn run_l2_sweep(
                 .as_ref()
                 .and_then(|e| e.properties.as_ref())
                 .and_then(|p| p.get("declaration_ids")),
+            existing_module
+                .as_ref()
+                .and_then(|e| e.properties.as_ref())
+                .and_then(|p| p.get("l2_scanner_identity_version"))
+                .and_then(Value::as_u64),
             &hash,
         );
 
@@ -3314,12 +3490,14 @@ async fn run_l2_sweep(
 /// Refresh outgoing dependency/implementation edges for declarations whose
 /// files were reused without parsing. This runs only after the complete L2
 /// walk and re-resolution, so a target is refreshed only when this invocation
-/// proved both endpoints current. Changed sources restamp only references
-/// observed by their new parse, leaving removed edges at their prior stamp.
+/// proved both endpoints current. An edge must also have been current at its
+/// source project's previous language sweep; changed sources restamp only
+/// references observed by their new parse, leaving removed edges historical.
 async fn refresh_unchanged_l2_edges(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     sweep_time: DateTime<Utc>,
+    previous_l2_sweep_stamps: &PreviousL2SweepStamps,
     state: &mut L2SweepState,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
@@ -3354,12 +3532,24 @@ async fn refresh_unchanged_l2_edges(
         {
             continue;
         }
+        let Some(previous_stamp) = previous_l2_sweep_stamps
+            .get(&source_owner)
+            .and_then(Option::as_deref)
+        else {
+            continue;
+        };
         if !edge
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("l2_derived"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+            || edge
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("last_seen_at"))
+                .and_then(Value::as_str)
+                != Some(previous_stamp)
         {
             continue;
         }
@@ -3375,6 +3565,7 @@ async fn refresh_unchanged_l2_edges(
                 .get("l2_derived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || metadata.get("last_seen_at").and_then(Value::as_str) != Some(previous_stamp)
             {
                 return None;
             }
@@ -3793,22 +3984,64 @@ mod tests {
     fn invalid_declaration_ids_force_reparse() {
         let hash = "0123456789abcdef";
 
-        assert!(l2_needs_reparse(Some(hash), None, hash));
-        assert!(l2_needs_reparse(Some(hash), Some(&Value::Null), hash));
+        assert!(l2_needs_reparse(
+            Some(hash),
+            None,
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
+        assert!(l2_needs_reparse(
+            Some(hash),
+            Some(&Value::Null),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
         assert!(l2_needs_reparse(
             Some(hash),
             Some(&json!("not-an-array")),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
             hash
         ));
         assert!(l2_needs_reparse(
             Some(hash),
             Some(&json!(["not-a-uuid"])),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
             hash
         ));
-        assert!(!l2_needs_reparse(Some(hash), Some(&json!([])), hash));
+        assert!(!l2_needs_reparse(
+            Some(hash),
+            Some(&json!([])),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
         assert!(!l2_needs_reparse(
             Some(hash),
             Some(&json!([Uuid::nil().to_string()])),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
+    }
+
+    #[test]
+    fn old_scanner_identity_stamp_forces_reparse_of_unchanged_file() {
+        let hash = "0123456789abcdef";
+        let declarations = json!([Uuid::nil().to_string()]);
+        assert!(l2_needs_reparse(
+            Some(hash),
+            Some(&declarations),
+            None,
+            hash
+        ));
+        assert!(l2_needs_reparse(
+            Some(hash),
+            Some(&declarations),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION - 1),
+            hash
+        ));
+        assert!(!l2_needs_reparse(
+            Some(hash),
+            Some(&declarations),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
             hash
         ));
     }

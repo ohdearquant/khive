@@ -164,6 +164,65 @@ async fn entity_count(rt: &KhiveRuntime) -> i64 {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn l1_5_skips_outside_symlink_and_non_regular_source() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+
+    let root = TempDir::new().expect("source root");
+    let outside = TempDir::new().expect("outside root");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"bounded_scan\"\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("lib.rs"), "pub fn safe() {}\n").unwrap();
+    symlink(src.join("lib.rs"), src.join("alias.rs")).unwrap();
+    let escaped = outside.path().join("escaped.rs");
+    std::fs::write(&escaped, "use private_project::secret;\n").unwrap();
+    symlink(&escaped, src.join("escaped.rs")).unwrap();
+    let _socket = UnixListener::bind(src.join("socket.rs")).unwrap();
+
+    let rt = rt_at(&root.path().join("bounded.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: ["rust"].into_iter().collect(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("bounded L1.5 ingest succeeds");
+
+    assert_eq!(
+        report.modules_created, 1,
+        "only one in-root file is scanned"
+    );
+    assert_eq!(report.files_dropped_without_source_path, 2);
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("outside the canonical ingest root") && warning.contains("escaped.rs")
+    }));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("non-regular source") && warning.contains("socket.rs")));
+    assert_eq!(
+        module_properties_for_path(&rt, "bounded_scan", "src/lib.rs")
+            .await
+            .len(),
+        1
+    );
+}
+
 async fn module_properties_for_path(
     rt: &KhiveRuntime,
     source_project: &str,
@@ -1170,14 +1229,13 @@ async fn gate_blocked_project_name_reports_safe_manifest_path() {
         report.blocked.len(),
         "blocked_count must match the number of entries in blocked"
     );
-    let expected_manifest = root
-        .path()
+    let canonical_root = root.path().canonicalize().expect("canonical tempdir");
+    let expected_manifest = canonical_root
         .join("pkg_secret")
         .join("Cargo.toml")
         .display()
         .to_string();
-    let expected_source = root
-        .path()
+    let expected_source = canonical_root
         .join("pkg_secret")
         .join("src")
         .join("lib.rs")
@@ -1227,6 +1285,66 @@ async fn gate_blocked_project_name_reports_safe_manifest_path() {
         !names.iter().any(|n| n.contains("user:pass")),
         "the gate-blocked project name must never be written as an entity: {names:?}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gate_blocked_project_paths_use_one_spelling_through_symlinked_parent() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().expect("tempdir");
+    let real_parent = root.path().join("real_parent");
+    let real_source = real_parent.join("source");
+    std::fs::create_dir_all(&real_source).expect("real source directory");
+    write_gate_blocked_project_name_fixture(&real_source);
+    let alias_parent = root.path().join("alias_parent");
+    symlink(&real_parent, &alias_parent).expect("symlink parent");
+    let aliased_source = alias_parent.join("source");
+    let canonical_source = real_source
+        .canonicalize()
+        .expect("canonical source directory");
+    assert_ne!(aliased_source, canonical_source);
+    assert_eq!(
+        aliased_source.canonicalize().expect("canonical alias"),
+        canonical_source
+    );
+
+    let db = root.path().join("gate_blocked_alias.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &aliased_source,
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("ingest through symlinked parent");
+
+    let mut blocked_files: Vec<&str> = report.blocked.iter().map(|b| b.file.as_str()).collect();
+    blocked_files.sort_unstable();
+    let expected_manifest = canonical_source.join("pkg_secret/Cargo.toml");
+    let expected_source = canonical_source.join("pkg_secret/src/lib.rs");
+    let mut expected_files = vec![
+        expected_manifest.to_str().expect("UTF-8 temp path"),
+        expected_source.to_str().expect("UTF-8 temp path"),
+    ];
+    expected_files.sort_unstable();
+    assert_eq!(report.blocked_count, 2);
+    assert_eq!(blocked_files, expected_files);
+    assert!(report
+        .blocked
+        .iter()
+        .all(|entry| entry.detector == "url-userinfo"));
+    assert!(!serde_json::to_string(&report)
+        .expect("serializable report")
+        .contains("user:pass"));
 }
 
 #[tokio::test]

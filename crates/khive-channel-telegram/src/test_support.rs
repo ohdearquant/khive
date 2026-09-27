@@ -1,7 +1,7 @@
 //! Opt-in fixture for coordinator tests; no live connector or copied offset algorithm.
 
 use super::{TelegramChannel, TelegramChannelConfig, TelegramConnector, TelegramUpdate};
-use crate::connector::{TelegramChat, TelegramMessage};
+use crate::connector::{TelegramChat, TelegramMessage, TelegramUser};
 use async_trait::async_trait;
 use khive_channel::ChannelError;
 use std::collections::VecDeque;
@@ -46,6 +46,7 @@ impl TelegramTimingFixture {
                         message_id: update_id,
                         date: 1_700_000_000,
                         chat: TelegramChat { id: 555 },
+                        from: Some(TelegramUser { id: 555 }),
                         text: Some(format!("timing fixture update {update_id}")),
                     }),
                 }]
@@ -58,6 +59,7 @@ impl TelegramTimingFixture {
         let config = TelegramChannelConfig {
             bot_token: "timing-fixture".into(),
             maintainer_chat_id: 555,
+            authorized_sender_id: 555,
             maintainer_slug: "maintainer".into(),
             ingest_namespace: "local".into(),
         };

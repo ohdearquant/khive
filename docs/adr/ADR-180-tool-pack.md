@@ -450,3 +450,122 @@ are recorded here as distinct so that neither is read as having answered the oth
     ranking. Arm 28 crosses a scoped allow against an unscoped deny for the SAME actor and tool,
     which is the safe case; nothing before this arm crosses scope specificity against actor
     specificity, which is the case where the sum lets a broader actor win.
+
+## Amendment 5 (2026-09-25): uniqueness by name is held by the store, not by a lookup
+
+**Status**: Accepted (2026-09-25).
+
+### Context
+
+The Decision says "Names are unique per namespace; re-registering an existing name returns the
+existing object and links any new capabilities without changing its properties", and acceptance arms
+1, 2 and 8 test it one call at a time. Nothing holds it when two registrations run at once.
+`register_one` in `crates/khive-pack-tool/src/handlers.rs` looks the name up (`find_by_name`) and
+calls `create_entity` when the lookup misses. `ensure_capability` does the same for each capability
+concept, after listing at most 5000 tagged concepts and matching the name in Rust. Two concurrent
+registrations of one new name can both miss and both create, and each caller is told
+`created: true`.
+
+This is reachable from ordinary use. A parallel batch ([ADR-016](ADR-016-request-dsl.md)) runs its
+operations concurrently, and the dispatcher derives no write-conflict key for `tool.register`;
+concurrent creates are left to database uniqueness constraints
+(`crates/khive-request/docs/api/write-conflicts.md`), and the registry has none. A batch that
+registers two tools sharing one new capability can therefore create that capability twice (#3307).
+
+Duplicates, once present, resolve deterministically: a name resolves to the caller's own namespace
+first, then to the exact-case spelling, then to the newest row (`registration_snapshot` in
+`crates/khive-pack-tool/src/pin.rs`). The caller whose row loses holds an id its name no longer
+resolves to, and its `created: true` is indistinguishable from winning, which is the kind of response
+Amendment 3 calls worse than a refusal.
+
+A claim cannot be added on top of the runtime's create path as it stands. `create_entity` in
+`crates/khive-runtime/src/operations.rs` writes the row with an upsert, then deletes it again when the
+full-text or vector step fails. Two callers writing one agreed id through that path would overwrite
+each other, and the compensating delete could remove a row another caller had already been handed
+and linked to.
+
+### Decision
+
+1. **Ids are derived, not minted.** A registry object's id is a version-5 UUID over a pack-level
+   seed, the owning namespace and the ASCII-lowercased name, the same fold the name lookup already
+   applies. A capability concept's id is derived the same way from its namespace and lowercased name,
+   under its own seed.
+2. **Registration claims the id with a conditional insert.** After the by-name lookup misses, the row
+   is written with `EntityStore::insert_entity_if_absent`, whose contract is that an existing row wins
+   and is never updated. The caller that inserts reports `created: true`. A caller that loses reads
+   the winning row and reports `created: false` with the winner's id and properties, exactly as
+   re-registration does today. The primary key is the unique index, so no table and no migration are
+   added.
+3. **Indexing never deletes a claimed row.** The secret gate runs before the insert, as today.
+   Full-text and vector indexing run after a successful insert. If either fails, the row stays, the
+   call reports the failure and names the row's id, and the next registration of that name, which
+   finds the row, repeats the indexing before it returns. Both index writes are keyed by the row id
+   and must be safe to repeat. Until the repair, the row resolves by name and by id but can be missing
+   from `tool.suggest`.
+4. **Existing rows keep their ids.** The by-name lookup runs first, so a name already held by a row
+   with a minted id resolves to that row and never gains a derived-id twin. Duplicates created before
+   this amendment are left as they are and keep resolving by the rule above; nothing merges or renames
+   them.
+5. **A tombstone is not revived.** If the derived id belongs to a soft-deleted row, registration
+   refuses and names that row. Reviving a registry row would bring back the id and policy inputs that
+   Amendment 1's grants are pinned to, so a deleted registration is never restored as a side effect
+   of registering its name; `restore` stays the explicit path. The same refusal applies to a
+   soft-deleted capability concept.
+6. **The capability lookup is an exact query.** `ensure_capability` finds a capability by namespace,
+   tag and lowercased name in the query rather than by scanning a bounded listing.
+
+### Acceptance
+
+35. Two registrations of one new name, forced to miss the lookup together, leave one registry row.
+    Exactly one caller reports `created: true`, and both report the same id. Mutation control, stated
+    before running: replacing the conditional insert with `create_entity` turns this arm red with two
+    rows.
+36. Two registrations of different tools naming one new capability, forced to miss together, leave
+    one capability concept with two `implements` edges to it.
+37. With full-text indexing forced to fail after the insert, the registration reports the failure
+    with the row id and the row still resolves by name. A second registration of the name reports
+    `created: false`, repeats the indexing, and makes the object reachable from `tool.suggest`.
+38. A name already held by a row with a minted id re-registers onto that row (`created: false`, same
+    id), and no row with the derived id appears.
+39. A soft-deleted row holding the derived id makes registration refuse and name it, and the row
+    stays deleted.
+40. A capability is found, not duplicated, when more than 5000 other capabilities exist in the
+    namespace.
+
+### Alternatives considered
+
+- **Weaken the guarantee**: "unique by name under sequential registration; concurrent first
+  registrations may create duplicates, which resolve deterministically", listed under Known rough
+  edges. Nothing to build, and it describes the shipped code. It keeps the ambiguous
+  `created: true`, leaves batched registrations of a shared capability creating duplicate concepts,
+  and makes arms 1 and 8 true only for callers that serialize themselves, which the dispatcher does
+  not do for them.
+- **A pack-owned claim table with pending claims and fencing**: a claim row keyed by namespace and
+  name, written before the entity and fenced so a crashed claimant's pending claim can be taken over.
+  It holds uniqueness under any id scheme, but needs a migration, a pending state every reader has to
+  understand, a takeover rule, and a repair path for claims whose entity never landed. The derived id
+  gets the same exclusion from the primary key without a second record to keep consistent.
+- **A per-namespace lock inside the pack**: serializes registrations within one process only. A
+  second process writing the same database, such as a direct-mode command-line call beside the
+  daemon, races as before.
+- **A derived id through the existing create path**: two callers upserting one id overwrite each
+  other's properties, and a failed indexing step deletes a row the other caller already returned and
+  linked, leaving a dangling `implements` edge.
+
+### Consequences
+
+- The Decision's uniqueness sentence holds under concurrency for names first registered after an
+  implementation lands. Until then the shipped behaviour is the one the first alternative describes.
+- Registration needs a runtime path that creates an entity under a caller-supplied id with a
+  conditional insert and no compensating delete, beside `create_entity`. That is new runtime surface.
+  The storage primitive exists (`EntityStore::insert_entity_if_absent` in `khive-storage`,
+  implemented for SQLite in `khive-db`), and the code pack already writes map rows this way
+  ([ADR-085](ADR-085-code-pack.md) Amendment 8).
+- A registry object's id becomes predictable from its namespace and name. Nothing in this pack treats
+  an id as a secret, and grants pin both id and digest, so predictability grants nothing.
+- Registering a capability that was soft-deleted through the generic `delete` now refuses instead of
+  minting a new concept; `restore` reinstates it.
+- #3308 (a refused `implements` edge reported as linked) is independent of this amendment and is a
+  code fix.
+
+Refs: #3307, #3308.
