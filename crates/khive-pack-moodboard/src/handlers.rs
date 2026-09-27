@@ -6,7 +6,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
 
 use khive_runtime::{BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -50,7 +50,7 @@ pub(crate) async fn handle_ingest(
     let name = optional_string(&params, "name", "moodboard.ingest", 512)?;
     let caption = optional_string(&params, "caption", "moodboard.ingest", 32 * 1024)?;
     let declared_media_type = optional_string(&params, "media_type", "moodboard.ingest", 64)?;
-    let encoded_image = image_base64_input(&params)?;
+    image_base64_input(&params)?;
     let core = pack.runtime().core();
     let blob_store = require_blob_store(&core)?;
     // Cold-load and verify the checkpoint before decoding large caller bytes:
@@ -59,8 +59,19 @@ pub(crate) async fn handle_ingest(
     let model = pack.model_state().get().await?;
     let descriptor = model.descriptor().clone();
     let preprocessing_permit = pack.model_state().acquire_preprocessing_permit().await?;
-    let raw = decode_image_base64(encoded_image)?;
-    let prepared = prepare_raster(&raw, declared_media_type.as_deref())?;
+    // Move the params rather than cloning a potentially 88 MiB base64 string.
+    // The owned permit stays in the worker until raster preparation finishes;
+    // on success it returns to this future for the existing blob.put scope.
+    let (preprocessing_permit, (raw, prepared)) = spawn_preprocessing(
+        preprocessing_permit,
+        "moodboard ingest preprocessing worker",
+        move || {
+            let raw = decode_image_base64(image_base64_input(&params)?)?;
+            let prepared = prepare_raster(&raw, declared_media_type.as_deref())?;
+            Ok((raw, prepared))
+        },
+    )
+    .await?;
     let original_len = raw.len();
 
     let content_ref = blob_store.put(raw).await?;
@@ -376,10 +387,35 @@ async fn prepare_source_raster(
         .hydrate_verified(content_ref, MAX_OBJECT_BYTES as u64)
         .await?;
     let preprocessing_permit = pack.model_state().acquire_preprocessing_permit().await?;
-    let prepared = prepare_raster(original.bytes(), None)?;
-    drop(original);
+    // The verified raw-byte lease moves with the permit into the blocking
+    // worker. Cancellation of the waiter cannot admit a second decoder while
+    // this worker still holds the admitted source and raster allocation.
+    let (preprocessing_permit, prepared) = spawn_preprocessing(
+        preprocessing_permit,
+        "moodboard search preprocessing worker",
+        move || prepare_raster(original.bytes(), None),
+    )
+    .await?;
     drop(preprocessing_permit);
     Ok(prepared)
+}
+
+/// Offload raster preprocessing without letting cancellation release the
+/// single-decoder permit while the blocking closure is still running. Return
+/// it to the caller so ingest can retain the original admission through the
+/// following blob write, matching the pre-offload memory lifetime.
+async fn spawn_preprocessing<T, F>(
+    permit: OwnedSemaphorePermit,
+    operation: &'static str,
+    job: F,
+) -> Result<(OwnedSemaphorePermit, T), RuntimeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RuntimeError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || job().map(|result| (permit, result)))
+        .await
+        .map_err(|error| RuntimeError::Internal(format!("joining {operation}: {error}")))?
 }
 
 fn asset_properties(prepared: &PreparedRaster, original_bytes: usize) -> Value {
@@ -697,6 +733,58 @@ mod tests {
         let secondary = KhiveRuntime::from_backend(secondary_backend, secondary_config)
             .with_core_backend(main_backend);
         (main, secondary)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preprocessing_uses_blocking_worker_and_keeps_admission_after_cancel() {
+        let executor_thread = std::thread::current().id();
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move {
+            let permit = worker_gate
+                .acquire_owned()
+                .await
+                .expect("preprocessing permit");
+            spawn_preprocessing(permit, "test preprocessing worker", move || {
+                started_tx
+                    .send(std::thread::current().id())
+                    .expect("send worker thread");
+                release_rx.recv().expect("release blocking worker");
+                Ok(())
+            })
+            .await
+        });
+        let blocking_thread = tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("blocking worker starts without occupying the executor")
+            .expect("worker thread reported");
+        assert_ne!(blocking_thread, executor_thread);
+
+        let (tick_tx, tick_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tick_tx.send(()).expect("send executor tick");
+        });
+        tokio::time::timeout(Duration::from_secs(1), tick_rx)
+            .await
+            .expect("executor makes progress while preprocessing is blocked")
+            .expect("tick reported");
+        assert_eq!(gate.available_permits(), 0);
+
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "caller cancellation must not release a live decoder's permit"
+        );
+        release_tx.send(()).expect("finish blocking worker");
+        let returned = tokio::time::timeout(Duration::from_secs(1), gate.acquire_owned())
+            .await
+            .expect("worker returns its permit")
+            .expect("gate reopens");
+        drop(returned);
     }
 
     #[tokio::test]

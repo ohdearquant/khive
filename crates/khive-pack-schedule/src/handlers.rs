@@ -4,13 +4,15 @@
 //! `scheduled_event` notes. Trigger evaluation is NOT performed by the pack —
 //! the pack only stores intent. See `docs/design.md` for execution modes.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
+use khive_storage::note::{
+    FilterOp, Note, NoteFilter, NoteInstantSeekAfter, PropertyFilter, SortDir,
+};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::Event;
 use khive_types::{EventKind, SubstrateKind};
@@ -872,118 +874,100 @@ pub(crate) async fn handle_agenda(
         None => None,
     };
 
-    // Push kind + status filter into SQL so SQLite can use idx_schedule_trigger
-    // (declared in lib.rs on json_extract(properties,'$.trigger_at')).
-    // The RFC3339 from/to window comparison and the Rust sort by parsed DateTime<Utc>
-    // are kept in Rust to preserve timezone-correct ordering and handle corrupt legacy rows.
+    // The exact SQL predicate and sort parse stored RFC 3339 text into a UTC
+    // key. Chrono accepts four-digit date prefixes and offsets under one day,
+    // so widened local-date bounds can use the existing raw trigger index.
+    // The exact predicate remains authoritative at each inclusive boundary.
     let store = runtime.notes(token)?;
     let namespace = token.namespace().as_str();
-    let filter = NoteFilter {
-        kind: Some("scheduled_event".to_string()),
-        property_filters: vec![PropertyFilter {
+    let mut property_filters = vec![
+        PropertyFilter {
             json_path: "$.status".to_string(),
             op: FilterOp::Eq,
             value: SqlValue::Text("pending".to_string()),
-        }],
+        },
+        PropertyFilter {
+            json_path: "$.trigger_at".to_string(),
+            op: FilterOp::Rfc3339Valid,
+            value: SqlValue::Null,
+        },
+    ];
+    if let Some(from) = from_instant {
+        if let Some(local_start) = from.checked_sub_signed(Duration::days(1)) {
+            let date = local_start.format("%Y-%m-%d").to_string();
+            if date.len() == 10 && date.as_bytes()[0].is_ascii_digit() {
+                property_filters.push(PropertyFilter {
+                    json_path: "$.trigger_at".to_string(),
+                    op: FilterOp::Gte,
+                    value: SqlValue::Text(date),
+                });
+            }
+        }
+        property_filters.push(PropertyFilter {
+            json_path: "$.trigger_at".to_string(),
+            op: FilterOp::Rfc3339Gte,
+            value: SqlValue::Timestamp(from),
+        });
+    }
+    if let Some(to) = to_instant {
+        if let Some(local_end_exclusive) = to.checked_add_signed(Duration::days(2)) {
+            let date = local_end_exclusive.format("%Y-%m-%d").to_string();
+            if date.len() == 10 && date.as_bytes()[0].is_ascii_digit() {
+                property_filters.push(PropertyFilter {
+                    json_path: "$.trigger_at".to_string(),
+                    op: FilterOp::Lt,
+                    value: SqlValue::Text(date),
+                });
+            }
+        }
+        property_filters.push(PropertyFilter {
+            json_path: "$.trigger_at".to_string(),
+            op: FilterOp::Rfc3339Lte,
+            value: SqlValue::Timestamp(to),
+        });
+    }
+    let mut filter = NoteFilter {
+        kind: Some("scheduled_event".to_string()),
+        property_filters,
         order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
+        order_by_instant: true,
         ..Default::default()
     };
 
-    const PAGE_SIZE: u32 = 200;
-    // Use u64 for offset so it cannot overflow for very large stores (SCH-AUD-006).
-    let mut offset: u64 = 0;
-    // Bounded top-k: keep only the `limit` earliest events while scanning
-    // so we avoid full allocation + sort of an unbounded set (SCH-AUD-004).
-    // BinaryHeap requires Ord on the element; serde_json::Value does not
-    // implement Ord, so we maintain a max-heap over just the timestamp and
-    // pair it with a separate Vec for the serialized payloads.
-    use std::collections::BinaryHeap;
-    // Max-heap over timestamps: the root is always the latest (worst) entry.
-    let mut ts_heap: BinaryHeap<DateTime<Utc>> = BinaryHeap::new();
-    // Parallel vec of serialized events, kept in the same insertion order.
-    // After scanning we zip ts_heap (drained) with this vec and sort.
-    let mut ts_vec: Vec<DateTime<Utc>> = Vec::new();
-    let mut ev_vec: Vec<Value> = Vec::new();
-
-    loop {
+    const PAGE_SIZE: u32 = 64;
+    let mut events = Vec::with_capacity(limit as usize);
+    while events.len() < limit as usize {
+        let page_limit = PAGE_SIZE.min(limit - events.len() as u32);
         let page = store
             .query_notes_filtered_count_free(
                 namespace,
                 &filter,
                 PageRequest {
-                    limit: PAGE_SIZE,
-                    offset,
+                    limit: page_limit,
+                    offset: 0,
                 },
             )
             .await?;
         let page_len = page.items.len() as u32;
-
-        for n in &page.items {
-            // Parse trigger_at as an instant. Skip rows with unparseable
-            // trigger_at — these are legacy corrupt rows.
-            let trigger_at_str = n
+        if let Some(last) = page.items.last() {
+            let value = last
                 .properties
                 .as_ref()
-                .and_then(|p| p.get("trigger_at"))
+                .and_then(|properties| properties.get("trigger_at"))
                 .and_then(Value::as_str)
-                .unwrap_or("");
-            let instant = match trigger_at_str.parse::<DateTime<Utc>>() {
-                Ok(ts) => ts,
-                Err(_) => continue,
-            };
-
-            // Apply from/to window using parsed instants.
-            if let Some(from) = from_instant {
-                if instant < from {
-                    continue;
-                }
-            }
-            if let Some(to) = to_instant {
-                if instant > to {
-                    continue;
-                }
-            }
-
-            // Maintain bounded top-k (SCH-AUD-004):
-            // if we already have `limit` items and this one is not earlier
-            // than the current worst (maximum), skip it entirely.
-            if ts_heap.len() < limit as usize {
-                ts_heap.push(instant);
-                ts_vec.push(instant);
-                ev_vec.push(note_to_event_json(n));
-            } else if let Some(&max_ts) = ts_heap.peek() {
-                if instant < max_ts {
-                    // Evict the worst entry and insert the better one.
-                    // We need to remove max_ts from ts_vec/ev_vec too; find
-                    // its last occurrence (insertion order, LIFO for ties).
-                    ts_heap.pop();
-                    if let Some(pos) = ts_vec.iter().rposition(|t| *t == max_ts) {
-                        ts_vec.remove(pos);
-                        ev_vec.remove(pos);
-                    }
-                    ts_heap.push(instant);
-                    ts_vec.push(instant);
-                    ev_vec.push(note_to_event_json(n));
-                }
-            }
+                .ok_or_else(|| {
+                    RuntimeError::Internal("agenda: SQL returned no trigger_at".into())
+                })?;
+            filter.after_instant = Some(NoteInstantSeekAfter {
+                value: value.to_string(),
+                id: last.id,
+            });
         }
-
-        // Stop when the storage page is exhausted.
-        if page_len < PAGE_SIZE {
+        events.extend(page.items.iter().map(note_to_event_json));
+        if page_len < page_limit {
             break;
         }
-        // Checked addition — extremely unlikely to overflow u64 for personal
-        // schedule data, but the standard coding policy requires it (SCH-AUD-006).
-        offset = offset
-            .checked_add(u64::from(PAGE_SIZE))
-            .ok_or_else(|| RuntimeError::Internal("agenda: pagination offset overflow".into()))?;
     }
-
-    // Sort ascending by parsed timestamp (sort only the selected ≤ limit items).
-    let mut selected: Vec<(DateTime<Utc>, Value)> = ts_vec.into_iter().zip(ev_vec).collect();
-    selected.sort_by_key(|(ts, _)| *ts);
-
-    let events: Vec<Value> = selected.into_iter().map(|(_, v)| v).collect();
     let count = events.len();
 
     Ok(json!({ "events": events, "count": count }))

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lean mini corpus expected extraction",
+  "type": "array",
+  "minItems": 6,
+  "maxItems": 6,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "name",
+      "kind",
+      "type_expr",
+      "refs",
+      "doc",
+      "module",
+      "source_location",
+      "provenance",
+      "incomplete"
+    ],
+    "properties": {
+      "name": { "type": ["string", "null"] },
+      "kind": {
+        "enum": ["theorem", "definition", "structure", "instance", "axiom", "goal"]
+      },
+      "type_expr": { "type": "string", "minLength": 1 },
+      "refs": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+      "doc": { "type": "string" },
+      "module": { "const": "Mini" },
+      "source_location": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line", "column"],
+        "properties": {
+          "path": { "const": "Mini.lean" },
+          "line": { "type": "integer", "minimum": 1 },
+          "column": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "provenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["origin", "lean_toolchain", "lake_version"],
+        "properties": {
+          "origin": { "const": "hand-authored-fixture" },
+          "lean_toolchain": { "const": "leanprover/lean4:v4.34.1" },
+          "lake_version": { "const": "5.0.0" }
+        }
+      },
+      "incomplete": { "type": "boolean" }
+    }
+  }
+}

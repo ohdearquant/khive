@@ -5,8 +5,12 @@
 //! transports (e.g. Streamable HTTP) register with [`TransportRegistry::register`]
 //! before serving, so the serve path never hard-codes a transport enum.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -14,6 +18,76 @@ use async_trait::async_trait;
 use crate::server::KhiveMcpServer;
 
 type RequestId = rmcp::model::RequestId;
+
+/// Apply the stdio response deadline at the writer itself. rmcp writes
+/// malformed-message replies inside `AsyncRwTransport::receive`, bypassing
+/// the outer transport's `send` deadline. A stalled peer must not pin that
+/// receive loop (or its writer mutex) indefinitely.
+pub(crate) struct DeadlineWriter<W> {
+    inner: W,
+    deadline: std::time::Duration,
+    root: tokio_util::sync::CancellationToken,
+    pending_write: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<W> DeadlineWriter<W> {
+    pub(crate) fn new(
+        inner: W,
+        deadline: std::time::Duration,
+        root: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            deadline,
+            root,
+            pending_write: None,
+        }
+    }
+
+    fn poll_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        let timer = self
+            .pending_write
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.deadline)));
+        if timer.as_mut().poll(cx).is_ready() {
+            self.root.cancel();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stdio reply write exceeded its delivery deadline",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DeadlineWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if let Err(error) = self.poll_deadline(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Err(error) = self.poll_deadline(cx) {
+            return Poll::Ready(Err(error));
+        }
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.pending_write = None;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 #[cfg(not(test))]
 type OutstandingEntries = HashMap<RequestId, OutstandingRequest>;
@@ -92,6 +166,9 @@ use counted_outstanding_entries::OutstandingEntries;
 #[derive(Default)]
 pub(crate) struct OutstandingRequests {
     entries: OutstandingEntries,
+    // TTL pruning removes freshness bookkeeping, not the live handler. Keep
+    // its id reserved until a response (or dropped send) retires it.
+    active_ids: HashSet<RequestId>,
     oldest: Option<RequestId>,
     newest: Option<RequestId>,
 }
@@ -104,10 +181,11 @@ struct OutstandingRequest {
 
 impl OutstandingRequests {
     fn admit(&mut self, id: RequestId, admitted_at: Instant, capacity: usize) -> bool {
-        if self.contains(&id) || self.entries.len() >= capacity {
+        if self.contains(&id) || self.active_ids.len() >= capacity {
             return false;
         }
 
+        self.active_ids.insert(id.clone());
         let previous = self.newest.clone();
         if let Some(previous_id) = previous.as_ref() {
             self.entries
@@ -130,10 +208,15 @@ impl OutstandingRequests {
     }
 
     fn contains(&self, id: &RequestId) -> bool {
-        self.entries.contains_key(id)
+        self.entries.contains_key(id) || self.active_ids.contains(id)
     }
 
     fn retire(&mut self, id: &RequestId) {
+        self.active_ids.remove(id);
+        self.retire_queue_entry(id);
+    }
+
+    fn retire_queue_entry(&mut self, id: &RequestId) {
         let Some(obligation) = self.entries.remove(id) else {
             return;
         };
@@ -170,7 +253,7 @@ impl OutstandingRequests {
             if !stale {
                 break;
             }
-            self.retire(&oldest_id);
+            self.retire_queue_entry(&oldest_id);
         }
     }
 
@@ -508,6 +591,119 @@ mod outstanding_request_tests {
         assert_eq!(outstanding.len(), 2);
     }
 
+    #[test]
+    fn stale_bookkeeping_keeps_request_id_reserved_until_response() {
+        let mut outstanding = OutstandingRequests::default();
+        let old = RequestId::Number(1);
+        let other = RequestId::Number(2);
+        let ttl = std::time::Duration::from_secs(1);
+        assert!(outstanding.admit(old.clone(), Instant::now() - ttl * 2, 2));
+        outstanding.drop_stale(Some(ttl));
+        assert_eq!(outstanding.len(), 0, "stale freshness row is pruned");
+        assert!(outstanding.admit(other.clone(), Instant::now(), 2));
+        outstanding.retire(&other);
+
+        assert!(outstanding.contains(&old), "old handler still owns its id");
+        assert!(
+            !outstanding.admit(old.clone(), Instant::now(), 2),
+            "another admission must not reuse an id held by a stale live handler"
+        );
+        outstanding.retire(&old);
+        assert!(outstanding.admit(old, Instant::now(), 2));
+    }
+
+    #[tokio::test]
+    async fn malformed_stdio_reply_has_a_write_deadline_even_without_peer_reads() {
+        use rmcp::transport::{async_rw::AsyncRwTransport, Transport as _};
+        use tokio::io::AsyncWriteExt;
+
+        let root = tokio_util::sync::CancellationToken::new();
+        // The parse-error reply is larger than this pipe. The client keeps
+        // the read half open but never drains it.
+        let (server_io, mut client_io) = tokio::io::duplex(16);
+        let (read, write) = tokio::io::split(server_io);
+        let write = DeadlineWriter::new(write, std::time::Duration::from_millis(50), root.clone());
+        let mut transport = AsyncRwTransport::new_server(read, write);
+        client_io
+            .write_all(b"{\n")
+            .await
+            .expect("send a malformed request line");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), transport.receive())
+            .await
+            .expect("parse-error write must not pin the receive loop");
+        assert!(
+            received.is_none(),
+            "write timeout must close the inner transport"
+        );
+        assert!(root.is_cancelled(), "write timeout must cancel the session");
+    }
+
+    #[test]
+    fn initialize_does_not_advertise_protocol_without_discovery_support() {
+        let mut info =
+            rmcp::model::InitializeResult::new(rmcp::model::ServerCapabilities::default());
+        info.protocol_version = rmcp::model::ProtocolVersion::V_2026_07_28;
+        let mut message = rmcp::model::ServerJsonRpcMessage::response(
+            rmcp::model::ServerResult::InitializeResult(info),
+            request_id(1),
+        );
+
+        cap_initialize_protocol_version(&mut message);
+        let rmcp::model::JsonRpcMessage::Response(response) = message else {
+            panic!("expected initialize response");
+        };
+        let rmcp::model::ServerResult::InitializeResult(info) = response.result else {
+            panic!("expected initialize result");
+        };
+        assert_eq!(
+            info.protocol_version,
+            rmcp::model::ProtocolVersion::V_2025_11_25,
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_initialize_caps_newer_client_version_on_wire() {
+        use rmcp::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        struct ProbeServer;
+        impl rmcp::ServerHandler for ProbeServer {}
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = CancelOnEofTransport::with_idle_timeout(
+            rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(std::time::Duration::from_secs(1)),
+            None,
+        );
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}\n")
+            .await
+            .expect("send newer initialize request");
+        let running = ProbeServer
+            .serve_with_ct(transport, root.clone())
+            .await
+            .expect("initialize the stdio service");
+        let mut client_read = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_read.read_line(&mut line),
+        )
+        .await
+        .expect("initialize reply deadline")
+        .expect("read initialize reply");
+        let reply: serde_json::Value = serde_json::from_str(&line).expect("initialize JSON-RPC");
+        assert_eq!(reply["result"]["protocolVersion"], "2025-11-25");
+        root.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), running.waiting()).await;
+    }
+
     fn poison_tracker(tracker: &Arc<Mutex<OutstandingRequests>>) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = tracker
@@ -610,6 +806,19 @@ impl RepeatableWriteError for std::io::Error {
     }
 }
 
+/// rmcp recognizes this newer version for negotiation, but this server does
+/// not implement its required discovery request. Keep the advertised stdio
+/// version at the latest one the server actually supports.
+fn cap_initialize_protocol_version(item: &mut rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>) {
+    if let rmcp::model::JsonRpcMessage::Response(response) = item {
+        if let rmcp::model::ServerResult::InitializeResult(info) = &mut response.result {
+            if info.protocol_version == rmcp::model::ProtocolVersion::V_2026_07_28 {
+                info.protocol_version = rmcp::model::ProtocolVersion::V_2025_11_25;
+            }
+        }
+    }
+}
+
 impl<T> rmcp::transport::Transport<rmcp::RoleServer> for CancelOnEofTransport<T>
 where
     T: rmcp::transport::Transport<rmcp::RoleServer>,
@@ -664,8 +873,9 @@ where
     /// timeout would only repeat it.
     fn send(
         &mut self,
-        item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+        mut item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        cap_initialize_protocol_version(&mut item);
         let is_response = matches!(
             item,
             rmcp::model::JsonRpcMessage::Response(_) | rmcp::model::JsonRpcMessage::Error(_)
@@ -866,19 +1076,13 @@ where
                 // session's lifetime accounting from the wire, which is what
                 // makes this the transport's problem rather than the peer's.
                 //
-                // The duplicate scan runs BEFORE the staleness drop, and that
-                // order is load-bearing. A stale entry is an id whose response
-                // was never observed — the handler may still be running, since
-                // rmcp keeps it alive independently of this receive loop until
-                // it constructs its response. Dropping it first would convert
-                // exactly the ambiguous case into a silent re-admission: the
-                // id passes the check, is pushed as a fresh entry, and the
-                // first of the two eventual responses retires the NEW entry by
-                // id match, leaving the older live handler untracked and the
-                // idle branch free to close out from under it. Scanning the
-                // full queue first refuses that reuse instead. It costs
-                // nothing a conforming peer can notice, because an id whose
-                // response WAS written is not in the queue at all.
+                // TTL expiry removes freshness bookkeeping but leaves the id
+                // reserved until its response retires it. rmcp can still be
+                // running that handler after the queue entry expires. The
+                // reserved-id set is capacity bounded and prevents a later
+                // admission from reusing the id after any unrelated request
+                // prunes the stale entry. Scan before pruning too, so this
+                // request cannot erase its own duplicate evidence.
                 let mut duplicate_id = None;
                 let mut capacity_exceeded = false;
                 if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {

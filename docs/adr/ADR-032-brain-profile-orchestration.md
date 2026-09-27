@@ -1392,6 +1392,105 @@ events. Profile attribution, fold weights, and replay interpretation are unchang
 
 ---
 
+## Amendment 4 — Entity-posterior cache eviction order (2026-09-25, #3319)
+
+**Status**: Accepted (2026-09-25)
+
+**Context.** Section 5a says: "Entity posteriors use a bounded LRU cache (10K entries default,
+configurable per namespace). Old entries evict on capacity. The eviction order is
+deterministic (insertion order) given the same event sequence." The same section calls the
+cache "a bounded LRU", the `BalancedRecallState` block annotates `entity_posteriors` as
+"bounded LRU, 10K default", the Positive consequences cite an "LRU cache on entity
+posteriors", and Open Question 5 is titled "LRU cache size". Least-recently-used and
+insertion order are different eviction policies, so the paragraph contradicts itself.
+
+The code follows neither statement consistently. `EntityPosteriors` in
+`crates/khive-brain-core/src/posterior.rs` is documented as a "Bounded LRU map for per-entity
+posteriors", and its `order()` and `from_snapshot` documentation describe the persisted
+order as least- to most-recently-used. `get_or_insert`, however, appends an id to the order
+only when it inserts it and evicts from the front of the order, and a hit leaves the entry
+where it is. Eviction is therefore first-in, first-out: an entity that receives feedback
+often is evicted once capacity-many newer entities have been inserted after it. Posterior
+updates reach the cache through `get_or_insert` (`BalancedRecallState::apply_signal` in
+`crates/khive-brain-core/src/profile.rs`), and reads use `get`. The capacity is the constant
+`ENTITY_CACHE_CAPACITY = 10_000` in `crates/khive-pack-brain/src/pack.rs`; there is no
+per-namespace setting, which Open Question 5 still lists as open. #3319 reports the
+first-in, first-out behaviour as a defect.
+
+**Decision (accepted).** The entity-posterior cache is least-recently-used, where a use is a
+posterior update through the write path (`get_or_insert`). A read through `get` does not
+change the order. Eviction removes the least recently updated entity, and when a restored
+snapshot holds more entries than the capacity, the entries dropped are the least recently
+updated ones. The order is part of the snapshot, so it is deterministic given the same
+starting snapshot and the same event sequence. In Section 5a, "(insertion order)" is read as
+"(least recently updated first)". The code does not yet follow this rule; #3319 tracks the
+change. The "configurable per namespace" clause is not decided here and stays with Open
+Question 5.
+
+**Alternatives considered.**
+
+- Keep first-in, first-out and amend Section 5a to say that a hit does not refresh an entry.
+  Every other mention of the cache in this ADR (the Section 5a summary, the
+  `BalancedRecallState` annotation, the Positive consequences and Open Question 5), the
+  type's own documentation, the snapshot-order documentation and the `khive-brain-core`
+  README all specify LRU. First-in, first-out also evicts the
+  entities with the most feedback, whose posteriors carry the most learned signal, as soon
+  as enough new entities arrive.
+- Count serve-time reads as uses. Reads are not events, so the order, and with it which
+  posteriors survive, would depend on read traffic that the event sequence does not record.
+  Two processes replaying the same events could then evict different entities.
+
+**Consequences.** `EntityPosteriors::get_or_insert` moves an existing id to the back of the
+order, and the eviction test must refresh the first entry before inserting past capacity and
+assert that it survives. The snapshot format is unchanged: a snapshot written under the
+current code stores an insertion order, which is a valid order to restore, and later updates
+refresh positions from there.
+
+---
+
+## Amendment 5 — `ModuleName` and LoRA profile state are not implemented (2026-09-25)
+
+**Status**: Accepted (2026-09-25)
+
+**Context.** Section 6.1 ("Versioned `ModuleName` enum") says "khive defines a closed
+`ModuleName` enum in `khive-types`" and gives its source location as
+`crates/khive-types/src/lora.rs`. Section 5b uses it as the key of `LoraProfileState` and says
+LoRA-class profiles "are _registerable_ (the typology is in place)". Section 2 lists the
+types that "remain target architecture and are not shipped v1 API" (the generic `Profile`
+struct, `ProfileMetadata`, `ProfileStateClass`, `SnapshotAdapter` and inference-hook fields),
+and Section 5b says no built-in profile uses the LoRA class, but Section 6.1 carries no such
+marker and is written in the present tense.
+
+In the repository: `crates/khive-types/src/lora.rs` has no history, and `ModuleName`,
+`LoraProfileState`, `ProfileStateClass` and `LoraHook` have no match under `crates/`, nor
+does a `lattice-tune` dependency. `ProfileRecord.state_class` is a `String`
+(`crates/khive-brain-core/src/profile.rs`), and every place the brain crates construct a
+profile record writes `"Bayesian"`; no verb parameter sets it. The brain-native
+`AdapterRecord` of Section 6.4 does exist (`crates/khive-brain-core/src/brain_state.rs`), so
+adapter registration records are present while the adapter state they would key is not.
+
+**Decision (accepted).** Section 6.1 and the `LoraProfileState` shape in Section 5b are target
+architecture on the same footing as the types Section 2 lists: they are not shipped v1 API,
+and `crates/khive-types/src/lora.rs` does not exist. The design rule of Section 6.1 (a closed
+enum keyed by stable serde names, extended by adding variants and never renamed or removed
+without a migration) remains the rule for when LoRA-class profile state is built. Nothing in
+the shipped snapshot format depends on it. Section 5b's statement that LoRA-class profiles are
+registerable does not describe shipped behaviour: shipped profiles are `Bayesian` only, and no
+typed state-class enum exists.
+
+**Alternatives considered.**
+
+- Withdraw Section 6.1. The history records no decision against LoRA-class state, and the
+  section's argument for stable snapshot keys holds whenever that state is built.
+- Add `ModuleName` to `khive-types` now. It would be a public type with no caller and no
+  snapshot that uses it, which is a placeholder rather than an implementation.
+
+**Consequences.** Readers treat the LoRA material in Sections 5b to 5g and 6.1 as unimplemented
+target design. When LoRA-class state is built, `ModuleName` lands with its first consumer and
+the enum rule above applies from its first snapshot.
+
+---
+
 ## References
 
 - ADR-006 — Deterministic Scoring (`DeterministicScore`, i64 fixed-point, canonical ordering)

@@ -4,7 +4,8 @@
 //!
 //! Algorithm:
 //! 1. Collect non-soft-deleted entities; sort by UUID string ascending.
-//! 2. Collect edges; sort by (source, target, relation) ascending.
+//! 2. Collect edges; canonicalize symmetric endpoints, then sort by
+//!    (source, target, relation) ascending.
 //! 3. Serialize as `{"edges":[...],"entities":[...]}` with fixed field order and no whitespace.
 //! 4. SHA-256 the UTF-8 bytes; prefix with `"sha256:"`.
 
@@ -44,6 +45,14 @@ pub fn canonical_json(archive: &KgArchive) -> Result<String, VcsError> {
     });
 
     let mut edges = archive.edges.clone();
+    // Runtime storage canonicalizes symmetric edge endpoints. Normalize the
+    // NDJSON side before sorting and hashing so a reversed source edge has
+    // the same identity as the row exported immediately after sync.
+    for edge in &mut edges {
+        if edge.relation.is_symmetric() && edge.target < edge.source {
+            std::mem::swap(&mut edge.source, &mut edge.target);
+        }
+    }
     edges.sort_by(|a, b| {
         let ak = (
             a.source.to_string(),
@@ -263,6 +272,68 @@ mod tests {
         assert_ne!(
             snapshot_id_for_archive(&without_edge).unwrap(),
             snapshot_id_for_archive(&with_edge).unwrap()
+        );
+    }
+
+    #[test]
+    fn symmetric_edge_direction_does_not_change_snapshot_id() {
+        let low = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let high = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let edge_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let timestamp = Utc::now();
+        for relation in [EdgeRelation::CompetesWith, EdgeRelation::ComposedWith] {
+            let edge = ExportedEdge {
+                edge_id,
+                source: low,
+                target: high,
+                relation,
+                weight: 0.7,
+                properties: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            };
+            let mut forward = empty_archive();
+            forward.edges.push(edge.clone());
+            let mut reversed = empty_archive();
+            reversed.edges.push(ExportedEdge {
+                source: high,
+                target: low,
+                ..edge
+            });
+            assert_eq!(
+                snapshot_id_for_archive(&forward).unwrap(),
+                snapshot_id_for_archive(&reversed).unwrap(),
+                "{relation} endpoint order must not change snapshot identity"
+            );
+        }
+    }
+
+    #[test]
+    fn directed_edge_direction_still_changes_snapshot_id() {
+        let low = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let high = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let edge = ExportedEdge {
+            edge_id: Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
+            source: low,
+            target: high,
+            relation: EdgeRelation::Extends,
+            weight: 0.7,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut forward = empty_archive();
+        forward.edges.push(edge.clone());
+        let mut reversed = empty_archive();
+        reversed.edges.push(ExportedEdge {
+            source: high,
+            target: low,
+            ..edge
+        });
+        assert_ne!(
+            snapshot_id_for_archive(&forward).unwrap(),
+            snapshot_id_for_archive(&reversed).unwrap(),
+            "directed edge orientation remains part of snapshot identity"
         );
     }
 

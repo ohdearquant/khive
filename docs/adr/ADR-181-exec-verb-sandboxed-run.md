@@ -385,3 +385,71 @@ Acceptance: small configured caps are preserved on complete and refusal receipts
 stdout and stderr retain fewer bytes than produced, matching the cap and preserving their
 tails; zero retains no bytes. New receipts round-trip through receipt lookup and listing,
 and decoding an older receipt leaves the unknown cap absent.
+
+## Amendment 9 (2026-09-25): what the version-control and `never` denial guarantees
+
+Status: Accepted (2026-09-25). Refs #3303, #3304. This amendment
+changes no enforcement. It states the guarantee of Amendment 3 item 3 exactly, and says which part of
+the profile bounds what a run can do to a repository.
+
+### Context
+
+Amendment 3 item 3 is headed "Version control is denied at the kernel boundary" and says that a run
+"which reaches git from inside (a shell, a build script, a package manager hook) gets an
+operation-not-permitted failure from the kernel". The mechanism it names is accurate:
+`render_profile` in `crates/khive-pack-exec/src/sandbox.rs` emits `(allow process-exec)` followed by a
+`(deny process-exec ...)` whose filters are a regex on the final path component (`git`, `gh`, or a
+`git-` prefix) and a `literal` for each canonical path in the `[exec] never` set. The kernel enforces
+that rule on every exec in the sandbox. What the rule matches is the path an executable is launched
+from, not what the executable is. The same profile allows writes to the run directory and maps it
+executable, which build-and-test runs need because they execute what they build there. So the heading
+and the outcome sentence claim more than a path rule provides: a program launched from a path the rule
+does not name is not refused, whatever it does. The `[exec]` configuration documentation
+(`crates/khive-runtime/src/engine_config.rs`, `ExecSectionConfig`) describes `never` as "which binaries
+never run", which overstates it the same way.
+
+Separately, the same profile allows file metadata reads (`file-read-metadata`) without a path filter,
+while step 3 limits reads to the run directory, the configured read roots and the fixed system paths.
+Step 3 is the rule; the profile is broader than it. That is tracked as a code defect in #3304, and
+this amendment does not change step 3.
+
+### Decision
+
+1. **The guarantee, stated exactly.** The kernel refuses `process-exec` of any file whose path ends in
+   a component named `git` or `gh`, or a component starting with `git-`, and of any file at a canonical
+   path listed in `[exec] never`. The rule identifies an executable by its path only. It guards against
+   a run reaching version control or a listed binary by its usual name or location, for example from a
+   build script or a package-manager hook; it is not a prohibition on any capability, and a program
+   reached through another path is not matched by it.
+2. **What bounds a run's effect on repositories.** A run's effects are bounded by the rest of the
+   profile, not by this rule: writes only under the run directory (and `/dev/null`), no network
+   operation, and no credential of the daemon or the operator in the environment. Whatever a program
+   inside a run does, it acts only on the run's materialized tree and reaches no remote. Trees reach a
+   repository only through the git verbs of ADR-182.
+3. **Wording.** Amendment 3 item 3 is read as headed "version-control and `never` executables are
+   refused by path", and its outcome sentence as applying to git reached under a path the rule names.
+   The `[exec] never` configuration documentation and the `exec.identity` description of the `never`
+   set say that the set matches canonical paths.
+
+### Alternatives considered
+
+- _Make the claim true by removing execution from the run directory._ Rejected as the default: the
+  purpose of this verb is building and testing, and a build executes what it produces in the run
+  directory (test binaries, generated scripts). It would also not turn the rule into a capability
+  boundary, because an interpreter under a read root can perform the same operations without
+  executing a file of a matching name. A per-tool opt-in that removes run-directory execution for tools
+  that do not need it is compatible with this amendment and can be proposed separately, with its own
+  acceptance arm.
+- _Leave the text as accepted._ Rejected: the text is a security claim, and a reader relying on it
+  would treat the `never` set as a hard prohibition it cannot be.
+
+### Consequences
+
+- No profile change, so the profile template digest does not change.
+- Operators who configure `never` read it as a guard against accidental invocation of those paths, and
+  rely on write confinement, the absence of network access and the absence of credentials for
+  containment.
+- Acceptance: arms 4 (no network), 5 (no writes outside the tree) and 22 (a shell invoking `git` by
+  name and a `never` path is refused, `/bin/echo` is the control) are the arms this guarantee rests on
+  and stay required. The `[exec]` configuration documentation and the `exec.identity` description are
+  updated to the wording in item 3 in the same change that accepts this amendment.

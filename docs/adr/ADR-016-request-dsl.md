@@ -668,8 +668,8 @@ registry resolves them.
   - Chain mode: sequential await + `$prev` substitution
   - Response envelope: `results` + `summary`
 - `crates/khive-mcp/src/tools/request.rs`: tool param struct and schema.
-- `crates/khive-mcp/src/tools/description.rs`: dynamic catalog injection
-  from `VerbRegistry`.
+- `crates/khive-mcp/src/server.rs`: dynamic catalog injection from `VerbRegistry`
+  (`build_verb_catalog`, `KhiveMcpServer::verb_catalog`).
 - `crates/khive-runtime/src/registry.rs`: `VerbRegistry` — registration,
   lookup, catalog enumeration.
 

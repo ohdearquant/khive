@@ -45,6 +45,32 @@ pub(crate) struct AnnBridge {
     /// Test-only proof that replacing this bridge drops its mmap owner.
     #[cfg(test)]
     drop_probe: Option<Arc<()>>,
+    #[cfg(test)]
+    search_pause: Option<Arc<TestSearchPause>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestSearchPause {
+    started: AtomicBool,
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TestSearchPause {
+    fn wait(&self) {
+        let mut released = self.released.lock().expect("search pause");
+        self.started.store(true, Ordering::SeqCst);
+        while !*released {
+            released = self.wake.wait(released).expect("search pause");
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("search pause") = true;
+        self.wake.notify_all();
+    }
 }
 
 /// Cache key for a per-{namespace, model} ANN index slot.
@@ -645,13 +671,23 @@ pub(crate) async fn search_loaded_with_seq(
     query: &[f32],
     k: usize,
 ) -> Option<(Vec<(Uuid, f32)>, u64)> {
-    let guard = ann.indexes.read().await;
-    guard.get(key).map(|bridge| {
-        (
-            bridge.search(query, k),
-            bridge.index.last_applied_seq().unwrap_or(0),
-        )
+    if !ann.indexes.read().await.contains_key(key) {
+        return None;
+    }
+    let ann = Arc::clone(ann);
+    let key = key.clone();
+    let query = query.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let guard = ann.indexes.blocking_read();
+        guard.get(&key).map(|bridge| {
+            (
+                bridge.search(&query, k),
+                bridge.index.last_applied_seq().unwrap_or(0),
+            )
+        })
     })
+    .await
+    .expect("loaded ANN traversal task panicked")
 }
 
 /// Returns `true` when `key` has a current-generation `Warming` owner but its
@@ -782,6 +818,8 @@ impl AnnBridge {
             generation: 0,
             #[cfg(test)]
             drop_probe: None,
+            #[cfg(test)]
+            search_pause: None,
         })
     }
 
@@ -890,6 +928,10 @@ impl AnnBridge {
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(Uuid, f32)> {
+        #[cfg(test)]
+        if let Some(pause) = &self.search_pause {
+            pause.wait();
+        }
         let mut q = query.to_vec();
         l2_normalize(&mut q);
         match self.index.search(&q, k) {
@@ -929,6 +971,8 @@ impl AnnBridge {
             generation: 0,
             #[cfg(test)]
             drop_probe: None,
+            #[cfg(test)]
+            search_pause: None,
         })
     }
 
@@ -1031,6 +1075,8 @@ impl AnnBridge {
             generation: 0,
             #[cfg(test)]
             drop_probe: None,
+            #[cfg(test)]
+            search_pause: None,
         })
     }
 }
@@ -1920,6 +1966,20 @@ pub(crate) fn merge_fresh_tail(
     merged
 }
 
+pub(crate) async fn merge_fresh_tail_off_thread(
+    candidates: Vec<(Uuid, f32)>,
+    query: &[f32],
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+) -> Vec<(Uuid, f32)> {
+    if ops.is_empty() {
+        return candidates;
+    }
+    let query = query.to_vec();
+    tokio::task::spawn_blocking(move || merge_fresh_tail(candidates, &query, ops))
+        .await
+        .expect("ANN fresh-tail merge task panicked")
+}
+
 pub(crate) enum FreshTailOutcome {
     /// Coalesced final tail operations that are valid against the candidate
     /// list the caller already captured from its serving bridge.
@@ -2085,7 +2145,7 @@ async fn fresh_tail_serving(
                 // bridge: return an exact-only replacement vector source.
                 clear_namespace(ann, ns).await;
                 return FreshTailOutcome::Replace {
-                    candidates: merge_fresh_tail(Vec::new(), query, snapshot.ops),
+                    candidates: merge_fresh_tail_off_thread(Vec::new(), query, snapshot.ops).await,
                     source_exhausted: true,
                 };
             }
@@ -2128,9 +2188,17 @@ async fn fresh_tail_reresolve(
                 source_exhausted: true,
             };
         };
-        let bridge = match AnnBridge::load(&dir) {
-            Ok(bridge) => bridge,
-            Err(error) => {
+        let query_for_search = query.to_vec();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let bridge = AnnBridge::load(&dir)?;
+            let loaded_watermark = bridge.index.last_applied_seq();
+            let candidates = bridge.search(&query_for_search, k);
+            Ok::<_, String>((candidates, loaded_watermark))
+        })
+        .await;
+        let (candidates, loaded_watermark) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error,
                     key = ?key,
@@ -2143,12 +2211,21 @@ async fn fresh_tail_reresolve(
                     source_exhausted: true,
                 };
             }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    key = ?key,
+                    namespace = ns,
+                    model,
+                    "knowledge fresh-tail segment worker failed during re-resolution"
+                );
+                return FreshTailOutcome::Replace {
+                    candidates: Vec::new(),
+                    source_exhausted: true,
+                };
+            }
         };
-        let loaded_watermark = bridge
-            .index
-            .last_applied_seq()
-            .unwrap_or(expected_watermark);
-        let candidates = bridge.search(query, k);
+        let loaded_watermark = loaded_watermark.unwrap_or(expected_watermark);
         let source_exhausted = candidates.len() < k;
 
         let snapshot = match fetch_fresh_tail_snapshot(rt, ns, model, loaded_watermark, None).await
@@ -2175,7 +2252,7 @@ async fn fresh_tail_reresolve(
 
         if registry_min <= loaded_watermark {
             return FreshTailOutcome::Replace {
-                candidates: merge_fresh_tail(candidates, query, snapshot.ops),
+                candidates: merge_fresh_tail_off_thread(candidates, query, snapshot.ops).await,
                 source_exhausted,
             };
         }
@@ -2190,7 +2267,7 @@ async fn fresh_tail_reresolve(
                 "knowledge fresh-tail re-resolution did not converge; using exact-only floored suffix"
             );
             return FreshTailOutcome::Replace {
-                candidates: merge_fresh_tail(Vec::new(), query, snapshot.ops),
+                candidates: merge_fresh_tail_off_thread(Vec::new(), query, snapshot.ops).await,
                 source_exhausted: true,
             };
         }
@@ -3461,6 +3538,44 @@ mod tests {
     use khive_runtime::KhiveRuntime;
     use khive_storage::types::{SqlStatement, SqlValue};
     use serde_json::json;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loaded_traversal_leaves_the_lexical_executor_runnable() {
+        let ann = new_shared_for_role(false);
+        let key = AnnKey::new("local", "test-model");
+        let id = Uuid::new_v4();
+        let pause = Arc::new(TestSearchPause::default());
+        let mut bridge = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![id])
+            .expect("build one-vector bridge");
+        bridge.search_pause = Some(Arc::clone(&pause));
+        assert!(insert_ann_if_absent(&ann, key.clone(), bridge).await);
+
+        let (cancel_watchdog, watchdog_cancelled) = std::sync::mpsc::channel();
+        let watchdog_pause = Arc::clone(&pause);
+        let watchdog = std::thread::spawn(move || {
+            if watchdog_cancelled
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_err()
+            {
+                watchdog_pause.release();
+            }
+        });
+
+        let search = search_loaded_with_seq(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1);
+        let lexical_progress = async {
+            while !pause.started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let reached_before_release = !*pause.released.lock().expect("search pause");
+            pause.release();
+            reached_before_release
+        };
+        let (hits, progressed) = tokio::join!(search, lexical_progress);
+        let _ = cancel_watchdog.send(());
+        watchdog.join().expect("watchdog thread");
+        assert!(progressed, "loaded traversal blocked the Tokio executor");
+        assert_eq!(hits.expect("loaded bridge").0[0].0, id);
+    }
 
     #[tokio::test(start_paused = true)]
     #[serial_test::serial(background_tasks)]

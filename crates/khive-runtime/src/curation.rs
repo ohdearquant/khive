@@ -8,6 +8,7 @@
 // logic into `curation/merge.rs` once the dedup policy API stabilises.
 //! Curation operations: entity update/merge and edge-list filter type.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
@@ -17,11 +18,12 @@ use uuid::Uuid;
 use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{EdgeFilter, PageRequest, SqlValue, TextDocument};
-use khive_storage::{EdgeRelation, Entity, SubstrateKind};
+use khive_storage::{AtomicUnitOp, EdgeRelation, Entity, SqlStatement, SubstrateKind};
 use khive_types::{Details, EdgeEndpointRule, EventKind, KhiveError};
 use rusqlite::OptionalExtension;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::event_store_guard::EventAttribution;
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -40,11 +42,27 @@ pub(crate) mod race_seam {
 
     tokio::task_local! {
         pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+        pub(crate) static BEFORE_ENTITY_INDEX_PUBLISH: Arc<(Barrier, Barrier)>;
+        pub(crate) static BEFORE_ENTITY_VECTOR_PUBLISH: Arc<(Barrier, Barrier)>;
     }
 
     pub(crate) async fn pause_after_read() {
         if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
             barrier.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_before_entity_index_publish() {
+        if let Ok(barriers) = BEFORE_ENTITY_INDEX_PUBLISH.try_with(Arc::clone) {
+            barriers.0.wait().await;
+            barriers.1.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_before_entity_vector_publish() {
+        if let Ok(barriers) = BEFORE_ENTITY_VECTOR_PUBLISH.try_with(Arc::clone) {
+            barriers.0.wait().await;
+            barriers.1.wait().await;
         }
     }
 }
@@ -743,6 +761,60 @@ impl From<rusqlite::Error> for MergeSqlError {
     }
 }
 
+/// Event data captured at the authorized runtime boundary before the merge
+/// moves to a writer thread. The event itself is built from the transaction's
+/// summary so destructive edge preimages are inserted before commit.
+struct MergeEventContext {
+    attribution: EventAttribution,
+    reason: Option<String>,
+    force: bool,
+    strategy: EntityDedupMergePolicy,
+    content_strategy: ContentMergeStrategy,
+    kind: EventKind,
+    substrate: SubstrateKind,
+    event_id: Option<Uuid>,
+}
+
+fn append_merge_event_in_transaction(
+    conn: &rusqlite::Connection,
+    context: MergeEventContext,
+    summary: &MergeSummary,
+    namespace: &str,
+) -> Result<(), MergeSqlError> {
+    let policy = match context.strategy {
+        EntityDedupMergePolicy::PreferInto => "prefer_into",
+        EntityDedupMergePolicy::PreferFrom => "prefer_from",
+        EntityDedupMergePolicy::Union => "union",
+    };
+    let mut payload = serde_json::json!({
+        "into_id": summary.kept_id,
+        "from_id": summary.removed_id,
+        "policy": policy,
+        "content_strategy": format!("{:?}", context.content_strategy),
+        "edges_rewired": summary.edges_rewired,
+        "edges_self_loop_dropped": summary.edges_self_loop_dropped,
+        "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
+        "edges_contract_skipped": summary.edges_contract_skipped,
+        "edge_conflict_preimages": &summary.edge_conflict_preimages,
+    });
+    if let Some(reason) = context.reason {
+        payload["reason"] = serde_json::Value::String(reason);
+    }
+    if context.force {
+        payload["force"] = serde_json::Value::Bool(true);
+    }
+    let mut event =
+        khive_storage::event::Event::new(namespace, "merge", context.kind, context.substrate, "")
+            .with_target(summary.kept_id)
+            .with_payload(payload);
+    if let Some(event_id) = context.event_id {
+        event.id = event_id;
+    }
+    let event = context.attribution.stamp(event);
+    khive_db::stores::event::append_event_in_transaction(conn, &event)?;
+    Ok(())
+}
+
 /// Recover only our semantic refusal after the writer has confirmed rollback.
 /// Other sources retain the request-state envelope and every driver field.
 fn recover_rolled_back_merge_refusal(
@@ -1424,8 +1496,9 @@ impl KhiveRuntime {
     ///
     /// If `dry_run` is true, computes and returns the planned summary without mutating any rows.
     ///
-    /// Atomic: all SQL (entity reads/writes, edge rewires, FTS updates, vec-index delete)
-    /// runs on a single pool connection inside one `BEGIN IMMEDIATE` transaction via
+    /// Atomic: all SQL (entity reads/writes, edge rewires, FTS updates, vec-index
+    /// delete, merge event with destructive edge preimages) runs on one pool
+    /// connection inside one `BEGIN IMMEDIATE` transaction via
     /// `merge_entity_sql`. If embedding vectors are configured, the vector re-insert for
     /// `into_id` is performed after the transaction (requires async embedding computation).
     pub async fn merge_entity(
@@ -1549,6 +1622,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.graph(token)?;
         let _ = self.text(token)?;
+        let _ = self.events(token)?;
         // vectors_for_model (not the default-model-only self.vectors()) so
         // custom-only runtimes (no default embedding_model) still get DDL primed.
         for model_name in embedding_plan.model_names() {
@@ -1559,9 +1633,19 @@ impl KhiveRuntime {
         let writer_task = pool
             .writer_task_for_runtime_write(RuntimeWriteOperation::MergeEntity)
             .map_err(RuntimeError::Storage)?;
-        // Minted before the transaction so the tombstone and the EntityMerged
-        // event appended after commit carry the same id.
+        // Minted before the transaction so the tombstone and its in-transaction
+        // EntityMerged event carry the same id.
         let merge_event_id = Uuid::new_v4();
+        let event_context = MergeEventContext {
+            attribution: EventAttribution::from_token(token),
+            reason,
+            force: validation == EntityMergeValidation::Forced,
+            strategy,
+            content_strategy,
+            kind: EventKind::EntityMerged,
+            substrate: SubstrateKind::Entity,
+            event_id: Some(merge_event_id),
+        };
 
         let (mut summary, updated_entity) = if let Some(writer_task) = writer_task {
             writer_task
@@ -1580,6 +1664,7 @@ impl KhiveRuntime {
                         validation,
                         MergeTxLimits::default(),
                         merge_event_id,
+                        Some(event_context),
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -1610,6 +1695,7 @@ impl KhiveRuntime {
                         validation,
                         MergeTxLimits::default(),
                         merge_event_id,
+                        Some(event_context),
                     )
                     .map_err(|error| match error {
                         MergeSqlError::Sqlite(error) => error,
@@ -1630,9 +1716,9 @@ impl KhiveRuntime {
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
         };
 
-        // Emitted only after the transaction has committed, so the log write
-        // never extends the writer hold the budget exists to bound.
+        // Count only committed event rows; dry-run never inserts an event.
         if !dry_run {
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
             tracing::info!(
                 into_id = %summary.kept_id,
                 from_id = %summary.removed_id,
@@ -1652,56 +1738,115 @@ impl KhiveRuntime {
                 .await?;
         }
 
-        // Dry-run is a read-only preview: it must not append a merge event.
-        if !dry_run {
-            let event_token =
-                token.with_namespace(crate::Namespace::parse(&updated_entity.namespace).map_err(
-                    |error| RuntimeError::Internal(format!("entity namespace invalid: {error}")),
-                )?);
-            let event_store = self.events(&event_token)?;
-            // Mirror the wire-level strategy spelling from MergeParams so consumers
-            // can round-trip the policy string back into a request.
-            let policy_str = match strategy {
-                EntityDedupMergePolicy::PreferInto => "prefer_into",
-                EntityDedupMergePolicy::PreferFrom => "prefer_from",
-                EntityDedupMergePolicy::Union => "union",
-            };
-            let mut payload = serde_json::json!({
-                "into_id": summary.kept_id,
-                "from_id": summary.removed_id,
-                "policy": policy_str,
-                "content_strategy": format!("{:?}", content_strategy),
-                "edges_rewired": summary.edges_rewired,
-                "edges_self_loop_dropped": summary.edges_self_loop_dropped,
-                "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
-                "edges_contract_skipped": summary.edges_contract_skipped,
-                "edge_conflict_preimages": &summary.edge_conflict_preimages,
-            });
-            if let Some(reason) = reason {
-                payload["reason"] = serde_json::Value::String(reason);
-            }
-            if validation == EntityMergeValidation::Forced {
-                payload["force"] = serde_json::Value::Bool(true);
-            }
-            let mut event = khive_storage::event::Event::new(
-                updated_entity.namespace.clone(),
-                "merge",
-                EventKind::EntityMerged,
-                SubstrateKind::Entity,
-                "",
-            )
-            .with_target(summary.kept_id)
-            .with_payload(payload);
-            event.id = merge_event_id;
-            event_store.append_event(event).await.map_err(|e| {
-                RuntimeError::Internal(format!("merge_entity: event store write failed: {e}"))
-            })?;
-        }
-
         Ok(summary)
     }
 
     // ---- Internal helpers ----
+
+    async fn apply_entity_index_revision(
+        &self,
+        entity: &Entity,
+        statements: Vec<SqlStatement>,
+    ) -> RuntimeResult<bool> {
+        let namespace = entity.namespace.clone();
+        let id = entity.id.to_string();
+        let version = entity.version;
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                let current = writer
+                    .query_scalar(SqlStatement {
+                        sql: "SELECT version FROM entities \
+                              WHERE namespace=?1 AND id=?2 AND deleted_at IS NULL"
+                            .into(),
+                        params: vec![SqlValue::Text(namespace), SqlValue::Text(id)],
+                        label: Some("entity-index-revision".into()),
+                    })
+                    .await?;
+                if !matches!(current, Some(SqlValue::Integer(current)) if current == version) {
+                    return Ok(Box::new(false) as Box<dyn Any + Send>);
+                }
+                for statement in statements {
+                    writer.execute(statement).await?;
+                }
+                Ok(Box::new(true) as Box<dyn Any + Send>)
+            })
+        });
+        self.sql()
+            .atomic_unit(op)
+            .await?
+            .downcast::<bool>()
+            .map(|result| *result)
+            .map_err(|_| RuntimeError::Internal("invalid entity index outcome".into()))
+    }
+
+    fn entity_vector_insert_statements(
+        table: &str,
+        entity: &Entity,
+        model_name: &str,
+        vector: &[f32],
+    ) -> Vec<SqlStatement> {
+        let subject = entity.id.to_string();
+        let kind = SubstrateKind::Entity.to_string();
+        let field = "entity.body";
+        let blob = vector
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        vec![
+            SqlStatement {
+                sql: format!(
+                    "INSERT INTO ann_write_log \
+                     (namespace, embedding_model, kind, field, subject_id, op) \
+                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                     FROM {table} WHERE subject_id=?1 AND NOT \
+                     (namespace=?2 AND embedding_model=?3 AND kind=?4 AND field=?5)"
+                ),
+                params: vec![
+                    SqlValue::Text(subject.clone()),
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(model_name.to_string()),
+                    SqlValue::Text(kind.clone()),
+                    SqlValue::Text(field.into()),
+                ],
+                label: Some("entity-reindex-log-delete".into()),
+            },
+            SqlStatement {
+                sql: format!("DELETE FROM {table} WHERE subject_id=?1"),
+                params: vec![SqlValue::Text(subject.clone())],
+                label: Some("entity-reindex-vector-delete".into()),
+            },
+            SqlStatement {
+                sql: format!(
+                    "INSERT INTO {table} \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                ),
+                params: vec![
+                    SqlValue::Text(subject.clone()),
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(kind.clone()),
+                    SqlValue::Text(field.into()),
+                    SqlValue::Text(model_name.to_string()),
+                    SqlValue::Blob(blob),
+                ],
+                label: Some("entity-reindex-vector-insert".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(model_name.to_string()),
+                    SqlValue::Text(kind),
+                    SqlValue::Text(field.into()),
+                    SqlValue::Text(subject),
+                ],
+                label: Some("entity-reindex-log-upsert".into()),
+            },
+        ]
+    }
 
     /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
@@ -1713,8 +1858,8 @@ impl KhiveRuntime {
     /// logs a warning and continues to the next model. The FTS step is fail-closed
     /// (propagates error). Callers (update_entity, merge_entity) have already committed
     /// the entity row, so a partial embed miss leaves a stale vector rather than
-    /// rolling back the update — acceptable because SqliteVecStore::insert is an upsert
-    /// (the prior vector stays intact on failure, keeping the record searchable).
+    /// rolling back the update. Each failed guarded vector replacement rolls back
+    /// its own index writes, keeping the prior row searchable.
     pub(crate) async fn reindex_entity(
         &self,
         token: &NamespaceToken,
@@ -1732,10 +1877,25 @@ impl KhiveRuntime {
         embedding_plan: &EmbeddingModelPlan,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         // Use entity.namespace (authoritative) rather than token.namespace().as_str() (caller claim).
-        let ns = entity.namespace.clone();
         let doc = entity_fts_document(entity);
         let embed_body = doc.body.clone();
-        self.text(token)?.upsert_document(doc).await?;
+        let _ = self.text(token)?;
+        #[cfg(test)]
+        race_seam::pause_before_entity_index_publish().await;
+        let statements = khive_db::stores::text::delete_document_statements(
+            "fts_entities",
+            &entity.namespace,
+            entity.id,
+        )
+        .into_iter()
+        .chain(khive_db::stores::text::insert_document_statements(
+            "fts_entities",
+            &doc,
+        ))
+        .collect();
+        if !self.apply_entity_index_revision(entity, statements).await? {
+            return Ok(crate::retrieval::EmbeddingTruncationReport::default());
+        }
 
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
@@ -1746,22 +1906,59 @@ impl KhiveRuntime {
                 Ok(outcome) => {
                     report.observe(&outcome);
                     match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => {
-                            if let Err(e) = vs
-                                .insert(
-                                    entity.id,
-                                    SubstrateKind::Entity,
-                                    &ns,
-                                    "entity.body",
-                                    vec![outcome.vector],
-                                )
-                                .await
+                        Ok(_) => {
+                            if let Some(index) =
+                                outcome.vector.iter().position(|value| !value.is_finite())
                             {
                                 tracing::warn!(
                                     model = model_name,
                                     id = %entity.id,
-                                    "reindex_entity: vector insert failed, skipping model: {e}"
+                                    index,
+                                    "reindex_entity: non-finite vector, skipping model"
                                 );
+                                continue;
+                            }
+                            let (storage_model, dimensions) = match self
+                                .vector_model_metadata(model_name)
+                            {
+                                Ok(metadata) => metadata,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        model = model_name,
+                                        id = %entity.id,
+                                        "reindex_entity: could not resolve vector model, skipping: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if outcome.vector.len() != dimensions {
+                                tracing::warn!(
+                                    model = model_name,
+                                    id = %entity.id,
+                                    "reindex_entity: vector dimensions do not match model, skipping"
+                                );
+                                continue;
+                            }
+                            let table =
+                                format!("vec_{}", crate::config::sanitize_key(&storage_model));
+                            let statements = Self::entity_vector_insert_statements(
+                                &table,
+                                entity,
+                                &storage_model,
+                                &outcome.vector,
+                            );
+                            #[cfg(test)]
+                            race_seam::pause_before_entity_vector_publish().await;
+                            match self.apply_entity_index_revision(entity, statements).await {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        model = model_name,
+                                        id = %entity.id,
+                                        "reindex_entity: vector insert failed, skipping model: {e}"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -2803,6 +3000,8 @@ impl KhiveRuntime {
     ///
     /// If `dry_run` is true, computes and returns the planned summary without mutating
     /// any rows, edges, or indexes.
+    /// The NoteMerged event, including destructive edge preimages, commits in
+    /// the same SQL transaction as the note and edge changes.
     pub async fn merge_note(
         &self,
         token: &NamespaceToken,
@@ -2879,6 +3078,7 @@ impl KhiveRuntime {
 
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
+        let _ = self.events(token)?;
         for model_name in embedding_plan.model_names() {
             let _ = self.vectors_for_model(token, model_name)?;
         }
@@ -2893,6 +3093,16 @@ impl KhiveRuntime {
         let writer_task = pool
             .writer_task_for_runtime_write(RuntimeWriteOperation::MergeNote)
             .map_err(RuntimeError::Storage)?;
+        let event_context = MergeEventContext {
+            attribution: EventAttribution::from_token(token),
+            reason,
+            force: false,
+            strategy,
+            content_strategy,
+            kind: EventKind::NoteMerged,
+            substrate: SubstrateKind::Note,
+            event_id: None,
+        };
 
         let (mut summary, updated_note) = if let Some(writer_task) = writer_task {
             writer_task
@@ -2910,6 +3120,7 @@ impl KhiveRuntime {
                         pack_rules,
                         preserve_owner_established,
                         MergeTxLimits::default(),
+                        Some(event_context),
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -2939,6 +3150,7 @@ impl KhiveRuntime {
                         pack_rules,
                         preserve_owner_established,
                         MergeTxLimits::default(),
+                        Some(event_context),
                     )
                     .map_err(|error| match error {
                         MergeSqlError::Sqlite(error) => error,
@@ -2959,9 +3171,9 @@ impl KhiveRuntime {
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
         };
 
-        // Emitted only after the transaction has committed, so the log write
-        // never extends the writer hold the budget exists to bound.
+        // Count only committed event rows; dry-run never inserts an event.
         if !dry_run {
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
             tracing::info!(
                 into_id = %summary.kept_id,
                 from_id = %summary.removed_id,
@@ -2972,56 +3184,6 @@ impl KhiveRuntime {
                 "merge_note: transaction materialization budget"
             );
         }
-
-        // Dry-run is a read-only preview: it must not append a merge event.
-        // Attempt the event write before reindexing so a post-commit index error
-        // cannot hide a merge that has already committed.
-        let event_result: RuntimeResult<()> = if !dry_run {
-            async {
-                let event_token = token.with_namespace(
-                    crate::Namespace::parse(&updated_note.namespace).map_err(|error| {
-                        RuntimeError::Internal(format!("note namespace invalid: {error}"))
-                    })?,
-                );
-                let event_store = self.events(&event_token)?;
-                // Mirror the wire-level strategy spelling from MergeParams so consumers
-                // can round-trip the policy string back into a request.
-                let policy_str = match strategy {
-                    EntityDedupMergePolicy::PreferInto => "prefer_into",
-                    EntityDedupMergePolicy::PreferFrom => "prefer_from",
-                    EntityDedupMergePolicy::Union => "union",
-                };
-                let mut payload = serde_json::json!({
-                    "into_id": summary.kept_id,
-                    "from_id": summary.removed_id,
-                    "policy": policy_str,
-                    "content_strategy": format!("{:?}", content_strategy),
-                    "edges_rewired": summary.edges_rewired,
-                    "edges_self_loop_dropped": summary.edges_self_loop_dropped,
-                    "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
-                    "edges_contract_skipped": summary.edges_contract_skipped,
-                    "edge_conflict_preimages": &summary.edge_conflict_preimages,
-                });
-                if let Some(reason) = reason {
-                    payload["reason"] = serde_json::Value::String(reason);
-                }
-                let event = khive_storage::event::Event::new(
-                    updated_note.namespace.clone(),
-                    "merge",
-                    EventKind::NoteMerged,
-                    SubstrateKind::Note,
-                    "",
-                )
-                .with_target(summary.kept_id)
-                .with_payload(payload);
-                event_store.append_event(event).await.map_err(|e| {
-                    RuntimeError::Internal(format!("merge_note: event store write failed: {e}"))
-                })
-            }
-            .await
-        } else {
-            Ok(())
-        };
 
         if !dry_run {
             if !embedding_plan.is_empty() {
@@ -3056,8 +3218,6 @@ impl KhiveRuntime {
             self.fire_note_mutation_hook(&updated_note.kind, updated_note.id)
                 .await;
         }
-
-        event_result?;
 
         Ok(summary)
     }
@@ -3349,6 +3509,7 @@ fn merge_entity_sql(
     validation: EntityMergeValidation,
     limits: MergeTxLimits,
     merge_event_id: Uuid,
+    event_context: Option<MergeEventContext>,
 ) -> Result<(MergeSummary, Entity), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Config-scaled fanout (one FTS/vector delete per table, one contract rule
@@ -3845,25 +4006,30 @@ fn merge_entity_sql(
         content_ref: into_entity.content_ref,
     };
 
-    Ok((
-        MergeSummary {
-            kept_id: into_id,
-            removed_id: from_id,
-            edges_rewired,
-            edges_self_loop_dropped,
-            self_loop_edge_preimages,
-            edges_contract_skipped,
-            edge_conflict_preimages,
-            properties_merged,
-            tags_unioned,
-            content_appended,
-            dry_run,
-            tx_budget: budget.report(),
-            embedding_truncation: Default::default(),
-            post_commit_reindex_error: None,
-        },
-        updated_entity,
-    ))
+    let summary = MergeSummary {
+        kept_id: into_id,
+        removed_id: from_id,
+        edges_rewired,
+        edges_self_loop_dropped,
+        self_loop_edge_preimages,
+        edges_contract_skipped,
+        edge_conflict_preimages,
+        properties_merged,
+        tags_unioned,
+        content_appended,
+        dry_run,
+        tx_budget: budget.report(),
+        embedding_truncation: Default::default(),
+        post_commit_reindex_error: None,
+    };
+    // The event is the only durable copy of destructive edge preimages. An
+    // insertion failure must abort this transaction along with the merge.
+    if !dry_run {
+        if let Some(context) = event_context {
+            append_merge_event_in_transaction(conn, context, &summary, &updated_entity.namespace)?;
+        }
+    }
+    Ok((summary, updated_entity))
 }
 
 // ---------------------------------------------------------------------------
@@ -4006,6 +4172,7 @@ fn merge_note_sql(
     pack_rules: Vec<EdgeEndpointRule>,
     preserve_owner_established: bool,
     limits: MergeTxLimits,
+    event_context: Option<MergeEventContext>,
 ) -> Result<(MergeSummary, khive_storage::note::Note), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Same accounting as `merge_entity_sql`: config-scaled fanout in bytes only.
@@ -4504,25 +4671,28 @@ fn merge_note_sql(
         )?,
     };
 
-    Ok((
-        MergeSummary {
-            kept_id: into_id,
-            removed_id: from_id,
-            edges_rewired,
-            edges_self_loop_dropped,
-            self_loop_edge_preimages,
-            edges_contract_skipped,
-            edge_conflict_preimages,
-            properties_merged,
-            tags_unioned: 0,
-            content_appended,
-            dry_run,
-            tx_budget: budget.report(),
-            embedding_truncation: Default::default(),
-            post_commit_reindex_error: None,
-        },
-        updated_note,
-    ))
+    let summary = MergeSummary {
+        kept_id: into_id,
+        removed_id: from_id,
+        edges_rewired,
+        edges_self_loop_dropped,
+        self_loop_edge_preimages,
+        edges_contract_skipped,
+        edge_conflict_preimages,
+        properties_merged,
+        tags_unioned: 0,
+        content_appended,
+        dry_run,
+        tx_budget: budget.report(),
+        embedding_truncation: Default::default(),
+        post_commit_reindex_error: None,
+    };
+    if !dry_run {
+        if let Some(context) = event_context {
+            append_merge_event_in_transaction(conn, context, &summary, &updated_note.namespace)?;
+        }
+    }
+    Ok((summary, updated_note))
 }
 
 // ---------------------------------------------------------------------------
@@ -4937,6 +5107,20 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    fn set_merge_event_refusal(rt: &KhiveRuntime, kind: &str, refuse: bool) {
+        let pool = rt.backend().pool_arc();
+        let guard = pool.writer().expect("acquire fixture writer");
+        let sql = if refuse {
+            format!(
+                "CREATE TRIGGER reject_merge_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = '{kind}' BEGIN SELECT RAISE(ABORT, 'blocked merge event'); END"
+            )
+        } else {
+            "DROP TRIGGER reject_merge_event".to_string()
+        };
+        guard.conn().execute_batch(&sql).expect("set event fault");
     }
 
     async fn seed_health_identity_note(runtime: &KhiveRuntime, slug: &str) -> Note {
@@ -8529,6 +8713,92 @@ mod tests {
         assert_eq!(tags, vec!["x", "y", "z"]);
     }
 
+    /// An event-store failure must roll back the edge deletion and tombstone.
+    /// Before the transactional event insert, this left a committed merge with
+    /// no durable preimage, even though the call returned an error.
+    #[tokio::test]
+    async fn entity_merge_event_insert_failure_rolls_back_destructive_merge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, into.id, from.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        let event_store = rt.events(&tok).unwrap();
+        set_merge_event_refusal(&rt, "entity_merged", true);
+
+        let failed = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        assert!(failed.is_err(), "event insert must abort the merge");
+        let source = rt.get_entity(&tok, from.id).await.unwrap();
+        assert_eq!(source.merge_event_id, None);
+        assert!(source.deleted_at.is_none());
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_some(),
+            "the deleted self-loop must roll back"
+        );
+        let filter = khive_storage::EventFilter {
+            kinds: vec![EventKind::EntityMerged],
+            ..Default::default()
+        };
+        let page = khive_storage::types::PageRequest {
+            offset: 0,
+            limit: 10,
+        };
+        assert!(event_store
+            .query_events(filter.clone(), page.clone())
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+
+        set_merge_event_refusal(&rt, "entity_merged", false);
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        let tombstone = rt
+            .entities(&tok)
+            .unwrap()
+            .get_entity_including_deleted(from.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = event_store.query_events(filter, page).await.unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(tombstone.merge_event_id, Some(events.items[0].id));
+        assert_eq!(
+            events.items[0].payload["self_loop_edge_preimages"],
+            serde_json::to_value(&summary.self_loop_edge_preimages).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn merge_entity_drops_self_loops() {
         let rt = rt();
@@ -10931,6 +11201,96 @@ mod tests {
         }
     }
 
+    /// The note path must leave its source and self-loop edge intact when the
+    /// only durable preimage copy cannot be inserted into the event store.
+    #[tokio::test]
+    async fn note_merge_event_insert_failure_rolls_back_destructive_merge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, into.id, from.id, EdgeRelation::Refutes, 1.0, None)
+            .await
+            .unwrap();
+        let event_store = rt.events(&tok).unwrap();
+        set_merge_event_refusal(&rt, "note_merged", true);
+
+        let failed = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        assert!(failed.is_err(), "event insert must abort the note merge");
+        let source = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(from.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source.deleted_at.is_none());
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_some(),
+            "the deleted self-loop must roll back"
+        );
+        let filter = khive_storage::EventFilter {
+            kinds: vec![EventKind::NoteMerged],
+            ..Default::default()
+        };
+        let page = khive_storage::types::PageRequest {
+            offset: 0,
+            limit: 10,
+        };
+        assert!(event_store
+            .query_events(filter.clone(), page.clone())
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+
+        set_merge_event_refusal(&rt, "note_merged", false);
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        let tombstone = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note_including_deleted(from.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tombstone.deleted_at.is_some());
+        let events = event_store.query_events(filter, page).await.unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(
+            events.items[0].payload["self_loop_edge_preimages"],
+            serde_json::to_value(&summary.self_loop_edge_preimages).unwrap()
+        );
+    }
+
     // The note-merge mirror of `merge_entity_drops_self_loops`. `into`
     // refutes `from` directly — merging `from` into `into` collapses this
     // into an into-refutes-into self-loop, which must be dropped and its
@@ -12302,6 +12662,72 @@ mod tests {
         }
     }
 
+    async fn assert_delete_during_entity_reindex_does_not_restore_indexes(pause_vector: bool) {
+        const MODEL: &str = "entity-reindex-delete-race";
+        let rt = Arc::new(KhiveRuntime::memory().unwrap());
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(MODEL, 4));
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "DeletedDuringReindex",
+                Some("the stale document must not return"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let id = entity.id;
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        let reindex_rt = Arc::clone(&rt);
+        let reindex_tok = tok.clone();
+        let reindex = async move { reindex_rt.reindex_entity(&reindex_tok, &entity).await };
+        let reindex = if pause_vector {
+            tokio::spawn(
+                race_seam::BEFORE_ENTITY_VECTOR_PUBLISH.scope(Arc::clone(&barriers), reindex),
+            )
+        } else {
+            tokio::spawn(
+                race_seam::BEFORE_ENTITY_INDEX_PUBLISH.scope(Arc::clone(&barriers), reindex),
+            )
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), barriers.0.wait())
+            .await
+            .expect("reindex reached publication boundary");
+        assert!(rt.delete_entity(&tok, id, false).await.unwrap());
+        barriers.1.wait().await;
+        reindex.await.unwrap().unwrap();
+
+        assert!(rt
+            .text(&tok)
+            .unwrap()
+            .get_document("local", id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            rt.vectors_for_model(&tok, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_entity_cannot_restore_fts_at_pending_reindex() {
+        assert_delete_during_entity_reindex_does_not_restore_indexes(false).await;
+    }
+
+    #[tokio::test]
+    async fn deleted_entity_cannot_restore_vector_after_embedding() {
+        assert_delete_during_entity_reindex_does_not_restore_indexes(true).await;
+    }
+
     #[tokio::test]
     async fn entity_reindex_with_captured_merge_plan_excludes_late_model() {
         const DIMS: usize = 4;
@@ -12929,6 +13355,7 @@ mod tests {
                     EntityMergeValidation::LegacyKind,
                     limits,
                     Uuid::new_v4(),
+                    None,
                 )
                 .map_err(|error| match error {
                     MergeSqlError::Sqlite(error) => error,
@@ -12971,6 +13398,7 @@ mod tests {
                         max_bytes: usize::MAX,
                     },
                     Uuid::new_v4(),
+                    None,
                 )
                 .map_err(|error| match error {
                     MergeSqlError::Sqlite(error) => error,
@@ -13102,6 +13530,7 @@ mod tests {
                     pack_rules,
                     false,
                     limits,
+                    None,
                 )
                 .map_err(|error| match error {
                     MergeSqlError::Sqlite(error) => error,

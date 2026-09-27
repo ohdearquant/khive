@@ -752,10 +752,13 @@ cut-over database.
 ### `exec --save-file` / `exec --ops-file`: daemon coexistence
 
 When they execute operations, both file-oriented `exec` modes deliberately build a local runtime
-instead of forwarding through the warm daemon (`--ops-file --dry-run` stops before runtime
-construction). `--save-file` needs a trusted local result sink; `--ops-file` needs bulk execution,
+instead of forwarding through the warm daemon (ordinary `--ops-file --dry-run` stops before
+runtime construction; atomic dry-run builds only the metadata preflight registry and never opens
+the target runtime). `--save-file` needs a trusted local result sink; `--ops-file` needs bulk execution,
 including optional whole-file atomic behavior, that the daemon protocol does not expose. If a live
 daemon has the same database open, the command and daemon are independent SQLite clients.
+An atomic dry-run applies the same op-count, topology, and verb-admissibility preflight as a real
+atomic run, then prints a summary with `"atomic": true` without opening the target database.
 `KHIVE_WRITE_QUEUE=1` does not combine them into one writer because that queue is process-local.
 
 SQLite serializes their writes through the WAL write lock. Each process waits for
@@ -768,8 +771,8 @@ For non-atomic `--ops-file`, a busy op can fail after earlier ops committed. Ins
 failure list and use `--strict` when any failed op must produce a non-zero exit. For
 `--ops-file --atomic`, the whole commit pass holds one bounded write transaction; run large units
 against an idle daemon or in a maintenance window. A plan-level rollback prints
-`atomic.committed=false` but currently exits zero even with `--strict`; inspect that field rather
-than relying on process status. Admissibility, prepare, and atomic-unit seam errors instead exit
+`atomic.committed=false` and exits non-zero with or without `--strict`. Inspect the envelope to
+distinguish a rollback from a post-commit publication error. Admissibility, prepare, and atomic-unit seam errors instead exit
 non-zero before printing an atomic result envelope. A deferred reindex or result-rendering failure
 after commit is different: it exits zero with `atomic.committed=true`,
 `atomic.status="committed_degraded"`, and `atomic.retryable=false`; repair or re-read as directed by

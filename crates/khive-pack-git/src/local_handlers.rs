@@ -668,6 +668,20 @@ impl GitPack {
                 if require_fast_forward && !fast_forward {
                     return Err(Failure::refused("non_fast_forward"));
                 }
+                let marker_git_version = if to.eq_ignore_ascii_case(&from) {
+                    let (version, supported) = local_git::push_marker_support(
+                        self.runtime().config().git_write.git_program(),
+                        repo,
+                    )
+                    .await?;
+                    if !supported {
+                        receipt.result = json!({"toolchain":{"git_version":version,"git_program":self.runtime().config().git_write.git_program(),"missing_capability":"reflog write"}});
+                        return Err(Failure::refused("unsupported_toolchain"));
+                    }
+                    Some(version)
+                } else {
+                    None
+                };
                 let result = json!({
                     "repo":repo.display().to_string(),
                     "ref":format!("refs/heads/{branch}"),
@@ -690,6 +704,13 @@ impl GitPack {
                 if let Err(error) = moved {
                     if error.code() == "not_committed" {
                         return Err(Failure::refused("expected_head_mismatch"));
+                    }
+                    if error.code() == "unsupported_toolchain" {
+                        // The synchronous worker also probes before CAS. If
+                        // the configured Git changed between probes, keep the
+                        // first observed version and receipt the refusal.
+                        receipt.result = json!({"toolchain":{"git_version":marker_git_version,"git_program":self.runtime().config().git_write.git_program(),"missing_capability":"reflog write"}});
+                        return Err(Failure::refused("unsupported_toolchain"));
                     }
                     return Err(error.into());
                 }
@@ -758,6 +779,13 @@ impl GitPack {
                 .await?;
                 if matches!(prior.verb.as_str(), "git.push" | "git.pr_merge") {
                     self.reconcile_remote(repo, &mut prior).await?;
+                    return Ok(json!({"receipt":prior.to_value()}));
+                }
+                if matches!(prior.verb.as_str(), "git.pr_open" | "git.pr_review") {
+                    // Neither platform operation has receipt-specific evidence. An absent PR or
+                    // review cannot prove that the original write did not happen, and a later
+                    // matching object cannot prove this receipt caused it. Preserve unknown
+                    // without resolving a credential or touching the platform.
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
                 if !matches!(

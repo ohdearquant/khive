@@ -50,21 +50,45 @@ fn resurrection_required_error(operation: &'static str, edge: &Edge) -> StorageE
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
-// Walk newest notes first and stop at the first eligible annotation. Starting
-// from all target edges would sort the complete annotation history before LIMIT
-// could take effect. The existing note-time and edge natural-key indexes support
-// this shape without fetching note bodies or materializing the history.
-const LATEST_ANNOTATING_NOTE_SQL: &str = "SELECT n.id, n.created_at \
-    FROM notes AS n INDEXED BY idx_notes_created \
-    WHERE n.deleted_at IS NULL AND n.kind = ?3 \
-      AND EXISTS (SELECT 1 FROM json_each(CASE \
-          WHEN json_type(n.properties, '$.tags') = 'array' \
-          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag \
-          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY) \
-      AND EXISTS (SELECT 1 FROM graph_edges AS e INDEXED BY idx_graph_edges_unique_triple \
-          WHERE e.namespace = ?1 AND e.source_id = n.id AND e.target_id = ?2 \
-            AND e.relation = 'annotates' AND e.deleted_at IS NULL) \
-    ORDER BY n.created_at DESC, n.id ASC LIMIT 1";
+// Latest eligible annotation of one target. First read at most three incident
+// `annotates` edge rows, tombstones included so the probe cannot scan a long
+// deleted prefix. The unique (namespace, source, target, relation) index allows
+// one row per source, so two or fewer rows is the complete incident set and
+// those notes are filtered and ordered directly. Three rows falls back to
+// walking notes newest-first, which keeps a long receipt history from being
+// enumerated or sorted. That fallback still visits newer unrelated notes when
+// a target with three or more incident edges has only old eligible annotations.
+const LATEST_ANNOTATING_NOTE_SQL: &str = r#"WITH incident AS MATERIALIZED (
+    SELECT source_id, deleted_at
+    FROM graph_edges INDEXED BY idx_graph_edges_ns_tgt_rel
+    WHERE namespace = ?1 AND target_id = ?2 AND relation = 'annotates'
+    LIMIT 3
+)
+SELECT result.id, result.created_at
+FROM notes AS result
+WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
+    SELECT n.id
+    FROM incident AS e CROSS JOIN notes AS n
+    WHERE n.id = e.source_id AND e.deleted_at IS NULL
+      AND n.deleted_at IS NULL AND n.kind = ?3
+      AND EXISTS (SELECT 1 FROM json_each(CASE
+          WHEN json_type(n.properties, '$.tags') = 'array'
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1
+) ELSE (
+    SELECT n.id
+    FROM notes AS n INDEXED BY idx_notes_created
+    WHERE n.deleted_at IS NULL AND n.kind = ?3
+      AND EXISTS (SELECT 1 FROM json_each(CASE
+          WHEN json_type(n.properties, '$.tags') = 'array'
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM graph_edges AS e INDEXED BY idx_graph_edges_unique_triple
+          WHERE e.namespace = ?1 AND e.source_id = n.id AND e.target_id = ?2
+            AND e.relation = 'annotates' AND e.deleted_at IS NULL)
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1
+) END"#;
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
