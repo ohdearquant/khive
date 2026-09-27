@@ -2,7 +2,7 @@
 //!
 //! Per ADR-032, `BrainState` now holds a profile registry; the BalancedRecall
 //! profile's `total_events` counter lives in `snapshot.balanced_recall.total_events`.
-//! These tests verify the dispatch hook still drives the BalancedRecallFold.
+//! These tests verify the dispatch hook still updates the balanced-recall state.
 
 use std::sync::Arc;
 

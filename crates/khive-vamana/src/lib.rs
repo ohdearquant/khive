@@ -1,5 +1,7 @@
 //! Vamana ANN index: batch-built approximate nearest-neighbor search over unit-normalized vectors.
 
+#[cfg(feature = "mmap")]
+mod checkpoint_io;
 pub mod config;
 pub mod distance;
 pub mod error;

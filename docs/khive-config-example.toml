@@ -128,6 +128,20 @@
 # granted_actors = ["lambda:khive", "service:indexer"]
 # grant_unattributed = false
 
+# -- [exec] -- sandbox path matches (ADR-181 Amendment 9) ------------------------
+#
+# The `never` list matches the resolved executable path, not the program's
+# capabilities. A copied executable whose launch path matches neither this
+# list nor the name patterns below is outside this rule.
+# The profile also refuses executable path components named git or gh, or
+# beginning with git-. Write, network and environment restrictions bound
+# what any admitted program can affect.
+#
+# [exec]
+# root = "/var/lib/khive/exec"
+# read_roots = ["/opt/toolchains/python3.11"]
+# never = ["/usr/bin/curl"]
+
 # -- [brain] -- aggregate event-count read permission ----------------------------
 #
 # Brain reads default to the authorized caller. This exact actor-id allowlist

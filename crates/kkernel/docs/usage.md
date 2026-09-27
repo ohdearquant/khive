@@ -55,6 +55,12 @@ kkernel mcp --db :memory: --no-embed
 Key flags: `--db`, `--actor`/`--namespace`, `--no-embed`, `--pack` (repeatable),
 `--config`, `--daemon`, `--transport <name>`, `--bind <addr>`.
 
+For stdio, `KHIVE_MCP_STDIO_MAX_LINE_BYTES` sets the maximum raw JSON-RPC
+line length, including its newline. It defaults to 8,454,144 bytes and accepts
+1 through 67,108,864; an invalid value fails startup. An oversized line gets
+a JSON-RPC parse error when it crosses the cap, then the reader discards its
+remainder and serves the next complete request.
+
 Every successful startup writes the resolved actor to stderr as
 `actor: "<id>" (resolved; attributed)` or explicitly marks the unattributed
 `local` fallback. This line is emitted at the forced `khive.boot` log target,
@@ -466,8 +472,12 @@ newer build. Recreate it from the current schema; in-place downgrade is unsuppor
 kkernel sync --repo . --db ~/.khive/working.db --namespace local
 ```
 
-Reads `.khive/kg/{entities,edges}.ndjson`, builds a queryable SQLite DB, and replaces
-the target atomically (tmp + rename). Consumed by the deno CLI's `khive kg sync`.
+Reads `.khive/kg/{entities,edges}.ndjson`, builds a queryable SQLite DB in a
+unique sibling file, and renames it over the target after checkpointing. Close
+all SQLite clients using the target first. Sync refuses existing `-wal` or
+`-shm` sidecars and serializes concurrent sync calls with a sibling lock file.
+Errors before the rename leave the previous database intact. Consumed by the
+deno CLI's `khive kg sync`.
 
 ---
 

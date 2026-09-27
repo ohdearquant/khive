@@ -2,10 +2,12 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
-use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
+use khive_storage::Entity;
 use serde_json::{json, Value};
 
 struct Fixture {
+    rt: KhiveRuntime,
     registry: VerbRegistry,
 }
 
@@ -17,7 +19,7 @@ fn fixture() -> Fixture {
     let registry = builder.build().expect("registry builds");
     registry.apply_schema_plans(rt.backend());
     rt.install_edge_rules(registry.all_edge_rules());
-    Fixture { registry }
+    Fixture { rt, registry }
 }
 
 impl Fixture {
@@ -114,6 +116,49 @@ async fn capabilities_are_created_once_and_linked() {
     assert_eq!(caps.len(), 2);
     assert!(caps.contains(&"web browsing".to_string()) && caps.contains(&"http".to_string()));
     assert_eq!(described["tool"]["decision"]["decision"], json!("ask"));
+}
+
+#[tokio::test]
+async fn registration_reuses_capability_after_more_than_five_thousand_newer_names() {
+    let f = fixture();
+    let original = f
+        .call(
+            "tool.register",
+            json!({"name": "first", "capabilities": ["HTTP"]}),
+        )
+        .await;
+    let original_id = original["capabilities"][0]["id"].clone();
+    let token = f.rt.authorize(Namespace::local()).unwrap();
+    let fillers: Vec<Entity> = (0..5000)
+        .map(|index| {
+            Entity::new("local", "concept", format!("filler-{index:05}"))
+                .with_entity_type(Some("capability"))
+                .with_tags(vec!["tool-capability".into()])
+        })
+        .collect();
+    let seeded =
+        f.rt.entities(&token)
+            .unwrap()
+            .upsert_entities(fillers)
+            .await
+            .unwrap();
+    assert_eq!(seeded.affected, 5000, "{seeded:?}");
+    assert_eq!(seeded.failed, 0, "{seeded:?}");
+
+    let reused = f
+        .call(
+            "tool.register",
+            json!({"name": "second", "capabilities": ["http"]}),
+        )
+        .await;
+    assert_eq!(reused["capabilities"][0]["id"], original_id);
+    assert_eq!(
+        f.rt.count_entities_tagged(&token, Some("concept"), Some("tool-capability"))
+            .await
+            .unwrap(),
+        5001,
+        "the second registration must not create a duplicate capability"
+    );
 }
 
 // Arm 3: a need phrased in capability words finds a tool registered under another name;
@@ -775,4 +820,91 @@ async fn a_nul_bearing_prefix_pattern_matches_by_bytes_for_policies_and_grants()
         .call("tool.check", json!({"tool": "a\0xcd", "actor": "agent:b"}))
         .await;
     assert_eq!(not_allowed["source"], json!("default"), "{not_allowed}");
+}
+
+#[tokio::test]
+async fn filtered_tool_lists_apply_predicates_before_the_limit() {
+    let f = fixture();
+    f.call(
+        "tool.register",
+        json!({"name": "older-tool", "kind": "tool"}),
+    )
+    .await;
+    f.call(
+        "tool.register",
+        json!({"name": "newer-verb", "kind": "verb"}),
+    )
+    .await;
+    let tools = f
+        .call("tool.list", json!({"kind": "tool", "limit": 1}))
+        .await;
+    assert_eq!(tools["count"], json!(1), "{tools}");
+    assert_eq!(tools["tools"][0]["name"], json!("older-tool"));
+
+    f.call(
+        "tool.policy",
+        json!({"actor": "agent:*", "tool": "older-tool", "decision": "deny"}),
+    )
+    .await;
+    f.call(
+        "tool.policy",
+        json!({"actor": "agent:unrelated", "tool": "older-tool", "decision": "allow"}),
+    )
+    .await;
+    let policies = f
+        .call(
+            "tool.policies",
+            json!({"actor": "agent:target", "limit": 1}),
+        )
+        .await;
+    assert_eq!(policies["count"], json!(1), "{policies}");
+    assert_eq!(policies["policies"][0]["actor"], json!("agent:*"));
+
+    f.call(
+        "tool.request",
+        json!({"tool": "newer-verb", "actor": "agent:target"}),
+    )
+    .await;
+    f.call(
+        "tool.request",
+        json!({"tool": "newer-verb", "actor": "agent:unrelated"}),
+    )
+    .await;
+    let requests = f
+        .call(
+            "tool.requests",
+            json!({"actor": "agent:target", "limit": 1}),
+        )
+        .await;
+    assert_eq!(requests["count"], json!(1), "{requests}");
+    assert_eq!(requests["requests"][0]["actor"], json!("agent:target"));
+}
+
+#[tokio::test]
+async fn grant_id_wildcards_cannot_select_a_request() {
+    let f = fixture();
+    f.call("tool.register", json!({"name": "send_mail"})).await;
+    let request = f
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:recipient"}),
+        )
+        .await;
+    let id = s(&request, "request_id");
+    for (verb, wildcard) in [("tool.grant", "%"), ("tool.deny", "_")] {
+        let error = f.call_err(verb, json!({"id": wildcard})).await;
+        assert!(error.contains("grant id"), "{error}");
+    }
+    let pending = f
+        .call("tool.requests", json!({"status": "requested"}))
+        .await;
+    assert_eq!(pending["requests"][0]["id"], json!(id));
+    assert_eq!(pending["requests"][0]["status"], json!("requested"));
+
+    f.call("tool.grant", json!({"id": &id[..8]})).await;
+    let error = f.call_err("tool.revoke", json!({"id": "%"})).await;
+    assert!(error.contains("grant id"), "{error}");
+    let granted = f.call("tool.requests", json!({"status": "granted"})).await;
+    assert_eq!(granted["requests"][0]["id"], json!(id));
+    assert_eq!(granted["requests"][0]["status"], json!("granted"));
 }
