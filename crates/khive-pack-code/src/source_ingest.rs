@@ -1588,29 +1588,57 @@ fn collect_source_files(
     out: &mut Vec<PathBuf>,
     skipped_outside_root: &mut Vec<PathBuf>,
     skipped_non_regular: &mut Vec<PathBuf>,
+    skipped_non_source: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
-    fn visit(
-        path: &Path,
-        canonical_root: &Path,
-        ext: &str,
-        visited_dirs: &mut BTreeSet<PathBuf>,
-        out: &mut Vec<PathBuf>,
-        skipped_outside_root: &mut Vec<PathBuf>,
-        skipped_non_regular: &mut Vec<PathBuf>,
-    ) -> std::io::Result<()> {
+    struct SourceWalk<'a> {
+        canonical_root: &'a Path,
+        ext: &'a str,
+        visited_dirs: BTreeSet<PathBuf>,
+        out: &'a mut Vec<PathBuf>,
+        skipped_outside_root: &'a mut Vec<PathBuf>,
+        skipped_non_regular: &'a mut Vec<PathBuf>,
+        skipped_non_source: &'a mut Vec<PathBuf>,
+    }
+
+    fn visit(path: &Path, walk: &mut SourceWalk<'_>) -> std::io::Result<()> {
         let canonical = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(_) => {
-                skipped_outside_root.push(path.to_path_buf());
+                if path.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+                    walk.skipped_outside_root.push(path.to_path_buf());
+                } else {
+                    walk.skipped_non_source.push(path.to_path_buf());
+                }
                 return Ok(());
             }
         };
-        if !canonical.starts_with(canonical_root) {
-            skipped_outside_root.push(path.to_path_buf());
+        if !canonical.starts_with(walk.canonical_root) {
+            if path.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+                walk.skipped_outside_root.push(path.to_path_buf());
+            } else {
+                walk.skipped_non_source.push(path.to_path_buf());
+            }
+            return Ok(());
+        }
+        // An alias must not re-enter a directory excluded by its canonical
+        // location. Components are relative to the explicitly chosen root,
+        // so a caller may still choose an excluded-name directory as root.
+        if canonical
+            .strip_prefix(walk.canonical_root)
+            .expect("canonical path was checked within the ingest root")
+            .components()
+            .any(|component| match component {
+                std::path::Component::Normal(name) => {
+                    let name = name.to_string_lossy();
+                    SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.')
+                }
+                _ => false,
+            })
+        {
             return Ok(());
         }
         if canonical.is_dir() {
-            if !visited_dirs.insert(canonical.clone()) {
+            if !walk.visited_dirs.insert(canonical.clone()) {
                 return Ok(());
             }
             for entry in fs::read_dir(&canonical)? {
@@ -1621,38 +1649,31 @@ fn collect_source_files(
                 if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
                     continue;
                 }
-                visit(
-                    &entry_path,
-                    canonical_root,
-                    ext,
-                    visited_dirs,
-                    out,
-                    skipped_outside_root,
-                    skipped_non_regular,
-                )?;
+                visit(&entry_path, walk)?;
             }
-        } else if canonical.extension().and_then(|value| value.to_str()) == Some(ext) {
+        } else if canonical.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
             if canonical.is_file() {
-                out.push(canonical);
+                walk.out.push(canonical);
             } else {
-                skipped_non_regular.push(path.to_path_buf());
+                walk.skipped_non_regular.push(path.to_path_buf());
             }
         }
         Ok(())
     }
 
     let canonical_root = fs::canonicalize(root)?;
-    visit(
-        &canonical_root,
-        &canonical_root,
+    let mut walk = SourceWalk {
+        canonical_root: &canonical_root,
         ext,
-        &mut BTreeSet::new(),
+        visited_dirs: BTreeSet::new(),
         out,
         skipped_outside_root,
         skipped_non_regular,
-    )?;
-    out.sort();
-    out.dedup();
+        skipped_non_source,
+    };
+    visit(&canonical_root, &mut walk)?;
+    walk.out.sort();
+    walk.out.dedup();
     Ok(())
 }
 
@@ -1913,12 +1934,14 @@ async fn run_import_scan(
     let mut files = Vec::new();
     let mut skipped_outside_root = Vec::new();
     let mut skipped_non_regular = Vec::new();
+    let mut skipped_non_source = Vec::new();
     if let Err(e) = collect_source_files(
         &canonical_ingest_root,
         ext,
         &mut files,
         &mut skipped_outside_root,
         &mut skipped_non_regular,
+        &mut skipped_non_source,
     ) {
         report
             .warnings
@@ -1938,6 +1961,15 @@ async fn run_import_scan(
             skipped.display()
         ));
         report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_source {
+        let warning = format!(
+            "L1.5 skipped non-source traversal entry: {}",
+            skipped.display()
+        );
+        if !report.warnings.contains(&warning) {
+            report.warnings.push(warning);
+        }
     }
     if !files.is_empty() {
         record_observed_language(report, language);
@@ -3256,12 +3288,14 @@ async fn run_l2_sweep(
     let mut files = Vec::new();
     let mut skipped_outside_root = Vec::new();
     let mut skipped_non_regular = Vec::new();
+    let mut skipped_non_source = Vec::new();
     if let Err(e) = collect_source_files(
         &canonical_ingest_root,
         ext,
         &mut files,
         &mut skipped_outside_root,
         &mut skipped_non_regular,
+        &mut skipped_non_source,
     ) {
         report
             .warnings
@@ -3281,6 +3315,12 @@ async fn run_l2_sweep(
             skipped.display()
         ));
         report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_source {
+        report.warnings.push(format!(
+            "L2 skipped non-source traversal entry: {}",
+            skipped.display()
+        ));
     }
     if !files.is_empty() {
         record_observed_language(report, LANGUAGE);
