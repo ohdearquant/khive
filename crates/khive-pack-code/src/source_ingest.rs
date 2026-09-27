@@ -28,8 +28,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use khive_runtime::{entity_fts_document, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -45,6 +47,26 @@ use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
 
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
+const RUST_L2_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const RUST_L2_MAX_DELIMITER_DEPTH: usize = 64;
+const RUST_L2_MAX_ANGLE_DEPTH: usize = 64;
+const RUST_L2_MAX_SEGMENT_TOKENS: usize = 2048;
+const RUST_L2_MAX_SEGMENT_OPERATORS: usize = 128;
+const RUST_L2_SCANNER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const RUST_L2_SCANNER_WORKERS: usize = 2;
+
+enum L2Source {
+    Ready { content: String, hash: String },
+    Refused { hash: String, reason: String },
+}
+
+impl L2Source {
+    fn hash(&self) -> &str {
+        match self {
+            Self::Ready { hash, .. } | Self::Refused { hash, .. } => hash,
+        }
+    }
+}
 
 #[cfg(test)]
 mod race_seam {
@@ -1671,6 +1693,318 @@ fn content_hash(content: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Read at most the L2 scanner's byte limit plus one. A refused file keeps
+/// module metadata and a parse-failure row, but its `refused:` fingerprint is
+/// deliberately not represented as a hash of unread source bytes.
+fn read_l2_source(path: &Path) -> io::Result<L2Source> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Ok(L2Source::Refused {
+            hash: "refused:non-regular-file".to_string(),
+            reason: "scanner safety limit: Rust source is not a regular file".to_string(),
+        });
+    }
+    if metadata.len() > RUST_L2_MAX_SOURCE_BYTES as u64 {
+        return Ok(L2Source::Refused {
+            hash: format!("refused:size:{}", metadata.len()),
+            reason: "scanner safety limit: Rust source is too large".to_string(),
+        });
+    }
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut hash: u64 = 0xcbf29ce484222325;
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(RUST_L2_MAX_SOURCE_BYTES + 1 - bytes.len());
+        for byte in &chunk[..retained] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        bytes.extend_from_slice(&chunk[..retained]);
+        if bytes.len() > RUST_L2_MAX_SOURCE_BYTES {
+            return Ok(L2Source::Refused {
+                hash: format!("refused:{hash:016x}"),
+                reason: "scanner safety limit: Rust source is too large".to_string(),
+            });
+        }
+    }
+    let hash = format!("{hash:016x}");
+    let content = String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Err(reason) = check_rust_l2_nesting(&content) {
+        return Ok(L2Source::Refused { hash, reason });
+    }
+    Ok(L2Source::Ready { content, hash })
+}
+
+/// Count delimiter nesting without constructing a recursive syntax tree. The
+/// scanner consumes only valid UTF-8, and this guard runs before `syn` sees it.
+fn check_rust_l2_nesting(content: &str) -> Result<(), String> {
+    let bytes = content.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut angle_at_delimiter = Vec::new();
+    let mut angle_depth = 0usize;
+    let mut segment_tokens = 0usize;
+    let mut segment_operators = 0usize;
+    let mut in_word = false;
+    let mut top_level_value_item = false;
+    let mut braced_item = false;
+    let mut item_body_opened = false;
+    let mut i = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
+    if bytes[i..].starts_with(b"#!") && !bytes[i..].starts_with(b"#![") {
+        while i < bytes.len() && bytes[i] != b'\n' {
+            i += 1;
+        }
+    }
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            in_word = false;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            in_word = false;
+            i += 2;
+            let mut comment_depth = 1usize;
+            while i < bytes.len() && comment_depth != 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    comment_depth += 1;
+                    if comment_depth > RUST_L2_MAX_DELIMITER_DEPTH {
+                        return Err("scanner safety limit: comment nesting is too deep".into());
+                    }
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    comment_depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if comment_depth != 0 {
+                return Err("scanner safety limit: unterminated block comment".into());
+            }
+            continue;
+        }
+        if bytes[i] == b'r' {
+            let mut marker = i + 1;
+            while marker < bytes.len() && bytes[marker] == b'#' {
+                marker += 1;
+                if marker - i - 1 > RUST_L2_MAX_DELIMITER_DEPTH {
+                    return Err("scanner safety limit: raw string delimiter is too long".into());
+                }
+            }
+            if marker < bytes.len() && bytes[marker] == b'"' {
+                scanner_budget_token(&mut segment_tokens)?;
+                in_word = false;
+                let hashes = marker - i - 1;
+                i = marker + 1;
+                let mut closed = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'"'
+                        && bytes.get(i + 1..i + 1 + hashes) == Some(&bytes[marker - hashes..marker])
+                    {
+                        i += 1 + hashes;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return Err("scanner safety limit: unterminated raw string".into());
+                }
+                continue;
+            }
+        }
+        if bytes[i] == b'"' {
+            scanner_budget_token(&mut segment_tokens)?;
+            in_word = false;
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = (i + 2).min(bytes.len()),
+                    b'"' => {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if !closed {
+                return Err("scanner safety limit: unterminated string".into());
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            if let Some(end) = rust_char_literal_end(content, i) {
+                scanner_budget_token(&mut segment_tokens)?;
+                in_word = false;
+                i = end;
+                continue;
+            }
+        }
+        let byte = bytes[i];
+        let word = byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
+        if word {
+            if !in_word {
+                scanner_budget_token(&mut segment_tokens)?;
+                if delimiters.is_empty() && angle_depth == 0 && !top_level_value_item {
+                    let mut end = i + 1;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric()
+                            || bytes[end] == b'_'
+                            || bytes[end] >= 0x80)
+                    {
+                        end += 1;
+                    }
+                    if matches!(
+                        std::str::from_utf8(&bytes[i..end]).ok(),
+                        Some(
+                            "fn" | "impl"
+                                | "struct"
+                                | "enum"
+                                | "union"
+                                | "trait"
+                                | "mod"
+                                | "extern"
+                                | "macro_rules"
+                                | "macro"
+                        )
+                    ) {
+                        braced_item = true;
+                    }
+                }
+            }
+        } else if !byte.is_ascii_whitespace() {
+            scanner_budget_token(&mut segment_tokens)?;
+        }
+        in_word = word;
+        if byte == b'<' {
+            angle_depth += 1;
+            if angle_depth > RUST_L2_MAX_ANGLE_DEPTH {
+                return Err("scanner safety limit: Rust generic nesting is too deep".into());
+            }
+        } else if byte == b'>' && i.checked_sub(1).and_then(|prev| bytes.get(prev)) != Some(&b'-') {
+            let floor = angle_at_delimiter.last().copied().unwrap_or(0);
+            angle_depth = angle_depth.saturating_sub(1).max(floor);
+        }
+        if matches!(byte, b'&' | b'*' | b'!' | b'+' | b'-' | b'=' | b'.' | b'?') {
+            segment_operators += 1;
+            if segment_operators > RUST_L2_MAX_SEGMENT_OPERATORS {
+                return Err("scanner safety limit: Rust expression is too complex".into());
+            }
+        }
+        if byte == b'=' && delimiters.is_empty() && angle_depth == 0 {
+            top_level_value_item = true;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => {
+                if byte == b'{'
+                    && delimiters.is_empty()
+                    && angle_depth == 0
+                    && braced_item
+                    && !top_level_value_item
+                {
+                    item_body_opened = true;
+                }
+                delimiters.push(bytes[i]);
+                angle_at_delimiter.push(angle_depth);
+                if delimiters.len() > RUST_L2_MAX_DELIMITER_DEPTH {
+                    return Err("scanner safety limit: Rust syntax nesting is too deep".into());
+                }
+            }
+            b')' | b']' | b'}' => {
+                let expected = match bytes[i] {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if delimiters.pop() != Some(expected) {
+                    return Err("scanner safety limit: unbalanced Rust delimiters".into());
+                }
+                angle_depth = angle_at_delimiter
+                    .pop()
+                    .expect("paired delimiter angle depth");
+                if byte == b'}' && delimiters.is_empty() && item_body_opened {
+                    segment_tokens = 0;
+                    segment_operators = 0;
+                    angle_depth = 0;
+                    top_level_value_item = false;
+                    braced_item = false;
+                    item_body_opened = false;
+                }
+            }
+            b';' | b',' => {
+                segment_tokens = 0;
+                segment_operators = 0;
+                if byte == b';' {
+                    angle_depth = angle_at_delimiter.last().copied().unwrap_or(0);
+                    if delimiters.is_empty() {
+                        top_level_value_item = false;
+                        braced_item = false;
+                        item_body_opened = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !delimiters.is_empty() {
+        return Err("scanner safety limit: unbalanced Rust delimiters".into());
+    }
+    Ok(())
+}
+
+fn scanner_budget_token(segment: &mut usize) -> Result<(), String> {
+    *segment += 1;
+    if *segment > RUST_L2_MAX_SEGMENT_TOKENS {
+        return Err("scanner safety limit: Rust syntax is too complex".into());
+    }
+    Ok(())
+}
+
+/// Distinguish one-character literals from lifetimes without letting a
+/// lifetime hide delimiters later on its line.
+fn rust_char_literal_end(content: &str, start: usize) -> Option<usize> {
+    let tail = content.get(start + 1..)?;
+    let first = tail.chars().next()?;
+    if first == '\\' {
+        let escaped = tail.chars().nth(1)?;
+        let end = if escaped == 'u' {
+            let open = start + 3;
+            if content.as_bytes().get(open) != Some(&b'{') {
+                return None;
+            }
+            let limit = (open + 10).min(content.len());
+            let close = content.get(open + 1..limit)?.find('}')? + open + 1;
+            if close - open > 8 {
+                return None;
+            }
+            close + 1
+        } else if escaped == 'x' {
+            start + 5
+        } else {
+            start + 3
+        };
+        return (content.as_bytes().get(end) == Some(&b'\'')).then_some(end + 1);
+    }
+    let end = start + 1 + first.len_utf8();
+    (content.as_bytes().get(end) == Some(&b'\'')).then_some(end + 1)
+}
+
 /// Run one selected-tier ingest pass over `opts.path` into the runtime `rt`
 /// (already bound to the caller-selected target database — B7 target
 /// selection happens in the verb handler, not here).
@@ -2130,9 +2464,62 @@ impl L2SweepState {
 /// metadata, no `declaration_ids` stamp, increment `symbol_parse_failures`,
 /// warn, retry next sweep) instead of aborting the sweep.
 fn parse_rust_file(content: &str) -> Result<ExtractedFile, String> {
+    #[cfg(test)]
+    if content.contains("l2_worker_probe_3292") {
+        if let Some(observer) = scanner_thread_observer()
+            .lock()
+            .expect("scanner observer lock")
+            .take()
+        {
+            let current = std::thread::current();
+            let _ = observer.send((current.id(), current.name().map(str::to_string)));
+        }
+    }
     crate::scanner_rust::scan_rust_source(content)
         .map(crate::extractor::from_rust_scan)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+type ScannerThreadObservation = (std::thread::ThreadId, Option<String>);
+
+#[cfg(test)]
+type ScannerThreadObserver =
+    std::sync::Mutex<Option<std::sync::mpsc::Sender<ScannerThreadObservation>>>;
+
+#[cfg(test)]
+fn scanner_thread_observer() -> &'static ScannerThreadObserver {
+    static OBSERVER: OnceLock<ScannerThreadObserver> = OnceLock::new();
+    OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Parsing and adaptation may recurse inside syn and the scanner. Keep that
+/// work off the async executor on a known stack, with a process-wide cap on
+/// concurrent scanner threads. The caller has already checked source size
+/// and delimiter depth before this function is reached.
+async fn parse_rust_file_on_worker(content: String) -> Result<ExtractedFile, String> {
+    static WORKERS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let workers = WORKERS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(RUST_L2_SCANNER_WORKERS)))
+        .clone();
+    let permit = workers
+        .acquire_owned()
+        .await
+        .map_err(|_| "scanner worker pool unavailable".to_string())?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("khive-rust-l2-scanner".to_string())
+        .stack_size(RUST_L2_SCANNER_STACK_BYTES)
+        .spawn(move || {
+            let _permit = permit;
+            let result = std::panic::catch_unwind(|| parse_rust_file(&content))
+                .unwrap_or_else(|_| Err("scanner worker panicked".to_string()));
+            let _ = send.send(result);
+        })
+        .map_err(|error| format!("scanner worker unavailable: {error}"))?;
+    receive
+        .await
+        .map_err(|_| "scanner worker terminated".to_string())?
 }
 
 /// Join a file module's own path with a declaration's in-file nesting
@@ -3288,8 +3675,8 @@ async fn run_l2_sweep(
             continue;
         };
 
-        let content = match fs::read_to_string(&file) {
-            Ok(c) => c,
+        let source = match read_l2_source(&file) {
+            Ok(source) => source,
             Err(e) => {
                 report
                     .warnings
@@ -3297,27 +3684,29 @@ async fn run_l2_sweep(
                 continue;
             }
         };
-        let hash = content_hash(&content);
+        let hash = source.hash().to_string();
+        let refused = matches!(&source, L2Source::Refused { .. });
 
         let precomputed_module_id = module_uuid(&proj_name, LANGUAGE, &module_path);
         let existing_module = get_entity_opt(rt, token, precomputed_module_id).await?;
-        let needs_reparse = l2_needs_reparse(
-            existing_module
-                .as_ref()
-                .and_then(|e| e.properties.as_ref())
-                .and_then(|p| p.get("l2_content_hash"))
-                .and_then(Value::as_str),
-            existing_module
-                .as_ref()
-                .and_then(|e| e.properties.as_ref())
-                .and_then(|p| p.get("declaration_ids")),
-            existing_module
-                .as_ref()
-                .and_then(|e| e.properties.as_ref())
-                .and_then(|p| p.get("l2_scanner_identity_version"))
-                .and_then(Value::as_u64),
-            &hash,
-        );
+        let needs_reparse = refused
+            || l2_needs_reparse(
+                existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .and_then(|p| p.get("l2_content_hash"))
+                    .and_then(Value::as_str),
+                existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .and_then(|p| p.get("declaration_ids")),
+                existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .and_then(|p| p.get("l2_scanner_identity_version"))
+                    .and_then(Value::as_u64),
+                &hash,
+            );
 
         let Some(module_id) = upsert_module(
             rt,
@@ -3383,7 +3772,10 @@ async fn run_l2_sweep(
         }
 
         clear_l2_ownership(rt, token, module_id, &file_label, report).await?;
-        let parse_result = parse_rust_file(&content);
+        let parse_result = match source {
+            L2Source::Ready { content, .. } => parse_rust_file_on_worker(content).await,
+            L2Source::Refused { reason, .. } => Err(reason),
+        };
         if let Some(declaration_ids) = persist_l2_file(
             rt,
             token,
@@ -3900,6 +4292,101 @@ mod tests {
         .expect("target runtime opens");
         let token = runtime.authorize(Namespace::local()).expect("token");
         (runtime, token)
+    }
+
+    #[test]
+    fn rust_l2_safety_guard_ignores_literals_and_comments() {
+        let braces = "{".repeat(RUST_L2_MAX_DELIMITER_DEPTH + 1);
+        let source = format!(
+            "// {braces}\n/* {braces} */\nconst RAW: &str = r#\"{braces}\"#;\nconst QUOTED: &str = \"{braces}\";\nfn valid<'a>(value: &'a str) {{ let _brace = '{{'; let _ = value; }}\n"
+        );
+        assert!(check_rust_l2_nesting(&source).is_ok());
+        assert!(check_rust_l2_nesting("#!/usr/bin/env rust-script ]\nfn valid() {}\n").is_ok());
+
+        let nested = format!("{}0{}", "(".repeat(65), ")".repeat(65));
+        assert!(check_rust_l2_nesting(&nested)
+            .unwrap_err()
+            .contains("scanner safety limit"));
+        let generic = format!("type Deep = {}u8{};", "Vec<".repeat(65), ">".repeat(65));
+        assert!(check_rust_l2_nesting(&generic)
+            .unwrap_err()
+            .contains("generic nesting"));
+        let unary = format!("fn f() {{ let _ = {}true; }}", "!".repeat(129));
+        assert!(check_rust_l2_nesting(&unary)
+            .unwrap_err()
+            .contains("expression is too complex"));
+    }
+
+    #[test]
+    fn rust_l2_safety_guard_accepts_large_flat_item() {
+        let mut source = String::from("pub fn many_statements() {\n");
+        for _ in 0..1_024 {
+            source.push_str("let _ = 0;\n");
+        }
+        source.push_str("}\n");
+
+        assert!(check_rust_l2_nesting(&source).is_ok());
+    }
+
+    #[test]
+    fn rust_l2_oversized_file_is_refused_without_reading_it() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("oversized.rs");
+        let source = " ".repeat(RUST_L2_MAX_SOURCE_BYTES + 1);
+        fs::write(&path, &source).expect("source file");
+        let L2Source::Refused { hash, reason } = read_l2_source(&path).expect("bounded read")
+        else {
+            panic!("oversized source must not be retained for parsing");
+        };
+        assert_eq!(hash, format!("refused:size:{}", source.len()));
+        assert!(reason.contains("scanner safety limit"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rust_l2_scanner_runs_off_the_ingest_thread() {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("worker_probe");
+        fs::create_dir_all(project.join("src")).expect("source directory");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"worker_probe\"\n",
+        )
+        .expect("manifest");
+        fs::write(
+            project.join("src/lib.rs"),
+            "pub fn l2_worker_probe_3292() {}\n",
+        )
+        .expect("source");
+        let (runtime, token) = runtime_on(&root.path().join("worker.db"));
+        let (send, receive) = std::sync::mpsc::channel();
+        *scanner_thread_observer()
+            .lock()
+            .expect("scanner observer lock") = Some(send);
+
+        let caller = std::thread::current().id();
+        let report = run_code_ingest(
+            &runtime,
+            &token,
+            CodeSourceIngestOptions {
+                path: &project,
+                languages: ["rust"].into_iter().collect(),
+                sweep_time: Utc::now(),
+                enable_l1: false,
+                enable_l1_5: false,
+                enable_l2: true,
+            },
+        )
+        .await
+        .expect("L2 ingest");
+        let (scanner, name) = receive
+            .try_recv()
+            .expect("valid Rust source reaches scanner");
+        assert_ne!(
+            scanner, caller,
+            "source parsing must leave the ingest thread"
+        );
+        assert_eq!(name.as_deref(), Some("khive-rust-l2-scanner"));
+        assert_eq!(report.l2.expect("L2 report").symbol_parse_failures, 0);
     }
 
     #[test]
