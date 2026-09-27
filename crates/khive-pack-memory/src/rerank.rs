@@ -21,8 +21,8 @@ pub struct RerankFeatures {
 /// Weighted feature-combination rerank score, normalized before accumulation.
 /// Returns 0.0 when weights are empty or all recognized weights are zero.
 /// RecallConfig::validate owns finite/non-negative weight validation.
-/// For finite features in [0, 1], scaling prevents intermediate overflow and
-/// avoids multiplying features by subnormal raw weights. Fixed feature order
+/// Scaling weights and finite feature magnitudes keeps intermediate sums bounded
+/// and avoids multiplying features by subnormal raw weights. Fixed feature order
 /// also removes HashMap iteration order from floating-point accumulation.
 pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>) -> f64 {
     let weighted_features = [
@@ -55,6 +55,11 @@ pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>
     if scale == 0.0 {
         return 0.0;
     }
+    let feature_scale = weighted_features
+        .iter()
+        .filter(|(weight, _)| *weight != 0.0)
+        .map(|(_, value)| value.abs())
+        .fold(1.0_f64, f64::max);
     let mut numerator = 0.0_f64;
     let mut weight_sum = 0.0_f64;
     for (weight, feature_value) in weighted_features {
@@ -62,12 +67,12 @@ pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>
             continue;
         }
         let normalized_weight = weight / scale;
-        numerator += normalized_weight * feature_value;
+        numerator += normalized_weight * (feature_value / feature_scale);
         if normalized_weight > 0.0 {
             weight_sum += normalized_weight;
         }
     }
-    numerator / weight_sum
+    (numerator / weight_sum).clamp(-1.0, 1.0) * feature_scale
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

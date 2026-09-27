@@ -412,9 +412,14 @@ async fn default_mmr_keeps_higher_composite_duplicate_in_both_id_orders() {
                 .expect("control rank_score")
         };
         let high_control_score = control_score(&high_id_text);
+        let low_control_score = control_score(&low_id_text);
         assert!(
-            high_control_score > control_score(&low_id_text),
+            high_control_score > low_control_score,
             "fixture must give the high-salience copy a higher composite score"
+        );
+        assert!(
+            low_control_score > 0.1,
+            "fixture must keep the lower-scoring duplicate above the default MMR penalty"
         );
 
         let default = registry
@@ -432,10 +437,21 @@ async fn default_mmr_keeps_higher_composite_duplicate_in_both_id_orders() {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["id"].as_str(), Some(high_id_text.as_str()));
         let high_final_score = hits[0]["rank_score"].as_f64().expect("rank_score");
+        let low_final_score = hits
+            .iter()
+            .find(|hit| hit["id"].as_str() == Some(low_id_text.as_str()))
+            .expect("lower-scoring duplicate in results")["rank_score"]
+            .as_f64()
+            .expect("lower-scoring duplicate rank_score");
         assert!(
             (high_final_score - high_control_score).abs() < 1e-3,
             "higher composite duplicate must not receive MMR penalty: \
              high_id_is_lower={high_id_is_lower}, control={high_control_score}, final={high_final_score}"
+        );
+        assert!(
+            (low_final_score - (low_control_score - 0.1)).abs() < 1e-3,
+            "lower composite duplicate must receive the default MMR penalty: \
+             high_id_is_lower={high_id_is_lower}, control={low_control_score}, final={low_final_score}"
         );
     }
 }

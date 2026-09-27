@@ -80,7 +80,7 @@ The default weight is `0.3`, making both clamp endpoints reachable at posterior 
 
 `RerankFeatures` exposes fused relevance, decay-adjusted salience, independent temporal recency, and boolean text/vector membership. Recognized weight keys are `relevance`, `salience`, `temporal`, `text_match`, and `vector_match`.
 
-The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value.
+The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value. Finite feature magnitudes are also scaled during accumulation so intermediate sums stay bounded.
 
 ## DoS caps and MMR
 
