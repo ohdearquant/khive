@@ -334,9 +334,23 @@ fn legacy_overwrite_keeps_existing_mmap_reader_on_its_original_inode() {
     // Two cooperating v1 publishers must serialize on the same directory,
     // including when a previous mmap reader remains alive.
     let contender_a_vectors = rand_unit_vectors(8, 4, 0x3270);
-    let contender_b_vectors = rand_unit_vectors(8, 4, 0x3271);
+    let contender_b_vectors = rand_unit_vectors(9, 4, 0x3271);
     let contender_a = VamanaIndex::build(&contender_a_vectors, cfg.clone()).unwrap();
     let contender_b = VamanaIndex::build(&contender_b_vectors, cfg).unwrap();
+    let capture_generation = |index: &VamanaIndex, name: &str| {
+        let generation_path = root.path().join(name);
+        index.save(&generation_path).unwrap();
+        ["metadata.bin", "graph.bin", "vectors.bin"]
+            .map(|segment| fs::read(generation_path.join(segment)).unwrap())
+    };
+    let contender_a_generation = capture_generation(&contender_a, "contender-a");
+    let contender_b_generation = capture_generation(&contender_b, "contender-b");
+    for segment in 0..3 {
+        assert_ne!(
+            contender_a_generation[segment], contender_b_generation[segment],
+            "contender generations must differ in every segment"
+        );
+    }
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let contender_a_path = path.clone();
     let contender_a_barrier = barrier.clone();
@@ -361,6 +375,12 @@ fn legacy_overwrite_keeps_existing_mmap_reader_on_its_original_inode() {
         .to_vec();
     assert!(
         final_vectors == contender_a_vectors || final_vectors == contender_b_vectors,
+        "concurrent publishers must leave one contender's vectors"
+    );
+    let final_generation = ["metadata.bin", "graph.bin", "vectors.bin"]
+        .map(|segment| fs::read(path.join(segment)).unwrap());
+    assert!(
+        final_generation == contender_a_generation || final_generation == contender_b_generation,
         "concurrent publishers must leave one complete generation"
     );
 }

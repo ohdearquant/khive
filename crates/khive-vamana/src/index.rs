@@ -3565,17 +3565,31 @@ fn encode_metadata(index: &VamanaIndex) -> Vec<u8> {
 
 #[cfg(feature = "mmap")]
 fn stage_legacy_replacement(destination: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let existing_permissions = match fs::metadata(destination) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let filename = destination
         .file_name()
         .expect("legacy segment has a fixed filename")
         .to_string_lossy();
     let temporary =
         destination.with_file_name(format!(".{filename}.legacy-{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if existing_permissions.is_some() {
+            options.mode(0o600);
+        }
+    }
+    let mut file = options.open(&temporary)?;
     let result = (|| -> std::io::Result<()> {
+        if let Some(permissions) = existing_permissions {
+            file.set_permissions(permissions)?;
+        }
         file.write_all(bytes)?;
         file.sync_all()
     })();
