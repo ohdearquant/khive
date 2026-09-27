@@ -107,11 +107,14 @@ Commit progress uses a **frozen snapshot continuation**, because the ancestor
 closure of one SHA does not describe a visited prefix across both sides of a
 merge. At the start of a new walk, resolve `HEAD` to an immutable OID. Reconstruct
 `git log --reverse --topo-order {base}..{snapshot_head}` on each resumed call
-(omit the base exclusion for a full-history walk). Metadata, touched paths,
-recovery retries, and the ADR-085 module index all bind to that same snapshot tip.
-The walk itself remains unbounded; `max_items` limits fresh record visits, not
-snapshot construction. Its acknowledged prefix is skipped before any natural-key
-lookup or budget charge.
+(omit the base exclusion for a full-history walk). Validate the checkpoint's
+membership in that walk, then skip its acknowledged prefix before selecting
+the next `max_items` commits for changed-path reads. The path pass asks Git for
+those explicit SHAs only, in reverse topological page order; an empty page
+does not run a path command. Recovery retries and the ADR-085 module index
+remain bound to the same snapshot tip. Metadata reconstruction remains
+unbounded, while `max_items` limits fresh record visits and the changed-path
+page. The acknowledged prefix consumes neither a lookup nor budget.
 
 After each contiguous success or existing-note visit, one atomic UPSERT stores the
 compatibility `commits` SHA and a versioned `commits_checkpoint` sidecar containing

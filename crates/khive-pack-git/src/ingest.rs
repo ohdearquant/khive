@@ -518,7 +518,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     opts: IngestOptions,
-    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send + 'static,
 ) -> Result<IngestReport> {
     run_ingest_inner(
         runtime,
@@ -537,7 +537,7 @@ async fn run_ingest_inner(
     registry: &VerbRegistry,
     opts: IngestOptions,
     origin_identity: OriginIdentity,
-    mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send + 'static,
 ) -> Result<IngestReport> {
     let mut report = IngestReport {
         done: true,
@@ -768,7 +768,7 @@ async fn run_ingest_inner(
             &mut report,
             &mut budget,
             &mut new_records,
-            &mut recover,
+            recover,
             &mut commits_complete,
         )
         .await
@@ -2224,33 +2224,42 @@ mod commit_framing_tests {
     }
 }
 
-/// `sha -> [touched paths]` for every commit in `repo`'s history, via a
-/// separate NUL-delimited `--name-only` pass. See
+/// `sha -> [touched paths]` for only the selected page, via separate
+/// NUL-delimited `--name-only` passes. See
 /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
-fn touched_files(repo: &Path, snapshot_head: &str) -> Result<HashMap<String, Vec<String>>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("log")
-        .arg("-z")
-        .arg("--name-only")
-        .arg("--no-renames")
-        .arg("--diff-merges=first-parent")
-        // Git paths are always repository-relative, so no tracked path token
-        // can start with `/`. This absolute-looking prefix is therefore an
-        // unambiguous header sentinel in the NUL-delimited token stream.
-        .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
-        .arg(snapshot_head)
-        .arg("--")
-        .output()
-        .context("spawning git log --name-only")?;
-    if !output.status.success() {
-        return Err(anyhow::Error::new(GitLogError {
-            phase: GitLogPhase::TouchedFiles,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }));
+fn touched_files(repo: &Path, page_shas: &[String]) -> Result<HashMap<String, Vec<String>>> {
+    // Keep argv bounded for the unbounded internal ingest API. The caller
+    // supplies this page newest-first, preserving the parser's orphan-header
+    // containment rule even when one page spans several commands.
+    const SHAS_PER_COMMAND: usize = 256;
+    let mut files_by_sha = HashMap::new();
+    for shas in page_shas.chunks(SHAS_PER_COMMAND) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("log")
+            .arg("--no-walk=unsorted")
+            .arg("-z")
+            .arg("--name-only")
+            .arg("--no-renames")
+            .arg("--diff-merges=first-parent")
+            // Git paths are always repository-relative, so no tracked path
+            // token can start with `/`. This absolute-looking prefix is an
+            // unambiguous header sentinel in the NUL-delimited stream.
+            .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
+            .args(shas)
+            .arg("--")
+            .output()
+            .context("spawning git log --name-only")?;
+        if !output.status.success() {
+            return Err(anyhow::Error::new(GitLogError {
+                phase: GitLogPhase::TouchedFiles,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }));
+        }
+        files_by_sha.extend(parse_touched_files(&output.stdout)?);
     }
-    parse_touched_files(&output.stdout)
+    Ok(files_by_sha)
 }
 
 /// Decode the `-z --name-only` stream [`touched_files`] produces. See
@@ -2426,7 +2435,7 @@ mod touched_file_parser_tests {
     }
 }
 
-/// The two `git log` passes a commit-ingest phase needs, loaded together so
+/// The metadata and page-path `git log` passes a commit-ingest phase needs, loaded together so
 /// a classified failure in either one can be retried as a single unit.
 struct CommitSnapshot {
     commits: Vec<RawCommit>,
@@ -2451,23 +2460,31 @@ fn resolve_commit_head(repo: &Path) -> Result<String> {
     Ok(head)
 }
 
-/// Load one commit-history snapshot; skips `touched_files` entirely when
-/// `walk_commits` found no new commits.
+/// Load one commit-history snapshot. Validate and remove the acknowledged
+/// prefix before selecting paths, but retain the entire remaining walk for
+/// the existing budget and completion decisions.
 fn load_commit_snapshot(
     repo: &Path,
     since_sha: Option<&str>,
     snapshot_head: &str,
+    last_completed_sha: Option<&str>,
+    page_limit: Option<usize>,
 ) -> Result<CommitSnapshot> {
-    let commits = walk_commits(repo, since_sha, snapshot_head)?;
-    if commits.is_empty() {
-        return Ok(CommitSnapshot {
-            commits,
-            files_by_sha: HashMap::new(),
-            head: snapshot_head.to_string(),
-            repo: repo.to_path_buf(),
-        });
+    let mut commits = walk_commits(repo, since_sha, snapshot_head)?;
+    if let Some(last_completed_sha) = last_completed_sha {
+        let position = commits
+            .iter()
+            .position(|record| record.sha == last_completed_sha)
+            .ok_or_else(|| anyhow!("commits checkpoint position is absent from its frozen snapshot; reset both commit cursor rows to replay history"))?;
+        commits.drain(..=position);
     }
-    let files_by_sha = touched_files(repo, snapshot_head)?;
+    let page_shas: Vec<String> = commits
+        .iter()
+        .take(page_limit.unwrap_or(usize::MAX))
+        .map(|commit| commit.sha.clone())
+        .rev()
+        .collect();
+    let files_by_sha = touched_files(repo, &page_shas)?;
     Ok(CommitSnapshot {
         commits,
         files_by_sha,
@@ -2510,6 +2527,8 @@ fn recover_commit_snapshot(
     repo: &Path,
     since_sha: Option<&str>,
     snapshot_head: Option<&str>,
+    last_completed_sha: Option<&str>,
+    page_limit: Option<usize>,
     mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>>,
 ) -> Result<(CommitSnapshot, Option<String>)> {
     let snapshot_head = match snapshot_head {
@@ -2519,7 +2538,13 @@ fn recover_commit_snapshot(
     let mut repo_path = repo.to_path_buf();
     let mut recovery_warning: Option<String> = None;
     loop {
-        match load_commit_snapshot(&repo_path, since_sha, &snapshot_head) {
+        match load_commit_snapshot(
+            &repo_path,
+            since_sha,
+            &snapshot_head,
+            last_completed_sha,
+            page_limit,
+        ) {
             Ok(snapshot) => return Ok((snapshot, recovery_warning)),
             Err(e) => {
                 let classified = e
@@ -2633,7 +2658,7 @@ async fn ingest_commits(
     report: &mut IngestReport,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
-    recover: &mut (dyn FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send),
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send + 'static,
     walk_complete: &mut bool,
 ) -> Result<()> {
     let (since, checkpoint) = read_commit_checkpoint(runtime, token, project_id).await?;
@@ -2652,25 +2677,34 @@ async fn ingest_commits(
             "invalid commits cursor; reset both commit cursor rows to replay history"
         ));
     }
-    let (snapshot, recovery_warning) = recover_commit_snapshot(
-        repo,
-        base_cursor.as_deref(),
-        pending.map(|c| c.snapshot_head.as_str()),
-        recover,
-    )?;
+    let repo_path = repo.to_path_buf();
+    let since_sha = base_cursor.clone();
+    let frozen_head = pending.map(|c| c.snapshot_head.clone());
+    let last_completed_sha = pending.map(|c| c.last_completed_sha.clone());
+    let page_limit = budget
+        .remaining
+        .map(|remaining| usize::try_from(remaining).unwrap_or(usize::MAX));
+    // The metadata walk, page-path pass, and any classified cache repair all
+    // use blocking git/cache operations. Keep them in one worker so retries
+    // still bind to the original frozen tip without blocking a Tokio worker.
+    let (snapshot, recovery_warning) = tokio::task::spawn_blocking(move || {
+        recover_commit_snapshot(
+            &repo_path,
+            since_sha.as_deref(),
+            frozen_head.as_deref(),
+            last_completed_sha.as_deref(),
+            page_limit,
+            recover,
+        )
+    })
+    .await
+    .context("commit snapshot task failed")??;
     let CommitSnapshot {
-        mut commits,
+        commits,
         files_by_sha,
         head: snapshot_head,
         repo: snapshot_repo,
     } = snapshot;
-    if let Some(c) = pending {
-        let position = commits.iter().position(|record| record.sha == c.last_completed_sha)
-            .ok_or_else(|| anyhow!("commits checkpoint position is absent from its frozen snapshot; reset both commit cursor rows to replay history"))?;
-        // Reconstructing the snapshot does no natural-key lookups. Its
-        // acknowledged prefix consumes no fresh-record visit budget.
-        commits.drain(..=position);
-    }
     if commits.is_empty() {
         // An empty range is a genuine completion only when the cursor is an
         // ancestor of HEAD. See crates/khive-pack-git/docs/ingest.md
@@ -2773,9 +2807,10 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        // Both `git log` passes walk the same history, so every walked
-        // commit should have a path-set entry. A missing entry means the two
-        // passes disagree; surface it instead of silently storing the `[]`
+        // The path pass requests this page's commits from the frozen metadata
+        // walk, so every visited commit should have a path-set entry. A
+        // missing entry means the passes disagree; surface it instead of
+        // silently storing the `[]`
         // the contract reserves for a genuinely empty commit.
         let Some(touched_paths) = files_by_sha.get(&c.sha) else {
             stall_cursor(&mut cursor_stalled, report);
@@ -4249,11 +4284,12 @@ mod recovery_classifier_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         init_repo_with_commit(dir.path());
         let mut recover_calls = 0;
-        let (snapshot, warning) = recover_commit_snapshot(dir.path(), None, None, |_repo, _err| {
-            recover_calls += 1;
-            Ok(None)
-        })
-        .expect("healthy repo loads");
+        let (snapshot, warning) =
+            recover_commit_snapshot(dir.path(), None, None, None, None, |_repo, _err| {
+                recover_calls += 1;
+                Ok(None)
+            })
+            .expect("healthy repo loads");
         assert_eq!(snapshot.commits.len(), 1);
         assert_eq!(warning, None);
         assert_eq!(recover_calls, 0);
@@ -4268,7 +4304,7 @@ mod recovery_classifier_tests {
         // Not a git repo at all -- `git log` fails with a plain spawn/repo
         // error, not a classified promisor one.
         let mut recover_calls = 0;
-        let result = recover_commit_snapshot(dir.path(), None, None, |_repo, _err| {
+        let result = recover_commit_snapshot(dir.path(), None, None, None, None, |_repo, _err| {
             recover_calls += 1;
             Ok(Some(RecoveredRepo {
                 repo: dir.path().to_path_buf(),
