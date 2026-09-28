@@ -726,7 +726,7 @@ pub(crate) fn build_embedder_registry(
     use crate::embedder_registry::{EmbedderRegistry, LatticeEmbedderProvider};
     let mut registry = EmbedderRegistry::new();
     for model in configured_embedding_models(config) {
-        registry.register(LatticeEmbedderProvider::new(model));
+        registry.register_builtin(LatticeEmbedderProvider::new(model));
     }
     let default_embedder_name = config
         .embedding_model

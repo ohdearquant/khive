@@ -352,13 +352,14 @@ async fn embed_and_insert_default_model(
     let records: Vec<VectorRecord> = staged
         .iter()
         .zip(outcomes.iter())
-        .map(|((id, _), outcome)| VectorRecord {
+        .map(|((id, _text), outcome)| VectorRecord {
             subject_id: *id,
             kind: SubstrateKind::Entity,
             namespace: ns_str.clone(),
             field: "knowledge.atom".to_string(),
             embedding_model: Some(model_name.to_string()),
             vectors: vec![outcome.vector.clone()],
+            text_fingerprint: outcome.prepared_text_fingerprint.clone(),
             updated_at: chrono::Utc::now(),
         })
         .collect();
