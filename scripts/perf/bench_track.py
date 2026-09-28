@@ -73,6 +73,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bench_calibrate as calibrate  # noqa: E402  (path insert must precede this)
+import ledger_shards  # noqa: E402
 
 SCHEMA_VERSION = 2
 REPO_ROOT = calibrate.REPO_ROOT
@@ -378,14 +379,19 @@ def append_record(record: dict, data_dir: pathlib.Path = DATA_DIR) -> pathlib.Pa
 
 
 def read_records(suite: str, data_dir: pathlib.Path = DATA_DIR) -> list[dict]:
-    path = ledger_path(suite, data_dir)
-    if not path.exists():
-        return []
+    paths = (
+        ledger_shards.component_ledger_paths(data_dir)
+        if suite == "components"
+        else [ledger_path(suite, data_dir)]
+    )
     records = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line:
-            records.append(json.loads(line))
+    for path in paths:
+        if path.exists():
+            with path.open() as stream:
+                for line in stream:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
     return records
 
 
