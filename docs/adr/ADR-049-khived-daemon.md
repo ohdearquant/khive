@@ -1425,9 +1425,9 @@ reaches its own commit or rollback boundary without duplication. An exclusively 
 child is drained and reaped only after its acknowledged handoffs settle; a shared or
 independently supervised events child is never killed by this process.
 
-## Amendment (2026-09-28): bridge-local fallback diagnostics
+## Amendment 12 (2026-09-28): bridge-local fallback diagnostics
 
-**Status: Proposed.** Addresses #3495. This amendment defines a read path for the five
+**Status: Accepted (2026-09-28).** Addresses #3495. This amendment defines a read path for the five
 bridge-process fallback counters and the strict-violation counter specified by Amendment 2.
 It does not create daemon-owned counters or change KG `stats()` or the daemon's
 `db_diagnostics.process` identity.
