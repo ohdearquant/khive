@@ -10592,6 +10592,7 @@ mod tests {
                 None,
                 "quarantined transport content",
                 Some(serde_json::json!({"quarantined": true})),
+                None,
             )
             .await
             .unwrap()
@@ -10652,6 +10653,7 @@ mod tests {
                 None,
                 "string-marked quarantined content",
                 Some(serde_json::json!({"quarantined": "true"})),
+                None,
             )
             .await
             .unwrap()
