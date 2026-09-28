@@ -78,15 +78,13 @@ pub fn document_id(site: Uuid, path_and_query: &str) -> Uuid {
 }
 
 /// Deterministic id for the `resource` produced by `web.extract`'s `text`
-/// kind over `original` (ADR-191 D3: "text `resource` (`derived_from`)").
-/// The derived text has no URL of its own, so it keys on the originating
-/// document's id rather than an address — repeated `extract(text)` calls
-/// over the same document converge on one row instead of minting a new one
-/// each time, matching every other identity in this module.
-pub fn derived_text_id(original: Uuid) -> Uuid {
+/// kind over one stored body of `original`. An unchanged body converges on
+/// one row, while a later capture at the same URL cannot overwrite an older
+/// excerpt, even when both captures produce identical text.
+pub fn derived_text_id(original: Uuid, source_content_ref: &str) -> Uuid {
     Uuid::new_v5(
         &WEB_NAMESPACE,
-        format!("derived-text|{original}").as_bytes(),
+        format!("derived-text|{original}|{source_content_ref}").as_bytes(),
     )
 }
 
@@ -217,6 +215,19 @@ mod tests {
         assert_eq!(
             document_id(site_id(&a), &path_and_query(&a)),
             document_id(site_id(&b), &path_and_query(&b))
+        );
+    }
+
+    #[test]
+    fn derived_text_identity_tracks_the_input_body() {
+        let original = Uuid::new_v4();
+        assert_eq!(
+            derived_text_id(original, "body-a"),
+            derived_text_id(original, "body-a")
+        );
+        assert_ne!(
+            derived_text_id(original, "body-a"),
+            derived_text_id(original, "body-b")
         );
     }
 }

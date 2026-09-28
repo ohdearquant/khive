@@ -10,10 +10,11 @@ use khive_runtime::{
 };
 
 use super::common::{
-    deser, ensure_entity_kind, ensure_note_kind, immutable_event_error, pack_private_record_error,
-    parse_content_strategy, parse_entity_policy, resolve_kind_spec, resolve_uuid_unfiltered,
-    to_json, KindSpec, MergeParams,
+    deser, ensure_entity_kind, ensure_entity_subtype, ensure_note_kind, immutable_event_error,
+    pack_private_record_error, parse_content_strategy, parse_entity_policy, resolve_kind_spec,
+    resolve_uuid_unfiltered, to_json, KindSpec, MergeParams,
 };
+use super::update::refuse_pack_registry_row;
 use crate::KgPack;
 
 /// Substrate word for a resolved kind, for a refusal that has to name both sides.
@@ -166,7 +167,10 @@ impl KgPack {
         let reason = p.reason.clone();
 
         let summary = match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 diagnose_private_merge(
                     ensure_entity_kind(&self.runtime, token, into_id, specific.as_deref()).await,
                     into_id,
@@ -191,6 +195,20 @@ impl KgPack {
                     registry,
                 )
                 .await?;
+                ensure_entity_subtype(
+                    into_id,
+                    into_entity.entity_type.as_deref(),
+                    entity_type.as_deref(),
+                )?;
+                ensure_entity_subtype(
+                    from_id,
+                    from_entity.entity_type.as_deref(),
+                    entity_type.as_deref(),
+                )?;
+                // A merge rewrites the survivor and consumes the source, even
+                // with `force`; neither operand may be a pack-owned registry row.
+                refuse_pack_registry_row(&into_entity, "merge")?;
+                refuse_pack_registry_row(&from_entity, "merge")?;
                 if !force {
                     if let Err(guard) = validate_entity_merge_floor(&into_entity, &from_entity) {
                         // A dry run is a prediction, so the safety floor it would

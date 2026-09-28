@@ -33,7 +33,7 @@ pub use text::{
 };
 pub use vector::{
     OrphanSweepConfig, OrphanSweepResult, PropertyFilter, PropertyOp, VectorIndexKind,
-    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorMetadataFilter, VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest,
     VectorStoreCapabilities, VectorStoreInfo,
 };
 

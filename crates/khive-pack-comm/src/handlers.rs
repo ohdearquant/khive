@@ -11,10 +11,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    is_valid_mailbox_actor_label, KhiveRuntime, MailboxView, NamespaceToken, RuntimeError,
+    is_valid_mailbox_actor_label, EmailMessageIdDomains, KhiveRuntime, MailboxView, NamespaceToken,
+    RuntimeError,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, DeleteMode, NewAttachment};
 
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
@@ -24,9 +26,9 @@ use crate::message::{
     COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
-    deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
-    IngestParams, MarkReadParams, ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams,
-    UnreadParams,
+    deser, CleanupExpiredQuarantineParams, CursorCommitParams, CursorGetParams, DeliveredParams,
+    HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, ReadParams,
+    ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
 fn add_embedding_truncation_warning(
@@ -1552,6 +1554,7 @@ pub(crate) fn reply_subject_for(subject: &str) -> String {
 pub(crate) async fn handle_reply(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
+    email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -1587,6 +1590,21 @@ pub(crate) async fn handle_reply(
         .as_ref()
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // Every nonempty outbound external_id would become a parent mail header
+    // below, including a legacy row with no channel metadata at all.
+    if orig_props.get("direction").and_then(Value::as_str) == Some("outbound") {
+        if let Some(external_id) = orig_props.get("external_id").and_then(Value::as_str) {
+            if !external_id.is_empty()
+                && !verified_outbound_email_external_id(&original, email_domains)
+            {
+                return Err(external_id_unverifiable(
+                    original.id,
+                    "outbound parent has no own-ID-bound Message-ID in the configured sending domains",
+                ));
+            }
+        }
+    }
 
     // Issue #403: parent's wire Message-ID drives In-Reply-To/References for native
     // mail clients. `None` when the parent has none — see docs/api/message-lifecycle.md.
@@ -2244,8 +2262,10 @@ pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
     channel_ingest_capability: Option<&khive_runtime::ChannelIngestCapability>,
+    email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     token: &NamespaceToken,
     params: Value,
+    quarantine_retention: std::time::Duration,
 ) -> Result<Value, RuntimeError> {
     // Note: IngestParams does not use deny_unknown_fields.
     let mut p: IngestParams = serde_json::from_value(params)
@@ -2327,6 +2347,22 @@ pub(crate) async fn handle_ingest(
 
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
+
+    // A legacy IMAP lookup can return a duplicate before the quarantine
+    // attachment repair below. The channel adapters never combine these two
+    // flows, so reject a synthetic combined request instead of acknowledging
+    // a quarantine replay without inspecting its original-byte owner.
+    let legacy_quarantine_overlap = p.legacy_external_id.is_some()
+        && p.metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .keys()
+                .any(|key| key == "quarantined" || key.starts_with("quarantine_"))
+        });
+    if legacy_quarantine_overlap {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: legacy_external_id cannot be combined with quarantine metadata".into(),
+        ));
+    }
 
     // One-release IMAP migration: read the pre-account key but never rewrite
     // its stored row. The old key was shared across accounts on one host, so
@@ -2411,6 +2447,8 @@ pub(crate) async fn handle_ingest(
         if !corr.is_empty() {
             // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
             let mut pass1 = None;
+            let email_reply =
+                p.channel_kind.as_deref() == Some("email") || p.from.trim().starts_with("email:");
             for candidate in message_id_match_candidates(corr) {
                 let corr_filter = NoteFilter {
                     kind: Some("message".to_string()),
@@ -2428,36 +2466,52 @@ pub(crate) async fn handle_ingest(
                     ],
                     ..Default::default()
                 };
-                let corr_page = store
-                    .query_notes_filtered_count_free(
-                        ns,
-                        &corr_filter,
-                        PageRequest {
-                            limit: 1,
-                            offset: 0,
-                        },
-                    )
-                    .await?;
-                pass1 = corr_page.items.first().map(|n| {
-                    // Falls back to the matched note's own UUID as root (#479b, ADR-040)
-                    // when it carries no valid thread_id (e.g. legacy/imported row).
-                    let thread_id = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("thread_id"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<Uuid>().ok())
-                        .map(|id| id.as_hyphenated().to_string())
-                        .unwrap_or_else(|| n.id.as_hyphenated().to_string());
-                    let from_actor = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("from_actor"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    (thread_id, from_actor)
-                });
+                let mut offset = 0;
+                loop {
+                    let corr_page = store
+                        .query_notes_filtered_count_free(
+                            ns,
+                            &corr_filter,
+                            PageRequest { limit: 100, offset },
+                        )
+                        .await?;
+                    let count = corr_page.items.len();
+                    if let Some(n) = corr_page.items.iter().find(|n| {
+                        if email_reply || outbound_email_message(n) {
+                            verified_outbound_email_external_id(n, email_domains)
+                        } else {
+                            true
+                        }
+                    }) {
+                        // A copied Message-ID can sort first. Only the row that
+                        // owns its UUID may supply the thread and actor.
+                        let thread_id = n
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("thread_id"))
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<Uuid>().ok())
+                            .map(|id| id.as_hyphenated().to_string())
+                            .unwrap_or_else(|| n.id.as_hyphenated().to_string());
+                        let from_actor = n
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("from_actor"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        pass1 = Some((thread_id, from_actor));
+                        break;
+                    }
+                    if count < 100 {
+                        break;
+                    }
+                    offset = offset.checked_add(count as u64).ok_or_else(|| {
+                        RuntimeError::Internal(
+                            "ingest: correlation pagination offset overflowed".into(),
+                        )
+                    })?;
+                }
                 if pass1.is_some() {
                     break;
                 }
@@ -2603,17 +2657,62 @@ pub(crate) async fn handle_ingest(
         }
     }
 
-    let note = match runtime
-        .try_create_note_as_trusted_ingest(
-            capability,
-            token,
-            "message",
-            p.subject.as_deref(),
-            p.content.trim(),
-            Some(props),
-        )
-        .await?
-    {
+    // The original bytes are this quarantine message's own binary content.
+    // A metadata-only ContentRef is invisible to blob GC, so pass its role to
+    // the note store for one transaction with the new note. Other inbound
+    // messages and quarantines without replay bytes keep their old behavior.
+    let is_quarantined = matches!(props.get("quarantined"), Some(Value::Bool(true)))
+        || props.get("quarantined").and_then(Value::as_str) == Some("true");
+    let quarantine_attachment = if is_quarantined {
+        match props.get("quarantine_content_ref") {
+            None => None,
+            Some(Value::String(raw)) => Some(NewAttachment {
+                role: "quarantine-original".to_string(),
+                content_ref: ContentRef::from_hex(raw).map_err(|error| {
+                    RuntimeError::InvalidInput(format!(
+                        "ingest: invalid quarantine_content_ref: {error}"
+                    ))
+                })?,
+                media_type: None,
+                size_bytes: None,
+            }),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "ingest: quarantine_content_ref must be a ContentRef string".to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let created = if let Some(attachment) = quarantine_attachment.clone() {
+        runtime
+            .try_create_note_as_trusted_ingest_with_attachment(
+                capability,
+                token,
+                "message",
+                p.subject.as_deref(),
+                p.content.trim(),
+                Some(props),
+                attachment,
+                is_quarantined.then_some(quarantine_retention),
+            )
+            .await?
+    } else {
+        runtime
+            .try_create_note_as_trusted_ingest(
+                capability,
+                token,
+                "message",
+                p.subject.as_deref(),
+                p.content.trim(),
+                Some(props),
+                is_quarantined.then_some(quarantine_retention),
+            )
+            .await?
+    };
+    let note = match created {
         Some(n) => n,
         None => {
             tracing::debug!(
@@ -2645,6 +2744,166 @@ pub(crate) async fn handle_ingest(
                     "comm.ingest: duplicate external_id {external_id:?} has no existing row"
                 ))
             })?;
+            if let Some(attachment) = quarantine_attachment {
+                let stored_ref = duplicate
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("quarantine_content_ref"))
+                    .and_then(Value::as_str);
+                if stored_ref != Some(attachment.content_ref.as_str()) {
+                    return Err(RuntimeError::InvalidInput(
+                        "ingest: duplicate quarantine external_id holds different original bytes"
+                            .to_string(),
+                    ));
+                }
+                let stored_channel_kind = duplicate
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("channel_kind"))
+                    .and_then(Value::as_str);
+                let stored_channel_slug = duplicate
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("channel_slug"))
+                    .and_then(Value::as_str);
+                if stored_channel_kind != p.channel_kind.as_deref()
+                    || stored_channel_slug
+                        .is_some_and(|slug| Some(slug) != p.channel_slug.as_deref())
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "ingest: duplicate quarantine channel identity disagrees with replay"
+                            .to_string(),
+                    ));
+                }
+                // Compute the replay grace before installing the owner, so an
+                // unrepresentable deadline cannot leave a partially repaired row.
+                let replay_deadline = if stored_channel_kind.is_some() && p.channel_slug.is_some() {
+                    let grace_us =
+                        i64::try_from(quarantine_retention.as_micros()).map_err(|_| {
+                            RuntimeError::InvalidInput(
+                                "ingest: quarantine replay retention exceeds i64 microseconds"
+                                    .into(),
+                            )
+                        })?;
+                    Some(
+                        Utc::now()
+                            .timestamp_micros()
+                            .checked_add(grace_us)
+                            .ok_or_else(|| {
+                                RuntimeError::InvalidInput(
+                                    "ingest: quarantine replay expiry exceeds i64 microseconds"
+                                        .into(),
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                let store = runtime.core().attachments()?;
+                match store
+                    .get_attachment(duplicate.id, "quarantine-original")
+                    .await?
+                {
+                    Some(existing) if existing.content_ref == attachment.content_ref => {}
+                    Some(_) => {
+                        return Err(RuntimeError::Internal(
+                            "ingest: duplicate quarantine attachment disagrees with note metadata"
+                                .to_string(),
+                        ));
+                    }
+                    None => {
+                        // Retry/backfill an older metadata-only quarantine.
+                        // A failed owner write keeps the channel cursor stalled.
+                        let blob = runtime.blob_store().ok_or_else(|| {
+                            RuntimeError::Unconfigured(
+                                "ingest: quarantine replay requires a BlobStore".to_string(),
+                            )
+                        })?;
+                        if !blob.exists(&attachment.content_ref).await? {
+                            return Err(RuntimeError::InvalidInput(
+                                "ingest: duplicate quarantine original is not published"
+                                    .to_string(),
+                            ));
+                        }
+                        #[cfg(test)]
+                        race_seam::pause_after_quarantine_role_read().await;
+                        if !store
+                            .try_insert_attachment(Attachment::from_new(
+                                duplicate.id,
+                                AttachmentSubstrate::Note,
+                                attachment.clone(),
+                                duplicate.created_at,
+                            ))
+                            .await?
+                        {
+                            // A writer installed the role after our first read.
+                            // A matching reference is an idempotent replay; a
+                            // different one must not be acknowledged as repaired.
+                            let current = store
+                                .get_attachment(duplicate.id, "quarantine-original")
+                                .await?;
+                            if !matches!(current, Some(ref existing)
+                                if existing.substrate == AttachmentSubstrate::Note
+                                    && existing.content_ref == attachment.content_ref)
+                            {
+                                return Err(RuntimeError::Internal(
+                                    "ingest: duplicate quarantine attachment changed during repair"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let (Some(channel_kind), Some(channel_slug), Some(deadline)) = (
+                    stored_channel_kind,
+                    p.channel_slug.as_deref(),
+                    replay_deadline,
+                ) {
+                    // The duplicate lookup has already matched the exact
+                    // channel kind and slug. This guarded write installs or
+                    // extends its retention deadline; a concurrent identity
+                    // change cannot redirect cleanup to another channel.
+                    // Later deadlines are retained.
+                    let sql = runtime.sql();
+                    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+                    let repaired = writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE notes SET \
+                                  properties = json_set(properties, '$.channel_slug', ?5), \
+                                  expires_at = CASE WHEN expires_at IS NULL OR expires_at < ?6 \
+                                    THEN ?6 ELSE expires_at END, \
+                                  updated_at = MAX(updated_at, ?7) \
+                                  WHERE id = ?1 AND namespace = ?2 AND kind = 'message' \
+                                    AND deleted_at IS NULL \
+                                    AND json_extract(properties, '$.quarantine_content_ref') = ?3 \
+                                    AND json_extract(properties, '$.channel_kind') = ?4 \
+                                    AND (json_type(properties, '$.channel_slug') IS NULL \
+                                         OR (json_type(properties, '$.channel_slug') = 'text' \
+                                             AND json_extract(properties, '$.channel_slug') = ?5)) \
+                                    AND (json_extract(properties, '$.quarantined') = 'true' \
+                                         OR json_type(properties, '$.quarantined') = 'true')"
+                                .into(),
+                            params: vec![
+                                SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
+                                SqlValue::Text(ns.to_string()),
+                                SqlValue::Text(attachment.content_ref.to_string()),
+                                SqlValue::Text(channel_kind.to_string()),
+                                SqlValue::Text(channel_slug.to_string()),
+                                SqlValue::Integer(deadline),
+                                SqlValue::Integer(Utc::now().timestamp_micros()),
+                            ],
+                            label: Some("comm_quarantine_duplicate_retention_repair".into()),
+                        })
+                        .await
+                        .map_err(RuntimeError::Storage)?;
+                    if repaired != 1 {
+                        return Err(RuntimeError::InvalidInput(
+                            "ingest: duplicate quarantine changed during retention repair"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
         }
     };
@@ -2657,6 +2916,99 @@ pub(crate) async fn handle_ingest(
         "external_id": p.external_id,
         "deduplicated": false,
     }))
+}
+
+/// Internal channel-poller maintenance. One bounded page per tick ensures an
+/// empty poll still makes progress without monopolizing the writer. The token
+/// carries the ingest namespace explicitly; heartbeat rows use a different
+/// namespace and must not be used as the maintenance scope.
+pub(crate) async fn handle_cleanup_expired_quarantine(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: CleanupExpiredQuarantineParams = deser(params)?;
+    if p.channel_kind.trim().is_empty() || p.channel_slug.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cleanup_expired_quarantine: channel_kind and channel_slug must be nonblank".into(),
+        ));
+    }
+    let as_of = p
+        .as_of_micros
+        .unwrap_or_else(|| Utc::now().timestamp_micros());
+    let namespace = token.namespace().as_str();
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT id FROM notes \
+                  WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
+                    AND expires_at IS NOT NULL AND expires_at <= ?2 \
+                    AND json_extract(properties, '$.channel_kind') = ?3 \
+                    AND json_extract(properties, '$.channel_slug') = ?4 \
+                    AND (json_extract(properties, '$.quarantined') = 'true' \
+                         OR json_type(properties, '$.quarantined') = 'true') \
+                  ORDER BY expires_at, id LIMIT 128"
+                .into(),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(as_of),
+                SqlValue::Text(p.channel_kind.clone()),
+                SqlValue::Text(p.channel_slug.clone()),
+            ],
+            label: Some("comm_cleanup_expired_quarantine".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    drop(reader);
+
+    // NoteStore by-ID deletion is not namespace-scoped. Re-read each UUID
+    // through the authorized store and enforce the query's full predicate
+    // before hard deletion. Hard delete removes the note and its attachment
+    // row in one transaction; blob GC reclaims the orphan after its grace.
+    let store = runtime.notes(token)?;
+    let mut deleted = 0usize;
+    for row in rows {
+        let id = match row.get("id") {
+            Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|error| {
+                RuntimeError::Internal(format!(
+                    "cleanup_expired_quarantine: invalid stored note id: {error}"
+                ))
+            })?,
+            _ => {
+                return Err(RuntimeError::Internal(
+                    "cleanup_expired_quarantine: query returned no text id".into(),
+                ));
+            }
+        };
+        let Some(note) = store.get_note(id).await? else {
+            continue;
+        };
+        let properties = note.properties.as_ref();
+        let still_due = note.namespace == namespace
+            && note.kind == "message"
+            && note.expires_at.is_some_and(|expires| expires <= as_of)
+            && properties
+                .and_then(|props| props.get("channel_kind"))
+                .and_then(Value::as_str)
+                == Some(p.channel_kind.as_str())
+            && properties
+                .and_then(|props| props.get("channel_slug"))
+                .and_then(Value::as_str)
+                == Some(p.channel_slug.as_str())
+            && (properties.and_then(|props| props.get("quarantined")) == Some(&Value::Bool(true))
+                || properties
+                    .and_then(|props| props.get("quarantined"))
+                    .and_then(Value::as_str)
+                    == Some("true"));
+        if still_due && store.delete_note(id, DeleteMode::Hard).await? {
+            deleted += 1;
+        }
+    }
+    Ok(json!({"ok": true, "deleted": deleted}))
 }
 
 /// Deterministic UUID identifying the `channel_health` row for one
@@ -3632,6 +3984,57 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
     }
 }
 
+fn outbound_email_message(note: &Note) -> bool {
+    let props = note.properties.as_ref();
+    props
+        .and_then(|p| p.get("direction"))
+        .and_then(Value::as_str)
+        == Some("outbound")
+        && (props
+            .and_then(|p| p.get("channel_kind"))
+            .and_then(Value::as_str)
+            == Some("email")
+            || props
+                .and_then(|p| p.get("channel_slug"))
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug.contains('@'))
+            || ["to_actor", "to", "from_actor", "from"].iter().any(|key| {
+                props
+                    .and_then(|p| p.get(*key))
+                    .and_then(Value::as_str)
+                    .is_some_and(|actor| actor.starts_with("email:"))
+            }))
+}
+
+fn verified_outbound_email_external_id(
+    note: &Note,
+    domains: &Result<Option<EmailMessageIdDomains>, String>,
+) -> bool {
+    let Some(domains) = domains.as_ref().ok().and_then(Option::as_ref) else {
+        return false;
+    };
+    let props = note.properties.as_ref();
+    domains.verifies_channel_slug(
+        props
+            .and_then(|p| p.get("channel_slug"))
+            .and_then(Value::as_str),
+    ) && props
+        .and_then(|p| p.get("external_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|external_id| domains.verify(note.id, external_id))
+}
+
+fn external_id_unverifiable(note_id: Uuid, reason: &str) -> RuntimeError {
+    khive_types::KhiveError::invalid_input(format!(
+        "external_id_unverifiable: outbound message {note_id}: {reason}"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "external_id_unverifiable".to_string()),
+        ("note_id", note_id.to_string()),
+    ]))
+    .into()
+}
+
 /// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed);
 /// the single place that does so for `In-Reply-To`/`References` headers.
 fn wrap_message_id(raw: &str) -> String {
@@ -3757,11 +4160,19 @@ mod race_seam {
 
     tokio::task_local! {
         pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+        pub(crate) static AFTER_QUARANTINE_ROLE_READ: (Arc<Barrier>, Arc<Barrier>);
     }
 
     pub(crate) async fn pause_after_read() {
         if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
             barrier.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_after_quarantine_role_read() {
+        if let Ok((arrived, resume)) = AFTER_QUARANTINE_ROLE_READ.try_with(Clone::clone) {
+            arrived.wait().await;
+            resume.wait().await;
         }
     }
 }
@@ -3916,10 +4327,17 @@ mod tests {
             "external_id": "imap:long-poll:dedup:1",
         });
 
-        let first =
-            super::handle_ingest(&runtime, &signal, Some(&capability), &token, body.clone())
-                .await
-                .expect("first ingest succeeds");
+        let first = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &Ok(None),
+            &token,
+            body.clone(),
+            std::time::Duration::from_secs(14 * 24 * 60 * 60),
+        )
+        .await
+        .expect("first ingest succeeds");
         assert_eq!(first["deduplicated"].as_bool(), Some(false));
         let generation_after_commit = signal.snapshot();
         assert_ne!(
@@ -3927,14 +4345,173 @@ mod tests {
             "a newly committed ingest must publish a wake"
         );
 
-        let second = super::handle_ingest(&runtime, &signal, Some(&capability), &token, body)
-            .await
-            .expect("deduplicated ingest succeeds");
+        let second = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &Ok(None),
+            &token,
+            body,
+            std::time::Duration::from_secs(14 * 24 * 60 * 60),
+        )
+        .await
+        .expect("deduplicated ingest succeeds");
         assert_eq!(second["deduplicated"].as_bool(), Some(true));
         assert_eq!(
             signal.snapshot(),
             generation_after_commit,
             "a deduplicated ingest must not publish a wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_quarantine_repair_preserves_a_competing_attachment() {
+        use std::sync::Arc;
+
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use khive_storage::{Attachment, AttachmentSubstrate, BlobStore as _, NewAttachment};
+        use tokio::sync::Barrier;
+        use uuid::Uuid;
+
+        let namespace = format!("ingest-quarantine-race-{}", Uuid::new_v4().simple());
+        let runtime = Arc::new(
+            super::KhiveRuntime::new(RuntimeConfig {
+                web: Default::default(),
+                telemetry: Default::default(),
+                mounts: Vec::new(),
+                brain: Default::default(),
+                git_write: Default::default(),
+                display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+                events_split: None,
+                db_path: None,
+                blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+                default_namespace: Namespace::parse(&namespace).unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                gate: Arc::new(AllowAllGate),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                backend_id: BackendId::main(),
+                brain_profile: None,
+                visible_namespaces: vec![],
+                allowed_outbound_namespaces: vec![],
+                actor_id: None,
+                exec: Default::default(),
+            })
+            .expect("in-memory runtime"),
+        );
+        let blob_root = tempfile::tempdir().expect("blob root");
+        let blob_store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("blob store"),
+        );
+        let original_ref = blob_store
+            .put(b"quarantine original".to_vec())
+            .await
+            .expect("publish original");
+        let competing_ref = blob_store
+            .put(b"competing original".to_vec())
+            .await
+            .expect("publish competing bytes");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+        let token = runtime
+            .authorize(Namespace::parse(&namespace).unwrap())
+            .expect("authorize");
+        let signal = crate::inbox_signal::InboxSignal::new();
+        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+        let body = json!({
+            "from": "email:sender@example.com",
+            "to": "local",
+            "content": "quarantined message",
+            "external_id": "imap:quarantine:race:1",
+            "metadata": {
+                "quarantined": true,
+                "quarantine_content_ref": original_ref.to_string(),
+            },
+        });
+
+        let first = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &Ok(None),
+            &token,
+            body.clone(),
+            std::time::Duration::from_secs(14 * 24 * 60 * 60),
+        )
+        .await
+        .expect("initial quarantine ingest");
+        let note_id = Uuid::parse_str(first["full_id"].as_str().expect("full note id"))
+            .expect("canonical note id");
+        let attachments = runtime.core().attachments().expect("attachment store");
+        assert!(attachments
+            .delete_attachment(note_id, "quarantine-original")
+            .await
+            .expect("leave legacy metadata-only row"));
+
+        let arrived = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let replay = {
+            let runtime = Arc::clone(&runtime);
+            let token = token.clone();
+            let arrived = Arc::clone(&arrived);
+            let resume = Arc::clone(&resume);
+            tokio::spawn(super::race_seam::AFTER_QUARANTINE_ROLE_READ.scope(
+                (arrived, resume),
+                async move {
+                    let capability =
+                        khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+                    let signal = crate::inbox_signal::InboxSignal::new();
+                    super::handle_ingest(
+                        &runtime,
+                        &signal,
+                        Some(&capability),
+                        &Ok(None),
+                        &token,
+                        body,
+                        std::time::Duration::from_secs(14 * 24 * 60 * 60),
+                    )
+                    .await
+                },
+            ))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), arrived.wait())
+            .await
+            .expect("replay must reach the post-read pause");
+
+        let competing = Attachment::from_new(
+            note_id,
+            AttachmentSubstrate::Note,
+            NewAttachment {
+                role: "quarantine-original".to_string(),
+                content_ref: competing_ref,
+                media_type: None,
+                size_bytes: None,
+            },
+            1,
+        );
+        attachments
+            .upsert_attachment(competing.clone())
+            .await
+            .expect("competing writer installs role");
+        resume.wait().await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), replay)
+            .await
+            .expect("replay must finish")
+            .expect("replay task");
+        assert!(
+            matches!(&result, Err(khive_runtime::RuntimeError::Internal(_))),
+            "a stale replay must refuse rather than acknowledge a different owner: {result:?}"
+        );
+        assert_eq!(
+            attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("stored attachment"),
+            Some(competing),
+            "the competing writer's role must survive the replay"
         );
     }
 

@@ -259,6 +259,7 @@ async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
     let main_attachments = fixture.main.attachments().unwrap();
     let web_attachments = fixture.routed.backend().attachments().unwrap();
     let mut rooted = 0;
+    let mut selected = 0;
     for entity in records {
         let roots = main_attachments.list_attachments(entity.id).await.unwrap();
         assert!(web_attachments
@@ -275,23 +276,133 @@ async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
             assert_eq!(roots[0].role, "content");
             assert_eq!(roots[0].content_ref.as_str(), reference);
             rooted += 1;
+            if entity
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("url"))
+                .is_some()
+            {
+                let properties = entity.properties.as_ref().unwrap();
+                assert_eq!(properties["request_headers"], json!({}));
+                assert_eq!(properties["vary"], json!([]));
+                assert!(
+                    entity.content_ref.is_none(),
+                    "the routed graph has no local content attachment projection"
+                );
+                selected += 1;
+            }
         } else {
             assert!(roots.is_empty());
         }
     }
     assert!(rooted >= 2, "page and resource each root their body");
+    assert_eq!(selected, 2, "both disk documents persist selection context");
+    let mut rooted_extractions = 0;
     for note in notes {
-        assert!(main_attachments
-            .list_attachments(note.id)
-            .await
-            .unwrap()
-            .is_empty());
+        let roots = main_attachments.list_attachments(note.id).await.unwrap();
+        let is_extraction = note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("tags"))
+            .and_then(|tags| tags.as_array())
+            .is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| tag.as_str() == Some("web.extraction"))
+            });
+        if is_extraction {
+            assert_eq!(roots.len(), 1, "extraction receipt roots its input body");
+            assert_eq!(roots[0].role, "source");
+            assert_eq!(
+                roots[0].content_ref.as_str(),
+                note.properties.as_ref().unwrap()["request"]["source_content_ref"]
+                    .as_str()
+                    .unwrap()
+            );
+            rooted_extractions += 1;
+        } else {
+            assert!(roots.is_empty(), "capture receipt has no attachment");
+        }
         assert!(web_attachments
             .list_attachments(note.id)
             .await
             .unwrap()
             .is_empty());
     }
+    assert!(rooted_extractions > 0, "ingest ran applicable extraction");
+}
+
+// The web graph backend has no projection of the canonical main attachment;
+// restoring the old graph-projected source check must make this test fail.
+#[tokio::test]
+async fn routed_extract_reads_canonical_main_content_root_without_graph_projection() {
+    let fixture = Fixture::new().await;
+    fixture.ingest().await;
+    let page = fetched_entities(&fixture.routed)
+        .await
+        .into_iter()
+        .find(|entity| entity.entity_type.as_deref() == Some("page"))
+        .expect("ingest creates a fetched page");
+    let source_ref = page.properties.as_ref().unwrap()["blob_ref"]
+        .as_str()
+        .unwrap();
+    assert!(
+        page.content_ref.is_none(),
+        "routed entity lookup cannot project the main backend's attachment"
+    );
+    let main_root = fixture
+        .main
+        .attachments()
+        .unwrap()
+        .get_attachment(page.id, "content")
+        .await
+        .unwrap()
+        .expect("canonical main owns the source body");
+    assert_eq!(main_root.content_ref.as_str(), source_ref);
+    assert!(fixture
+        .routed
+        .backend()
+        .attachments()
+        .unwrap()
+        .get_attachment(page.id, "content")
+        .await
+        .unwrap()
+        .is_none());
+    let capture_id = uuid::Uuid::parse_str(
+        page.properties.as_ref().unwrap()["capture_receipt_id"]
+            .as_str()
+            .expect("routed ingest binds its body-owning capture receipt"),
+    )
+    .unwrap();
+    let token = fixture.routed.authorize(Namespace::local()).unwrap();
+    let capture = fixture
+        .routed
+        .notes(&token)
+        .unwrap()
+        .get_note(capture_id)
+        .await
+        .unwrap()
+        .expect("capture receipt stays in the routed graph backend");
+    let capture_request = &capture.properties.as_ref().unwrap()["request"];
+    assert_eq!(capture_request["body_entity_id"], page.id.to_string());
+    assert_eq!(capture_request["content_ref"], source_ref);
+
+    let reply = fixture
+        .registry
+        .dispatch("web.extract", json!({ "id": page.id, "kinds": ["text"] }))
+        .await
+        .expect("routed extraction must verify the canonical main attachment");
+    assert_eq!(reply["status"], "complete");
+    assert!(reply["result"]["text"]["id"].as_str().is_some());
+    let receipt_id = uuid::Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+    let source_root = fixture
+        .main
+        .attachments()
+        .unwrap()
+        .get_attachment(receipt_id, "source")
+        .await
+        .unwrap()
+        .expect("extraction note roots the verified source body");
+    assert_eq!(source_root.content_ref.as_str(), source_ref);
 }
 
 // Must fail if web.extract leaves the derived body unrooted, roots it in the
@@ -723,7 +834,7 @@ async fn entity_deleted_event_count(
 }
 
 #[tokio::test]
-async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
+async fn routed_delete_reports_failed_event_append_without_repeating_committed_delete() {
     for explicit_kind in [false, true] {
         let fixture = Fixture::new().await;
         fixture.ingest().await;
@@ -756,10 +867,17 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
             .registry
             .dispatch("delete", request.clone())
             .await
-            .expect_err("the event write failure is returned after the row delete commits");
-        assert!(first
-            .to_string()
-            .contains("entity deletion event write failed"));
+            .expect("the committed delete reports the post-commit event failure");
+        assert_eq!(first["deleted"], true);
+        assert_eq!(first["id"], entity.id.to_string());
+        let degradations = first["post_commit_degradations"]
+            .as_array()
+            .expect("post-commit degradation list");
+        assert_eq!(degradations.len(), 1, "{first}");
+        assert_eq!(degradations[0]["stage"], "event_append");
+        assert!(degradations[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("entity deletion event write failed")));
         assert!(fixture
             .routed
             .entities(&token)
@@ -773,7 +891,7 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
             entity_deleted_event_count(&fixture.routed, &token, entity.id).await,
             0
         );
-        assert_eq!(
+        assert!(
             fixture
                 .main
                 .attachments()
@@ -781,9 +899,8 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
                 .list_attachments(entity.id)
                 .await
                 .unwrap()
-                .len(),
-            1,
-            "the first error occurs before routed cleanup removes the core root"
+                .is_empty(),
+            "routed cleanup still removes the core root after the committed delete"
         );
         {
             let writer = fixture.routed_backend.pool().try_writer().unwrap();
@@ -797,17 +914,13 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
             .registry
             .dispatch("delete", request)
             .await
-            .expect("retry cleans the remaining core attachment");
-        let index_entries_gone = !entity_is_indexed(&fixture.routed, &token, entity.id).await;
-        let deleted_events = entity_deleted_event_count(&fixture.routed, &token, entity.id).await;
-        assert!(
-            retry["deleted"] != json!(true) || (index_entries_gone && deleted_events == 1),
-            "retry must not claim deletion completed unless indexes are gone and exactly one deletion event exists"
+            .expect_err("retry cannot claim a second deletion of the absent row");
+        assert!(matches!(retry, khive_runtime::RuntimeError::NotFound(_)));
+        assert!(!entity_is_indexed(&fixture.routed, &token, entity.id).await);
+        assert_eq!(
+            entity_deleted_event_count(&fixture.routed, &token, entity.id).await,
+            0
         );
-        assert_eq!(retry["deleted"], false);
-        assert_eq!(retry["attachment_cleanup"], true);
-        assert!(index_entries_gone);
-        assert_eq!(deleted_events, 0);
         assert!(fixture
             .main
             .attachments()

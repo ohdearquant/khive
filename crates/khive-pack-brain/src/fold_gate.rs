@@ -186,7 +186,8 @@ pub enum GateAndAppendOutcome {
 
 /// ADR-081 §2/§6 (PR #497): claim the `(scorer_run_id, serve_ledger_id)` dedup
 /// key (if supplied), run the bounded-mass fold gate (or skip it for
-/// `ForcedZero`), and append the resulting `brain.feedback` event — as ONE
+/// `ForcedZero`), append the resulting `brain.feedback` event, and backfill
+/// the scorer grade when supplied — as ONE
 /// atomic, all-or-nothing unit on a single held `BEGIN IMMEDIATE` writer
 /// transaction, mirroring `apply_fold_gate`'s commit/rollback shape.
 ///
@@ -206,6 +207,7 @@ pub async fn apply_fold_gate_and_append_event<F>(
     gate_mode: FeedbackGateMode,
     now_us: i64,
     dedup_key: Option<(&str, &str)>,
+    grade: Option<&str>,
     build_event: F,
 ) -> Result<GateAndAppendOutcome, RuntimeError>
 where
@@ -216,6 +218,7 @@ where
     let profile_id = profile_id.to_string();
     let target_id = target_id.to_string();
     let dedup_key = dedup_key.map(|(a, b)| (a.to_string(), b.to_string()));
+    let grade = grade.map(str::to_owned);
 
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
@@ -229,6 +232,7 @@ where
                 gate_mode,
                 now_us,
                 dedup_ref,
+                grade.as_deref(),
                 build_event,
             )
             .await
@@ -262,6 +266,7 @@ pub(crate) async fn apply_gate_and_append_within_tx<F>(
     gate_mode: FeedbackGateMode,
     now_us: i64,
     dedup_key: Option<(&str, &str)>,
+    grade: Option<&str>,
     build_event: F,
 ) -> Result<GateAndAppendOutcome, RuntimeError>
 where
@@ -288,6 +293,17 @@ where
     khive_db::stores::event::append_event_on_writer(writer, &event)
         .await
         .map_err(|e| sql_err("append feedback event", e))?;
+
+    if let (Some((scorer_run_id, serve_ledger_id)), Some(grade)) = (dedup_key, grade) {
+        crate::serve_ledger::backfill_grade_on_writer(
+            writer,
+            serve_ledger_id,
+            grade,
+            now_us,
+            scorer_run_id,
+        )
+        .await?;
+    }
 
     Ok(GateAndAppendOutcome::Applied(Box::new(
         GateAndAppendResult {
@@ -1118,6 +1134,7 @@ mod tests {
             FeedbackGateMode::Nominal(weight),
             now_us,
             Some((scorer_run_id, serve_ledger_id)),
+            None,
             move |_fold_outcome, _forced_zero| Event {
                 id: colliding_id,
                 ..Event::new(
@@ -1207,6 +1224,7 @@ mod tests {
             FeedbackGateMode::Nominal(weight),
             now_us,
             Some((scorer_run_id, serve_ledger_id)),
+            None,
             move |_fold_outcome, _forced_zero| {
                 Event::new(
                     "forged-namespace".to_string(),
@@ -1382,6 +1400,7 @@ mod tests {
                     FeedbackGateMode::ForcedZero,
                     now_us,
                     Some((scorer_run_id, serve_ledger_id)),
+                    None,
                     move |fold_outcome, forced_zero| {
                         assert!(
                             fold_outcome.is_none(),

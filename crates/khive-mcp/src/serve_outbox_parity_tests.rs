@@ -147,6 +147,28 @@ mod outbox_parity_tests {
         }
     }
 
+    async fn email_cycle_with_domains(
+        runtime: &KhiveRuntime,
+        channel: &RecordingChannel,
+        domains: &khive_runtime::EmailMessageIdDomains,
+    ) {
+        let mut pause_until = None;
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(channel),
+            outbox::OutboxPolicy::Email {
+                mailbox: domains.mailbox(),
+                domains,
+                allowlist: &["recipient@example.com".into()],
+            },
+            runtime,
+            &Namespace::local(),
+            &tokio_util::sync::CancellationToken::new(),
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+    }
+
     fn expected(kind: &str, id: uuid::Uuid) -> Value {
         let mut envelope = ChannelEnvelope::new(
             if kind == "email" {
@@ -333,5 +355,256 @@ mod outbox_parity_tests {
                 assert!(p.get("external_id").is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn outbox_reuses_current_and_configured_historical_own_message_ids() {
+        let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(
+            "sender@example.com",
+            "former.example",
+        )
+        .unwrap();
+        for domain in ["example.com", "former.example"] {
+            let (runtime, token) = fixture();
+            let id = seed(&runtime, &token, "email", None).await;
+            let message_id = format!("<{id}@{domain}>");
+            let mut note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            note.properties.as_mut().unwrap()["external_id"] = json!(message_id);
+            runtime
+                .notes(&token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+            let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
+            email_cycle_with_domains(&runtime, &channel, &domains).await;
+            {
+                let sent = channel.sent.lock().unwrap();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0]["message_id"], message_id);
+            }
+            assert_eq!(props(&runtime, &token, id).await["external_id"], message_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn outbox_parks_copied_victim_id_without_smtp_and_links_one_diagnostic() {
+        let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(
+            "sender@example.com",
+            "former.example",
+        )
+        .unwrap();
+        let (runtime, token) = fixture();
+        let victim = seed(&runtime, &token, "email", None).await;
+        let copier = seed(&runtime, &token, "email", None).await;
+        let mut victim_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(victim)
+            .await
+            .unwrap()
+            .unwrap();
+        victim_note.properties.as_mut().unwrap()["delivery"] = json!("delivered");
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(victim_note)
+            .await
+            .unwrap();
+        let mut copied = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(copier)
+            .await
+            .unwrap()
+            .unwrap();
+        copied.properties.as_mut().unwrap()["external_id"] =
+            json!(format!("<{victim}@former.example>"));
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(copied)
+            .await
+            .unwrap();
+        let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
+
+        email_cycle_with_domains(&runtime, &channel, &domains).await;
+        assert!(
+            channel.sent.lock().unwrap().is_empty(),
+            "no SMTP call is allowed"
+        );
+        let held = props(&runtime, &token, copier).await;
+        assert_eq!(held["delivery_hold"], "external_id_unverifiable");
+        assert!(held["delivery_hold_reason"].as_str().is_some());
+        assert!(held.get("delivered_at").is_none());
+        assert_ne!(held["delivery"], "failed");
+        let diagnostics = runtime
+            .list_notes(&token, Some("observation"), 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1, "one keyed diagnostic must be visible");
+        let edges = runtime
+            .list_edges(
+                &token,
+                khive_runtime::EdgeListFilter {
+                    source_id: Some(diagnostics[0].id),
+                    target_id: Some(copier),
+                    ..Default::default()
+                },
+                20,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1, "diagnostic must annotate the offending row");
+        email_cycle_with_domains(&runtime, &channel, &domains).await;
+        assert!(channel.sent.lock().unwrap().is_empty());
+        assert_eq!(
+            runtime
+                .list_notes(&token, Some("observation"), 20, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "repeated passes must not duplicate the keyed diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_parks_malformed_and_unconfigured_ids_even_when_recipient_is_denied() {
+        let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(
+            "sender@example.com",
+            "former.example",
+        )
+        .unwrap();
+        for malformed in [
+            "not-a-message-id".to_string(),
+            "<own@unconfigured.example>".to_string(),
+        ] {
+            let (runtime, token) = fixture();
+            let id = seed(&runtime, &token, "email", None).await;
+            let mut note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            note.properties.as_mut().unwrap()["external_id"] = json!(malformed);
+            runtime
+                .notes(&token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+            let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
+            let mut pause_until = None;
+            outbox::outbox_once(
+                outbox::OutboxChannels::Single(&channel),
+                outbox::OutboxPolicy::Email {
+                    mailbox: domains.mailbox(),
+                    domains: &domains,
+                    allowlist: &["someone-else@example.com".into()],
+                },
+                &runtime,
+                &Namespace::local(),
+                &tokio_util::sync::CancellationToken::new(),
+                &mut pause_until,
+            )
+            .await
+            .unwrap();
+            assert!(channel.sent.lock().unwrap().is_empty());
+            let held = props(&runtime, &token, id).await;
+            assert_eq!(held["delivery_hold"], "external_id_unverifiable");
+            assert_ne!(held["delivery"], "failed");
+            assert_eq!(
+                runtime
+                    .list_notes(&token, Some("observation"), 20, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outbox_reports_diagnostic_write_failure_and_recovers_without_smtp() {
+        let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(
+            "sender@example.com",
+            "",
+        )
+        .unwrap();
+        let (runtime, token) = fixture();
+        let id = seed(&runtime, &token, "email", None).await;
+        let mut note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap();
+        note.properties.as_mut().unwrap()["external_id"] =
+            json!(format!("<{}@example.com>", uuid::Uuid::new_v4()));
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(note)
+            .await
+            .unwrap();
+        // Deny the observation kind to force the keyed diagnostic write to fail
+        // after the owner hold succeeds.
+        runtime.install_kind_registry(vec![], vec!["message".into()]);
+        let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
+        let mut pause_until = None;
+        let first = outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Email {
+                mailbox: domains.mailbox(),
+                domains: &domains,
+                allowlist: &["recipient@example.com".into()],
+            },
+            &runtime,
+            &Namespace::local(),
+            &tokio_util::sync::CancellationToken::new(),
+            &mut pause_until,
+        )
+        .await;
+        assert!(matches!(
+            first,
+            Err(crate::components::ComponentError::Retryable(_))
+        ));
+        assert!(channel.sent.lock().unwrap().is_empty());
+        assert_eq!(
+            props(&runtime, &token, id).await["delivery_hold"],
+            "external_id_unverifiable"
+        );
+        assert!(props(&runtime, &token, id)
+            .await
+            .get("external_id_diagnostic_note_id")
+            .is_none());
+
+        runtime.install_kind_registry(vec![], vec!["message".into(), "observation".into()]);
+        email_cycle_with_domains(&runtime, &channel, &domains).await;
+        assert!(channel.sent.lock().unwrap().is_empty());
+        assert!(
+            props(&runtime, &token, id).await["external_id_diagnostic_note_id"]
+                .as_str()
+                .is_some()
+        );
+        assert_eq!(
+            runtime
+                .list_notes(&token, Some("observation"), 20, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

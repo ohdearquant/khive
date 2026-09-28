@@ -6,13 +6,14 @@ use uuid::Uuid;
 use khive_runtime::{EdgePatch, EntityPatch, NamespaceToken, RuntimeError, VerbRegistry};
 
 use khive_storage::Entity;
-use khive_types::pack::PACK_REGISTRY_TAGS;
+use khive_types::pack::pack_registry_tag;
 
 use super::common::{
-    description_patch, deser, immutable_event_error, normalize_entity_timestamps,
-    pack_private_record_error, parse_relation, remap_note_status, resolve_kind_spec,
-    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, string_value, to_json,
-    validate_entity_type, DeleteParams, KindSpec, RestoreParams, UpdateParams,
+    description_patch, deser, ensure_entity_subtype, immutable_event_error,
+    normalize_entity_timestamps, pack_private_record_error, parse_relation, remap_note_status,
+    resolve_kind_spec, resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted,
+    string_value, to_json, validate_entity_type, DeleteParams, KindSpec, RestoreParams,
+    UpdateParams,
 };
 use crate::KgPack;
 
@@ -23,12 +24,8 @@ use crate::KgPack;
 /// read at run time and handed to the policy decision. The check reads the
 /// row's CURRENT tags, so a patch that would strip the tag first is refused by
 /// the same rule rather than becoming the way around it.
-fn refuse_pack_registry_row(entity: &Entity, verb: &str) -> Result<(), RuntimeError> {
-    let Some(tag) = entity
-        .tags
-        .iter()
-        .find(|tag| PACK_REGISTRY_TAGS.contains(&tag.as_str()))
-    else {
+pub(super) fn refuse_pack_registry_row(entity: &Entity, verb: &str) -> Result<(), RuntimeError> {
+    let Some(tag) = entity.tags.iter().find_map(|tag| pack_registry_tag(tag)) else {
         return Ok(());
     };
     Err(RuntimeError::InvalidInput(format!(
@@ -135,7 +132,10 @@ impl KgPack {
         // PR-A1: by-ID substrate inference must NOT gate on caller namespace.
         // UUID v4 is globally unique — resolve without visible-set or primary-ns check.
         match self.runtime.resolve_by_id(token, id).await? {
-            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
+            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity {
+                specific: None,
+                entity_type: None,
+            }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {
                 if self.runtime.get_edge(token, id).await?.is_some() {
@@ -160,7 +160,10 @@ impl KgPack {
             .resolve_by_id_including_deleted(token, id)
             .await?
         {
-            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
+            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity {
+                specific: None,
+                entity_type: None,
+            }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {
                 if self
@@ -222,9 +225,23 @@ impl KgPack {
         reject_inapplicable_fields(&spec, &p)?;
 
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type: required_entity_type,
+            } => {
                 let entity = self.runtime.get_entity(token, id).await?;
                 refuse_pack_registry_row(&entity, "update")?;
+                if let Some(tag) = p
+                    .tags
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find_map(|tag| pack_registry_tag(tag))
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "update refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+                    )));
+                }
                 if let Some(k) = specific.as_ref() {
                     if entity.kind != *k {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -233,6 +250,11 @@ impl KgPack {
                         )));
                     }
                 }
+                ensure_entity_subtype(
+                    id,
+                    entity.entity_type.as_deref(),
+                    required_entity_type.as_deref(),
+                )?;
                 // ADR-014 tri-state: `Some(None)` is an explicit clear and
                 // bypasses the vocabulary check (runtime applies it);
                 // `Some(Some(raw))` validates + normalizes; `None` unchanged.
@@ -245,6 +267,16 @@ impl KgPack {
                     )?),
                     None => None,
                 };
+                if let Some(expected) = required_entity_type.as_deref() {
+                    if entity_type
+                        .as_ref()
+                        .is_some_and(|value| value.as_deref() != Some(expected))
+                    {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind={expected:?} contradicts the requested entity_type update"
+                        )));
+                    }
+                }
                 let patch = EntityPatch {
                     name: string_value(p.name, "name")?,
                     description: description_patch(p.description)?,
@@ -417,7 +449,10 @@ impl KgPack {
         let spec = spec.unwrap();
 
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 // Read the row before deciding: a registry row is refused here
                 // whether or not the caller named a kind, so the guard cannot
                 // be stepped around by omitting one.
@@ -455,12 +490,16 @@ impl KgPack {
                         )));
                     }
                 }
+                ensure_entity_subtype(id, entity.entity_type.as_deref(), entity_type.as_deref())?;
                 // Report the kind the row carries, not the one the caller typed. The row
                 // was read a few lines up to enforce the mismatch guard, so this costs
                 // nothing, and a caller who deleted by a bare id or a hex prefix learns
                 // what it actually removed.
                 let resolved_kind = entity.kind.clone();
-                let deleted = target.runtime.delete_entity(token, id, hard).await?;
+                let (deleted, degradations) = target
+                    .runtime
+                    .delete_entity_with_post_commit_report(token, id, hard)
+                    .await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
@@ -470,9 +509,13 @@ impl KgPack {
                         .cleanup_deleted_entity_attachments(&target.runtime, token, id)
                         .await?;
                 }
-                to_json(
+                let mut response = to_json(
                     &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
-                )
+                )?;
+                if !degradations.is_empty() {
+                    response["post_commit_degradations"] = serde_json::json!(degradations);
+                }
+                Ok(response)
             }
             KindSpec::Note { specific } => {
                 // Read the row whether or not the caller named a kind. It used to be read
@@ -503,13 +546,20 @@ impl KgPack {
                     }
                 }
                 let resolved_kind = note.kind.clone();
-                let deleted = target.runtime.delete_note(token, id, hard).await?;
+                let (deleted, degradations) = target
+                    .runtime
+                    .delete_note_with_post_commit_report(token, id, hard)
+                    .await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
-                to_json(
+                let mut response = to_json(
                     &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
-                )
+                )?;
+                if !degradations.is_empty() {
+                    response["post_commit_degradations"] = serde_json::json!(degradations);
+                }
+                Ok(response)
             }
             KindSpec::Edge => {
                 let deleted = target.runtime.delete_edge(token, id, hard).await?;
@@ -544,7 +594,10 @@ impl KgPack {
         };
 
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 let existing = self
                     .runtime
                     .get_entity_including_deleted(token, id)
@@ -565,6 +618,7 @@ impl KgPack {
                         )));
                     }
                 }
+                ensure_entity_subtype(id, existing.entity_type.as_deref(), entity_type.as_deref())?;
                 let Some((entity, restored)) = self.runtime.restore_entity(token, id).await? else {
                     return Err(foreign_restore_target(&p.id));
                 };

@@ -361,6 +361,20 @@ impl NoteVectors {
                     scope,
                 ))
                 .await?;
+            let model_key = table.strip_prefix("vec_").ok_or_else(|| {
+                StorageError::Internal("invalid persisted vector table name".into())
+            })?;
+            writer
+                .execute(statement(
+                    "DELETE FROM vector_provenance \
+                     WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
+                    vec![
+                        SqlValue::Text(model_key.to_string()),
+                        SqlValue::Text(self.namespace.clone()),
+                        SqlValue::Text(self.subject_id.to_string()),
+                    ],
+                ))
+                .await?;
         }
         Ok(())
     }
@@ -860,6 +874,7 @@ impl KhiveRuntime {
         }
         let expected_updated_at = snapshot.updated_at;
         let expected_deleted_at = snapshot.deleted_at;
+        let expected_snapshot_version = snapshot.version;
         let (mut note, text_changed, changed) = self
             .prepare_update_note_from_snapshot(token, snapshot, patch)
             .await?;
@@ -871,8 +886,8 @@ impl KhiveRuntime {
         // a write. This branch serves `update` and the `stream.batch` write
         // member alike, and a batch write member is always fenced.
         if !changed && options.embed.is_none() && options.expected_version.is_none() {
-            let mut assertion = SqlStatement {
-                sql: "SELECT 1 FROM notes WHERE id=?1 AND updated_at=?2 AND deleted_at IS ?3"
+            let assertion = SqlStatement {
+                sql: "SELECT 1 FROM notes WHERE id=?1 AND updated_at=?2 AND deleted_at IS ?3 AND version=?4"
                     .into(),
                 params: vec![
                     SqlValue::Text(note.id.to_string()),
@@ -880,15 +895,10 @@ impl KhiveRuntime {
                     expected_deleted_at
                         .map(SqlValue::Integer)
                         .unwrap_or(SqlValue::Null),
+                    SqlValue::Integer(expected_snapshot_version),
                 ],
                 label: Some("note-noop-assertion".into()),
             };
-            if let Some(version) = options.expected_version {
-                assertion.params.push(SqlValue::Integer(version));
-                assertion
-                    .sql
-                    .push_str(&format!(" AND version = ?{}", assertion.params.len()));
-            }
             let plan = UpdatePlan {
                 graph_effects: Vec::new(),
                 target_id: note.id,
@@ -945,6 +955,15 @@ impl KhiveRuntime {
                 expected_deleted_at,
             )
         };
+        // A writer such as gtd.repair may change the row while retaining its
+        // updated_at. The snapshot version is therefore part of every CAS,
+        // including an unfenced update.
+        update
+            .params
+            .push(SqlValue::Integer(expected_snapshot_version));
+        update
+            .sql
+            .push_str(&format!(" AND version = ?{}", update.params.len()));
         if let Some(version) = options.expected_version {
             update.params.push(SqlValue::Integer(version));
             update
@@ -1050,6 +1069,46 @@ impl KhiveRuntime {
         khive_storage::note::Note,
         crate::retrieval::EmbeddingTruncationReport,
     )> {
+        self.create_note_with_options_resolving_annotations(
+            token,
+            kind,
+            name,
+            content,
+            embedding_content,
+            salience,
+            decay_factor,
+            properties,
+            std::future::ready(Ok(annotates)),
+            embedding_model,
+            options,
+        )
+        .await
+    }
+
+    /// Defer annotation target resolution until a keyed-create holder check
+    /// has decided whether this request is an exact replay. Resolution errors
+    /// still take part in the final holder recheck before they are returned.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_options_resolving_annotations<F>(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        embedding_content: Option<&str>,
+        salience: Option<f64>,
+        decay_factor: Option<f64>,
+        properties: Option<serde_json::Value>,
+        annotations: F,
+        embedding_model: Option<&str>,
+        options: NoteWriteOptions,
+    ) -> RuntimeResult<(
+        khive_storage::note::Note,
+        crate::retrieval::EmbeddingTruncationReport,
+    )>
+    where
+        F: std::future::Future<Output = RuntimeResult<Vec<Uuid>>> + Send,
+    {
         use crate::atomic_message::{AtomicNoteOptions, AtomicNoteSpec};
         use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicRunOutcome};
         use crate::note_create::{prepare_note_create, KeyPublication};
@@ -1083,6 +1142,7 @@ impl KhiveRuntime {
         // the same way it always has, and the single writer transaction at
         // the end is the only admission decision.
         let Some(key) = options.key.as_deref() else {
+            let annotates = annotations.await?;
             let (mut prepared, _) = prepare_note_create(
                 self,
                 AtomicNoteSpec {
@@ -1170,30 +1230,34 @@ impl KhiveRuntime {
         // captured rather than returned immediately: the final writer
         // transaction below still gets to revalidate the holder before
         // either this plan or this failure is consumed.
-        let prep_result = prepare_note_create(
-            self,
-            AtomicNoteSpec {
-                token,
-                id: None,
-                kind,
-                name,
-                content,
-                properties: derived_properties.clone(),
-            },
-            AtomicNoteOptions {
-                salience,
-                decay_factor,
-                embedding_model,
-                embedding_content,
-                embed: Some(options.embed.unwrap_or(kind != "head")),
-                key: Some(key),
-                replay_receipt: true,
-                fence: options.fence.as_ref(),
-                properties_already_derived: true,
-            },
-            &annotates,
-            KeyPublication::AtInsert,
-        )
+        let prep_result = async {
+            let annotates = annotations.await?;
+            prepare_note_create(
+                self,
+                AtomicNoteSpec {
+                    token,
+                    id: None,
+                    kind,
+                    name,
+                    content,
+                    properties: derived_properties.clone(),
+                },
+                AtomicNoteOptions {
+                    salience,
+                    decay_factor,
+                    embedding_model,
+                    embedding_content,
+                    embed: Some(options.embed.unwrap_or(kind != "head")),
+                    key: Some(key),
+                    replay_receipt: true,
+                    fence: options.fence.as_ref(),
+                    properties_already_derived: true,
+                },
+                &annotates,
+                KeyPublication::AtInsert,
+            )
+            .await
+        }
         .await;
 
         // Test-only pause, reached whether preparation succeeded or failed:

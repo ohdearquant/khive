@@ -1784,3 +1784,80 @@ Acceptance, stated before any implementation runs:
   an allow-list.
 
 Refs: #3298, #1855, #1793, #3056.
+
+## Amendment 10 (2026-09-28): bounded source ingest execution
+
+**Status**: Accepted (2026-09-28).
+
+### Context
+
+L1 manifest discovery, L1.5 source scanning, and L2 source reads previously mixed recursive
+filesystem work with the async ingest executor. Reopening the governing manifest for every source
+also multiplied parsing work in large packages. The reading surfaces are precise: L1/L1.5 read
+`Cargo.toml` for Rust, `pyproject.toml` for Python, and `package.json` for TypeScript; L1.5 reads
+`.rs`, `.py`, and `.ts` respectively (not `.tsx`); L2 reads only `.rs` and its governing
+`Cargo.toml`. The same 2 MiB source ceiling was already used by the L2 scanner on main (source_ingest.rs:51).
+
+An offline regular-file census of three available local checkouts, pruning the walk's hidden and
+build directories, found no candidate above 2 MiB. On khive-oss `78ad6641`, the candidate counts
+were 52 `Cargo.toml`, 3 `pyproject.toml`, 9 `package.json`, and 1,028 `.rs`, 128 `.py`, 115 `.ts`
+(maximum source: 743,833 bytes). On the TypeScript-heavy ARW checkout `6c314a14`, 65
+`package.json` and 798 `.ts` candidates had a 125,771-byte maximum `.ts` file. On the
+Python-heavy lionagi-oss checkout `b9175445`, one `pyproject.toml` and 1,586 `.py` candidates
+had a 272,428-byte maximum `.py` file. This is local impact evidence, not a guarantee for other
+repositories.
+
+### Decision
+
+`code.ingest` performs recursive discovery, file reads, and source parsing on blocking workers.
+Graph and FTS writes remain on the async side. A sweep parses each governing manifest at most once
+per tier and resolves source ownership against that sweep's manifest snapshot, so a repository with
+many files in one package does not repeatedly read and parse the same manifest. L2 discovers
+manifests from the canonical source paths it actually walked, including files reached through
+symlinks that remain inside the ingest root.
+
+The L1/L1.5 manifest and source readers require regular files and cap each input at 2 MiB. They
+check metadata on the opened handle and read at most 2 MiB plus one byte from that same handle,
+so a file growing during the read cannot allocate without bound. An oversized manifest or L1.5 source
+is skipped with a warning; healthy siblings continue. The existing L2 refusal path retains its
+per-file parse-failure record and source fingerprint. Oversized manifests and L1.5 sources increment the existing
+`manifest_files_refused` and `source_files_refused` counters respectively. L2 retains its
+`symbol_parse_failures` counter and per-file warning. No report field or default wire shape changes.
+
+Every manifest and L1.5/L2 source read checks the **opened file descriptor's** resolved path
+against the canonical ingest root before reading bytes. A symlink planted after traversal or
+metadata preflight cannot redirect a read outside the requested tree. Refused opened manifest and
+L1.5 source paths increment their existing refusal counters and emit path-specific warnings;
+L2 source refusals follow its established per-file reporting. A dangling or looping symlink is
+skipped with a warning, and the source walk records its existing dropped-path count. L2 also deduplicates canonical directory visits, so directory symlink cycles
+terminate. This source-file boundary does not change the target-database VFS fence decided in E7
+and tracked by #1855.
+
+### Alternatives and residuals
+
+Refusing an entire ingest when one source or manifest exceeds 2 MiB would make a healthy sibling
+unavailable and turn a single generated file into a repository-wide failure. This amendment
+instead skips that input, reports it, and lets the next sweep include it if it becomes eligible.
+An unbounded read would preserve coverage but lets one input dominate worker memory and parsing
+time. Checking only the pathname discovered by the walk was rejected because a concurrent writer
+can replace it with an external symlink before open (#3449); the opened-descriptor check closes
+that particular gap. A file may still be edited while its already-accepted descriptor is read:
+the byte ceiling remains enforced, but one sweep is not a transactional snapshot of all files.
+The parsed manifest index likewise reflects the manifests observed during that sweep, not edits
+made afterward; a later sweep reconciles ordinary edits. Pinning Git blobs or locking the whole
+tree would be a different ingest contract and is deferred.
+
+Acceptance:
+
+1. A file exactly at the byte ceiling is readable; one byte over is refused before parsing.
+2. An oversized manifest and L1.5 source increment the existing refusal counters, while a small
+   sibling still ingests.
+3. L2-only ingest retains its oversized Rust parse-failure reporting.
+4. Source walks and reads yield the async executor; governing manifest resolution uses one parsed
+   snapshot per sweep rather than reopening manifests per file.
+5. A source or manifest swapped to an external symlink after preflight is rejected by the opened
+   descriptor check. Existing source-walk tests retain canonical excluded-tree and symlink-cycle
+   boundaries. This is the source boundary from #3449, separate from #1855 and the E7
+   target-database VFS fence.
+
+Refs: #3299, #3292, #3449, #1855.

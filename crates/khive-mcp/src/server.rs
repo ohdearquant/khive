@@ -57,6 +57,12 @@ const _: () = assert!(
     khive_runtime::daemon::ERROR_DETAIL_NESTING_DEPTH_LIMIT == khive_request::NESTING_DEPTH_LIMIT
 );
 
+static BRIDGE_INSTANCE_ID: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
+
+pub(crate) fn bridge_instance_id() -> uuid::Uuid {
+    *BRIDGE_INSTANCE_ID.get_or_init(uuid::Uuid::new_v4)
+}
+
 const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
 const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
 const MAX_BACKEND_ERROR_MESSAGE_CHARS: usize = 1_024;
@@ -1309,6 +1315,7 @@ pub struct KhiveMcpServer {
     registry: VerbRegistry,
     #[cfg(unix)]
     bridge_executable: Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
+    stdio_bridge: bool,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     default_namespace: String,
@@ -1366,6 +1373,7 @@ pub struct KhiveMcpServer {
 /// Failure reason inside a [`PackRegError`].
 pub enum PackRegFailure {
     UnknownPack(String),
+    DuplicatePack(String),
     MissingDependency { pack: String, dep: String },
     NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
@@ -1384,6 +1392,7 @@ impl std::fmt::Debug for PackRegError {
         let mut dbg = f.debug_struct("PackRegError");
         match &self.failure {
             PackRegFailure::UnknownPack(unknown) => dbg.field("unknown", unknown),
+            PackRegFailure::DuplicatePack(pack) => dbg.field("duplicate_pack", pack),
             PackRegFailure::MissingDependency { pack, dep } => {
                 dbg.field("pack", pack).field("missing_dep", dep)
             }
@@ -1404,6 +1413,7 @@ impl std::fmt::Display for PackRegError {
                 unknown,
                 builtin_pack_names().join(", ")
             ),
+            PackRegFailure::DuplicatePack(pack) => write!(f, "duplicate pack {pack:?}"),
             PackRegFailure::MissingDependency { pack, dep } => write!(
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
@@ -1680,6 +1690,7 @@ impl KhiveMcpServer {
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {
                 PackLoadError::UnknownPack(name) => PackRegFailure::UnknownPack(name),
+                PackLoadError::DuplicatePack(name) => PackRegFailure::DuplicatePack(name),
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }
@@ -1758,6 +1769,7 @@ impl KhiveMcpServer {
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             bridge_executable: None,
+            stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
             runtime: Some(runtime),
@@ -1787,6 +1799,7 @@ impl KhiveMcpServer {
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             bridge_executable: None,
+            stdio_bridge: false,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1815,6 +1828,7 @@ impl KhiveMcpServer {
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             bridge_executable: None,
+            stdio_bridge: false,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -2090,6 +2104,8 @@ impl KhiveMcpServer {
     pub async fn serve_stdio(mut self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
+        let _ = bridge_instance_id();
+        self.stdio_bridge = true;
         self.bridge_executable = crate::daemon::executable::BridgeExecutable::current()
             .map(|executable| Arc::new(std::sync::Mutex::new(executable)));
         let root = tokio_util::sync::CancellationToken::new();
@@ -2144,9 +2160,11 @@ impl KhiveMcpServer {
     /// no flush-triggered hook. It still shares rmcp's root token with the EOF
     /// adapter so disconnect cancellation is platform-independent.
     #[cfg(not(unix))]
-    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+    pub async fn serve_stdio(mut self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
+        let _ = bridge_instance_id();
+        self.stdio_bridge = true;
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
         let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
@@ -3904,6 +3922,10 @@ Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
 schemas live in each pack's docs and SKILL.md files.
 
+Bridge control: `bridge.diagnostics()` reads this stdio bridge's in-memory
+fallback counters without contacting a daemon or store. It must be the only
+operation in the request; `bridge.diagnostics(help=true)` describes its schema.
+
 Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
@@ -3989,6 +4011,145 @@ impl KhiveMcpServer {
         khive_request::plan_request(ops, &catalog).to_string()
     }
 
+    fn plan_bridge_ops(&self, ops: &str) -> String {
+        let mut plan: Value =
+            serde_json::from_str(&self.plan_ops(ops)).expect("plan output is always JSON");
+        if let Some(stages) = plan.get_mut("stages").and_then(Value::as_array_mut) {
+            for stage in stages {
+                if stage["verb"] == "bridge.diagnostics" {
+                    stage["known"] = Value::Bool(true);
+                    stage["pack"] = json!("bridge-control");
+                }
+            }
+        }
+        plan.to_string()
+    }
+
+    fn bridge_diagnostics_response(
+        &self,
+        p: &RequestParams,
+        parsed: &ParsedRequest,
+    ) -> Result<String, McpError> {
+        if !self.stdio_bridge {
+            return Err(invalid_request_error(
+                "bridge.diagnostics is available only on the stdio bridge".into(),
+            ));
+        }
+        if parsed.mode != ExecutionMode::Single || parsed.ops.len() != 1 {
+            return Err(invalid_request_error(
+                "bridge.diagnostics must be the only operation in an unbatched request".into(),
+            ));
+        }
+        if p.save_to.is_some() {
+            return Err(invalid_request_error(
+                "bridge.diagnostics does not accept save_to".into(),
+            ));
+        }
+        let op = &parsed.ops[0];
+        let is_help = op.args.len() == 1
+            && matches!(
+                op.args.get("help"),
+                Some(ArgValue::Value(Value::Bool(true)))
+            );
+        if !op.args.is_empty() && !is_help {
+            return Err(invalid_request_error(
+                "bridge.diagnostics accepts only help=true".into(),
+            ));
+        }
+        validate_request_overrides(p, 1)?;
+        if khive_storage::request_read_is_cancelled() {
+            return Err(McpError::internal_error(
+                "request cancelled before bridge diagnostics read",
+                Some(error_with_disposition(
+                    json!({"kind":"cancelled", "message":"request cancelled before bridge diagnostics read"}),
+                    DomainDisposition::NotCommitted,
+                )),
+            ));
+        }
+
+        let result = if is_help {
+            bridge_diagnostics_help()
+        } else {
+            #[cfg(unix)]
+            {
+                bridge_diagnostics_value().ok_or_else(|| {
+                    McpError::internal_error(
+                        "bridge fallback total overflow",
+                        Some(error_with_disposition(
+                            json!({"kind":"counter_overflow", "message":"bridge fallback total overflow"}),
+                            DomainDisposition::NotCommitted,
+                        )),
+                    )
+                })?
+            }
+            #[cfg(not(unix))]
+            {
+                bridge_diagnostics_value()
+            }
+        };
+        let presentation =
+            parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
+        let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
+            p.presentation_per_op.as_ref().map(|modes| {
+                modes
+                    .iter()
+                    .map(|mode| {
+                        mode.as_deref().map(|mode| {
+                            parse_presentation_mode(Some(mode))
+                                .expect("presentation override was validated")
+                        })
+                    })
+                    .collect()
+            });
+        let effective_presentation = presentation_per_op
+            .as_ref()
+            .and_then(|modes| modes.first())
+            .and_then(|mode| *mode)
+            .unwrap_or(presentation);
+        let result = present_with_policy(
+            result,
+            effective_presentation,
+            chrono::Utc::now().timestamp(),
+            VerbPresentationPolicy::Standard,
+        );
+        let batch_format = parse_output_format(p.format.as_deref())
+            .map_err(invalid_request_error)?
+            .unwrap_or(self.default_output_format);
+        let format_per_op: Option<Vec<Option<OutputFormat>>> =
+            p.format_per_op.as_ref().map(|formats| {
+                formats
+                    .iter()
+                    .map(|format| {
+                        parse_output_format(format.as_deref())
+                            .expect("format override was validated")
+                    })
+                    .collect()
+            });
+        let effective_format = format_per_op
+            .as_ref()
+            .and_then(|formats| formats.first())
+            .and_then(|format| *format)
+            .unwrap_or(batch_format);
+        let formatted = if effective_format == OutputFormat::Json {
+            khive_runtime::presentation::prepare_format_value(
+                result,
+                effective_format,
+                effective_presentation,
+            )
+        } else {
+            Value::String(render_format(
+                result,
+                effective_format,
+                effective_presentation,
+            ))
+        };
+        Ok(serialize_response_value(&json!({
+            "results": [{"ok": true, "tool": "bridge.diagnostics", "result": formatted}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
+            "status": "success",
+        })))
+    }
+
     fn plan_response(&self, p: &RequestParams) -> Result<Option<String>, McpError> {
         if p.plan != Some(true) {
             return Ok(None);
@@ -3998,6 +4159,18 @@ impl KhiveMcpServer {
     }
 
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        let parsed = parse_request(&p.ops);
+        if let Ok(ref parsed) = parsed {
+            if parsed_contains_bridge_diagnostics(parsed) {
+                if p.plan == Some(true) && self.stdio_bridge {
+                    p.validate_plan_envelope()?;
+                    return Ok(self.plan_bridge_ops(&p.ops));
+                }
+                if p.plan != Some(true) {
+                    return self.bridge_diagnostics_response(&p, parsed);
+                }
+            }
+        }
         #[cfg(unix)]
         if let Some(executable) = &self.bridge_executable {
             executable
@@ -4008,6 +4181,7 @@ impl KhiveMcpServer {
         if let Some(plan) = self.plan_response(&p)? {
             return Ok(plan);
         }
+        parsed.map_err(dsl_err_to_mcp)?;
         let mut p = p;
         let request_id = ensure_bridge_request_id(&mut p);
         tracing::debug!(
@@ -4041,6 +4215,9 @@ impl KhiveMcpServer {
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        if parsed_contains_bridge_diagnostics(&parsed) {
+            return self.bridge_diagnostics_response(&p, &parsed);
+        }
         validate_request_overrides(&p, parsed.ops.len())?;
         #[cfg(unix)]
         let replay_read_only = !parsed.ops.is_empty()
@@ -4237,6 +4414,78 @@ impl KhiveMcpServer {
         }
         self.dispatch_request_wire(p).await
     }
+}
+
+#[cfg(unix)]
+fn bridge_diagnostics_value() -> Option<Value> {
+    crate::daemon::bridge_diagnostics_snapshot()
+        .map(|snapshot| serde_json::to_value(snapshot).expect("bridge snapshot is serializable"))
+}
+
+#[cfg(not(unix))]
+fn bridge_diagnostics_value() -> Value {
+    json!({
+        "bridge_instance_id": bridge_instance_id(),
+        "pid": std::process::id(),
+        "fallback_reasons": {
+            "config_mismatch": 0,
+            "namespace_mismatch": 0,
+            "no_socket": 0,
+            "parse_failure": 0,
+            "protocol_mismatch": 0,
+        },
+        "fallback_total": 0,
+        "strict_violations": 0,
+    })
+}
+
+fn parsed_contains_bridge_diagnostics(parsed: &ParsedRequest) -> bool {
+    parsed.ops.iter().any(|op| op.tool == "bridge.diagnostics")
+}
+
+fn bridge_diagnostics_help() -> Value {
+    let counter = json!({"type":"integer", "minimum":0});
+    json!({
+        "verb": "bridge.diagnostics",
+        "pack": "bridge-control",
+        "description": "Read this stdio bridge process image's fallback counters without daemon or store access.",
+        "category": "Read",
+        "params": [{
+            "name": "help",
+            "type": "boolean",
+            "required": false,
+            "description": "Set to true to return this local schema. No other operation argument is accepted."
+        }],
+        "input_schema": {
+            "type": "object",
+            "properties": {"help": {"const": true}},
+            "additionalProperties": false
+        },
+        "result_schema": {
+            "type": "object",
+            "required": ["bridge_instance_id", "pid", "fallback_reasons", "fallback_total", "strict_violations"],
+            "properties": {
+                "bridge_instance_id": {"type":"string", "format":"uuid", "description":"Full 36-character generation UUID; changes after an in-place re-exec."},
+                "pid": {"type":"integer", "minimum":0},
+                "fallback_reasons": {
+                    "type":"object",
+                    "required": ["config_mismatch", "namespace_mismatch", "no_socket", "parse_failure", "protocol_mismatch"],
+                    "properties": {
+                        "config_mismatch": counter,
+                        "namespace_mismatch": counter,
+                        "no_socket": counter,
+                        "parse_failure": counter,
+                        "protocol_mismatch": counter
+                    },
+                    "additionalProperties": false
+                },
+                "fallback_total": counter,
+                "strict_violations": counter
+            },
+            "additionalProperties": false
+        },
+        "identifier_resolution": khive_runtime::pack::identifier_resolution_help(),
+    })
 }
 
 /// Response-envelope `status` for a batch of `failed`/`aborted` counts
@@ -4758,6 +5007,11 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         policy: ParsedDispatchPolicy,
     ) -> Result<String, McpError> {
+        if parsed_contains_bridge_diagnostics(&parsed) {
+            return Err(invalid_request_error(
+                "bridge.diagnostics is available only on the stdio bridge".into(),
+            ));
+        }
         validate_request_overrides(&p, parsed.ops.len())?;
         let ParsedDispatchPolicy {
             strict_refusals,
@@ -14226,6 +14480,9 @@ mod request_read_cancellation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bridge_diagnostics_tests;
 
 #[cfg(test)]
 mod disposition_tests;

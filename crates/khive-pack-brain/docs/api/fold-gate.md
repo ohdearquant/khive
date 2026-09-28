@@ -72,10 +72,10 @@ before touching `brain_implicit_mass` at all — the claim and the fold commit o
 together, so a crash between them cannot leave a claimed-but-never-folded key.
 
 Reading the ledger row's `scorer_run_id` column first (as `serve_ledger::resolve` does)
-cannot provide this guarantee: two concurrent duplicate submissions both observe the
-pre-backfill NULL and both pass, since the column is only backfilled after the fold
-completes (`backfill_grade`, called from `handlers.rs` after event append) — that check is
-a useful non-atomic fast path, not a correctness mechanism.
+cannot provide this guarantee: two concurrent duplicate submissions can both observe
+the pre-backfill NULL and pass. The dedup claim remains authoritative. The grade update
+now runs in the same transaction as claim, fold, and event append; if it fails, all those
+writes roll back and the scorer can retry the same pair.
 
 ## `apply_fold_gate_and_append_event`: claim-rollback and forced-zero interaction
 
@@ -94,7 +94,7 @@ event.
 ## ADR-067 Component A: single `atomic_unit` closure, not a manually-owned transaction
 
 Both `apply_fold_gate` and `apply_fold_gate_and_append_event` hand their whole
-claim+check+fold(+append) unit to `SqlAccess::atomic_unit` as ONE closure, instead of
+claim+check+fold(+append+grade) unit to `SqlAccess::atomic_unit` as ONE closure, instead of
 opening a `writer()` handle and issuing `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` by hand. On
 the flag-on path, `atomic_unit` runs the closure inside the writer task's single request
 transaction — no separate connection competes for SQLite's write lock. On the flag-off (or

@@ -239,7 +239,9 @@ impl UploadManager {
             )));
         }
         if let Some(reference) = &expected_ref {
-            if let Some(stored_size) = store.size(reference).await? {
+            // A known-ref fast path is still a publication: restart the
+            // filesystem sweep grace period under the store's root lock.
+            if let Some(stored_size) = store.refresh_publish_grace(reference).await? {
                 return Ok(json!({"content_ref": reference.to_string(), "size": stored_size}));
             }
         }

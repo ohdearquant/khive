@@ -21,6 +21,7 @@ pub mod config_ledger;
 pub mod cost_unit;
 pub mod curation;
 pub mod daemon;
+pub mod email_message_id;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod entity_write;
@@ -53,6 +54,7 @@ pub mod phase_events;
 pub mod portability;
 pub mod preference_verification;
 pub mod presentation;
+pub mod process_retry;
 pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
@@ -109,6 +111,7 @@ pub use daemon::{
     track_named_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard,
     PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
 };
+pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
@@ -156,8 +159,8 @@ pub use operations::{
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
     hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
-    EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome, QueryResult,
-    Resolved,
+    EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome,
+    PostCommitDegradation, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -175,7 +178,9 @@ pub use presentation::{
     apply_redundancy_drop, micros_to_iso, prepare_format_value, present, present_with_policy,
     render_format, rfc3339_to_utc_micros, OutputFormat, PresentationMode, RedundancyScope,
 };
-pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
+pub use reference_resolution::{
+    resolve_reference, resolve_reference_with_entity_type, ReferenceCandidate, ReferenceResolution,
+};
 pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};

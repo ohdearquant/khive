@@ -19,6 +19,7 @@
 //! `page`/`resource` row.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -50,8 +51,43 @@ const INLINE_RAW_BODY_LIMIT: u64 = (INLINE_BODY_BUDGET / 4 * 3) as u64;
 /// Response headers echoed to the caller and recorded in the receipt: a
 /// response header set is attacker-controlled, so only this allow-listed
 /// subset is ever surfaced.
-const ALLOWED_RESPONSE_HEADERS: &[&str] =
-    &["content-type", "content-length", "last-modified", "etag"];
+const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "last-modified",
+    "etag",
+    "vary",
+    "content-language",
+];
+
+/// Preserve every Vary field line. A non-UTF-8 line becomes JSON null rather
+/// than disappearing: refresh must treat that stored selector as unreplayable.
+pub(crate) fn vary_value(headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    let values: Vec<Value> = headers
+        .get_all("vary")
+        .iter()
+        .map(|value| value.to_str().map_or(Value::Null, |text| json!(text)))
+        .collect();
+    (!values.is_empty()).then_some(Value::Array(values))
+}
+
+/// Content-Language is a list field; combine repeated valid lines in order.
+/// An invalid supplied value clears the interpretable cached language rather
+/// than silently retaining an older language from a different response.
+pub(crate) fn content_language_value(headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    let values: Vec<_> = headers.get_all("content-language").iter().collect();
+    if values.is_empty() {
+        return None;
+    }
+    let mut text = Vec::with_capacity(values.len());
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return Some(Value::Null);
+        };
+        text.push(value.trim());
+    }
+    Some(json!(text.join(", ")))
+}
 
 pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> Value {
     let mut out = serde_json::Map::new();
@@ -62,10 +98,25 @@ pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> V
             }
         }
     }
+    if let Some(vary) = vary_value(headers) {
+        out.insert("vary".to_string(), vary);
+    }
+    if let Some(language) = content_language_value(headers) {
+        out.insert("content-language".to_string(), language);
+    }
+    let links: Vec<&str> = headers
+        .get_all("link")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    if !links.is_empty() {
+        out.insert("link".to_string(), json!(links));
+    }
     Value::Object(out)
 }
 
-const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language"];
+pub(crate) const FIXED_ACCEPT_ENCODING: &str = "gzip";
+const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language", "accept-encoding"];
 
 /// Keep only representation negotiation, never credentials or conditional
 /// validators. Lists retain repeated header values in their sent order.
@@ -80,43 +131,152 @@ pub(crate) fn negotiation_headers(headers: &[(String, String)]) -> BTreeMap<Stri
     selected
 }
 
+/// Both HTTP clients enable reqwest gzip, which sends this header when the
+/// caller has not supplied one. The egress allowlist does not permit callers
+/// to set Accept-Encoding. Record that fixed client choice alongside the
+/// fields passed explicitly to `run_one_hop`.
+pub(crate) fn recorded_negotiation_headers(
+    headers: &[(String, String)],
+) -> BTreeMap<String, Vec<String>> {
+    let mut selected = negotiation_headers(headers);
+    selected.insert(
+        "accept-encoding".to_string(),
+        vec![FIXED_ACCEPT_ENCODING.to_string()],
+    );
+    selected
+}
+
 pub(crate) fn stored_negotiation_headers(
     properties: &Value,
 ) -> Result<Vec<(String, String)>, RuntimeError> {
+    let stored = properties
+        .get("request_headers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "stored request negotiation is missing or invalid".to_string(),
+            )
+        })?;
+    if stored
+        .keys()
+        .any(|name| !NEGOTIATION_HEADERS.contains(&name.as_str()))
+    {
+        return Err(RuntimeError::InvalidInput(
+            "stored request negotiation contains an unknown header".to_string(),
+        ));
+    }
     let mut headers = Vec::new();
     for name in NEGOTIATION_HEADERS {
-        if let Some(value) = properties
-            .get("request_headers")
-            .and_then(|headers| headers.get(*name))
-        {
+        if let Some(value) = stored.get(*name) {
             let values: Vec<String> = serde_json::from_value(value.clone()).map_err(|error| {
                 RuntimeError::InvalidInput(format!("stored {name} negotiation is invalid: {error}"))
             })?;
+            if values.is_empty()
+                || values.iter().any(|value| {
+                    value.trim().is_empty()
+                        || reqwest::header::HeaderValue::from_str(value).is_err()
+                })
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stored {name} negotiation has no valid header value"
+                )));
+            }
+            if *name == "accept-encoding"
+                && (values.len() != 1 || values[0] != FIXED_ACCEPT_ENCODING)
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "stored accept-encoding differs from the fixed client value".to_string(),
+                ));
+            }
             headers.extend(values.into_iter().map(|value| ((*name).to_string(), value)));
         }
     }
     Ok(headers)
 }
 
-/// Bind negotiation to the exact entity revision produced by this body settlement.
-pub(crate) async fn persist_negotiation_headers(
+/// Bind response selection and request negotiation to this GET body revision.
+pub(crate) async fn persist_get_context(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     settled: &SettledContent,
     headers: &[(String, String)],
+    response_headers: &reqwest::header::HeaderMap,
 ) -> Result<(), RuntimeError> {
-    let selected = negotiation_headers(headers);
-    let stored = match &settled.entity.properties {
-        Some(properties) => stored_negotiation_headers(properties)?,
-        None => Vec::new(),
-    };
-    if negotiation_headers(&stored) != selected {
+    persist_selection_context(
+        runtime,
+        token,
+        settled,
+        recorded_negotiation_headers(headers),
+        response_headers,
+    )
+    .await
+}
+
+/// Disk ingest has no HTTP request, so it must not claim the client's fixed
+/// Accept-Encoding was sent. It still binds the observed-empty Vary context
+/// to the newly stored body.
+pub(crate) async fn persist_disk_context(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    settled: &SettledContent,
+) -> Result<(), RuntimeError> {
+    persist_selection_context(
+        runtime,
+        token,
+        settled,
+        BTreeMap::new(),
+        &reqwest::header::HeaderMap::new(),
+    )
+    .await
+}
+
+async fn persist_selection_context(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    settled: &SettledContent,
+    selected: BTreeMap<String, Vec<String>>,
+    response_headers: &reqwest::header::HeaderMap,
+) -> Result<(), RuntimeError> {
+    let stored = settled
+        .entity
+        .properties
+        .as_ref()
+        .map(stored_negotiation_headers)
+        .transpose()
+        .ok()
+        .flatten()
+        .map(|headers| negotiation_headers(&headers));
+    let vary = vary_value(response_headers).unwrap_or_else(|| json!([]));
+    let content_language = content_language_value(response_headers).unwrap_or(Value::Null);
+    let mut patch = serde_json::Map::new();
+    if stored != Some(selected.clone()) {
+        patch.insert("request_headers".to_string(), json!(selected));
+    }
+    if settled
+        .entity
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("vary"))
+        != Some(&vary)
+    {
+        patch.insert("vary".to_string(), vary);
+    }
+    if settled
+        .entity
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("content_language"))
+        != Some(&content_language)
+    {
+        patch.insert("content_language".to_string(), content_language);
+    }
+    if !patch.is_empty() {
         runtime
             .update_entity_if_unchanged(
                 token,
                 &settled.entity,
                 EntityPatch {
-                    properties: Some(json!({"request_headers": selected})),
+                    properties: Some(Value::Object(patch)),
                     ..Default::default()
                 },
                 &[],
@@ -183,8 +343,21 @@ pub(crate) async fn run_one_hop(
         .into());
     }
     let want_body = method == reqwest::Method::GET;
-    let mut request = client.request(method, url.clone());
+    // The encoded representation is fixed for every hop, including HEAD and
+    // redirects. Supplying it explicitly also keeps the wire value stable if
+    // a future internal client builder changes its reqwest defaults.
+    let mut request = client
+        .request(method, url.clone())
+        .header(reqwest::header::ACCEPT_ENCODING, FIXED_ACCEPT_ENCODING);
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("accept-encoding") {
+            if value != FIXED_ACCEPT_ENCODING {
+                return Err(RuntimeError::InvalidInput(
+                    "request accept-encoding differs from the fixed client value".to_string(),
+                ));
+            }
+            continue;
+        }
         request = request.header(name.as_str(), value.as_str());
     }
     let hop = async {
@@ -304,7 +477,7 @@ async fn run_fetch(
                 "method_not_allowed",
                 format!("method {other:?} is refused; only GET and HEAD are permitted"),
             )
-            .into())
+            .into());
         }
     };
     let url = Url::parse(&params.url)
@@ -436,14 +609,79 @@ pub(crate) async fn run_hop_chain_with_clients<F>(
     clients: &egress::PinnedClients,
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
+    url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    headers_for_hop: F,
+) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+{
+    let (outcome, redirect_hops, ()) = run_hop_chain_with_clients_observed(
+        clients,
+        resolver,
+        cfg,
+        url,
+        method,
+        max_bytes,
+        deadline,
+        headers_for_hop,
+        |_| async { Ok(()) },
+    )
+    .await?;
+    Ok((outcome, redirect_hops))
+}
+
+/// Observe each hop immediately before sending it. The returned observation
+/// belongs to the terminal request, including when that request followed a
+/// redirect; callers can use it as an optimistic-write guard at settlement.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_hop_chain_observed<F, O, Fut, T>(
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
+    url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    headers_for_hop: F,
+    before_request: O,
+) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+    O: FnMut(Url) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
+{
+    run_hop_chain_with_clients_observed(
+        &egress::PinnedClients::default(),
+        resolver,
+        cfg,
+        url,
+        method,
+        max_bytes,
+        deadline,
+        headers_for_hop,
+        before_request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
+    clients: &egress::PinnedClients,
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
     mut url: Url,
     method: reqwest::Method,
     max_bytes: u64,
     deadline: Instant,
     mut headers_for_hop: F,
-) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+    mut before_request: O,
+) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
 where
     F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+    O: FnMut(Url) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
 {
     let mut redirects = 0u32;
     let mut redirect_hops: Vec<RedirectHop> = Vec::new();
@@ -458,6 +696,7 @@ where
             .to_string();
         let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
         let client = clients.for_checked_address(&url, addr)?;
+        let request_observation = before_request(url.clone()).await?;
 
         let outcome = run_one_hop(
             &client,
@@ -481,7 +720,7 @@ where
                 url = next.clone();
                 continue;
             }
-            None => return Ok((outcome, redirect_hops)),
+            None => return Ok((outcome, redirect_hops, request_observation)),
         }
     }
 }
@@ -611,6 +850,42 @@ pub(crate) async fn root_body(
         .map_err(|error| RuntimeError::Internal(format!("body attachment write failed: {error}")))
 }
 
+/// An entity's `content_ref` is projected from the graph backend's local
+/// attachment table. The body root may instead live on canonical main, so a
+/// snapshot returned before `root_body` cannot be forged into the one that a
+/// guarded metadata update will read. Keep the graph row's own revision and
+/// body reference stable, then use its actual projection for that guard.
+pub(crate) async fn entity_after_body_root(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    patched: &khive_storage::Entity,
+    content_ref: &str,
+) -> Result<khive_storage::Entity, RuntimeError> {
+    let conflict = || {
+        RuntimeError::Khive(khive_types::KhiveError::conflict(
+            "web body row changed while its content attachment was rooted",
+        ))
+    };
+    let current = runtime
+        .entities(token)?
+        .get_entity(patched.id)
+        .await?
+        .ok_or_else(conflict)?;
+    if current.namespace != patched.namespace
+        || current.deleted_at.is_some()
+        || current.version != patched.version
+        || current
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("blob_ref"))
+            .and_then(Value::as_str)
+            != Some(content_ref)
+    {
+        return Err(conflict());
+    }
+    Ok(current)
+}
+
 /// Mint (if absent), blob-store the body, and patch one page/resource
 /// entity's full row: identity resolve, `site contains {page|resource}`
 /// link (arm29: minted before the blob put, so a failing store still leaves
@@ -626,16 +901,7 @@ pub(crate) struct SettledContent {
     pub content_ref: Option<String>,
     pub bytes: u64,
     pub truncated: bool,
-    entity: Entity,
-}
-
-pub(crate) enum ContentBody {
-    Received(Vec<u8>, bool),
-    Stored {
-        content_ref: ContentRef,
-        bytes: u64,
-        truncated: bool,
-    },
+    pub(crate) entity: Entity,
 }
 
 pub(crate) fn representation_patch(
@@ -657,6 +923,10 @@ pub(crate) fn representation_patch(
         "fetched_at": chrono::Utc::now().to_rfc3339(),
         "etag": etag,
         "last_modified": last_modified,
+        // Unknown until a GET's exact response Vary is bound to this body.
+        // A stale or failed metadata patch cannot make validators replayable.
+        "vary": [null],
+        "content_language": null,
     })
 }
 
@@ -670,30 +940,6 @@ pub(crate) async fn settle_content(
     etag: Option<&str>,
     last_modified: Option<&str>,
     body: Option<(Vec<u8>, bool)>,
-) -> Result<SettledContent, RuntimeError> {
-    settle_content_body(
-        runtime,
-        token,
-        url,
-        content_type,
-        status,
-        etag,
-        last_modified,
-        body.map(|(bytes, truncated)| ContentBody::Received(bytes, truncated)),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn settle_content_body(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    url: &Url,
-    content_type: Option<&str>,
-    status: u16,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
-    body: Option<ContentBody>,
 ) -> Result<SettledContent, RuntimeError> {
     let request_url = identity::request_url(url.clone());
     let canonical = identity::canonicalize(request_url.clone());
@@ -739,17 +985,12 @@ pub(crate) async fn settle_content_body(
     let no_body = body.is_none();
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
-        Some(ContentBody::Received(buffer, truncated)) => {
+        Some((buffer, truncated)) => {
             let store = crate::blob_store(runtime)?;
             let len = buffer.len() as u64;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             (Some(content_ref), len, truncated)
         }
-        Some(ContentBody::Stored {
-            content_ref,
-            bytes,
-            truncated,
-        }) => (Some(content_ref), bytes, truncated),
     };
     let content_ref = typed_ref.as_ref().map(ToString::to_string);
 
@@ -780,11 +1021,7 @@ pub(crate) async fn settle_content_body(
             bytes,
         )
         .await?;
-        // `content_ref` is a read-only projection of the content attachment.
-        // The entity returned by `patch` predates that attachment write, so
-        // bring its snapshot up to the settled body before the guarded
-        // negotiation patch compares it with the stored row.
-        entity.content_ref = content_ref.clone();
+        entity = entity_after_body_root(runtime, token, &entity, typed_ref.as_str()).await?;
     }
 
     Ok(SettledContent {
@@ -871,7 +1108,7 @@ pub(crate) async fn settle_with_request_headers(
         .await?;
         // HEAD cannot replace the request context of a cached GET body.
         if method_name == "GET" {
-            persist_negotiation_headers(runtime, token, &settled, request_headers).await?;
+            persist_get_context(runtime, token, &settled, request_headers, headers).await?;
         }
         if !entities_touched.contains(&settled.id) {
             entities_touched.push(settled.id);
@@ -907,7 +1144,7 @@ pub(crate) async fn settle_with_request_headers(
         "final_url": final_url.to_string(),
         "status": status,
         "headers": response_headers_json,
-        "request_headers": negotiation_headers(request_headers),
+        "request_headers": recorded_negotiation_headers(request_headers),
         "bytes": bytes,
         "truncated": truncated,
         "content_ref": content_ref,
@@ -920,6 +1157,9 @@ pub(crate) async fn settle_with_request_headers(
         // untouched. A HEAD has no bytes from which to infer either field.
         request_record["content_digest"] = json!(content_digest);
         request_record["size"] = json!(bytes);
+        if content_ref.is_some() {
+            request_record["body_entity_id"] = json!(final_entity_id);
+        }
     }
     let receipt_id = write_receipt(
         runtime,
@@ -935,6 +1175,9 @@ pub(crate) async fn settle_with_request_headers(
             content_ref
         ))
     })?;
+    if let (Some(id), Some(reference)) = (final_entity_id, content_ref.as_deref()) {
+        crate::receipt::bind_capture_receipt(runtime, token, id, reference, receipt_id).await?;
+    }
     Ok(json!({
         "final_url": final_url.to_string(),
         "status": status,
@@ -1026,6 +1269,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebCredentialConfig;
+
     use khive_runtime::{Namespace, VerbRegistryBuilder};
     use khive_storage::{
         BlobStore, ContentRef, Direction, EntityFilter, PageRequest, StorageError, StorageResult,
@@ -1035,6 +1279,20 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn allowed_headers_keep_every_link_field_for_later_extraction() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("link", "</next>; rel=next".parse().unwrap());
+        headers.append("link", "</license>; rel=license".parse().unwrap());
+        headers.insert("x-private", "discard".parse().unwrap());
+        let kept = extract_allowed_headers(&headers);
+        assert_eq!(
+            kept["link"],
+            json!(["</next>; rel=next", "</license>; rel=license"])
+        );
+        assert!(kept.get("x-private").is_none());
+    }
 
     /// The in-crate test runtime carries no `VerbRegistry`, so the web
     /// pack's own `EDGE_RULES` (`site contains page|resource`) are never
@@ -2395,6 +2653,69 @@ mod tests {
             text.contains("accept: application/vnd.khive+json"),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_and_pinned_clients_send_fixed_accept_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let captured = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).await.expect("read request");
+                    assert!(count > 0 && bytes.len() < 16_384);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(String::from_utf8(bytes).expect("ASCII request headers"));
+                stream
+                    .write_all(&http_response(200, "OK", &[], b""))
+                    .await
+                    .expect("respond");
+                stream.shutdown().await.expect("shutdown");
+            }
+            requests
+        });
+        let plain = plain_client(Duration::from_secs(5));
+        let pinned = egress::pinned_client(
+            "encoding.example",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        )
+        .expect("pinned client builds");
+        for (client, url, method) in [
+            (&plain, local_url(port, "/plain"), reqwest::Method::GET),
+            (
+                &pinned,
+                Url::parse(&format!("http://encoding.example:{port}/pinned-get")).unwrap(),
+                reqwest::Method::GET,
+            ),
+            (
+                &pinned,
+                Url::parse(&format!("http://encoding.example:{port}/pinned-head")).unwrap(),
+                reqwest::Method::HEAD,
+            ),
+        ] {
+            client
+                .request(method, url)
+                .send()
+                .await
+                .expect("built client sends request");
+        }
+        for request in captured.await.expect("captured requests") {
+            assert_eq!(
+                request
+                    .lines()
+                    .filter(|line| line.to_ascii_lowercase().starts_with("accept-encoding:"))
+                    .map(|line| line.split_once(':').unwrap().1.trim())
+                    .collect::<Vec<_>>(),
+                vec!["gzip"],
+                "the built client must send one fixed encoding: {request}"
+            );
+        }
     }
 
     // The redirect hop cap refuses once already at the cap (the

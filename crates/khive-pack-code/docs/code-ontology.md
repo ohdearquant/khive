@@ -70,8 +70,14 @@ Before Rust L2 parsing, the scanner refuses non-regular files, source files over
 that exceed its conservative syntax-complexity limits. Each refusal increments
 `symbol_parse_failures`, records a warning, and leaves no current declaration ownership stamp;
 other files in the sweep continue. A size refusal uses a `refused:` module fingerprint rather than
-claiming a full-content hash for bytes it did not read. The L1 and L1.5 tiers keep their existing
-input behavior.
+claiming a full-content hash for bytes it did not read. L1 manifests and L1.5 sources share
+the 2 MiB input ceiling. The reader verifies the opened regular file remains inside the canonical
+ingest root, checks its length, and reads at most the ceiling plus one byte on that same descriptor.
+An oversized manifest increments `manifest_files_refused`; an oversized L1.5 source increments
+`source_files_refused`. Each refusal names the path and ceiling in `warnings`, and healthy siblings
+continue. Recursive walks, manifest parsing, source reads, and import extraction run on blocking
+workers; graph and FTS writes stay on the async ingest path. A parsed manifest index supplies
+source ownership for the sweep, so files in one package do not reopen the same manifest.
 
 `import_scan_status` distinguishes `scanned`, `partially_resolved`, and `unscanned` modules, with
 `import_specifier_count` and `unresolved_import_count` recording the completed scan's coverage.
@@ -103,9 +109,11 @@ pre-created empty dedicated file may initialize and migrate. Omitting `db` still
 an inode or prevent concurrent unlink/replacement between the check and SQLite open. Both explicit
 and default targets are checked against every production database this process knows: the default
 anchor, its runtime database, every declared backend, each adjacent events database, and their
-SQLite companions. Existing files are compared by file identity to catch hard links; missing
-members use normalized paths. An unrelated database unknown to this process is outside this
-preflight fence.
+SQLite companions. A declared backend reached through a symlink protects companions beside both
+the declared name and its physical database. Target symlinks are checked at their destination,
+including a dangling default-map link. Existing files are compared by file identity to catch hard
+links; missing members use normalized paths. An unrelated database unknown to this process is
+outside this preflight fence.
 
 The dedicated map is an ordinary khive database, not a private code-pack format. Every
 non-blocked entity upsert also updates its FTS document, and `code.ingest` reports the completed

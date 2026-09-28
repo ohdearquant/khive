@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, NotePatch, RequestIdentity,
-    RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
+    AllowAllGate, BackendId, EmailMessageIdDomains, KhiveRuntime, Namespace, NamespaceToken,
+    NotePatch, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_storage::Note;
-use khive_types::Pack;
+use khive_types::{Pack, Visibility};
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
@@ -43,6 +43,24 @@ fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
     builder.with_default_namespace(ns);
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
+}
+
+fn build_registry_for_ns_with_email(ns: &str) -> (VerbRegistry, KhiveRuntime) {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    let domains =
+        EmailMessageIdDomains::from_mailbox_and_history("mailbox@khive.ai", "former.khive.ai")
+            .unwrap();
+    builder.register(
+        CommPack::new_with_channel_ingest_capability(
+            runtime.clone(),
+            khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+        )
+        .with_email_message_id_domains(domains),
+    );
+    builder.with_default_namespace(ns);
+    (builder.build().expect("registry builds"), runtime)
 }
 
 #[test]
@@ -107,12 +125,12 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_fourteen_handlers() {
+fn comm_pack_declares_fifteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        14,
-        "comm pack must declare 14 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
-         thread, ingest, heartbeat, health, probe, cursor_get, cursor_commit \
+        15,
+        "comm pack must declare 15 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
+         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
@@ -139,6 +157,16 @@ fn comm_pack_declares_fourteen_handlers() {
     assert!(
         names.contains(&"comm.ingest"),
         "comm.ingest verb must be registered"
+    );
+    assert!(names.contains(&"comm.cleanup_expired_quarantine"));
+    let cleanup = CommPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "comm.cleanup_expired_quarantine")
+        .unwrap();
+    assert_eq!(cleanup.visibility, Visibility::Subhandler);
+    assert!(
+        !cleanup.params.iter().any(|param| param.name == "namespace"),
+        "namespace is a registry routing key, not a cleanup handler parameter"
     );
     assert!(
         names.contains(&"comm.heartbeat"),
@@ -5028,7 +5056,11 @@ fn build_identity_registry(
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    builder.register(CommPack::new(rt.clone()));
+    builder.register(CommPack::new_with_email_message_id_domains(
+        rt.clone(),
+        EmailMessageIdDomains::from_mailbox_and_history("mailbox@khive.ai", "former.khive.ai")
+            .unwrap(),
+    ));
     builder.with_actor_id(actor_id.map(str::to_string));
     let registry = builder.build().expect("actor registry builds");
     (registry, rt)
@@ -5653,6 +5685,79 @@ async fn imap_account_keys_keep_accounts_distinct_and_recognize_same_account_leg
         .expect("old row retained");
     assert_eq!(old_note.content, "old account A body");
     assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
+}
+
+#[tokio::test]
+async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
+    use khive_storage::BlobStore as _;
+
+    let (registry, runtime) = build_registry_for_ns("local");
+    let blob_root = tempfile::tempdir().expect("blob root");
+    let blob_store = Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+            .expect("blob store"),
+    );
+    let original_ref = blob_store
+        .put(b"quarantined original".to_vec())
+        .await
+        .expect("publish original");
+    runtime
+        .install_blob_store(blob_store)
+        .expect("install blob store");
+    let old_id = "imap:mail.example.com:17:quarantine";
+    let new_id = "imap:mail.example.com:a@example.com:17:quarantine";
+    let original = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "quarantined message", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": old_id,
+                "metadata": {
+                    "quarantined": true,
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("seed old-key quarantine");
+    let note_id = original["full_id"]
+        .as_str()
+        .expect("note id")
+        .parse()
+        .expect("canonical UUID");
+    let attachments = runtime.core().attachments().expect("attachment store");
+    assert!(attachments
+        .delete_attachment(note_id, "quarantine-original")
+        .await
+        .expect("leave metadata-only legacy row"));
+
+    let error = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "quarantined replay", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": true,
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect_err("a legacy-key ack must not bypass quarantine ownership repair");
+    assert!(matches!(
+        error,
+        khive_runtime::RuntimeError::InvalidInput(message)
+            if message.contains("legacy_external_id cannot be combined with quarantine metadata")
+    ));
+    assert!(attachments
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .is_none());
 }
 
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
@@ -6504,9 +6609,10 @@ async fn list_thread_prefix_collision_across_visible_namespaces_is_ambiguous() {
 /// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive → ingested note to_actor=lambda:khive.
 #[tokio::test]
 async fn ingest_routing_reply_routes_to_original_sender() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_registry_for_ns_with_email("local");
 
-    let outbound_external_id = "<sent-msg-001@khive.ai>";
+    let outbound_id = uuid::Uuid::new_v4();
+    let outbound_external_id = format!("<{outbound_id}@khive.ai>");
     {
         use khive_storage::note::Note;
         let token = rt
@@ -6518,7 +6624,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         let note = Note {
             version: 1,
             key: None,
-            id: uuid::Uuid::new_v4(),
+            id: outbound_id,
             namespace: "local".into(),
             kind: "message".into(),
             status: "active".into(),
@@ -6533,7 +6639,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
-                "external_id": outbound_external_id,
+                "external_id": outbound_external_id.clone(),
                 "thread_id": thread_uuid.as_hyphenated().to_string(),
                 "sent_at": chrono::Utc::now().to_rfc3339(),
             })),
@@ -6568,10 +6674,11 @@ async fn ingest_routing_reply_routes_to_original_sender() {
 /// (a2) Regression: outbound stores its Message-ID in wire form `<id@domain>`, but an inbound `In-Reply-To` is delivered bracket-free (`id@domain`) because `mail_parser` strips the angle brackets.
 #[tokio::test]
 async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_registry_for_ns_with_email("local");
 
-    let outbound_external_id = "<sent-msg-002@khive.ai>";
-    let inbound_correlation = "sent-msg-002@khive.ai";
+    let outbound_id = uuid::Uuid::new_v4();
+    let outbound_external_id = format!("<{outbound_id}@khive.ai>");
+    let inbound_correlation = format!("{outbound_id}@khive.ai");
     let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
     {
         use khive_storage::note::Note;
@@ -6583,7 +6690,7 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
         let note = Note {
             version: 1,
             key: None,
-            id: uuid::Uuid::new_v4(),
+            id: outbound_id,
             namespace: "local".into(),
             kind: "message".into(),
             status: "active".into(),
@@ -6598,7 +6705,7 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
-                "external_id": outbound_external_id,
+                "external_id": outbound_external_id.clone(),
                 "thread_id": thread_uuid,
                 "sent_at": chrono::Utc::now().to_rfc3339(),
             })),
@@ -6636,6 +6743,71 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
         "correlated reply must attach to the original thread, not a fresh root; \
          got props={props}"
     );
+}
+
+#[tokio::test]
+async fn ingest_message_id_correlation_skips_copier_and_routes_to_victim() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let root = uuid::Uuid::new_v4().to_string();
+    let victim = uuid::Uuid::new_v4();
+    let message_id = format!("<{victim}@khive.ai>");
+    let copied_spelling = format!("{victim}@khive.ai");
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let store = rt.notes(&token).unwrap();
+    let mut original = Note::new("local", "message", "victim outbound");
+    original.id = victim;
+    original.properties = Some(serde_json::json!({
+        "direction": "outbound", "to_actor": "email:user@example.com",
+        "from_actor": "lambda:victim", "thread_id": root.clone(),
+        "external_id": message_id.clone(),
+    }));
+    store.upsert_note(original).await.unwrap();
+    let mut copier = Note::new("local", "message", "copied ID");
+    copier.properties = Some(serde_json::json!({
+        "direction": "outbound", "to_actor": "email:user@example.com",
+        "from_actor": "lambda:copier", "thread_id": uuid::Uuid::new_v4().to_string(),
+        "external_id": copied_spelling.clone(),
+    }));
+    // The unique index permits different spellings in one namespace. The
+    // bracket-free correlation probes the copied spelling first, then finds
+    // the original row's bracketed ID after rejecting the copier.
+    store.upsert_note(copier).await.unwrap();
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com", "to": "email:mailbox@khive.ai",
+            "content": "reply", "correlation_external_id": copied_spelling,
+            "external_id": "imap:victim-correlation:1", "default_inbound_actor": "lambda:default",
+            "namespace": "local",
+        }),
+    )
+    .await;
+    assert_eq!(props["to_actor"], "lambda:victim");
+    assert_eq!(props["thread_id"], root);
+}
+
+#[tokio::test]
+async fn ingest_message_id_correlation_does_not_adopt_unverified_only_row() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let absent_victim = uuid::Uuid::new_v4();
+    let message_id = format!("<{absent_victim}@khive.ai>");
+    let mut copier = Note::new("local", "message", "copied ID");
+    copier.properties = Some(serde_json::json!({
+        "direction": "outbound", "to_actor": "email:user@example.com",
+        "from_actor": "lambda:copier", "thread_id": uuid::Uuid::new_v4().to_string(),
+        "external_id": message_id.clone(),
+    }));
+    let token = rt.authorize(Namespace::local()).unwrap();
+    rt.notes(&token).unwrap().upsert_note(copier).await.unwrap();
+    let props = ingest_and_get_props(&registry, &rt, serde_json::json!({
+        "from": "email:user@example.com", "to": "email:mailbox@khive.ai",
+        "content": "reply", "correlation_external_id": message_id,
+        "external_id": "imap:unverified-correlation:1", "default_inbound_actor": "lambda:default",
+        "namespace": "local",
+    })).await;
+    assert_eq!(props["to_actor"], "lambda:default");
 }
 
 /// (b) Fresh message, no correlation, default_inbound_actor=lambda:leo → to_actor=lambda:leo.
@@ -6991,21 +7163,169 @@ async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
             "to": "local",
             "from_actor": "lambda:khive",
             "to_actor": "email:sender@example.com",
-            "external_id": "<outbound-msg-001@khive.ai>",
             "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
             "sent_at": chrono::Utc::now().to_rfc3339(),
         }),
     )
     .await;
 
+    let external_id = format!("<{parent_id}@khive.ai>");
+    let token = rt.authorize(Namespace::local()).unwrap();
+    rt.claim_outbound_message_external_id(&token, parent_id, external_id.clone())
+        .await
+        .expect("owner claim succeeds");
+
     let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
 
     assert_eq!(
         props["in_reply_to_message_id"].as_str(),
-        Some("<outbound-msg-001@khive.ai>"),
+        Some(external_id.as_str()),
         "reply to an outbound-minted parent must reuse its bracketed external_id \
          verbatim; got props={props}"
     );
+}
+
+#[tokio::test]
+async fn reply_refuses_copied_parent_message_id_before_creating_reply() {
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:copier");
+    let victim = uuid::Uuid::new_v4();
+    let parent = plant_message_note(
+        &rt,
+        "copied parent",
+        serde_json::json!({
+            "direction": "outbound", "from_actor": "lambda:copier",
+            "to_actor": "email:user@example.com",
+            "external_id": format!("<{victim}@khive.ai>"),
+            "thread_id": uuid::Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let before = rt
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .unwrap()
+        .len();
+    let error = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({
+                "id": parent.to_string(), "content": "must not use copied parent"
+            }),
+        )
+        .await
+        .expect_err("copied parent must be refused");
+    let wire =
+        khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::NotCommitted);
+    assert_eq!(wire["code"], "external_id_unverifiable");
+    let after = rt
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(after, before, "no reply may be created before the refusal");
+}
+
+#[tokio::test]
+async fn reply_refuses_legacy_email_parent_without_to_actor_when_id_is_unverifiable() {
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:sender");
+    // An older outbound row can be recognized by its email recipient even
+    // without transport-owned channel provenance or a to_actor field.
+    let parent = plant_message_note(
+        &rt,
+        "legacy email parent",
+        serde_json::json!({
+            "direction": "outbound", "from_actor": "lambda:sender",
+            "to": "email:user@example.com",
+            "external_id": format!("<{}@khive.ai>", uuid::Uuid::new_v4()),
+        }),
+    )
+    .await;
+    let error = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({
+                "id": parent.to_string(), "content": "must not emit legacy copied ID"
+            }),
+        )
+        .await
+        .expect_err("legacy outbound email parent must be checked");
+    let wire =
+        khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::NotCommitted);
+    assert_eq!(wire["code"], "external_id_unverifiable");
+}
+
+#[tokio::test]
+async fn trusted_ingest_establishes_email_channel_provenance() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "trusted inbound provenance",
+            "external_id": format!("imap:provenance:{}", uuid::Uuid::new_v4()),
+            "default_inbound_actor": "lambda:receiver",
+            "channel_kind": "email",
+            "channel_slug": "mailbox@khive.ai",
+            "namespace": "local",
+        }),
+    )
+    .await;
+    assert_eq!(props["direction"], "inbound");
+    assert_eq!(props["channel_kind"], "email");
+    assert_eq!(props["channel_slug"], "mailbox@khive.ai");
+    assert_eq!(props["to_actor"], "lambda:receiver");
+}
+
+#[tokio::test]
+async fn reply_refuses_unverifiable_outbound_parent_even_without_channel_metadata() {
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:sender");
+    let parent = plant_message_note(
+        &rt,
+        "metadata-free outbound parent",
+        serde_json::json!({
+            "direction": "outbound", "from_actor": "lambda:sender",
+            "external_id": "malformed-parent-id",
+        }),
+    )
+    .await;
+    let error = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({
+                "id": parent.to_string(), "content": "must not emit malformed ID"
+            }),
+        )
+        .await
+        .expect_err("outbound header source must be checked even without channel metadata");
+    let wire =
+        khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::NotCommitted);
+    assert_eq!(wire["code"], "external_id_unverifiable");
+}
+
+#[tokio::test]
+async fn reply_accepts_configured_historical_own_message_id() {
+    let (registry, rt) = build_actor_registry(shared_backend(), "lambda:sender");
+    let parent = plant_message_note(
+        &rt,
+        "historical parent",
+        serde_json::json!({
+            "direction": "outbound", "from_actor": "lambda:sender",
+            "to_actor": "email:user@example.com",
+            "thread_id": uuid::Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let historical_id = format!("<{parent}@former.khive.ai>");
+    let token = rt.authorize(Namespace::local()).unwrap();
+    rt.claim_outbound_message_external_id(&token, parent, historical_id.clone())
+        .await
+        .unwrap();
+    let props = reply_and_get_outbound_props(&registry, &rt, parent, "reply").await;
+    assert_eq!(props["in_reply_to_message_id"], historical_id);
+    assert_eq!(props["references_chain"], historical_id);
 }
 
 /// (c) Reply to a parent with no known wire Message-ID (e.g. a khive-internal message never routed through email): no In-Reply-To/References must be fabricated, and the reply still succeeds exactly as before this feature.
@@ -7238,7 +7558,6 @@ async fn reply_extends_references_chain_for_outbound_parent() {
             "to": "local",
             "from_actor": "lambda:khive",
             "to_actor": "email:sender@example.com",
-            "external_id": "<outbound-msg-002@khive.ai>",
             // Realistic stored shape: an outbound row's own `references_chain` is
             // ancestors-only (exactly what `build_references_header` computes for
             // it when it was sent) and never contains that same row's own
@@ -7251,17 +7570,23 @@ async fn reply_extends_references_chain_for_outbound_parent() {
     )
     .await;
 
+    let external_id = format!("<{parent_id}@khive.ai>");
+    let token = rt.authorize(Namespace::local()).unwrap();
+    rt.claim_outbound_message_external_id(&token, parent_id, external_id.clone())
+        .await
+        .unwrap();
+
     let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
 
     assert_eq!(
         props["in_reply_to_message_id"].as_str(),
-        Some("<outbound-msg-002@khive.ai>"),
+        Some(external_id.as_str()),
         "In-Reply-To must be exactly the outbound parent's self-minted external_id; \
          got props={props}"
     );
     assert_eq!(
         props["references_chain"].as_str(),
-        Some("<root1@example.com> <outbound-msg-002@khive.ai>"),
+        Some(format!("<root1@example.com> {external_id}").as_str()),
         "reply-to-outbound must extend the outbound parent's own references_chain \
          (read direction-aware, not wire_references) followed by its Message-ID; \
          got props={props}"
@@ -7315,23 +7640,43 @@ async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
             "to": "local",
             "from_actor": "lambda:khive",
             "to_actor": "email:sender@example.com",
-            "external_id": "<dup-msg@khive.ai>",
-            "references_chain": "<root1@example.com> <dup-msg@khive.ai> <root2@example.com>",
+            "references_chain": "<root1@example.com> <root2@example.com>",
             "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
             "sent_at": chrono::Utc::now().to_rfc3339(),
         }),
     )
     .await;
 
+    let external_id = format!("<{parent_id}@khive.ai>");
+    let token = rt.authorize(Namespace::local()).unwrap();
+    rt.claim_outbound_message_external_id(&token, parent_id, external_id.clone())
+        .await
+        .unwrap();
+    let mut planted = rt
+        .notes(&token)
+        .unwrap()
+        .get_note(parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    planted.properties.as_mut().unwrap()["references_chain"] = serde_json::json!(format!(
+        "<root1@example.com> {external_id} <root2@example.com>"
+    ));
+    rt.notes(&token)
+        .unwrap()
+        .upsert_note(planted)
+        .await
+        .unwrap();
+
     let props = reply_and_get_outbound_props(&registry, &rt, parent_id, "reply body").await;
 
     assert_eq!(
         props["in_reply_to_message_id"].as_str(),
-        Some("<dup-msg@khive.ai>")
+        Some(external_id.as_str())
     );
     assert_eq!(
         props["references_chain"].as_str(),
-        Some("<root1@example.com> <dup-msg@khive.ai> <root2@example.com>"),
+        Some(format!("<root1@example.com> {external_id} <root2@example.com>").as_str()),
         "a tainted chain already containing the parent's own id must be \
          deduplicated (not doubled at the end) and keep first-seen order; \
          got props={props}"
@@ -7706,10 +8051,10 @@ async fn ingest_rejects_malformed_sent_at_without_writing_note() {
 /// A reply correlated to an outbound message that has no `thread_id` property (e.g. a legacy/imported row) must reuse the outbound note's own UUID as the canonical root and route to the original `from_actor`, instead of being treated as unmatched and split into a fresh thread routed to the default inbound actor.
 #[tokio::test]
 async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_registry_for_ns_with_email("local");
 
-    let outbound_external_id = "<legacy@khive.ai>";
     let outbound_id = uuid::Uuid::new_v4();
+    let outbound_external_id = format!("<{outbound_id}@khive.ai>");
     {
         use khive_storage::note::Note;
         let token = rt
@@ -7735,7 +8080,7 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
-                "external_id": outbound_external_id,
+                "external_id": outbound_external_id.clone(),
                 "sent_at": chrono::Utc::now().to_rfc3339(),
             })),
             created_at: now,
@@ -7795,13 +8140,13 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
 /// Correlation against a legacy outbound row may recover a UUID stored in a compact spelling.
 #[tokio::test]
 async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup() {
-    let (registry, rt) = build_registry_for_ns("local");
+    let (registry, rt) = build_registry_for_ns_with_email("local");
     let root_id =
         uuid::Uuid::parse_str("12345678-1234-4abc-8def-1234567890ab").expect("fixed root UUID");
     let legacy_child_id =
         uuid::Uuid::parse_str("87654321-4321-4cba-8fed-ba0987654321").expect("fixed child UUID");
     let canonical_thread_id = root_id.as_hyphenated().to_string();
-    let external_id = "<legacy-compact-root@khive.ai>";
+    let external_id = format!("<{root_id}@khive.ai>");
 
     {
         use khive_storage::note::Note;
@@ -7829,7 +8174,7 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
                     "to": "email:user@example.com",
                     "from_actor": "local",
                     "to_actor": "email:user@example.com",
-                    "external_id": external_id,
+                    "external_id": external_id.clone(),
                     "thread_id": root_id.simple().to_string(),
                     "sent_at": "2026-07-31T12:00:00Z",
                 })),

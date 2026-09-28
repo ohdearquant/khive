@@ -26,7 +26,7 @@
 //! records only the information needed to recompute its target's id later,
 //! and the synchronous re-resolve pass (`reresolve_pass`) does exactly that.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -45,9 +45,10 @@ use crate::extractor::{DeclKind, ExtractedDeclaration, ExtractedFile};
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+use crate::safe_source::{self, SourceReadError};
 
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
-const RUST_L2_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const RUST_L2_MAX_SOURCE_BYTES: usize = safe_source::MAX_INGEST_FILE_BYTES as usize;
 const RUST_L2_MAX_DELIMITER_DEPTH: usize = 64;
 const RUST_L2_MAX_ANGLE_DEPTH: usize = 64;
 const RUST_L2_MAX_SEGMENT_TOKENS: usize = 2048;
@@ -170,6 +171,13 @@ pub struct CodeSourceIngestReport {
     /// could be derived — counted instead of silently skipping them.
     #[serde(default)]
     pub files_skipped_without_module_path: u64,
+    /// L1.5 source reads refused because the candidate disappeared, was not
+    /// regular, escaped the ingest root, or exceeded the 2 MiB ceiling.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub source_files_refused: u64,
+    /// Manifest reads refused for the same file, containment, and size checks.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub manifest_files_refused: u64,
     /// Entity documents successfully written to the map database's FTS index.
     /// A successful ingest indexes every non-blocked entity upsert, so generic
     /// KG `search` and query-anchored `context` can read the resulting map.
@@ -193,6 +201,10 @@ pub struct CodeSourceIngestReport {
     pub source_revision: String,
 }
 
+fn count_is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodeSourceIngestError {
     #[error("path {0:?} does not exist or is not a directory")]
@@ -201,6 +213,52 @@ pub enum CodeSourceIngestError {
     Runtime(#[from] RuntimeError),
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+fn record_manifest_failures(
+    report: &mut CodeSourceIngestReport,
+    failures: Vec<manifest::ManifestReadFailure>,
+) {
+    for failure in failures {
+        let refused = matches!(&failure.error, SourceReadError::Refused(_));
+        let warning = if refused {
+            format!(
+                "refused manifest {}: {}",
+                failure.path.display(),
+                failure.error
+            )
+        } else {
+            format!(
+                "reading manifest {}: {}",
+                failure.path.display(),
+                failure.error
+            )
+        };
+        if !report.warnings.contains(&warning) {
+            if refused {
+                report.manifest_files_refused += 1;
+            }
+            report.warnings.push(warning);
+        }
+    }
+}
+
+fn record_source_read_failure(
+    report: &mut CodeSourceIngestReport,
+    tier: &str,
+    path: &Path,
+    error: SourceReadError,
+) {
+    if matches!(&error, SourceReadError::Refused(_)) {
+        report.source_files_refused += 1;
+        report
+            .warnings
+            .push(format!("{tier} refused source {}: {error}", path.display()));
+    } else {
+        report
+            .warnings
+            .push(format!("reading {}: {error}", path.display()));
+    }
 }
 
 pub struct CodeSourceIngestOptions<'a> {
@@ -214,6 +272,16 @@ pub struct CodeSourceIngestOptions<'a> {
     /// L2 symbol/call-edge persistence tier (this module). Wire default
     /// `false` — opt-in only.
     pub enable_l2: bool,
+}
+
+async fn blocking_io<T, F>(work: F) -> Result<T, CodeSourceIngestError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        CodeSourceIngestError::Storage(format!("code ingest worker failed: {error}"))
+    })
 }
 
 fn record_observed_language(report: &mut CodeSourceIngestReport, language: &str) {
@@ -243,11 +311,12 @@ struct ModuleScan {
 type ManifestScopeIndex = BTreeMap<(String, String, String), BTreeSet<String>>;
 
 async fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
-    let fallback_root = ingest_root
-        .canonicalize()
-        .unwrap_or_else(|_| ingest_root.to_path_buf());
+    let fallback_ingest_root = ingest_root.to_path_buf();
     let ingest_root = ingest_root.to_path_buf();
     let git_result = tokio::task::spawn_blocking(move || {
+        let fallback_root = ingest_root
+            .canonicalize()
+            .unwrap_or_else(|_| ingest_root.clone());
         let git_output = |args: &[&str]| {
             Command::new("git")
                 .arg("-C")
@@ -269,12 +338,13 @@ async fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
             .map(PathBuf::from);
         let revision =
             git_output(&["rev-parse", "--verify", "HEAD"]).filter(|revision| !revision.is_empty());
-        (root, revision)
+        (root, revision, fallback_root)
     })
     .await
     .ok();
 
-    let (git_root, git_revision) = git_result.unwrap_or((None, None));
+    let (git_root, git_revision, fallback_root) =
+        git_result.unwrap_or((None, None, fallback_ingest_root));
     let git_metadata_available = git_root.is_some() && git_revision.is_some();
     SourceSnapshot {
         root: git_root.unwrap_or(fallback_root),
@@ -440,7 +510,7 @@ fn edge_uuid(relation: EdgeRelation, source_id: Uuid, target_id: Uuid) -> Uuid {
 /// A `uuid5`-recomputable unresolved reference recorded on a source entity
 /// (B6). Content-hash-free by design: only the fields needed to recompute
 /// the target's identity and the edge's metadata are kept.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct UnresolvedSpec {
     specifier: String,
     target_kind: String,
@@ -449,6 +519,13 @@ struct UnresolvedSpec {
     dependency_scope: String,
     language: String,
 }
+
+struct PendingUnresolved {
+    spec: UnresolvedSpec,
+    file: String,
+}
+
+type PendingUnresolvedByOwner = BTreeMap<Uuid, Vec<PendingUnresolved>>;
 
 fn read_unresolved(properties: &Value) -> Vec<UnresolvedSpec> {
     let mut specs: Vec<UnresolvedSpec> = properties
@@ -1158,34 +1235,108 @@ async fn upsert_module(
     Ok(Some(id))
 }
 
-/// Append `spec` to `entity_id`'s `unresolved_specifiers` (deduped), without
-/// disturbing any other property already stamped this sweep (project/module
-/// upsert already ran first, so this always reads back the row this pass
-/// just wrote).
+/// Append one sweep's unresolved specs to an owner in encounter order with a
+/// single guarded entity/FTS write. Project/module upserts have already run,
+/// and the fresh-read rebase preserves their other properties.
 ///
-/// When the gate refuses the updated properties (e.g. `spec.specifier` is
-/// itself secret-shaped), the refusal is recorded in `report.blocked` keyed
-/// by `file` and the specifier is simply not recorded this sweep — the
-/// entity itself is untouched, since the guarded mutation blocks before writing.
-async fn record_unresolved(
+/// Screen each candidate separately before batching, so a secret-shaped
+/// specifier is quarantined under its own source file without discarding safe
+/// siblings. The full replacement still passes `mutate_entity`'s secret gate.
+async fn record_unresolved_batch(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     entity_id: Uuid,
-    spec: UnresolvedSpec,
-    file: &str,
+    pending: &[PendingUnresolved],
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let outcome = mutate_entity(rt, token, entity_id, file, report, |current| {
+    // A pre-existing spec (or an earlier safe candidate in this batch) was
+    // already a no-op in the per-spec path, before its gate check. Preserve
+    // that behavior and avoid screening duplicates repeatedly. The guarded
+    // mutation below reads again and rebases if another sweep wrote meanwhile.
+    let current = rt
+        .entities(token)?
+        .get_entity_including_deleted(entity_id)
+        .await
+        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let mut staged_seen: HashSet<_> = current
+        .properties
+        .as_ref()
+        .map(read_unresolved)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if pending.iter().all(|item| staged_seen.contains(&item.spec)) {
+        return Ok(());
+    }
+    // If the owner already carries a gate-refused value, every new per-spec
+    // mutation used to be refused before any of them could write. Keep that
+    // per-item report behavior without rebuilding and rechecking the growing
+    // list K times.
+    if let Err(error) = gate_check(&current) {
+        match error {
+            RuntimeError::SecretDetected(secret) => {
+                for item in pending {
+                    if !staged_seen.contains(&item.spec) {
+                        report.blocked_count += 1;
+                        report.blocked.push(BlockedWrite {
+                            file: item.file.clone(),
+                            detector: secret.detector.to_string(),
+                            masked_excerpt: secret.masked.clone(),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            other => return Err(other.into()),
+        }
+    }
+    let mut allowed = Vec::with_capacity(pending.len());
+    for item in pending {
+        if staged_seen.contains(&item.spec) {
+            continue;
+        }
+        let candidate = serde_json::to_value(&item.spec).expect("serializes");
+        match secret_gate::check_json_at(&candidate, "entity", "properties") {
+            Ok(()) => {
+                staged_seen.insert(item.spec.clone());
+                allowed.push(item);
+            }
+            Err(RuntimeError::SecretDetected(secret)) => {
+                report.blocked_count += 1;
+                report.blocked.push(BlockedWrite {
+                    file: item.file.clone(),
+                    detector: secret.detector.to_string(),
+                    masked_excerpt: secret.masked,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+    }
+    let Some(first) = allowed.first() else {
+        return Ok(());
+    };
+    let mut appended = 0usize;
+    let outcome = mutate_entity(rt, token, entity_id, &first.file, report, |current| {
         let mut entity = current?.clone();
         let mut list = entity
             .properties
             .as_ref()
             .map(read_unresolved)
             .unwrap_or_default();
-        if list.contains(&spec) {
+        let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
+        appended = 0;
+        for item in &allowed {
+            if seen.insert(item.spec.clone()) {
+                list.push(item.spec.clone());
+                appended += 1;
+            }
+        }
+        if appended == 0 {
             return None;
         }
-        list.push(spec.clone());
         let mut props = entity
             .properties
             .clone()
@@ -1200,7 +1351,7 @@ async fn record_unresolved(
     })
     .await?;
     if outcome.wrote() {
-        report.unresolved_recorded += 1;
+        report.unresolved_recorded += appended as u64;
     }
     Ok(())
 }
@@ -1402,6 +1553,7 @@ async fn reresolve_pass(
         }
         let original_list = list.clone();
         let mut still_unresolved = Vec::new();
+        let mut still_seen = HashSet::new();
         let mut changed = false;
         for mut spec in list.drain(..) {
             let selected = if spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
@@ -1410,6 +1562,7 @@ async fn reresolve_pass(
                 tiers.l1
             };
             if !selected {
+                still_seen.insert(spec.clone());
                 still_unresolved.push(spec);
                 continue;
             }
@@ -1475,7 +1628,7 @@ async fn reresolve_pass(
                     // normalize to the same specifier as the freshly
                     // scanned form above. Keep the durable queue deduped
                     // after that repair as well as before it.
-                    if still_unresolved.contains(&spec) {
+                    if !still_seen.insert(spec.clone()) {
                         changed = true;
                     } else {
                         still_unresolved.push(spec);
@@ -1485,6 +1638,7 @@ async fn reresolve_pass(
         }
         if changed {
             let entity_label = id.to_string();
+            let original_set: HashSet<_> = original_list.iter().cloned().collect();
             mutate_entity(rt, token, id, &entity_label, report, |current| {
                 let mut entity = current?.clone();
                 let mut rebased = entity
@@ -1492,9 +1646,10 @@ async fn reresolve_pass(
                     .as_ref()
                     .map(read_unresolved)
                     .unwrap_or_default();
-                rebased.retain(|specifier| !original_list.contains(specifier));
+                rebased.retain(|specifier| !original_set.contains(specifier));
+                let mut seen: HashSet<_> = rebased.iter().cloned().collect();
                 for specifier in &still_unresolved {
-                    if !rebased.contains(specifier) {
+                    if seen.insert(specifier.clone()) {
                         rebased.push(specifier.clone());
                     }
                 }
@@ -1699,6 +1854,61 @@ fn collect_source_files(
     Ok(())
 }
 
+struct SourceWalkResult {
+    canonical_root: PathBuf,
+    files: Vec<PathBuf>,
+    skipped_outside_root: Vec<PathBuf>,
+    skipped_non_regular: Vec<PathBuf>,
+    skipped_non_source: Vec<PathBuf>,
+}
+
+async fn walk_source_files_on_worker(
+    ingest_root: &Path,
+    ext: &'static str,
+) -> Result<io::Result<SourceWalkResult>, CodeSourceIngestError> {
+    let root = ingest_root.to_path_buf();
+    blocking_io(move || {
+        let canonical_root = fs::canonicalize(root)?;
+        let mut walk = SourceWalkResult {
+            canonical_root,
+            files: Vec::new(),
+            skipped_outside_root: Vec::new(),
+            skipped_non_regular: Vec::new(),
+            skipped_non_source: Vec::new(),
+        };
+        collect_source_files(
+            &walk.canonical_root,
+            ext,
+            &mut walk.files,
+            &mut walk.skipped_outside_root,
+            &mut walk.skipped_non_regular,
+            &mut walk.skipped_non_source,
+        )?;
+        Ok(walk)
+    })
+    .await
+}
+
+async fn derive_source_path_on_worker(
+    file: &Path,
+    ingest_root: &Path,
+    snapshot_root: &Path,
+) -> Result<(Option<String>, Vec<String>, u64), CodeSourceIngestError> {
+    let file = file.to_path_buf();
+    let ingest_root = ingest_root.to_path_buf();
+    let snapshot_root = snapshot_root.to_path_buf();
+    blocking_io(move || {
+        let mut path_report = CodeSourceIngestReport::default();
+        let path = derive_source_path(&file, &ingest_root, &snapshot_root, &mut path_report);
+        (
+            path,
+            path_report.warnings,
+            path_report.files_dropped_without_source_path,
+        )
+    })
+    .await
+}
+
 fn content_hash(content: &str) -> String {
     // FNV-1a: fast, dependency-free, sufficient for change-detection (not a
     // security boundary).
@@ -1710,24 +1920,31 @@ fn content_hash(content: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn scan_import_source(
+    canonical_root: &Path,
+    path: &Path,
+    language: &str,
+) -> Result<(String, Vec<String>), SourceReadError> {
+    let content = safe_source::read_contained_to_string(canonical_root, path)?;
+    Ok((
+        content_hash(&content),
+        imports::extract_raw_imports(language, &content),
+    ))
+}
+
 /// Read at most the L2 scanner's byte limit plus one. A refused file keeps
 /// module metadata and a parse-failure row, but its `refused:` fingerprint is
 /// deliberately not represented as a hash of unread source bytes.
-fn read_l2_source(path: &Path) -> io::Result<L2Source> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Ok(L2Source::Refused {
-            hash: "refused:non-regular-file".to_string(),
-            reason: "scanner safety limit: Rust source is not a regular file".to_string(),
-        });
-    }
+fn read_l2_source(canonical_root: &Path, path: &Path) -> Result<L2Source, SourceReadError> {
+    let source = safe_source::open_contained_file(canonical_root, path)?;
+    let metadata = source.metadata()?;
     if metadata.len() > RUST_L2_MAX_SOURCE_BYTES as u64 {
         return Ok(L2Source::Refused {
             hash: format!("refused:size:{}", metadata.len()),
             reason: "scanner safety limit: Rust source is too large".to_string(),
         });
     }
-    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut reader = BufReader::new(source);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -2030,7 +2247,8 @@ pub async fn run_code_ingest(
     token: &NamespaceToken,
     opts: CodeSourceIngestOptions<'_>,
 ) -> Result<CodeSourceIngestReport, CodeSourceIngestError> {
-    if !opts.path.is_dir() {
+    let path_for_check = opts.path.to_path_buf();
+    if !blocking_io(move || path_for_check.is_dir()).await? {
         return Err(CodeSourceIngestError::InvalidPath(opts.path.to_path_buf()));
     }
 
@@ -2054,18 +2272,28 @@ pub async fn run_code_ingest(
     // L1/L1.5 calls to preserve their established write/counter behavior.
     let mut project_ids: HashMap<(String, String), Uuid> = HashMap::new();
     let mut previous_l2_sweep_stamps = PreviousL2SweepStamps::new();
+    let mut pending_unresolved = PendingUnresolvedByOwner::new();
 
     // Manifest discovery supplies bounded identity, alias, and scope context
     // to L1.5 without implying L1 output. No selected L1/L1.5 tier means no
     // manifest walk, preserving the zero-write and L2-only boundaries.
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
-        let canonical_ingest_root = fs::canonicalize(opts.path)
-            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
-        manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
-            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?
+        let root = opts.path.to_path_buf();
+        let languages = opts.languages.clone();
+        let discovery = blocking_io(move || {
+            let canonical_root = fs::canonicalize(root)?;
+            manifest::discover_manifests(&canonical_root, &languages)
+        })
+        .await?;
+        let (manifests, failures) = discovery.map_err(|error| {
+            CodeSourceIngestError::InvalidPath(opts.path.join(error.to_string()))
+        })?;
+        record_manifest_failures(&mut report, failures);
+        manifests
     } else {
         Vec::new()
     };
+    let manifest_index = manifest::ManifestIndex::new(&manifests);
     for manifest in &manifests {
         record_observed_language(&mut report, manifest.language);
         for (dependency, _kind, scope) in &manifest.dependencies {
@@ -2128,7 +2356,7 @@ pub async fn run_code_ingest(
                 // A renamed dependency's alias row and package row both
                 // index the same declared fact; canonicalizing the alias to
                 // the package at record time makes the two rows produce one
-                // identical spec (deduped by `record_unresolved`) targeting
+                // identical spec (deduped by the per-owner batch) targeting
                 // the package's project identity — never a phantom alias
                 // project.
                 let specifier =
@@ -2140,7 +2368,13 @@ pub async fn run_code_ingest(
                     dependency_scope: dep_scope.clone(),
                     language: m.language.to_string(),
                 };
-                record_unresolved(rt, token, source_id, spec, &file_label, &mut report).await?;
+                pending_unresolved
+                    .entry(source_id)
+                    .or_default()
+                    .push(PendingUnresolved {
+                        spec,
+                        file: file_label.clone(),
+                    });
             }
         }
     }
@@ -2162,15 +2396,24 @@ pub async fn run_code_ingest(
                 &snapshot,
                 &manifest_scopes,
                 &project_renames,
+                &manifest_index,
                 opts.enable_l2,
                 opts.sweep_time,
                 &mut project_ids,
                 &mut previous_l2_sweep_stamps,
                 &mut module_scans,
+                &mut pending_unresolved,
                 &mut report,
             )
             .await?;
         }
+    }
+
+    // Flush after all project/module refreshes, before synchronous B6
+    // re-resolution observes the unresolved queue. Each owner gets one
+    // guarded write regardless of how many files/specifiers contributed.
+    for (entity_id, pending) in pending_unresolved {
+        record_unresolved_batch(rt, token, entity_id, &pending, &mut report).await?;
     }
 
     if opts.enable_l1 || opts.enable_l1_5 {
@@ -2245,43 +2488,34 @@ async fn run_import_scan(
     snapshot: &SourceSnapshot,
     manifest_scopes: &ManifestScopeIndex,
     project_renames: &ProjectRenames,
+    manifest_index: &manifest::ManifestIndex,
     per_language_project_stamps: bool,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<(String, String), Uuid>,
     previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     module_scans: &mut HashMap<Uuid, ModuleScan>,
+    pending_unresolved: &mut PendingUnresolvedByOwner,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
-    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
-        Ok(path) => path,
+    let walk = match walk_source_files_on_worker(ingest_root, ext).await? {
+        Ok(walk) => walk,
         Err(error) => {
-            report.warnings.push(format!(
-                "canonicalizing L1.5 ingest root {}: {error}",
-                ingest_root.display()
-            ));
+            report
+                .warnings
+                .push(format!("walking {}: {error}", ingest_root.display()));
             return Ok(());
         }
     };
-    let mut files = Vec::new();
-    let mut skipped_outside_root = Vec::new();
-    let mut skipped_non_regular = Vec::new();
-    let mut skipped_non_source = Vec::new();
-    if let Err(e) = collect_source_files(
-        &canonical_ingest_root,
-        ext,
-        &mut files,
-        &mut skipped_outside_root,
-        &mut skipped_non_regular,
-        &mut skipped_non_source,
-    ) {
-        report
-            .warnings
-            .push(format!("walking {}: {e}", ingest_root.display()));
-        return Ok(());
-    }
+    let SourceWalkResult {
+        canonical_root: canonical_ingest_root,
+        files,
+        skipped_outside_root,
+        skipped_non_regular,
+        skipped_non_source,
+    } = walk;
     for skipped in skipped_outside_root {
         report.warnings.push(format!(
             "L1.5 skipped source outside the canonical ingest root: {}",
@@ -2313,21 +2547,22 @@ async fn run_import_scan(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, language)
-                .unwrap_or_else(|| {
-                    (
-                        canonical_ingest_root.clone(),
-                        basename_project_name(ingest_root),
-                    )
-                });
+        let governing = manifest_index.governing(file_dir, &canonical_ingest_root, language);
+        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+            (
+                canonical_ingest_root.clone(),
+                basename_project_name(ingest_root),
+            )
+        });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) =
-            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
-        else {
+        let (source_path, warnings, dropped) =
+            derive_source_path_on_worker(&file, &canonical_ingest_root, &snapshot.root).await?;
+        report.warnings.extend(warnings);
+        report.files_dropped_without_source_path += dropped;
+        let Some(source_path) = source_path else {
             continue;
         };
 
@@ -2352,16 +2587,18 @@ async fn run_import_scan(
             continue;
         };
 
-        let content = match fs::read_to_string(&file) {
-            Ok(c) => c,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("reading {}: {e}", file.display()));
-                continue;
-            }
-        };
-        let hash = content_hash(&content);
+        let file_for_read = file.clone();
+        let root_for_read = canonical_ingest_root.clone();
+        let (hash, raw_imports) =
+            match blocking_io(move || scan_import_source(&root_for_read, &file_for_read, language))
+                .await?
+            {
+                Ok(scan) => scan,
+                Err(error) => {
+                    record_source_read_failure(report, "L1.5", &file, error);
+                    continue;
+                }
+            };
         let Some(module_id) = upsert_module(
             rt,
             token,
@@ -2403,7 +2640,7 @@ async fn run_import_scan(
 
         let mut scan_imports = Vec::new();
         let is_package = file.file_name().is_some_and(|name| name == "__init__.py");
-        for raw in imports::extract_raw_imports(language, &content) {
+        for raw in raw_imports {
             let resolved = if language == "typescript" && raw.starts_with('.') {
                 let rel_dir = file_dir.strip_prefix(&proj_root).unwrap_or(Path::new(""));
                 Resolved::IntraModule(imports::resolve_relative_ts_module(rel_dir, &raw))
@@ -2421,7 +2658,13 @@ async fn run_import_scan(
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
-                    record_unresolved(rt, token, module_id, spec, &file_label, report).await?;
+                    pending_unresolved
+                        .entry(module_id)
+                        .or_default()
+                        .push(PendingUnresolved {
+                            spec,
+                            file: file_label.clone(),
+                        });
                 }
                 Resolved::ExternalProject(target_name) => {
                     let resolution = project_import_target_and_scope(
@@ -2440,7 +2683,13 @@ async fn run_import_scan(
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
-                    record_unresolved(rt, token, proj_id, spec, &file_label, report).await?;
+                    pending_unresolved
+                        .entry(proj_id)
+                        .or_default()
+                        .push(PendingUnresolved {
+                            spec,
+                            file: file_label.clone(),
+                        });
                 }
             }
         }
@@ -3662,33 +3911,22 @@ async fn run_l2_sweep(
     let Some(ext) = imports::extension_for_language(LANGUAGE) else {
         return Ok(state);
     };
-    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
-        Ok(path) => path,
+    let walk = match walk_source_files_on_worker(ingest_root, ext).await? {
+        Ok(walk) => walk,
         Err(error) => {
-            report.warnings.push(format!(
-                "canonicalizing L2 ingest root {}: {error}",
-                ingest_root.display()
-            ));
+            report
+                .warnings
+                .push(format!("walking {}: {error}", ingest_root.display()));
             return Ok(state);
         }
     };
-    let mut files = Vec::new();
-    let mut skipped_outside_root = Vec::new();
-    let mut skipped_non_regular = Vec::new();
-    let mut skipped_non_source = Vec::new();
-    if let Err(e) = collect_source_files(
-        &canonical_ingest_root,
-        ext,
-        &mut files,
-        &mut skipped_outside_root,
-        &mut skipped_non_regular,
-        &mut skipped_non_source,
-    ) {
-        report
-            .warnings
-            .push(format!("walking {}: {e}", ingest_root.display()));
-        return Ok(state);
-    }
+    let SourceWalkResult {
+        canonical_root: canonical_ingest_root,
+        files,
+        skipped_outside_root,
+        skipped_non_regular,
+        skipped_non_source,
+    } = walk;
     for skipped in skipped_outside_root {
         report.warnings.push(format!(
             "L2 skipped source outside the canonical ingest root: {}",
@@ -3713,25 +3951,37 @@ async fn run_l2_sweep(
         record_observed_language(report, LANGUAGE);
     }
 
+    // L2-only never requests the L1 manifest walk. Read only ancestors of
+    // canonical source paths and reuse that parsed snapshot for every file.
+    let files_for_manifests = files.clone();
+    let root_for_manifests = canonical_ingest_root.clone();
+    let (manifests, failures) = blocking_io(move || {
+        manifest::discover_rust_manifests_for_sources(&files_for_manifests, &root_for_manifests)
+    })
+    .await?;
+    record_manifest_failures(report, failures);
+    let manifest_index = manifest::ManifestIndex::new(&manifests);
+
     for file in files {
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, LANGUAGE)
-                .unwrap_or_else(|| {
-                    (
-                        canonical_ingest_root.clone(),
-                        basename_project_name(ingest_root),
-                    )
-                });
+        let governing = manifest_index.governing(file_dir, &canonical_ingest_root, LANGUAGE);
+        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+            (
+                canonical_ingest_root.clone(),
+                basename_project_name(ingest_root),
+            )
+        });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, LANGUAGE) else {
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) =
-            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
-        else {
+        let (source_path, warnings, dropped) =
+            derive_source_path_on_worker(&file, &canonical_ingest_root, &snapshot.root).await?;
+        report.warnings.extend(warnings);
+        report.files_dropped_without_source_path += dropped;
+        let Some(source_path) = source_path else {
             continue;
         };
         let file_label = file.display().to_string();
@@ -3753,15 +4003,16 @@ async fn run_l2_sweep(
             continue;
         };
 
-        let source = match read_l2_source(&file) {
-            Ok(source) => source,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("reading {}: {e}", file.display()));
-                continue;
-            }
-        };
+        let file_for_read = file.clone();
+        let root_for_read = canonical_ingest_root.clone();
+        let source =
+            match blocking_io(move || read_l2_source(&root_for_read, &file_for_read)).await? {
+                Ok(source) => source,
+                Err(error) => {
+                    record_source_read_failure(report, "L2", &file, error);
+                    continue;
+                }
+            };
         let hash = source.hash().to_string();
         let refused = matches!(&source, L2Source::Refused { .. });
 
@@ -4361,6 +4612,18 @@ mod tests {
     use khive_runtime::{Namespace, RuntimeConfig};
     use tempfile::TempDir;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_worker_yields_the_async_executor() {
+        let worker = blocking_io(|| std::thread::sleep(std::time::Duration::from_millis(200)));
+        tokio::pin!(worker);
+        tokio::select! {
+            biased;
+            _ = &mut worker => panic!("blocking work completed before the executor timer"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        worker.await.expect("blocking worker completed");
+    }
+
     fn runtime_on(db_path: &Path) -> (KhiveRuntime, NamespaceToken) {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: Some(db_path.to_path_buf()),
@@ -4412,12 +4675,48 @@ mod tests {
         let path = root.path().join("oversized.rs");
         let source = " ".repeat(RUST_L2_MAX_SOURCE_BYTES + 1);
         fs::write(&path, &source).expect("source file");
-        let L2Source::Refused { hash, reason } = read_l2_source(&path).expect("bounded read")
+        let L2Source::Refused { hash, reason } =
+            read_l2_source(&root.path().canonicalize().expect("canonical root"), &path)
+                .expect("bounded read")
         else {
             panic!("oversized source must not be retained for parsing");
         };
         assert_eq!(hash, format!("refused:size:{}", source.len()));
         assert!(reason.contains("scanner safety limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_scan_reader_refuses_opened_source_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("ingest root");
+        let outside = TempDir::new().expect("outside root");
+        let source = outside.path().join("outside.py");
+        fs::write(&source, "import must_not_ingest\n").expect("outside source");
+        let link = root.path().join("source.py");
+        symlink(&source, &link).expect("outside link");
+        assert!(matches!(
+            scan_import_source(&root.path().canonicalize().expect("canonical root"), &link, "python"),
+            Err(SourceReadError::Refused(reason)) if reason.contains("escapes the canonical ingest root")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_l2_reader_refuses_opened_source_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("ingest root");
+        let outside = TempDir::new().expect("outside root");
+        let source = outside.path().join("outside.rs");
+        fs::write(&source, "pub fn must_not_ingest() {}\n").expect("outside source");
+        let link = root.path().join("source.rs");
+        symlink(&source, &link).expect("outside link");
+        assert!(matches!(
+            read_l2_source(&root.path().canonicalize().expect("canonical root"), &link),
+            Err(SourceReadError::Refused(reason)) if reason.contains("escapes the canonical ingest root")
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4676,29 +4975,23 @@ mod tests {
         let pause_b = std::sync::Arc::new(race_seam::OneShotPause::new(barrier));
         let mut report_a = CodeSourceIngestReport::default();
         let mut report_b = CodeSourceIngestReport::default();
+        let pending_a = [PendingUnresolved {
+            spec: specifier_a.clone(),
+            file: "alpha.rs".to_string(),
+        }];
+        let pending_b = [PendingUnresolved {
+            spec: specifier_b.clone(),
+            file: "beta.rs".to_string(),
+        }];
 
         let (result_a, result_b) = tokio::join!(
             race_seam::AFTER_ROW_READ.scope(
                 pause_a,
-                record_unresolved(
-                    &runtime_a,
-                    &token_a,
-                    entity_id,
-                    specifier_a.clone(),
-                    "alpha.rs",
-                    &mut report_a,
-                ),
+                record_unresolved_batch(&runtime_a, &token_a, entity_id, &pending_a, &mut report_a),
             ),
             race_seam::AFTER_ROW_READ.scope(
                 pause_b,
-                record_unresolved(
-                    &runtime_b,
-                    &token_b,
-                    entity_id,
-                    specifier_b.clone(),
-                    "beta.rs",
-                    &mut report_b,
-                ),
+                record_unresolved_batch(&runtime_b, &token_b, entity_id, &pending_b, &mut report_b),
             ),
         );
         result_a.expect("writer A completes");
@@ -4728,6 +5021,82 @@ mod tests {
         assert_eq!(report_b.unresolved_recorded, 1);
         assert_eq!(report_a.fts_indexed, 1);
         assert_eq!(report_b.fts_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_batch_keeps_order_and_dedup_with_one_owner_write() {
+        let root = TempDir::new().expect("temporary database directory");
+        let (runtime, token) = runtime_on(&root.path().join("unresolved-batch.db"));
+        let entity_id = project_uuid("batch-fixture");
+        let existing = UnresolvedSpec {
+            specifier: "existing".to_string(),
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let mut entity = Entity::new(token.namespace().as_str(), "project", "batch-fixture");
+        entity.id = entity_id;
+        entity.properties = Some(json!({
+            "source_project": "batch-fixture",
+            "unresolved_specifiers": [existing],
+        }));
+        runtime
+            .entities(&token)
+            .expect("entity store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let spec = |name: String| UnresolvedSpec {
+            specifier: name,
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let mut pending: Vec<_> = (0..64)
+            .map(|i| PendingUnresolved {
+                spec: spec(format!("missing_{i:02}")),
+                file: "Cargo.toml".to_string(),
+            })
+            .collect();
+        pending.insert(
+            1,
+            PendingUnresolved {
+                spec: spec("existing".to_string()),
+                file: "Cargo.toml".to_string(),
+            },
+        );
+        pending.push(PendingUnresolved {
+            spec: spec("missing_00".to_string()),
+            file: "Cargo.toml".to_string(),
+        });
+        pending.push(PendingUnresolved {
+            spec: spec("scheme://user:pass@host".to_string()),
+            file: "blocked.toml".to_string(),
+        });
+        let mut report = CodeSourceIngestReport::default();
+        record_unresolved_batch(&runtime, &token, entity_id, &pending, &mut report)
+            .await
+            .expect("batch appends safe siblings");
+
+        let stored = runtime
+            .entities(&token)
+            .expect("entity store")
+            .get_entity(entity_id)
+            .await
+            .expect("read entity")
+            .expect("entity remains");
+        let list = read_unresolved(stored.properties.as_ref().expect("properties"));
+        let expected: Vec<_> = std::iter::once(spec("existing".to_string()))
+            .chain((0..64).map(|i| spec(format!("missing_{i:02}"))))
+            .collect();
+        assert_eq!(list, expected, "append order and dedup must be stable");
+        assert_eq!(report.unresolved_recorded, 64);
+        assert_eq!(report.fts_indexed, 1, "one owner gets one FTS upsert");
+        assert_eq!(report.blocked_count, 1);
+        assert_eq!(report.blocked[0].file, "blocked.toml");
     }
 
     #[tokio::test]

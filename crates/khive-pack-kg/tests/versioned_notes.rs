@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use khive_pack_kg::KgPack;
@@ -352,6 +353,94 @@ async fn keyed_create_c1_equal_replay_is_a_minimal_receipt_unkeyed_creates_stay_
         .await
         .unwrap();
     assert_ne!(u1["id"], u2["id"]);
+}
+
+#[tokio::test]
+async fn keyed_create_replays_before_resolving_a_deleted_annotation_prefix() {
+    let (_, _, registry) = fixture(true);
+    let target = registry
+        .dispatch(
+            "create",
+            json!({"kind":"concept", "name":"annotation target", "skip_dedup_check":true}),
+        )
+        .await
+        .unwrap();
+    let target_id = target["id"].as_str().unwrap();
+    let target_prefix = &target_id[..8];
+    let args = json!({
+        "kind":"observation", "key":"replay/deleted-annotation", "content":"payload",
+        "annotates":[target_prefix], "embed":false
+    });
+    let holder = registry.dispatch("create", args.clone()).await.unwrap();
+    assert_eq!(holder["created"], true);
+
+    registry
+        .dispatch("delete", json!({"id":target_id}))
+        .await
+        .unwrap();
+    let before = registry
+        .dispatch("get", json!({"id":holder["id"]}))
+        .await
+        .unwrap();
+    let replay = registry.dispatch("create", args.clone()).await.unwrap();
+    assert_eq!(replay, json!({"id":holder["id"], "created":false}));
+    let after = registry
+        .dispatch("get", json!({"id":holder["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+
+    let mut fresh = args;
+    fresh["key"] = json!("fresh/deleted-annotation");
+    let error = registry.dispatch("create", fresh).await.unwrap_err();
+    assert!(
+        format!("{error}").contains("no record matches prefix"),
+        "a new note must still reject the missing annotation target: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn keyed_create_replay_does_not_poll_annotation_resolver() {
+    let (runtime, token, registry) = fixture(true);
+    let holder = registry
+        .dispatch(
+            "create",
+            json!({"kind":"observation", "key":"replay/deferred-resolution", "content":"payload", "embed":false}),
+        )
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let error = runtime
+        .create_note_with_options_resolving_annotations(
+            &token,
+            "observation",
+            None,
+            "payload",
+            None,
+            None,
+            None,
+            None,
+            async move {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::InvalidInput(
+                    "resolver unexpectedly ran".into(),
+                ))
+            },
+            None,
+            khive_runtime::note_write::NoteWriteOptions {
+                key: Some("replay/deferred-resolution".into()),
+                embed: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let conflict = details(error);
+    assert_eq!(conflict["reason"], "key_conflict");
+    assert_eq!(conflict["equal"], "true");
+    assert_eq!(conflict["existing_id"], holder["id"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

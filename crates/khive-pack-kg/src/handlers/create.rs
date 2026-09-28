@@ -10,11 +10,12 @@ use khive_runtime::{
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
+use khive_types::pack::pack_registry_tag;
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
-    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_specific,
-    remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type,
+    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_entity_type,
+    reconcile_specific, remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered, to_json,
     validate_weight, CreateParams, KindSpec,
 };
 use crate::KgPack;
@@ -156,6 +157,7 @@ impl KgPack {
     async fn prepare_create_fields(
         &self,
         kind: &str,
+        required_entity_type: Option<&str>,
         mut fields: CreateParams,
         args: &mut Value,
         hook: Option<&Arc<dyn KindHook>>,
@@ -169,6 +171,19 @@ impl KgPack {
             fields = deser(args.clone())?;
         }
         super::common::require_object_param(fields.properties.as_ref(), "properties")?;
+        if fields.kind == "entity" {
+            if let Some(tag) = fields
+                .tags
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find_map(|tag| pack_registry_tag(tag))
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "create refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+                )));
+            }
+        }
         if fields.kind != "note"
             && (fields.key.is_some() || fields.embed.is_some() || fields.fence.is_some())
         {
@@ -189,7 +204,12 @@ impl KgPack {
             if name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
-            let entity_type = validate_entity_type(kind, fields.entity_type.as_deref(), registry)?;
+            let entity_type = reconcile_entity_type(
+                Some(kind),
+                required_entity_type,
+                fields.entity_type.as_deref(),
+                registry,
+            )?;
             let normalized = describe_entity_type_normalization(
                 fields.entity_type.as_deref(),
                 entity_type.as_deref(),
@@ -205,6 +225,7 @@ impl KgPack {
     async fn prepare_bulk_entity(
         &self,
         kind: String,
+        required_entity_type: Option<&str>,
         entry: super::params::BulkCreateEntry,
         token: &NamespaceToken,
         registry: &VerbRegistry,
@@ -255,7 +276,14 @@ impl KgPack {
             fence: None,
         };
         let (fields, normalized) = self
-            .prepare_create_fields(&kind, fields, &mut args, hook.as_ref(), registry)
+            .prepare_create_fields(
+                &kind,
+                required_entity_type,
+                fields,
+                &mut args,
+                hook.as_ref(),
+                registry,
+            )
             .await?;
         if fields.kind != "entity" {
             return Err(RuntimeError::InvalidInput(
@@ -335,7 +363,7 @@ impl KgPack {
             fence: None,
         };
         let (fields, _normalized) = self
-            .prepare_create_fields(&kind, fields, &mut args, hook.as_ref(), registry)
+            .prepare_create_fields(&kind, None, fields, &mut args, hook.as_ref(), registry)
             .await?;
         if fields.kind != "note" {
             return Err(RuntimeError::InvalidInput(
@@ -374,12 +402,15 @@ impl KgPack {
         token: &NamespaceToken,
         registry: &VerbRegistry,
     ) -> Result<PreparedBulkItem, RuntimeError> {
-        let entry: super::params::BulkCreateEntry = serde_json::from_value(raw)
+        let mut entry: super::params::BulkCreateEntry = serde_json::from_value(raw)
             .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
         let item_kind_spec = resolve_kind_spec(&entry.kind, registry)
             .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}")))?;
         match item_kind_spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 if entry.content.is_some() || entry.note_kind.is_some() || entry.salience.is_some()
                 {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -396,8 +427,17 @@ impl KgPack {
                 .ok_or_else(|| RuntimeError::InvalidInput(format!(
                     "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
                 )))?;
+                if entry.entity_type.is_none() {
+                    entry.entity_type = reconcile_entity_type(
+                        Some(&canonical),
+                        entity_type.as_deref(),
+                        None,
+                        registry,
+                    )
+                    .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
+                }
                 let (prepared, normalized) = self
-                    .prepare_bulk_entity(canonical, entry, token, registry)
+                    .prepare_bulk_entity(canonical, entity_type.as_deref(), entry, token, registry)
                     .await
                     .map_err(|error| {
                         RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
@@ -849,7 +889,7 @@ impl KgPack {
         let spec = resolve_kind_spec(&raw_kind, registry)?;
 
         let (sub_kind, hook) = match &spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity { specific, .. } => {
                 let canonical = reconcile_specific(
                     specific.clone(),
                     raw_entity_kind.as_deref(),
@@ -927,12 +967,24 @@ impl KgPack {
         // `CreateParams` intentionally accepts the flavored hook-only keys as
         // unknown fields, so this validates the shared subset without
         // precluding pack-specific input.
-        let fields: CreateParams = deser(params.clone())?;
+        let mut fields: CreateParams = deser(params.clone())?;
+        let required_entity_type = match &spec {
+            KindSpec::Entity { entity_type, .. } => entity_type.as_deref(),
+            _ => None,
+        };
+        if fields.entity_type.is_none() {
+            if let Some(expected) = required_entity_type {
+                fields.entity_type =
+                    reconcile_entity_type(sub_kind.as_deref(), Some(expected), None, registry)?;
+                params["entity_type"] = json!(fields.entity_type.as_deref());
+            }
+        }
         let (p, entity_type_normalized) = self
             .prepare_create_fields(
                 sub_kind
                     .as_deref()
                     .expect("create kind canonicalized above"),
+                required_entity_type,
                 fields,
                 &mut params,
                 hook.as_ref(),
@@ -952,14 +1004,15 @@ impl KgPack {
             None
         };
 
-        let (mut response, new_id, embedding_input_truncated) = match p.kind.as_str() {
+        let (mut response, new_id, embedding_input_truncated, degradations) = match p.kind.as_str()
+        {
             "entity" => {
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.expect("entity fields validated during preparation");
                 let tags = p.tags.unwrap_or_default();
-                let (entity, embedding_report) = self
+                let (entity, embedding_report, degradations) = self
                     .runtime
-                    .create_entity_with_embedding_report(
+                    .create_entity_with_post_commit_report(
                         token,
                         &canonical,
                         p.entity_type.as_deref(),
@@ -976,7 +1029,12 @@ impl KgPack {
                         obj.insert("entity_type_normalized".to_string(), applied);
                     }
                 }
-                (entity_json, id, embedding_report.any_truncated())
+                (
+                    entity_json,
+                    id,
+                    embedding_report.any_truncated(),
+                    degradations,
+                )
             }
             "note" => {
                 let canonical = sub_kind
@@ -985,18 +1043,16 @@ impl KgPack {
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let mut annotates = Vec::new();
-                for s in p.annotates.unwrap_or_default() {
-                    annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
-                }
+                let annotation_refs = p.annotates.unwrap_or_default();
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
                 let result = if canonical == "head"
                     || p.key.is_some()
                     || p.embed.is_some()
                     || p.fence.is_some()
                 {
+                    let runtime = &self.runtime;
                     self.runtime
-                        .create_note_with_options(
+                        .create_note_with_options_resolving_annotations(
                             token,
                             &canonical,
                             p.name.as_deref(),
@@ -1005,7 +1061,15 @@ impl KgPack {
                             p.salience,
                             None,
                             properties,
-                            annotates,
+                            async move {
+                                let mut annotates = Vec::with_capacity(annotation_refs.len());
+                                for reference in annotation_refs {
+                                    annotates.push(
+                                        resolve_uuid_unfiltered(&reference, runtime, token).await?,
+                                    );
+                                }
+                                Ok(annotates)
+                            },
                             None,
                             khive_runtime::note_write::NoteWriteOptions {
                                 key: p.key.clone(),
@@ -1015,9 +1079,15 @@ impl KgPack {
                             },
                         )
                         .await
+                        .map(|(note, report)| (note, report, Vec::new()))
                 } else {
+                    let mut annotates = Vec::with_capacity(annotation_refs.len());
+                    for reference in annotation_refs {
+                        annotates
+                            .push(resolve_uuid_unfiltered(&reference, &self.runtime, token).await?);
+                    }
                     self.runtime
-                        .create_note_with_embedding_content_and_report(
+                        .create_note_with_embedding_content_and_post_commit_report(
                             token,
                             &canonical,
                             p.name.as_deref(),
@@ -1029,7 +1099,7 @@ impl KgPack {
                         )
                         .await
                 };
-                let (note, embedding_report) = match result {
+                let (note, embedding_report, degradations) = match result {
                     Ok(pair) => pair,
                     Err(RuntimeError::Khive(error))
                         if error.details().and_then(|details| details.get("reason"))
@@ -1084,7 +1154,12 @@ impl KgPack {
                         obj.insert("created".to_string(), json!(true));
                     }
                 }
-                (note_json, id, embedding_report.any_truncated())
+                (
+                    note_json,
+                    id,
+                    embedding_report.any_truncated(),
+                    degradations,
+                )
             }
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -1094,6 +1169,9 @@ impl KgPack {
         };
 
         add_embedding_truncation_warning(&mut response, embedding_input_truncated);
+        if !degradations.is_empty() {
+            response["post_commit_degradations"] = json!(degradations);
+        }
 
         if let Some(ref h) = hook {
             if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {

@@ -19,6 +19,15 @@ names under the same publication lock as `load` and `save_atomic`. A previously
 loaded mmap reader keeps its old `vectors.bin` inode. The v1 data layout remains
 three segments without a checksum-bearing cross-file commit record; use
 `save_atomic` when crash-consistent generations are required.
+`load` creates `.checkpoint.lock` before reading a historical directory that
+does not yet have one, then holds a shared lock through all segment reads.
+This prevents the first concurrent `save` or `save_atomic` from publishing a
+mixed generation during that load. If lock creation is refused solely because
+the directory is read-only, `load` reads without a lock but compares the file
+identities, lengths and modification times of every segment and the lock file
+before and after; any observed change refuses the load. This guards against
+the rename-based publications used by `save` and `save_atomic`. Other lock-creation errors still
+fail. Subsequent loads open the existing lock file for reading.
 If a platform refuses replacement of a mapped destination, `save` returns the
 I/O error; it never falls back to truncating the canonical file.
 
@@ -109,14 +118,18 @@ a single `VamanaGraph` refactor suffices.
 
 ## v2 crash-safe save/load
 
-`VamanaIndex::save_atomic` writes `vectors.bin` and `graph.bin` (same formats as v1),
-then `lifecycle.bin` (tombstones, free_slots, reverse_adj, ops_since_consolidation),
-then atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. If a
-crash interrupts before the rename, the previous `metadata.bin` (v1 or v2) is still
-valid — `load_or_build` never observes a torn v2 commit. Segments are staged under
-`.v2new` suffixes so a crash between segment write and metadata rename never corrupts
-a live v1-format segment set. The directory entry is fsynced after both the metadata
-rename (commit gate) and the final segment-promotion renames.
+`VamanaIndex::save_atomic` stages `vectors.bin`, `graph.bin`, `lifecycle.bin`
+(tombstones, free_slots, reverse_adj, ops_since_consolidation), and `codes.bin`
+under `.v2new` names. It then renames `metadata.bin.tmp` → `metadata.bin` as the
+commit record and fsyncs the directory **before** promoting the four staged
+segments to their live names and fsyncing again. A crash before metadata promotion
+leaves the previous metadata and live segments together. A crash between metadata
+promotion and the last segment promotion can leave a mixed generation: raw `load`
+rejects any checksum mismatch, and `load_or_build` rebuilds from the caller's corpus
+and saves a fresh generation. The guarantee is integrity with rebuild fallback, not
+continuous availability of the previous snapshot. See
+[ADR-052 Amendment 1](../../../../docs/adr/ADR-052-ann-production-lifecycle.md#amendment-1-2026-09-27-v2-segment-promotion-after-metadata)
+and [ADR-079 Amendment 3](../../../../docs/adr/ADR-079-ann-persistence-warm-path-integration.md#amendment-3-2026-09-27-interrupted-v2-save-can-require-coldrebuild).
 
 File-backed commits append a 16-byte random publication nonce after the existing
 41-byte watermark/codes trailer. Readers accept all three layouts: the original base
@@ -128,6 +141,7 @@ long-lived mmap owners can detect and release unlinked predecessor generations (
 
 `VamanaIndex::load_or_build` is the fingerprint-gated restore used by callers holding a
 live corpus. Decision tree:
+
 - `metadata.bin` with `KHVVAMG2` magic AND checksums valid AND fingerprint matches →
   fast path (`load_v2_fast`, O(N) — no reverse_adj rebuild)
 - `KHVVAMG2` but checksum or fingerprint mismatch → rebuild from commit config, then
@@ -148,16 +162,16 @@ surfaces the error directly to callers that don't hold a corpus to rebuild from.
 Written by `write_lifecycle` (`index.rs`) as part of the v2 segmented save. All
 fields little-endian:
 
-| Field              | Size                    | Type            |
-| ------------------ | ----------------------- | --------------- |
-| magic               | 8 B                     | bytes `KHVVLIF1` |
-| tombstone_words     | 8 B                     | u64 (count of u64 words) |
-| tombstone data      | N × 8 B                 | u64 words        |
-| free_slots_count    | 8 B                     | u64              |
-| free_slots data     | M × 4 B                 | u32 each         |
-| ops                 | 8 B                     | u64              |
-| rev_num_nodes       | 8 B                     | u64              |
-| reverse_adj records | varies, one per node    | degree (u32) + neighbors (degree × u32) |
+| Field               | Size                 | Type                                    |
+| ------------------- | -------------------- | --------------------------------------- |
+| magic               | 8 B                  | bytes `KHVVLIF1`                        |
+| tombstone_words     | 8 B                  | u64 (count of u64 words)                |
+| tombstone data      | N × 8 B              | u64 words                               |
+| free_slots_count    | 8 B                  | u64                                     |
+| free_slots data     | M × 4 B              | u32 each                                |
+| ops                 | 8 B                  | u64                                     |
+| rev_num_nodes       | 8 B                  | u64                                     |
+| reverse_adj records | varies, one per node | degree (u32) + neighbors (degree × u32) |
 
 `reverse_adj` uses the same per-node record format as `graph.bin`'s adjacency
 (degree followed by that many neighbor IDs). `num_nodes` for the tombstone bitvec is

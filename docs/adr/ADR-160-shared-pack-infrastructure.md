@@ -295,6 +295,26 @@ object whose stored bytes exceed its reported size still refused.
 
 **Refs.** #3325
 
+#### Amendment 3 (2026-09-28): prior blob size is a reservation only
+
+Status: Accepted (2026-09-28; #3484).
+
+**Context.** Amendment 2 correctly says that the earlier `size()` result is a reservation, not
+proof of the later read. Its following sentence incorrectly treats that result as an expected
+length: it says an object shorter than the earlier size fails with `BlobSizeMismatch`. D2 instead
+compares the bounded read's own metadata with the bytes read. `get_bounded_verified` accepts
+`max_bytes`, not an expected length.
+
+**Decision.** This amendment supersedes Amendment 2's sentence containing "a stored object longer than the size read
+fails with `BlobTooLarge`, a shorter one with `BlobSizeMismatch`".
+Bytes beyond the earlier size passed as `max_bytes` fail with `BlobTooLarge`. A complete object
+shorter than that bound does not fail merely for being shorter: read-local metadata and final
+length must agree, and the bytes must match `content_ref`. A read-local metadata/length
+disagreement fails with `BlobSizeMismatch`; a wrong digest fails with `BlobDigestMismatch`.
+`blob.get` checks requested ranges against the verified length after hydration. The earlier
+`size()` remains the admission reservation, with no equality guarantee; D2, D3, and Amendment 2's
+reservation decision are otherwise unchanged.
+
 ### D4 — Artifact consumers converge on ADR-121 attachments
 
 The shared blob operation is independent of record modeling. Packs attach original bytes through
@@ -333,8 +353,9 @@ filesystem walk. There is no fallback to caller-snapshot sweep or unconditional 
 This exact-V21 rule describes the Phase-4a rollout binary. [ADR-121 Amendment 1](ADR-121-attachments-first-class.md#amendment-1-2026-09-25-the-orphan-sweep-runs-on-a-schedule-and-on-demand)
 proposes admission through a named `REVIEWED_SCHEMA_EPOCH` after review of the complete core migration
 chain, plus main-database ownership rows for every durable blob producer, a checked blob-writer
-census and a cutover-recorded store ID bound to the root, before any scheduled
-or on-demand transactional sweep. The ownership-table migration requires a separate exact-epoch review.
+census and a store ID bound to the root on first daemon boot after cutover, or by verified adoption,
+before any scheduled or on-demand transactional sweep. The ownership-table migration requires a
+separate exact-epoch review.
 The Phase-4a attachment-only liveness rule does not by itself protect persistent exec, git or
 derived web objects that share the root; newer epochs remain refused until separately reviewed.
 

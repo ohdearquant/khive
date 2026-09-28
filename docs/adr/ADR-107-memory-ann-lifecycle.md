@@ -289,6 +289,7 @@ leaking through.
   at process shutdown is bounded by the daemon's own drain timeout
   (`KHIVE_DRAIN_TIMEOUT_SECS`), not by anything in this mechanism — there is no
   separate cancellation signal for this loop.
+
 - A daemon that stays warm across a `kkernel reindex` run only detects the resulting
   staleness on its next amortized durable-epoch check (§4), not immediately — the check
   is debounced to a fixed 5-second interval in production, so there can be a bounded
@@ -300,3 +301,30 @@ leaking through.
 
 Accepted. Implemented by PR #812 (issue #791), most recently on
 `fix/791-recall-ann-rebuild-blocking`.
+
+## Amendment 1 (2026-09-27): chained rebuild debounce
+
+**Status**: Accepted (2026-09-27) ([#3464](https://github.com/ohdearquant/khive/issues/3464)).
+
+### Context
+
+The Consequences section names a fixed one-second production delay. In
+`crates/khive-pack-memory/src/ann.rs`, `REBUILD_CHAIN_DEBOUNCE_DEFAULT` is 30
+seconds in production and 5 milliseconds in tests. `rebuild_chain_debounce()`
+reads `KHIVE_ANN_REBUILD_DEBOUNCE_MS` from the process environment. The override
+is trimmed and parsed as a `u64` millisecond count; zero disables coalescing,
+while an unset, empty, negative, or malformed value falls back to the default.
+Only the first attempt of a **chained** rebuild task sleeps; an initial rebuild
+task does not wait on this debounce.
+
+The environment-only `KHIVE_ANN_REBUILD_DEBOUNCE_MS` setting follows accepted
+[ADR-079 Amendment 2](ADR-079-ann-persistence-warm-path-integration.md#amendment-2-2026-09-25-ann-operational-knobs-are-environment-variables):
+ANN knobs are read from the worker process environment, not `khive.toml` or CLI flags.
+
+### Correction
+
+Replace the one-second production value in Consequences with a 30-second
+default, overridable by `KHIVE_ANN_REBUILD_DEBOUNCE_MS` as described above.
+The delay remains a coalescing interval between chained tasks, not a fixed
+freshness bound for a memory read. The write-generation, re-enqueue, and
+non-eviction behavior elsewhere in this ADR is unchanged.

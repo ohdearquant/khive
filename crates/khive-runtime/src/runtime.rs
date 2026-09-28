@@ -2044,7 +2044,7 @@ impl KhiveRuntime {
     /// First call for any name loads the underlying service (cold start cost);
     /// subsequent calls are cheap (registry caches the `Arc`).
     pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        self.embedder_inner(name, None).await
+        Ok(self.embedder_inner(name, None).await?.0)
     }
 
     pub(crate) async fn embedder_with_token(
@@ -2052,14 +2052,25 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         name: &str,
     ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        self.embedder_inner(name, Some(token)).await
+        Ok(self.embedder_inner(name, Some(token)).await?.0)
+    }
+
+    /// Resolve the service and its document-preparation attestation from the
+    /// same registry entry. A pack can replace a built-in name while a cold
+    /// service is initializing, so a second registry lookup would be unsafe.
+    pub(crate) async fn embedder_with_input_attestation(
+        &self,
+        name: &str,
+        token: Option<&NamespaceToken>,
+    ) -> RuntimeResult<(Arc<dyn EmbeddingService>, bool)> {
+        self.embedder_inner(name, token).await
     }
 
     async fn embedder_inner(
         &self,
         name: &str,
         token: Option<&NamespaceToken>,
-    ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+    ) -> RuntimeResult<(Arc<dyn EmbeddingService>, bool)> {
         // Fall back to the literal name (not the alias table) so custom
         // providers registered with non-lattice names stay reachable.
         let canonical_key = match parse_embedding_model_alias(name) {
@@ -2079,6 +2090,7 @@ impl KhiveRuntime {
                 .get_entry(&canonical_key)
                 .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
         };
+        let audited_document_preparation = entry.has_audited_document_preparation();
         let (service, init_duration_us) = entry.resolve().await?;
         if let Some(duration_us) = init_duration_us {
             if let Some(token) = token {
@@ -2089,7 +2101,7 @@ impl KhiveRuntime {
                     .await;
             }
         }
-        Ok(service)
+        Ok((service, audited_document_preparation))
     }
 
     async fn emit_embedder_initialized(
@@ -2148,6 +2160,21 @@ impl KhiveRuntime {
                 std::any::type_name::<dyn crate::embedder_registry::EmbedderProvider>()
             );
         }
+    }
+
+    /// Install a deterministic backend for exact-input provenance tests.
+    /// The test adapter, not the supplied backend, owns lattice passage
+    /// prefixing; this API is absent unless `test-internals` is enabled.
+    #[cfg(feature = "test-internals")]
+    pub fn register_test_audited_embedder(
+        &self,
+        model: EmbeddingModel,
+        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
+    ) {
+        self.embedder_registry
+            .write()
+            .expect("test embedder registry lock")
+            .register_test_audited(model, provider);
     }
 
     /// List registered embedding models via `SqlAccess`, routing through the

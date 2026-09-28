@@ -506,11 +506,12 @@ and linked to.
    with a minted id resolves to that row and never gains a derived-id twin. Duplicates created before
    this amendment are left as they are and keep resolving by the rule above; nothing merges or renames
    them.
-5. **A tombstone is not revived.** If the derived id belongs to a soft-deleted row, registration
-   refuses and names that row. Reviving a registry row would bring back the id and policy inputs that
-   Amendment 1's grants are pinned to, so a deleted registration is never restored as a side effect
-   of registering its name; `restore` stays the explicit path. The same refusal applies to a
-   soft-deleted capability concept.
+5. **A tombstone is not revived.** If a soft-deleted registry row in the owning namespace has the
+   same ASCII-folded name and registry tag, registration refuses and names that row, whether its id
+   is derived or is a legacy minted id. A deleted registration is never restored or replaced as a
+   side effect of registering its name; `restore` stays the explicit path. The same refusal applies
+   to a soft-deleted capability concept with the same folded name, capability type and tag. Rows in
+   another namespace or without the registry or capability tag do not hold that name.
 6. **The capability lookup is an exact query.** `ensure_capability` finds a capability by namespace,
    tag and lowercased name in the query rather than by scanning a bounded listing.
 
@@ -531,6 +532,11 @@ and linked to.
     stays deleted.
 40. A capability is found, not duplicated, when more than 5000 other capabilities exist in the
     namespace.
+41. A soft-deleted legacy registry row with a minted id blocks registration of its folded name;
+    the refusal names that row and no derived-id replacement is inserted. A live legacy row still
+    re-registers onto its existing id, and a derived-id tombstone still refuses.
+42. A soft-deleted legacy capability concept blocks a new concept with its folded name and tag.
+    A tombstone with another tag or in another namespace does not block registration.
 
 ### Alternatives considered
 

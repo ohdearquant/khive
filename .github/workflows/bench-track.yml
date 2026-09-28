@@ -2,8 +2,9 @@ name: Bench Trend Tracking
 
 # Trend tracking for component (Criterion) and e2e (pipeline / bench-1m
 # synthetic) benchmarks. Metric values are advisory: they are appended to
-# bench-data/<suite>.jsonl on `perf-data` and rendered without performance
-# thresholds. Component compile failures, benchmark panics and timeouts fail
+# run-local bench-data/<suite>.jsonl on `perf-data` (numbered shards for
+# components) and rendered without performance thresholds. Component compile
+# failures, benchmark panics and timeouts fail
 # their job after the ledger and raw artifacts have had a chance to publish.
 #
 # Efficiency and coverage:
@@ -45,7 +46,7 @@ env:
 concurrency:
   # A main/release push owns a SHA-specific group so a merge burst cannot
   # replace an older pending data point. The publisher already retries
-  # perf-data push races, so overlapping push runs remain lossless. PR runs
+  # perf-data push races. Exhausted races are advisory incidents. PR runs
   # stay ref-grouped and superseded measurements may be cancelled to avoid
   # wasting runners.
   group: bench-track-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
@@ -126,7 +127,7 @@ jobs:
                 crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
                   packs=true
                   ;;
-                crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
+                crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/ledger_shards.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
                   all_components=true
                   ;;
               esac
@@ -303,7 +304,9 @@ jobs:
           exit 0
 
       - name: Publish ledgers to perf-data branch
+        id: publish
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: bash scripts/perf/publish_ledger.sh bench-data/pipeline.jsonl bench-data/bench-1m.jsonl
 
       - name: Write step summary
@@ -321,8 +324,30 @@ jobs:
             perf/pipeline-ledger.csv
             target/bench-out/SIFT-CI-synthetic.json
             perf/ci-synthetic-ledger.csv
+            bench-data/pipeline.jsonl
+            bench-data/bench-1m.jsonl
           retention-days: 90
           if-no-files-found: ignore
+
+      - name: Warn if trend ledger publish failed (advisory, never fails)
+        if: ${{ !cancelled() && (steps.publish.outputs.publish_status == 'failed' || steps.publish.outcome == 'failure') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          MSG="perf-data publish failed for e2e benches; pipeline and bench-1m ledger records are retained in the run artifact. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "::warning::${MSG}"
+          {
+            echo "## Trend ledger publish failed (advisory)"
+            echo ""
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          TRACKING_ISSUE=863
+          gh issue reopen "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          if ! gh issue comment "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"; then
+            echo "::warning::tracking-issue comment failed (non-fatal)"
+          fi
+          exit 0
 
       # Advisory-lane semantics: see the components job note above. Exit 0.
       - name: Warn if trend ledger record errored (advisory, never fails)
@@ -330,10 +355,17 @@ jobs:
         env:
           PIPELINE_EXIT_CODE: ${{ steps.record_pipeline.outputs.exit_code }}
           BENCH_1M_RECORD_EXIT_CODE: ${{ steps.record_bench_1m.outputs.exit_code }}
+          PUBLISH_STATUS: ${{ steps.publish.outputs.publish_status }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          MSG="bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ "$PUBLISH_STATUS" = failed ] || [ "$PUBLISH_OUTCOME" = failure ]; then
+            LEDGER_NOTE="status=error record(s) are retained in the run artifact; perf-data publish failed."
+          else
+            LEDGER_NOTE="status=error record(s) were still published to perf-data."
+          fi
+          MSG="bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; ${LEDGER_NOTE} Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "::warning::${MSG}"
           {
             echo "## Trend ledger record errored (advisory)"

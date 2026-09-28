@@ -39,6 +39,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["test-internals"] }
 # Test-only: builds the two-backend (secondary + core main) runtime for the
 # ADR-073 concept-tier routing regression tests.
 khive-db = { version = "0.9.0", path = "../khive-db" }
@@ -46,6 +47,7 @@ khive-pack-brain = { version = "0.9.0", path = "../khive-pack-brain" }
 khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
+blake3 = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }

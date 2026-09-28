@@ -100,6 +100,7 @@ async fn refresh_preserves_original_query_in_request() {
         )
         .await
         .unwrap();
+        let fetched_headers = fetched.headers.clone();
         let settled = settle_content(
             &runtime,
             &token,
@@ -112,6 +113,9 @@ async fn refresh_preserves_original_query_in_request() {
         )
         .await
         .unwrap();
+        crate::fetch::persist_get_context(&runtime, &token, &settled, &[], &fetched_headers)
+            .await
+            .unwrap();
         let entity = runtime
             .entities(&token)
             .unwrap()

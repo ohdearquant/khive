@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
+    EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan,
+    VerbRegistry,
 };
 use khive_types::{HandlerDef, Pack};
 
@@ -20,6 +21,7 @@ use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 pub struct CommPack {
     runtime: KhiveRuntime,
     inbox_signal: InboxSignal,
+    quarantine_retention: std::time::Duration,
     /// Instance-bound trusted channel-ingest grant (khive #1839 round 3).
     ///
     /// Previously a process-global `OnceLock` shared by every `CommPack`
@@ -30,6 +32,7 @@ pub struct CommPack {
     /// to `self` so each instance's grant reflects only what was explicitly
     /// given to it.
     channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
+    email_message_id_domains: Result<Option<EmailMessageIdDomains>, String>,
 }
 
 impl Pack for CommPack {
@@ -53,8 +56,23 @@ impl CommPack {
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
+            quarantine_retention: std::time::Duration::from_secs(14 * 24 * 60 * 60),
             channel_ingest: std::sync::OnceLock::new(),
+            email_message_id_domains: EmailMessageIdDomains::from_env(),
         }
+    }
+
+    /// Explicit composition of the selected email channel's domain policy.
+    pub fn new_with_email_message_id_domains(
+        runtime: KhiveRuntime,
+        domains: EmailMessageIdDomains,
+    ) -> Self {
+        Self::new(runtime).with_email_message_id_domains(domains)
+    }
+
+    pub fn with_email_message_id_domains(mut self, domains: EmailMessageIdDomains) -> Self {
+        self.email_message_id_domains = Ok(Some(domains));
+        self
     }
 
     /// Create a new `CommPack` with the trusted channel-ingest capability
@@ -67,6 +85,13 @@ impl CommPack {
         let pack = Self::new(runtime);
         let _ = pack.channel_ingest.set(capability);
         pack
+    }
+
+    /// Set how long a quarantined message and its original-byte attachment
+    /// remain live before the channel poller's expiry pass removes them.
+    pub fn with_quarantine_retention(mut self, retention: std::time::Duration) -> Self {
+        self.quarantine_retention = retention;
+        self
     }
 
     pub(crate) fn runtime(&self) -> &KhiveRuntime {
@@ -84,11 +109,23 @@ impl CommPack {
 ///
 /// `comm.health` interprets quarantine/channel fields as transport evidence;
 /// outbound delivery and inbound thread resolution trust `external_id` as a
-/// transport identity. Generic message creates/updates must not forge any of
-/// these fields. `comm.ingest` writes through the trusted ingest path, while
-/// the internal outbox claim establishes outbound `external_id` later.
-const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug", "external_id"];
+/// transport identity; the outbox keeps a message with an unverifiable stored
+/// Message-ID out of delivery through the `delivery_hold*` fields and links
+/// its diagnostic note through `external_id_diagnostic_note_id`. Generic
+/// message creates/updates must not forge any of these fields. `comm.ingest`
+/// writes through the trusted ingest path, while the internal outbox claim
+/// establishes outbound `external_id` later and the outbox's owner-side hold
+/// establishes the delivery-hold and diagnostic fields.
+const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] = &[
+    "quarantined",
+    "channel_kind",
+    "channel_slug",
+    "external_id",
+    "delivery_hold",
+    "delivery_hold_reason",
+    "delivery_hold_at",
+    "external_id_diagnostic_note_id",
+];
 
 fn transport_owned_message_property_named_in(
     properties: &serde_json::Map<String, Value>,
@@ -107,6 +144,19 @@ fn refuse_transport_owned_message_property(key: &str) -> RuntimeError {
              establish it"
                 .into(),
         );
+    }
+    if matches!(
+        key,
+        "delivery_hold"
+            | "delivery_hold_reason"
+            | "delivery_hold_at"
+            | "external_id_diagnostic_note_id"
+    ) {
+        return RuntimeError::InvalidInput(format!(
+            "`{key}` is transport-owned on a `message` note and cannot be supplied by a generic \
+             record mutation; only the internal outbox owner-side hold may establish \
+             delivery-hold and diagnostic fields"
+        ));
     }
     RuntimeError::InvalidInput(format!(
         "`{key}` is transport-owned on a `message` note and cannot be supplied by a generic \
@@ -359,7 +409,14 @@ impl PackRuntime for CommPack {
             "comm.mark_read" => handlers::handle_mark_read(self.runtime(), token, params).await,
             "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
             "comm.reply" => {
-                handlers::handle_reply(self.runtime(), &self.inbox_signal, token, params).await
+                handlers::handle_reply(
+                    self.runtime(),
+                    &self.inbox_signal,
+                    &self.email_message_id_domains,
+                    token,
+                    params,
+                )
+                .await
             }
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             "comm.ingest" => {
@@ -367,10 +424,15 @@ impl PackRuntime for CommPack {
                     self.runtime(),
                     &self.inbox_signal,
                     self.channel_ingest_capability(),
+                    &self.email_message_id_domains,
                     token,
                     params,
+                    self.quarantine_retention,
                 )
                 .await
+            }
+            "comm.cleanup_expired_quarantine" => {
+                handlers::handle_cleanup_expired_quarantine(self.runtime(), token, params).await
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
@@ -843,5 +905,30 @@ mod message_identity_tests {
                 "error must name {key}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn note_write_refusal_names_the_owner_of_hold_and_ingest_properties() {
+        let hold = derive_message_identity(
+            "message",
+            "lambda:caller",
+            Some(json!({"delivery_hold": "external_id_unverifiable"})),
+        )
+        .expect_err("generic writes must not set an outbox owner-side hold")
+        .to_string();
+        assert!(hold.contains("delivery_hold"), "{hold}");
+        assert!(hold.contains("internal outbox owner-side hold"), "{hold}");
+        assert!(!hold.contains("only `comm.ingest`"), "{hold}");
+
+        let ingest = derive_message_identity(
+            "message",
+            "lambda:caller",
+            Some(json!({"channel_slug": "inbox"})),
+        )
+        .expect_err("generic writes must not set ingest provenance")
+        .to_string();
+        assert!(ingest.contains("channel_slug"), "{ingest}");
+        assert!(ingest.contains("only `comm.ingest`"), "{ingest}");
+        assert!(!ingest.contains("outbox owner-side hold"), "{ingest}");
     }
 }

@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use uuid::Uuid;
 
 use khive_types::Hash32;

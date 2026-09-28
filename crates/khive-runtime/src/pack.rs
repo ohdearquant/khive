@@ -135,7 +135,8 @@ fn resolution_mode_key(mode: IdResolutionMode) -> &'static str {
     }
 }
 
-fn identifier_resolution_help() -> Value {
+/// Shared identifier-resolution contract included in every operation help schema.
+pub fn identifier_resolution_help() -> Value {
     let modes: serde_json::Map<String, Value> = [
         IdResolutionMode::UnscopedById,
         IdResolutionMode::PrefixScopedToPrimary,
@@ -1244,6 +1245,7 @@ impl VerbRegistryBuilder {
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
         validate_unique_entity_types(&ordered_packs)?;
+        validate_entity_type_note_kind_collisions(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
         if activate {
             for pack in &ordered_packs {
@@ -1438,6 +1440,46 @@ fn validate_unique_entity_types(packs: &[Box<dyn PackRuntime>]) -> Result<(), Ru
         .flat_map(|p| p.entity_types().iter().map(move |def| (p.name(), def)));
     khive_types::EntityTypeRegistry::check_extra_collisions(owned_defs)
         .map_err(RuntimeError::InvalidInput)
+}
+
+/// A granular kind token must identify only one substrate after pack composition.
+/// Check aliases too: both subtype and note-kind spellings are normalized at
+/// the request boundary, so a cosmetic spelling difference is still a clash.
+fn validate_entity_type_note_kind_collisions(
+    packs: &[Box<dyn PackRuntime>],
+) -> Result<(), RuntimeError> {
+    let mut note_kinds = HashMap::new();
+    for pack in packs {
+        for &kind in pack.note_kinds() {
+            note_kinds
+                .entry(khive_types::to_snake_case(kind))
+                .or_insert(pack.name());
+        }
+    }
+
+    let check_definition = |definition: &EntityTypeDef, owner: &str| {
+        for name in std::iter::once(definition.type_name).chain(definition.aliases.iter().copied())
+        {
+            let normalized = khive_types::to_snake_case(name);
+            if let Some(note_owner) = note_kinds.get(&normalized) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "entity subtype {name:?} from {owner:?} collides with note kind {normalized:?} from pack {note_owner:?}"
+                )));
+            }
+        }
+        Ok(())
+    };
+
+    let builtin = khive_types::EntityTypeRegistry::builtin();
+    for definition in builtin.definitions() {
+        check_definition(definition, "builtin")?;
+    }
+    for pack in packs {
+        for definition in pack.entity_types() {
+            check_definition(definition, pack.name())?;
+        }
+    }
+    Ok(())
 }
 
 fn find_pack_dependency_cycle(
@@ -4618,6 +4660,8 @@ inventory::collect!(PackRegistration);
 pub enum PackLoadError {
     /// The requested pack name was not found in the inventory.
     UnknownPack(String),
+    /// The requested pack name occurs more than once.
+    DuplicatePack(String),
     /// A pack was requested but a declared dependency is absent from the list.
     MissingDependency {
         /// The pack that declared the dependency.
@@ -4637,6 +4681,7 @@ impl std::fmt::Display for PackLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PackLoadError::UnknownPack(name) => write!(f, "unknown pack {name:?}"),
+            PackLoadError::DuplicatePack(name) => write!(f, "duplicate pack {name:?}"),
             PackLoadError::MissingDependency { pack, dep } => write!(
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
@@ -4705,6 +4750,45 @@ impl PackRegistry {
             .collect()
     }
 
+    /// Validate linked pack names and explicit dependencies without creating
+    /// runtimes, opening stores, or constructing pack instances.
+    ///
+    /// Launchers can use this before publishing ownership. Registration uses
+    /// the same validation, including when extra factories are supplied.
+    pub fn validate_pack_selection(names: &[String]) -> Result<(), PackLoadError> {
+        let all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        Self::validate_pack_selection_from(&all, names)
+    }
+
+    fn validate_pack_selection_from(
+        factories: &[&'static dyn PackFactory],
+        names: &[String],
+    ) -> Result<(), PackLoadError> {
+        let factory_for = |name: &str| factories.iter().copied().find(|f| f.name() == name);
+        let mut requested = std::collections::HashSet::new();
+        for name in names {
+            factory_for(name).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
+            if !requested.insert(name.as_str()) {
+                return Err(PackLoadError::DuplicatePack(name.clone()));
+            }
+        }
+        for name in names {
+            let factory = factory_for(name).unwrap(); // All names were validated above.
+            for &dep in factory.requires() {
+                if !requested.contains(dep) {
+                    return Err(PackLoadError::MissingDependency {
+                        pack: name.clone(),
+                        dep: dep.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register the named packs into `builder` using the supplied `runtime`.
     ///
     /// Validates the explicit pack list against `PackFactory::requires()` —
@@ -4716,7 +4800,7 @@ impl PackRegistry {
     ///
     /// Returns `Ok(())` when all names are recognised and all declared
     /// dependencies are satisfied; returns `Err(PackLoadError)` with a
-    /// distinct variant for unknown pack vs missing dependency.
+    /// distinct variants for unknown or duplicate packs and missing dependencies.
     pub fn register_packs(
         names: &[String],
         runtime: KhiveRuntime,
@@ -4731,25 +4815,7 @@ impl PackRegistry {
             all.iter().copied().find(|f| f.name() == name)
         };
 
-        // Validate that every requested name is a known factory.
-        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
-        for name in names {
-            factory_for(name.as_str()).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
-        }
-
-        // Validate that all requires() dependencies are explicitly present in
-        // the requested set. Missing dep → boot error, not auto-add.
-        for name in names {
-            let factory = factory_for(name.as_str()).unwrap(); // validated above
-            for &dep in factory.requires() {
-                if !requested.contains(dep) {
-                    return Err(PackLoadError::MissingDependency {
-                        pack: name.clone(),
-                        dep: dep.to_string(),
-                    });
-                }
-            }
-        }
+        Self::validate_pack_selection_from(&all, names)?;
 
         // Register every requested pack; VerbRegistryBuilder::build()
         // performs the topo-sort, so insertion order here does not matter.
@@ -4892,22 +4958,7 @@ impl PackRegistry {
             factories.iter().copied().find(|f| f.name() == name)
         };
 
-        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
-        for name in names {
-            factory_for(name.as_str()).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
-        }
-
-        for name in names {
-            let factory = factory_for(name.as_str()).unwrap();
-            for &dep in factory.requires() {
-                if !requested.contains(dep) {
-                    return Err(PackLoadError::MissingDependency {
-                        pack: name.clone(),
-                        dep: dep.to_string(),
-                    });
-                }
-            }
-        }
+        Self::validate_pack_selection_from(factories, names)?;
 
         builder.kg_read_resolver = Some(Arc::new(crate::kg_read::KgReadResolver::new(
             default_runtime,
@@ -5833,6 +5884,92 @@ pub(crate) mod tests {
                 first_field_line: first_field_line.to_string(),
             },
         }
+    }
+
+    // The web macro emits its handler table from concrete declarations.
+    // Count macro entries independently of the census's literal scanner so
+    // an opaque declaration cannot silently disappear from its population.
+    #[test]
+    fn web_macro_handlers_remain_visible_to_admission_census() {
+        struct Declarations(Vec<syn::Ident>);
+        impl syn::parse::Parse for Declarations {
+            fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+                let mut handlers = Vec::new();
+                while !input.is_empty() {
+                    let _: syn::Ident = input.parse()?;
+                    let _: syn::Token![=>] = input.parse()?;
+                    handlers.push(input.parse()?);
+                    let content;
+                    syn::braced!(content in input);
+                    let _: proc_macro2::TokenStream = content.parse()?;
+                }
+                Ok(Self(handlers))
+            }
+        }
+
+        let source = include_str!("../../khive-pack-web/src/vocab.rs");
+        let file = syn::parse_file(source).unwrap();
+        let declarations: Vec<_> = file
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                syn::Item::Macro(item) if item.mac.path.is_ident("web_verbs") => {
+                    Some(syn::parse2::<Declarations>(item.mac.tokens).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "one web handler declaration inventory"
+        );
+        let declared = &declarations[0].0;
+        assert!(
+            !declared.is_empty(),
+            "web macro handler inventory must be nonempty"
+        );
+        for handler in declared {
+            assert_eq!(
+                handler.to_string(),
+                "HandlerDef",
+                "web handler declarations must stay census-visible"
+            );
+        }
+
+        let marker = "HandlerDef {";
+        let mut classified = 0;
+        for (start, _) in source.match_indices(marker) {
+            match classify_handler_def_occurrence(source, start, start + marker.len()) {
+                HandlerDefOccurrence::StructLiteral {
+                    name,
+                    visibility,
+                    category,
+                } => {
+                    assert!(
+                        name.starts_with("web."),
+                        "web handler name must retain its prefix"
+                    );
+                    assert_eq!(
+                        visibility.trim(),
+                        "Visibility::Verb,",
+                        "web handlers must remain public verbs"
+                    );
+                    assert_eq!(
+                        category.trim(),
+                        "VerbCategory::Commissive,",
+                        "web handlers must retain their admission category"
+                    );
+                    classified += 1;
+                }
+                other => panic!("web macro handler declaration is not census-visible: {other:?}"),
+            }
+        }
+        assert_eq!(
+            classified,
+            declared.len(),
+            "every web macro entry must reach the admission census"
+        );
     }
 
     /// khive-oss#2311: before this fix, the live census's per-file
@@ -7381,6 +7518,137 @@ pub(crate) mod tests {
         assert!(
             msg.contains("gamma_report"),
             "collision error must name the colliding entity_type key: {msg}"
+        );
+    }
+
+    #[test]
+    fn entity_subtype_cannot_shadow_a_note_kind_at_composition() {
+        struct CollisionPack;
+        impl Pack for CollisionPack {
+            const NAME: &'static str = "cross_kind_collision";
+            const NOTE_KINDS: &'static [&'static str] = &["reference"];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
+            const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
+                kind: khive_types::EntityKind::Document,
+                type_name: "reference",
+                aliases: &[],
+            }];
+        }
+        #[async_trait]
+        impl PackRuntime for CollisionPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            fn entity_types(&self) -> &'static [EntityTypeDef] {
+                Self::ENTITY_TYPES
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(CollisionPack);
+        let error = builder
+            .build()
+            .err()
+            .expect("a note-kind/entity-subtype collision must refuse composition");
+        let message = error.to_string();
+        assert!(message.contains("entity subtype") && message.contains("note kind"));
+        assert!(message.contains("reference") && message.contains("cross_kind_collision"));
+    }
+
+    #[test]
+    fn builtin_entity_subtype_cannot_shadow_a_note_kind_at_composition() {
+        macro_rules! note_pack {
+            ($name:ident, $pack_name:literal, $note_kind:literal) => {
+                struct $name;
+                impl Pack for $name {
+                    const NAME: &'static str = $pack_name;
+                    const NOTE_KINDS: &'static [&'static str] = &[$note_kind];
+                    const ENTITY_KINDS: &'static [&'static str] = &[];
+                    const HANDLERS: &'static [HandlerDef] = &[];
+                }
+                #[async_trait]
+                impl PackRuntime for $name {
+                    fn name(&self) -> &str {
+                        Self::NAME
+                    }
+                    fn note_kinds(&self) -> &'static [&'static str] {
+                        Self::NOTE_KINDS
+                    }
+                    fn entity_kinds(&self) -> &'static [&'static str] {
+                        Self::ENTITY_KINDS
+                    }
+                    fn handlers(&self) -> &'static [HandlerDef] {
+                        Self::HANDLERS
+                    }
+                    async fn dispatch(
+                        &self,
+                        _verb: &str,
+                        _params: Value,
+                        _registry: &VerbRegistry,
+                        _token: &NamespaceToken,
+                    ) -> Result<Value, RuntimeError> {
+                        Ok(Value::Null)
+                    }
+                }
+            };
+        }
+
+        note_pack!(
+            ResearchReportNotePack,
+            "builtin_report_collision",
+            "research_report"
+        );
+        note_pack!(PreprintNotePack, "builtin_preprint_collision", "preprint");
+        note_pack!(
+            SpacedReportNotePack,
+            "builtin_spaced_collision",
+            "Research Report"
+        );
+
+        fn expect_collision<P: Pack + PackRuntime + 'static>(pack: P, owner: &str, token: &str) {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(pack);
+            let error = builder
+                .build()
+                .err()
+                .expect("a built-in subtype/note-kind collision must refuse composition");
+            let message = error.to_string();
+            assert!(
+                message.contains("builtin")
+                    && message.contains(owner)
+                    && message.contains(token),
+                "collision must name the built-in subtype, note pack, and normalized token: {message}"
+            );
+        }
+        expect_collision(
+            ResearchReportNotePack,
+            "builtin_report_collision",
+            "research_report",
+        );
+        expect_collision(PreprintNotePack, "builtin_preprint_collision", "preprint");
+        expect_collision(
+            SpacedReportNotePack,
+            "builtin_spaced_collision",
+            "research_report",
         );
     }
 

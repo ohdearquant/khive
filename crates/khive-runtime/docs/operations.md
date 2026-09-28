@@ -23,6 +23,19 @@ unconsumed injection.
 
 ## Concurrency and correctness notes
 
+### Legacy create/delete post-commit results
+
+The report-returning runtime create/delete methods return the committed record or
+delete result together with every failed post-commit stage. Older methods keep
+their original Rust return types. If a post-commit stage fails, those methods
+return a structured `RuntimeError::Khive` with `reason=post_commit_degraded`,
+`committed=true`, `retryable=false`, the operation and committed `record_id`,
+and a JSON array in `post_commit_degradations` (each entry has `stage` and
+`error`). Its projected `domain_disposition` is `committed`. The caller must
+reconcile that ID and failed stage rather than repeat the create/delete. The
+report-returning methods remain the preferred API when a caller can handle the
+committed value and diagnostics in one successful result.
+
 ### atomic_hard_delete_with_edge_purge
 
 The endpoint row delete and the incident-edge cascade used to run as two independently-committing

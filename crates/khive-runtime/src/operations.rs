@@ -53,6 +53,19 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
     .into()
 }
 
+/// Inputs for a store-owned entity identity. Unlike ordinary creation, a
+/// competing insert must leave the existing row untouched.
+pub struct EntityClaimSpec {
+    pub id: Uuid,
+    pub kind: String,
+    pub entity_type: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub properties: Option<serde_json::Value>,
+    pub tags: Vec<String>,
+    pub identity_tag: String,
+}
+
 fn live_merged_entity_refused(id: Uuid, kept_id: impl std::fmt::Display) -> RuntimeError {
     KhiveError::conflict(format!(
         "live_merged_entity: {id} is live but still carries merged_into {kept_id}; a row an \
@@ -86,6 +99,70 @@ use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, Atomi
 use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+
+/// A non-retryable failure after a substrate mutation has committed.
+/// Callers can report the committed id/result and this diagnostic together.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostCommitDegradation {
+    pub stage: &'static str,
+    pub error: String,
+}
+
+impl PostCommitDegradation {
+    fn new(stage: &'static str, error: impl ToString) -> Self {
+        Self {
+            stage,
+            error: error.to_string(),
+        }
+    }
+}
+
+fn record_post_commit_degradation(
+    degradations: &mut Vec<PostCommitDegradation>,
+    operation: &'static str,
+    id: Uuid,
+    stage: &'static str,
+    error: impl ToString,
+) {
+    let degradation = PostCommitDegradation::new(stage, error);
+    tracing::warn!(%operation, %id, stage, error = %degradation.error,
+        "substrate mutation committed with post-commit degradation");
+    degradations.push(degradation);
+}
+
+/// Legacy methods cannot return both their original result and the new report.
+/// Give direct callers a typed, non-retryable error with the committed record
+/// handle and every failed stage instead of silently dropping the report.
+fn legacy_post_commit_result<T>(
+    operation: &'static str,
+    id: Uuid,
+    value: T,
+    degradations: Vec<PostCommitDegradation>,
+) -> RuntimeResult<T> {
+    if degradations.is_empty() {
+        return Ok(value);
+    }
+    let failures = serde_json::Value::Array(
+        degradations
+            .iter()
+            .map(|failure| {
+                serde_json::json!({"stage": failure.stage, "error": failure.error.as_str()})
+            })
+            .collect(),
+    );
+    Err(KhiveError::internal(format!(
+        "{operation} committed record {id}, but post-commit work failed; do not retry the mutation; reconcile by record_id"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "post_commit_degraded".to_string()),
+        ("operation", operation.to_string()),
+        ("record_id", id.to_string()),
+        ("committed", "true".to_string()),
+        ("retryable", "false".to_string()),
+        ("post_commit_degradations", failures.to_string()),
+    ]))
+    .into())
+}
 
 // Test-only fault-injection state; see docs/operations.md#fault-injection-static-state.
 #[cfg(test)]
@@ -1110,6 +1187,9 @@ pub(crate) fn merge_dependency_kind(
     tgt_kind: &str,
     metadata: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
+    // JSON null has the same meaning as an omitted metadata argument. All
+    // callers validate the object shape before reaching inference.
+    let metadata = metadata.filter(|value| !value.is_null());
     if let Some(ref m) = metadata {
         if m.get("dependency_kind").is_some() {
             return metadata;
@@ -1142,6 +1222,8 @@ pub fn merge_entry_metadata(
     metadata: Option<serde_json::Value>,
     dependency_kind: Option<String>,
 ) -> RuntimeResult<Option<serde_json::Value>> {
+    validate_metadata_shape(metadata.as_ref())?;
+    let metadata = metadata.filter(|value| !value.is_null());
     let Some(dk) = dependency_kind else {
         return Ok(metadata);
     };
@@ -1178,18 +1260,36 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
     Ok(())
 }
 
+fn validate_metadata_shape(metadata: Option<&serde_json::Value>) -> RuntimeResult<()> {
+    if metadata.is_some_and(|value| !value.is_null() && !value.is_object()) {
+        return Err(RuntimeError::InvalidInput(
+            "metadata must be a JSON object".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate governed edge metadata keys.
 ///
-/// Currently enforces:
-/// - `dependency_kind` is only valid on `depends_on` edges.
-/// - `dependency_kind`, when present, must be one of the governed values.
+/// Enforces object shape, the `depends_on` scope and vocabulary of
+/// `dependency_kind`, and the boolean type of `optional`.
 pub(crate) fn validate_edge_metadata(
     relation: EdgeRelation,
     metadata: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
-    let Some(meta) = metadata else {
+    validate_metadata_shape(metadata)?;
+    let Some(meta) = metadata.filter(|value| !value.is_null()) else {
         return Ok(());
     };
+    let object = meta.as_object().expect("validated metadata object");
+    if object
+        .get("optional")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "metadata.optional must be a boolean".into(),
+        ));
+    }
     if let Some(dk) = meta.get("dependency_kind") {
         if relation != EdgeRelation::DependsOn {
             return Err(RuntimeError::InvalidInput(format!(
@@ -1426,6 +1526,223 @@ impl KhiveRuntime {
         }
     }
 
+    /// Claim a caller-derived entity id without replacing a competing row.
+    /// Index writes are repeatable and never compensate by deleting the claim.
+    pub async fn claim_entity_if_absent(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityClaimSpec,
+    ) -> RuntimeResult<(Entity, bool)> {
+        self.validate_entity_kind(&spec.kind)?;
+        let entity_type =
+            self.validate_entity_type_for_kind(&spec.kind, spec.entity_type.as_deref())?;
+        crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
+        crate::secret_gate::check_at(&spec.name, "entity", "name")?;
+        if let Some(description) = &spec.description {
+            crate::secret_gate::check_at(description, "entity", "description")?;
+        }
+        if let Some(properties) = &spec.properties {
+            crate::secret_gate::check_json_at(properties, "entity", "properties")?;
+        }
+        crate::secret_gate::check_tags_at(&spec.tags, "entity", "tags")?;
+
+        let mut proposed = Entity::new(token.namespace().as_str(), &spec.kind, &spec.name);
+        proposed.id = spec.id;
+        proposed.entity_type = entity_type.clone();
+        proposed.description = spec.description;
+        proposed.properties = spec.properties;
+        proposed.tags = spec.tags;
+
+        let store = self.entities(token)?;
+        let inserted = store.insert_entity_if_absent(proposed.clone()).await?;
+        let entity = if inserted {
+            proposed
+        } else {
+            store
+                .get_entity_including_deleted(spec.id)
+                .await?
+                .ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "entity claim {} lost but the winning row is missing",
+                        spec.id
+                    ))
+                })?
+        };
+        if entity.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity claim {} is soft-deleted; restore it explicitly",
+                entity.id
+            )));
+        }
+        if entity.namespace != token.namespace().as_str()
+            || entity.kind != spec.kind
+            || entity.entity_type.as_deref() != entity_type.as_deref()
+            || !entity.name.eq_ignore_ascii_case(&spec.name)
+            || !entity
+                .tags
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case(&spec.identity_tag))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity claim {} belongs to a different record",
+                entity.id
+            )));
+        }
+
+        self.ensure_claimed_entity_create_event(token, &entity)
+            .await?;
+        self.reindex_claimed_entity(token, &entity).await?;
+        Ok((entity, inserted))
+    }
+
+    /// A claimed row may survive a failed event append. Verify the event before
+    /// a retry can report the row as registered.
+    pub async fn ensure_claimed_entity_create_event(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+    ) -> RuntimeResult<()> {
+        if entity.namespace != token.namespace().as_str() || entity.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity {} is not a live row in the write namespace",
+                entity.id
+            )));
+        }
+        let events = self.events(token).map_err(|error| {
+            RuntimeError::Internal(format!(
+                "entity {} persists but its create event store is unavailable: {error}",
+                entity.id
+            ))
+        })?;
+        let filter = EventFilter {
+            target_id: Some(entity.id),
+            kinds: vec![EventKind::EntityCreated],
+            verbs: vec!["create".into()],
+            substrates: vec![SubstrateKind::Entity],
+            after: Some(entity.created_at.saturating_sub(1)),
+            ..EventFilter::default()
+        };
+        let page = PageRequest {
+            offset: 0,
+            limit: 1,
+        };
+        if !events
+            .query_events(filter.clone(), page.clone())
+            .await?
+            .items
+            .is_empty()
+        {
+            return Ok(());
+        }
+
+        let mut event = Event::new(
+            entity.namespace.clone(),
+            "create",
+            EventKind::EntityCreated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(entity.id)
+        .with_payload(serde_json::json!({
+            "id": entity.id,
+            "namespace": &entity.namespace,
+            "kind": &entity.kind,
+        }));
+        let event_seed = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"khive:claimed-entity-create:v1");
+        let mut event_key = Vec::with_capacity(24);
+        event_key.extend_from_slice(entity.id.as_bytes());
+        event_key.extend_from_slice(&entity.created_at.to_be_bytes());
+        event.id = Uuid::new_v5(&event_seed, &event_key);
+        if let Err(error) = events.append_event(event).await {
+            if events.query_events(filter, page).await?.items.is_empty() {
+                return Err(RuntimeError::Internal(format!(
+                    "entity {} persists but its create event failed: {error}",
+                    entity.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Repair a claimed row after an earlier post-insert indexing failure.
+    /// This path is strict: any failed index stage names the still-live id.
+    pub async fn reindex_claimed_entity(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+    ) -> RuntimeResult<()> {
+        if entity.namespace != token.namespace().as_str() || entity.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity {} is not a live row in the write namespace",
+                entity.id
+            )));
+        }
+        let doc = entity_fts_document(entity);
+        let embed_body = doc.body.clone();
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fts_inject = consume_fault(&FTS_FAIL_NS, &entity.namespace);
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let fts_inject = false;
+        let fts_result = if fts_inject {
+            Err(RuntimeError::Internal("injected FTS failure".into()))
+        } else {
+            match self.text(token) {
+                Ok(text) => text.upsert_document(doc).await.map_err(Into::into),
+                Err(error) => Err(error),
+            }
+        };
+        fts_result.map_err(|error| {
+            RuntimeError::Internal(format!(
+                "entity {} persists but its text index failed: {error}",
+                entity.id
+            ))
+        })?;
+
+        for model_name in self.registered_embedding_model_names() {
+            let outcome = self
+                .embed_document_with_model_outcome_for_token(token, &model_name, &embed_body)
+                .await
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} persists but model {model_name} embedding failed: {error}",
+                        entity.id
+                    ))
+                })?;
+            #[cfg(any(test, feature = "fault-injection"))]
+            let vector_inject = consume_fault(&VECTOR_FAIL_NS, &entity.namespace);
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let vector_inject = false;
+            if vector_inject {
+                return Err(RuntimeError::Internal(format!(
+                    "entity {} persists but model {model_name} vector indexing failed: injected vector failure",
+                    entity.id
+                )));
+            }
+            self.vectors_for_model(token, &model_name)
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} persists but model {model_name} vector store is unavailable: {error}",
+                        entity.id
+                    ))
+                })?
+                .insert(
+                    entity.id,
+                    SubstrateKind::Entity,
+                    &entity.namespace,
+                    "entity.body",
+                    vec![outcome.vector],
+                )
+                .await
+                .map_err(|error| {
+                    RuntimeError::Internal(format!(
+                        "entity {} persists but model {model_name} vector indexing failed: {error}",
+                        entity.id
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Create and persist a new entity.
     ///
     /// Indexing failures trigger compensation across the entity row, FTS
@@ -1447,7 +1764,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
-        Ok(self
+        let (entity, _, degradations) = self
             .create_entity_with_embedding_report_inner(
                 token,
                 kind,
@@ -1458,8 +1775,8 @@ impl KhiveRuntime {
                 tags,
                 Vec::new(),
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result("create_entity", entity.id, entity, degradations)
     }
 
     /// Create an entity with role-keyed bytes already published to `BlobStore`.
@@ -1511,7 +1828,7 @@ impl KhiveRuntime {
             }
         }
         let validated_type = self.validate_entity_type_for_kind(kind, entity_type)?;
-        Ok(self
+        let (entity, _, degradations) = self
             .create_entity_with_embedding_report_inner(
                 token,
                 kind,
@@ -1522,8 +1839,13 @@ impl KhiveRuntime {
                 tags,
                 attachments,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result(
+            "create_entity_with_attachments",
+            entity.id,
+            entity,
+            degradations,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1537,6 +1859,42 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        let (entity, embedding, degradations) = self
+            .create_entity_with_embedding_report_inner(
+                token,
+                kind,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags,
+                Vec::new(),
+            )
+            .await?;
+        legacy_post_commit_result(
+            "create_entity_with_embedding_report",
+            entity.id,
+            (entity, embedding),
+            degradations,
+        )
+    }
+
+    /// The committed entity and its non-retryable post-commit diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_entity_with_post_commit_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+    ) -> RuntimeResult<(
+        Entity,
+        crate::retrieval::EmbeddingTruncationReport,
+        Vec<PostCommitDegradation>,
+    )> {
         self.create_entity_with_embedding_report_inner(
             token,
             kind,
@@ -1561,7 +1919,11 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
         attachments: Vec<NewAttachment>,
-    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+    ) -> RuntimeResult<(
+        Entity,
+        crate::retrieval::EmbeddingTruncationReport,
+        Vec<PostCommitDegradation>,
+    )> {
         self.validate_entity_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan name, description, structured properties, and tags.
@@ -1783,7 +2145,6 @@ impl KhiveRuntime {
         // exist. Deletes and updates already emitted theirs; creates did not,
         // which left the audit trail able to say what left the graph and not
         // what entered it.
-        let event_store = self.events(token)?;
         let created_event = khive_storage::event::Event::new(
             entity.namespace.clone(),
             "create",
@@ -1797,11 +2158,25 @@ impl KhiveRuntime {
             "namespace": entity.namespace,
             "kind": entity.kind,
         }));
-        event_store.append_event(created_event).await.map_err(|e| {
-            RuntimeError::Internal(format!("create_entity: event store write failed: {e}"))
-        })?;
+        let event_result = match self.events(token) {
+            Ok(store) => store
+                .append_event(created_event)
+                .await
+                .map_err(RuntimeError::from),
+            Err(error) => Err(error),
+        };
+        let mut degradations = Vec::new();
+        if let Err(error) = event_result {
+            record_post_commit_degradation(
+                &mut degradations,
+                "create_entity",
+                entity.id,
+                "event_append",
+                error,
+            );
+        }
 
-        Ok((entity, embedding_report))
+        Ok((entity, embedding_report, degradations))
     }
 
     /// Retrieve an entity by ID.
@@ -2666,6 +3041,7 @@ impl KhiveRuntime {
         resurrect: bool,
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
+        validate_edge_metadata(relation, metadata.as_ref())?;
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
@@ -3480,12 +3856,12 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        Ok(self
+        let (note, _, degradations) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result("create_note", note.id, note, degradations)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3510,7 +3886,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        Ok(self
+        let (note, _, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -3523,8 +3899,13 @@ impl KhiveRuntime {
                 annotates,
                 None,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_embedding_content",
+            note.id,
+            note,
+            degradations,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3539,6 +3920,45 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
+        let (note, embedding, degradations) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                embedding_content,
+                salience,
+                None,
+                properties,
+                annotates,
+                None,
+            )
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_embedding_content_and_report",
+            note.id,
+            (note, embedding),
+            degradations,
+        )
+    }
+
+    /// The committed note and its non-retryable post-commit diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_embedding_content_and_post_commit_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        embedding_content: Option<&str>,
+        salience: Option<f64>,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<(
+        Note,
+        crate::retrieval::EmbeddingTruncationReport,
+        Vec<PostCommitDegradation>,
+    )> {
         self.create_note_inner(
             token,
             kind,
@@ -3600,7 +4020,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
-        Ok(self
+        let (note, _, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -3613,8 +4033,13 @@ impl KhiveRuntime {
                 annotates,
                 embedding_model,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_decay_for_embedding_model",
+            note.id,
+            note,
+            degradations,
+        )
     }
 
     /// Insert a note using `INSERT OR IGNORE` semantics for atomic deduplication.
@@ -3645,7 +4070,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, false)
+        self.try_create_note_impl(token, kind, name, content, properties, false, None, None)
             .await
     }
 
@@ -3664,6 +4089,7 @@ impl KhiveRuntime {
     /// exclusively to channel-transport packs. Every other write path uses
     /// `try_create_note`, which rejects those three properties
     /// unconditionally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_create_note_as_trusted_ingest(
         &self,
         _capability: &crate::pack::ChannelIngestCapability,
@@ -3672,9 +4098,47 @@ impl KhiveRuntime {
         name: Option<&str>,
         content: &str,
         properties: Option<serde_json::Value>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, true)
-            .await
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            None,
+            expires_after,
+        )
+        .await
+    }
+
+    /// Publish a trusted inbound message and its original-byte attachment in
+    /// one database transaction. Channel quarantine must not advertise a
+    /// reference in note metadata before GC can see its attachment owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_create_note_as_trusted_ingest_with_attachment(
+        &self,
+        _capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        attachment: NewAttachment,
+        expires_after: Option<std::time::Duration>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            Some(attachment),
+            expires_after,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3686,6 +4150,8 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
         allow_transport_owned_message_properties: bool,
+        attachment: Option<NewAttachment>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3695,6 +4161,23 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json_at(p, "note", "properties")?;
+        }
+        if let Some(ref attachment) = attachment {
+            // The note and its owner row must share the main database. A
+            // secondary pack backend cannot atomically root the reference.
+            drop(self.attachments()?);
+            attachment.validate()?;
+            let blob_store = self.blob_store().ok_or_else(|| {
+                RuntimeError::Unconfigured(
+                    "trusted ingest attachment requires an installed BlobStore".to_string(),
+                )
+            })?;
+            if !blob_store.exists(&attachment.content_ref).await? {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "trusted ingest attachment refers to an unpublished blob: {}",
+                    attachment.content_ref
+                )));
+            }
         }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
@@ -3712,6 +4195,16 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str();
         let mut note = Note::new(ns, kind, content);
+        if let Some(retention) = expires_after {
+            let duration_us = i64::try_from(retention.as_micros()).map_err(|_| {
+                RuntimeError::InvalidInput(
+                    "trusted ingest retention exceeds i64 microseconds".into(),
+                )
+            })?;
+            note.expires_at = Some(note.created_at.checked_add(duration_us).ok_or_else(|| {
+                RuntimeError::InvalidInput("trusted ingest expiry exceeds i64 microseconds".into())
+            })?);
+        }
         if let Some(n) = name {
             note = note.with_name(n);
         }
@@ -3725,7 +4218,21 @@ impl KhiveRuntime {
         // so this reaches storage directly rather than duplicate the check
         // through a wrapper that cannot see the trust decision this function
         // just made.
-        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
+        let inserted = if let Some(attachment) = attachment {
+            self.raw_notes(token)?
+                .try_insert_note_with_attachments(
+                    note.clone(),
+                    vec![Attachment::from_new(
+                        note.id,
+                        AttachmentSubstrate::Note,
+                        attachment,
+                        note.created_at,
+                    )],
+                )
+                .await?
+        } else {
+            self.raw_notes(token)?.try_insert_note(note.clone()).await?
+        };
         if !inserted {
             return Ok(None);
         }
@@ -3812,7 +4319,11 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
-    ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
+    ) -> RuntimeResult<(
+        Note,
+        crate::retrieval::EmbeddingTruncationReport,
+        Vec<PostCommitDegradation>,
+    )> {
         self.validate_note_kind(kind)?;
         // Owned identity properties are derived from the authorization token
         // before anything else touches them, so every caller of this function —
@@ -4074,10 +4585,9 @@ impl KhiveRuntime {
         }
 
         // Create annotates edges, compensating on failure to preserve atomicity.
-        //
         // Pre-validation (above) ensures all targets exist, so link failures are
-        // unexpected. If one occurs: delete any edges already created, then remove
-        // the note, its FTS document, and its vector entry.
+        // unexpected. If one occurs, purge incident edges and the note in one
+        // transaction; a failed purge retains the live note as their source.
         let mut created_edges: Vec<Uuid> = Vec::with_capacity(annotates.len());
 
         // In test builds, iterate with an index so the failure-injection hook can
@@ -4140,14 +4650,33 @@ impl KhiveRuntime {
             match link_result {
                 Ok(edge) => created_edges.push(edge.id.into()),
                 Err(e) => {
-                    // Preserve newer revisions and their edges. Successful
-                    // removal still uses canonical edge cleanup and its audits.
-                    if self.compensate_note_creation(&note).await {
-                        for edge_id in created_edges {
-                            let _ = self.delete_edge(token, edge_id, true).await;
+                    // The graph purge, index cleanup, and note removal share
+                    // one writer transaction. If the edge purge fails, its
+                    // transaction rolls back, preserving a live source note
+                    // for the surviving edges instead of orphaning them.
+                    let edge_ids = created_edges
+                        .iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match self.compensate_note_creation_with_edges(&note).await {
+                        Ok(true) => return Err(e),
+                        Ok(false) => {
+                            return Err(RuntimeError::Internal(format!(
+                                "create_note: annotates link failed: {e}; note {} changed before \
+                                 compensation, retaining its incident edges [{edge_ids}]",
+                                note.id
+                            )));
+                        }
+                        Err(cleanup_error) => {
+                            return Err(RuntimeError::Internal(format!(
+                                "create_note: annotates link failed: {e}; compensation failed \
+                                 for note {} and retained edges [{edge_ids}]: {cleanup_error}; \
+                                 note and edges remain for reconciliation",
+                                note.id
+                            )));
                         }
                     }
-                    return Err(e);
                 }
             }
         }
@@ -4156,7 +4685,6 @@ impl KhiveRuntime {
         // so a rolled-back create leaves no event. This is the single funnel for
         // every note create in the product, which is why the memory pack's own
         // note_created emitter was removed rather than left beside it.
-        let event_store = self.events(token)?;
         let created_event = khive_storage::event::Event::new(
             note.namespace.clone(),
             "create",
@@ -4171,11 +4699,25 @@ impl KhiveRuntime {
             "kind": note.kind,
             "salience": note.salience,
         }));
-        event_store.append_event(created_event).await.map_err(|e| {
-            RuntimeError::Internal(format!("create_note: event store write failed: {e}"))
-        })?;
+        let event_result = match self.events(token) {
+            Ok(store) => store
+                .append_event(created_event)
+                .await
+                .map_err(RuntimeError::from),
+            Err(error) => Err(error),
+        };
+        let mut degradations = Vec::new();
+        if let Err(error) = event_result {
+            record_post_commit_degradation(
+                &mut degradations,
+                "create_note",
+                note.id,
+                "event_append",
+                error,
+            );
+        }
 
-        Ok((note, embedding_report))
+        Ok((note, embedding_report, degradations))
     }
 
     /// List notes visible to the token, optionally filtered by kind.
@@ -5468,16 +6010,31 @@ impl KhiveRuntime {
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
+        let (deleted, degradations) = self
+            .delete_note_with_post_commit_report(token, id, hard)
+            .await?;
+        legacy_post_commit_result("delete_note", id, deleted, degradations)
+    }
+
+    /// Delete the note and return diagnostics for any failed work after the
+    /// row change committed. A degradation is non-retryable: callers must not
+    /// repeat a create or delete because an index or telemetry leg failed.
+    pub async fn delete_note_with_post_commit_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        hard: bool,
+    ) -> RuntimeResult<(bool, Vec<PostCommitDegradation>)> {
         let note_store = self.notes(token)?;
         let note = if hard {
             match note_store.get_note_including_deleted(id).await? {
                 Some(n) => n,
-                None => return Ok(false),
+                None => return Ok((false, Vec::new())),
             }
         } else {
             match note_store.get_note(id).await? {
                 Some(n) => n,
-                None => return Ok(false),
+                None => return Ok((false, Vec::new())),
             }
         };
         if let Some(error) = self.stream_member_error(&note).await? {
@@ -5502,42 +6059,51 @@ impl KhiveRuntime {
         // `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
-            let deleted = self
-                .atomic_hard_delete_with_edge_purge(
-                    note_hard_delete_statement(id),
-                    id,
-                    &record_ns,
-                    &actor,
-                    SubstrateKind::Note,
-                )
-                .await?;
-            self.text_for_notes(&record_tok)?
-                .delete_document(&record_ns, id)
-                .await?;
-            // Scoped delete: iterate over EVERY registered embedding model's
-            // vector store so non-default vectors don't orphan when the note is deleted.
-            for model_name in self.registered_embedding_model_names() {
-                self.vectors_for_model(&record_tok, &model_name)?
-                    .delete(id)
-                    .await?;
-            }
-            deleted
+            self.atomic_hard_delete_with_edge_purge(
+                note_hard_delete_statement(id),
+                id,
+                &record_ns,
+                &actor,
+                SubstrateKind::Note,
+            )
+            .await?
         } else {
-            let deleted = note_store.delete_note(id, mode).await?;
-            if deleted {
-                self.text_for_notes(&record_tok)?
+            note_store.delete_note(id, mode).await?
+        };
+        let mut degradations = Vec::new();
+        if deleted {
+            let fts_result = match self.text_for_notes(&record_tok) {
+                Ok(store) => store
                     .delete_document(&record_ns, id)
-                    .await?;
-                for model_name in self.registered_embedding_model_names() {
-                    self.vectors_for_model(&record_tok, &model_name)?
-                        .delete(id)
-                        .await?;
+                    .await
+                    .map_err(RuntimeError::from),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = fts_result {
+                record_post_commit_degradation(
+                    &mut degradations,
+                    "delete_note",
+                    id,
+                    "fts_cleanup",
+                    error,
+                );
+            }
+            // Try every model even when FTS or another model failed.
+            for model_name in self.registered_embedding_model_names() {
+                let vector_result = match self.vectors_for_model(&record_tok, &model_name) {
+                    Ok(store) => store.delete(id).await.map_err(RuntimeError::from),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = vector_result {
+                    record_post_commit_degradation(
+                        &mut degradations,
+                        "delete_note",
+                        id,
+                        "vector_cleanup",
+                        format!("{model_name}: {error}"),
+                    );
                 }
             }
-            deleted
-        };
-        if deleted {
-            let event_store = self.events(&record_tok)?;
             let event = khive_storage::event::Event::new(
                 record_ns.clone(),
                 "delete",
@@ -5547,9 +6113,19 @@ impl KhiveRuntime {
             )
             .with_target(id)
             .with_payload(serde_json::json!({"id": id, "namespace": record_ns, "hard": hard}));
-            event_store.append_event(event).await.map_err(|e| {
-                RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
-            })?;
+            let event_result = match self.events(&record_tok) {
+                Ok(store) => store.append_event(event).await.map_err(RuntimeError::from),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = event_result {
+                record_post_commit_degradation(
+                    &mut degradations,
+                    "delete_note",
+                    id,
+                    "event_append",
+                    error,
+                );
+            }
             // A soft OR hard delete removes the note's vectors/FTS document
             // above: any pack-owned vector-derived cache (e.g.
             // khive-pack-memory's warm ANN index) needs to know the corpus
@@ -5558,7 +6134,7 @@ impl KhiveRuntime {
             // installed a hook.
             self.fire_note_mutation_hook(&note.kind, id).await;
         }
-        Ok(deleted)
+        Ok((deleted, degradations))
     }
 
     /// Row-first compensating delete for rolling back a partially-written note
@@ -5829,6 +6405,19 @@ impl KhiveRuntime {
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
+        let (deleted, degradations) = self
+            .delete_entity_with_post_commit_report(token, id, hard)
+            .await?;
+        legacy_post_commit_result("delete_entity", id, deleted, degradations)
+    }
+
+    /// The committed delete together with non-retryable index/telemetry errors.
+    pub async fn delete_entity_with_post_commit_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        hard: bool,
+    ) -> RuntimeResult<(bool, Vec<PostCommitDegradation>)> {
         let entity = if hard {
             match self
                 .entities(token)?
@@ -5836,12 +6425,12 @@ impl KhiveRuntime {
                 .await?
             {
                 Some(e) => e,
-                None => return Ok(false),
+                None => return Ok((false, Vec::new())),
             }
         } else {
             match self.entities(token)?.get_entity(id).await? {
                 Some(e) => e,
-                None => return Ok(false),
+                None => return Ok((false, Vec::new())),
             }
         };
         let mode = if hard {
@@ -5862,28 +6451,52 @@ impl KhiveRuntime {
         // `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
-            let deleted = self
-                .atomic_hard_delete_with_edge_purge(
-                    entity_hard_delete_statement(id),
-                    id,
-                    &entity.namespace,
-                    &actor,
-                    SubstrateKind::Entity,
-                )
-                .await?;
             // Cross-backend attachment cleanup requires the registry's ownership check.
-            self.remove_from_indexes(&record_tok, id).await?;
-            deleted
+            self.atomic_hard_delete_with_edge_purge(
+                entity_hard_delete_statement(id),
+                id,
+                &entity.namespace,
+                &actor,
+                SubstrateKind::Entity,
+            )
+            .await?
         } else {
-            let deleted = self.entities(token)?.delete_entity(id, mode).await?;
-            if deleted {
-                self.remove_from_indexes(&record_tok, id).await?;
-            }
-            deleted
+            self.entities(token)?.delete_entity(id, mode).await?
         };
+        let mut degradations = Vec::new();
         if deleted {
-            let event_store = self.events(&record_tok)?;
             let ns = entity.namespace.clone();
+            let fts_result = match self.text(&record_tok) {
+                Ok(store) => store
+                    .delete_document(&ns, id)
+                    .await
+                    .map_err(RuntimeError::from),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = fts_result {
+                record_post_commit_degradation(
+                    &mut degradations,
+                    "delete_entity",
+                    id,
+                    "fts_cleanup",
+                    error,
+                );
+            }
+            for model_name in self.registered_embedding_model_names() {
+                let vector_result = match self.vectors_for_model(&record_tok, &model_name) {
+                    Ok(store) => store.delete(id).await.map_err(RuntimeError::from),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = vector_result {
+                    record_post_commit_degradation(
+                        &mut degradations,
+                        "delete_entity",
+                        id,
+                        "vector_cleanup",
+                        format!("{model_name}: {error}"),
+                    );
+                }
+            }
             let event = khive_storage::event::Event::new(
                 ns.clone(),
                 "delete",
@@ -5893,11 +6506,21 @@ impl KhiveRuntime {
             )
             .with_target(id)
             .with_payload(serde_json::json!({"id": id, "namespace": ns, "hard": hard}));
-            event_store.append_event(event).await.map_err(|e| {
-                RuntimeError::Internal(format!("delete_entity: event store write failed: {e}"))
-            })?;
+            let event_result = match self.events(&record_tok) {
+                Ok(store) => store.append_event(event).await.map_err(RuntimeError::from),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = event_result {
+                record_post_commit_degradation(
+                    &mut degradations,
+                    "delete_entity",
+                    id,
+                    "event_append",
+                    error,
+                );
+            }
         }
-        Ok(deleted)
+        Ok((deleted, degradations))
     }
 
     pub(crate) async fn delete_entity_attachments_on_core(&self, id: Uuid) -> RuntimeResult<bool> {
@@ -6854,6 +7477,7 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        validate_edge_metadata(spec.relation, spec.metadata.as_ref())?;
         let ns_str = match &spec.namespace {
             Some(s) => {
                 let spec_ns = crate::Namespace::parse(s)
@@ -7296,6 +7920,39 @@ mod tests {
             Some(metadata)
         );
         assert_eq!(merge_dependency_kind("concept", "concept", None), None);
+    }
+
+    #[test]
+    fn edge_metadata_requires_object_and_boolean_optional() {
+        for invalid in [
+            serde_json::json!(false),
+            serde_json::json!("text"),
+            serde_json::json!([]),
+        ] {
+            let error = validate_edge_metadata(EdgeRelation::DependsOn, Some(&invalid))
+                .expect_err("scalar or array metadata must be refused");
+            assert!(format!("{error}").contains("metadata must be a JSON object"));
+            assert!(merge_entry_metadata(Some(invalid), None).is_err());
+        }
+
+        let invalid_optional = serde_json::json!({"optional": "false"});
+        let error = validate_edge_metadata(EdgeRelation::DependsOn, Some(&invalid_optional))
+            .expect_err("optional must be boolean");
+        assert!(format!("{error}").contains("metadata.optional"));
+        validate_edge_metadata(
+            EdgeRelation::DependsOn,
+            Some(&serde_json::json!({"optional": false})),
+        )
+        .expect("boolean optional is valid");
+
+        assert_eq!(
+            merge_entry_metadata(Some(serde_json::Value::Null), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            merge_dependency_kind("document", "document", Some(serde_json::Value::Null)),
+            Some(serde_json::json!({"dependency_kind": "normative"}))
+        );
     }
 
     #[test]
@@ -13513,6 +14170,401 @@ mod tests {
             edges_from_t2.is_empty(),
             "no second annotates edge must exist; got {edges_from_t2:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_annotates_edge_cleanup_keeps_the_source_note_and_names_the_edge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let t1 = rt
+            .create_entity(&tok, "concept", None, "cleanup T1", None, None, vec![])
+            .await
+            .unwrap();
+        let t2 = rt
+            .create_entity(&tok, "concept", None, "cleanup T2", None, None, vec![])
+            .await
+            .unwrap();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_annotates_compensation \
+                 BEFORE DELETE ON graph_edges \
+                 WHEN OLD.relation = 'annotates' \
+                 BEGIN SELECT RAISE(ABORT, 'injected edge cleanup failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        LINK_FAIL_AFTER.with(|cell| cell.set(2));
+        let error = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "preserve source on failed cleanup",
+                None,
+                None,
+                vec![t1.id, t2.id],
+            )
+            .await
+            .expect_err("second link and first-edge cleanup must fail");
+        let notes = rt.list_notes(&tok, None, 10, 0).await.unwrap();
+        assert_eq!(notes.len(), 1, "failed cleanup keeps the edge source live");
+        let edges = rt
+            .neighbors(
+                &tok,
+                notes[0].id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        let text = error.to_string();
+        assert!(text.contains("injected edge cleanup failure"), "{text}");
+        assert!(text.contains(&notes[0].id.to_string()), "{text}");
+        assert!(text.contains(&edges[0].edge_id.to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn failed_created_event_reports_committed_entity_and_note_ids() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let (provider, _) = ConstVecProvider::new("created-event-test-model", 4);
+        rt.register_embedder(provider);
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_created_events BEFORE INSERT ON events \
+                 WHEN NEW.kind IN ('entity_created', 'note_created') \
+                 BEGIN SELECT RAISE(ABORT, 'injected created-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let (entity, _, entity_degradations) = rt
+            .create_entity_with_post_commit_report(
+                &tok,
+                "concept",
+                None,
+                "committed entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("event telemetry failure must not conceal a committed entity");
+        assert_eq!(rt.get_entity(&tok, entity.id).await.unwrap().id, entity.id);
+        assert_eq!(entity_degradations.len(), 1);
+        assert_eq!(entity_degradations[0].stage, "event_append");
+        assert!(entity_degradations[0]
+            .error
+            .contains("injected created-event failure"));
+
+        let (note, _, note_degradations) = rt
+            .create_note_with_embedding_content_and_post_commit_report(
+                &tok,
+                "observation",
+                None,
+                "committed note",
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("event telemetry failure must not conceal a committed note");
+        assert_eq!(
+            rt.notes(&tok)
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            note.id
+        );
+        assert_eq!(note_degradations.len(), 1);
+        assert_eq!(note_degradations[0].stage, "event_append");
+        assert!(note_degradations[0]
+            .error
+            .contains("injected created-event failure"));
+    }
+
+    fn assert_legacy_post_commit_error(
+        error: RuntimeError,
+        operation: &str,
+        expected_stages: &[&str],
+    ) -> Uuid {
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("legacy caller lost its typed post-commit signal: {error:?}");
+        };
+        assert_eq!(domain.kind(), khive_types::ErrorKind::Internal);
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(details.get("operation"), Some(operation));
+        assert_eq!(details.get("committed"), Some("true"));
+        assert_eq!(details.get("retryable"), Some("false"));
+        let id = details
+            .get("record_id")
+            .expect("committed id")
+            .parse::<Uuid>()
+            .expect("canonical committed id");
+        let failures: serde_json::Value = serde_json::from_str(
+            details
+                .get("post_commit_degradations")
+                .expect("complete degradation list"),
+        )
+        .expect("degradations are JSON");
+        let stages: Vec<&str> = failures
+            .as_array()
+            .expect("degradation array")
+            .iter()
+            .map(|failure| {
+                assert!(
+                    failure["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("legacy")),
+                    "the original injected failure must remain in the report: {failure:?}"
+                );
+                failure["stage"].as_str().expect("named failure stage")
+            })
+            .collect();
+        assert_eq!(stages, expected_stages);
+        let projected =
+            crate::error_projection::runtime_error_value(error, crate::DomainDisposition::Unknown);
+        assert_eq!(projected["domain_disposition"], "committed");
+        id
+    }
+
+    #[tokio::test]
+    async fn legacy_create_callers_receive_committed_id_and_failed_event_detail() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_legacy_created_events BEFORE INSERT ON events \
+                 WHEN NEW.kind IN ('entity_created', 'note_created') \
+                 BEGIN SELECT RAISE(ABORT, 'legacy created-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let entity_error = rt
+            .create_entity(&tok, "concept", None, "legacy entity", None, None, vec![])
+            .await
+            .expect_err("legacy create_entity must report the committed degradation");
+        let entity_id =
+            assert_legacy_post_commit_error(entity_error, "create_entity", &["event_append"]);
+        assert_eq!(rt.get_entity(&tok, entity_id).await.unwrap().id, entity_id);
+
+        let report_error = rt
+            .create_entity_with_embedding_report(
+                &tok,
+                "concept",
+                None,
+                "legacy report entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("legacy embedding-report wrapper must retain degradation");
+        let report_id = assert_legacy_post_commit_error(
+            report_error,
+            "create_entity_with_embedding_report",
+            &["event_append"],
+        );
+        assert_eq!(rt.get_entity(&tok, report_id).await.unwrap().id, report_id);
+
+        let note_error = rt
+            .create_note(&tok, "observation", None, "legacy note", None, None, vec![])
+            .await
+            .expect_err("legacy create_note must report the committed degradation");
+        let note_id = assert_legacy_post_commit_error(note_error, "create_note", &["event_append"]);
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let decay_error = rt
+            .create_note_with_decay_for_embedding_model(
+                &tok,
+                "observation",
+                None,
+                "legacy decay note",
+                None,
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect_err("legacy decay wrapper must retain degradation");
+        let decay_id = assert_legacy_post_commit_error(
+            decay_error,
+            "create_note_with_decay_for_embedding_model",
+            &["event_append"],
+        );
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(decay_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_callers_receive_committed_id_and_all_failed_cleanup_stages() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "delete legacy entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "delete legacy note",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_legacy_deleted_events BEFORE INSERT ON events \
+                 WHEN NEW.kind IN ('entity_deleted', 'note_deleted') \
+                 BEGIN SELECT RAISE(ABORT, 'legacy deleted-event failure'); END; \
+                 CREATE TRIGGER reject_legacy_note_fts_cleanup BEFORE DELETE ON fts_notes_rowids \
+                 BEGIN SELECT RAISE(ABORT, 'legacy note FTS cleanup failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let note_error = rt
+            .delete_note(&tok, note.id, true)
+            .await
+            .expect_err("legacy delete_note must report committed cleanup failures");
+        let note_id = assert_legacy_post_commit_error(
+            note_error,
+            "delete_note",
+            &["fts_cleanup", "event_append"],
+        );
+        assert_eq!(note_id, note.id);
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let entity_error = rt
+            .delete_entity(&tok, entity.id, true)
+            .await
+            .expect_err("legacy delete_entity must report committed event failure");
+        let entity_id =
+            assert_legacy_post_commit_error(entity_error, "delete_entity", &["event_append"]);
+        assert_eq!(entity_id, entity.id);
+        assert!(matches!(
+            rt.get_entity(&tok, entity.id).await,
+            Err(RuntimeError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_note_fts_failure_still_emits_event_and_invalidates_cache() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "delete with failed FTS cleanup",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&invalidations);
+        rt.install_note_mutation_hook(Arc::new(move |_kind, _id| {
+            let observed = Arc::clone(&observed);
+            Box::pin(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+        // Acquiring a text store recreates a dropped FTS table, so fail the
+        // actual cleanup DML on its ordinary rowid-map sidecar.
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_note_fts_cleanup BEFORE DELETE ON fts_notes_rowids \
+                 BEGIN SELECT RAISE(ABORT, 'injected fts_notes cleanup failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let (deleted, degradations) = rt
+            .delete_note_with_post_commit_report(&tok, note.id, true)
+            .await
+            .expect("a failed index cleanup must not conceal a committed delete");
+        assert!(deleted);
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(degradations.len(), 1);
+        assert_eq!(degradations[0].stage, "fts_cleanup");
+        assert!(degradations[0].error.contains("fts_notes"));
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .is_none());
+        let events = rt
+            .list_events(
+                &tok,
+                EventFilter {
+                    target_id: Some(note.id),
+                    kinds: vec![EventKind::NoteDeleted],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
     }
 
     // Inject an FTS failure after the note row is committed and assert the note
