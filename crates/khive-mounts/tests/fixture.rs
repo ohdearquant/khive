@@ -34,6 +34,21 @@ fn main() {
                 json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}})
             }
             "tools/list" => {
+                let mut catalogs = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{path}.catalogs"))
+                    .unwrap();
+                writeln!(catalogs, "{id}").unwrap();
+                if state["exit_once_during_catalog"] == true
+                    && OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(format!("{path}.exited_once"))
+                        .is_ok()
+                {
+                    std::process::exit(3);
+                }
                 if let Some(delay_ms) = state["catalog_delay_ms"].as_u64() {
                     std::thread::sleep(Duration::from_millis(delay_ms));
                 }

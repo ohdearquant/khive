@@ -48,8 +48,14 @@ struct CallFence<'a> {
 }
 
 impl CallFence<'_> {
-    fn expired(self) -> bool {
-        self.reply.is_closed() || Instant::now() >= self.deadline
+    fn check(self) -> Result<(), Failure> {
+        if self.reply.is_closed() {
+            Err(Failure::error("caller_cancelled"))
+        } else if Instant::now() >= self.deadline {
+            Err(Failure::timeout())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -114,7 +120,7 @@ async fn supervise(config: MountConfig, connection: Connection, mut receiver: mp
             job = receiver.recv() => {
                 let Some(job) = job else { return };
                 let fence = CallFence { reply: &job.reply, deadline: job.deadline };
-                if fence.expired() { continue; }
+                if fence.check().is_err() { continue; }
                 let result = timeout_at(job.deadline, current.perform(&config, job.operation, fence)).await.unwrap_or_else(|_| Err(Failure::timeout()));
                 let fatal = result.as_ref().err().is_some_and(|error| error.fatal);
                 let _ = job.reply.send(result);
@@ -170,8 +176,8 @@ impl Connection {
             return Err(Failure::error("request_too_large"));
         }
         bytes.push(b'\n');
-        if fence.is_some_and(|fence| fence.expired()) {
-            return Err(Failure::timeout());
+        if let Some(fence) = fence {
+            fence.check()?;
         }
         self.stdin
             .write_all(&bytes)
@@ -310,9 +316,7 @@ impl Connection {
         if current.is_none_or(|(generation, _)| generation != definition.generation) {
             return Err(Failure::error("catalog_drift"));
         }
-        if fence.expired() {
-            return Err(Failure::timeout());
-        }
+        fence.check()?;
         let result = self
             .rpc(
                 "tools/call",

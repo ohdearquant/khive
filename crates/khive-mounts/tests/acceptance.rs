@@ -204,6 +204,73 @@ async fn queued_call_expiring_during_catalog_refresh_never_reaches_source() {
 }
 
 #[tokio::test]
+async fn cancelled_during_catalog_refresh_preserves_restart_budget_and_never_calls_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    write_catalog(&path, &["A"], false);
+    let runtime = runtime();
+    let registry = registry(&runtime, config(&path, &["A"]), false).await;
+    let starts = count(&path, ".starts");
+    let catalogs = count(&path, ".catalogs");
+
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["catalog_delay_ms"] = json!(300);
+    fs::write(&path, state.to_string()).unwrap();
+    {
+        let call = registry.dispatch("demo.A", json!({}));
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => panic!("call completed before its catalog refresh: {result:?}"),
+            _ = async {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        if count(&path, ".catalogs") > catalogs {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }).await.expect("fixture must enter the catalog refresh");
+            } => {}
+        }
+    }
+
+    state["catalog_delay_ms"] = Value::Null;
+    fs::write(&path, state.to_string()).unwrap();
+    registry
+        .dispatch("demo.A", json!({}))
+        .await
+        .expect("next call succeeds without restarting the cancelled source");
+    assert_eq!(count(&path, ".calls"), 1, "cancelled call was not sent");
+    assert_eq!(
+        count(&path, ".starts"),
+        starts,
+        "cancellation used no restart"
+    );
+
+    state["exit_once_during_catalog"] = json!(true);
+    fs::write(&path, state.to_string()).unwrap();
+    registry
+        .dispatch("demo.A", json!({}))
+        .await
+        .expect_err("the fixture exits once during catalog refresh");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if count(&path, ".starts") == starts + 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the real child failure retains its restart");
+    registry
+        .dispatch("demo.A", json!({}))
+        .await
+        .expect("one real child failure is recoverable after cancellation");
+    assert_eq!(count(&path, ".calls"), 2);
+}
+
+#[tokio::test]
 async fn gate_denial_has_no_foreign_call_or_additional_process() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
