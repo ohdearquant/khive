@@ -621,6 +621,65 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_publish_failure_is_advisory_and_records_incident(self):
+        for workflow_name, publish_name in (
+            ("bench-component.yml", "Publish ledger to perf-data branch"),
+            ("bench-track.yml", "Publish ledgers to perf-data branch"),
+        ):
+            with self.subTest(workflow=workflow_name):
+                workflow = workflow_text(workflow_name)
+
+                def step(name):
+                    return workflow.split(f"      - name: {name}\n", 1)[1].split("      - name:", 1)[0]
+
+                publish = step(publish_name)
+                warning = step("Warn if trend ledger publish failed (advisory, never fails)")
+                self.assertIn("id: publish", publish)
+                self.assertIn("continue-on-error: true", publish)
+                self.assertIn("steps.publish.outputs.publish_status == 'failed'", warning)
+                self.assertIn("steps.publish.outcome == 'failure'", warning)
+                artifact = step(
+                    "Upload raw Criterion output"
+                    if workflow_name == "bench-component.yml"
+                    else "Upload raw e2e output"
+                )
+                for ledger in (
+                    ("bench-data/components.jsonl",)
+                    if workflow_name == "bench-component.yml"
+                    else ("bench-data/pipeline.jsonl", "bench-data/bench-1m.jsonl")
+                ):
+                    self.assertIn(ledger, artifact)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = pathlib.Path(tmp)
+                    bin_dir = root / "bin"
+                    bin_dir.mkdir()
+                    gh = bin_dir / "gh"
+                    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n')
+                    gh.chmod(0o755)
+                    env = {
+                        **os.environ,
+                        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                        "GH_LOG": str(root / "gh.log"),
+                        "GITHUB_STEP_SUMMARY": str(root / "summary"),
+                        "GITHUB_SERVER_URL": "https://github.com",
+                        "GITHUB_REPOSITORY": "ohdearquant/khive",
+                        "GITHUB_RUN_ID": "12345",
+                        "COMPONENT": "ann-query",
+                    }
+                    script = textwrap.dedent(warning.split("        run: |\n", 1)[1])
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("issue comment 863", (root / "gh.log").read_text())
+                    self.assertIn("perf-data publish failed", (root / "summary").read_text())
+
     def test_component_phases_bound_children_and_report_raw_exit_codes(self):
         workflow = workflow_text("bench-component.yml")
         for phase, name, limit in [
