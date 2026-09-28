@@ -3666,6 +3666,17 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cleanup_preserves_live_incumbent_without_reachable_socket() {
+        // No other test in this process may fork while this fixture briefly
+        // owns a listener: a child that inherits it can keep the socket
+        // reachable after this test drops its own descriptor.
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        assert_eq!(
+            std::env::var("KHIVE_RUNTIME_ISOLATED_TEST").ok().as_deref(),
+            Some("daemon::tests::stale_cleanup_preserves_live_incumbent_without_reachable_socket"),
+            "the stale-listener fixture must run alone in its child process"
+        );
         for socket_exists in [false, true] {
             let dir = tempfile::tempdir().expect("tempdir");
             let sock = dir.path().join("khived.sock");
