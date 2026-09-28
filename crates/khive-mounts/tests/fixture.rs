@@ -33,7 +33,27 @@ fn main() {
             "initialize" => {
                 json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}})
             }
-            "tools/list" => json!({"tools": state["tools"]}),
+            "tools/list" => {
+                let mut catalogs = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{path}.catalogs"))
+                    .unwrap();
+                writeln!(catalogs, "{id}").unwrap();
+                if state["exit_once_during_catalog"] == true
+                    && OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(format!("{path}.exited_once"))
+                        .is_ok()
+                {
+                    std::process::exit(3);
+                }
+                if let Some(delay_ms) = state["catalog_delay_ms"].as_u64() {
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                }
+                json!({"tools": state["tools"]})
+            }
             "tools/call" => {
                 let mut calls = OpenOptions::new()
                     .create(true)
@@ -51,6 +71,7 @@ fn main() {
                         continue;
                     }
                     Some("timeout") => std::thread::sleep(Duration::from_secs(10)),
+                    Some("delay") => std::thread::sleep(Duration::from_millis(300)),
                     Some("malformed") => {
                         println!(
                             "{}",
