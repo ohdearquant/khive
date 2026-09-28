@@ -3,6 +3,10 @@
 Source: `crates/khive-channel-email/src/connector/imap.rs`. Covers how a fetched IMAP page
 is validated and turned into per-message dispositions.
 
+The live poll opens INBOX read-only with `EXAMINE` and fetches bodies with bounded
+`BODY.PEEK[]` requests. Neither operation marks a message Seen; durable UID progress,
+not server read flags, controls retries and checkpoint advancement.
+
 ## `process_selected_page`
 
 Validates a selected page and builds the `SelectedMessage` list, in
