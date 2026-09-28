@@ -154,11 +154,14 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(ChildProcessError):
                 os.waitpid(child.pid, os.WNOHANG)
 
-    def assert_completion_envelope(self, elapsed, *, phase, exchange=0.0, reap=0.0, worker=0.0):
+    def assert_completion_envelope(self, elapsed, *, phase, exchange=0.0, reap=0.0,
+                                   worker=0.0, scheduling_floor=0.0):
         # Cleanup can wait once before killing and once to reap. One additional
-        # largest-budget interval allows scheduling; the watchdog bounds coverage
-        # runs while their process ownership and reaping assertions remain active.
-        envelope = exchange + worker + 2 * reap + max(exchange, reap, worker)
+        # largest-budget interval allows scheduling; a caller may set a fixed
+        # floor when its budget is shorter than hosted-runner scheduling delays.
+        # The watchdog bounds coverage runs while ownership checks remain active.
+        envelope = exchange + worker + 2 * reap + max(exchange, reap, worker,
+                                                       scheduling_floor)
         if "LLVM_PROFILE_FILE" not in os.environ:
             self.assertLess(elapsed, envelope,
                             f"{phase} exceeded completion envelope {envelope:g}s")
@@ -371,7 +374,8 @@ class HarnessTests(unittest.TestCase):
             start = time.monotonic()
             transport.close()
             elapsed = time.monotonic() - start
-            self.assert_completion_envelope(elapsed, phase="independent reap", reap=reap_budget)
+            self.assert_completion_envelope(elapsed, phase="independent reap",
+                                            reap=reap_budget, scheduling_floor=0.5)
             self.assertIsNotNone(proc.returncode, "independent close must reap its child")
             self.assert_reaped()
         finally:
