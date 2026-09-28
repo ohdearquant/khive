@@ -10,7 +10,9 @@ use khive_runtime::{
     VerbRegistry,
 };
 use khive_storage::types::Direction;
-use khive_storage::{Entity, EntityFilter, StorageCapability, StorageError};
+use khive_storage::{
+    Entity, EntityFilter, SqlStatement, SqlValue, StorageCapability, StorageError,
+};
 use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
@@ -179,6 +181,46 @@ async fn find_by_name(
     find_visible_by_name(rt, &own_namespace, name).await
 }
 
+async fn same_name_tombstone(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+    kind: &str,
+    entity_type: Option<&str>,
+    identity_tag: &str,
+) -> Result<Option<Uuid>, RuntimeError> {
+    let mut reader = rt.sql().reader().await?;
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT id FROM entities \
+                  WHERE namespace = ?1 AND kind = ?2 \
+                    AND (?3 IS NULL OR entity_type = ?3) AND deleted_at IS NOT NULL \
+                    AND CAST(lower(name) AS BLOB) = ?4 \
+                    AND EXISTS (SELECT 1 FROM json_each(entities.tags) \
+                                WHERE lower(json_each.value) = ?5) \
+                  ORDER BY created_at DESC, id ASC LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(kind.into()),
+                entity_type.map_or(SqlValue::Null, |value| SqlValue::Text(value.into())),
+                SqlValue::Blob(name.to_ascii_lowercase().into_bytes()),
+                SqlValue::Text(identity_tag.into()),
+            ],
+            label: Some("tool_same_name_tombstone".into()),
+        })
+        .await?;
+    match row.as_ref().and_then(|row| row.get("id")) {
+        None => Ok(None),
+        Some(SqlValue::Text(id)) => Uuid::parse_str(id)
+            .map(Some)
+            .map_err(|_| RuntimeError::Internal("invalid registry tombstone UUID".into())),
+        Some(_) => Err(RuntimeError::Internal(
+            "invalid registry tombstone identity".into(),
+        )),
+    }
+}
+
 async fn find_visible_by_name(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -258,8 +300,23 @@ async fn ensure_capability(
         )
         .await?;
     if let Some(e) = existing.into_iter().next() {
+        rt.ensure_claimed_entity_create_event(token, &e).await?;
         rt.reindex_claimed_entity(token, &e).await?;
         return Ok(e);
+    }
+    if let Some(id) = same_name_tombstone(
+        rt,
+        token,
+        name,
+        "concept",
+        Some("capability"),
+        CAPABILITY_TAG,
+    )
+    .await?
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "capability name {name:?} is soft-deleted at entity {id}; restore it explicitly"
+        )));
     }
     #[cfg(test)]
     pause_before_claim().await;
@@ -373,10 +430,27 @@ async fn register_one(
 
     let (entity, created) = match find_by_name(rt, token, &spec.name).await? {
         Some(existing) => {
+            rt.ensure_claimed_entity_create_event(token, &existing)
+                .await?;
             rt.reindex_claimed_entity(token, &existing).await?;
             (existing, false)
         }
         None => {
+            if let Some(id) = same_name_tombstone(
+                rt,
+                token,
+                &spec.name,
+                REGISTRY_ENTITY_KIND,
+                None,
+                REGISTRY_TAG,
+            )
+            .await?
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "registry name {:?} is soft-deleted at entity {id}; restore it explicitly",
+                    spec.name
+                )));
+            }
             #[cfg(test)]
             pause_before_claim().await;
             let mut props = serde_json::Map::new();

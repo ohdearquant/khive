@@ -1502,38 +1502,79 @@ impl KhiveRuntime {
             )));
         }
 
-        if inserted {
-            let event = Event::new(
-                entity.namespace.clone(),
-                "create",
-                EventKind::EntityCreated,
-                SubstrateKind::Entity,
-                "",
-            )
-            .with_target(entity.id)
-            .with_payload(serde_json::json!({
-                "id": entity.id,
-                "namespace": &entity.namespace,
-                "kind": &entity.kind,
-            }));
-            self.events(token)
-                .map_err(|error| {
-                    RuntimeError::Internal(format!(
-                        "entity {} was claimed but its event store is unavailable: {error}",
-                        entity.id
-                    ))
-                })?
-                .append_event(event)
-                .await
-                .map_err(|error| {
-                    RuntimeError::Internal(format!(
-                        "entity {} was claimed but its create event failed: {error}",
-                        entity.id
-                    ))
-                })?;
-        }
+        self.ensure_claimed_entity_create_event(token, &entity)
+            .await?;
         self.reindex_claimed_entity(token, &entity).await?;
         Ok((entity, inserted))
+    }
+
+    /// A claimed row may survive a failed event append. Verify the event before
+    /// a retry can report the row as registered.
+    pub async fn ensure_claimed_entity_create_event(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+    ) -> RuntimeResult<()> {
+        if entity.namespace != token.namespace().as_str() || entity.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity {} is not a live row in the write namespace",
+                entity.id
+            )));
+        }
+        let events = self.events(token).map_err(|error| {
+            RuntimeError::Internal(format!(
+                "entity {} persists but its create event store is unavailable: {error}",
+                entity.id
+            ))
+        })?;
+        let filter = EventFilter {
+            target_id: Some(entity.id),
+            kinds: vec![EventKind::EntityCreated],
+            verbs: vec!["create".into()],
+            substrates: vec![SubstrateKind::Entity],
+            after: Some(entity.created_at.saturating_sub(1)),
+            ..EventFilter::default()
+        };
+        let page = PageRequest {
+            offset: 0,
+            limit: 1,
+        };
+        if !events
+            .query_events(filter.clone(), page.clone())
+            .await?
+            .items
+            .is_empty()
+        {
+            return Ok(());
+        }
+
+        let mut event = Event::new(
+            entity.namespace.clone(),
+            "create",
+            EventKind::EntityCreated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(entity.id)
+        .with_payload(serde_json::json!({
+            "id": entity.id,
+            "namespace": &entity.namespace,
+            "kind": &entity.kind,
+        }));
+        let event_seed = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"khive:claimed-entity-create:v1");
+        let mut event_key = Vec::with_capacity(24);
+        event_key.extend_from_slice(entity.id.as_bytes());
+        event_key.extend_from_slice(&entity.created_at.to_be_bytes());
+        event.id = Uuid::new_v5(&event_seed, &event_key);
+        if let Err(error) = events.append_event(event).await {
+            if events.query_events(filter, page).await?.items.is_empty() {
+                return Err(RuntimeError::Internal(format!(
+                    "entity {} persists but its create event failed: {error}",
+                    entity.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Repair a claimed row after an earlier post-insert indexing failure.

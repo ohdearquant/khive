@@ -4,7 +4,9 @@ use std::sync::Arc;
 use khive_pack_kg::KgPack;
 use khive_runtime::operations::arm_fts_fail_scoped;
 use khive_runtime::{Namespace, VerbRegistryBuilder};
-use khive_storage::types::DeleteMode;
+use khive_storage::types::{DeleteMode, PageRequest};
+use khive_storage::EventFilter;
+use khive_types::{EventKind, SubstrateKind};
 
 fn fixture() -> (KhiveRuntime, NamespaceToken) {
     let rt = KhiveRuntime::memory().expect("memory runtime");
@@ -186,6 +188,189 @@ async fn minted_legacy_id_wins_and_derived_tombstone_refuses() {
         .expect("tombstone")
         .deleted_at
         .is_some());
+}
+
+#[tokio::test]
+async fn deleted_legacy_id_blocks_same_name_registration() {
+    let (rt, token) = fixture();
+    let name = "deleted legacy row";
+    let legacy = rt
+        .create_entity(
+            &token,
+            REGISTRY_ENTITY_KIND,
+            Some("tool"),
+            name,
+            None,
+            None,
+            vec![REGISTRY_TAG.into(), "tool".into()],
+        )
+        .await
+        .expect("legacy row");
+    let derived = derived_registry_id("object", token.namespace().as_str(), name);
+    assert_ne!(legacy.id, derived);
+    rt.entities(&token)
+        .expect("entity store")
+        .delete_entity(legacy.id, DeleteMode::Soft)
+        .await
+        .expect("soft delete legacy row");
+
+    let error = register_one(&rt, &token, spec("DELETED LEGACY ROW", &[]))
+        .await
+        .expect_err("legacy tombstone must block a new identity");
+    assert!(
+        error.to_string().contains(&legacy.id.to_string()),
+        "{error}"
+    );
+    assert!(rt
+        .get_entity_including_deleted(&token, derived)
+        .await
+        .expect("derived lookup")
+        .is_none());
+}
+
+#[tokio::test]
+async fn tombstones_with_other_tag_or_namespace_do_not_hold_registry_name() {
+    let (rt, token) = fixture();
+    let other_tag = rt
+        .create_entity(
+            &token,
+            REGISTRY_ENTITY_KIND,
+            Some("tool"),
+            "unrelated tag",
+            None,
+            None,
+            vec!["unrelated".into()],
+        )
+        .await
+        .expect("other-tag row");
+    rt.entities(&token)
+        .expect("entity store")
+        .delete_entity(other_tag.id, DeleteMode::Soft)
+        .await
+        .expect("delete other-tag row");
+    let (_, created, _) = register_one(&rt, &token, spec("UNRELATED TAG", &[]))
+        .await
+        .expect("other tag is not registry ownership");
+    assert!(created);
+
+    let other_token = rt
+        .authorize(Namespace::parse("foreign-tool-claims").expect("other namespace"))
+        .expect("other token");
+    let foreign = rt
+        .create_entity(
+            &other_token,
+            REGISTRY_ENTITY_KIND,
+            Some("tool"),
+            "foreign tombstone",
+            None,
+            None,
+            vec![REGISTRY_TAG.into(), "tool".into()],
+        )
+        .await
+        .expect("foreign row");
+    rt.entities(&other_token)
+        .expect("foreign entity store")
+        .delete_entity(foreign.id, DeleteMode::Soft)
+        .await
+        .expect("delete foreign row");
+    let (_, created, _) = register_one(&rt, &token, spec("FOREIGN TOMBSTONE", &[]))
+        .await
+        .expect("other namespace cannot hold the name");
+    assert!(created);
+}
+
+#[tokio::test]
+async fn deleted_legacy_capability_blocks_same_name_claim() {
+    let (rt, token) = fixture();
+    let name = "legacy capability tombstone";
+    let legacy = rt
+        .create_entity(
+            &token,
+            "concept",
+            Some("capability"),
+            name,
+            None,
+            None,
+            vec![CAPABILITY_TAG.into()],
+        )
+        .await
+        .expect("legacy capability");
+    let derived = derived_registry_id("capability", token.namespace().as_str(), name);
+    assert_ne!(legacy.id, derived);
+    rt.entities(&token)
+        .expect("entity store")
+        .delete_entity(legacy.id, DeleteMode::Soft)
+        .await
+        .expect("soft delete capability");
+
+    let error = ensure_capability(&rt, &token, "LEGACY CAPABILITY TOMBSTONE")
+        .await
+        .expect_err("legacy capability tombstone must block a new identity");
+    assert!(
+        error.to_string().contains(&legacy.id.to_string()),
+        "{error}"
+    );
+    assert!(rt
+        .get_entity_including_deleted(&token, derived)
+        .await
+        .expect("derived lookup")
+        .is_none());
+}
+
+#[tokio::test]
+async fn retry_repairs_claimed_row_without_create_event() {
+    let (rt, token) = fixture();
+    let name = "missing create event";
+    let id = derived_registry_id("object", token.namespace().as_str(), name);
+    let mut row = Entity::new(token.namespace().as_str(), REGISTRY_ENTITY_KIND, name)
+        .with_entity_type(Some("tool"))
+        .with_tags(vec![REGISTRY_TAG.into(), "tool".into()]);
+    row.id = id;
+    assert!(rt
+        .entities(&token)
+        .expect("entity store")
+        .insert_entity_if_absent(row)
+        .await
+        .expect("seed row left by failed append"));
+    let events = rt.events(&token).expect("event store");
+    let filter = EventFilter {
+        target_id: Some(id),
+        kinds: vec![EventKind::EntityCreated],
+        verbs: vec!["create".into()],
+        substrates: vec![SubstrateKind::Entity],
+        ..EventFilter::default()
+    };
+    let page = PageRequest {
+        offset: 0,
+        limit: 10,
+    };
+    assert!(events
+        .query_events(filter.clone(), page.clone())
+        .await
+        .expect("event read before retry")
+        .items
+        .is_empty());
+
+    let (registered, created, _) = register_one(&rt, &token, spec(name, &[]))
+        .await
+        .expect("retry completes the claim");
+    assert_eq!(registered.id, id);
+    assert!(!created);
+    let emitted = events
+        .query_events(filter.clone(), page.clone())
+        .await
+        .expect("event read after retry");
+    assert_eq!(emitted.items.len(), 1);
+    assert_eq!(emitted.items[0].payload["id"], json!(id));
+
+    register_one(&rt, &token, spec(name, &[]))
+        .await
+        .expect("idempotent registration");
+    let repeated = events
+        .query_events(filter, page)
+        .await
+        .expect("event read after another retry");
+    assert_eq!(repeated.items.len(), 1);
 }
 
 #[tokio::test]
