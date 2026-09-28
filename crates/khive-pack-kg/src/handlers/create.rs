@@ -13,8 +13,8 @@ use khive_storage::Entity;
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
-    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_specific,
-    remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type,
+    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_entity_type,
+    reconcile_specific, remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered, to_json,
     validate_weight, CreateParams, KindSpec,
 };
 use crate::KgPack;
@@ -156,6 +156,7 @@ impl KgPack {
     async fn prepare_create_fields(
         &self,
         kind: &str,
+        required_entity_type: Option<&str>,
         mut fields: CreateParams,
         args: &mut Value,
         hook: Option<&Arc<dyn KindHook>>,
@@ -189,7 +190,12 @@ impl KgPack {
             if name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
-            let entity_type = validate_entity_type(kind, fields.entity_type.as_deref(), registry)?;
+            let entity_type = reconcile_entity_type(
+                Some(kind),
+                required_entity_type,
+                fields.entity_type.as_deref(),
+                registry,
+            )?;
             let normalized = describe_entity_type_normalization(
                 fields.entity_type.as_deref(),
                 entity_type.as_deref(),
@@ -205,6 +211,7 @@ impl KgPack {
     async fn prepare_bulk_entity(
         &self,
         kind: String,
+        required_entity_type: Option<&str>,
         entry: super::params::BulkCreateEntry,
         token: &NamespaceToken,
         registry: &VerbRegistry,
@@ -255,7 +262,14 @@ impl KgPack {
             fence: None,
         };
         let (fields, normalized) = self
-            .prepare_create_fields(&kind, fields, &mut args, hook.as_ref(), registry)
+            .prepare_create_fields(
+                &kind,
+                required_entity_type,
+                fields,
+                &mut args,
+                hook.as_ref(),
+                registry,
+            )
             .await?;
         if fields.kind != "entity" {
             return Err(RuntimeError::InvalidInput(
@@ -335,7 +349,7 @@ impl KgPack {
             fence: None,
         };
         let (fields, _normalized) = self
-            .prepare_create_fields(&kind, fields, &mut args, hook.as_ref(), registry)
+            .prepare_create_fields(&kind, None, fields, &mut args, hook.as_ref(), registry)
             .await?;
         if fields.kind != "note" {
             return Err(RuntimeError::InvalidInput(
@@ -374,12 +388,15 @@ impl KgPack {
         token: &NamespaceToken,
         registry: &VerbRegistry,
     ) -> Result<PreparedBulkItem, RuntimeError> {
-        let entry: super::params::BulkCreateEntry = serde_json::from_value(raw)
+        let mut entry: super::params::BulkCreateEntry = serde_json::from_value(raw)
             .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
         let item_kind_spec = resolve_kind_spec(&entry.kind, registry)
             .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}")))?;
         match item_kind_spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 if entry.content.is_some() || entry.note_kind.is_some() || entry.salience.is_some()
                 {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -396,8 +413,17 @@ impl KgPack {
                 .ok_or_else(|| RuntimeError::InvalidInput(format!(
                     "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
                 )))?;
+                if entry.entity_type.is_none() {
+                    entry.entity_type = reconcile_entity_type(
+                        Some(&canonical),
+                        entity_type.as_deref(),
+                        None,
+                        registry,
+                    )
+                    .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
+                }
                 let (prepared, normalized) = self
-                    .prepare_bulk_entity(canonical, entry, token, registry)
+                    .prepare_bulk_entity(canonical, entity_type.as_deref(), entry, token, registry)
                     .await
                     .map_err(|error| {
                         RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
@@ -849,7 +875,7 @@ impl KgPack {
         let spec = resolve_kind_spec(&raw_kind, registry)?;
 
         let (sub_kind, hook) = match &spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity { specific, .. } => {
                 let canonical = reconcile_specific(
                     specific.clone(),
                     raw_entity_kind.as_deref(),
@@ -927,12 +953,24 @@ impl KgPack {
         // `CreateParams` intentionally accepts the flavored hook-only keys as
         // unknown fields, so this validates the shared subset without
         // precluding pack-specific input.
-        let fields: CreateParams = deser(params.clone())?;
+        let mut fields: CreateParams = deser(params.clone())?;
+        let required_entity_type = match &spec {
+            KindSpec::Entity { entity_type, .. } => entity_type.as_deref(),
+            _ => None,
+        };
+        if fields.entity_type.is_none() {
+            if let Some(expected) = required_entity_type {
+                fields.entity_type =
+                    reconcile_entity_type(sub_kind.as_deref(), Some(expected), None, registry)?;
+                params["entity_type"] = json!(fields.entity_type.as_deref());
+            }
+        }
         let (p, entity_type_normalized) = self
             .prepare_create_fields(
                 sub_kind
                     .as_deref()
                     .expect("create kind canonicalized above"),
+                required_entity_type,
                 fields,
                 &mut params,
                 hook.as_ref(),

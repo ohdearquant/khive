@@ -1110,6 +1110,9 @@ pub(crate) fn merge_dependency_kind(
     tgt_kind: &str,
     metadata: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
+    // JSON null has the same meaning as an omitted metadata argument. All
+    // callers validate the object shape before reaching inference.
+    let metadata = metadata.filter(|value| !value.is_null());
     if let Some(ref m) = metadata {
         if m.get("dependency_kind").is_some() {
             return metadata;
@@ -1142,6 +1145,8 @@ pub fn merge_entry_metadata(
     metadata: Option<serde_json::Value>,
     dependency_kind: Option<String>,
 ) -> RuntimeResult<Option<serde_json::Value>> {
+    validate_metadata_shape(metadata.as_ref())?;
+    let metadata = metadata.filter(|value| !value.is_null());
     let Some(dk) = dependency_kind else {
         return Ok(metadata);
     };
@@ -1178,18 +1183,36 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
     Ok(())
 }
 
+fn validate_metadata_shape(metadata: Option<&serde_json::Value>) -> RuntimeResult<()> {
+    if metadata.is_some_and(|value| !value.is_null() && !value.is_object()) {
+        return Err(RuntimeError::InvalidInput(
+            "metadata must be a JSON object".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate governed edge metadata keys.
 ///
-/// Currently enforces:
-/// - `dependency_kind` is only valid on `depends_on` edges.
-/// - `dependency_kind`, when present, must be one of the governed values.
+/// Enforces object shape, the `depends_on` scope and vocabulary of
+/// `dependency_kind`, and the boolean type of `optional`.
 pub(crate) fn validate_edge_metadata(
     relation: EdgeRelation,
     metadata: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
-    let Some(meta) = metadata else {
+    validate_metadata_shape(metadata)?;
+    let Some(meta) = metadata.filter(|value| !value.is_null()) else {
         return Ok(());
     };
+    let object = meta.as_object().expect("validated metadata object");
+    if object
+        .get("optional")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "metadata.optional must be a boolean".into(),
+        ));
+    }
     if let Some(dk) = meta.get("dependency_kind") {
         if relation != EdgeRelation::DependsOn {
             return Err(RuntimeError::InvalidInput(format!(
@@ -2666,6 +2689,7 @@ impl KhiveRuntime {
         resurrect: bool,
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
+        validate_edge_metadata(relation, metadata.as_ref())?;
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
@@ -6854,6 +6878,7 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        validate_edge_metadata(spec.relation, spec.metadata.as_ref())?;
         let ns_str = match &spec.namespace {
             Some(s) => {
                 let spec_ns = crate::Namespace::parse(s)
@@ -7296,6 +7321,39 @@ mod tests {
             Some(metadata)
         );
         assert_eq!(merge_dependency_kind("concept", "concept", None), None);
+    }
+
+    #[test]
+    fn edge_metadata_requires_object_and_boolean_optional() {
+        for invalid in [
+            serde_json::json!(false),
+            serde_json::json!("text"),
+            serde_json::json!([]),
+        ] {
+            let error = validate_edge_metadata(EdgeRelation::DependsOn, Some(&invalid))
+                .expect_err("scalar or array metadata must be refused");
+            assert!(format!("{error}").contains("metadata must be a JSON object"));
+            assert!(merge_entry_metadata(Some(invalid), None).is_err());
+        }
+
+        let invalid_optional = serde_json::json!({"optional": "false"});
+        let error = validate_edge_metadata(EdgeRelation::DependsOn, Some(&invalid_optional))
+            .expect_err("optional must be boolean");
+        assert!(format!("{error}").contains("metadata.optional"));
+        validate_edge_metadata(
+            EdgeRelation::DependsOn,
+            Some(&serde_json::json!({"optional": false})),
+        )
+        .expect("boolean optional is valid");
+
+        assert_eq!(
+            merge_entry_metadata(Some(serde_json::Value::Null), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            merge_dependency_kind("document", "document", Some(serde_json::Value::Null)),
+            Some(serde_json::json!({"dependency_kind": "normative"}))
+        );
     }
 
     #[test]
