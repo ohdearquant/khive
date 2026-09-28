@@ -828,6 +828,10 @@ impl StorageBackend {
         // Ensure sqlite-vec is registered before creating vec0 tables.
         crate::extension::ensure_extensions_loaded();
 
+        // Direct store construction may precede migrations. Leave the
+        // provenance sidecar to its versioned migration; vector operations
+        // tolerate its absence until the ledger advances.
+
         if self.is_read_only() {
             // Snapshot inspection must not check schema through the pool's
             // query-only writer slot: even a SELECT there is a writer-class
@@ -887,14 +891,6 @@ impl StorageBackend {
         writer
             .conn()
             .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
-        // A direct StorageBackend::vectors() caller can create a vec0 table
-        // without running migrations first. Its vector writes still maintain
-        // provenance in the same transaction, so install V43's exact schema
-        // on that constructor path as well.
-        writer
-            .conn()
-            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)?;
-
         // Create missing vec0 tables without changing existing vector data.
         for (model_key, dimensions) in models {
             let ddl = format!(
@@ -1787,16 +1783,22 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "vectors")]
-    async fn vectors_direct_store_creates_provenance_sidecar() {
+    async fn vectors_direct_store_leaves_provenance_to_migration() {
         let backend = StorageBackend::memory().unwrap();
+        {
+            let reader = backend.pool.reader().unwrap();
+            assert!(!sqlite_table_exists(reader.conn(), "vector_provenance").unwrap());
+            assert_eq!(
+                crate::migrations::read_schema_version(reader.conn()).unwrap(),
+                0
+            );
+        }
         let store = backend
             .vectors("direct_provenance", "direct_provenance", 3)
             .unwrap();
         let reader = backend.pool.reader().unwrap();
-        assert!(
-            sqlite_table_exists(reader.conn(), "vector_provenance").unwrap(),
-            "the direct vector-store constructor must install V43's sidecar"
-        );
+        assert!(!sqlite_table_exists(reader.conn(), "vector_provenance").unwrap());
+        assert!(!sqlite_table_exists(reader.conn(), "_schema_migrations").unwrap());
         drop(reader);
 
         let id = uuid::Uuid::new_v4();
@@ -1814,6 +1816,53 @@ mod tests {
         assert_eq!(provenance.embedding_model, "direct_provenance");
         assert_eq!(provenance.text_fingerprint, None);
         assert_eq!(provenance.updated_at, None);
+        assert!(store.delete(id).await.unwrap());
+        assert!(store.provenance(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "vectors")]
+    async fn vectors_after_lazy_notes_and_events_schema_stay_unmigrated() {
+        let backend = StorageBackend::memory().unwrap();
+        backend.notes().unwrap();
+        backend.events().unwrap();
+        {
+            let reader = backend.pool.reader().unwrap();
+            let note_key_columns: u32 = reader
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_xinfo('notes') WHERE name = 'key'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(note_key_columns, 1);
+            assert_eq!(
+                crate::migrations::read_schema_version(reader.conn()).unwrap(),
+                0
+            );
+        }
+
+        let store = backend.vectors("after_notes", "after_notes", 3).unwrap();
+        let id = uuid::Uuid::new_v4();
+        store
+            .insert(
+                id,
+                khive_types::SubstrateKind::Entity,
+                "local",
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
+            )
+            .await
+            .unwrap();
+        let provenance = store.provenance(id).await.unwrap().unwrap();
+        assert_eq!(provenance.embedding_model, "after_notes");
+        assert_eq!(provenance.text_fingerprint, None);
+        assert_eq!(provenance.updated_at, None);
+
+        let reader = backend.pool.reader().unwrap();
+        assert!(!sqlite_table_exists(reader.conn(), "vector_provenance").unwrap());
+        assert!(!sqlite_table_exists(reader.conn(), "_schema_migrations").unwrap());
     }
 
     #[tokio::test]

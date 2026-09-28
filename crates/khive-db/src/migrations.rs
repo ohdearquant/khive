@@ -221,8 +221,7 @@ pub const ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL: &str = V12_UP;
 pub const ANN_CONSUMER_PENDING_DDL: &str = include_str!("../sql/ann-consumer-pending-ddl.sql");
 
 /// Sidecar DDL registered in the migration ledger. Direct vector-store
-/// construction applies this same idempotent schema when the caller has not
-/// run migrations; production startup still records V43 in the ledger.
+/// construction leaves this schema to the versioned migration.
 pub const VECTOR_PROVENANCE_DDL: &str = V43_UP;
 
 /// DDL for the `_embedding_models` registry table.

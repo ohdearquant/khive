@@ -44,16 +44,34 @@ pub(crate) fn delete_vector_statement(
     }
 }
 
-fn provenance_read_sql(table: &str) -> String {
-    format!(
-        "SELECT v.embedding_model, v.field, v.embedding, p.embedding_digest, \
-                p.text_fingerprint, p.updated_at \
-         FROM {table} AS v \
-         LEFT JOIN vector_provenance AS p \
-           ON p.model_key = ?1 AND p.subject_id = v.subject_id \
-          AND p.namespace = v.namespace \
-         WHERE v.subject_id = ?2 AND v.namespace = ?3"
+fn provenance_sidecar_exists(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vector_provenance'",
+        [],
+        |row| row.get::<_, i64>(0),
     )
+    .optional()
+    .map(|row| row.is_some())
+}
+
+fn provenance_read_sql(table: &str, has_sidecar: bool) -> String {
+    if has_sidecar {
+        format!(
+            "SELECT v.embedding_model, v.field, v.embedding, p.embedding_digest, \
+                    p.text_fingerprint, p.updated_at \
+             FROM {table} AS v \
+             LEFT JOIN vector_provenance AS p \
+               ON p.model_key = ?1 AND p.subject_id = v.subject_id \
+              AND p.namespace = v.namespace \
+             WHERE v.subject_id = ?2 AND v.namespace = ?3"
+        )
+    } else {
+        format!(
+            "SELECT v.embedding_model, v.field, v.embedding, NULL, NULL, NULL \
+             FROM {table} AS v \
+             WHERE v.subject_id = ?1 AND v.namespace = ?2"
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,36 +608,38 @@ fn replace_vector_row_dml(
         ],
     )?;
 
-    let model_key = table
-        .strip_prefix("vec_")
-        .expect("vector table names use the vec_ prefix");
-    // Bind provenance to the bytes the live vec0 table exposes, rather than
-    // assuming its read representation matches the input slice's layout.
-    let stored_embedding: Vec<u8> = conn.query_row(
-        &format!("SELECT embedding FROM {table} WHERE subject_id = ?1 AND namespace = ?2"),
-        rusqlite::params![&subject_id, row.namespace],
-        |stored| stored.get(0),
-    )?;
-    let embedding_digest = blake3::hash(&stored_embedding).to_hex().to_string();
-    let updated_at = row.updated_at.map(DateTime::to_rfc3339);
-    conn.execute(
-        "INSERT INTO vector_provenance \
-         (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(model_key, subject_id) DO UPDATE SET \
-         namespace = excluded.namespace, \
-         embedding_digest = excluded.embedding_digest, \
-         text_fingerprint = excluded.text_fingerprint, \
-         updated_at = excluded.updated_at",
-        rusqlite::params![
-            model_key,
-            &subject_id,
-            row.namespace,
-            embedding_digest,
-            row.text_fingerprint.map(ContentRef::as_str),
-            updated_at,
-        ],
-    )?;
+    if provenance_sidecar_exists(conn)? {
+        let model_key = table
+            .strip_prefix("vec_")
+            .expect("vector table names use the vec_ prefix");
+        // Bind provenance to the bytes the live vec0 table exposes, rather than
+        // assuming its read representation matches the input slice's layout.
+        let stored_embedding: Vec<u8> = conn.query_row(
+            &format!("SELECT embedding FROM {table} WHERE subject_id = ?1 AND namespace = ?2"),
+            rusqlite::params![&subject_id, row.namespace],
+            |stored| stored.get(0),
+        )?;
+        let embedding_digest = blake3::hash(&stored_embedding).to_hex().to_string();
+        let updated_at = row.updated_at.map(DateTime::to_rfc3339);
+        conn.execute(
+            "INSERT INTO vector_provenance \
+             (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(model_key, subject_id) DO UPDATE SET \
+             namespace = excluded.namespace, \
+             embedding_digest = excluded.embedding_digest, \
+             text_fingerprint = excluded.text_fingerprint, \
+             updated_at = excluded.updated_at",
+            rusqlite::params![
+                model_key,
+                &subject_id,
+                row.namespace,
+                embedding_digest,
+                row.text_fingerprint.map(ContentRef::as_str),
+                updated_at,
+            ],
+        )?;
+    }
 
     if record_ann_delta {
         // Delta record for the ANN restart classifier; rides the caller's
@@ -665,6 +685,9 @@ fn delete_vector_provenance(
     subject_ids: &[String],
 ) -> Result<(), rusqlite::Error> {
     if subject_ids.is_empty() {
+        return Ok(());
+    }
+    if !provenance_sidecar_exists(conn)? {
         return Ok(());
     }
     let model_key = table
@@ -1173,61 +1196,66 @@ impl VectorStore for SqliteVecStore {
         let model_key = self.model_key.clone();
         let namespace = self.namespace.clone();
         self.with_reader("vec_provenance", move |conn| {
-            let sql = provenance_read_sql(&table);
-            conn.query_row(
-                &sql,
-                rusqlite::params![model_key, subject_id.to_string(), namespace],
-                |row| {
-                    let embedding_model = row.get(0)?;
-                    let field = row.get(1)?;
-                    let live_embedding: Vec<u8> = row.get(2)?;
-                    let stored_digest: Option<String> = row.get(3)?;
-                    let live_digest = blake3::hash(&live_embedding).to_hex().to_string();
-                    if stored_digest.as_deref() != Some(live_digest.as_str()) {
-                        return Ok(VectorProvenance {
-                            embedding_model,
-                            field,
-                            text_fingerprint: None,
-                            updated_at: None,
-                        });
-                    }
-                    let fingerprint: Option<String> = row.get(4)?;
-                    let text_fingerprint = fingerprint
-                        .map(|raw| {
-                            ContentRef::from_hex(raw).map_err(|message| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    4,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        message,
-                                    )),
-                                )
-                            })
-                        })
-                        .transpose()?;
-                    let timestamp: Option<String> = row.get(5)?;
-                    let updated_at = timestamp
-                        .map(|raw| {
-                            DateTime::parse_from_rfc3339(&raw)
-                                .map(|value| value.with_timezone(&Utc))
-                                .map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        5,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                })
-                        })
-                        .transpose()?;
-                    Ok(VectorProvenance {
+            let has_sidecar = provenance_sidecar_exists(conn)?;
+            let sql = provenance_read_sql(&table, has_sidecar);
+            let subject_id = subject_id.to_string();
+            let with_sidecar: [&dyn rusqlite::ToSql; 3] = [&model_key, &subject_id, &namespace];
+            let without_sidecar: [&dyn rusqlite::ToSql; 2] = [&subject_id, &namespace];
+            let params: &[&dyn rusqlite::ToSql] = if has_sidecar {
+                &with_sidecar
+            } else {
+                &without_sidecar
+            };
+            conn.query_row(&sql, params, |row| {
+                let embedding_model = row.get(0)?;
+                let field = row.get(1)?;
+                let live_embedding: Vec<u8> = row.get(2)?;
+                let stored_digest: Option<String> = row.get(3)?;
+                let live_digest = blake3::hash(&live_embedding).to_hex().to_string();
+                if stored_digest.as_deref() != Some(live_digest.as_str()) {
+                    return Ok(VectorProvenance {
                         embedding_model,
                         field,
-                        text_fingerprint,
-                        updated_at,
+                        text_fingerprint: None,
+                        updated_at: None,
+                    });
+                }
+                let fingerprint: Option<String> = row.get(4)?;
+                let text_fingerprint = fingerprint
+                    .map(|raw| {
+                        ContentRef::from_hex(raw).map_err(|message| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    message,
+                                )),
+                            )
+                        })
                     })
-                },
-            )
+                    .transpose()?;
+                let timestamp: Option<String> = row.get(5)?;
+                let updated_at = timestamp
+                    .map(|raw| {
+                        DateTime::parse_from_rfc3339(&raw)
+                            .map(|value| value.with_timezone(&Utc))
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    5,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Ok(VectorProvenance {
+                    embedding_model,
+                    field,
+                    text_fingerprint,
+                    updated_at,
+                })
+            })
             .optional()
         })
         .await
@@ -5586,7 +5614,7 @@ mod provenance_tests {
     ) -> i64 {
         let sql = format!(
             "SELECT COUNT(embedding_digest) FROM ({})",
-            provenance_read_sql(table)
+            provenance_read_sql(table, true)
         );
         conn.query_row(
             &sql,
