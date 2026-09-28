@@ -97,4 +97,97 @@ mod tests {
         assert!(cache.join("edges.ndjson").exists(), "edges.ndjson in cache");
         assert!(cache.join("meta.json").exists(), "meta.json in cache");
     }
+
+    #[tokio::test]
+    async fn fetch_protects_cache_with_legacy_parent_gitignore() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let remote_url = make_git_remote_for_kg(remote_dir.path());
+        run_git(repo_dir.path(), &["init", "--quiet"]);
+        let kg_dir = repo_dir.path().join(".khive/kg");
+        std::fs::create_dir_all(&kg_dir).unwrap();
+        std::fs::write(
+            repo_dir.path().join(".khive/.gitignore"),
+            "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\n",
+        )
+        .unwrap();
+        std::fs::write(kg_dir.join("entities.ndjson"), "local export\n").unwrap();
+        let before = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.excludesFile=/dev/null",
+                "check-ignore",
+                "--no-index",
+                "-q",
+                "--",
+                ".khive/kg/remotes/upstream/meta.json",
+            ])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            before.status.code(),
+            Some(1),
+            "the old parent rule alone leaves the cache trackable"
+        );
+
+        cmd_fetch(FetchArgs {
+            remote: "upstream".to_string(),
+            repo: repo_dir.path().to_path_buf(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: None,
+            repin: false,
+        })
+        .await
+        .unwrap();
+
+        let remotes = kg_dir.join("remotes");
+        assert_eq!(
+            std::fs::read_to_string(remotes.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        let backup = remotes.join("upstream.replaced~4242");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join(".khive-backup-owner"), "test marker\n").unwrap();
+
+        for relative in [
+            ".khive/kg/remotes/upstream/meta.json",
+            ".khive/kg/remotes/upstream.replaced~4242/.khive-backup-owner",
+        ] {
+            let check = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.excludesFile=/dev/null",
+                    "check-ignore",
+                    "--no-index",
+                    "-q",
+                    "--",
+                    relative,
+                ])
+                .current_dir(repo_dir.path())
+                .output()
+                .unwrap();
+            assert!(check.status.success(), "{relative} must be ignored");
+        }
+        let export_check = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.excludesFile=/dev/null",
+                "check-ignore",
+                "--no-index",
+                "-q",
+                "--",
+                ".khive/kg/entities.ndjson",
+            ])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            export_check.status.code(),
+            Some(1),
+            "KG export remains trackable"
+        );
+    }
 }
