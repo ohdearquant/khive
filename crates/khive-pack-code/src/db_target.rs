@@ -177,6 +177,10 @@ fn protected_store_members(base: &Path) -> Result<Vec<PathBuf>, String> {
         if physical.as_path() != base {
             bases.push(physical);
         }
+    } else {
+        // A missing final symlink target still names the database SQLite will
+        // create; protect its companions beside that destination as well.
+        bases.extend(target_spellings(base)?.into_iter().skip(1));
     }
     let mut members = Vec::new();
     for spelling in &bases {
@@ -398,6 +402,54 @@ mod tests {
             "{error}"
         );
         assert_eq!(std::fs::read(&physical_wal).unwrap(), b"wal sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_backend_physical_wal_companion_is_protected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let physical = tmp.path().join("physical.db");
+        let declared = tmp.path().join("declared.db");
+        let physical_wal = append_sqlite_suffix(&physical, "-wal");
+        std::fs::write(&physical_wal, b"wal sentinel").unwrap();
+        std::os::unix::fs::symlink(&physical, &declared).unwrap();
+        assert!(!physical.exists());
+
+        let error = resolve_target_db(
+            Some(physical_wal.to_str().unwrap()),
+            tmp.path(),
+            None,
+            &[declared],
+        )
+        .expect_err("a dangling backend must protect the physical WAL companion");
+        assert!(
+            error.contains(&physical_wal.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&physical_wal).unwrap(), b"wal sentinel");
+        assert!(!physical.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_production_backend_and_default_map_share_destination_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let physical = tmp.path().join("physical.db");
+        let declared = tmp.path().join("declared.db");
+        std::os::unix::fs::symlink(&physical, &declared).unwrap();
+
+        let ingest = tmp.path().join("source");
+        let default_dir = ingest.join(".khive");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_map = default_dir.join("code-map.db");
+        std::os::unix::fs::symlink(&physical, &default_map).unwrap();
+        assert!(!physical.exists());
+
+        let error = resolve_target_db(None, &ingest, Some(&declared), &[])
+            .expect_err("a default map must not create a dangling production destination");
+        assert!(error.contains(&physical.display().to_string()), "{error}");
+        assert!(!physical.exists());
+        assert_eq!(std::fs::read_link(&default_map).unwrap(), physical);
     }
 
     #[cfg(unix)]
