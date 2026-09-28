@@ -1011,15 +1011,19 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("edit section writer", e))?;
 
             if existing_section.is_some() {
-                // Identical content already stored: refresh metadata only. Content
-                // is unchanged, so the embedding and verification status stay valid.
+                // Identical content already stored: refresh mutable metadata while
+                // preserving verification status. The embedding input includes the
+                // heading, so invalidate the vector only when that text changes;
+                // the incremental section pass below fills the NULL embedding.
                 writer
                     .execute(SqlStatement {
                         sql: "UPDATE knowledge_sections SET \
-                              heading=?1, tokens=?2, sort_order=?3, updated_at=?4 \
-                              WHERE id=?5"
+                              section_type=?1, heading=?2, tokens=?3, sort_order=?4, \
+                              embedding=CASE WHEN heading = ?2 THEN embedding ELSE NULL END, \
+                              updated_at=?5 WHERE id=?6"
                             .into(),
                         params: vec![
+                            SqlValue::Text(stype.as_str().to_string()),
                             SqlValue::Text(heading.clone()),
                             SqlValue::Integer(tokens),
                             SqlValue::Integer(sort_order),
@@ -1070,10 +1074,11 @@ impl KnowledgeHandlers {
             }));
         }
 
-        // Inline re-embed: newly-inserted section rows (embedding IS NULL) are embedded
-        // via the shared embed_sections path so the hybrid section-cosine read path
-        // (ADR-051) is fresh without a manual reindex. Byte-identical sections go
-        // through the metadata-only UPDATE branch above and keep their existing vector.
+        // Inline re-embed: newly inserted sections and unchanged-body sections
+        // whose heading changed have NULL embeddings and are embedded through
+        // the shared path. Byte-identical content with an unchanged heading
+        // retains its vector. The hybrid section-cosine path is then fresh
+        // without a manual reindex (ADR-051).
         // The Vamana ANN snapshot rebuild is deferred (per-edit cost too high);
         // approximate ANN recall over new vectors lags until the next kkernel reindex.
         // Missing embedder: embed_sections returns zero counters and an empty
