@@ -44,7 +44,7 @@ include = ["name", "description"]
 strict = true
 "#;
 
-const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\n!khive.toml\n";
+const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/remotes/\n!khive.toml\n";
 
 const PRE_COMMIT_HOOK: &str = r#"#!/usr/bin/env bash
 # .khive/kg/hooks/pre-commit
@@ -235,6 +235,8 @@ fn hook_status(repo: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -271,5 +273,61 @@ mod tests {
 
         let content = std::fs::read_to_string(&toml_path).unwrap();
         assert_eq!(content, "# custom\n", "should not overwrite existing toml");
+    }
+
+    #[test]
+    fn init_gitignore_excludes_remote_cache_and_backup_marker() {
+        let tmp = TempDir::new().unwrap();
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        cmd_init(InitArgs {
+            repo: tmp.path().to_path_buf(),
+            ci: false,
+            add_hooks: false,
+        })
+        .unwrap();
+
+        for path in [
+            ".khive/kg/remotes/upstream/meta.json",
+            ".khive/kg/remotes/upstream.replaced~1234/.khive-backup-owner",
+        ] {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "core.excludesFile=/dev/null",
+                    "check-ignore",
+                    "--no-index",
+                    "-q",
+                    "--",
+                    path,
+                ])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{path} should be ignored by git");
+        }
+
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "core.excludesFile=/dev/null",
+                "check-ignore",
+                "--no-index",
+                "-q",
+                "--",
+                ".khive/kg/entities.ndjson",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "KG exports stay trackable");
     }
 }
