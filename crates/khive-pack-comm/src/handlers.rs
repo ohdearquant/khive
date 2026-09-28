@@ -16,7 +16,7 @@ use khive_runtime::{
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
-use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, DeleteMode, NewAttachment};
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
@@ -3077,8 +3077,8 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         .map_err(RuntimeError::Storage)?;
     drop(reader);
 
-    // NoteStore by-ID deletion is not namespace-scoped. Re-read each UUID
-    // through the authorized store and enforce the query's full predicate.
+    // Hard deletion by ID is not namespace-scoped. Re-read each UUID through
+    // the authorized store and enforce the query's full predicate.
     let store = runtime.notes(token)?;
     let mut deleted = 0usize;
     let mut routed_owner_detached = 0usize;
@@ -3144,11 +3144,19 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         let expected_ref = properties
             .and_then(|props| props.get("quarantine_content_ref"))
             .and_then(Value::as_str);
-        // Hard-delete the note first. Main-backend NoteStore removes its
-        // attachment rows in the same transaction. A routed note's repaired
-        // original lives on canonical main and is detached by exact ID/ref
-        // only after the note deletion commits.
-        if store.delete_note(id, DeleteMode::Hard).await? {
+        // The runtime hard-delete removes incident graph edges alongside the
+        // note and its local attachments in one transaction. A routed note's
+        // repaired original lives on canonical main and is detached by exact
+        // ID/ref only after that transaction commits.
+        let delete_result = runtime.delete_note(token, id, true).await;
+        // Index or event cleanup can fail after the row/edge transaction has
+        // committed. In that case the row will not be selected next tick, so
+        // still detach its routed owner before reporting the original error.
+        let note_deleted = match &delete_result {
+            Ok(deleted) => *deleted,
+            Err(_) => store.get_note_including_deleted(id).await?.is_none(),
+        };
+        if note_deleted {
             deleted += 1;
             if routed_legacy {
                 for attempt in 1..=3 {
@@ -3180,6 +3188,7 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
                 }
             }
         }
+        delete_result?;
     }
     Ok(json!({
         "ok": true,

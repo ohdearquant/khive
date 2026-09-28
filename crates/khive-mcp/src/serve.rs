@@ -13942,6 +13942,37 @@ backend = "kg-backend"
                 .authorize(Namespace::parse("retention-ns").unwrap())
                 .unwrap();
             let notes = runtime.notes(&token).unwrap();
+            let annotator = runtime
+                .create_note(
+                    &token,
+                    "observation",
+                    None,
+                    "quarantine cleanup edge fixture",
+                    None,
+                    None,
+                    vec![note_id],
+                )
+                .await
+                .unwrap();
+            let incident_edge_query = || SqlStatement {
+                sql: "SELECT id FROM graph_edges \
+                      WHERE source_id = ?1 AND target_id = ?2 AND relation = 'annotates'"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(annotator.id.to_string()),
+                    SqlValue::Text(note_id.to_string()),
+                ],
+                label: Some("quarantine_retention_incident_edges".into()),
+            };
+            let edges_before = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert_eq!(edges_before.len(), 1);
             let note = notes.get_note(note_id).await.unwrap().unwrap();
             let expires_at = note
                 .expires_at
@@ -13988,6 +14019,15 @@ backend = "kg-backend"
                 .expect("expired cleanup");
             assert_eq!(after["deleted"], 1);
             assert!(notes.get_note(note_id).await.unwrap().is_none());
+            let edges_after = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert!(edges_after.is_empty());
             assert!(runtime
                 .attachments()
                 .unwrap()
