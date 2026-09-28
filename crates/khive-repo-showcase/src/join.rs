@@ -2,7 +2,6 @@ use std::fs;
 use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -35,26 +34,14 @@ pub(crate) fn natural_id(kind: &str, components: &[&str]) -> String {
 }
 
 pub(crate) fn git_output(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ExportError> {
-    let output = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null"])
-        .args(["-c", "gc.auto=0"])
-        .args(["-c", "maintenance.auto=false"])
+    let output = crate::git_safety::hardened_git_command_for_repo(repo)
+        .map_err(|source| ExportError::GitSpawn {
+            args: "config --get-regexp ^filter\\.".into(),
+            source,
+        })?
         .arg("-C")
         .arg(repo)
         .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
         .output()
         .map_err(|source| ExportError::GitSpawn {
             args: args.join(" "),
@@ -91,9 +78,9 @@ pub(crate) fn head_committed_at(repo: &Path) -> Result<String, ExportError> {
     git_text(repo, &["show", "-s", "--format=%cI", "HEAD"])
 }
 
-pub(crate) fn tracked_paths(repo: &Path) -> Result<Vec<String>, ExportError> {
+pub(crate) fn tracked_paths(repo: &Path, head: &str) -> Result<Vec<String>, ExportError> {
     let mut paths = decode_nul_paths(
-        git_output(repo, &["ls-files", "-z"])?,
+        git_output(repo, &["ls-tree", "-r", "-z", "--name-only", head])?,
         "tracked repository path",
     )?;
     paths.sort();
@@ -359,6 +346,12 @@ pub(crate) fn derive_rust_module_keys(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
 
     use super::*;
 
@@ -470,6 +463,134 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("must not be a symlink"), "{error}");
+    }
+
+    #[test]
+    fn tracked_paths_follow_head_even_when_index_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        fs::create_dir(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn live() {}\n").unwrap();
+        fs::write(repo.join("src/gone.rs"), "pub fn still_in_head() {}\n").unwrap();
+        git(&["add", "src/lib.rs", "src/gone.rs"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+        let head = head_sha(repo).unwrap();
+
+        fs::write(repo.join("src/extra.rs"), "pub fn staged_only() {}\n").unwrap();
+        fs::remove_file(repo.join("src/gone.rs")).unwrap();
+        git(&["add", "-A"]);
+
+        assert_eq!(
+            tracked_paths(repo, &head).unwrap(),
+            vec!["src/gone.rs", "src/lib.rs"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_head_does_not_run_repo_configured_verifier() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        fs::write(repo.join("README.md"), "signed fixture\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+
+        // Add a gpgsig header without depending on a real signing key.
+        let original = git(&["cat-file", "commit", "HEAD"]);
+        let split = original
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .unwrap();
+        let mut signed = Vec::new();
+        signed.extend_from_slice(&original[..=split]);
+        signed.extend_from_slice(
+            b"gpgsig -----BEGIN PGP SIGNATURE-----\n fake\n -----END PGP SIGNATURE-----\n",
+        );
+        signed.extend_from_slice(&original[split + 1..]);
+        let mut writer = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer.stdin.take().unwrap().write_all(&signed).unwrap();
+        let output = writer.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let oid = String::from_utf8(output.stdout).unwrap();
+        git(&["update-ref", "HEAD", oid.trim()]);
+
+        let verifier = repo.join("fake-verifier.sh");
+        let marker = repo.join("fake-verifier.sh.marker");
+        fs::write(&verifier, "#!/bin/sh\n: > \"$0.marker\"\nexit 1\n").unwrap();
+        fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
+        git(&["config", "log.showSignature", "true"]);
+        git(&["config", "gpg.format", "openpgp"]);
+        git(&["config", "gpg.program", verifier.to_str().unwrap()]);
+
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["show", "-s", "--format=%cI", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "fixture must execute the unguarded verifier"
+        );
+        fs::remove_file(&marker).unwrap();
+
+        assert!(!head_committed_at(repo).unwrap().is_empty());
+        assert!(
+            !marker.exists(),
+            "showcase Git read must not run the verifier"
+        );
     }
 
     #[test]

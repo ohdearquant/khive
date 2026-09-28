@@ -241,6 +241,42 @@ mod unit_tests {
     }
 
     #[test]
+    fn exact_scan_dot_tail_and_batch_have_the_same_score() {
+        let vectors = [
+            (make_id(1), vec![0.6, 0.8]),
+            (make_id(2), vec![0.0, 1.0]),
+            (make_id(3), vec![-1.0, 0.0]),
+            (make_id(4), vec![0.0, -1.0]),
+            (make_id(5), vec![1.0, 0.0]),
+        ];
+
+        for metric in [DistanceMetric::Dot, DistanceMetric::Cosine] {
+            for best_in_tail in [true, false] {
+                let mut config = HnswConfig::with_dimensions(2);
+                config.metric = metric;
+                let mut index = HnswIndex::with_config(config);
+                let order = if best_in_tail {
+                    [0, 1, 2, 3, 4]
+                } else {
+                    [4, 0, 1, 2, 3]
+                };
+                for position in order {
+                    let (id, vector) = &vectors[position];
+                    index.insert(*id, vector.clone()).expect("insert");
+                }
+
+                let results = index.search(&[1.0, 0.0], 1).expect("search");
+                assert_eq!(results[0].0, make_id(5), "{metric:?}, tail={best_in_tail}");
+                assert_eq!(
+                    results[0].1.to_f64(),
+                    1.0,
+                    "{metric:?}, tail={best_in_tail}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_euclidean_metric() {
         let mut config = HnswConfig::with_dimensions(2);
         config.metric = DistanceMetric::L2;

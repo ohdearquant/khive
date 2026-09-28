@@ -629,6 +629,9 @@ surfaces an entity below that threshold is a view-layer filtering decision,
 not a data-layer one (khive's data-versus-view principle: showing only
 current state is always a query concern, never a reason to delete, mutate,
 or transfer stored data).
+When a scanner identity correction changes a symbol UUID, manually authored
+edges on the old UUID remain on that historical node and require manual
+re-linking to a new symbol UUID.
 
 ### B6: Cross-repo resolution
 

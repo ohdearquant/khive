@@ -2,12 +2,44 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 struct Triple {
     subject: String,
     predicate: Predicate,
     object: Object,
+}
+
+/// A repeated SPARQL triple is conjunctive, not a last-write-wins map update.
+fn insert_string_property_constraint(
+    node_props: &mut HashMap<String, HashMap<String, ConditionValue>>,
+    subject: String,
+    name: String,
+    value: String,
+) -> Result<(), QueryError> {
+    let constraint = ConditionValue::String(value);
+    let props = node_props.entry(subject.clone()).or_default();
+    if let Some(existing) = props.get(&name) {
+        let equivalent = match (existing, &constraint) {
+            (ConditionValue::String(left), ConditionValue::String(right))
+                if name != "entity_type" =>
+            {
+                left.eq_ignore_ascii_case(right)
+            }
+            _ => existing == &constraint,
+        };
+        if !equivalent {
+            return Err(QueryError::Parse {
+                position: 0,
+                message: format!(
+                    "conflicting constraints on '?{subject} :{name}'; repeated predicates must agree"
+                ),
+            });
+        }
+    } else {
+        props.insert(name, constraint);
+    }
+    Ok(())
 }
 
 enum Predicate {
@@ -322,7 +354,8 @@ fn triples_to_ast(
 ) -> Result<GqlQuery, QueryError> {
     let return_items: Vec<ReturnItem> =
         return_items.into_iter().map(ReturnItem::Variable).collect();
-    let mut node_kinds: HashMap<String, String> = HashMap::new();
+    let mut substrate_kinds: BTreeMap<String, String> = BTreeMap::new();
+    let mut granular_kinds: BTreeMap<String, String> = BTreeMap::new();
     let mut node_props: HashMap<String, HashMap<String, ConditionValue>> = HashMap::new();
     let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new(); // (src, tgt, rel, min, max)
     let mut where_cond_list: Vec<Condition> = Vec::new();
@@ -331,7 +364,24 @@ fn triples_to_ast(
         match triple.predicate {
             Predicate::Type => {
                 if let Object::Kind(kind) = triple.object {
-                    node_kinds.insert(triple.subject, kind);
+                    let kinds = if matches!(kind.as_str(), "entity" | "note" | "event" | "edge") {
+                        &mut substrate_kinds
+                    } else {
+                        &mut granular_kinds
+                    };
+                    if let Some(existing) = kinds.get(&triple.subject) {
+                        if existing != &kind {
+                            return Err(QueryError::Parse {
+                                position: 0,
+                                message: format!(
+                                    "conflicting kind constraints on '?{}'; repeated kinds must agree",
+                                    triple.subject
+                                ),
+                            });
+                        }
+                    } else {
+                        kinds.insert(triple.subject, kind);
+                    }
                 } else {
                     return Err(QueryError::Parse {
                         message: "'a' predicate requires a kind object (:concept, :paper, etc.)"
@@ -349,10 +399,7 @@ fn triples_to_ast(
                     edges.push((triple.subject, target, name, min_hops, max_hops));
                 }
                 Object::StringLiteral(val) => {
-                    node_props
-                        .entry(triple.subject)
-                        .or_default()
-                        .insert(name, ConditionValue::String(val));
+                    insert_string_property_constraint(&mut node_props, triple.subject, name, val)?;
                 }
                 Object::NumberLiteral(val) => {
                     where_cond_list.push(Condition {
@@ -363,12 +410,27 @@ fn triples_to_ast(
                     });
                 }
                 Object::Kind(val) => {
-                    node_props
-                        .entry(triple.subject)
-                        .or_default()
-                        .insert(name, ConditionValue::String(val));
+                    insert_string_property_constraint(&mut node_props, triple.subject, name, val)?;
                 }
             },
+        }
+    }
+
+    // The AST has one kind slot, so retain the substrate there and filter its granular kind.
+    let mut node_kinds = substrate_kinds;
+    for (variable, kind) in granular_kinds {
+        match node_kinds.entry(variable) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                where_cond_list.push(Condition {
+                    variable: entry.key().clone(),
+                    property: PropertyRef::Field("kind".into()),
+                    op: CompareOp::Eq,
+                    value: ConditionValue::String(kind),
+                });
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(kind);
+            }
         }
     }
 
@@ -656,6 +718,73 @@ mod tests {
         assert_eq!(
             nodes[0].properties.get("domain").unwrap(),
             &ConditionValue::String("attention".into())
+        );
+    }
+
+    #[test]
+    fn conflicting_repeated_kind_constraint_is_rejected() {
+        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a a :person . ?a :extends ?b . }")
+            .unwrap_err();
+        assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+        assert!(err.to_string().contains("conflicting kind"), "{err}");
+    }
+
+    #[test]
+    fn substrate_and_granular_kinds_constrain_the_same_node_in_both_orders() {
+        for kinds in [":entity . ?a a :concept", ":concept . ?a a :entity"] {
+            let query = parse(&format!(
+                "SELECT ?a WHERE {{ ?a a {kinds} . ?a :extends ?b . }}"
+            ))
+            .unwrap();
+            let start = query.pattern.nodes().next().unwrap();
+            assert_eq!(start.kind.as_deref(), Some("entity"));
+            let conditions: Vec<_> = query.where_clause.conditions().collect();
+            assert_eq!(conditions.len(), 1);
+            assert_eq!(conditions[0].variable, "a");
+            assert_eq!(conditions[0].property, PropertyRef::Field("kind".into()));
+            assert_eq!(
+                conditions[0].value,
+                ConditionValue::String("concept".into())
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_substrate_kinds_are_rejected_in_both_orders() {
+        for kinds in [":entity . ?a a :note", ":note . ?a a :entity"] {
+            let err = parse(&format!(
+                "SELECT ?a WHERE {{ ?a a {kinds} . ?a :extends ?b . }}"
+            ))
+            .unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting kind"), "{err}");
+        }
+    }
+
+    #[test]
+    fn conflicting_repeated_string_or_kind_literal_is_rejected() {
+        for input in [
+            "SELECT ?a WHERE { ?a :name 'x' . ?a :name 'y' . ?a :extends ?b . }",
+            "SELECT ?a WHERE { ?a :domain :attention . ?a :domain 'vision' . ?a :extends ?b . }",
+        ] {
+            let err = parse(input).unwrap_err();
+            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
+            assert!(err.to_string().contains("conflicting constraints"), "{err}");
+        }
+    }
+
+    #[test]
+    fn identical_repeated_kind_and_string_constraints_are_idempotent() {
+        let query = parse(
+            "SELECT ?a WHERE { ?a a :concept . ?a a :concept . \
+             ?a :name 'x' . ?a :name 'x' . ?a :extends ?b . }",
+        )
+        .expect("identical repeated triples remain valid");
+        let start = query.pattern.nodes().next().expect("start node");
+        assert_eq!(start.kind.as_deref(), Some("concept"));
+        assert_eq!(
+            start.properties.get("name"),
+            Some(&ConditionValue::String("x".into()))
         );
     }
 

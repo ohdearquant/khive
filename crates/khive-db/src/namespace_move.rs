@@ -610,10 +610,11 @@ pub fn validate(
 ///
 /// The second rule covers two cases that are not alike, and saying so here keeps
 /// the comment from presenting one reason for both.
-/// `idx_comm_message_external_id` (`sql/005-unique-comm-external-id.sql:33`) is
-/// unreachable either way: its third key column is `json_extract(properties,
-/// '$.external_id')` and its predicate calls the same function twice, so neither
-/// the key nor the filter can be expressed without evaluating it on both sides.
+/// `idx_comm_message_external_id` (V42's channel-scoped successor to the V5
+/// index) is unreachable either way: its third key column is
+/// `json_extract(properties, '$.external_id')`, followed by two channel
+/// expressions, and its predicate also reads the external ID. Neither the key
+/// nor the filter can be expressed without evaluating it on both sides.
 /// `idx_notes_namespace_kind_key` (`sql/028-notes-key.sql:4`) is not like that at
 /// all: three plain column names and `WHERE key IS NOT NULL AND deleted_at IS
 /// NULL`, which a source/target join CAN express exactly. It is excluded only

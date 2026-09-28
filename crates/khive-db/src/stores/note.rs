@@ -12,7 +12,8 @@ use uuid::Uuid;
 use khive_storage::attachment::AttachmentSubstrate;
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{
-    FilterOp, Note, NoteFilter, NoteKeyCursor, NoteSeekAfter, NoteTagMode, SortDir,
+    FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NoteSeekAfter, NoteTagMode,
+    SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -32,7 +33,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Notes, op, e)
+    e.into_storage_error(StorageCapability::Notes, op)
 }
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
@@ -753,6 +754,10 @@ fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
     }
     match &filter.order_by {
         Some((path, dir)) => {
+            if filter.order_by_instant {
+                let expr = json_extract_expr(path);
+                return format!(" ORDER BY khive_rfc3339_key({expr}) ASC, {expr} ASC, id ASC");
+            }
             let dir_str = match dir {
                 SortDir::Asc => "ASC",
                 SortDir::Desc => "DESC",
@@ -886,6 +891,34 @@ fn build_note_filter_where(
 
     for pf in &filter.property_filters {
         match &pf.op {
+            FilterOp::Rfc3339Valid => {
+                let expr = json_extract_expr(&pf.json_path);
+                conditions.push(format!("khive_rfc3339_key({expr}) IS NOT NULL"));
+            }
+            FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte => {
+                let instant = match &pf.value {
+                    SqlValue::Timestamp(instant) => *instant,
+                    SqlValue::Text(text) => {
+                        text.parse::<chrono::DateTime<chrono::Utc>>()
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?
+                    }
+                    _ => {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(
+                            "RFC 3339 filters require a timestamp or text value".into(),
+                        ));
+                    }
+                };
+                let expr = json_extract_expr(&pf.json_path);
+                let op = if matches!(&pf.op, FilterOp::Rfc3339Gte) {
+                    ">="
+                } else {
+                    "<="
+                };
+                params.push(Box::new(crate::pool::rfc3339_instant_key(instant)));
+                conditions.push(format!("khive_rfc3339_key({expr}) {op} ?{}", params.len()));
+            }
             FilterOp::EqOrMissing => {
                 let expr = json_extract_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
@@ -1043,6 +1076,9 @@ fn build_note_filter_where(
                     | FilterOp::TextStartsWithIndexed => {
                         unreachable!()
                     }
+                    FilterOp::Rfc3339Valid | FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte => {
+                        unreachable!()
+                    }
                 };
                 params.push(sql_value_param(&pf.value)?);
                 conditions.push(format!("{expr} {op} ?{}", params.len()));
@@ -1141,6 +1177,39 @@ fn build_note_filter_read_clause(
 /// the same column list out inline.
 const NOTE_COLUMNS: &str = "id, namespace, kind, status, name, content, salience, decay_factor, \
      expires_at, properties, created_at, updated_at, deleted_at, key, version";
+
+fn fetch_notes_after_instant(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    base_filter: &NoteFilter,
+    after: &NoteInstantSeekAfter,
+    limit: i64,
+) -> Result<Vec<Note>, rusqlite::Error> {
+    let (where_sql, mut params) = build_note_filter_read_clause(namespace, base_filter)?;
+    params.push(Box::new(after.value.clone()));
+    let value_idx = params.len();
+    params.push(Box::new(after.id.to_string()));
+    let id_idx = params.len();
+    params.push(Box::new(limit));
+    let limit_idx = params.len();
+    let (path, _) = base_filter
+        .order_by
+        .as_ref()
+        .expect("instant cursor requires order_by");
+    let expr = json_extract_expr(path);
+    let order_clause = note_filter_page_order_clause(base_filter);
+    let sql = format!(
+        "SELECT {NOTE_COLUMNS} FROM notes{where_sql} \
+         AND (khive_rfc3339_key({expr}), {expr}, id) > \
+             (khive_rfc3339_key(?{value_idx}), ?{value_idx}, ?{id_idx}) \
+         {order_clause} LIMIT ?{limit_idx}"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|param| param.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
+    rows.collect()
+}
 
 /// Fetch up to `limit` rows strictly after `after` in the notes store's
 /// default `created_at DESC, id ASC` total order, for `NoteFilter.after`
@@ -1506,7 +1575,7 @@ impl NoteStore for SqlNoteStore {
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
-        // Extract external_id (if any) for dedup verification after a zero-row insert.
+        // Capture the durable dedup key for verification after a zero-row insert.
         let ext_id_opt: Option<String> = note
             .properties
             .as_ref()
@@ -1514,6 +1583,20 @@ impl NoteStore for SqlNoteStore {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let channel_kind = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.get("channel_kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let channel_slug = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.get("channel_slug"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
 
         self.with_writer_tx("try_insert_note", move |conn| {
             let rows = conn.execute(
@@ -1546,7 +1629,8 @@ impl NoteStore for SqlNoteStore {
 
             // Zero rows: the INSERT was silently skipped by OR IGNORE.
             // Only treat this as a dedup hit when a live note with the same
-            // non-empty external_id already exists in this namespace and kind.
+            // non-empty external_id and exact channel provenance already exists
+            // in this namespace and kind.
             // Any other ignored constraint (e.g. a PRIMARY KEY collision) must
             // surface as an error rather than being misreported as a duplicate.
             if let Some(ref ext_id) = ext_id_opt {
@@ -1555,8 +1639,10 @@ impl NoteStore for SqlNoteStore {
                      WHERE namespace = ?1 \
                        AND kind = ?2 \
                        AND json_extract(properties, '$.external_id') = ?3 \
+                       AND ifnull(json_extract(properties, '$.channel_kind'), '') = ?4 \
+                       AND ifnull(json_extract(properties, '$.channel_slug'), '') = ?5 \
                        AND deleted_at IS NULL",
-                    rusqlite::params![namespace, kind_str, ext_id],
+                    rusqlite::params![namespace, kind_str, ext_id, channel_kind, channel_slug],
                     |row| row.get(0),
                 )?;
                 if is_dedup {
@@ -1841,11 +1927,18 @@ impl NoteStore for SqlNoteStore {
         if let Some((path, _)) = &filter.order_by {
             validate_json_path(path)?;
         }
-        if filter.after.is_some() {
+        if filter.order_by_instant && !matches!(filter.order_by.as_ref(), Some((_, SortDir::Asc))) {
             return Err(StorageError::InvalidInput {
                 capability: StorageCapability::Notes,
                 operation: "query_notes_filtered".into(),
-                message: "NoteFilter.after (keyset pagination) is not supported by this \
+                message: "order_by_instant requires an ascending property order".into(),
+            });
+        }
+        if filter.after.is_some() || filter.after_instant.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered".into(),
+                message: "NoteFilter.after or after_instant (keyset pagination) is not supported by this \
                           method: it computes an exact COUNT(*) total over the whole \
                           matching set, which has no defined meaning paired with a seek \
                           boundary; use query_notes_filtered_count_free instead, which \
@@ -1913,6 +2006,34 @@ impl NoteStore for SqlNoteStore {
         if let Some((path, _)) = &filter.order_by {
             validate_json_path(path)?;
         }
+        if filter.order_by_instant && !matches!(filter.order_by.as_ref(), Some((_, SortDir::Asc))) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_count_free".into(),
+                message: "order_by_instant requires an ascending property order".into(),
+            });
+        }
+        if filter.order_by_instant && filter.unordered {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_count_free".into(),
+                message: "order_by_instant is incompatible with unordered pages".into(),
+            });
+        }
+        if filter.after_instant.is_some() && !filter.order_by_instant {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_count_free".into(),
+                message: "after_instant requires order_by_instant".into(),
+            });
+        }
+        if filter.after.is_some() && filter.after_instant.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_count_free".into(),
+                message: "after and after_instant are mutually exclusive".into(),
+            });
+        }
         if filter.after.is_some() && filter.order_by.is_some() {
             return Err(StorageError::InvalidInput {
                 capability: StorageCapability::Notes,
@@ -1922,12 +2043,12 @@ impl NoteStore for SqlNoteStore {
                     .into(),
             });
         }
-        if filter.after.is_some() && page.offset != 0 {
+        if (filter.after.is_some() || filter.after_instant.is_some()) && page.offset != 0 {
             return Err(StorageError::InvalidInput {
                 capability: StorageCapability::Notes,
                 operation: "query_notes_filtered_count_free".into(),
-                message: "NoteFilter.after and a non-zero PageRequest.offset are mutually \
-                          exclusive pagination strategies; pass offset: 0 with after"
+                message: "NoteFilter.after or after_instant and a non-zero PageRequest.offset \
+                          are mutually exclusive pagination strategies; pass offset: 0"
                     .into(),
             });
         }
@@ -1945,6 +2066,13 @@ impl NoteStore for SqlNoteStore {
         })?;
 
         self.with_reader("query_notes_filtered_count_free", move |conn| {
+            if let Some(after) = &filter.after_instant {
+                let mut base_filter = filter.clone();
+                base_filter.after_instant = None;
+                let items =
+                    fetch_notes_after_instant(conn, &namespace, &base_filter, after, limit_i64)?;
+                return Ok(Page { items, total: None });
+            }
             if let Some(after) = &filter.after {
                 let mut base_filter = filter.clone();
                 base_filter.after = None;

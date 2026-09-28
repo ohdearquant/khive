@@ -186,7 +186,7 @@ web_verbs! {
             namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
                                   authorized token namespace, never elevates capability.", NotApplicable);
             #[serde(default)]
-            link_limit: Option<u32> => (4, "Maximum number of unique href targets to process for links on this page. \
+            link_limit: Option<u32> => (4, "Maximum number of targets to process across links, sitemap, and feed on this document. \
                                   Defaults to 100 and cannot exceed 1,000.", NotApplicable);
         }
     }
@@ -246,9 +246,10 @@ web_verbs! {
     RefreshParams => HandlerDef {
         name: "web.refresh",
         description: "Conditionally re-fetch a previously fetched document using its stored \
-                      etag/last_modified. An unchanged body writes a receipt only; a changed \
-                      body updates the stored blob and properties. Every refresh's receipt \
-                      supersedes the previous one for the same document.",
+                      etag/last_modified and Accept/Accept-Language. An unchanged body keeps \
+                      its blob and attachment while changed response metadata updates the document. \
+                      A redirected 304 is refused. A changed body updates the stored blob and \
+                      properties. Every refresh's receipt supersedes the previous one for the same document.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: {
@@ -372,6 +373,30 @@ mod tests {
             categories,
             "generated handler categories must match source declarations"
         );
+    }
+
+    #[test]
+    fn generated_metadata_keeps_current_extract_and_refresh_contracts() {
+        let extract = WEB_HANDLERS
+            .iter()
+            .find(|handler| handler.name == "web.extract")
+            .expect("extract handler");
+        let link_limit = extract
+            .params
+            .iter()
+            .find(|param| param.name == "link_limit")
+            .expect("link limit parameter");
+        assert!(
+            link_limit.description.contains("links, sitemap, and feed"),
+            "generated help must cover every extract target kind"
+        );
+
+        let refresh = WEB_HANDLERS
+            .iter()
+            .find(|handler| handler.name == "web.refresh")
+            .expect("refresh handler");
+        assert!(refresh.description.contains("Accept/Accept-Language"));
+        assert!(refresh.description.contains("redirected 304 is refused"));
     }
 
     // Serialization exposes every typed field, including optional fields

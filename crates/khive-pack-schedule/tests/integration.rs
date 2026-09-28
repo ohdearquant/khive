@@ -16,6 +16,21 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     (registry, runtime)
 }
 
+async fn event_properties(runtime: &KhiveRuntime, full_id: &str) -> serde_json::Value {
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("local token");
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(full_id.parse().expect("full UUID"))
+        .await
+        .expect("read event")
+        .expect("event exists")
+        .properties
+        .expect("event properties")
+}
+
 #[test]
 fn schedule_pack_declares_scheduled_event_note_kind() {
     assert!(SchedulePack::NOTE_KINDS.contains(&"scheduled_event"));
@@ -73,6 +88,90 @@ async fn schedule_creates_pending_event_with_action() {
 
     assert!(result.get("id").is_some(), "schedule returns id: {result}");
     assert_eq!(result["event_type"], "schedule");
+}
+
+#[tokio::test]
+async fn monthly_creation_stores_original_trigger_as_repeat_anchor_for_both_verbs() {
+    let (registry, runtime) = build_registry();
+    let at = "2099-01-31T09:30:00+04:00";
+    for (verb, params) in [
+        (
+            "schedule.remind",
+            serde_json::json!({"content": "month-end reminder", "at": at, "repeat": "monthly"}),
+        ),
+        (
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"concept\", name=\"month-end action\")",
+                "at": at,
+                "repeat": "monthly"
+            }),
+        ),
+    ] {
+        let created = registry
+            .dispatch(verb, params)
+            .await
+            .expect("create monthly event");
+        let props = event_properties(&runtime, created["full_id"].as_str().expect("full_id")).await;
+        assert_eq!(props["trigger_at"], at, "{verb}: original trigger");
+        assert_eq!(props["repeat_anchor"], at, "{verb}: immutable anchor");
+    }
+}
+
+#[tokio::test]
+async fn nonmonthly_creation_does_not_store_repeat_anchor() {
+    let (registry, runtime) = build_registry();
+    for repeat in ["daily", "weekly", "every:15m", "0 9 * * 1"] {
+        let created = registry
+            .dispatch(
+                "schedule.remind",
+                serde_json::json!({
+                    "content": "nonmonthly reminder",
+                    "at": "2099-06-01T09:30:00Z",
+                    "repeat": repeat,
+                }),
+            )
+            .await
+            .expect("create nonmonthly reminder");
+        let props = event_properties(&runtime, created["full_id"].as_str().expect("full_id")).await;
+        assert!(
+            props.get("repeat_anchor").is_none(),
+            "{repeat} must not store a monthly anchor"
+        );
+    }
+}
+
+#[tokio::test]
+async fn generic_update_cannot_rewrite_monthly_repeat_anchor() {
+    let (registry, runtime) = build_registry();
+    let at = "2099-01-31T09:30:00Z";
+    let created = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({"content": "protected anchor", "at": at, "repeat": "monthly"}),
+        )
+        .await
+        .expect("create monthly reminder");
+    let full_id = created["full_id"].as_str().expect("full_id");
+    let error = registry
+        .dispatch(
+            "update",
+            serde_json::json!({
+                "id": full_id,
+                "properties": {"repeat_anchor": "2099-01-01T09:30:00Z"}
+            }),
+        )
+        .await
+        .expect_err("generic update must refuse a schedule-managed note");
+    assert!(
+        error
+            .to_string()
+            .contains("scheduled_event notes are not editable via `update`"),
+        "unexpected refusal: {error}"
+    );
+    let props = event_properties(&runtime, full_id).await;
+    assert_eq!(props["repeat_anchor"], at, "refusal must preserve anchor");
+    assert_eq!(props["trigger_at"], at, "refusal must preserve trigger");
 }
 
 #[tokio::test]

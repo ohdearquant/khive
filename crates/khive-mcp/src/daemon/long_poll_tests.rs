@@ -114,7 +114,9 @@ async fn cli_forward_replays_classified_reads_once_but_never_mutations_unknown_o
     let _cleanup = RecoveryTestGuard::new();
     for (ops, replay, creates_message) in [
         ("comm.inbox(limit=20)", true, false),
-        ("search(kind=\"entity\", query=\"missing\")", true, false),
+        // Search persists a fresh search record, so a lost response cannot
+        // authorize transport replay even though the verb is assertive.
+        ("search(kind=\"entity\", query=\"missing\")", false, false),
         (
             "comm.send(to=\"reader\", content=\"committed once\", self_send=true)",
             false,

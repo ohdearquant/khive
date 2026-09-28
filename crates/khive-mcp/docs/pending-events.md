@@ -55,7 +55,8 @@ which accepts and advances these forms:
 
 - `"daily"` → `trigger_at + 1 day`
 - `"weekly"` → `trigger_at + 7 days`
-- `"monthly"` → `trigger_at + 1 calendar month`
+- `"monthly"` → the original `repeat_anchor` plus each successive calendar
+  month, clamped independently to that month's last day
 - `"every:<N><s|m|h|d>"` → `trigger_at + N units` (`N >= 1`, for example `"every:15m"`)
 - a five-field cron expression → the next match after `trigger_at`, evaluated in UTC
   (for example `"0 9 * * 1"` for 09:00 UTC on Mondays)
@@ -63,6 +64,9 @@ which accepts and advances these forms:
 Unsupported expressions are rejected at creation. A legacy row carrying any
 unsupported repeat fails closed before invocation instead of silently degrading
 to one-shot delivery.
+New monthly rows store their original `trigger_at` as `repeat_anchor`. A legacy
+monthly row without that property adopts its current `trigger_at` on its next
+advance, so a day already lost to an earlier clamp cannot be recovered.
 
 ## Missed-event policy (ADR-106 amendment)
 
