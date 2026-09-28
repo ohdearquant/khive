@@ -91,10 +91,14 @@ aggregate multiple operations.
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 
 Fetch and refresh receipts include allow-listed response `headers` and negotiation `request_headers`.
-The document stores `request_headers` for its cached GET body: lowercase `accept`/`accept-language`
-keys map to arrays retaining repeated values in their sent order. Credentials, conditional validators
-and other request headers are excluded. A later GET replaces this negotiation, including clearing it
-when absent; HEAD records its own request in the receipt and preserves cached GET negotiation.
+The document stores `request_headers` for its cached GET body: lowercase `accept` and
+`accept-language` keys retain caller negotiation in sent order, while `accept-encoding: ["gzip"]`
+records the client-fixed encoding sent on every HTTP request. Credentials, conditional validators
+and other request headers are excluded. A later GET replaces this context, clearing absent caller
+negotiation while retaining the fixed encoding; HEAD records its own request in the receipt and
+preserves cached GET context. Refresh sends validators only when every recorded `Vary` selector is
+represented by valid stored `Accept`, `Accept-Language`, or fixed `Accept-Encoding` values; any
+other `Vary` field forces an unconditional GET.
 
 ### `web.extract(id | url, kinds?, namespace?, link_limit?)`
 
