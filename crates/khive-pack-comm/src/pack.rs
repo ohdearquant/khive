@@ -136,6 +136,19 @@ fn refuse_transport_owned_message_property(key: &str) -> RuntimeError {
                 .into(),
         );
     }
+    if matches!(
+        key,
+        "delivery_hold"
+            | "delivery_hold_reason"
+            | "delivery_hold_at"
+            | "external_id_diagnostic_note_id"
+    ) {
+        return RuntimeError::InvalidInput(format!(
+            "`{key}` is transport-owned on a `message` note and cannot be supplied by a generic \
+             record mutation; only the internal outbox owner-side hold may establish \
+             delivery-hold and diagnostic fields"
+        ));
+    }
     RuntimeError::InvalidInput(format!(
         "`{key}` is transport-owned on a `message` note and cannot be supplied by a generic \
          record mutation; only `comm.ingest` may establish quarantine disposition and channel \
@@ -879,5 +892,30 @@ mod message_identity_tests {
                 "error must name {key}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn note_write_refusal_names_the_owner_of_hold_and_ingest_properties() {
+        let hold = derive_message_identity(
+            "message",
+            "lambda:caller",
+            Some(json!({"delivery_hold": "external_id_unverifiable"})),
+        )
+        .expect_err("generic writes must not set an outbox owner-side hold")
+        .to_string();
+        assert!(hold.contains("delivery_hold"), "{hold}");
+        assert!(hold.contains("internal outbox owner-side hold"), "{hold}");
+        assert!(!hold.contains("only `comm.ingest`"), "{hold}");
+
+        let ingest = derive_message_identity(
+            "message",
+            "lambda:caller",
+            Some(json!({"channel_slug": "inbox"})),
+        )
+        .expect_err("generic writes must not set ingest provenance")
+        .to_string();
+        assert!(ingest.contains("channel_slug"), "{ingest}");
+        assert!(ingest.contains("only `comm.ingest`"), "{ingest}");
+        assert!(!ingest.contains("outbox owner-side hold"), "{ingest}");
     }
 }
