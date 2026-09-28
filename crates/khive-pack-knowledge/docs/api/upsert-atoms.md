@@ -5,6 +5,12 @@ writes. A content item carries `slug`, `name`, `content` and optional atom field
 a properties-only item carries exactly a complete UUID `id` and `properties`.
 `chunk_size` remains an accepted hint; the server does not split the batch.
 
+When an existing atom's name changes, the same atomic write clears embeddings
+for its sections. The batch does not call an embedder. A later non-forced section
+reindex or `knowledge.edit` of that atom fills the missing vectors from the new
+atom name, each section heading, and its content. Repeating an upsert with the
+same name keeps existing section vectors.
+
 With `dry_run=true`, all items are checked and the response contains:
 
 ```json

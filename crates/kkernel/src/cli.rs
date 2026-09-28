@@ -289,6 +289,10 @@ pub async fn cli_main() -> Result<()> {
     load_khive_dotenv();
     let args = Args::parse();
     init_tracing(&args.log);
+    // This process can forward `exec` to a daemon whose logging was fixed at
+    // startup. Give operators a client-owned event that proves --log/KHIVE_LOG
+    // took effect without recording an operation or its arguments.
+    tracing::debug!(log_filter = %args.log, "kkernel logging initialized");
 
     // `-e/--exec` is the quick-shot equivalent of `exec <OPS>` — route it
     // through the exact same clap parsing `exec` itself uses (`ExecArgs::parse_from`)
