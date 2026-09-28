@@ -1284,6 +1284,7 @@ impl VerbRegistryBuilder {
                 if matches!(handler.visibility, Visibility::Verb)
                     && pack_name == canonical_owner
                     && crate::classify_operation(handler.name) == Some(crate::OperationAccess::Read)
+                    && !VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&handler.name)
                 {
                     read_replay_safe_verbs.insert(handler.name);
                 }
@@ -1790,33 +1791,109 @@ impl std::error::Error for PackSchemaCollisionError {}
 
 /// Extract table names from a single DDL statement.
 ///
-/// Handles `CREATE TABLE IF NOT EXISTS`, `CREATE TABLE`, and
-/// `CREATE VIRTUAL TABLE IF NOT EXISTS`, `CREATE VIRTUAL TABLE`.
-/// Returns an empty Vec when no table name is found (e.g. index DDL).
+/// Handles SQL trivia, SQLite identifier quoting, optional TEMP/VIRTUAL and a
+/// `main.` qualifier. Index and other non-table DDL return no table names.
 fn extract_table_names(stmt: &str) -> Vec<String> {
-    let normalized = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
-    let upper = normalized.to_ascii_uppercase();
-    let table_name = if let Some(rest) = upper.strip_prefix("CREATE VIRTUAL TABLE IF NOT EXISTS ") {
-        rest.split_whitespace().next()
-    } else if let Some(rest) = upper.strip_prefix("CREATE VIRTUAL TABLE ") {
-        rest.split_whitespace().next()
-    } else if let Some(rest) = upper.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
-        rest.split_whitespace().next()
-    } else if let Some(rest) = upper.strip_prefix("CREATE TABLE ") {
-        rest.split_whitespace().next()
-    } else {
-        None
-    };
-    match table_name {
-        Some(name) => {
-            let clean = name.trim_matches(|c: char| c == '(' || c == ';');
-            if clean.is_empty() {
-                vec![]
-            } else {
-                vec![clean.to_ascii_lowercase()]
-            }
+    enum SqlToken {
+        Bare(String),
+        Quoted(String),
+        Punctuation(char),
+    }
+
+    let mut tokens = Vec::new();
+    let mut chars = stmt.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
         }
-        None => vec![],
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for next in chars.by_ref() {
+                if previous == '*' && next == '/' {
+                    break;
+                }
+                previous = next;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '`' | '[' | '\'') {
+            let closing = if ch == '[' { ']' } else { ch };
+            let mut token = String::new();
+            while let Some(next) = chars.next() {
+                if next == closing {
+                    if chars.peek() == Some(&closing) {
+                        chars.next();
+                        token.push(closing);
+                    } else {
+                        break;
+                    }
+                } else {
+                    token.push(next);
+                }
+            }
+            tokens.push(SqlToken::Quoted(token));
+            continue;
+        }
+        if matches!(ch, '.' | '(' | ';') {
+            tokens.push(SqlToken::Punctuation(ch));
+            continue;
+        }
+        let mut token = ch.to_string();
+        while let Some(next) = chars.peek().copied() {
+            let begins_comment = (next == '-' && chars.clone().nth(1) == Some('-'))
+                || (next == '/' && chars.clone().nth(1) == Some('*'));
+            if next.is_whitespace()
+                || matches!(next, '.' | '(' | ';' | '"' | '`' | '[' | '\'')
+                || begins_comment
+            {
+                break;
+            }
+            token.push(next);
+            chars.next();
+        }
+        tokens.push(SqlToken::Bare(token));
+    }
+
+    let keyword = |index: usize, word: &str| matches!(tokens.get(index), Some(SqlToken::Bare(token)) if token.eq_ignore_ascii_case(word));
+    if !keyword(0, "CREATE") {
+        return Vec::new();
+    }
+    let mut index = 1;
+    if keyword(index, "TEMP") || keyword(index, "TEMPORARY") {
+        index += 1;
+    }
+    if keyword(index, "VIRTUAL") {
+        index += 1;
+    }
+    if !keyword(index, "TABLE") {
+        return Vec::new();
+    }
+    index += 1;
+    if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
+        index += 3;
+    }
+    let main_qualifier = matches!(
+        tokens.get(index),
+        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if name.eq_ignore_ascii_case("main")
+    );
+    if main_qualifier && matches!(tokens.get(index + 1), Some(SqlToken::Punctuation('.'))) {
+        index += 2;
+    }
+    match tokens.get(index) {
+        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if !name.is_empty() => {
+            vec![name.to_ascii_lowercase()]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1927,6 +2004,43 @@ impl VerbRegistry {
             None if include_deleted => runtime.resolve_by_id_including_deleted(token, id).await,
             None => runtime.resolve_by_id(token, id).await,
         }
+    }
+
+    /// Find the unique configured backend holding an entity for deletion.
+    /// Includes tombstones so soft deletion cannot hide a duplicate owner.
+    /// The dispatch-authorized token is preserved; lookup is namespace-agnostic.
+    pub async fn resolve_entity_delete_runtime(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<Option<KhiveRuntime>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.entity_runtime(token, id).await,
+            None => {
+                let store = runtime.entities(token)?;
+                let entity = store.get_entity_including_deleted(id).await?;
+                Ok(entity.map(|_| runtime.clone()))
+            }
+        }
+    }
+
+    /// Clean main-backend attachments after no live or tombstoned owner remains.
+    /// A live or tombstoned entity on any configured backend keeps its roots.
+    pub async fn cleanup_deleted_entity_attachments(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+    ) -> Result<bool, RuntimeError> {
+        if self
+            .resolve_entity_delete_runtime(runtime, token, id)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        runtime.delete_entity_attachments_on_core(id).await
     }
 
     /// Recheck a merged-entity read against the kept id before returning it.
@@ -2337,8 +2451,9 @@ impl VerbRegistry {
     }
 
     /// Transport replay eligibility from the shared operation-effects table,
-    /// restricted to trusted canonical public handlers. Read permits incidental
-    /// audit/cache effects; the request id is correlation, not deduplication.
+    /// restricted to trusted canonical public handlers. A read that persists a
+    /// fresh serve or telemetry row is excluded because the request id is
+    /// correlation, not deduplication.
     /// Custom and mounted handlers cannot inherit safety from a name/category.
     pub fn is_read_replay_safe(&self, verb: &str) -> bool {
         self.read_replay_safe_verbs.contains(verb)
@@ -4179,7 +4294,7 @@ impl VerbRegistry {
     /// storage. Adding a verb here (or removing one because its side effect
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
-    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
+    pub const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
         &["memory.recall", "search", "telemetry.emit"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
@@ -4286,7 +4401,10 @@ impl VerbRegistry {
         // Backend identity is the raw pointer of the underlying connection pool Arc.
         let mut claimed: HashMap<(*const (), String), &'static str> = HashMap::new();
 
-        for (plan, additions) in self.all_schema_plans_with_columns() {
+        let plans = self.all_schema_plans_with_columns();
+        // Check every declaration before applying any pack DDL. A collision
+        // must not leave earlier plans installed on a failed boot.
+        for (plan, additions) in &plans {
             if plan.is_empty() && additions.is_empty() {
                 continue;
             }
@@ -4297,7 +4415,7 @@ impl VerbRegistry {
                 .unwrap_or(default_backend);
             let backend_ptr = std::sync::Arc::as_ptr(&backend.pool_arc()) as *const ();
 
-            // Pre-scan DDL for table names and detect collisions before applying.
+            // Collect DDL table ownership for the full plan set.
             for stmt in plan.statements {
                 for table_name in extract_table_names(stmt) {
                     let key = (backend_ptr, table_name.clone());
@@ -4316,8 +4434,7 @@ impl VerbRegistry {
                     }
                 }
             }
-
-            for addition in additions {
+            for addition in *additions {
                 let table_name = addition.table.to_ascii_lowercase();
                 let key = (backend_ptr, table_name.clone());
                 match claimed.entry(key) {
@@ -4338,7 +4455,17 @@ impl VerbRegistry {
                     }
                 }
             }
+        }
 
+        for (plan, additions) in plans {
+            if plan.is_empty() && additions.is_empty() {
+                continue;
+            }
+            let pack_name = plan.pack;
+            let backend = backend_for_pack
+                .get(pack_name)
+                .copied()
+                .unwrap_or(default_backend);
             if backend.is_read_only() {
                 backend.validate_pack_schema_columns(additions).map_err(|error| {
                     crate::PackSchemaCollisionError {
@@ -6160,6 +6287,27 @@ pub(crate) mod tests {
                 }
                 assert!(!registry.is_read_replay_safe("unknown.read"));
             }
+        }
+    }
+
+    #[test]
+    fn read_replay_excludes_reads_with_fresh_persisted_serve_or_search_rows() {
+        for (owner, verb) in [("memory", "memory.recall"), ("kg", "search")] {
+            let handler = Box::leak(Box::new([HandlerDef {
+                name: verb,
+                description: "side-effecting replay fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            }]));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_trusted(CountingHandlersPack {
+                name: owner,
+                handlers: handler,
+                calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let registry = builder.build().expect("side-effecting read fixture");
+            assert!(!registry.is_read_replay_safe(verb), "{verb}");
         }
     }
 
@@ -16002,6 +16150,173 @@ mod help_tests {
             msg.contains("collision_table"),
             "collision error must name the table; got: {msg}"
         );
+    }
+
+    #[test]
+    fn schema_collision_normalizes_sql_identifiers_before_any_ddl() {
+        let spellings: [&'static [&'static str]; 7] = [
+            &["CREATE TABLE IF NOT EXISTS \"shared\"(id INTEGER)"],
+            &["-- pack table\nCREATE TABLE IF NOT EXISTS shared(id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS main.shared(id INTEGER)"],
+            &["CREATE TEMP TABLE IF NOT EXISTS shared(id INTEGER)"],
+            &["CREATE/**/TABLE IF NOT EXISTS shared(id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS/**/shared(id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS shared/**/(id INTEGER)"],
+        ];
+        for statements in spellings {
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_alpha",
+                statements: &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+                column_additions: &[],
+            }));
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_beta",
+                statements,
+                column_additions: &[],
+            }));
+            let registry = builder.build().expect("registry builds");
+            let error = registry
+                .apply_schema_plans_with_map(&HashMap::new(), &backend)
+                .expect_err("spelling must not evade table ownership");
+            let message = error.to_string();
+            assert!(message.contains("pack_alpha") && message.contains("pack_beta"));
+            assert!(message.contains("shared"));
+            let table_count: i64 = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'shared'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("schema count");
+            assert_eq!(table_count, 0, "collision must precede all pack DDL");
+        }
+    }
+
+    #[test]
+    fn sqlite_accepts_single_quoted_table_names() {
+        let cases = [
+            ("shared", "CREATE TABLE 'shared' (id INTEGER)"),
+            ("sh'ared", "CREATE TABLE 'sh''ared' (id INTEGER)"),
+        ];
+        for (name, statement) in cases {
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            backend
+                .apply_pack_ddl_statements(&[statement])
+                .expect("SQLite accepts the table name");
+            let actual: String = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .expect("created table");
+            assert_eq!(actual, name);
+        }
+    }
+
+    #[test]
+    fn single_quoted_table_names_collide_before_ddl() {
+        let cases: [(
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+        ); 2] = [
+            (
+                "shared",
+                &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+                &["CREATE TABLE IF NOT EXISTS 'shared' (id INTEGER)"],
+            ),
+            (
+                "sh'ared",
+                &["CREATE TABLE IF NOT EXISTS \"sh'ared\" (id INTEGER)"],
+                &["CREATE TABLE IF NOT EXISTS 'sh''ared' (id INTEGER)"],
+            ),
+        ];
+        for (name, unquoted_or_double_quoted, single_quoted) in cases {
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_alpha",
+                statements: unquoted_or_double_quoted,
+                column_additions: &[],
+            }));
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_beta",
+                statements: single_quoted,
+                column_additions: &[],
+            }));
+            let registry = builder.build().expect("registry builds");
+            let error = registry
+                .apply_schema_plans_with_map(&HashMap::new(), &backend)
+                .expect_err("both declarations own one SQLite table");
+            assert_eq!(error.pack_a, "pack_alpha");
+            assert_eq!(error.pack_b, "pack_beta");
+            assert_eq!(error.table, name);
+            let table_count: i64 = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .expect("schema count");
+            assert_eq!(table_count, 0, "collision must precede all pack DDL");
+        }
+    }
+
+    #[test]
+    fn quoted_punctuation_table_names_cannot_evade_ownership() {
+        let cases: [(&'static str, &'static [&'static str]); 3] = [
+            (".", &[r#"CREATE TABLE IF NOT EXISTS "." (id INTEGER)"#]),
+            ("(", &[r#"CREATE TABLE IF NOT EXISTS "(" (id INTEGER)"#]),
+            (";", &[r#"CREATE TABLE IF NOT EXISTS ";" (id INTEGER)"#]),
+        ];
+        for (table, statements) in cases {
+            // Control: the quoted-punctuation identifier is valid SQLite on its
+            // own, so a refusal below must be an ownership-collision refusal,
+            // not a generic SQL-syntax rejection.
+            let control = khive_db::StorageBackend::memory().expect("control backend");
+            control
+                .apply_pack_ddl_statements(statements)
+                .expect("quoted punctuation is valid SQLite");
+
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            let mut builder = VerbRegistryBuilder::new();
+            for pack_name in ["pack_alpha", "pack_beta"] {
+                builder.register_boxed(Box::new(SchemaPack {
+                    pack_name,
+                    statements,
+                    column_additions: &[],
+                }));
+            }
+            let registry = builder.build().expect("registry builds");
+            let error = registry
+                .apply_schema_plans_with_map(&HashMap::new(), &backend)
+                .expect_err("quoted punctuation must remain an owned table");
+            let message = error.to_string();
+            assert!(message.contains("pack_alpha") && message.contains("pack_beta"));
+            let table_count: i64 = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("schema count");
+            assert_eq!(table_count, 0, "collision must precede all pack DDL");
+        }
     }
 
     #[test]

@@ -1742,6 +1742,52 @@ async fn get_include_sections_returns_all_sections_ordered() {
 }
 
 #[tokio::test]
+async fn edit_same_body_persists_changed_section_type() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "section-type-refresh",
+            "name": "Section Type Refresh",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let body = "The same section body can move from an overview to an example when the author changes its role, while its content-addressed identity remains stable.";
+    let first = f
+        .dispatch(
+            "knowledge.edit",
+            json!({ "id": "section-type-refresh", "sections": [{
+                "section_type": "overview", "heading": "Shared heading", "content": body
+            }] }),
+        )
+        .await
+        .expect("create overview section");
+    let second = f
+        .dispatch(
+            "knowledge.edit",
+            json!({ "id": "section-type-refresh", "sections": [{
+                "section_type": "examples", "heading": "Shared heading", "content": body
+            }] }),
+        )
+        .await
+        .expect("change section type without changing body");
+
+    assert_eq!(first["sections"][0]["id"], second["sections"][0]["id"]);
+    assert_eq!(second["sections"][0]["section_type"], "examples");
+    let stored = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": "section-type-refresh", "include_sections": true }),
+        )
+        .await
+        .expect("read section after edit");
+    assert_eq!(stored["sections"][0]["section_type"], "examples");
+}
+
+#[tokio::test]
 async fn get_include_sections_by_uuid() {
     let f = pack(rt());
     f.dispatch(
@@ -3499,6 +3545,60 @@ async fn compose_returns_markdown_for_atoms() {
     assert_eq!(count, 2);
 }
 
+/// #3233/#3235: a large first candidate must not stop packing, and the
+/// structured atom list/count must describe only what the briefing contains.
+#[tokio::test]
+async fn compose_skips_large_candidate_and_reports_only_packed_atoms() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "compose-too-large",
+                    "name": "Too Large",
+                    "content": "oversized ".repeat(400)
+                },
+                {
+                    "slug": "compose-small-a",
+                    "name": "Small A",
+                    "content": "first small relevant content ".repeat(22)
+                },
+                {
+                    "slug": "compose-small-b",
+                    "name": "Small B",
+                    "content": "second small relevant content ".repeat(22)
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    let response = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["compose-too-large", "compose-small-a", "compose-small-b"],
+                "query": "relevant content",
+                "max_tokens": 500,
+            }),
+        )
+        .await
+        .expect("compose with bounded output");
+    let data = &response["data"];
+    let markdown = data["markdown"].as_str().expect("markdown");
+    assert!(markdown.len() <= 2_000);
+    assert!(!markdown.contains("Too Large"));
+    assert!(markdown.contains("Small A"));
+    assert!(markdown.contains("Small B"));
+    let atoms = data["atoms"].as_array().expect("packed atoms");
+    assert_eq!(atoms.len(), 2);
+    assert_eq!(data["count"], json!(2));
+    assert_eq!(atoms[0]["slug"], json!("compose-small-a"));
+    assert_eq!(atoms[1]["slug"], json!("compose-small-b"));
+}
+
 /// #1505: the public namespace parameter is an exact compose scope, not a
 /// widened visible set. Identical slugs in local and a measurement arm must
 /// resolve to the arm's atom only, while an absent parameter preserves the
@@ -3729,6 +3829,85 @@ async fn compose_returns_markdown_for_domain() {
     assert!(
         !atoms.is_empty(),
         "compose from domain should include member atoms"
+    );
+}
+
+#[tokio::test]
+async fn compose_omits_deleted_domain_members_and_keeps_live_content() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({"atoms": [
+            {
+                "slug": "compose-surviving-member",
+                "name": "Surviving Member",
+                "content": "The surviving atom remains available in the composed briefing after another member of the same domain has been deleted, preserving useful and accurate context for subsequent requests."
+            },
+            {
+                "slug": "compose-deleted-member",
+                "name": "Deleted Member",
+                "content": "This atom is removed after domain membership is stored, leaving a stale member reference in the domain, while the surviving member should still compose normally afterward."
+            }
+        ]}),
+    )
+    .await
+    .expect("upsert atoms");
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({"domains": [{
+            "slug": "compose-mixed-domain",
+            "name": "Mixed Domain",
+            "description": "A domain with one live atom and one member that is later deleted, used to verify composed briefings retain surviving content while reporting stale membership accurately.",
+            "members": ["compose-surviving-member", "compose-deleted-member"]
+        }]}),
+    )
+    .await
+    .expect("upsert domain");
+    f.dispatch(
+        "knowledge.delete_atoms",
+        json!({"ids": ["compose-deleted-member"]}),
+    )
+    .await
+    .expect("delete member atom");
+
+    let response = f
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "surviving member", "domain_ids": ["compose-mixed-domain"]}),
+        )
+        .await
+        .expect("stale domain membership must not abort compose");
+    assert_eq!(response["status"], "ok", "got: {response}");
+    assert_eq!(response["data"]["count"], 1, "got: {response}");
+    assert_eq!(
+        response["data"]["atoms"][0]["slug"],
+        "compose-surviving-member"
+    );
+    assert!(
+        response["data"]["markdown"]
+            .as_str()
+            .expect("briefing markdown")
+            .contains("The surviving atom remains available"),
+        "live content must be rendered: {response}"
+    );
+    assert_eq!(
+        response["data"]["omissions"],
+        json!(["compose-deleted-member"]),
+        "stale domain member reference must be reported: {response}"
+    );
+
+    let explicit_missing = f
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "deleted member", "atom_ids": ["compose-deleted-member"]}),
+        )
+        .await;
+    assert!(
+        matches!(
+            &explicit_missing,
+            Err(khive_runtime::RuntimeError::NotFound(_))
+        ),
+        "an explicitly requested missing atom must still fail: {explicit_missing:?}"
     );
 }
 
@@ -5039,6 +5218,71 @@ mod kg_blend {
         generation dense sparse benchmark corpus latency gradient descent transformer vector \
         index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
 
+    async fn section_embedding_head(rt: &KhiveRuntime, section_id: &str) -> [f32; 2] {
+        let mut reader = rt.sql().reader().await.expect("section embedding reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT embedding FROM knowledge_sections WHERE id = ?1".into(),
+                params: vec![SqlValue::Text(section_id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("section embedding query")
+            .expect("section row");
+        let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
+            panic!("section must have an inline embedding: {row:?}");
+        };
+        assert!(bytes.len() >= 8, "section embedding has two dimensions");
+        [
+            f32::from_le_bytes(bytes[0..4].try_into().expect("first dimension")),
+            f32::from_le_bytes(bytes[4..8].try_into().expect("second dimension")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn edit_same_body_changed_heading_refreshes_section_embedding() {
+        let rt = rt_with_marker_embedder();
+        let f = pack(rt.clone());
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{
+                "slug": "heading-vector-refresh",
+                "name": "Heading Vector Refresh",
+                "content": OVERLAP_CONTENT
+            }] }),
+        )
+        .await
+        .expect("upsert atom");
+
+        let body = "The section body stays byte identical across edits so its content hash and section identity remain unchanged while the heading changes the embedding input.";
+        let first = f
+            .dispatch(
+                "knowledge.edit",
+                json!({ "id": "heading-vector-refresh", "sections": [{
+                    "section_type": "overview", "heading": "Plain heading", "content": body
+                }] }),
+            )
+            .await
+            .expect("create section with plain heading");
+        let section_id = first["sections"][0]["id"]
+            .as_str()
+            .expect("section id")
+            .to_string();
+        assert_eq!(section_embedding_head(&rt, &section_id).await, [0.0, 1.0]);
+
+        let second = f
+            .dispatch(
+                "knowledge.edit",
+                json!({ "id": "heading-vector-refresh", "sections": [{
+                    "section_type": "overview", "heading": format!("{MARKER} heading"), "content": body
+                }] }),
+            )
+            .await
+            .expect("change heading without changing section body");
+        assert_eq!(second["sections"][0]["id"], section_id);
+        assert_eq!(section_embedding_head(&rt, &section_id).await, [1.0, 0.0]);
+    }
+
     async fn seed_domain_and_atom(f: &Fixture) -> String {
         f.dispatch(
             "knowledge.upsert_atoms",
@@ -5466,11 +5710,10 @@ mod kg_blend {
     async fn blended_entities_respect_max_tokens_budget() {
         let f = pack(rt_with_marker_embedder());
 
-        // A padded atom whose cost alone consumes nearly all of the
-        // minimum-clamped max_tokens=500 budget (2000 chars), leaving too
-        // little remaining for the entity section but not exceeding the
-        // budget itself — the atom must survive either way.
-        let filler = "x".repeat(1677);
+        // A padded atom whose fully rendered briefing consumes nearly all
+        // of the 2000-byte floor budget, leaving too little for a KG heading
+        // and entity line. The atom must survive either way.
+        let filler = "x".repeat(1510);
         let big_content = format!("{OVERLAP_CONTENT} {filler}");
         f.dispatch(
             "knowledge.upsert_atoms",
@@ -5526,6 +5769,10 @@ mod kg_blend {
             .expect("tight-budget compose ok");
         let tight_atoms = tight["data"]["atoms"].as_array().expect("atoms array");
         assert!(!tight_atoms.is_empty(), "atoms must survive a tight budget");
+        assert!(
+            tight["data"]["markdown"].as_str().expect("markdown").len() <= 2_000,
+            "the whole rendered briefing, including the KG tail, must fit"
+        );
         assert!(
             tight["data"].get("entities").is_none(),
             "entity must be trimmed out under a tight budget, got: {}",

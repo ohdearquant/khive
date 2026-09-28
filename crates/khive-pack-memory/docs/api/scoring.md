@@ -12,7 +12,7 @@ score = w_rel * relevance
       * (1 + w_imp * salience)
 ```
 
-Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order, and the final value is clamped to `[0, 1]`.
+Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`.
 
 `ScoreInput` groups candidate fields to keep the function interface manageable: salience, memory type, content, creation time, decay factor, current time, normalized relevance, and entity names.
 
@@ -80,10 +80,10 @@ The default weight is `0.3`, making both clamp endpoints reachable at posterior 
 
 `RerankFeatures` exposes fused relevance, decay-adjusted salience, independent temporal recency, and boolean text/vector membership. Recognized weight keys are `relevance`, `salience`, `temporal`, `text_match`, and `vector_match`.
 
-The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value.
+The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value. Finite feature magnitudes are also scaled during accumulation so intermediate sums stay bounded.
 
 ## DoS caps and MMR
 
-`ScoringConfig::apply_dos_caps` clamps candidates to 500, token budget to 16,000, and result limit to 200. Defaults are 200 candidates, 4,000 tokens, and 10 results. `default_token_budget` and `chars_per_token` must both be positive; recall rejects a configuration whose effective character-budget product cannot be represented instead of wrapping it or treating it as an empty-result budget. MMR applies a default `0.1` penalty when the first 100 characters duplicate an earlier result.
+`ScoringConfig::apply_dos_caps` clamps candidates to 500, token budget to 16,000, and result limit to 200. Defaults are 200 candidates, 4,000 tokens, and 10 results. `default_token_budget` and `chars_per_token` must both be positive; recall rejects a configuration whose effective character-budget product cannot be represented instead of wrapping it or treating it as an empty-result budget. MMR applies a default `0.1` penalty when the first 100 characters duplicate a higher-ranked result in pre-penalty composite-score order (ID breaks equal-score ties). Both the MMR and final sorts use a total order that puts NaN after numeric scores, with ID as the tie-breaker.
 
 Supersedes suppression is enabled by default. Recall always fans out across every registered embedding engine and fuses the results (issue #1115) — there is no per-query engine selection to configure.

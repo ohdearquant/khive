@@ -249,6 +249,8 @@ pub(crate) mod tests {
         /// match) and "degraded-empty" (backend failed, no survivor)
         /// envelope fixtures (ADR-130 §1 regression coverage).
         pub empty_hits: bool,
+        /// Metadata delivered by the most recent intercepted singleton link.
+        pub last_link_metadata: std::sync::Mutex<Option<Option<Value>>>,
         pub last_search_request: std::sync::Mutex<Option<ValidatedSearchRequest>>,
         /// The `limit` value `fan_out_search` was last called with (MCP-AUD-003).
         pub last_limit: std::sync::atomic::AtomicU32,
@@ -266,6 +268,7 @@ pub(crate) mod tests {
                 failed_backend: None,
                 vector_failed_backend: None,
                 empty_hits: false,
+                last_link_metadata: std::sync::Mutex::new(None),
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -283,6 +286,7 @@ pub(crate) mod tests {
                 failed_backend: None,
                 vector_failed_backend: None,
                 empty_hits: true,
+                last_link_metadata: std::sync::Mutex::new(None),
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -297,6 +301,7 @@ pub(crate) mod tests {
                 failed_backend: Some(BackendId::parse(failed_backend).expect("valid backend id")),
                 vector_failed_backend: None,
                 empty_hits: false,
+                last_link_metadata: std::sync::Mutex::new(None),
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -313,6 +318,7 @@ pub(crate) mod tests {
                 failed_backend: Some(BackendId::parse(failed_backend).expect("valid backend id")),
                 vector_failed_backend: None,
                 empty_hits: true,
+                last_link_metadata: std::sync::Mutex::new(None),
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -333,6 +339,7 @@ pub(crate) mod tests {
                     BackendId::parse(vector_failed_backend).expect("valid backend id"),
                 ),
                 empty_hits: false,
+                last_link_metadata: std::sync::Mutex::new(None),
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -347,6 +354,7 @@ pub(crate) mod tests {
                 failed_backend: None,
                 vector_failed_backend: None,
                 empty_hits: false,
+                last_link_metadata: std::sync::Mutex::new(None),
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -374,11 +382,12 @@ pub(crate) mod tests {
             _target_id: Uuid,
             _relation: EdgeRelation,
             _weight: f64,
-            _metadata: Option<serde_json::Value>,
+            metadata: Option<serde_json::Value>,
             _resurrect: bool,
         ) -> Result<CoordLinkResult, CoordError> {
             self.link_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.last_link_metadata.lock().unwrap() = Some(metadata);
             Err(CoordError::UnknownNode { id: Uuid::new_v4() })
         }
 
@@ -619,6 +628,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// A top-level dependency_kind must reach the coordinator just as it does
+    /// the single-backend KG handler; explicit metadata wins on a conflict.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn multi_backend_link_preserves_dependency_kind_metadata() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        for (metadata, expected) in [
+            (
+                r#"{"tag":"keep"}"#,
+                json!({"tag": "keep", "dependency_kind": "artifact"}),
+            ),
+            (
+                r#"{"dependency_kind":"runtime"}"#,
+                json!({"dependency_kind": "runtime"}),
+            ),
+        ] {
+            *coord.last_link_metadata.lock().unwrap() = None;
+            let ops = format!(
+                r#"link(source_id="{source_id}", target_id="{target_id}", relation="depends_on", metadata={metadata}, dependency_kind="artifact")"#
+            );
+            server
+                .dispatch_request_local(RequestParams {
+                    plan: None,
+                    ops,
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("coordinator dispatch must return an operation result");
+            assert_eq!(
+                coord.last_link_metadata.lock().unwrap().clone(),
+                Some(Some(expected)),
+                "coordinator must see the KG handler's merged metadata"
+            );
+        }
+    }
+
     /// T6b: a multi-backend server MUST route `search` through the coordinator.
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
@@ -801,7 +857,7 @@ pub(crate) mod tests {
             assert_eq!(
                 search["arm_participation"],
                 json!({
-                    "text": {"status": "error", "candidate_count": expected_text_candidates},
+                    "text": {"mode": "all_terms", "status": "error", "candidate_count": expected_text_candidates},
                     "vector": {"status": "error", "candidate_count": 1}
                 }),
                 "selected arms must remain typed on partial-with-hit responses"
@@ -852,6 +908,7 @@ pub(crate) mod tests {
             search["arm_participation"],
             json!({
                 "text": {
+                    "mode": "all_terms",
                     "status": "ran",
                     "candidate_count": 0,
                     "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
@@ -862,6 +919,84 @@ pub(crate) mod tests {
         assert!(search.get("partial").is_none());
         assert!(search.get("missing_backends").is_none());
         assert!(search.get("backend_errors").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn coordinated_search_reports_effective_any_term_mode_for_both_substrates() {
+        for kind in ["entity", "note"] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::empty_multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(
+                        r#"search(kind="{kind}", query="nothing matches", text_mode="any_term")"#
+                    ),
+                    ..Default::default()
+                })
+                .await
+                .expect("coordinated search dispatch");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let entry = &response["results"][0];
+            assert_eq!(entry["ok"], true, "{kind}: {entry}");
+            assert_eq!(entry["arm_participation"]["text"]["mode"], "any_term");
+            assert_eq!(
+                entry["arm_participation"]["text"]["reason"],
+                "No text candidate survived matching, filtering, fusion, and the result limit."
+            );
+            assert_eq!(
+                coord
+                    .last_search_request
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("validated request")
+                    .text_mode_name(),
+                "any_term"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn coordinated_any_term_mode_survives_partial_and_incomplete_results() {
+        for (kind, partial) in [("entity", true), ("entity", false), ("note", false)] {
+            let (registry, _runtime) = make_registry();
+            let coord = if partial {
+                MockCoordinator::degraded_multi_backend("archive")
+            } else {
+                MockCoordinator::degraded_empty_multi_backend("archive")
+            };
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(
+                        r#"search(kind="{kind}", query="nothing matches", text_mode="any_term")"#
+                    ),
+                    ..Default::default()
+                })
+                .await
+                .expect("coordinated search dispatch");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let entry = &response["results"][0];
+            let arms = if partial {
+                assert_eq!(entry["ok"], true, "{kind}: {entry}");
+                assert_eq!(entry["status"], "partial");
+                &entry["arm_participation"]
+            } else {
+                assert_eq!(entry["ok"], false, "{kind}: {entry}");
+                assert_eq!(entry["error"]["kind"], "search_incomplete");
+                &entry["error"]["arm_participation"]
+            };
+            assert_eq!(arms["text"]["mode"], "any_term");
+            assert_eq!(arms["text"]["status"], "error");
+            assert!(arms["text"].get("reason").is_none());
+            assert!(arms.get("vector").is_some());
+            assert_eq!(arms.as_object().expect("arm object").len(), 2);
+        }
     }
 
     /// A vector-arm-only failure (the text arm still ran and contributed a
@@ -963,7 +1098,7 @@ pub(crate) mod tests {
         assert_eq!(
             search["error"]["arm_participation"],
             json!({
-                "text": {"status": "error", "candidate_count": 0},
+                "text": {"mode": "all_terms", "status": "error", "candidate_count": 0},
                 "vector": {"status": "error", "candidate_count": 0}
             })
         );
@@ -1229,7 +1364,7 @@ pub(crate) mod tests {
             );
             let expected_text_candidates = usize::from(kind == "entity");
             let mut expected_participation = json!({
-                "text": {"status": "ran", "candidate_count": expected_text_candidates},
+                "text": {"mode": "all_terms", "status": "ran", "candidate_count": expected_text_candidates},
                 "vector": {"status": "ran", "candidate_count": 1}
             });
             if kind == "note" {

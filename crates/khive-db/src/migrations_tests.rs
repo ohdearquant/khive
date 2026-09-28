@@ -280,6 +280,87 @@ fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
 }
 
 #[test]
+fn concurrent_service_schema_opens_apply_a_migration_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE_PREDICATES: AtomicUsize = AtomicUsize::new(0);
+    static MAX_ACTIVE_PREDICATES: AtomicUsize = AtomicUsize::new(0);
+
+    fn slow_untracked_predicate(_: &Connection) -> bool {
+        // On the old path both openers evaluated this before taking the write
+        // lock, then both observed a missing ledger row. On the corrected
+        // path the first holds BEGIN IMMEDIATE throughout this pause.
+        let active = ACTIVE_PREDICATES.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_ACTIVE_PREDICATES.fetch_max(active, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        ACTIVE_PREDICATES.fetch_sub(1, Ordering::SeqCst);
+        false
+    }
+
+    static STEPS: &[Migration] = &[Migration {
+        id: "001_concurrent",
+        up_sql: "CREATE TABLE service_migration_effect (id INTEGER PRIMARY KEY);",
+        down_sql: None,
+        is_already_applied: Some(slow_untracked_predicate),
+    }];
+    static PLAN: ServiceSchemaPlan = ServiceSchemaPlan {
+        service: "concurrent_service_schema",
+        sqlite: STEPS,
+        postgres: &[],
+    };
+
+    ACTIVE_PREDICATES.store(0, Ordering::SeqCst);
+    MAX_ACTIVE_PREDICATES.store(0, Ordering::SeqCst);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("service-schema.db");
+    let conn = Connection::open(&path).expect("create db");
+    conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .expect("enable concurrent reader");
+    conn.execute_batch(SCHEMA_VERSION_TABLE)
+        .expect("create ledger before contention");
+    drop(conn);
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let start = std::sync::Arc::clone(&start);
+        workers.push(std::thread::spawn(move || {
+            let conn = Connection::open(&path).expect("open worker connection");
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .expect("busy timeout");
+            start.wait();
+            apply_schema_plan(&conn, &PLAN).map_err(|error| error.to_string())
+        }));
+    }
+    start.wait();
+    for worker in workers {
+        worker
+            .join()
+            .expect("migration worker must not panic")
+            .expect("both concurrent openers must succeed");
+    }
+
+    let conn = Connection::open(&path).expect("inspect db");
+    assert_eq!(
+        MAX_ACTIVE_PREDICATES.load(Ordering::SeqCst),
+        1,
+        "migration admission predicates must run under the write lock"
+    );
+    assert!(table_exists(&conn, "service_migration_effect"));
+    let ledger_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _schema_versions
+             WHERE service = 'concurrent_service_schema' AND migration_id = '001_concurrent'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("ledger count");
+    assert_eq!(ledger_rows, 1);
+}
+
+#[test]
 fn fresh_db_migrates_to_latest() {
     let mut conn = open_memory();
     let version = run_migrations(&mut conn).expect("migrations should succeed");
@@ -2815,7 +2896,7 @@ fn v26_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
     .expect("section FTS must remain consistent after hard delete");
 }
 
-// ── V5: external_id unique index tests ──────────────────────────────────────
+// ── External-ID unique index tests (V5 and V42) ─────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
@@ -2873,6 +2954,55 @@ fn v5_duplicate_external_id_insert_rejected() {
         rusqlite::params![now],
     );
     assert!(dup.is_err(), "duplicate external_id must be rejected");
+}
+
+#[test]
+fn v42_external_id_uniqueness_uses_exact_channel_provenance() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    let insert = |id: &str, properties: serde_json::Value| {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, status, content, properties, created_at, updated_at) \
+             VALUES (?1, 'local', 'message', 'active', 'body', ?2, 1, 1)",
+            rusqlite::params![id, properties.to_string()],
+        )
+    };
+
+    let scoped = |slug: &str| {
+        serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "email",
+            "channel_slug": slug,
+        })
+    };
+    insert("upper", scoped("User@Example.com")).expect("first slug");
+    insert("lower", scoped("user@example.com")).expect("case-distinct slug");
+    assert!(
+        insert("upper-retry", scoped("User@Example.com")).is_err(),
+        "the same exact channel and external ID must remain unique"
+    );
+    insert(
+        "other-kind",
+        serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "telegram",
+            "channel_slug": "User@Example.com",
+        }),
+    )
+    .expect("channel kind is part of the dedup scope");
+    insert(
+        "unscoped",
+        serde_json::json!({"external_id": "imap:host:user@example.com:17:42"}),
+    )
+    .expect("an unattributed row has its own dedup scope");
+    assert!(
+        insert(
+            "unscoped-retry",
+            serde_json::json!({"external_id": "imap:host:user@example.com:17:42"}),
+        )
+        .is_err(),
+        "unattributed duplicates must remain unique"
+    );
 }
 
 #[test]

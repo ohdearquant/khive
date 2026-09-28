@@ -22,6 +22,12 @@ Version history for `PROTOCOL_VERSION`:
 - 5 — added `plan` (default false). A true value returns syntax and loaded-catalog information
   before request identity construction or dispatch. Older daemons reject v5 frames before they
   could ignore the flag and execute the operations. Restart a warm daemon when upgrading clients.
+- 6 — added new resident verbs. Older bridges re-exec onto the installed binary instead of
+  forwarding to a warm daemon that lacks the new catalog.
+- 7 — expanded the verb set and the `knowledge.search` candidate provenance response.
+- 8 — a daemon may serve a client whose extra embedders are a subset of its own. Older bridges
+  require exact config ids and could replay a successful write locally after a compatible daemon
+  serves it; reject their v7 frames before dispatch during a rolling upgrade.
 
 `process_ref` carries the originating client's opaque `KHIVE_PROCESS_REF`; it is request
 attribution, not identity, and prevents a shared daemon from substituting its own process
@@ -34,6 +40,14 @@ Plan frames retain the protocol and configuration checks. They reject the presen
 values, with an `invalid_params` error naming the field. The response `result` contains the same
 JSON object as `request(ops, plan=true)` and `Session.plan(ops)`. A grammar error is a successful
 response whose result has `parsed=false`; planning never grants permission or resolves `$prev`.
+
+An accepted socket has 30 seconds to supply its complete initial length-prefixed
+request frame. The bound includes the length header and body; an incomplete frame
+closes that connection without entering dispatch. The deadline is captured at
+acceptance, before peer checks and connection-task scheduling. The per-request
+read deadline starts after a complete frame is decoded and remains independent
+of this bound. A frame buffered before a delayed task starts still expires at
+the original acceptance deadline.
 
 ## try_acquire_flock_until
 

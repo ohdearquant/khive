@@ -1213,7 +1213,7 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
     let config = pool.config();
     let conn = pool
         .open_standalone_writer()
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_writer", e))?;
+        .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
 
     conn.busy_timeout(config.busy_timeout)
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
@@ -1974,7 +1974,46 @@ struct SqliteWriter {
     pool: Arc<ConnectionPool>,
 }
 
+fn execute_top_level_maintenance(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+    maintenance: TopLevelMaintenance,
+) -> rusqlite::Result<()> {
+    match maintenance {
+        TopLevelMaintenance::WalCheckpointTruncate => {
+            let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            crate::checkpoint::record_checkpoint_run_result(pool, result.as_ref().ok().copied());
+            result.map(|_| ())
+        }
+        TopLevelMaintenance::Vacuum => conn.execute_batch(maintenance.as_sql()),
+    }
+}
+
 impl SqliteWriter {
+    /// A standalone handle holds its connection across calls, so opening it
+    /// cannot serve as admission for every later write on that connection.
+    fn admit_standalone_write(
+        &self,
+        operation: &'static str,
+    ) -> khive_storage::types::StorageResult<()> {
+        if self.handle.is_none() {
+            return Err(StorageError::Pool {
+                operation: operation.into(),
+                message: "connection already consumed".into(),
+            });
+        }
+        self.pool
+            .write_admission()
+            .check()
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, operation))
+    }
+
     async fn use_queue_read_transaction_handle(
         &mut self,
         transaction_control: Option<CachedReadTransactionControl>,
@@ -2271,6 +2310,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
+        self.admit_standalone_write("execute")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
             message: "connection already consumed".into(),
@@ -2328,6 +2368,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
+        self.admit_standalone_write("execute_batch")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_batch".into(),
             message: "connection already consumed".into(),
@@ -2386,6 +2427,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
+        self.admit_standalone_write("execute_script")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script".into(),
             message: "connection already consumed".into(),
@@ -2413,7 +2455,6 @@ impl khive_storage::SqlWriter for SqliteWriter {
     ) -> khive_storage::types::StorageResult<()> {
         // Only the closed maintenance enum can supply unbound SQL here.
         // This is not the separate raw migration-script interface.
-        let script = maintenance.as_sql();
         // ADR-067 Component A: unlike
         // `execute_script`, this must NOT run inside the writer task's
         // per-request `BEGIN IMMEDIATE` — statements such as VACUUM are
@@ -2422,9 +2463,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // call through the single writer owner but skips the transaction
         // wrap entirely.
         if let Some(writer_task) = self.writer_task.clone() {
+            let pool = Arc::clone(&self.pool);
             return writer_task
                 .send_top_level_bounded(move |conn| {
-                    conn.execute_batch(script)
+                    execute_top_level_maintenance(&pool, conn, maintenance)
                         .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
                 })
                 .await;
@@ -2432,13 +2474,18 @@ impl khive_storage::SqlWriter for SqliteWriter {
 
         // Flag off / no writer task: identical to `execute_script`'s own
         // flag-off path — a bare `execute_batch` on the standalone
-        // connection, already transaction-free.
+        // connection, already transaction-free. This is a request-path
+        // maintenance operation, so it has the same reserve check as an
+        // ordinary standalone write. Only infrastructure checkpoint
+        // connections are exempt.
+        self.admit_standalone_write("execute_script_top_level")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script_top_level".into(),
             message: "connection already consumed".into(),
         })?;
+        let pool = Arc::clone(&self.pool);
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let res = handle.conn.execute_batch(script);
+            let res = execute_top_level_maintenance(&pool, &handle.conn, maintenance);
             (handle, res)
         })
         .await
@@ -2516,7 +2563,7 @@ where
         operation,
         move |scope| {
             let guard = pool.try_writer().map_err(|error: SqliteError| {
-                StorageError::driver(StorageCapability::Sql, operation, error)
+                error.into_storage_error(StorageCapability::Sql, operation)
             })?;
             scope.with_pooled_writer(&pool, &guard, |conn| {
                 let interruptible = conn.is_autocommit();
@@ -3534,6 +3581,45 @@ mod tests {
     use crate::pool::PoolConfig;
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
+
+    #[tokio::test]
+    async fn top_level_wal_checkpoint_ends_the_active_pin_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("top_level_checkpoint.db")),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (1)")
+                .unwrap();
+        }
+
+        let _task_guard = crate::checkpoint::CheckpointRunTaskGuard::start(
+            &pool,
+            std::time::Duration::from_secs(60),
+        );
+        crate::checkpoint::record_checkpoint_run_result(&pool, Some((0, 20, 10)));
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        bridge
+            .writer()
+            .await
+            .unwrap()
+            .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::checkpoint::checkpoint_run_status(&pool),
+            crate::checkpoint::CheckpointRunStatus::NoObservation
+        );
+    }
 
     #[tokio::test]
     async fn in_memory_atomic_unit_pending_future_rolls_back_and_remains_usable() {
@@ -9152,6 +9238,99 @@ mod tests {
             assert!(
                 matches!(&val, Some(SqlValue::Text(v)) if *v == format!("marked-{i}")),
                 "mark row {i} must reflect the persisted UPDATE after release; got {val:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_writer_handle_resamples_reserve_before_each_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for operation in [
+            "execute",
+            "execute_batch",
+            "execute_script",
+            "top_level_vacuum",
+            "top_level_checkpoint",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut pool = ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join(format!("reserve-{operation}.db"))),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap();
+            let samples = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&samples);
+            pool.set_test_write_admission(100, move |_| {
+                match observed.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => Ok(101), // Handle open, then first operation.
+                    2 => Ok(100),     // The same handle's next operation.
+                    extra => panic!("unexpected capacity sample {extra}"),
+                }
+            });
+            let bridge = SqlBridge::new(Arc::new(pool), true);
+            let mut writer = bridge.writer().await.unwrap();
+            writer
+                .execute(SqlStatement {
+                    sql: "CREATE TABLE reserve_test (id INTEGER PRIMARY KEY)".into(),
+                    params: vec![],
+                    label: None,
+                })
+                .await
+                .unwrap();
+
+            let insert = || SqlStatement {
+                sql: "INSERT INTO reserve_test (id) VALUES (1)".into(),
+                params: vec![],
+                label: None,
+            };
+            let error = match operation {
+                "execute" => writer.execute(insert()).await.map(|_| ()),
+                "execute_batch" => writer.execute_batch(vec![insert()]).await.map(|_| ()),
+                "execute_script" => {
+                    writer
+                        .execute_script("INSERT INTO reserve_test (id) VALUES (1)".into())
+                        .await
+                }
+                "top_level_vacuum" => {
+                    writer
+                        .execute_script_top_level(TopLevelMaintenance::Vacuum)
+                        .await
+                }
+                "top_level_checkpoint" => {
+                    writer
+                        .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .expect_err("the second operation must see the new reserve sample");
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::CapacityFloor {
+                        available_bytes,
+                        floor_bytes,
+                        ..
+                    } if *available_bytes == 100 && *floor_bytes == 100
+                ),
+                "{operation} must retain typed capacity-floor classification: {error:?}"
+            );
+            assert_eq!(samples.load(Ordering::SeqCst), 3, "{operation}");
+            assert!(
+                matches!(
+                    writer
+                        .query_scalar(SqlStatement {
+                            sql: "SELECT COUNT(*) FROM reserve_test".into(),
+                            params: vec![],
+                            label: None,
+                        })
+                        .await
+                        .unwrap(),
+                    Some(SqlValue::Integer(0))
+                ),
+                "{operation} must not write after the reserve refusal"
             );
         }
     }

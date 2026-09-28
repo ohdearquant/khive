@@ -11,7 +11,10 @@ use khive_types::{namespace::Namespace, SubstrateKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{config::BackendId, presentation::OutputFormat};
+use crate::{
+    config::{parse_embedding_model_alias, BackendId},
+    presentation::OutputFormat,
+};
 
 // ---- Error type ----
 
@@ -44,6 +47,12 @@ pub enum ConfigError {
 
     #[error("engine {name:?}: fusion_weight must be > 0, got {value}")]
     InvalidFusionWeight { name: String, value: f64 },
+
+    #[error(
+        "engine {name:?}: fusion_weight is not applied by current retrieval; \
+         remove it until weighted multi-engine fusion is wired"
+    )]
+    UnsupportedFusionWeight { name: String },
 
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
@@ -183,15 +192,13 @@ pub struct EngineConfig {
     #[serde(default)]
     pub default: bool,
 
-    /// RRF fusion weight for weighted multi-engine fusion.
+    /// Reserved RRF fusion weight for future weighted multi-engine fusion.
     ///
-    /// Only meaningful when multiple engines are loaded. Must be `> 0` when
-    /// present. `None` means the engine participates in fusion with equal weight
-    /// to other engines that also lack a `fusion_weight`.
-    ///
-    /// For RRF: `fusion_weight` provides per-engine relative importance during
-    /// weighted RRF; it does NOT apply to rank-based unweighted RRF (the weights
-    /// are injected into `FusionStrategy::Weighted` only).
+    /// Current retrieval does not consume this field. Config loading rejects
+    /// any explicit value rather than silently treating it as applied. Leave
+    /// it unset until per-engine weighted fusion is implemented. The loader
+    /// still distinguishes invalid (non-finite or non-positive) values from
+    /// valid but unsupported ones.
     pub fusion_weight: Option<f64>,
 
     /// Expected output dimensionality (optional sanity check).
@@ -761,14 +768,16 @@ pub struct ExecLimitsConfig {
 }
 
 /// `[exec]` section (ADR-181): where runs materialize, what they may read,
-/// which caller environment keys pass through, which binaries never run,
-/// output caps, wall-clock defaults and resource limits.
+/// which caller environment keys pass through, which executable paths the
+/// `never` list matches, and the output caps, wall-clock defaults and resource
+/// limits. `never` matches paths, not a program's capabilities (ADR-181 A9).
 ///
 /// ```toml
 /// [exec]
 /// root = "/var/lib/khive/exec"
 /// read_roots = ["/opt/toolchains/python3.11"]
 /// env = ["SOURCE_DATE_EPOCH"]
+/// # The never list matches resolved executable paths, not renamed copies.
 /// never = ["/usr/bin/curl"]
 /// max_output_bytes = 1048576
 /// timeout_default_s = 30
@@ -1494,10 +1503,9 @@ impl KhiveConfig {
     /// Checks:
     /// - Exactly one engine has `default = true` (when the list is non-empty).
     /// - Engine names are unique.
-    /// - `fusion_weight`, when present, is `> 0`.
-    ///
-    /// Model name validity is checked lazily at runtime (the config loader does
-    /// not import `lattice_embed` directly to keep the dep surface minimal).
+    /// - Every engine model is recognized by the runtime's alias parser.
+    /// - `fusion_weight`, when present, is finite and `> 0`, then rejected as
+    ///   unsupported until the retrieval path actually consumes it.
     pub fn validate(&self) -> Result<(), ConfigError> {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
@@ -1786,6 +1794,12 @@ impl KhiveConfig {
                     name: engine.name.clone(),
                 });
             }
+            if parse_embedding_model_alias(&engine.model).is_none() {
+                return Err(ConfigError::UnknownModel {
+                    name: engine.name.clone(),
+                    model: engine.model.clone(),
+                });
+            }
         }
 
         let default_count = self.engines.iter().filter(|e| e.default).count();
@@ -1806,6 +1820,15 @@ impl KhiveConfig {
                     });
                 }
             }
+        }
+        if let Some(engine) = self
+            .engines
+            .iter()
+            .find(|engine| engine.fusion_weight.is_some())
+        {
+            return Err(ConfigError::UnsupportedFusionWeight {
+                name: engine.name.clone(),
+            });
         }
 
         Ok(())
@@ -2109,6 +2132,50 @@ default = true
     }
 
     #[test]
+    fn test_unknown_engine_model_rejected_before_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            "[[engines]]\nname = \"primary\"\nmodel = \"not-a-model\"\ndefault = true\n",
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown primary model must fail");
+        assert!(
+            matches!(
+                config_error_root(&err),
+                ConfigError::UnknownModel { name, model }
+                    if name == "primary" && model == "not-a-model"
+            ),
+            "expected UnknownModel for the primary engine, got {err:?}"
+        );
+
+        let config: KhiveConfig = toml::from_str(
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n\n[[engines]]\nname = \"secondary\"\nmodel = \"not-a-model\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnknownModel { name, model })
+                if name == "secondary" && model == "not-a-model"
+        ));
+    }
+
+    #[test]
+    fn test_recognized_engine_model_validates_and_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        );
+        let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        config.validate().unwrap();
+        let runtime = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        assert_eq!(
+            runtime.embedding_model,
+            Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2)
+        );
+    }
+
+    #[test]
     fn test_default_engine_required_when_engines_present() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
@@ -2381,7 +2448,7 @@ blob_hydration_bytes = 134217728
     }
 
     #[test]
-    fn test_multi_engine_positive_fusion_weight() {
+    fn configured_fusion_weight_is_refused_instead_of_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
             &dir,
@@ -2398,12 +2465,37 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 fusion_weight = 0.3
 "#,
         );
-        let cfg = KhiveConfig::load(Some(&path))
-            .expect("load should succeed")
+        let err = KhiveConfig::load(Some(&path))
+            .expect_err("an explicit fusion weight must not be silently ignored");
+        assert!(
+            matches!(
+                config_error_root(&err),
+                ConfigError::UnsupportedFusionWeight { name } if name == "primary"
+            ),
+            "expected UnsupportedFusionWeight for primary, got {err:?}"
+        );
+
+        let unweighted_path = write_toml(
+            &dir,
+            r#"
+[[engines]]
+name = "primary"
+model = "all-minilm-l6-v2"
+default = true
+
+[[engines]]
+name = "secondary"
+model = "paraphrase-multilingual-minilm-l12-v2"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&unweighted_path))
+            .expect("unweighted multi-engine config remains valid")
             .expect("file should be found");
         assert_eq!(cfg.engines.len(), 2);
-        assert_eq!(cfg.engines[0].fusion_weight, Some(0.7));
-        assert_eq!(cfg.engines[1].fusion_weight, Some(0.3));
+        assert!(cfg
+            .engines
+            .iter()
+            .all(|engine| engine.fusion_weight.is_none()));
     }
 
     #[test]

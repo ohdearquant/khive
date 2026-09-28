@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -74,30 +75,98 @@ pub struct Found {
     pub mode: u32,
 }
 
+/// One bounded file capture, with its content hash accumulated while reading.
+pub struct CapturedContent {
+    pub bytes: Vec<u8>,
+    pub digest: String,
+}
+
+pub enum CaptureRead {
+    Complete(CapturedContent),
+    TooLarge { observed_at_least: u64 },
+}
+
+fn read_regular_bounded(
+    mut reader: impl Read,
+    advertised_len: u64,
+    max_bytes: u64,
+) -> std::io::Result<CaptureRead> {
+    // Sparse files are refused from opened-file metadata before allocating
+    // or reading them. Recheck the actual stream because a tool can grow a
+    // file between metadata inspection and EOF.
+    if advertised_len > max_bytes {
+        return Ok(CaptureRead::TooLarge {
+            observed_at_least: advertised_len,
+        });
+    }
+    let mut bytes = Vec::new();
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let observed = (bytes.len() as u64).saturating_add(n as u64);
+        if observed > max_bytes {
+            return Ok(CaptureRead::TooLarge {
+                observed_at_least: observed,
+            });
+        }
+        hasher.update(&chunk[..n]);
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    Ok(CaptureRead::Complete(CapturedContent {
+        bytes,
+        digest: hasher.finalize().to_hex().to_string(),
+    }))
+}
+
 impl Found {
-    pub fn read_content(&self) -> std::io::Result<Vec<u8>> {
+    pub fn read_content_bounded(&self, max_bytes: u64) -> std::io::Result<CaptureRead> {
         if self.mode == 120000 {
-            Ok(std::fs::read_link(&self.abs)?
+            let bytes = std::fs::read_link(&self.abs)?
                 .into_os_string()
-                .into_encoded_bytes())
+                .into_encoded_bytes();
+            if bytes.len() as u64 > max_bytes {
+                return Ok(CaptureRead::TooLarge {
+                    observed_at_least: bytes.len() as u64,
+                });
+            }
+            Ok(CaptureRead::Complete(CapturedContent {
+                digest: blake3::hash(&bytes).to_hex().to_string(),
+                bytes,
+            }))
         } else {
-            std::fs::read(&self.abs)
+            let file = std::fs::File::open(&self.abs)?;
+            let advertised_len = file.metadata()?.len();
+            read_regular_bounded(file, advertised_len, max_bytes)
         }
     }
 }
 
 /// Walk `root` without following symlinks. Files and symlinks become entries;
-/// directories are descended; sockets, fifos and devices are reported in `skipped`.
+/// directories are descended; sockets, fifos and devices are reported in
+/// `skipped`. An unreadable entry is an error, never evidence that an input
+/// path was deleted.
 pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String>)> {
     let mut files = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
+        let entries = std::fs::read_dir(&dir).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("read capture directory {}: {error}", dir.display()),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("enumerate capture directory {}: {error}", dir.display()),
+                )
+            })?;
             let name = entry.file_name().to_string_lossy().to_string();
             let child_rel = if rel.is_empty() {
                 name.clone()
@@ -105,10 +174,12 @@ pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String
                 format!("{rel}/{name}")
             };
             let abs = entry.path();
-            let meta = match std::fs::symlink_metadata(&abs) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let meta = std::fs::symlink_metadata(&abs).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("stat capture entry {}: {error}", abs.display()),
+                )
+            })?;
             let ft = meta.file_type();
             if ft.is_symlink() {
                 files.insert(child_rel, Found { abs, mode: 120000 });
@@ -143,6 +214,13 @@ pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String
 mod tests {
     use super::*;
 
+    fn captured_bytes(found: &Found) -> Vec<u8> {
+        match found.read_content_bounded(1024).unwrap() {
+            CaptureRead::Complete(content) => content.bytes,
+            CaptureRead::TooLarge { .. } => panic!("small fixture exceeded capture cap"),
+        }
+    }
+
     #[test]
     fn tail_keeps_last_bytes_and_counts_all() {
         let mut t = Tail::new(128);
@@ -157,6 +235,72 @@ mod tests {
         small.push(b"ok\n");
         assert!(small.complete());
         assert_eq!(small.retained(), b"ok\n");
+    }
+
+    #[test]
+    fn sparse_output_is_refused_from_metadata_before_a_whole_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse-output");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        let found = Found {
+            abs: path,
+            mode: 644,
+        };
+        assert!(matches!(
+            found.read_content_bounded(1024).unwrap(),
+            CaptureRead::TooLarge { observed_at_least } if observed_at_least == 1024 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn actual_capture_bytes_are_bounded_even_if_metadata_underreports() {
+        let bytes = vec![b'x'; 2048];
+        let result = read_regular_bounded(std::io::Cursor::new(bytes), 0, 1024).unwrap();
+        assert!(matches!(
+            result,
+            CaptureRead::TooLarge { observed_at_least } if observed_at_least > 1024
+        ));
+        let result = read_regular_bounded(std::io::Cursor::new(b"complete"), 0, 1024).unwrap();
+        let CaptureRead::Complete(content) = result else {
+            panic!("small content should be captured");
+        };
+        assert_eq!(content.bytes, b"complete");
+        assert_eq!(
+            content.digest,
+            blake3::hash(b"complete").to_hex().to_string()
+        );
+    }
+
+    #[test]
+    fn walk_reports_missing_root_instead_of_returning_an_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-run");
+        let error = walk(&missing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("missing-run"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_reports_unreadable_descendant_instead_of_omitting_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_ne!(unsafe { libc::geteuid() }, 0, "run as a non-root user");
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::write(sealed.join("input"), b"still present").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = walk(dir.path());
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("sealed"));
+        assert_eq!(
+            std::fs::read(sealed.join("input")).unwrap(),
+            b"still present"
+        );
     }
 
     #[cfg(unix)]
@@ -187,8 +331,8 @@ mod tests {
             ]
         );
         assert!(skipped.is_empty());
-        assert_eq!(files["a"].read_content().unwrap(), b"1");
-        assert_eq!(files["sub/b"].read_content().unwrap(), b"2");
+        assert_eq!(captured_bytes(&files["a"]), b"1");
+        assert_eq!(captured_bytes(&files["sub/b"]), b"2");
         for (name, target) in [
             ("file-link", "a"),
             ("dir-link", "sub"),
@@ -196,7 +340,7 @@ mod tests {
             ("escape-link", "/etc/passwd"),
         ] {
             assert_eq!(files[name].mode, 120000);
-            assert_eq!(files[name].read_content().unwrap(), target.as_bytes());
+            assert_eq!(captured_bytes(&files[name]), target.as_bytes());
         }
     }
 
@@ -215,7 +359,7 @@ mod tests {
         let (files, skipped) = walk(dir.path()).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(files["link"].mode, 120000);
-        assert_eq!(files["link"].read_content().unwrap(), target);
+        assert_eq!(captured_bytes(&files["link"]), target);
     }
 
     #[cfg(unix)]

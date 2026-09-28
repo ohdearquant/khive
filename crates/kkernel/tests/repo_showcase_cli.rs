@@ -25,6 +25,9 @@ fn git(repo: &Path, args: &[&str]) -> String {
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
         .output()
         .expect("git available");
     assert!(
@@ -112,6 +115,171 @@ fn build(home: &Path, repo: &Path, work: &Path, output: &Path, include: &str) ->
         ])
         .output()
         .expect("run repo build")
+}
+
+#[cfg(unix)]
+fn init_filter_fixture_repo(repo: &Path, filtered: bool) {
+    std::fs::create_dir_all(repo).expect("create fixture repository");
+    git(repo, &["init", "-q"]);
+    git(repo, &["config", "user.name", "Fixture"]);
+    git(repo, &["config", "user.email", "fixture@example.invalid"]);
+    if filtered {
+        std::fs::write(repo.join(".gitattributes"), "tracked.txt filter=probe\n")
+            .expect("write filter attributes");
+        std::fs::write(repo.join("tracked.txt"), b"original\n").expect("write tracked input");
+        git(repo, &["add", ".gitattributes", "tracked.txt"]);
+    } else {
+        std::fs::write(repo.join("README"), b"fixture\n").expect("write root input");
+        git(repo, &["add", "README"]);
+    }
+    git(repo, &["commit", "-m", "initial fixture"]);
+}
+
+#[cfg(unix)]
+fn assert_filter_is_not_run_before_refusal(root: &Path, submodule: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("create isolated home");
+    let repo = root.join("repo");
+    init_filter_fixture_repo(&repo, !submodule);
+    let target = if submodule {
+        let child = repo.join("child");
+        init_filter_fixture_repo(&child, true);
+        std::fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"child\"]\n\tpath = child\n\turl = ./child\n",
+        )
+        .expect("write local submodule record");
+        git(&repo, &["add", ".gitmodules", "child"]);
+        git(&repo, &["commit", "-m", "record child gitlink"]);
+        git(&repo, &["config", "submodule.child.ignore", "none"]);
+        assert!(
+            git(&repo, &["ls-files", "--stage", "child"]).starts_with("160000"),
+            "fixture must record a gitlink"
+        );
+        child
+    } else {
+        repo.clone()
+    };
+
+    let helper = root.join("marker-filter.sh");
+    let marker = root.join("marker-filter.sh.marker");
+    std::fs::write(&helper, "#!/bin/sh\n: > \"$0.marker\"\ncat\n").expect("write marker filter");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make marker filter executable");
+    let helper_command = format!("'{}'", helper.display().to_string().replace('\'', "'\\''"));
+    git(&target, &["config", "filter.probe.clean", &helper_command]);
+    let tracked = target.join("tracked.txt");
+    let write_dirty_input = |bytes: &[u8]| {
+        assert_eq!(bytes.len(), b"original\n".len());
+        std::fs::write(&tracked, bytes).expect("modify filtered input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tracked)
+            .expect("open filtered input")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800))
+            .expect("force stale filtered input mtime");
+    };
+    write_dirty_input(b"changed!\n");
+    let control = git(
+        &repo,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    assert!(!control.is_empty(), "fixture must be dirty");
+    if marker.exists() {
+        std::fs::remove_file(&marker).expect("clear status marker");
+    }
+    git(
+        &target,
+        &[
+            "hash-object",
+            "--filters",
+            "--path=tracked.txt",
+            "--",
+            "tracked.txt",
+        ],
+    );
+    assert!(
+        marker.is_file(),
+        "explicit Git probe must run the marker filter"
+    );
+    std::fs::remove_file(&marker).expect("clear positive-control marker");
+    write_dirty_input(b"updated!\n");
+
+    let output = root.join("bundle.json");
+    let history = root.join("history.db");
+    let map = root.join("map.db");
+    let mut command = isolated_command(&home);
+    command
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE");
+    if submodule {
+        command.env_remove("GIT_CONFIG");
+    } else {
+        command.env("GIT_CONFIG", "/dev/null");
+    }
+    let result = command
+        .args([
+            "repo",
+            "export",
+            "--repo",
+            repo.to_str().expect("utf-8 repo path"),
+            "--history-db",
+            history.to_str().expect("utf-8 history path"),
+            "--map-db",
+            map.to_str().expect("utf-8 map path"),
+            "--repository-url",
+            "https://github.com/example/synthetic",
+            "--generated-at",
+            "2026-08-07T16:00:00Z",
+            "--out",
+            output.to_str().expect("utf-8 output path"),
+        ])
+        .output()
+        .expect("run guarded repo export");
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !result.status.success(),
+        "export must refuse: {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("not a clean HEAD snapshot")
+            || diagnostics.contains("tracked special file"),
+        "export must reach the snapshot or gitlink refusal: {diagnostics}"
+    );
+    assert!(
+        !marker.exists(),
+        "Git clean filter ran before export refusal: {diagnostics}"
+    );
+    assert!(!output.exists() && !history.exists() && !map.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_git_config_does_not_run_clean_filter() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    assert_filter_is_not_run_before_refusal(tmp.path(), false);
+}
+
+#[cfg(unix)]
+#[test]
+fn submodule_local_filter_is_not_run_before_gitlink_refusal() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    assert_filter_is_not_run_before_refusal(tmp.path(), true);
 }
 
 #[test]

@@ -15,9 +15,9 @@ description = "SQLite storage backend: entities, edges, notes, events, FTS5, sql
 bench = false
 
 [dependencies]
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
-khive-score = { version = "0.8.0", path = "../khive-score" }
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-score = { version = "0.9.0", path = "../khive-score" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
@@ -36,6 +36,7 @@ fs4 = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -57,9 +58,8 @@ windows-sys = { version = "0.61", features = [
 khive-db = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks", "limits", "functions"] }
-bytes = "1"
-khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
 uuid = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }

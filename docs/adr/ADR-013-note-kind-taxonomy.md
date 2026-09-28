@@ -306,7 +306,7 @@ edge ontology (ADR-002) already handles cross-substrate edges via endpoint rules
 - `crates/khive-pack-kg/src/vocab.rs`: registers the five base note kinds via
   `NoteKindSpec`.
 - `crates/khive-pack-gtd/src/vocab.rs`: registers `task` kind.
-- `crates/khive-pack-memory/src/vocab.rs`: registers `memory` kind.
+- `crates/khive-pack-memory/src/pack.rs`: registers `memory` kind (`Pack::NOTE_KINDS`).
 - `crates/khive-runtime/src/registry.rs`: aggregates note kind registrations from
   loaded packs; rejects collisions at boot.
 - `crates/khive-runtime/src/operations.rs`: `create_note` validates kind against the

@@ -23,15 +23,15 @@ Namespace, weight, duplicate-entity, and duplicate-edge-key failures have dedica
 2. classify and merge edges;
 3. validate all merged edge endpoints against the merged entity IDs;
 4. return `MergeResult::Conflicts` when any entity, edge, or dangling conflict exists; otherwise
-5. build and deterministically sort a `MergeResult::Clean` archive.
+5. build and deterministically sort the archive, validate its output invariants, and return `MergeResult::Clean`.
 
 The conflict result does not include a provisional archive. The lower-level entity merge does retain an ours-side fallback for some conflicted entities, but the top-level function returns only the accumulated conflicts whenever any remain.
 
 ## Ours and theirs strategies
 
-`Ours` and `Theirs` are last-write-wins shortcuts. They select the preferred branch's versions, retain additions unique to the other branch, sort and timestamp the result, and still run dangling-edge validation. A shortcut therefore returns `Conflicts`, rather than incorrectly returning `Clean`, if its composed archive references a missing entity.
+`Ours` and `Theirs` are last-write-wins shortcuts. They select the preferred branch's versions and retain additions unique to the other branch. An opposing-only edge whose durable ID is already held by a preferred edge is dropped and reported as `EdgeIdentityCollision`; the shortcut does not return `Clean` with duplicate edge IDs. The result is sorted and timestamped, then checked for archive uniqueness and dangling endpoints. A dangling edge also produces `Conflicts`.
 
-`apply_theirs` is defined by swapping the branch arguments to `apply_ours`, which keeps the two shortcut policies symmetric.
+`apply_theirs` is defined by swapping the branch arguments to `apply_ours`, which keeps the two shortcut policies symmetric. The low-level `apply_ours`/`apply_theirs` helpers return only the composed archive; call `three_way_merge` to receive collision and dangling-edge conflicts.
 
 ## Deterministic output
 
