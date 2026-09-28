@@ -71,7 +71,8 @@ Weights are processed in this order before use:
 
 1. Non-finite values (`NaN`, `+Inf`, `-Inf`) are treated as `0.0`
 2. Negative values are treated as `0.0`
-3. If all effective weights are `<= 0`, equal distribution is applied
+3. If the effective sum is zero or overflows, equal distribution is applied to source positions
+   covered by a nonempty weight list; an empty list gives every source equal weight
 4. Otherwise, weights are divided by their sum to normalize to 1.0
 
 Use `try_normalize_weights` at public API boundaries to reject non-finite inputs with an error
@@ -91,7 +92,9 @@ of original score scale.
 ### Weight/source length mismatch
 
 - Extra weights beyond `sources.len()` are excluded from the normalization denominator.
-- Extra sources beyond `weights.len()` receive weight `0.0` (excluded from output).
+- With nonempty weights, extra sources beyond `weights.len()` receive weight `0.0` (excluded from
+  output), including during a zero-sum or overflow fallback.
+- With empty weights, every source receives an equal fallback weight.
 
 ---
 
@@ -131,7 +134,7 @@ do not apply `top_k` truncation — they return the full fused list.
 | `top_k == 0`                                 | Returns empty vec                                             |
 | VectorOnly/KeywordOnly with multiple sources | Selects slot 0/slot 1, respectively                           |
 | VectorOnly/KeywordOnly with one source       | Returns that authoritative source unchanged                   |
-| All-zero or all-negative weights             | Falls back to equal weight distribution                       |
+| Zero or overflowing effective weight sum     | Equal weight for covered sources, or all with empty weights   |
 | Non-finite weights in `weighted_fusion`      | Treated as 0.0 (lossy); use `try_normalize_weights` to reject |
 
 ---
