@@ -1974,6 +1974,27 @@ struct SqliteWriter {
     pool: Arc<ConnectionPool>,
 }
 
+fn execute_top_level_maintenance(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+    maintenance: TopLevelMaintenance,
+) -> rusqlite::Result<()> {
+    match maintenance {
+        TopLevelMaintenance::WalCheckpointTruncate => {
+            let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            crate::checkpoint::record_checkpoint_run_result(pool, result.as_ref().ok().copied());
+            result.map(|_| ())
+        }
+        TopLevelMaintenance::Vacuum => conn.execute_batch(maintenance.as_sql()),
+    }
+}
+
 impl SqliteWriter {
     async fn use_queue_read_transaction_handle(
         &mut self,
@@ -2413,7 +2434,6 @@ impl khive_storage::SqlWriter for SqliteWriter {
     ) -> khive_storage::types::StorageResult<()> {
         // Only the closed maintenance enum can supply unbound SQL here.
         // This is not the separate raw migration-script interface.
-        let script = maintenance.as_sql();
         // ADR-067 Component A: unlike
         // `execute_script`, this must NOT run inside the writer task's
         // per-request `BEGIN IMMEDIATE` — statements such as VACUUM are
@@ -2422,9 +2442,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // call through the single writer owner but skips the transaction
         // wrap entirely.
         if let Some(writer_task) = self.writer_task.clone() {
+            let pool = Arc::clone(&self.pool);
             return writer_task
                 .send_top_level_bounded(move |conn| {
-                    conn.execute_batch(script)
+                    execute_top_level_maintenance(&pool, conn, maintenance)
                         .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
                 })
                 .await;
@@ -2437,8 +2458,9 @@ impl khive_storage::SqlWriter for SqliteWriter {
             operation: "execute_script_top_level".into(),
             message: "connection already consumed".into(),
         })?;
+        let pool = Arc::clone(&self.pool);
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let res = handle.conn.execute_batch(script);
+            let res = execute_top_level_maintenance(&pool, &handle.conn, maintenance);
             (handle, res)
         })
         .await
@@ -3534,6 +3556,45 @@ mod tests {
     use crate::pool::PoolConfig;
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
+
+    #[tokio::test]
+    async fn top_level_wal_checkpoint_ends_the_active_pin_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("top_level_checkpoint.db")),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (1)")
+                .unwrap();
+        }
+
+        let _task_guard = crate::checkpoint::CheckpointRunTaskGuard::start(
+            &pool,
+            std::time::Duration::from_secs(60),
+        );
+        crate::checkpoint::record_checkpoint_run_result(&pool, Some((0, 20, 10)));
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        bridge
+            .writer()
+            .await
+            .unwrap()
+            .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::checkpoint::checkpoint_run_status(&pool),
+            crate::checkpoint::CheckpointRunStatus::NoObservation
+        );
+    }
 
     #[tokio::test]
     async fn in_memory_atomic_unit_pending_future_rolls_back_and_remains_usable() {
