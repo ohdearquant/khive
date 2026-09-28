@@ -536,7 +536,14 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 name: "channel_slug",
                 param_type: "string",
                 required: true,
-                description: "Exact channel credential slug owning the quarantine notes.",
+                description: "Exact channel credential slug, or an empty string only in legacy_slugless mode.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "mode",
+                param_type: "string",
+                required: false,
+                description: "Internal cleanup selector: channel (default) or legacy_slugless for one kind's historical blank-slug partition.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

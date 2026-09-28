@@ -333,8 +333,8 @@ populated. There is no intermediate state visible to concurrent readers."
 The shipped path differs. `publish_remote_cache` in `crates/khive-vcs/src/sync.rs` writes
 `entities.ndjson`, `edges.ndjson` and `meta.json` into a staging directory beside the cache under
 `.khive/kg/remotes/`, then calls `atomic_replace_dir`. When the cache directory already exists, that is
-two renames: the current directory to a sibling `<remote>.replaced-<pid>`, then the staging directory
-into place, after which the backup is removed. Between the two renames the cache path does not exist,
+two renames: the current directory to a sibling `<remote>.replaced~<pid>`, then the staging directory
+into place, after which backup removal is attempted. Between the two renames the cache path does not exist,
 which the function's own comment states ("is briefly absent"). The directory swap is the intended
 design, adopted for #475 so that the three files change together; a directory cannot be renamed over
 a non-empty directory in one portable step. Three details are not intended (#3215): a failed restore
@@ -353,12 +353,17 @@ swap leaves the old or the new cache. No production code reads `.khive/kg/remote
 2. **Failure between the renames.** If the second rename fails, the publish restores the backup. If the
    restore also fails, the error says so and names the backup path that holds the old cache; it never
    reports a restore that did not happen.
-3. **Recovery after a crash.** A publish first inspects the remote's `<remote>.replaced-*` siblings.
-   If the cache directory is missing and a backup exists, the newest backup is restored before the
-   publish proceeds; any other backup is removed. So a crash can leave the absent window open only
-   until the next publish of that remote.
+3. **Recovery after a crash.** Before a replacement swap, the target cache receives an owner marker
+   naming its backup; the first rename moves that marked cache to `<remote>.replaced~<pid>`. A later
+   publish scans only `<remote>.replaced~<digits>` siblings and recognizes a backup only when its
+   owner marker is valid. If the cache is missing and exactly one owned backup exists, it restores
+   that backup and clears the marker. If several owned backups exist, it refuses publication and
+   requires manual recovery rather than choosing one. When the cache is present, it removes owned
+   stale backups. An unverified
+   backup-shaped sibling is left untouched with a warning. Older `<remote>.replaced-<digits>`
+   siblings are ignored: they may be valid remote caches, not backups of this remote.
 4. **A reader added later** treats a missing cache directory as "not fetched", never as "empty remote",
-   and does not read a `.replaced-*` sibling.
+   and does not read a `.replaced~*` sibling as the cache.
 
 ### Alternatives considered
 
@@ -375,6 +380,11 @@ swap leaves the old or the new cache. No production code reads `.khive/kg/remote
 - The code changes are the ones #3215 lists: check the restore result and report it, and handle stale
   backups at the start of a publish. The `publish_remote_cache` doc comment is corrected to item 1.
 - Acceptance: a failure injected at both the second rename and the restore yields an error that names
-  the backup path and does not claim a restore; a `<remote>.replaced-99999` sibling with no cache
-  directory is restored by the next publish, and no `.replaced-*` sibling remains afterwards; the
-  existing failure-injection arms (no mixed cache after a failure at any staging step) still pass.
+  the backup path and does not claim a restore; a single marked `<remote>.replaced~99999` sibling
+  with no cache directory is restored by the next publish, while several owned backups cause a
+  manual-recovery refusal without selecting or deleting one. Unverified
+  `<remote>.replaced~<digits>` candidates are left untouched with a warning, and a
+  `<remote>.replaced-99999` sibling is left untouched as a possible valid remote cache. Normal
+  cleanup removes owned stale backups; a cleanup failure may leave one for the next publish to
+  remove. The existing failure-injection arms (no mixed cache after a failure
+  at any staging step) still pass.

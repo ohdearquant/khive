@@ -212,14 +212,24 @@ pub(crate) struct IngestParams {
     pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
-/// Internal daemon maintenance, scoped to one configured channel and the
-/// namespace in the registry token. `as_of_micros` permits deterministic
-/// retention tests without advancing a process-wide clock.
+/// Internal daemon maintenance, scoped to one channel kind and the namespace
+/// in the registry token. `as_of_micros` permits deterministic retention tests
+/// without advancing a process-wide clock.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuarantineCleanupMode {
+    #[default]
+    Channel,
+    LegacySlugless,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CleanupExpiredQuarantineParams {
     pub channel_kind: String,
     pub channel_slug: String,
+    #[serde(default)]
+    pub mode: QuarantineCleanupMode,
     #[serde(default)]
     pub as_of_micros: Option<i64>,
 }

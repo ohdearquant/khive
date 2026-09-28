@@ -101,15 +101,19 @@ pub struct HandlerDef {
 pub enum Visibility {
     /// Exposed to MCP agents. Agents call via `request("pack.verb(args)")`.
     Verb,
-    /// Not on the MCP wire. Callable only via `kkernel exec '<pack>.<handler>(args)'`.
-    /// Examples: `memory.recall_score`, `memory.recall_embed` — addressable
-    /// through batch DSL chains but NOT registered as top-level MCP verbs.
+    /// Not MCP-callable. Named `help=true` requests can describe it over MCP.
+    /// Callable in any DSL form through `kkernel exec` (single, batch, chain).
+    /// Examples: `memory.recall_score`, `memory.recall_embed`.
     Subhandler,
 }
 ```
 
 The MCP transport filters by `visibility == Verb` when building the agent capability
-list. `Subhandler` handlers are unreachable from MCP — agents never see them.
+list. `Subhandler` handlers are refused when invoked through the MCP `request` tool in
+any form (single, batch, chain). A named `help=true` request still returns the
+subhandler's description and parameter schema with `"visibility": "internal"` and
+`"callable_via_mcp": false`; it never runs the handler. A non-help call is refused
+as an internal subhandler.
 
 The kkernel CLI exposes the **full** handler surface via the verb-DSL `exec` subcommand:
 
@@ -585,15 +589,16 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 
 ### Tests
 
-| Scenario                                                       | Assert                                                      |
-| -------------------------------------------------------------- | ----------------------------------------------------------- |
-| Two packs declare the same verb name                           | `BootError::VerbCollision` at registration                  |
-| Static `Visibility::Subhandler` handler in a loaded pack       | Excluded from MCP capability list                           |
-| Substrate verb with kind-owning pack registering KindHook      | `create(kind=X, ...)` routes through prepare_create         |
-| Subhandler invoked via MCP `request("pack.subhandler_x(...)")` | Permission denied; internal subhandler; `not_committed`     |
-| Subhandler visible through operator introspection              | Listed as `Visibility::Subhandler`, not MCP-callable        |
-| Future `verbs_disabled` config policy                          | Deferred; requires parser, validation, and capability tests |
-| Pack template-generated crate compiles + passes smoke test     | Yes                                                         |
+| Scenario                                                   | Assert                                                       |
+| ---------------------------------------------------------- | ------------------------------------------------------------ |
+| Two packs declare the same verb name                       | `BootError::VerbCollision` at registration                   |
+| Static `Visibility::Subhandler` handler in a loaded pack   | Excluded from MCP capability list                            |
+| Substrate verb with kind-owning pack registering KindHook  | `create(kind=X, ...)` routes through prepare_create          |
+| Non-help subhandler via MCP request (single/batch/chain)   | Permission denied; internal subhandler; `not_committed`      |
+| Named MCP subhandler `help=true` request                   | Returns metadata with `callable_via_mcp: false`; no dispatch |
+| Subhandler visible through operator introspection          | Listed as `Visibility::Subhandler`, not MCP-callable         |
+| Future `verbs_disabled` config policy                      | Deferred; requires parser, validation, and capability tests  |
+| Pack template-generated crate compiles + passes smoke test | Yes                                                          |
 
 ## Amendment: dispatch-by-kind + KindHook as the mandatory pattern for future packs (2026-07-05)
 
