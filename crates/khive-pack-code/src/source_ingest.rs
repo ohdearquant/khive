@@ -45,6 +45,7 @@ use crate::extractor::{DeclKind, ExtractedDeclaration, ExtractedFile};
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+use crate::safe_source::{self, SourceReadError};
 
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
 const RUST_L2_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -170,6 +171,13 @@ pub struct CodeSourceIngestReport {
     /// could be derived — counted instead of silently skipping them.
     #[serde(default)]
     pub files_skipped_without_module_path: u64,
+    /// Source file opens refused because the candidate disappeared, was not
+    /// regular, or could not be verified inside the ingest root.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub source_files_refused: u64,
+    /// Manifest opens refused for the same file and containment checks.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub manifest_files_refused: u64,
     /// Entity documents successfully written to the map database's FTS index.
     /// A successful ingest indexes every non-blocked entity upsert, so generic
     /// KG `search` and query-anchored `context` can read the resulting map.
@@ -193,6 +201,10 @@ pub struct CodeSourceIngestReport {
     pub source_revision: String,
 }
 
+fn count_is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodeSourceIngestError {
     #[error("path {0:?} does not exist or is not a directory")]
@@ -201,6 +213,52 @@ pub enum CodeSourceIngestError {
     Runtime(#[from] RuntimeError),
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+fn record_manifest_failures(
+    report: &mut CodeSourceIngestReport,
+    failures: Vec<manifest::ManifestReadFailure>,
+) {
+    for failure in failures {
+        let refused = matches!(&failure.error, SourceReadError::Refused(_));
+        let warning = if refused {
+            format!(
+                "refused manifest {}: {}",
+                failure.path.display(),
+                failure.error
+            )
+        } else {
+            format!(
+                "reading manifest {}: {}",
+                failure.path.display(),
+                failure.error
+            )
+        };
+        if !report.warnings.contains(&warning) {
+            if refused {
+                report.manifest_files_refused += 1;
+            }
+            report.warnings.push(warning);
+        }
+    }
+}
+
+fn record_source_read_failure(
+    report: &mut CodeSourceIngestReport,
+    tier: &str,
+    path: &Path,
+    error: SourceReadError,
+) {
+    if matches!(&error, SourceReadError::Refused(_)) {
+        report.source_files_refused += 1;
+        report
+            .warnings
+            .push(format!("{tier} refused source {}: {error}", path.display()));
+    } else {
+        report
+            .warnings
+            .push(format!("reading {}: {error}", path.display()));
+    }
 }
 
 pub struct CodeSourceIngestOptions<'a> {
@@ -1798,21 +1856,16 @@ fn content_hash(content: &str) -> String {
 /// Read at most the L2 scanner's byte limit plus one. A refused file keeps
 /// module metadata and a parse-failure row, but its `refused:` fingerprint is
 /// deliberately not represented as a hash of unread source bytes.
-fn read_l2_source(path: &Path) -> io::Result<L2Source> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Ok(L2Source::Refused {
-            hash: "refused:non-regular-file".to_string(),
-            reason: "scanner safety limit: Rust source is not a regular file".to_string(),
-        });
-    }
+fn read_l2_source(canonical_root: &Path, path: &Path) -> Result<L2Source, SourceReadError> {
+    let source = safe_source::open_contained_file(canonical_root, path)?;
+    let metadata = source.metadata()?;
     if metadata.len() > RUST_L2_MAX_SOURCE_BYTES as u64 {
         return Ok(L2Source::Refused {
             hash: format!("refused:size:{}", metadata.len()),
             reason: "scanner safety limit: Rust source is too large".to_string(),
         });
     }
-    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut reader = BufReader::new(source);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -2147,8 +2200,11 @@ pub async fn run_code_ingest(
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
         let canonical_ingest_root = fs::canonicalize(opts.path)
             .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
-        manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
-            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?
+        let (manifests, failures) =
+            manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
+                .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+        record_manifest_failures(&mut report, failures);
+        manifests
     } else {
         Vec::new()
     };
@@ -2414,14 +2470,20 @@ async fn run_import_scan(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, language)
-                .unwrap_or_else(|| {
-                    (
-                        canonical_ingest_root.clone(),
-                        basename_project_name(ingest_root),
-                    )
-                });
+        let mut manifest_failures = Vec::new();
+        let governing = manifest::find_governing_manifest(
+            file_dir,
+            &canonical_ingest_root,
+            language,
+            &mut manifest_failures,
+        );
+        record_manifest_failures(report, manifest_failures);
+        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+            (
+                canonical_ingest_root.clone(),
+                basename_project_name(ingest_root),
+            )
+        });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             report.files_skipped_without_module_path += 1;
             continue;
@@ -2453,12 +2515,10 @@ async fn run_import_scan(
             continue;
         };
 
-        let content = match fs::read_to_string(&file) {
+        let content = match safe_source::read_contained_to_string(&canonical_ingest_root, &file) {
             Ok(c) => c,
             Err(e) => {
-                report
-                    .warnings
-                    .push(format!("reading {}: {e}", file.display()));
+                record_source_read_failure(report, "L1.5", &file, e);
                 continue;
             }
         };
@@ -3830,14 +3890,20 @@ async fn run_l2_sweep(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, LANGUAGE)
-                .unwrap_or_else(|| {
-                    (
-                        canonical_ingest_root.clone(),
-                        basename_project_name(ingest_root),
-                    )
-                });
+        let mut manifest_failures = Vec::new();
+        let governing = manifest::find_governing_manifest(
+            file_dir,
+            &canonical_ingest_root,
+            LANGUAGE,
+            &mut manifest_failures,
+        );
+        record_manifest_failures(report, manifest_failures);
+        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+            (
+                canonical_ingest_root.clone(),
+                basename_project_name(ingest_root),
+            )
+        });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, LANGUAGE) else {
             report.files_skipped_without_module_path += 1;
             continue;
@@ -3866,12 +3932,10 @@ async fn run_l2_sweep(
             continue;
         };
 
-        let source = match read_l2_source(&file) {
+        let source = match read_l2_source(&canonical_ingest_root, &file) {
             Ok(source) => source,
             Err(e) => {
-                report
-                    .warnings
-                    .push(format!("reading {}: {e}", file.display()));
+                record_source_read_failure(report, "L2", &file, e);
                 continue;
             }
         };
@@ -4525,7 +4589,9 @@ mod tests {
         let path = root.path().join("oversized.rs");
         let source = " ".repeat(RUST_L2_MAX_SOURCE_BYTES + 1);
         fs::write(&path, &source).expect("source file");
-        let L2Source::Refused { hash, reason } = read_l2_source(&path).expect("bounded read")
+        let L2Source::Refused { hash, reason } =
+            read_l2_source(&root.path().canonicalize().expect("canonical root"), &path)
+                .expect("bounded read")
         else {
             panic!("oversized source must not be retained for parsing");
         };
