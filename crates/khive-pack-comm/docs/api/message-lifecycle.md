@@ -657,8 +657,11 @@ exact channel kind and slug match. A matching channel-scoped replay also
 installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed
-or repaired by a replay from a named channel. It needs a separate audited
-migration or cleanup.
+or repaired by a replay from a named channel. At boot, the configured backends
+are scanned for live slugless quarantine originals, and a missing matching
+`quarantine-original` owner attachment is restored through the main backend.
+The repair preserves the stored original; it does not assign a channel slug or
+make the row eligible for channel-scoped expiry and cleanup.
 
 Quarantine notes receive `expires_at` at creation, computed from their own
 `created_at` plus the comm pack's `quarantine_retention` (14 days by default;
