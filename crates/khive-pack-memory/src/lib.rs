@@ -13,6 +13,7 @@ mod store_access;
 #[doc(hidden)]
 pub mod text_gather;
 pub mod tunable;
+pub(crate) mod visibility;
 
 #[cfg(test)]
 mod test_support;

@@ -277,6 +277,27 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "consistency",
+                param_type: "string",
+                required: false,
+                description: "Recall consistency: eventual (default) or session. Session requires a visibility_token and proves each requested model fence in its candidate-producing read.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "visibility_token",
+                param_type: "object",
+                required: false,
+                description: "Versioned namespace-bound visibility receipt returned by memory.remember; required when consistency is session.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "timeout_ms",
+                param_type: "integer",
+                required: false,
+                description: "Session proof wait in milliseconds, 0 by default and at most 10000; also bounded by the request deadline.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "include_breakdown",
                 param_type: "boolean",
                 required: false,
@@ -592,7 +613,8 @@ impl MemoryPack {
         // not embedded again in this future, `PackRuntime::dispatch`, and the
         // MCP request stack. Inlining it here can overflow Tokio's worker stack
         // even though the pipeline has no recursive call cycle.
-        let recall = Box::pin(self.handle_recall(token, params, registry));
+        let hard_deadline = start.checked_add(std::time::Duration::from_millis(budget_ms));
+        let recall = Box::pin(self.handle_recall(token, params, registry, hard_deadline));
         match tokio::time::timeout(std::time::Duration::from_millis(budget_ms), recall).await {
             Ok(result) => result,
             Err(_) => {
@@ -644,6 +666,7 @@ mod recall_future_footprint_tests {
                     &token,
                     serde_json::json!({"query": "future footprint probe"}),
                     &registry,
+                    None,
                 ));
                 let deadline_bytes = std::mem::size_of_val(&pack.handle_recall_with_deadline(
                     &token,

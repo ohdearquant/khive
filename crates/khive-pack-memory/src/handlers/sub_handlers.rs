@@ -118,6 +118,7 @@ impl MemoryPack {
                 RecallCandidateParams {
                     candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
+                    session_fence: None,
                     cjk_fts_bypass: false,
                     snippet_policy: TextSnippetPolicy::Include {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
@@ -234,6 +235,7 @@ impl MemoryPack {
                 RecallCandidateParams {
                     candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
+                    session_fence: None,
                     cjk_fts_bypass: false,
                     snippet_policy: TextSnippetPolicy::Include {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,

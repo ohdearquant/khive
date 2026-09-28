@@ -1947,7 +1947,10 @@ async fn v43_upgrade_preserves_v42_vector_as_unknown_provenance() {
             rusqlite::params![subject_id.to_string(), embedding],
         )
         .expect("write historical vector");
-        assert_eq!(run_migrations(&mut conn).expect("upgrade to V43"), 43);
+        assert_eq!(
+            run_migrations(&mut conn).expect("upgrade through latest migration"),
+            latest_schema_version()
+        );
         assert!(table_exists(&conn, "vector_provenance"));
         let sidecars: i64 = conn
             .query_row("SELECT COUNT(*) FROM vector_provenance", [], |row| {

@@ -7,6 +7,8 @@ mod fresh_tail_tests;
 mod prune;
 mod recall;
 mod remember;
+#[cfg(test)]
+mod session_visibility_tests;
 mod sub_handlers;
 #[cfg(test)]
 mod tests;

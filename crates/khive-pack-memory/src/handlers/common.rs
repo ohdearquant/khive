@@ -415,6 +415,14 @@ pub(super) struct RecallParams {
     pub(super) score_floor: Option<f32>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
+    /// Session controls stay in the same deserialized contract as HandlerDef.
+    /// Preserve explicit null so the strict boundary parser can reject it.
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub(super) consistency: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub(super) visibility_token: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub(super) timeout_ms: Option<Value>,
     #[serde(default)]
     pub(super) include_breakdown: Option<bool>,
     #[serde(default)]
@@ -450,6 +458,13 @@ pub(super) struct RecallParams {
     /// `brain.event_counts` since/until convention.
     #[serde(default)]
     pub(super) created_before: Option<String>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// Parse an RFC 3339 timestamp (offset required) into Unix microseconds.
@@ -699,6 +714,8 @@ pub(super) struct RecallCandidateSet {
     /// model degraded. Surfaced on empty degraded responses so they are
     /// distinguishable from a genuine no-match.
     pub(super) ann_degraded_reason: Option<String>,
+    /// Session fences that the candidate-producing vector read could not prove.
+    pub(super) session_unmet_models: Vec<String>,
     pub(super) timings: RecallStageTimings,
 }
 
@@ -751,9 +768,11 @@ pub(super) struct CandidateMeta {
     pub(super) snippet: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct RecallCandidateParams<'a> {
     pub(super) candidate_limit: u32,
     pub(super) embedding_model: Option<&'a str>,
+    pub(super) session_fence: Option<&'a crate::visibility::VisibilityFence>,
     /// Route the FTS path through the CJK-bypass tokenizer. Keyed on `contains_cjk`.
     pub(super) cjk_fts_bypass: bool,
     pub(super) snippet_policy: TextSnippetPolicy,
@@ -767,6 +786,7 @@ pub(super) struct RecallCandidateParams<'a> {
 pub(super) struct RecallVectorCandidateParams<'a> {
     pub(super) candidate_limit: u32,
     pub(super) embedding_model: Option<&'a str>,
+    pub(super) session_fence: Option<&'a crate::visibility::VisibilityFence>,
     /// Namespace set the caller is allowed to read. ANN returns global candidates;
     /// post-filter trims to this set before returning hits.
     pub(super) visible_namespaces: Vec<String>,
@@ -783,6 +803,7 @@ pub(super) struct RecallVectorCandidateResult {
     /// #1657: the first degraded model's failure-site reason; `None` when no
     /// model degraded.
     pub(super) ann_degraded_reason: Option<String>,
+    pub(super) session_unmet_models: Vec<String>,
     timings: RecallStageTimings,
 }
 
@@ -1074,6 +1095,7 @@ impl MemoryPack {
         let RecallCandidateParams {
             candidate_limit,
             embedding_model,
+            session_fence,
             cjk_fts_bypass,
             snippet_policy,
             fts_gather,
@@ -1112,6 +1134,7 @@ impl MemoryPack {
             RecallVectorCandidateParams {
                 candidate_limit,
                 embedding_model,
+                session_fence,
                 visible_namespaces: visible.clone(),
                 ann_overfetch_max_rounds,
                 ann_ready_timeout_ms,
@@ -1128,6 +1151,7 @@ impl MemoryPack {
             visible_namespaces: visible,
             ann_degraded: vector_result.ann_degraded,
             ann_degraded_reason: vector_result.ann_degraded_reason,
+            session_unmet_models: vector_result.session_unmet_models,
             timings,
         })
     }
@@ -1147,6 +1171,7 @@ impl MemoryPack {
         let RecallVectorCandidateParams {
             candidate_limit,
             embedding_model,
+            session_fence,
             visible_namespaces,
             ann_overfetch_max_rounds,
             ann_ready_timeout_ms,
@@ -1167,6 +1192,7 @@ impl MemoryPack {
         // #1657: first degraded model's failure-site reason, propagated so an
         // empty degraded response can cite it verbatim.
         let mut ann_degraded_reason: Option<String> = None;
+        let mut session_unmet_models = Vec::new();
         let model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
@@ -1192,9 +1218,15 @@ impl MemoryPack {
                     match result {
                         Ok(pair) => vec![pair],
                         Err(e) => {
-                            return Err(RuntimeError::Internal(format!(
-                                "recall: all embedding engines failed: {m}: {e}"
-                            )));
+                            if session_fence.is_some_and(|fence| fence.seq_for_model(&m).is_some())
+                            {
+                                tracing::warn!(model = %m, error = %e, "session embedding failed; visibility unproven");
+                                Vec::new()
+                            } else {
+                                return Err(RuntimeError::Internal(format!(
+                                    "recall: all embedding engines failed: {m}: {e}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -1216,7 +1248,17 @@ impl MemoryPack {
                     );
                     let (r0, r1) = tokio::join!(f0, f1);
                     khive_storage::ensure_request_read_active("memory.recall")?;
-                    collect_embed_results(vec![(m0, r0), (m1, r1)])?
+                    match collect_embed_results(vec![(m0, r0), (m1, r1)]) {
+                        Ok(pairs) => pairs,
+                        Err(error)
+                            if session_fence.is_some_and(|fence| !fence.fences.is_empty())
+                                && matches!(&error, RuntimeError::Internal(message) if message.starts_with("recall: all embedding engines failed:")) =>
+                        {
+                            tracing::warn!(%error, "session embeddings failed; visibility unproven");
+                            Vec::new()
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 _ => {
                     let mut handles = Vec::with_capacity(model_names.len());
@@ -1262,9 +1304,28 @@ impl MemoryPack {
                         })?;
                         named_results.push(pair);
                     }
-                    collect_embed_results(named_results)?
+                    match collect_embed_results(named_results) {
+                        Ok(pairs) => pairs,
+                        Err(error)
+                            if session_fence.is_some_and(|fence| !fence.fences.is_empty())
+                                && matches!(&error, RuntimeError::Internal(message) if message.starts_with("recall: all embedding engines failed:")) =>
+                        {
+                            tracing::warn!(%error, "session embeddings failed; visibility unproven");
+                            Vec::new()
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             };
+            if let Some(fence) = session_fence {
+                let embedded: HashSet<&str> =
+                    query_vecs.iter().map(|(model, _)| model.as_str()).collect();
+                for required in &fence.fences {
+                    if !embedded.contains(required.model.as_str()) {
+                        session_unmet_models.push(required.model.clone());
+                    }
+                }
+            }
             timings.embed = Some(embed_started.elapsed());
 
             if prof {
@@ -1287,6 +1348,8 @@ impl MemoryPack {
                 0 => Vec::new(),
                 1 => {
                     let (model_name, vec) = query_vecs.into_iter().next().unwrap();
+                    let session_seq =
+                        session_fence.and_then(|fence| fence.proof_for_model(&model_name));
                     let r = collect_model_ann_hits(
                         &self.runtime,
                         &self.ann,
@@ -1299,6 +1362,7 @@ impl MemoryPack {
                         ann_fetch_limit,
                         ann_overfetch_max_rounds,
                         ann_ready_timeout_ms,
+                        session_seq,
                     )
                     .await?;
                     khive_storage::ensure_request_read_active("memory.recall")?;
@@ -1308,6 +1372,8 @@ impl MemoryPack {
                     let mut it = query_vecs.into_iter();
                     let (m0, v0) = it.next().unwrap();
                     let (m1, v1) = it.next().unwrap();
+                    let seq0 = session_fence.and_then(|fence| fence.proof_for_model(&m0));
+                    let seq1 = session_fence.and_then(|fence| fence.proof_for_model(&m1));
                     let f0 = collect_model_ann_hits(
                         &self.runtime,
                         &self.ann,
@@ -1320,6 +1386,7 @@ impl MemoryPack {
                         ann_fetch_limit,
                         ann_overfetch_max_rounds,
                         ann_ready_timeout_ms,
+                        seq0,
                     );
                     let f1 = collect_model_ann_hits(
                         &self.runtime,
@@ -1333,6 +1400,7 @@ impl MemoryPack {
                         ann_fetch_limit,
                         ann_overfetch_max_rounds,
                         ann_ready_timeout_ms,
+                        seq1,
                     );
                     let (r0, r1) = tokio::join!(f0, f1);
                     khive_storage::ensure_request_read_active("memory.recall")?;
@@ -1341,6 +1409,8 @@ impl MemoryPack {
                 _ => {
                     let mut handles = Vec::with_capacity(query_vecs.len());
                     for (model_name, vec) in query_vecs {
+                        let session_seq =
+                            session_fence.and_then(|fence| fence.proof_for_model(&model_name));
                         let rt = self.runtime.clone();
                         let ann_shared = self.ann.clone();
                         let token_owned = token.clone();
@@ -1361,6 +1431,7 @@ impl MemoryPack {
                                         ann_fetch_limit,
                                         ann_overfetch_max_rounds,
                                         ann_ready_timeout_ms,
+                                        session_seq,
                                     )
                                     .await
                                 }),
@@ -1399,6 +1470,9 @@ impl MemoryPack {
 
             for r in &per_model_results {
                 timings.record_parallel_model(r.ann_elapsed, r.fresh_tail_elapsed);
+                if r.session_unmet {
+                    session_unmet_models.push(r.model_name.clone());
+                }
                 if r.degraded {
                     ann_degraded = true;
                     if ann_degraded_reason.is_none() {
@@ -1434,6 +1508,7 @@ impl MemoryPack {
             vector_hits_per_model,
             ann_degraded,
             ann_degraded_reason,
+            session_unmet_models,
             timings,
         })
     }
@@ -1510,6 +1585,7 @@ pub(super) struct PerModelAnnHits {
     /// excluding the separately measured fresh-tail leg.
     ann_elapsed: Duration,
     fresh_tail_elapsed: Option<Duration>,
+    session_unmet: bool,
 }
 
 /// Resolve one embedding model's vector candidates via warm ANN or the exact sqlite-vec
@@ -1529,10 +1605,55 @@ pub(super) async fn collect_model_ann_hits(
     ann_fetch_limit: usize,
     ann_overfetch_max_rounds: usize,
     ann_ready_timeout_ms: u64,
+    session_seq: Option<(u64, String)>,
 ) -> Result<PerModelAnnHits, RuntimeError> {
     let degrade_name = model_name.clone();
     let started = Instant::now();
     khive_storage::ensure_request_read_active("memory.recall")?;
+    // A fenced model uses a single exact candidate-producing SQL snapshot.
+    // The log or published-watermark proof and vector candidates are read by
+    // the same statement;
+    // an unrelated preflight clock must not certify ordinary ANN hits.
+    if let Some((required_seq, receipt_namespace)) = session_seq {
+        let result = ann::session_exact_candidates(
+            runtime,
+            &model_name,
+            &vec,
+            visible_namespaces,
+            &receipt_namespace,
+            required_seq,
+            ann_fetch_limit,
+        )
+        .await;
+        khive_storage::ensure_request_read_active("memory.recall")?;
+        let (raw, unmet) = match result {
+            Ok(Some(raw)) => (raw, false),
+            Ok(None) => (Vec::new(), true),
+            Err(error) => {
+                tracing::warn!(model = %model_name, %error, "session exact read could not prove visibility");
+                (Vec::new(), true)
+            }
+        };
+        let hits = raw
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (subject_id, score))| VectorSearchHit {
+                subject_id,
+                score: khive_score::DeterministicScore::from_f64(score as f64),
+                rank: (idx + 1) as u32,
+            })
+            .collect();
+        return Ok(PerModelAnnHits {
+            model_name,
+            hits,
+            degraded: false,
+            degraded_reason: None,
+            used_sqlite_vec_fallback: true,
+            ann_elapsed: started.elapsed(),
+            fresh_tail_elapsed: None,
+            session_unmet: unmet,
+        });
+    }
     let result = collect_model_ann_hits_inner(
         runtime,
         ann,
@@ -1572,6 +1693,7 @@ pub(super) async fn collect_model_ann_hits(
                 used_sqlite_vec_fallback: false,
                 ann_elapsed: started.elapsed(),
                 fresh_tail_elapsed: None,
+                session_unmet: false,
             })
         }
     }
@@ -1776,6 +1898,7 @@ async fn collect_model_ann_hits_inner(
             used_sqlite_vec_fallback: false,
             ann_elapsed,
             fresh_tail_elapsed: Some(fresh_tail_elapsed),
+            session_unmet: false,
         });
     }
 
@@ -1921,6 +2044,7 @@ async fn collect_model_ann_hits_inner(
             used_sqlite_vec_fallback: false,
             ann_elapsed,
             fresh_tail_elapsed: Some(fresh_tail_elapsed),
+            session_unmet: false,
         });
     }
 
@@ -1971,6 +2095,7 @@ async fn collect_model_ann_hits_inner(
         used_sqlite_vec_fallback: true,
         ann_elapsed: ann_started.elapsed(),
         fresh_tail_elapsed: None,
+        session_unmet: false,
     })
 }
 
@@ -2025,6 +2150,7 @@ mod request_cancellation_tests {
                 RecallCandidateParams {
                     candidate_limit: 10,
                     embedding_model: None,
+                    session_fence: None,
                     cjk_fts_bypass: false,
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &crate::config::RecallFtsGatherConfig::default(),
@@ -2090,6 +2216,7 @@ mod request_cancellation_tests {
             40,
             1,
             10,
+            None,
         )
         .await
         .unwrap();

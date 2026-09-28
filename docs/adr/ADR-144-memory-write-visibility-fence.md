@@ -127,3 +127,73 @@ decision:
 4. The session-fence wait carries a server-side maximum timeout cap;
    caller-provided timeouts bound below that cap and can never request an
    unbounded hold.
+
+## Amendment 1 (2026-09-27): receipt shape and one-snapshot proof
+
+**Status**: Accepted (2026-09-27). This amendment records the owner's rulings
+on implementation choices left open by the original decision; it does not
+weaken Arm A.
+
+### Receipt and replay
+
+`memory.remember` returns `visibility_token` as a strict JSON object:
+
+```json
+{"version":1,"namespace":"local","fences":[{"model":"example-model","ann_write_log_seq":123}]}
+```
+
+The namespace is the actual write namespace. There is exactly one fence per
+vector written, with the `ann_write_log.seq` captured in that vector write's
+transaction; model entries are unique and sorted by model name for stable
+serialization. A write with no registered embedding models returns the same
+object with `fences: []`. No token is returned for a rolled-back write.
+
+An exact keyed `memory.remember` replay writes nothing and returns the original
+durably stored per-memory, per-model fences. It must not mint a fresh log row
+or infer a sequence from a later `MAX(seq)` query. If the original receipt
+cannot be recovered, the replay reports `freshness_unmet` rather than claiming
+new visibility. The receipt storage and vector-log insertion commit together
+for keyed writes.
+The receipt records the expected model count so a missing per-model fence
+cannot be mistaken for a legitimate zero-model receipt.
+
+### Session input and bounded wait
+
+`memory.recall` defaults to `consistency: "eventual"`, preserving existing
+behavior. `consistency: "session"` requires `visibility_token`; a missing token,
+malformed shape or version, foreign namespace, duplicate model, or token model
+outside the recall's requested model set is `InvalidInput`. A well-formed
+fence whose sequence cannot be proven, including a future/unobserved sequence,
+returns a typed `freshness_unmet` result naming the failed models; this does
+not assert that the token was authentic. A missing keyed replay receipt is
+likewise unmet, not a new token. A token with an empty fence list has no
+per-model vector coverage obligation.
+
+The caller may supply `timeout_ms`; its default is zero (one immediate proof
+attempt). Waiting is bounded by 10,000 ms and must finish strictly before
+the request's remaining deadline minus a 2-second margin. The implementation
+polls with bounded sleeps and honors cancellation. On timeout it reports
+`freshness_unmet`, not a successful stale read or an unbounded hold.
+
+### Coverage proof
+
+For each requested model, session success requires evidence that the same
+candidate-producing read covered its fence through the served segment
+watermark together with the exact-tail snapshot. The candidates and the
+coverage evidence must come from one coherent read snapshot; a separate
+preflight query followed by ordinary recall cannot establish the guarantee.
+A skipped, capped, floored, or degraded tail leg may succeed only if the
+remaining evidence still proves the fence. An exact SQLite vector scan may
+serve as coverage proof only when the scan and fence evidence share that
+same snapshot. Otherwise the model is named in `freshness_unmet`.
+
+Coverage is a retrieval-source guarantee, not a promise that every covered
+memory survives ranking, caller filters, or a zero limit. Acceptance uses a
+distinctive matching query, permissive limit, and no excluding filters for
+the immediate remember→session recall test, plus a separate test proving that
+an unprovable fence refuses success.
+
+Returning a token while bypassing the session coverage check must turn the
+unprovable-fence refusal test red while that named test runs; removing the
+same-snapshot requirement (a preflight query then ordinary recall) must turn
+the interleaved compaction test red.
