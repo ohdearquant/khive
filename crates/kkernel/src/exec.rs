@@ -8,6 +8,8 @@
 //! `--log` and `KHIVE_LOG` affect the client process, while the daemon's level
 //! is fixed at startup. The response protocol does not report a daemon PID
 //! or stderr destination, so this disclosure includes neither.
+//! A forwarded lexical-timeout response is also reported as a client-side
+//! WARN: the daemon's detailed event cannot reach the caller's stderr.
 //!
 //! ## Modes
 //!

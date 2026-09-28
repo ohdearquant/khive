@@ -950,6 +950,15 @@ fn map_response(
         );
     }
     if resp.ok {
+        if resp
+            .error_detail
+            .as_ref()
+            .and_then(|detail| detail.get("lexical_timeout"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            tracing::warn!(source = "daemon_response", "lexical read timed out");
+        }
         Some(Ok(resp.result.unwrap_or_default()))
     } else {
         let msg = resp.error.unwrap_or_else(|| {
@@ -4143,6 +4152,52 @@ mod tests {
             Some(Ok(s)) => assert_eq!(s, "the-result"),
             other => panic!("expected Some(Ok(\"the-result\")), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepted_daemon_timeout_warns_once_and_preserves_result_bytes() {
+        let public = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "knowledge.search", "result": "| name |\n|---|\n| first |\n"},
+                {"ok": true, "tool": "knowledge.suggest", "result": "| name |\n|---|\n| second |\n"}
+            ],
+            "summary": {"total": 2, "succeeded": 2, "failed": 0}
+        });
+        let raw = public.to_string();
+        let nested = serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {
+                "degraded": {"lexical_timeout": true}
+            }}]
+        })
+        .to_string();
+        let unmarked = serde_json::json!({
+            "results": [{"ok": true, "tool": "knowledge.search", "result": {
+                "degraded": {"lexical_timeout": true}
+            }}]
+        })
+        .to_string();
+        let logs = capture_sync_events(|| {
+            let mut frame = frame_ok(&raw);
+            frame.error_detail = Some(serde_json::json!({"lexical_timeout": true}));
+            let accepted = map_response(frame, CFG, NS)
+                .expect("accepted response")
+                .expect("successful response");
+            assert_eq!(accepted, raw);
+            assert_eq!(
+                map_response(frame_ok(&nested), CFG, NS)
+                    .expect("accepted response")
+                    .expect("successful response"),
+                nested
+            );
+            assert_eq!(
+                map_response(frame_ok(&unmarked), CFG, NS)
+                    .expect("accepted response")
+                    .expect("successful response"),
+                unmarked
+            );
+        });
+        assert_eq!(logs.matches("lexical read timed out").count(), 1, "{logs}");
+        assert!(logs.contains("daemon_response"), "{logs}");
     }
 
     #[test]
