@@ -36,6 +36,14 @@ character is), but this layer never sees `(...)` comments — those were already
 by the segment scanner. A token is returned verbatim, including any retained quote and
 backslash characters; it is never unquoted.
 
+Before tokenizing, `normalize_delimiter_cfws` removes whitespace immediately around
+unquoted `=` and, in method segments, the dot in a `ptype.property` name, as RFC 8601
+permits. It does not collapse spaces around dots in property values or an authserv-id.
+Quoted values remain unchanged, including whitespace and `=` inside a quoted pvalue.
+The first segment receives only `=` normalization before shape detection, so a
+no-authserv-id `dmarc = pass` is recognized as a method without changing an authserv-id;
+if it is a method, property-name dot normalization follows.
+
 Malformed input (an unmatched `"`, or a `\` as the final character while quoted) is
 handled conservatively: the remainder of the segment is retained as one atomic token
 through EOF rather than resuming whitespace splitting, so a malformed quoted tail can

@@ -212,6 +212,64 @@ fn split_top_level_ws(segment: &str) -> Vec<String> {
     tokens
 }
 
+/// RFC 8601 permits CFWS on either side of `=` and of the dot in a
+/// `ptype.property` name. Comments were removed by the segment scanner;
+/// remove only adjacent whitespace here, retaining quoted pvalues byte for
+/// byte and leaving other whitespace for `split_top_level_ws` to tokenize.
+/// Dot CFWS is valid only in property names, never an authserv-id or pvalue.
+fn normalize_delimiter_cfws(segment: &str, property_names: bool) -> String {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut normalized = String::with_capacity(segment.len());
+    let mut in_quotes = false;
+    let mut in_property_name = false;
+    let mut in_value = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if in_quotes {
+            normalized.push(current);
+            if current == '\\' {
+                if let Some(escaped) = chars.get(index + 1) {
+                    normalized.push(*escaped);
+                    index += 1;
+                }
+            } else if current == '"' {
+                in_quotes = false;
+            }
+        } else if current == '"' {
+            in_quotes = true;
+            normalized.push(current);
+        } else if current == '=' {
+            in_property_name = false;
+            in_value = true;
+            normalized.push(current);
+        } else if current.is_whitespace() {
+            let start = index;
+            while index + 1 < chars.len() && chars[index + 1].is_whitespace() {
+                index += 1;
+            }
+            let next = chars.get(index + 1).copied();
+            let previous = normalized.as_bytes().last().copied();
+            let adjacent_to_equal = matches!(previous, Some(b'=')) || next == Some('=');
+            let adjacent_dot = matches!(previous, Some(b'.')) || next == Some('.');
+            let collapse_property_dot = property_names && in_property_name && adjacent_dot;
+            if !adjacent_to_equal && !collapse_property_dot {
+                normalized.extend(chars[start..=index].iter().copied());
+                // A pvalue's malformed spaced dot is still part of that
+                // value, not the start of a new property name.
+                if !in_value || !adjacent_dot {
+                    in_property_name = true;
+                    in_value = false;
+                }
+            }
+        } else {
+            normalized.push(current);
+        }
+        index += 1;
+    }
+    normalized
+}
+
 /// True if `target` occurs in `token` outside a quoted-string span (same
 /// quoted-pair semantics as [`split_top_level_ws`]) -- unlike `str::contains`,
 /// distinguishes a quoted `=` from an unquoted one. See
@@ -251,7 +309,8 @@ fn contains_unquoted(token: &str, target: char) -> bool {
 /// for the full shape-detection contract and the empty-vs-zero-signal distinction.
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
     let mut all_segments = split_top_level_segments(raw).into_iter();
-    let first_segment = all_segments.next()?;
+    let first_raw = all_segments.next()?;
+    let first_segment = normalize_delimiter_cfws(&first_raw, false);
     let first_token = split_top_level_ws(&first_segment).into_iter().next()?;
 
     // A valid RFC 8601 authserv-id can never contain an *unquoted* `=`; a
@@ -273,10 +332,17 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
         if is_no_authserv_id_form {
             (
                 None,
-                Box::new(std::iter::once(first_segment).chain(all_segments)),
+                Box::new(
+                    std::iter::once(normalize_delimiter_cfws(&first_raw, true)).chain(
+                        all_segments.map(|segment| normalize_delimiter_cfws(&segment, true)),
+                    ),
+                ),
             )
         } else {
-            (Some(first_token), Box::new(all_segments))
+            (
+                Some(first_token),
+                Box::new(all_segments.map(|segment| normalize_delimiter_cfws(&segment, true))),
+            )
         };
 
     let mut out = AuthResults {
@@ -388,6 +454,55 @@ mod tests {
         let parsed = parse_header("mx.example.com; dmarc=pass header.from=example.com").unwrap();
         assert_eq!(parsed.authserv_id.as_deref(), Some("mx.example.com"));
         assert!(parsed.dmarc_pass());
+    }
+
+    #[test]
+    fn spaced_method_and_property_delimiters_preserve_alignment() {
+        let parsed = parse_header(
+            r#"mx.example.net; dmarc = pass header . from = example.com reason = "a = b""#,
+        )
+        .unwrap();
+        assert_eq!(parsed.authserv_id.as_deref(), Some("mx.example.net"));
+        assert_eq!(parsed.dmarc.len(), 1);
+        assert_eq!(parsed.dmarc[0].result, "pass");
+        assert_eq!(
+            parsed.dmarc[0].props.get("header.from").map(String::as_str),
+            Some("example.com")
+        );
+        assert_eq!(
+            parsed.dmarc[0].props.get("reason").map(String::as_str),
+            Some(r#""a = b""#)
+        );
+        assert!(parsed.dmarc_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn spaced_dot_in_property_value_never_becomes_an_aligned_domain() {
+        let raw = "mx.example.net; dmarc = pass header . from = example .com";
+        assert_eq!(
+            normalize_delimiter_cfws("dmarc = pass header . from = example .com", true),
+            "dmarc=pass header.from=example .com"
+        );
+        let parsed = parse_header(raw).expect("method result still parses");
+        assert_eq!(parsed.authserv_id.as_deref(), Some("mx.example.net"));
+        assert!(parsed.dmarc_pass());
+        assert!(!parsed.dmarc_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn spaced_dot_in_authserv_id_never_matches_the_trust_anchor() {
+        let raw = "mx . example . com; dmarc = pass header . from = example.com";
+        let parsed = parse_header(raw).expect("header still parses");
+        assert_ne!(parsed.authserv_id.as_deref(), Some("mx.example.com"));
+        let anchor = TrustAnchor::AuthservId("mx.example.com".to_string());
+        assert!(select_trusted(&[raw.to_string()], &anchor).is_none());
+    }
+
+    #[test]
+    fn spaced_first_method_still_has_no_authserv_id() {
+        let parsed = parse_header("dmarc = pass header.from = example.com").unwrap();
+        assert_eq!(parsed.authserv_id, None);
+        assert!(parsed.dmarc_pass_aligned("example.com"));
     }
 
     #[test]
