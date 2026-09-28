@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -363,6 +363,32 @@ enum PublishFailAt {
 const REMOTE_BACKUP_MARKER: &str = ".replaced~";
 const REMOTE_BACKUP_OWNER_FILE: &str = ".khive-backup-owner";
 const REMOTE_BACKUP_OWNER_HEADER: &str = "khive-vcs remote cache backup v1\n";
+const REMOTES_GITIGNORE: &[u8] = b"*\n";
+
+fn ensure_remote_cache_gitignore(remotes_root: &Path) -> Result<()> {
+    let path = remotes_root.join(".gitignore");
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(REMOTES_GITIGNORE)
+                .with_context(|| format!("writing {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing {}", path.display()))?;
+            fsync_dir_best_effort(remotes_root);
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspecting {}", path.display()))?;
+            if !metadata.is_file() || fs::read(&path)?.as_slice() != REMOTES_GITIGNORE {
+                bail!(
+                    "remote cache ignore file {} is not the tool-owned `*` rule",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+    }
+    Ok(())
+}
 
 fn publish_remote_cache(
     remotes_root: &Path,
@@ -374,6 +400,7 @@ fn publish_remote_cache(
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(remotes_root)
         .with_context(|| format!("creating {}", remotes_root.display()))?;
+    ensure_remote_cache_gitignore(remotes_root)?;
     let cache_dir = remotes_root.join(name);
     // Recovery precedes staging I/O too: an error while constructing the next
     // generation must not leave a prior crash's backup as the only copy.
