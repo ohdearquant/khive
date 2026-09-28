@@ -337,6 +337,10 @@ phase_daemon_recovery_flake() {
 
 phase_no_default_features() {
     echo "=== No-Default-Features Check ==="
+    # Check the package alone: workspace feature unification enables fold's
+    # default serde feature through its runtime/pack dependents (#3341).
+    cargo check --locked -p khive-fold --no-default-features --lib
+    cargo test --locked -p khive-fold --no-default-features --test no_default_checkpoint
     cargo check --workspace --no-default-features
 }
 
