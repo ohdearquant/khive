@@ -423,6 +423,16 @@ fn open_blob_shard_file_no_follow(
     root_handle: &std::fs::File,
     content_ref: &ContentRef,
 ) -> std::io::Result<std::fs::File> {
+    open_blob_shard_file_no_follow_windows(root, root_handle, content_ref, false)
+}
+
+#[cfg(windows)]
+fn open_blob_shard_file_no_follow_windows(
+    root: &Path,
+    root_handle: &std::fs::File,
+    content_ref: &ContentRef,
+    for_mtime_update: bool,
+) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
@@ -492,6 +502,7 @@ fn open_blob_shard_file_no_follow(
 
     let target = OpenOptions::new()
         .read(true)
+        .write(for_mtime_update)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(shard2.join(hex))?;
@@ -1173,6 +1184,74 @@ fn put_blocking_from_root_handle(
     // not claim the Unix directory-metadata persistence barrier.
     verify_blob_root_identity(root, root_handle).map_err(|e| map_io_err(e, "put_root_identity"))?;
     put_blocking(root, floor_bytes, bytes)
+}
+
+#[cfg(unix)]
+fn refresh_publish_grace_blocking(
+    root: &Path,
+    root_handle: &fs::File,
+    content_ref: &ContentRef,
+) -> StorageResult<Option<u64>> {
+    use std::os::fd::AsRawFd;
+
+    let _root_write_guard = acquire_root_write_lock_anchored(root, root_handle)?;
+    let hex = content_ref.as_str();
+    let opened = (|| -> std::io::Result<_> {
+        let shard1 = openat_dir_no_follow(root_handle.as_raw_fd(), &hex[..2])?;
+        let shard2 = openat_dir_no_follow(shard1.as_raw_fd(), &hex[2..4])?;
+        let file = openat_regular_file_no_follow(shard2.as_raw_fd(), hex, libc::O_WRONLY)?;
+        Ok(file)
+    })();
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_io_err(error, "refresh_publish_grace_open")),
+    };
+    let size = file
+        .metadata()
+        .map_err(|error| map_io_err(error, "refresh_publish_grace_stat"))?
+        .len();
+    file.set_modified(SystemTime::now())
+        .map_err(|error| map_io_err(error, "refresh_publish_grace_mtime"))?;
+    file.sync_all()
+        .map_err(|error| map_io_err(error, "refresh_publish_grace_fsync"))?;
+    Ok(Some(size))
+}
+
+#[cfg(windows)]
+fn refresh_publish_grace_blocking(
+    root: &Path,
+    root_handle: &fs::File,
+    content_ref: &ContentRef,
+) -> StorageResult<Option<u64>> {
+    let _root_write_guard = acquire_root_write_lock_anchored(root, root_handle)?;
+    let file = match open_blob_shard_file_no_follow_windows(root, root_handle, content_ref, true) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_io_err(error, "refresh_publish_grace_open")),
+    };
+    let size = file
+        .metadata()
+        .map_err(|error| map_io_err(error, "refresh_publish_grace_stat"))?
+        .len();
+    file.set_modified(SystemTime::now())
+        .map_err(|error| map_io_err(error, "refresh_publish_grace_mtime"))?;
+    file.sync_all()
+        .map_err(|error| map_io_err(error, "refresh_publish_grace_fsync"))?;
+    Ok(Some(size))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn refresh_publish_grace_blocking(
+    _root: &Path,
+    _root_handle: &fs::File,
+    _content_ref: &ContentRef,
+) -> StorageResult<Option<u64>> {
+    Err(StorageError::Unsupported {
+        capability: StorageCapability::Blob,
+        operation: "refresh_publish_grace".into(),
+        message: "safe in-place mtime refresh is unsupported on this platform".into(),
+    })
 }
 
 #[cfg(any(test, not(unix)))]
@@ -2556,6 +2635,23 @@ impl FsBlobStore {
 
 #[async_trait]
 impl BlobStore for FsBlobStore {
+    async fn refresh_publish_grace(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        // Keep the owned async guard with the blocking work even when the
+        // caller is cancelled; the same root lock serializes put and sweep.
+        let guard = self.write_lock.clone().lock_owned().await;
+        let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
+        let content_ref = content_ref.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            refresh_publish_grace_blocking(&root, &root_handle, &content_ref)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::driver(StorageCapability::Blob, "refresh_publish_grace", error)
+        })?
+    }
+
     async fn begin_upload(&self, declared_size: u64) -> StorageResult<UploadId> {
         uploads::begin(self, declared_size).await
     }

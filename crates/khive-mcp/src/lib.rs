@@ -9,6 +9,7 @@ pub mod components;
 pub mod coordinator;
 #[cfg(unix)]
 pub mod daemon;
+mod legacy_quarantine;
 pub mod pack;
 pub mod pending_events;
 mod request_policy;
