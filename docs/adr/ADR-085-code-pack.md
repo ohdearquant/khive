@@ -1785,9 +1785,9 @@ Acceptance, stated before any implementation runs:
 
 Refs: #3298, #1855, #1793, #3056.
 
-## Amendment 10 (2026-09-27): bounded source ingest execution
+## Amendment 10 (2026-09-28): bounded source ingest execution
 
-Status: **Proposed**.
+**Status**: Accepted (2026-09-28).
 
 ### Context
 
