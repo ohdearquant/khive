@@ -104,8 +104,11 @@ state, so best-effort partial success can never be retried as a whole and duplic
 
 Other generic dispatch failures remain per-event: they are persisted as
 `dispatch_error`/`dispatch_failed_at`. A failed one-shot returns to `pending` for a later
-drain; a failed named repeat advances to its next occurrence. A later success clears
-those fields.
+drain when its error carries no ambiguous-outcome evidence. An error with a
+`committed` or `unknown` domain disposition ends a one-shot as terminal
+`failed`/`indeterminate`, so a later drain cannot replay a possible side effect.
+A failed named repeat advances to its next occurrence with the error recorded.
+A later success clears those fields.
 
 ## Ticker liveness on `schedule.agenda` (issue #1352)
 
@@ -163,8 +166,10 @@ states require a valid `completed_at`, with `error=null` for `succeeded`/`missed
 non-empty error for `failed`/`indeterminate`/`not_invoked`. A `claimed` occurrence
 atomically becomes `not_invoked` and returns to pending because invocation never began; this
 increments `retry_pending`/`finalized`, not `failed`, `invoked`, or `outcomes_persisted`. Valid `succeeded` or `failed`
-resumes finalization without invoking again; a failed one-shot remains pending, while
-a failed repeat advances normally. An expired `invoking`, malformed receipt, or
+resumes finalization without invoking again; a failed one-shot returns to pending only
+when its recorded error carries no ambiguous-outcome evidence, while a failed repeat advances
+normally. A failed one-shot with a `committed` or `unknown` domain disposition is
+finalized as terminal `failed`/`indeterminate`. An expired `invoking`, malformed receipt, or
 completed pre-invocation receipt still attached to `status="firing"` becomes terminal
 `failed`/`indeterminate`, because replay could duplicate a side effect that committed
 before the claimant disappeared. The quarantine record retains the malformed source
@@ -199,9 +204,10 @@ bound, not the last word.
 
 ## Executable recurrence boundary
 
-Creation and `next_trigger_at` share one parser, `khive_pack_schedule::repeat`:
-`daily`, `weekly`, `monthly`, `every:<N><s|m|h|d>` intervals from the previous
-trigger, and five-field cron expressions evaluated in UTC. Anything else is
+Creation and the executor share one parser, `khive_pack_schedule::repeat`:
+`daily`, `weekly`, and `every:<N><s|m|h|d>` intervals from the previous trigger;
+`monthly` dates from the stored `repeat_anchor`, clamped within each month;
+and five-field cron expressions evaluated in UTC. Anything else is
 rejected at creation instead of being stored and silently consumed as a
 one-shot, and a legacy row the parser refuses fails closed before action
 invocation.

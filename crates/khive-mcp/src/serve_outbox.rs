@@ -40,6 +40,22 @@ impl SelectedChannel<'_> {
 }
 
 impl OutboxChannels<'_> {
+    fn scan_scope(&self, kind: &str) -> (String, bool) {
+        match self {
+            #[cfg(all(test, feature = "channel-email"))]
+            Self::Single(channel) => (channel.slug(), true),
+            Self::Registered { registry, slug } => (
+                (*slug).to_string(),
+                registry
+                    .iter()
+                    .filter(|(registered, _, _)| *registered == kind)
+                    .take(2)
+                    .count()
+                    == 1,
+            ),
+        }
+    }
+
     fn select(
         &self,
         kind: &str,
@@ -268,10 +284,12 @@ impl OutboxPolicy<'_> {
 
 /// Row carries `channel_slug`: only the channel registered as exactly `(kind, slug)` may take it.
 /// If no configured channel has that slug, the row stays pending (delivery state untouched,
-/// never failed), with one WARN per pass per unknown slug. No credential is touched.
+/// never failed). No credential is touched.
 /// Row carries no `channel_slug`: it is taken only when EXACTLY ONE channel of that kind is
-/// configured. With two or more same-kind channels configured, the row stays pending with
-/// one WARN per pass. It is never routed by guess, order, default or first match.
+/// configured. With two or more same-kind channels configured, the row stays pending.
+/// It is never routed by guess, order, default or first match.
+/// The SQL scan applies these constraints before its page bound; an ineligible
+/// row cannot keep a later eligible row out of a finite delivery pass.
 /// No producer changes are required; selection precedes any external-id claim or send.
 pub(super) async fn outbox_once(
     channels: OutboxChannels<'_>,
@@ -279,15 +297,30 @@ pub(super) async fn outbox_once(
     runtime: &KhiveRuntime,
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
+    pause_until: &mut Option<tokio::time::Instant>,
 ) -> Result<(), crate::components::ComponentError> {
     use crate::components::ComponentError;
+    if pause_until
+        .as_ref()
+        .is_some_and(|deadline| tokio::time::Instant::now() < *deadline)
+    {
+        return Ok(());
+    }
+    *pause_until = None;
     let token = runtime.authorize(namespace.clone()).map_err(|error| {
         policy.scan_error(&error, true);
         ComponentError::Permanent(error.to_string())
     })?;
     policy.retry_held_diagnostics(runtime, &token).await?;
+    let (channel_slug, include_legacy) = channels.scan_scope(policy.kind());
     let notes = runtime
-        .list_undelivered_outbound_messages(&token, Some(policy.prefix()), 200)
+        .list_undelivered_outbound_messages_for_channel(
+            &token,
+            policy.prefix(),
+            &channel_slug,
+            include_legacy,
+            200,
+        )
         .await
         .map_err(|error| {
             policy.scan_error(&error, false);
@@ -351,8 +384,18 @@ pub(super) async fn outbox_once(
                 return Err(ComponentError::Retryable(error))
             }
             Err(error) => {
+                let rate_limit = match &error {
+                    khive_channel::ChannelError::RateLimited { retry_after, .. } => {
+                        *pause_until = Some(tokio::time::Instant::now() + *retry_after);
+                        true
+                    }
+                    _ => false,
+                };
                 let result = record_outbound_send_failure(runtime, &token, note.id, &error).await;
                 policy.failed(note.id, &prepared.recipient, &error, result);
+                if rate_limit {
+                    return Ok(());
+                }
             }
         }
     }

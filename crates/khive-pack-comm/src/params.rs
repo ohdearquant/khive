@@ -177,9 +177,14 @@ pub(crate) struct IngestParams {
     /// `comm.health` channel entry owns a quarantined message.
     #[serde(default)]
     pub channel_slug: Option<String>,
-    /// Stable transport dedup key. For email: `imap:{host}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.
+    /// Stable transport dedup key. For email: `imap:{host}:{account}:{uidvalidity}:{uid}`.
+    /// Duplicate messages are silently ignored.
     #[serde(default)]
     pub external_id: Option<String>,
+    /// Pre-account IMAP key for a one-release read-only compatibility lookup.
+    /// Never written onto new notes; the lookup is scoped to this channel slug.
+    #[serde(default)]
+    pub legacy_external_id: Option<String>,
     /// RFC 3339 timestamp of the original message.
     #[serde(default)]
     pub sent_at: Option<String>,

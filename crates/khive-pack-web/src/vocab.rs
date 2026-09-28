@@ -126,11 +126,14 @@ web_verbs! {
                               Authorization: Bearer header. Requires https at every hop, \
                               and only on a host in the credential's own configured set.", NotApplicable);
         #[serde(default)]
-        persist: Option<bool> => (2, "Defaults to true. False fetches without minting entities or \
-                              writing a receipt.", NotApplicable);
+        persist: Option<bool> => (2, "Defaults to true. False stores no body or entities, returns the body \
+                              as a standard padded base64 string, and writes a receipt with final URL, content \
+                              digest, size and fetch time. HEAD returns no body. Transient GET requires effective max_bytes \
+                              at most 6288384 before network access; oversized body or header metadata is refused before a receipt.", NotApplicable);
         #[serde(default)]
         max_bytes: Option<u64> => (3, "Caller-supplied byte ceiling; may only lower the operator's \
-                              configured maximum, never raise it.", NotApplicable);
+                              configured maximum, never raise it. With persist=false, GET accepts at most 6288384 raw bytes; \
+                              lower this value or use persist=true for larger bodies. HEAD is exempt from this inline limit.", NotApplicable);
         #[serde(default)]
         timeout_s: Option<u64> => (4, "Caller-supplied time ceiling in seconds; may only lower the \
                               operator's configured maximum, never raise it.", NotApplicable);
@@ -152,7 +155,7 @@ web_verbs! {
         namespace: Option<String> => (3, "Narrows the write to a namespace; must equal the caller's own \
                               authorized token namespace, never elevates capability.", NotApplicable);
         #[serde(default)]
-        link_limit: Option<u32> => (4, "Maximum number of unique href targets to process for links on this page. \
+        link_limit: Option<u32> => (4, "Maximum number of targets to process across links, sitemap, and feed on this document. \
                               Defaults to 100 and cannot exceed 1,000.", NotApplicable);
     }
     IngestParams("web.ingest", "Fetch and extract over a URL, a list of URLs, or (with origin) a served \
@@ -197,9 +200,10 @@ web_verbs! {
                               authorized token namespace, never elevates capability.", NotApplicable);
     }
     RefreshParams("web.refresh", "Conditionally re-fetch a previously fetched document using its stored \
-                      etag/last_modified. An unchanged body writes a receipt only; a changed \
-                      body updates the stored blob and properties. Every refresh's receipt \
-                      supersedes the previous one for the same document.") {
+                      etag/last_modified and Accept/Accept-Language. An unchanged body keeps \
+                      its blob and attachment while changed response metadata updates the document. \
+                      A redirected 304 is refused. A changed body updates the stored blob and \
+                      properties. Every refresh's receipt supersedes the previous one for the same document.") {
         id: Uuid => (0, "The document entity to refresh.", UnscopedById);
         #[serde(default)]
         max_bytes: Option<u64> => (1, "Caller-supplied byte ceiling; may only lower the operator's \

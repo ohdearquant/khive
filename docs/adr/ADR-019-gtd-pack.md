@@ -721,7 +721,7 @@ minimal. Operators who want GTD configure it explicitly.
   - Transaction-time property/edge cycle backstops shared by every SQLite write path.
 - `crates/khive-pack-gtd/src/schema.rs`:
   - `gtd_lifecycle_audit` table DDL.
-- `crates/kkernel/src/server.rs` (or pack registration):
+- `crates/khive-mcp/src/serve.rs` (pack registration in `build_registry_for_multi_backend*`):
   - Conditional `GtdPack` registration based on `RuntimeConfig::packs`.
 - `marketplace/gtd/plugin.json`:
   - Plugin manifest with `KHIVE_PACKS=gtd` env setting for task-only deployments.

@@ -72,7 +72,7 @@ decision.
 
 ### Record shape (`schema_version: 2`)
 
-One JSON object per line, appended to `bench-data/<suite>.jsonl`:
+One JSON object per line, appended to the run-local `bench-data/<suite>.jsonl`:
 
 ```json
 {
@@ -140,19 +140,31 @@ for a specific metric.
 
 `bench-data/*.jsonl` is never committed to `main` or a feature branch (see
 `.gitignore`). CI publishes it to a dedicated orphan branch, `perf-data`, via
-`scripts/perf/publish_ledger.sh <file> [<file> ...]`: the script checks out
-`perf-data` into a scratch git worktree, copies in the freshly-written
-ledger file(s), commits, and pushes - retrying (fetch + reset + re-copy,
-never a force-push) if a concurrent job's push landed first. Two jobs in the
-same `bench-track.yml` run (`components`, `e2e`) both publish to this branch,
-plus a nightly cron can overlap a push-triggered run, so the retry loop is
-load-bearing, not defensive boilerplate.
+`scripts/perf/publish_ledger.sh <file> [<file> ...]`. The script checks out
+the latest branch in a scratch worktree, merges the run-local records, commits,
+and pushes without force. Component history lives in append-ordered
+`bench-data/components/000001.jsonl`, `000002.jsonl`, … shards capped at 32 MiB
+each. The first publish migrates the historical flat `components.jsonl` into
+these shards and deletes that large file from the branch head. A retry or a
+rerun deduplicates exact records across every shard, so neither the migration
+nor a shard rollover drops or duplicates a record. Other suites retain their
+flat JSONL files. `bench_track.py render` reads the complete component history
+across all shards, including a flat file temporarily restored by an old job.
+
+Component and e2e jobs can push concurrently. The publisher retries a lost
+race from the latest branch with jittered backoff. If every attempt loses,
+publication is advisory: the job records a warning and a run-linked incident
+on [#863](https://github.com/ohdearquant/khive/issues/863) but stays green
+when its benchmarks succeeded. Run-local ledger records remain in the build
+artifact for recovery; a transient publish failure does not pretend that they
+reached `perf-data`.
 
 To inspect history locally:
 
 ```bash
 git fetch origin perf-data
-git show origin/perf-data:bench-data/components.jsonl | tail -20
+latest=$(git ls-tree -r --name-only origin/perf-data bench-data/components | tail -1)
+git show "origin/perf-data:$latest" | tail -20
 ```
 
 ## CI wiring (`bench-track.yml`)

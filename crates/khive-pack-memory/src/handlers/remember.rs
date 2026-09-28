@@ -172,7 +172,8 @@ impl MemoryPack {
         let edge_id = if let Some(id) = keyed_edge_id {
             Some(id.to_string())
         } else if replayed || annotates_target.is_some() {
-            self.runtime
+            let neighbors = self
+                .runtime
                 .neighbors_with_query(
                     write_token,
                     note.id,
@@ -183,7 +184,18 @@ impl MemoryPack {
                         min_weight: None,
                     },
                 )
-                .await?
+                .await;
+            let neighbors = match neighbors {
+                Ok(hits) => hits,
+                // Prune can remove a replayed holder after its key lookup.
+                Err(RuntimeError::NotFound(message))
+                    if replayed && message == format!("neighbor anchor {} not found", note.id) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+            neighbors
                 .into_iter()
                 .find(|hit| replayed || annotates_target == Some(hit.node_id))
                 .map(|hit| hit.edge_id.to_string())

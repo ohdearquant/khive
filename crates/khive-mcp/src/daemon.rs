@@ -17,7 +17,7 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use khive_runtime::daemon::{
     self, acquire_recovery_lock, env_truthy, pid_path, read_frame, socket_path, write_frame,
-    DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
+    DaemonRequestFrame, DaemonResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use rmcp::ErrorData as McpError;
 use sha2::{Digest, Sha256};
@@ -231,123 +231,8 @@ pub(crate) fn reset_fallback_counters() {
     FALLBACK_STRICT_VIOLATIONS.store(0, SeqCst);
 }
 
-struct ConfigIdFields<'a> {
-    packs: &'a str,
-    db: &'a str,
-    embed: &'a str,
-    extra: &'a str,
-    fresh_tail: &'a str,
-    blob_hydration_bytes: &'a str,
-    backend: &'a str,
-    outbound: &'a str,
-    gate: &'a str,
-    git_write: &'a str,
-    brain: &'a str,
-    telemetry: &'a str,
-    display_timezone: &'a str,
-    backends: Option<&'a str>,
-    pack_backends: Option<&'a str>,
-}
-
-fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
-    let (base, backends, pack_backends) =
-        if let Some((before_routing, routing)) = config_id.rsplit_once("];pack_backends=[") {
-            let pack_backends = routing.strip_suffix(']')?;
-            let (base, backends) = before_routing.rsplit_once(";backends=[")?;
-            (base, Some(backends), Some(pack_backends))
-        } else {
-            (config_id, None, None)
-        };
-
-    let base = base.strip_prefix("packs=[")?;
-    let (packs, rest) = base.split_once("];db=")?;
-    let (rest, display_timezone) = rest
-        .rsplit_once(";display_tz=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, telemetry) = rest
-        .rsplit_once(";telemetry=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, brain) = rest
-        .rsplit_once(";brain=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, git_write) = rest.rsplit_once(";git_write=")?;
-    let (rest, gate) = rest
-        .rsplit_once(";gate=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
-    let outbound = outbound.strip_suffix(']')?;
-    let (rest, backend) = rest.rsplit_once(";backend=")?;
-    // Parse pre-ADR-160 fingerprints too so an incumbent from the preceding
-    // release reports the newly construction-baked budget as the mismatch,
-    // rather than degrading an otherwise recognizable identity to `unknown`.
-    let (rest, blob_hydration_bytes) = rest
-        .rsplit_once(";blob_hydration_bytes=")
-        .unwrap_or((rest, "<legacy-absent>"));
-    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
-    let (rest, extra) = rest.rsplit_once(";extra=[")?;
-    let extra = extra.strip_suffix(']')?;
-    let (db, embed) = rest.rsplit_once(";embed=")?;
-
-    Some(ConfigIdFields {
-        packs,
-        db,
-        embed,
-        extra,
-        fresh_tail,
-        blob_hydration_bytes,
-        backend,
-        outbound,
-        gate,
-        git_write,
-        brain,
-        telemetry,
-        display_timezone,
-        backends,
-        pack_backends,
-    })
-}
-
 fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static str {
-    let Some(daemon) = daemon else {
-        return "unknown";
-    };
-    let (Some(client), Some(daemon)) = (parse_config_id(client), parse_config_id(daemon)) else {
-        return "unknown";
-    };
-
-    if client.packs != daemon.packs {
-        "packs"
-    } else if client.db != daemon.db {
-        "db"
-    } else if client.embed != daemon.embed {
-        "embed"
-    } else if client.extra != daemon.extra {
-        "extra"
-    } else if client.fresh_tail != daemon.fresh_tail {
-        "fresh_tail"
-    } else if client.blob_hydration_bytes != daemon.blob_hydration_bytes {
-        "blob_hydration_bytes"
-    } else if client.backend != daemon.backend {
-        "backend"
-    } else if client.outbound != daemon.outbound {
-        "outbound"
-    } else if client.gate != daemon.gate {
-        "gate"
-    } else if client.git_write != daemon.git_write {
-        "git_write"
-    } else if client.brain != daemon.brain {
-        "brain"
-    } else if client.telemetry != daemon.telemetry {
-        "telemetry"
-    } else if client.display_timezone != daemon.display_timezone {
-        "display_tz"
-    } else if client.backends != daemon.backends {
-        "backends"
-    } else if client.pack_backends != daemon.pack_backends {
-        "pack_backends"
-    } else {
-        "unknown"
-    }
+    khive_runtime::daemon::first_config_mismatch_field(client, daemon)
 }
 
 fn opaque_config_id(config_id: &str) -> String {
@@ -555,6 +440,10 @@ enum ForwardOutcome {
     /// The socket is absent/refused, or the frame failed before it could reach
     /// dispatch. These outcomes are safe to route through recovery.
     NoSocket,
+    /// Serialization produced a frame over the transport cap. `write_frame`
+    /// would refuse it before writing any byte, so reconnecting or spawning
+    /// cannot change the outcome.
+    RequestTooLarge { bytes: usize },
     /// This process could not establish whether a daemon is listening. An OS
     /// access/policy failure is not proof that the daemon is absent, so it must
     /// never enter lifecycle recovery or local fallback (#1242).
@@ -594,23 +483,16 @@ fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
     }
 }
 
+#[cfg(test)]
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     try_forward_before(frame, None).await
 }
 
-async fn try_forward_before(
-    frame: &DaemonRequestFrame,
+fn socket_exchange_deadline(
+    probe_only: bool,
+    ops: &str,
     retry_deadline: Option<tokio::time::Instant>,
-) -> ForwardOutcome {
-    let sock = socket_path();
-    #[cfg(test)]
-    {
-        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
-        if forced_error != 0 {
-            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
-        }
-    }
-
+) -> tokio::time::Instant {
     // One absolute deadline bounds connect, write, and read together, so the
     // whole socket exchange can never exceed the ceiling the read phase alone
     // used to honour on its own. A same-UID peer that accepts the connection
@@ -626,17 +508,54 @@ async fn try_forward_before(
     // future caller outside the MCP bridge) fall back to a fresh relative
     // ceiling derived from the configured read timeout and the request's
     // valid long-poll waits plus a five-second transport margin.
-    let deadline = khive_storage::capture_request_read_context()
-        .deadline()
-        .map(khive_storage::RequestReadDeadline::async_at)
-        .unwrap_or_else(|| {
-            tokio::time::Instant::now()
-                + crate::request_policy::read_timeout(
-                    &frame.ops,
-                    khive_storage::request_read_timeout_from_env(),
-                )
-        });
-    let deadline = retry_deadline.map_or(deadline, |retry| retry.min(deadline));
+    if probe_only {
+        // Lifecycle probes are independent of the request that happened to
+        // trigger recovery. Their caller supplies a fresh probe deadline; an
+        // expired request deadline must never make a live daemon appear dead.
+        retry_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + khive_storage::request_read_timeout_from_env()
+        })
+    } else {
+        let request_deadline = khive_storage::capture_request_read_context()
+            .deadline()
+            .map(khive_storage::RequestReadDeadline::async_at)
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + crate::request_policy::read_timeout(
+                        ops,
+                        khive_storage::request_read_timeout_from_env(),
+                    )
+            });
+        retry_deadline.map_or(request_deadline, |retry| retry.min(request_deadline))
+    }
+}
+
+async fn try_forward_before(
+    frame: &DaemonRequestFrame,
+    retry_deadline: Option<tokio::time::Instant>,
+) -> ForwardOutcome {
+    let payload = match serde_json::to_vec(frame) {
+        Ok(p) => p,
+        Err(_) => return ForwardOutcome::NoSocket,
+    };
+    // Check before even connecting. The same cap is enforced by write_frame,
+    // but that function returns InvalidData before its first write; treating
+    // that as NoSocket would enter deterministic, futile lifecycle recovery.
+    if payload.len() > MAX_FRAME_BYTES {
+        return ForwardOutcome::RequestTooLarge {
+            bytes: payload.len(),
+        };
+    }
+    let sock = socket_path();
+    #[cfg(test)]
+    {
+        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
+        if forced_error != 0 {
+            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
+        }
+    }
+
+    let deadline = socket_exchange_deadline(frame.probe_only, &frame.ops, retry_deadline);
 
     let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&sock)).await {
         Ok(Ok(s)) => s,
@@ -650,10 +569,6 @@ async fn try_forward_before(
             );
             return ForwardOutcome::NoSocket;
         }
-    };
-    let payload = match serde_json::to_vec(frame) {
-        Ok(p) => p,
-        Err(_) => return ForwardOutcome::NoSocket,
     };
     match tokio::time::timeout_at(deadline, write_frame(&mut stream, &payload)).await {
         Ok(Ok(())) => {}
@@ -780,8 +695,36 @@ fn bounded_retry_deadline() -> tokio::time::Instant {
         .map_or(deadline, |caller| caller.min(deadline))
 }
 
+fn pid_file_directory_is_trusted_if_present(pid_file: &std::path::Path) -> Result<bool, String> {
+    let parent = pid_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match std::fs::metadata(parent) {
+        // First startup may not have created the default rendezvous directory
+        // yet. No PID record exists to read; daemon startup checks the parent
+        // before it creates the PID file.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => daemon::ensure_pid_file_dir_is_trusted(pid_file)
+            .map(|()| true)
+            .map_err(|error| format!("{error:#}")),
+    }
+}
+
 fn recorded_daemon_is_alive() -> bool {
-    std::fs::read_to_string(pid_path())
+    let pid_file = pid_path();
+    match pid_file_directory_is_trusted_if_present(&pid_file) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "daemon PID-file directory is not trusted; skipping the recorded-process probe"
+            );
+            return false;
+        }
+    }
+    std::fs::read_to_string(pid_file)
         .ok()
         .and_then(|pid| pid.trim().parse::<u32>().ok())
         .is_some_and(process_is_alive)
@@ -891,7 +834,9 @@ async fn try_forward_with_read_replay(
             ForwardOutcome::Response(response)
                 if response.config_mismatch
                     || response.namespace_mismatch
-                    || response.served_config_id.as_deref() != Some(frame.config_id.as_str()) =>
+                    || !response.served_config_id.as_deref().is_some_and(|served| {
+                        khive_runtime::daemon::config_ids_compatible(&frame.config_id, served)
+                    }) =>
             {
                 // A later identity rejection cannot erase the first dispatch
                 // or permit map_response to select local fallback.
@@ -908,6 +853,22 @@ async fn try_forward_with_read_replay(
 fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
     let error = daemon::DaemonDispatchError::new(message, data);
     McpError::internal_error(error.message, Some(error.error_detail))
+}
+
+fn request_too_large_error(bytes: usize) -> McpError {
+    let message =
+        format!("request too large: {bytes} bytes exceeds {MAX_FRAME_BYTES} byte daemon IPC cap");
+    let error = daemon::DaemonDispatchError::new(
+        message,
+        Some(serde_json::json!({
+            "kind": "transport",
+            "code": "request_frame_size_limit",
+            "frame_bytes": bytes,
+            "max_frame_bytes": MAX_FRAME_BYTES,
+            "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+        })),
+    );
+    McpError::invalid_params(error.message, Some(error.error_detail))
 }
 
 /// The operator-facing text for a protocol mismatch, by direction. A daemon ahead
@@ -976,9 +937,11 @@ fn map_response(
         );
     }
     // Fail closed: only trust a result the daemon positively confirms it served
-    // under our exact config. A legacy daemon omits `served_config_id` (→ None)
-    // and a config-drifted daemon echoes a different id — both fall back local.
-    if resp.served_config_id.as_deref() != Some(expected_config_id) {
+    // under a compatible config. A legacy daemon omits `served_config_id` (→ None)
+    // and a daemon with any incompatible field echoes a different id — both fall back local.
+    if !resp.served_config_id.as_deref().is_some_and(|served| {
+        khive_runtime::daemon::config_ids_compatible(expected_config_id, served)
+    }) {
         return fallback_or_reject(
             FallbackReason::ConfigMismatch,
             expected_config_id,
@@ -987,6 +950,15 @@ fn map_response(
         );
     }
     if resp.ok {
+        if resp
+            .error_detail
+            .as_ref()
+            .and_then(|detail| detail.get("lexical_timeout"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            tracing::warn!(source = "daemon_response", "lexical read timed out");
+        }
         Some(Ok(resp.result.unwrap_or_default()))
     } else {
         let msg = resp.error.unwrap_or_else(|| {
@@ -1288,6 +1260,8 @@ const INCUMBENT_EXIT_POLL_MS: u64 = 25;
 enum RecoveryError {
     Spawn(std::io::Error),
     IncumbentStillAlive { pid: u32 },
+    RequestExpired,
+    PidFileDirectoryUntrusted(String),
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -1365,7 +1339,11 @@ async fn kill_stale_daemon_inner(
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let pid_file = pid_path();
-    let expected_snapshot = PidFileSnapshot::read(&pid_file);
+    let expected_snapshot = match pid_file_directory_is_trusted_if_present(&pid_file) {
+        Ok(true) => PidFileSnapshot::read(&pid_file),
+        Ok(false) => PidFileSnapshot::Missing,
+        Err(message) => return Err(RecoveryError::PidFileDirectoryUntrusted(message)),
+    };
     let expected_pid = expected_snapshot.pid();
 
     let wait_for_exit = if let Some(pid) = expected_pid {
@@ -1421,7 +1399,18 @@ fn remove_daemon_paths_if_still_stale(
     pid_file: &std::path::Path,
     expected_snapshot: &PidFileSnapshot,
 ) -> bool {
-    let current_snapshot = PidFileSnapshot::read(pid_file);
+    let (current_snapshot, pid_directory_trusted) =
+        match pid_file_directory_is_trusted_if_present(pid_file) {
+            Ok(true) => (PidFileSnapshot::read(pid_file), true),
+            Ok(false) => (PidFileSnapshot::Missing, false),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "daemon PID-file directory is not trusted; skipping stale-path cleanup"
+                );
+                return false;
+            }
+        };
     if matches!(expected_snapshot, PidFileSnapshot::Unreadable)
         || matches!(current_snapshot, PidFileSnapshot::Unreadable)
     {
@@ -1457,11 +1446,16 @@ fn remove_daemon_paths_if_still_stale(
         Err(_) => return false,
     }
 
-    for path in [pid_file, sock.as_path()] {
-        if let Err(error) = std::fs::remove_file(path) {
+    if pid_directory_trusted {
+        if let Err(error) = std::fs::remove_file(pid_file) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return false;
             }
+        }
+    }
+    if let Err(error) = std::fs::remove_file(&sock) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return false;
         }
     }
     true
@@ -1522,7 +1516,21 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         request_id: None,
     };
     let deadline = std::time::Duration::from_millis(timeout_ms);
-    match tokio::time::timeout(deadline, try_forward_inner(&probe)).await {
+    let probe_deadline = tokio::time::Instant::now() + deadline;
+    let exchange = tokio::time::timeout_at(
+        probe_deadline,
+        try_forward_before(&probe, Some(probe_deadline)),
+    )
+    .await;
+    // The inner connect/read timeout and this outer probe timeout can become
+    // ready in the same scheduler turn. A timed-out inner NoSocket/ParseFailure
+    // is uncertainty about a slow peer, never evidence that it is dead.
+    if tokio::time::Instant::now() >= probe_deadline
+        && !matches!(&exchange, Ok(ForwardOutcome::Response(_)))
+    {
+        return ProbeOutcome::Timeout;
+    }
+    match exchange {
         Err(_elapsed) => {
             tracing::debug!(
                 timeout_ms,
@@ -1553,7 +1561,9 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
                 && !resp.namespace_mismatch
                 && !resp.config_mismatch
                 && resp.daemon_protocol_version == PROTOCOL_VERSION
-                && resp.served_config_id.as_deref() == Some(config_id)
+                && resp.served_config_id.as_deref().is_some_and(|served| {
+                    khive_runtime::daemon::config_ids_compatible(config_id, served)
+                })
             {
                 tracing::debug!("under-lock probe: live matching daemon confirmed; skipping kill");
                 ProbeOutcome::Alive
@@ -1574,6 +1584,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
             | ForwardOutcome::ResponseLost
             | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
+        Ok(ForwardOutcome::RequestTooLarge { .. }) => ProbeOutcome::Timeout,
         Ok(ForwardOutcome::Unreachable {
             kind,
             os_error_code,
@@ -1871,6 +1882,12 @@ where
         }
     };
 
+    // The bridge may have stopped waiting while this task waited for a peer
+    // recoverer. Its detached task must not now classify or kill a daemon.
+    if khive_storage::request_read_is_cancelled() {
+        return Err(RecoveryError::RequestExpired);
+    }
+
     let outcome = match confirm_genuinely_dead(config_id, namespace).await {
         ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
         ProbeOutcome::LockContended => {
@@ -1886,6 +1903,9 @@ where
                 ProbeOutcome::Alive | ProbeOutcome::Timeout => return Ok(RecoveryOutcome::Skipped),
                 ProbeOutcome::LockContended => return Ok(RecoveryOutcome::Uncertain),
                 ProbeOutcome::Dead => {}
+            }
+            if khive_storage::request_read_is_cancelled() {
+                return Err(RecoveryError::RequestExpired);
             }
             let expected_snapshot = kill_stale_daemon_inner(exit_timeout, boot_lock).await?;
             // Keep the recoverer-only lock throughout, but let graceful exit
@@ -2044,6 +2064,22 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
         format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
+}
+
+fn untrusted_pid_file_directory_error(message: String) -> McpError {
+    tracing::error!(
+        reason = "untrusted_pid_file_directory",
+        error = %message,
+        "daemon recovery refused because its PID-file directory is not trusted"
+    );
+    let mut data = serde_json::json!({
+        "reason": "untrusted_pid_file_directory",
+        "error": message,
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    daemon_mcp_error(format!("daemon recovery refused: {message}"), Some(data))
 }
 
 /// Build the caller-visible error for a socket-less rendezvous claimed by a
@@ -2776,6 +2812,9 @@ where
         ForwardOutcome::Response(resp) => {
             return map_response(*resp, &frame.config_id, &frame.namespace)
         }
+        ForwardOutcome::RequestTooLarge { bytes } => {
+            return Some(Err(request_too_large_error(bytes)));
+        }
         ForwardOutcome::NoSocket => {
             // No marker (checked above): nothing was written; fall through
             // to the spawn/recover-then-send path below, unchanged from
@@ -2831,6 +2870,12 @@ where
     // connect-retry window or the #667 boot-quiescence wait short.
     let mut spawned_child: Option<std::process::Child> = None;
     match kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await {
+        Err(RecoveryError::RequestExpired) => {
+            return Some(Err(daemon_mcp_error(
+                "daemon reconnect deadline expired or request cancelled before lifecycle recovery",
+                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+            )));
+        }
         Err(RecoveryError::Spawn(e)) => {
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
@@ -2841,6 +2886,9 @@ where
         }
         Err(RecoveryError::IncumbentStillAlive { pid }) => {
             return Some(Err(incumbent_still_alive_error(pid)));
+        }
+        Err(RecoveryError::PidFileDirectoryUntrusted(message)) => {
+            return Some(Err(untrusted_pid_file_directory_error(message)));
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
@@ -2866,12 +2914,18 @@ where
 
     // Send the real frame now that a daemon is confirmed ready
     // (or believed ready via Skipped). The connect attempt inside
-    // `try_forward_inner` doubles as the readiness check — a `NoSocket`
+    // `try_forward_before` doubles as the readiness check — a `NoSocket`
     // outcome here just means "not listening yet" (nothing written), so keep
     // retrying. Only the explicit read policy may replay a lost response;
     // every other post-write outcome is terminal and returned immediately.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
+        if khive_storage::request_read_is_cancelled() {
+            return Some(Err(daemon_mcp_error(
+                "daemon reconnect deadline expired or request cancelled before dispatch",
+                Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+            )));
+        }
         if tokio::time::Instant::now() >= deadline {
             // #667: a bare timeout here does not mean "no daemon" — it may
             // mean "daemon is still inside cold-boot schema init". Wait for
@@ -2910,6 +2964,9 @@ where
         match try_forward_with_read_replay(frame, &mut replay, None).await {
             ForwardOutcome::Response(resp) => {
                 return map_response(*resp, &frame.config_id, &frame.namespace)
+            }
+            ForwardOutcome::RequestTooLarge { bytes } => {
+                return Some(Err(request_too_large_error(bytes)));
             }
             ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
                 let config_id = opaque_config_id(&frame.config_id);
@@ -2982,11 +3039,347 @@ mod tests {
         KhiveRuntime, Namespace, RuntimeConfig,
     };
 
+    #[tokio::test]
+    async fn lifecycle_probe_uses_own_deadline_when_request_deadline_has_expired() {
+        khive_storage::scope_request_read_deadline(std::time::Duration::ZERO, async {
+            tokio::task::yield_now().await;
+            let now = tokio::time::Instant::now();
+            let probe_deadline = now + std::time::Duration::from_millis(500);
+            assert_eq!(
+                socket_exchange_deadline(true, "", Some(probe_deadline)),
+                probe_deadline
+            );
+            assert!(socket_exchange_deadline(false, "stats()", None) <= now);
+        })
+        .await;
+    }
+
+    const PRIMARY_MODEL: lattice_embed::EmbeddingModel =
+        lattice_embed::EmbeddingModel::AllMiniLmL6V2;
+    const EXTRA_MODEL: lattice_embed::EmbeddingModel = lattice_embed::EmbeddingModel::BgeSmallEnV15;
+    const SECOND_EXTRA_MODEL: lattice_embed::EmbeddingModel =
+        lattice_embed::EmbeddingModel::BgeBaseEnV15;
+
+    struct FixedModelService {
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for FixedModelService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![0.25; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "configured-test-embedder"
+        }
+    }
+
+    struct FixedModelProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for FixedModelProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(
+            &self,
+        ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+            Ok(Arc::new(FixedModelService {
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    fn embedding_runtime_config(extras: &[lattice_embed::EmbeddingModel]) -> RuntimeConfig {
+        let mut config = memory_runtime_config();
+        config.default_namespace = Namespace::parse("test").unwrap();
+        config.packs = vec!["kg".to_string(), "memory".to_string()];
+        config.embedding_model = Some(PRIMARY_MODEL);
+        config.additional_embedding_models = extras.to_vec();
+        config
+    }
+
+    fn install_test_embedders(runtime: &KhiveRuntime, config: &RuntimeConfig) {
+        let models = config
+            .embedding_model
+            .into_iter()
+            .chain(config.additional_embedding_models.iter().copied());
+        for model in models {
+            runtime.register_embedder(FixedModelProvider {
+                name: model.to_string(),
+                dimensions: model.dimensions(),
+            });
+        }
+    }
+
+    async fn start_embedding_daemon(
+        extras: &[lattice_embed::EmbeddingModel],
+    ) -> (
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+        KhiveRuntime,
+        crate::server::KhiveMcpServer,
+        std::path::PathBuf,
+    ) {
+        clear_daemon_env();
+        let config = embedding_runtime_config(extras);
+        let runtime = KhiveRuntime::new(config.clone()).expect("embedding runtime");
+        install_test_embedders(&runtime, &config);
+        let inspect_runtime = runtime.clone();
+        let server = crate::server::KhiveMcpServer::new(runtime).expect("embedding server");
+        let dir = tempfile::tempdir().expect("daemon tempdir");
+        let socket = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &socket);
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        let daemon_server = server.clone();
+        let daemon = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let ready = connect_when_ready(&socket).await;
+        drop(ready);
+        (dir, daemon, inspect_runtime, server, socket)
+    }
+
+    fn embedding_request_frame(ops: &str, config_id: String) -> DaemonRequestFrame {
+        DaemonRequestFrame {
+            plan: false,
+            ops: ops.to_owned(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id,
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: true,
+            request_id: None,
+        }
+    }
+
+    /// The namespace a successful daemon `create` wrote into, read from its
+    /// response, so vector counts look where the write landed.
+    fn created_namespace(response: &DaemonResponseFrame) -> String {
+        assert!(response.ok, "create failed: {:?}", response.error);
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.as_deref().expect("create response"))
+                .expect("JSON response");
+        assert_eq!(result["results"][0]["ok"], true, "{result}");
+        result["results"][0]["result"]["namespace"]
+            .as_str()
+            .expect("created note namespace")
+            .to_owned()
+    }
+
+    async fn vector_count(runtime: &KhiveRuntime, namespace: &str, model: &str) -> u64 {
+        let token = runtime
+            .authorize(Namespace::parse(namespace).unwrap())
+            .expect("note namespace token");
+        runtime
+            .vectors_for_model(&token, model)
+            .expect("model vector store")
+            .count()
+            .await
+            .expect("vector count")
+    }
+
+    async fn stop_embedding_daemon(daemon: tokio::task::JoinHandle<()>) {
+        daemon.abort();
+        let _ = daemon.await;
+        clear_daemon_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_omits_vectors_for_undeclared_extra_models() {
+        let (_dir, daemon, runtime, server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+        let client_config = embedding_runtime_config(&[]);
+        let client_id = crate::server::compute_config_id(&client_config, None);
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"client model scope\")",
+                client_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&response);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1,
+            "the client's primary model must receive the note vector"
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            0,
+            "a daemon-only extra must not receive the note vector"
+        );
+        assert_eq!(
+            server.config_id(),
+            crate::server::compute_config_id(&embedding_runtime_config(&[EXTRA_MODEL]), None)
+        );
+        stop_embedding_daemon(daemon).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_uses_only_client_declared_extra_models() {
+        let (_dir, daemon, runtime, _server, socket) =
+            start_embedding_daemon(&[EXTRA_MODEL, SECOND_EXTRA_MODEL]).await;
+        let client_config = embedding_runtime_config(&[EXTRA_MODEL]);
+        let client_id = crate::server::compute_config_id(&client_config, None);
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"declared extra scope\")",
+                client_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&response);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &SECOND_EXTRA_MODEL.to_string()).await,
+            0,
+            "the daemon's second extra is outside the client's declaration"
+        );
+
+        stop_embedding_daemon(daemon).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn equal_configuration_keeps_the_daemons_full_embedder_set() {
+        let (_dir, daemon, runtime, server, socket) =
+            start_embedding_daemon(&[EXTRA_MODEL, SECOND_EXTRA_MODEL]).await;
+        let equal_id = server.config_id().to_owned();
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"equal configuration scope\")",
+                equal_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&response);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &SECOND_EXTRA_MODEL.to_string()).await,
+            1
+        );
+        stop_embedding_daemon(daemon).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_treats_an_undeclared_explicit_model_as_unknown() {
+        let (_dir, daemon, runtime, _server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+        let client_id = crate::server::compute_config_id(&embedding_runtime_config(&[]), None);
+        let response = exchange(
+            &socket,
+            &embedding_request_frame(
+                "memory.remember(content=\"outside the client model set\", memory_type=\"semantic\", embedding_model=\"bge-small-en-v1.5\")",
+                client_id.clone(),
+            ),
+        )
+        .await;
+        assert!(response.ok, "MCP dispatch failed: {:?}", response.error);
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.as_deref().expect("remember response"))
+                .expect("JSON response");
+        let entry = &result["results"][0];
+        assert_eq!(entry["ok"], false, "{result}");
+        assert!(
+            entry
+                .to_string()
+                .contains("unknown embedding model: bge-small-en-v1.5"),
+            "the explicit model must have the in-process unknown-model result: {entry}"
+        );
+        // A declared write through the same client lands one primary vector, so
+        // the counts below read the namespace this client's writes use.
+        let anchor = exchange(
+            &socket,
+            &embedding_request_frame(
+                "create(kind=\"observation\", content=\"declared model anchor\")",
+                client_id,
+            ),
+        )
+        .await;
+        let namespace = created_namespace(&anchor);
+        assert_eq!(
+            vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
+            1
+        );
+        assert_eq!(
+            vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
+            0
+        );
+        stop_embedding_daemon(daemon).await;
+    }
+
     fn memory_runtime_config() -> RuntimeConfig {
         KhiveRuntime::memory()
             .expect("memory runtime")
             .config()
             .clone()
+    }
+
+    #[test]
+    fn missing_pid_parent_is_treated_as_no_incumbent() {
+        let workspace = std::env::current_dir().expect("workspace directory");
+        let dir = tempfile::Builder::new()
+            .prefix("khive-missing-pid-parent-")
+            .tempdir_in(workspace)
+            .expect("workspace-local tempdir");
+        let pid_file = dir.path().join("not-created").join("khived.pid");
+
+        assert!(!pid_file_directory_is_trusted_if_present(&pid_file)
+            .expect("an absent PID parent is not an unsafe PID record"));
     }
 
     fn make_test_server() -> crate::server::KhiveMcpServer {
@@ -3759,6 +4152,52 @@ mod tests {
             Some(Ok(s)) => assert_eq!(s, "the-result"),
             other => panic!("expected Some(Ok(\"the-result\")), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepted_daemon_timeout_warns_once_and_preserves_result_bytes() {
+        let public = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "knowledge.search", "result": "| name |\n|---|\n| first |\n"},
+                {"ok": true, "tool": "knowledge.suggest", "result": "| name |\n|---|\n| second |\n"}
+            ],
+            "summary": {"total": 2, "succeeded": 2, "failed": 0}
+        });
+        let raw = public.to_string();
+        let nested = serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {
+                "degraded": {"lexical_timeout": true}
+            }}]
+        })
+        .to_string();
+        let unmarked = serde_json::json!({
+            "results": [{"ok": true, "tool": "knowledge.search", "result": {
+                "degraded": {"lexical_timeout": true}
+            }}]
+        })
+        .to_string();
+        let logs = capture_sync_events(|| {
+            let mut frame = frame_ok(&raw);
+            frame.error_detail = Some(serde_json::json!({"lexical_timeout": true}));
+            let accepted = map_response(frame, CFG, NS)
+                .expect("accepted response")
+                .expect("successful response");
+            assert_eq!(accepted, raw);
+            assert_eq!(
+                map_response(frame_ok(&nested), CFG, NS)
+                    .expect("accepted response")
+                    .expect("successful response"),
+                nested
+            );
+            assert_eq!(
+                map_response(frame_ok(&unmarked), CFG, NS)
+                    .expect("accepted response")
+                    .expect("successful response"),
+                unmarked
+            );
+        });
+        assert_eq!(logs.matches("lexical read timed out").count(), 1, "{logs}");
+        assert!(logs.contains("daemon_response"), "{logs}");
     }
 
     #[test]
@@ -4537,6 +4976,65 @@ mod tests {
                 _ => panic!("EACCES/EPERM must be unreachable, never safe-to-recover NoSocket"),
             }
         }
+    }
+
+    /// A frame-size refusal happens before the first socket write and cannot
+    /// be repaired by reconnecting, killing a peer, or spawning a daemon.
+    /// The unbounded per-op override represents the old caller path: `ops`
+    /// itself is capped separately before forwarding.
+    #[tokio::test]
+    #[serial]
+    async fn oversized_request_frame_is_terminal_before_recovery() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
+        clear_daemon_env();
+        reset_counters();
+        reset_fallback_counters();
+        let _cleanup = RecoveryTestGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+
+        let mut frame = unreachable_daemon_frame("oversized-request-test");
+        frame.format_per_op = Some(vec![Some("x".repeat(MAX_FRAME_BYTES))]);
+        let bytes = serde_json::to_vec(&frame).expect("serialize frame").len();
+        assert!(bytes > MAX_FRAME_BYTES);
+        assert!(matches!(
+            try_forward_inner(&frame).await,
+            ForwardOutcome::RequestTooLarge { bytes: actual } if actual == bytes
+        ));
+
+        let spawn_attempts = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = || {
+            spawn_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("oversized request must not spawn"))
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            forward_or_spawn_with(&frame, &spawn),
+        )
+        .await
+        .expect("deterministic pre-write refusal must not wait for daemon recovery");
+        match outcome {
+            Some(Err(error)) => {
+                assert!(error.message.contains("request too large"));
+                let data = error.data.expect("structured frame cap error");
+                assert_eq!(data["code"], "request_frame_size_limit");
+                assert_eq!(data["domain_disposition"], "not_committed");
+                assert_eq!(data["frame_bytes"].as_u64(), Some(bytes as u64));
+                assert_eq!(
+                    data["max_frame_bytes"].as_u64(),
+                    Some(MAX_FRAME_BYTES as u64)
+                );
+            }
+            other => panic!("oversized frame must be a terminal request error: {other:?}"),
+        }
+        assert_eq!(spawn_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 0);
     }
 
     #[tokio::test]
@@ -6803,17 +7301,18 @@ mod tests {
         // (unpaused) time, since a genuinely blocked socket write is real
         // I/O, not a timer, and would not release control for a paused
         // clock's auto-advance to fire.
-        let request_timeout = std::time::Duration::from_secs(1);
+        let request_timeout = std::time::Duration::from_secs(2);
         std::env::set_var(
             "KHIVE_REQUEST_READ_TIMEOUT_SECS",
             request_timeout.as_secs().to_string(),
         );
-        // The ordinary lane rejects an extra 1s return delay that the old 3s
-        // cap admitted. Coverage keeps its wider cap, still below the watchdog.
+        // A fixed second covers runner scheduling without scaling down with the
+        // timeout. The strict ordinary cap still rejects an extra 1s return
+        // delay; coverage keeps its wider cap, below the watchdog.
         let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
             request_timeout * 3
         } else {
-            request_timeout + request_timeout / 2
+            request_timeout + std::time::Duration::from_secs(1)
         };
         let watchdog = request_timeout * 5;
 
@@ -6933,17 +7432,17 @@ mod tests {
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::env::set_var("KHIVE_PID", &pid_file);
         std::env::remove_var("KHIVE_NO_DAEMON");
-        let request_timeout = std::time::Duration::from_secs(1);
+        let request_timeout = std::time::Duration::from_secs(2);
         std::env::set_var(
             "KHIVE_REQUEST_READ_TIMEOUT_SECS",
             request_timeout.as_secs().to_string(),
         );
-        // LLVM_PROFILE_FILE presence selects coverage slack deliberately;
-        // the ordinary cap rejects the old bound's extra 1s-delay blind spot.
+        // Coverage uses wider slack; the ordinary cap allows a fixed second
+        // for scheduling but still rejects an extra 1s return delay.
         let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
             request_timeout * 3
         } else {
-            request_timeout + request_timeout / 2
+            request_timeout + std::time::Duration::from_secs(1)
         };
         let watchdog = request_timeout * 5;
 
@@ -7222,7 +7721,11 @@ mod tests {
                 None
             }
             Ok(RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain)
-            | Err(RecoveryError::Spawn(_)) => None,
+            | Err(
+                RecoveryError::Spawn(_)
+                | RecoveryError::RequestExpired
+                | RecoveryError::PidFileDirectoryUntrusted(_),
+            ) => None,
         };
         let live_pid_file_preserved = pid_file.exists();
         cleanup.kill_and_reap_child();

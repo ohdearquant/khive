@@ -217,11 +217,16 @@ pub(super) fn score_candidate(
                 if has_exact {
                     return true;
                 }
-                terms.iter().filter(|t| *t != *orig).any(|exp| {
-                    matching::has_in_tokens(&cand.name, exp)
-                        || matching::has_in_tokens(&cand.tags, exp)
-                        || matching::has_in_tokens(&cand.content, exp)
-                })
+                // A different original query term is not evidence that this
+                // one was covered. Only this term's own generated forms count.
+                expansions_for(orig)
+                    .into_iter()
+                    .filter(|exp| !original_terms.contains(exp))
+                    .any(|exp| {
+                        matching::has_in_tokens(&cand.name, &exp)
+                            || matching::has_in_tokens(&cand.tags, &exp)
+                            || matching::has_in_tokens(&cand.content, &exp)
+                    })
             })
             .count();
         let coverage = matched as f32 / original_terms.len() as f32;
@@ -231,24 +236,30 @@ pub(super) fn score_candidate(
     }
 }
 
+fn expansions_for(term: &str) -> Vec<String> {
+    let mut forms = Vec::with_capacity(2);
+    if !term.ends_with('s') && term.len() >= 3 {
+        forms.push(format!("{term}s"));
+    }
+    if term.ends_with("ies") && term.len() > 4 {
+        let singular = format!("{}y", &term[..term.len() - 3]);
+        if singular.len() >= 3 {
+            forms.push(singular);
+        }
+    } else if term.ends_with('s') && !term.ends_with("ss") && term.len() > 3 {
+        let singular = term[..term.len() - 1].to_string();
+        if singular.len() >= 3 {
+            forms.push(singular);
+        }
+    }
+    forms
+}
+
 pub(super) fn expand_terms(terms: &mut Vec<String>) -> HashSet<String> {
     let originals: HashSet<String> = terms.iter().cloned().collect();
     let snapshot: Vec<String> = terms.clone();
     for t in &snapshot {
-        if !t.ends_with('s') && t.len() >= 3 {
-            terms.push(format!("{t}s"));
-        }
-        if t.ends_with("ies") && t.len() > 4 {
-            let s = format!("{}y", &t[..t.len() - 3]);
-            if s.len() >= 3 {
-                terms.push(s);
-            }
-        } else if t.ends_with('s') && !t.ends_with("ss") && t.len() > 3 {
-            let s = t[..t.len() - 1].to_string();
-            if s.len() >= 3 {
-                terms.push(s);
-            }
-        }
+        terms.extend(expansions_for(t));
     }
     terms.sort();
     terms.dedup();
@@ -257,4 +268,58 @@ pub(super) fn expand_terms(terms: &mut Vec<String>) -> HashSet<String> {
         .filter(|t| !originals.contains(*t))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_counts_only_own_expansion_for_each_original_term() {
+        let originals = vec!["alpha".to_owned(), "beta".to_owned()];
+        let mut terms = originals.clone();
+        expand_terms(&mut terms);
+        let idf = terms.iter().map(|term| (term.clone(), 1.0)).collect();
+        let weights = Weights::default();
+        let unpenalized = Weights {
+            coverage_alpha: 0.0,
+            ..Weights::default()
+        };
+        let candidate = |content: &str| Candidate {
+            id: "test".into(),
+            slug: "test".into(),
+            name_raw: String::new(),
+            content_raw: Some(content.into()),
+            tags_raw: None,
+            status_raw: None,
+            finalized: false,
+            is_domain: false,
+            name: Vec::new(),
+            tags: Vec::new(),
+            content: matching::tokenize_field(content),
+        };
+        let score = |content: &str, weights: &Weights| {
+            score_candidate(
+                &candidate(content),
+                &terms,
+                &originals,
+                &originals,
+                &idf,
+                "alpha beta",
+                weights,
+            )
+        };
+
+        let complete = score("alpha beta", &weights);
+        let complete_base = score("alpha beta", &unpenalized);
+        assert!((complete - complete_base).abs() < 1e-6);
+
+        let missing = score("alpha", &weights);
+        let missing_base = score("alpha", &unpenalized);
+        assert!((missing / missing_base - 0.5_f32.sqrt()).abs() < 1e-6);
+
+        let expanded = score("alpha betas", &weights);
+        let expanded_base = score("alpha betas", &unpenalized);
+        assert!((expanded - expanded_base).abs() < 1e-6);
+    }
 }

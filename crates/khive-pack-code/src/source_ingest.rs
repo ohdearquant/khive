@@ -26,10 +26,12 @@
 //! records only the information needed to recompute its target's id later,
 //! and the synchronous re-resolve pass (`reresolve_pass`) does exactly that.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use khive_runtime::{entity_fts_document, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -43,6 +45,28 @@ use crate::extractor::{DeclKind, ExtractedDeclaration, ExtractedFile};
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+
+const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
+const RUST_L2_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const RUST_L2_MAX_DELIMITER_DEPTH: usize = 64;
+const RUST_L2_MAX_ANGLE_DEPTH: usize = 64;
+const RUST_L2_MAX_SEGMENT_TOKENS: usize = 2048;
+const RUST_L2_MAX_SEGMENT_OPERATORS: usize = 128;
+const RUST_L2_SCANNER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const RUST_L2_SCANNER_WORKERS: usize = 2;
+
+enum L2Source {
+    Ready { content: String, hash: String },
+    Refused { hash: String, reason: String },
+}
+
+impl L2Source {
+    fn hash(&self) -> &str {
+        match self {
+            Self::Ready { hash, .. } | Self::Refused { hash, .. } => hash,
+        }
+    }
+}
 
 #[cfg(test)]
 mod race_seam {
@@ -416,7 +440,7 @@ fn edge_uuid(relation: EdgeRelation, source_id: Uuid, target_id: Uuid) -> Uuid {
 /// A `uuid5`-recomputable unresolved reference recorded on a source entity
 /// (B6). Content-hash-free by design: only the fields needed to recompute
 /// the target's identity and the edge's metadata are kept.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct UnresolvedSpec {
     specifier: String,
     target_kind: String,
@@ -425,6 +449,13 @@ struct UnresolvedSpec {
     dependency_scope: String,
     language: String,
 }
+
+struct PendingUnresolved {
+    spec: UnresolvedSpec,
+    file: String,
+}
+
+type PendingUnresolvedByOwner = BTreeMap<Uuid, Vec<PendingUnresolved>>;
 
 fn read_unresolved(properties: &Value) -> Vec<UnresolvedSpec> {
     let mut specs: Vec<UnresolvedSpec> = properties
@@ -890,6 +921,40 @@ fn ts(dt: DateTime<Utc>) -> i64 {
     dt.timestamp_micros()
 }
 
+/// Capture the old project/language clock before any tier in this invocation
+/// advances it. A missing or malformed clock cannot authorize refreshing
+/// historical L2 edges.
+async fn capture_previous_l2_sweep_stamp(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+    language: &str,
+    previous_stamps: &mut PreviousL2SweepStamps,
+) -> Result<(), CodeSourceIngestError> {
+    let owner = L2OwnerKey {
+        source_project: name.to_string(),
+        language: language.to_string(),
+    };
+    if previous_stamps.contains_key(&owner) {
+        return Ok(());
+    }
+    let stamp = get_entity_opt(rt, token, project_uuid(name))
+        .await?
+        .and_then(|project| {
+            project
+                .properties
+                .and_then(|properties| properties.get("sweep_clock").cloned())
+                .and_then(|clock| {
+                    clock
+                        .get(language)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        });
+    previous_stamps.insert(owner, stamp);
+    Ok(())
+}
+
 /// Upsert (create or refresh) the `project` entity for `name`, merging the
 /// per-`(source_project, language)` sweep clock (B5) with any prior sweeps
 /// for a different language recorded on the same entity.
@@ -907,9 +972,15 @@ async fn upsert_project(
     source_label: &str,
     language: &str,
     sweep_time: DateTime<Utc>,
+    capture_previous_l2_sweep: bool,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let id = project_uuid(name);
+    if capture_previous_l2_sweep {
+        capture_previous_l2_sweep_stamp(rt, token, name, language, previous_l2_sweep_stamps)
+            .await?;
+    }
     let now = ts(sweep_time);
     let outcome = mutate_entity(rt, token, id, source_label, report, |current| {
         let mut entity = current
@@ -970,6 +1041,7 @@ async fn ensure_project_id(
     language: &str,
     per_language_project_stamps: bool,
     sweep_time: DateTime<Utc>,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let key = project_cache_key(proj_name, language, per_language_project_stamps);
@@ -977,7 +1049,15 @@ async fn ensure_project_id(
         return Ok(Some(*id));
     }
     let Some(id) = upsert_project(
-        rt, token, proj_name, file_label, language, sweep_time, report,
+        rt,
+        token,
+        proj_name,
+        file_label,
+        language,
+        sweep_time,
+        per_language_project_stamps,
+        previous_l2_sweep_stamps,
+        report,
     )
     .await?
     else {
@@ -1056,7 +1136,12 @@ async fn upsert_module(
             .entry("import_scan_status".to_string())
             .or_insert_with(|| json!("unscanned"));
         if !preserve_l2_state {
-            for key in ["declaration_ids", "l2_pending_impls", "l2_content_hash"] {
+            for key in [
+                "declaration_ids",
+                "l2_pending_impls",
+                "l2_content_hash",
+                "l2_scanner_identity_version",
+            ] {
                 props.remove(key);
             }
         }
@@ -1080,34 +1165,108 @@ async fn upsert_module(
     Ok(Some(id))
 }
 
-/// Append `spec` to `entity_id`'s `unresolved_specifiers` (deduped), without
-/// disturbing any other property already stamped this sweep (project/module
-/// upsert already ran first, so this always reads back the row this pass
-/// just wrote).
+/// Append one sweep's unresolved specs to an owner in encounter order with a
+/// single guarded entity/FTS write. Project/module upserts have already run,
+/// and the fresh-read rebase preserves their other properties.
 ///
-/// When the gate refuses the updated properties (e.g. `spec.specifier` is
-/// itself secret-shaped), the refusal is recorded in `report.blocked` keyed
-/// by `file` and the specifier is simply not recorded this sweep — the
-/// entity itself is untouched, since the guarded mutation blocks before writing.
-async fn record_unresolved(
+/// Screen each candidate separately before batching, so a secret-shaped
+/// specifier is quarantined under its own source file without discarding safe
+/// siblings. The full replacement still passes `mutate_entity`'s secret gate.
+async fn record_unresolved_batch(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     entity_id: Uuid,
-    spec: UnresolvedSpec,
-    file: &str,
+    pending: &[PendingUnresolved],
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let outcome = mutate_entity(rt, token, entity_id, file, report, |current| {
+    // A pre-existing spec (or an earlier safe candidate in this batch) was
+    // already a no-op in the per-spec path, before its gate check. Preserve
+    // that behavior and avoid screening duplicates repeatedly. The guarded
+    // mutation below reads again and rebases if another sweep wrote meanwhile.
+    let current = rt
+        .entities(token)?
+        .get_entity_including_deleted(entity_id)
+        .await
+        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let mut staged_seen: HashSet<_> = current
+        .properties
+        .as_ref()
+        .map(read_unresolved)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if pending.iter().all(|item| staged_seen.contains(&item.spec)) {
+        return Ok(());
+    }
+    // If the owner already carries a gate-refused value, every new per-spec
+    // mutation used to be refused before any of them could write. Keep that
+    // per-item report behavior without rebuilding and rechecking the growing
+    // list K times.
+    if let Err(error) = gate_check(&current) {
+        match error {
+            RuntimeError::SecretDetected(secret) => {
+                for item in pending {
+                    if !staged_seen.contains(&item.spec) {
+                        report.blocked_count += 1;
+                        report.blocked.push(BlockedWrite {
+                            file: item.file.clone(),
+                            detector: secret.detector.to_string(),
+                            masked_excerpt: secret.masked.clone(),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            other => return Err(other.into()),
+        }
+    }
+    let mut allowed = Vec::with_capacity(pending.len());
+    for item in pending {
+        if staged_seen.contains(&item.spec) {
+            continue;
+        }
+        let candidate = serde_json::to_value(&item.spec).expect("serializes");
+        match secret_gate::check_json_at(&candidate, "entity", "properties") {
+            Ok(()) => {
+                staged_seen.insert(item.spec.clone());
+                allowed.push(item);
+            }
+            Err(RuntimeError::SecretDetected(secret)) => {
+                report.blocked_count += 1;
+                report.blocked.push(BlockedWrite {
+                    file: item.file.clone(),
+                    detector: secret.detector.to_string(),
+                    masked_excerpt: secret.masked,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+    }
+    let Some(first) = allowed.first() else {
+        return Ok(());
+    };
+    let mut appended = 0usize;
+    let outcome = mutate_entity(rt, token, entity_id, &first.file, report, |current| {
         let mut entity = current?.clone();
         let mut list = entity
             .properties
             .as_ref()
             .map(read_unresolved)
             .unwrap_or_default();
-        if list.contains(&spec) {
+        let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
+        appended = 0;
+        for item in &allowed {
+            if seen.insert(item.spec.clone()) {
+                list.push(item.spec.clone());
+                appended += 1;
+            }
+        }
+        if appended == 0 {
             return None;
         }
-        list.push(spec.clone());
         let mut props = entity
             .properties
             .clone()
@@ -1122,7 +1281,7 @@ async fn record_unresolved(
     })
     .await?;
     if outcome.wrote() {
-        report.unresolved_recorded += 1;
+        report.unresolved_recorded += appended as u64;
     }
     Ok(())
 }
@@ -1324,6 +1483,7 @@ async fn reresolve_pass(
         }
         let original_list = list.clone();
         let mut still_unresolved = Vec::new();
+        let mut still_seen = HashSet::new();
         let mut changed = false;
         for mut spec in list.drain(..) {
             let selected = if spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
@@ -1332,6 +1492,7 @@ async fn reresolve_pass(
                 tiers.l1
             };
             if !selected {
+                still_seen.insert(spec.clone());
                 still_unresolved.push(spec);
                 continue;
             }
@@ -1397,7 +1558,7 @@ async fn reresolve_pass(
                     // normalize to the same specifier as the freshly
                     // scanned form above. Keep the durable queue deduped
                     // after that repair as well as before it.
-                    if still_unresolved.contains(&spec) {
+                    if !still_seen.insert(spec.clone()) {
                         changed = true;
                     } else {
                         still_unresolved.push(spec);
@@ -1407,6 +1568,7 @@ async fn reresolve_pass(
         }
         if changed {
             let entity_label = id.to_string();
+            let original_set: HashSet<_> = original_list.iter().cloned().collect();
             mutate_entity(rt, token, id, &entity_label, report, |current| {
                 let mut entity = current?.clone();
                 let mut rebased = entity
@@ -1414,9 +1576,10 @@ async fn reresolve_pass(
                     .as_ref()
                     .map(read_unresolved)
                     .unwrap_or_default();
-                rebased.retain(|specifier| !original_list.contains(specifier));
+                rebased.retain(|specifier| !original_set.contains(specifier));
+                let mut seen: HashSet<_> = rebased.iter().cloned().collect();
                 for specifier in &still_unresolved {
-                    if !rebased.contains(specifier) {
+                    if seen.insert(specifier.clone()) {
                         rebased.push(specifier.clone());
                     }
                 }
@@ -1524,54 +1687,65 @@ const SOURCE_SKIP_DIRS: &[&str] = &[
     "build",
 ];
 
-fn collect_source_files(root: &Path, ext: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
-                continue;
-            }
-            collect_source_files(&path, ext, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// L2's source walk resolves symlinks but never crosses the canonical ingest
+/// Both source tiers resolve symlinks without crossing the canonical ingest
 /// root. Canonical directory de-duplication also prevents symlink cycles.
-fn collect_l2_source_files(
+fn collect_source_files(
     root: &Path,
     ext: &str,
     out: &mut Vec<PathBuf>,
     skipped_outside_root: &mut Vec<PathBuf>,
+    skipped_non_regular: &mut Vec<PathBuf>,
+    skipped_non_source: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
-    fn visit(
-        path: &Path,
-        canonical_root: &Path,
-        ext: &str,
-        visited_dirs: &mut BTreeSet<PathBuf>,
-        out: &mut Vec<PathBuf>,
-        skipped: &mut Vec<PathBuf>,
-    ) -> std::io::Result<()> {
+    struct SourceWalk<'a> {
+        canonical_root: &'a Path,
+        ext: &'a str,
+        visited_dirs: BTreeSet<PathBuf>,
+        out: &'a mut Vec<PathBuf>,
+        skipped_outside_root: &'a mut Vec<PathBuf>,
+        skipped_non_regular: &'a mut Vec<PathBuf>,
+        skipped_non_source: &'a mut Vec<PathBuf>,
+    }
+
+    fn visit(path: &Path, walk: &mut SourceWalk<'_>) -> std::io::Result<()> {
         let canonical = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(_) => {
-                skipped.push(path.to_path_buf());
+                if path.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+                    walk.skipped_outside_root.push(path.to_path_buf());
+                } else {
+                    walk.skipped_non_source.push(path.to_path_buf());
+                }
                 return Ok(());
             }
         };
-        if !canonical.starts_with(canonical_root) {
-            skipped.push(path.to_path_buf());
+        if !canonical.starts_with(walk.canonical_root) {
+            if path.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+                walk.skipped_outside_root.push(path.to_path_buf());
+            } else {
+                walk.skipped_non_source.push(path.to_path_buf());
+            }
+            return Ok(());
+        }
+        // An alias must not re-enter a directory excluded by its canonical
+        // location. Components are relative to the explicitly chosen root,
+        // so a caller may still choose an excluded-name directory as root.
+        if canonical
+            .strip_prefix(walk.canonical_root)
+            .expect("canonical path was checked within the ingest root")
+            .components()
+            .any(|component| match component {
+                std::path::Component::Normal(name) => {
+                    let name = name.to_string_lossy();
+                    SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.')
+                }
+                _ => false,
+            })
+        {
             return Ok(());
         }
         if canonical.is_dir() {
-            if !visited_dirs.insert(canonical.clone()) {
+            if !walk.visited_dirs.insert(canonical.clone()) {
                 return Ok(());
             }
             for entry in fs::read_dir(&canonical)? {
@@ -1582,25 +1756,31 @@ fn collect_l2_source_files(
                 if SOURCE_SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
                     continue;
                 }
-                visit(&entry_path, canonical_root, ext, visited_dirs, out, skipped)?;
+                visit(&entry_path, walk)?;
             }
-        } else if canonical.extension().and_then(|value| value.to_str()) == Some(ext) {
-            out.push(canonical);
+        } else if canonical.extension().and_then(|value| value.to_str()) == Some(walk.ext) {
+            if canonical.is_file() {
+                walk.out.push(canonical);
+            } else {
+                walk.skipped_non_regular.push(path.to_path_buf());
+            }
         }
         Ok(())
     }
 
     let canonical_root = fs::canonicalize(root)?;
-    visit(
-        &canonical_root,
-        &canonical_root,
+    let mut walk = SourceWalk {
+        canonical_root: &canonical_root,
         ext,
-        &mut BTreeSet::new(),
+        visited_dirs: BTreeSet::new(),
         out,
         skipped_outside_root,
-    )?;
-    out.sort();
-    out.dedup();
+        skipped_non_regular,
+        skipped_non_source,
+    };
+    visit(&canonical_root, &mut walk)?;
+    walk.out.sort();
+    walk.out.dedup();
     Ok(())
 }
 
@@ -1613,6 +1793,318 @@ fn content_hash(content: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// Read at most the L2 scanner's byte limit plus one. A refused file keeps
+/// module metadata and a parse-failure row, but its `refused:` fingerprint is
+/// deliberately not represented as a hash of unread source bytes.
+fn read_l2_source(path: &Path) -> io::Result<L2Source> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Ok(L2Source::Refused {
+            hash: "refused:non-regular-file".to_string(),
+            reason: "scanner safety limit: Rust source is not a regular file".to_string(),
+        });
+    }
+    if metadata.len() > RUST_L2_MAX_SOURCE_BYTES as u64 {
+        return Ok(L2Source::Refused {
+            hash: format!("refused:size:{}", metadata.len()),
+            reason: "scanner safety limit: Rust source is too large".to_string(),
+        });
+    }
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut hash: u64 = 0xcbf29ce484222325;
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(RUST_L2_MAX_SOURCE_BYTES + 1 - bytes.len());
+        for byte in &chunk[..retained] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        bytes.extend_from_slice(&chunk[..retained]);
+        if bytes.len() > RUST_L2_MAX_SOURCE_BYTES {
+            return Ok(L2Source::Refused {
+                hash: format!("refused:{hash:016x}"),
+                reason: "scanner safety limit: Rust source is too large".to_string(),
+            });
+        }
+    }
+    let hash = format!("{hash:016x}");
+    let content = String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Err(reason) = check_rust_l2_nesting(&content) {
+        return Ok(L2Source::Refused { hash, reason });
+    }
+    Ok(L2Source::Ready { content, hash })
+}
+
+/// Count delimiter nesting without constructing a recursive syntax tree. The
+/// scanner consumes only valid UTF-8, and this guard runs before `syn` sees it.
+fn check_rust_l2_nesting(content: &str) -> Result<(), String> {
+    let bytes = content.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut angle_at_delimiter = Vec::new();
+    let mut angle_depth = 0usize;
+    let mut segment_tokens = 0usize;
+    let mut segment_operators = 0usize;
+    let mut in_word = false;
+    let mut top_level_value_item = false;
+    let mut braced_item = false;
+    let mut item_body_opened = false;
+    let mut i = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
+    if bytes[i..].starts_with(b"#!") && !bytes[i..].starts_with(b"#![") {
+        while i < bytes.len() && bytes[i] != b'\n' {
+            i += 1;
+        }
+    }
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            in_word = false;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            in_word = false;
+            i += 2;
+            let mut comment_depth = 1usize;
+            while i < bytes.len() && comment_depth != 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    comment_depth += 1;
+                    if comment_depth > RUST_L2_MAX_DELIMITER_DEPTH {
+                        return Err("scanner safety limit: comment nesting is too deep".into());
+                    }
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    comment_depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if comment_depth != 0 {
+                return Err("scanner safety limit: unterminated block comment".into());
+            }
+            continue;
+        }
+        if bytes[i] == b'r' {
+            let mut marker = i + 1;
+            while marker < bytes.len() && bytes[marker] == b'#' {
+                marker += 1;
+                if marker - i - 1 > RUST_L2_MAX_DELIMITER_DEPTH {
+                    return Err("scanner safety limit: raw string delimiter is too long".into());
+                }
+            }
+            if marker < bytes.len() && bytes[marker] == b'"' {
+                scanner_budget_token(&mut segment_tokens)?;
+                in_word = false;
+                let hashes = marker - i - 1;
+                i = marker + 1;
+                let mut closed = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'"'
+                        && bytes.get(i + 1..i + 1 + hashes) == Some(&bytes[marker - hashes..marker])
+                    {
+                        i += 1 + hashes;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return Err("scanner safety limit: unterminated raw string".into());
+                }
+                continue;
+            }
+        }
+        if bytes[i] == b'"' {
+            scanner_budget_token(&mut segment_tokens)?;
+            in_word = false;
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = (i + 2).min(bytes.len()),
+                    b'"' => {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if !closed {
+                return Err("scanner safety limit: unterminated string".into());
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            if let Some(end) = rust_char_literal_end(content, i) {
+                scanner_budget_token(&mut segment_tokens)?;
+                in_word = false;
+                i = end;
+                continue;
+            }
+        }
+        let byte = bytes[i];
+        let word = byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
+        if word {
+            if !in_word {
+                scanner_budget_token(&mut segment_tokens)?;
+                if delimiters.is_empty() && angle_depth == 0 && !top_level_value_item {
+                    let mut end = i + 1;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric()
+                            || bytes[end] == b'_'
+                            || bytes[end] >= 0x80)
+                    {
+                        end += 1;
+                    }
+                    if matches!(
+                        std::str::from_utf8(&bytes[i..end]).ok(),
+                        Some(
+                            "fn" | "impl"
+                                | "struct"
+                                | "enum"
+                                | "union"
+                                | "trait"
+                                | "mod"
+                                | "extern"
+                                | "macro_rules"
+                                | "macro"
+                        )
+                    ) {
+                        braced_item = true;
+                    }
+                }
+            }
+        } else if !byte.is_ascii_whitespace() {
+            scanner_budget_token(&mut segment_tokens)?;
+        }
+        in_word = word;
+        if byte == b'<' {
+            angle_depth += 1;
+            if angle_depth > RUST_L2_MAX_ANGLE_DEPTH {
+                return Err("scanner safety limit: Rust generic nesting is too deep".into());
+            }
+        } else if byte == b'>' && i.checked_sub(1).and_then(|prev| bytes.get(prev)) != Some(&b'-') {
+            let floor = angle_at_delimiter.last().copied().unwrap_or(0);
+            angle_depth = angle_depth.saturating_sub(1).max(floor);
+        }
+        if matches!(byte, b'&' | b'*' | b'!' | b'+' | b'-' | b'=' | b'.' | b'?') {
+            segment_operators += 1;
+            if segment_operators > RUST_L2_MAX_SEGMENT_OPERATORS {
+                return Err("scanner safety limit: Rust expression is too complex".into());
+            }
+        }
+        if byte == b'=' && delimiters.is_empty() && angle_depth == 0 {
+            top_level_value_item = true;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => {
+                if byte == b'{'
+                    && delimiters.is_empty()
+                    && angle_depth == 0
+                    && braced_item
+                    && !top_level_value_item
+                {
+                    item_body_opened = true;
+                }
+                delimiters.push(bytes[i]);
+                angle_at_delimiter.push(angle_depth);
+                if delimiters.len() > RUST_L2_MAX_DELIMITER_DEPTH {
+                    return Err("scanner safety limit: Rust syntax nesting is too deep".into());
+                }
+            }
+            b')' | b']' | b'}' => {
+                let expected = match bytes[i] {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if delimiters.pop() != Some(expected) {
+                    return Err("scanner safety limit: unbalanced Rust delimiters".into());
+                }
+                angle_depth = angle_at_delimiter
+                    .pop()
+                    .expect("paired delimiter angle depth");
+                if byte == b'}' && delimiters.is_empty() && item_body_opened {
+                    segment_tokens = 0;
+                    segment_operators = 0;
+                    angle_depth = 0;
+                    top_level_value_item = false;
+                    braced_item = false;
+                    item_body_opened = false;
+                }
+            }
+            b';' | b',' => {
+                segment_tokens = 0;
+                segment_operators = 0;
+                if byte == b';' {
+                    angle_depth = angle_at_delimiter.last().copied().unwrap_or(0);
+                    if delimiters.is_empty() {
+                        top_level_value_item = false;
+                        braced_item = false;
+                        item_body_opened = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !delimiters.is_empty() {
+        return Err("scanner safety limit: unbalanced Rust delimiters".into());
+    }
+    Ok(())
+}
+
+fn scanner_budget_token(segment: &mut usize) -> Result<(), String> {
+    *segment += 1;
+    if *segment > RUST_L2_MAX_SEGMENT_TOKENS {
+        return Err("scanner safety limit: Rust syntax is too complex".into());
+    }
+    Ok(())
+}
+
+/// Distinguish one-character literals from lifetimes without letting a
+/// lifetime hide delimiters later on its line.
+fn rust_char_literal_end(content: &str, start: usize) -> Option<usize> {
+    let tail = content.get(start + 1..)?;
+    let first = tail.chars().next()?;
+    if first == '\\' {
+        let escaped = tail.chars().nth(1)?;
+        let end = if escaped == 'u' {
+            let open = start + 3;
+            if content.as_bytes().get(open) != Some(&b'{') {
+                return None;
+            }
+            let limit = (open + 10).min(content.len());
+            let close = content.get(open + 1..limit)?.find('}')? + open + 1;
+            if close - open > 8 {
+                return None;
+            }
+            close + 1
+        } else if escaped == 'x' {
+            start + 5
+        } else {
+            start + 3
+        };
+        return (content.as_bytes().get(end) == Some(&b'\'')).then_some(end + 1);
+    }
+    let end = start + 1 + first.len_utf8();
+    (content.as_bytes().get(end) == Some(&b'\'')).then_some(end + 1)
 }
 
 /// Run one selected-tier ingest pass over `opts.path` into the runtime `rt`
@@ -1646,12 +2138,16 @@ pub async fn run_code_ingest(
     // `project_cache_key` collapses its language component for default
     // L1/L1.5 calls to preserve their established write/counter behavior.
     let mut project_ids: HashMap<(String, String), Uuid> = HashMap::new();
+    let mut previous_l2_sweep_stamps = PreviousL2SweepStamps::new();
+    let mut pending_unresolved = PendingUnresolvedByOwner::new();
 
     // Manifest discovery supplies bounded identity, alias, and scope context
     // to L1.5 without implying L1 output. No selected L1/L1.5 tier means no
     // manifest walk, preserving the zero-write and L2-only boundaries.
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
-        manifest::discover_manifests(opts.path, &opts.languages)
+        let canonical_ingest_root = fs::canonicalize(opts.path)
+            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+        manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
             .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?
     } else {
         Vec::new()
@@ -1691,6 +2187,8 @@ pub async fn run_code_ingest(
                 &file_label,
                 m.language,
                 opts.sweep_time,
+                opts.enable_l2,
+                &mut previous_l2_sweep_stamps,
                 &mut report,
             )
             .await?
@@ -1716,7 +2214,7 @@ pub async fn run_code_ingest(
                 // A renamed dependency's alias row and package row both
                 // index the same declared fact; canonicalizing the alias to
                 // the package at record time makes the two rows produce one
-                // identical spec (deduped by `record_unresolved`) targeting
+                // identical spec (deduped by the per-owner batch) targeting
                 // the package's project identity — never a phantom alias
                 // project.
                 let specifier =
@@ -1728,7 +2226,13 @@ pub async fn run_code_ingest(
                     dependency_scope: dep_scope.clone(),
                     language: m.language.to_string(),
                 };
-                record_unresolved(rt, token, source_id, spec, &file_label, &mut report).await?;
+                pending_unresolved
+                    .entry(source_id)
+                    .or_default()
+                    .push(PendingUnresolved {
+                        spec,
+                        file: file_label.clone(),
+                    });
             }
         }
     }
@@ -1753,11 +2257,20 @@ pub async fn run_code_ingest(
                 opts.enable_l2,
                 opts.sweep_time,
                 &mut project_ids,
+                &mut previous_l2_sweep_stamps,
                 &mut module_scans,
+                &mut pending_unresolved,
                 &mut report,
             )
             .await?;
         }
+    }
+
+    // Flush after all project/module refreshes, before synchronous B6
+    // re-resolution observes the unresolved queue. Each owner gets one
+    // guarded write regardless of how many files/specifiers contributed.
+    for (entity_id, pending) in pending_unresolved {
+        record_unresolved_batch(rt, token, entity_id, &pending, &mut report).await?;
     }
 
     if opts.enable_l1 || opts.enable_l1_5 {
@@ -1786,15 +2299,26 @@ pub async fn run_code_ingest(
         let mut state = run_l2_sweep(
             rt,
             token,
-            opts.path,
-            &snapshot,
-            opts.sweep_time,
+            L2SweepInputs {
+                ingest_root: opts.path,
+                snapshot: &snapshot,
+                sweep_time: opts.sweep_time,
+            },
             &mut project_ids,
+            &mut previous_l2_sweep_stamps,
             &mut report,
         )
         .await?;
         l2_reresolve_pass(rt, token, opts.sweep_time, &mut state, &mut report).await?;
-        refresh_unchanged_l2_edges(rt, token, opts.sweep_time, &mut state, &mut report).await?;
+        refresh_unchanged_l2_edges(
+            rt,
+            token,
+            opts.sweep_time,
+            &previous_l2_sweep_stamps,
+            &mut state,
+            &mut report,
+        )
+        .await?;
         if let Some(l2) = report.l2.as_mut() {
             l2.symbol_edges_stamped = state.stamped_edge_ids.len() as u64;
         }
@@ -1824,20 +2348,64 @@ async fn run_import_scan(
     per_language_project_stamps: bool,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<(String, String), Uuid>,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     module_scans: &mut HashMap<Uuid, ModuleScan>,
+    pending_unresolved: &mut PendingUnresolvedByOwner,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
+    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
+        Ok(path) => path,
+        Err(error) => {
+            report.warnings.push(format!(
+                "canonicalizing L1.5 ingest root {}: {error}",
+                ingest_root.display()
+            ));
+            return Ok(());
+        }
+    };
     let mut files = Vec::new();
-    if let Err(e) = collect_source_files(ingest_root, ext, &mut files) {
+    let mut skipped_outside_root = Vec::new();
+    let mut skipped_non_regular = Vec::new();
+    let mut skipped_non_source = Vec::new();
+    if let Err(e) = collect_source_files(
+        &canonical_ingest_root,
+        ext,
+        &mut files,
+        &mut skipped_outside_root,
+        &mut skipped_non_regular,
+        &mut skipped_non_source,
+    ) {
         report
             .warnings
             .push(format!("walking {}: {e}", ingest_root.display()));
         return Ok(());
     }
-    files.sort();
+    for skipped in skipped_outside_root {
+        report.warnings.push(format!(
+            "L1.5 skipped source outside the canonical ingest root: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_regular {
+        report.warnings.push(format!(
+            "L1.5 skipped non-regular source: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_source {
+        let warning = format!(
+            "L1.5 skipped non-source traversal entry: {}",
+            skipped.display()
+        );
+        if !report.warnings.contains(&warning) {
+            report.warnings.push(warning);
+        }
+    }
     if !files.is_empty() {
         record_observed_language(report, language);
     }
@@ -1847,19 +2415,19 @@ async fn run_import_scan(
             continue;
         };
         let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, ingest_root, language).unwrap_or_else(
-                || {
+            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, language)
+                .unwrap_or_else(|| {
                     (
-                        ingest_root.to_path_buf(),
+                        canonical_ingest_root.clone(),
                         basename_project_name(ingest_root),
                     )
-                },
-            );
+                });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) = derive_source_path(&file, ingest_root, &snapshot.root, report)
+        let Some(source_path) =
+            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
         else {
             continue;
         };
@@ -1875,6 +2443,7 @@ async fn run_import_scan(
             language,
             per_language_project_stamps,
             sweep_time,
+            previous_l2_sweep_stamps,
             report,
         )
         .await?
@@ -1953,7 +2522,13 @@ async fn run_import_scan(
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
-                    record_unresolved(rt, token, module_id, spec, &file_label, report).await?;
+                    pending_unresolved
+                        .entry(module_id)
+                        .or_default()
+                        .push(PendingUnresolved {
+                            spec,
+                            file: file_label.clone(),
+                        });
                 }
                 Resolved::ExternalProject(target_name) => {
                     let resolution = project_import_target_and_scope(
@@ -1972,7 +2547,13 @@ async fn run_import_scan(
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
-                    record_unresolved(rt, token, proj_id, spec, &file_label, report).await?;
+                    pending_unresolved
+                        .entry(proj_id)
+                        .or_default()
+                        .push(PendingUnresolved {
+                            spec,
+                            file: file_label.clone(),
+                        });
                 }
             }
         }
@@ -1992,11 +2573,13 @@ async fn run_import_scan(
 // `crate::extractor`; this module consumes that language-neutral contract
 // rather than defining a parallel copy.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct L2OwnerKey {
     source_project: String,
     language: String,
 }
+
+type PreviousL2SweepStamps = HashMap<L2OwnerKey, Option<String>>;
 
 #[derive(Debug, Default)]
 struct L2SweepState {
@@ -2055,9 +2638,62 @@ impl L2SweepState {
 /// metadata, no `declaration_ids` stamp, increment `symbol_parse_failures`,
 /// warn, retry next sweep) instead of aborting the sweep.
 fn parse_rust_file(content: &str) -> Result<ExtractedFile, String> {
+    #[cfg(test)]
+    if content.contains("l2_worker_probe_3292") {
+        if let Some(observer) = scanner_thread_observer()
+            .lock()
+            .expect("scanner observer lock")
+            .take()
+        {
+            let current = std::thread::current();
+            let _ = observer.send((current.id(), current.name().map(str::to_string)));
+        }
+    }
     crate::scanner_rust::scan_rust_source(content)
         .map(crate::extractor::from_rust_scan)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+type ScannerThreadObservation = (std::thread::ThreadId, Option<String>);
+
+#[cfg(test)]
+type ScannerThreadObserver =
+    std::sync::Mutex<Option<std::sync::mpsc::Sender<ScannerThreadObservation>>>;
+
+#[cfg(test)]
+fn scanner_thread_observer() -> &'static ScannerThreadObserver {
+    static OBSERVER: OnceLock<ScannerThreadObserver> = OnceLock::new();
+    OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Parsing and adaptation may recurse inside syn and the scanner. Keep that
+/// work off the async executor on a known stack, with a process-wide cap on
+/// concurrent scanner threads. The caller has already checked source size
+/// and delimiter depth before this function is reached.
+async fn parse_rust_file_on_worker(content: String) -> Result<ExtractedFile, String> {
+    static WORKERS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let workers = WORKERS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(RUST_L2_SCANNER_WORKERS)))
+        .clone();
+    let permit = workers
+        .acquire_owned()
+        .await
+        .map_err(|_| "scanner worker pool unavailable".to_string())?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("khive-rust-l2-scanner".to_string())
+        .stack_size(RUST_L2_SCANNER_STACK_BYTES)
+        .spawn(move || {
+            let _permit = permit;
+            let result = std::panic::catch_unwind(|| parse_rust_file(&content))
+                .unwrap_or_else(|_| Err("scanner worker panicked".to_string()));
+            let _ = send.send(result);
+        })
+        .map_err(|error| format!("scanner worker unavailable: {error}"))?;
+    receive
+        .await
+        .map_err(|_| "scanner worker terminated".to_string())?
 }
 
 /// Join a file module's own path with a declaration's in-file nesting
@@ -2093,18 +2729,17 @@ fn declaration_owner_id(
     }
 }
 
-/// Decide whether an L2-selected file needs (re)parsing this sweep
-/// unchanged content with a valid
-/// existing ownership stamp reuses that stamp without reparsing; anything
-/// else — changed content, or no stamp yet even with unchanged content —
-/// parses. Pure and independent of storage so the boundary is directly
-/// testable.
+/// Unchanged content reuses its ownership stamp only when that stamp was
+/// produced by this Rust scanner identity version. Older generic method IDs
+/// must be recomputed even when the source bytes have not changed.
 fn l2_needs_reparse(
     existing_content_hash: Option<&str>,
     existing_declaration_ids: Option<&Value>,
+    existing_identity_version: Option<u64>,
     new_content_hash: &str,
 ) -> bool {
     existing_content_hash != Some(new_content_hash)
+        || existing_identity_version != Some(RUST_L2_SCANNER_IDENTITY_VERSION)
         || existing_declaration_ids
             .and_then(read_declaration_ids)
             .is_none()
@@ -2785,9 +3420,14 @@ async fn clear_l2_ownership(
             .properties
             .clone()
             .and_then(|value| value.as_object().cloned())?;
-        let changed = ["declaration_ids", "l2_pending_impls", "l2_content_hash"]
-            .into_iter()
-            .any(|key| props.remove(key).is_some());
+        let changed = [
+            "declaration_ids",
+            "l2_pending_impls",
+            "l2_content_hash",
+            "l2_scanner_identity_version",
+        ]
+        .into_iter()
+        .any(|key| props.remove(key).is_some());
         if !changed {
             return None;
         }
@@ -2799,8 +3439,7 @@ async fn clear_l2_ownership(
 }
 
 /// Stamp the module's current-coverage `declaration_ids` (sorted, deduped)
-/// after a successful parse — the authoritative "this module's declarations
-/// as of `content_hash`/`source_revision`" marker.
+/// and scanner identity version after a successful parse.
 async fn stamp_l2_declarations(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -2827,6 +3466,10 @@ async fn stamp_l2_declarations(
                 .collect::<Vec<_>>()),
         );
         props.insert("l2_content_hash".into(), json!(content_hash));
+        props.insert(
+            "l2_scanner_identity_version".into(),
+            json!(RUST_L2_SCANNER_IDENTITY_VERSION),
+        );
         module.properties = Some(Value::Object(props));
         Some(module)
     })
@@ -3103,6 +3746,12 @@ async fn persist_l2_file(
     Ok(Some(declaration_ids))
 }
 
+struct L2SweepInputs<'a> {
+    ingest_root: &'a Path,
+    snapshot: &'a SourceSnapshot,
+    sweep_time: DateTime<Utc>,
+}
+
 /// Walk every `.rs` file under `ingest_root`, ensure its project/module L2
 /// ownership scaffolding exists, and (re)parse it when needed
 /// Rust-only; other-language selections
@@ -3111,12 +3760,16 @@ async fn persist_l2_file(
 async fn run_l2_sweep(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    ingest_root: &Path,
-    snapshot: &SourceSnapshot,
-    sweep_time: DateTime<Utc>,
+    inputs: L2SweepInputs<'_>,
     project_ids: &mut HashMap<(String, String), Uuid>,
+    previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     report: &mut CodeSourceIngestReport,
 ) -> Result<L2SweepState, CodeSourceIngestError> {
+    let L2SweepInputs {
+        ingest_root,
+        snapshot,
+        sweep_time,
+    } = inputs;
     const LANGUAGE: &str = "rust";
     let mut state = L2SweepState::default();
     let Some(ext) = imports::extension_for_language(LANGUAGE) else {
@@ -3134,11 +3787,15 @@ async fn run_l2_sweep(
     };
     let mut files = Vec::new();
     let mut skipped_outside_root = Vec::new();
-    if let Err(e) = collect_l2_source_files(
+    let mut skipped_non_regular = Vec::new();
+    let mut skipped_non_source = Vec::new();
+    if let Err(e) = collect_source_files(
         &canonical_ingest_root,
         ext,
         &mut files,
         &mut skipped_outside_root,
+        &mut skipped_non_regular,
+        &mut skipped_non_source,
     ) {
         report
             .warnings
@@ -3151,6 +3808,19 @@ async fn run_l2_sweep(
             skipped.display()
         ));
         report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_regular {
+        report.warnings.push(format!(
+            "L2 skipped non-regular source: {}",
+            skipped.display()
+        ));
+        report.files_dropped_without_source_path += 1;
+    }
+    for skipped in skipped_non_source {
+        report.warnings.push(format!(
+            "L2 skipped non-source traversal entry: {}",
+            skipped.display()
+        ));
     }
     if !files.is_empty() {
         record_observed_language(report, LANGUAGE);
@@ -3188,6 +3858,7 @@ async fn run_l2_sweep(
             LANGUAGE,
             true,
             sweep_time,
+            previous_l2_sweep_stamps,
             report,
         )
         .await?
@@ -3195,8 +3866,8 @@ async fn run_l2_sweep(
             continue;
         };
 
-        let content = match fs::read_to_string(&file) {
-            Ok(c) => c,
+        let source = match read_l2_source(&file) {
+            Ok(source) => source,
             Err(e) => {
                 report
                     .warnings
@@ -3204,22 +3875,29 @@ async fn run_l2_sweep(
                 continue;
             }
         };
-        let hash = content_hash(&content);
+        let hash = source.hash().to_string();
+        let refused = matches!(&source, L2Source::Refused { .. });
 
         let precomputed_module_id = module_uuid(&proj_name, LANGUAGE, &module_path);
         let existing_module = get_entity_opt(rt, token, precomputed_module_id).await?;
-        let needs_reparse = l2_needs_reparse(
-            existing_module
-                .as_ref()
-                .and_then(|e| e.properties.as_ref())
-                .and_then(|p| p.get("l2_content_hash"))
-                .and_then(Value::as_str),
-            existing_module
-                .as_ref()
-                .and_then(|e| e.properties.as_ref())
-                .and_then(|p| p.get("declaration_ids")),
-            &hash,
-        );
+        let needs_reparse = refused
+            || l2_needs_reparse(
+                existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .and_then(|p| p.get("l2_content_hash"))
+                    .and_then(Value::as_str),
+                existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .and_then(|p| p.get("declaration_ids")),
+                existing_module
+                    .as_ref()
+                    .and_then(|e| e.properties.as_ref())
+                    .and_then(|p| p.get("l2_scanner_identity_version"))
+                    .and_then(Value::as_u64),
+                &hash,
+            );
 
         let Some(module_id) = upsert_module(
             rt,
@@ -3285,7 +3963,10 @@ async fn run_l2_sweep(
         }
 
         clear_l2_ownership(rt, token, module_id, &file_label, report).await?;
-        let parse_result = parse_rust_file(&content);
+        let parse_result = match source {
+            L2Source::Ready { content, .. } => parse_rust_file_on_worker(content).await,
+            L2Source::Refused { reason, .. } => Err(reason),
+        };
         if let Some(declaration_ids) = persist_l2_file(
             rt,
             token,
@@ -3314,12 +3995,14 @@ async fn run_l2_sweep(
 /// Refresh outgoing dependency/implementation edges for declarations whose
 /// files were reused without parsing. This runs only after the complete L2
 /// walk and re-resolution, so a target is refreshed only when this invocation
-/// proved both endpoints current. Changed sources restamp only references
-/// observed by their new parse, leaving removed edges at their prior stamp.
+/// proved both endpoints current. An edge must also have been current at its
+/// source project's previous language sweep; changed sources restamp only
+/// references observed by their new parse, leaving removed edges historical.
 async fn refresh_unchanged_l2_edges(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     sweep_time: DateTime<Utc>,
+    previous_l2_sweep_stamps: &PreviousL2SweepStamps,
     state: &mut L2SweepState,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
@@ -3354,12 +4037,24 @@ async fn refresh_unchanged_l2_edges(
         {
             continue;
         }
+        let Some(previous_stamp) = previous_l2_sweep_stamps
+            .get(&source_owner)
+            .and_then(Option::as_deref)
+        else {
+            continue;
+        };
         if !edge
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("l2_derived"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+            || edge
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("last_seen_at"))
+                .and_then(Value::as_str)
+                != Some(previous_stamp)
         {
             continue;
         }
@@ -3375,6 +4070,7 @@ async fn refresh_unchanged_l2_edges(
                 .get("l2_derived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || metadata.get("last_seen_at").and_then(Value::as_str) != Some(previous_stamp)
             {
                 return None;
             }
@@ -3790,25 +4486,162 @@ mod tests {
     }
 
     #[test]
+    fn rust_l2_safety_guard_ignores_literals_and_comments() {
+        let braces = "{".repeat(RUST_L2_MAX_DELIMITER_DEPTH + 1);
+        let source = format!(
+            "// {braces}\n/* {braces} */\nconst RAW: &str = r#\"{braces}\"#;\nconst QUOTED: &str = \"{braces}\";\nfn valid<'a>(value: &'a str) {{ let _brace = '{{'; let _ = value; }}\n"
+        );
+        assert!(check_rust_l2_nesting(&source).is_ok());
+        assert!(check_rust_l2_nesting("#!/usr/bin/env rust-script ]\nfn valid() {}\n").is_ok());
+
+        let nested = format!("{}0{}", "(".repeat(65), ")".repeat(65));
+        assert!(check_rust_l2_nesting(&nested)
+            .unwrap_err()
+            .contains("scanner safety limit"));
+        let generic = format!("type Deep = {}u8{};", "Vec<".repeat(65), ">".repeat(65));
+        assert!(check_rust_l2_nesting(&generic)
+            .unwrap_err()
+            .contains("generic nesting"));
+        let unary = format!("fn f() {{ let _ = {}true; }}", "!".repeat(129));
+        assert!(check_rust_l2_nesting(&unary)
+            .unwrap_err()
+            .contains("expression is too complex"));
+    }
+
+    #[test]
+    fn rust_l2_safety_guard_accepts_large_flat_item() {
+        let mut source = String::from("pub fn many_statements() {\n");
+        for _ in 0..1_024 {
+            source.push_str("let _ = 0;\n");
+        }
+        source.push_str("}\n");
+
+        assert!(check_rust_l2_nesting(&source).is_ok());
+    }
+
+    #[test]
+    fn rust_l2_oversized_file_is_refused_without_reading_it() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("oversized.rs");
+        let source = " ".repeat(RUST_L2_MAX_SOURCE_BYTES + 1);
+        fs::write(&path, &source).expect("source file");
+        let L2Source::Refused { hash, reason } = read_l2_source(&path).expect("bounded read")
+        else {
+            panic!("oversized source must not be retained for parsing");
+        };
+        assert_eq!(hash, format!("refused:size:{}", source.len()));
+        assert!(reason.contains("scanner safety limit"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rust_l2_scanner_runs_off_the_ingest_thread() {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("worker_probe");
+        fs::create_dir_all(project.join("src")).expect("source directory");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"worker_probe\"\n",
+        )
+        .expect("manifest");
+        fs::write(
+            project.join("src/lib.rs"),
+            "pub fn l2_worker_probe_3292() {}\n",
+        )
+        .expect("source");
+        let (runtime, token) = runtime_on(&root.path().join("worker.db"));
+        let (send, receive) = std::sync::mpsc::channel();
+        *scanner_thread_observer()
+            .lock()
+            .expect("scanner observer lock") = Some(send);
+
+        let caller = std::thread::current().id();
+        let report = run_code_ingest(
+            &runtime,
+            &token,
+            CodeSourceIngestOptions {
+                path: &project,
+                languages: ["rust"].into_iter().collect(),
+                sweep_time: Utc::now(),
+                enable_l1: false,
+                enable_l1_5: false,
+                enable_l2: true,
+            },
+        )
+        .await
+        .expect("L2 ingest");
+        let (scanner, name) = receive
+            .try_recv()
+            .expect("valid Rust source reaches scanner");
+        assert_ne!(
+            scanner, caller,
+            "source parsing must leave the ingest thread"
+        );
+        assert_eq!(name.as_deref(), Some("khive-rust-l2-scanner"));
+        assert_eq!(report.l2.expect("L2 report").symbol_parse_failures, 0);
+    }
+
+    #[test]
     fn invalid_declaration_ids_force_reparse() {
         let hash = "0123456789abcdef";
 
-        assert!(l2_needs_reparse(Some(hash), None, hash));
-        assert!(l2_needs_reparse(Some(hash), Some(&Value::Null), hash));
+        assert!(l2_needs_reparse(
+            Some(hash),
+            None,
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
+        assert!(l2_needs_reparse(
+            Some(hash),
+            Some(&Value::Null),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
         assert!(l2_needs_reparse(
             Some(hash),
             Some(&json!("not-an-array")),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
             hash
         ));
         assert!(l2_needs_reparse(
             Some(hash),
             Some(&json!(["not-a-uuid"])),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
             hash
         ));
-        assert!(!l2_needs_reparse(Some(hash), Some(&json!([])), hash));
+        assert!(!l2_needs_reparse(
+            Some(hash),
+            Some(&json!([])),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
         assert!(!l2_needs_reparse(
             Some(hash),
             Some(&json!([Uuid::nil().to_string()])),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
+            hash
+        ));
+    }
+
+    #[test]
+    fn old_scanner_identity_stamp_forces_reparse_of_unchanged_file() {
+        let hash = "0123456789abcdef";
+        let declarations = json!([Uuid::nil().to_string()]);
+        assert!(l2_needs_reparse(
+            Some(hash),
+            Some(&declarations),
+            None,
+            hash
+        ));
+        assert!(l2_needs_reparse(
+            Some(hash),
+            Some(&declarations),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION - 1),
+            hash
+        ));
+        assert!(!l2_needs_reparse(
+            Some(hash),
+            Some(&declarations),
+            Some(RUST_L2_SCANNER_IDENTITY_VERSION),
             hash
         ));
     }
@@ -3956,29 +4789,23 @@ mod tests {
         let pause_b = std::sync::Arc::new(race_seam::OneShotPause::new(barrier));
         let mut report_a = CodeSourceIngestReport::default();
         let mut report_b = CodeSourceIngestReport::default();
+        let pending_a = [PendingUnresolved {
+            spec: specifier_a.clone(),
+            file: "alpha.rs".to_string(),
+        }];
+        let pending_b = [PendingUnresolved {
+            spec: specifier_b.clone(),
+            file: "beta.rs".to_string(),
+        }];
 
         let (result_a, result_b) = tokio::join!(
             race_seam::AFTER_ROW_READ.scope(
                 pause_a,
-                record_unresolved(
-                    &runtime_a,
-                    &token_a,
-                    entity_id,
-                    specifier_a.clone(),
-                    "alpha.rs",
-                    &mut report_a,
-                ),
+                record_unresolved_batch(&runtime_a, &token_a, entity_id, &pending_a, &mut report_a),
             ),
             race_seam::AFTER_ROW_READ.scope(
                 pause_b,
-                record_unresolved(
-                    &runtime_b,
-                    &token_b,
-                    entity_id,
-                    specifier_b.clone(),
-                    "beta.rs",
-                    &mut report_b,
-                ),
+                record_unresolved_batch(&runtime_b, &token_b, entity_id, &pending_b, &mut report_b),
             ),
         );
         result_a.expect("writer A completes");
@@ -4008,6 +4835,82 @@ mod tests {
         assert_eq!(report_b.unresolved_recorded, 1);
         assert_eq!(report_a.fts_indexed, 1);
         assert_eq!(report_b.fts_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_batch_keeps_order_and_dedup_with_one_owner_write() {
+        let root = TempDir::new().expect("temporary database directory");
+        let (runtime, token) = runtime_on(&root.path().join("unresolved-batch.db"));
+        let entity_id = project_uuid("batch-fixture");
+        let existing = UnresolvedSpec {
+            specifier: "existing".to_string(),
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let mut entity = Entity::new(token.namespace().as_str(), "project", "batch-fixture");
+        entity.id = entity_id;
+        entity.properties = Some(json!({
+            "source_project": "batch-fixture",
+            "unresolved_specifiers": [existing],
+        }));
+        runtime
+            .entities(&token)
+            .expect("entity store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let spec = |name: String| UnresolvedSpec {
+            specifier: name,
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let mut pending: Vec<_> = (0..64)
+            .map(|i| PendingUnresolved {
+                spec: spec(format!("missing_{i:02}")),
+                file: "Cargo.toml".to_string(),
+            })
+            .collect();
+        pending.insert(
+            1,
+            PendingUnresolved {
+                spec: spec("existing".to_string()),
+                file: "Cargo.toml".to_string(),
+            },
+        );
+        pending.push(PendingUnresolved {
+            spec: spec("missing_00".to_string()),
+            file: "Cargo.toml".to_string(),
+        });
+        pending.push(PendingUnresolved {
+            spec: spec("scheme://user:pass@host".to_string()),
+            file: "blocked.toml".to_string(),
+        });
+        let mut report = CodeSourceIngestReport::default();
+        record_unresolved_batch(&runtime, &token, entity_id, &pending, &mut report)
+            .await
+            .expect("batch appends safe siblings");
+
+        let stored = runtime
+            .entities(&token)
+            .expect("entity store")
+            .get_entity(entity_id)
+            .await
+            .expect("read entity")
+            .expect("entity remains");
+        let list = read_unresolved(stored.properties.as_ref().expect("properties"));
+        let expected: Vec<_> = std::iter::once(spec("existing".to_string()))
+            .chain((0..64).map(|i| spec(format!("missing_{i:02}"))))
+            .collect();
+        assert_eq!(list, expected, "append order and dedup must be stable");
+        assert_eq!(report.unresolved_recorded, 64);
+        assert_eq!(report.fts_indexed, 1, "one owner gets one FTS upsert");
+        assert_eq!(report.blocked_count, 1);
+        assert_eq!(report.blocked[0].file, "blocked.toml");
     }
 
     #[tokio::test]

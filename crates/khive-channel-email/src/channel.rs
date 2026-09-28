@@ -26,6 +26,23 @@ const IMAP_FOLDER: &str = "INBOX";
 /// `poll_page` path.
 const IMAP_PAGE_LIMIT: usize = 50;
 
+/// Scope the connector's pre-account UID key to the configured mailbox.
+/// Keep the connector's original key separately for the read-only migration
+/// lookup; new rows are written only under this account-scoped form.
+fn account_scoped_imap_id(old_id: &str, mailbox: &str) -> String {
+    let account = mailbox.to_lowercase();
+    if let Some((host_and_validity, uid)) = old_id.rsplit_once(':') {
+        if let Some((host, validity)) = host_and_validity.rsplit_once(':') {
+            if host.starts_with("imap:") {
+                return format!("{host}:{account}:{validity}:{uid}");
+            }
+        }
+    }
+    // An alternate connector can supply an opaque key. Still include the
+    // account so an unexpected format cannot collapse two credentials.
+    format!("imap:{account}:{old_id}")
+}
+
 // Quarantine sender prefix invariant: `email:quarantine` must retain the
 // channel's `email:` prefix because prefix-keyed consumers use it to surface
 // the notification. Renaming it outside that prefix silently hides alerts.
@@ -50,6 +67,8 @@ enum QuarantineReason {
     /// An RFC822 body was present but could not be parsed (khive #449 High
     /// fix: a durable terminal disposition, never a silent drop).
     ParseFailure,
+    /// The message exceeds the configured inbound byte limit.
+    TooLarge,
 }
 
 impl std::fmt::Display for QuarantineReason {
@@ -61,6 +80,7 @@ impl std::fmt::Display for QuarantineReason {
             QuarantineReason::OffAllowlist => "off-allowlist",
             QuarantineReason::MissingBody => "missing-body",
             QuarantineReason::ParseFailure => "parse-failure",
+            QuarantineReason::TooLarge => "too-large",
         })
     }
 }
@@ -70,6 +90,7 @@ impl From<MalformedReason> for QuarantineReason {
         match reason {
             MalformedReason::MissingBody => QuarantineReason::MissingBody,
             MalformedReason::ParseFailure => QuarantineReason::ParseFailure,
+            MalformedReason::TooLarge => QuarantineReason::TooLarge,
         }
     }
 }
@@ -97,11 +118,13 @@ impl EmailChannel {
                     &config.username,
                     password,
                 );
-                let imap = ImapFetcher::new(
+                let imap = ImapFetcher::new_with_limits(
                     &config.imap_host,
                     config.imap_port,
                     &config.username,
                     password,
+                    config.imap_max_message_bytes,
+                    config.imap_max_page_bytes,
                 );
                 (smtp, imap)
             }
@@ -121,11 +144,13 @@ impl EmailChannel {
                     &config.mailbox,
                     Arc::clone(&token_provider),
                 );
-                let imap = ImapFetcher::new_oauth(
+                let imap = ImapFetcher::new_oauth_with_limits(
                     &config.imap_host,
                     config.imap_port,
                     &config.mailbox,
                     Arc::clone(&token_provider),
+                    config.imap_max_message_bytes,
+                    config.imap_max_page_bytes,
                 );
                 (smtp, imap)
             }
@@ -276,7 +301,12 @@ impl EmailChannel {
         if let Some(date) = email.date {
             env = env.with_sent_at(date);
         }
-        env = env.with_external_id(&email.imap_external_id);
+        env = env
+            .with_external_id(account_scoped_imap_id(
+                &email.imap_external_id,
+                &self.config.mailbox,
+            ))
+            .with_legacy_external_id(&email.imap_external_id);
 
         env.metadata
             .insert("quarantined".to_string(), "true".to_string());
@@ -291,8 +321,8 @@ impl EmailChannel {
     }
 
     /// Build the envelope recorded for a selected UID that could not be
-    /// durably parsed into a message (khive #449 High fix: a missing RFC822
-    /// body or an unparseable one). Unlike [`Self::quarantine_envelope`],
+    /// ingested because it is too large or lacks a parseable RFC 822 body.
+    /// Unlike [`Self::quarantine_envelope`],
     /// this is never gated by `quarantine_store` -- a data-integrity failure
     /// must always leave a queryable record, never a silent drop, since
     /// dropping it here is the only way this UID's disposition could be lost
@@ -305,11 +335,15 @@ impl EmailChannel {
         raw_bytes: Option<Vec<u8>>,
     ) -> ChannelEnvelope {
         let to = format!("email:{}", self.maintainer_address());
-        let body =
-            format!("(khive: IMAP message UID {uid} could not be parsed and was quarantined)");
+        let body = format!("(khive: IMAP message UID {uid} was quarantined: {reason})");
         let mut env = ChannelEnvelope::new(EMAIL_QUARANTINE_SENDER, to.clone(), body)
             .with_quarantine_replay(raw_bytes.unwrap_or_default(), to);
-        env = env.with_external_id(imap_external_id);
+        env = env
+            .with_external_id(account_scoped_imap_id(
+                imap_external_id,
+                &self.config.mailbox,
+            ))
+            .with_legacy_external_id(imap_external_id);
         env.metadata
             .insert("quarantined".to_string(), "true".to_string());
         env.metadata
@@ -437,7 +471,7 @@ impl EmailChannel {
                     warn!(
                         uid,
                         reason = %reason,
-                        "quarantining permanently unparseable IMAP message"
+                        "quarantining IMAP message"
                     );
                     envelopes.push(self.malformed_quarantine_envelope(
                         uid,
@@ -472,7 +506,12 @@ impl EmailChannel {
         }
         // Always set external_id from the stable IMAP-based dedup key. Never derive it
         // from Message-ID, which is optional and could be absent or absent-by-design.
-        env = env.with_external_id(&email.imap_external_id);
+        env = env
+            .with_external_id(account_scoped_imap_id(
+                &email.imap_external_id,
+                &self.config.mailbox,
+            ))
+            .with_legacy_external_id(&email.imap_external_id);
         if let Some(corr) = email.correlation() {
             env = env.with_correlation(corr);
         }
@@ -596,6 +635,8 @@ mod tests {
             smtp_port: 587,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
+            imap_max_message_bytes: crate::config::DEFAULT_IMAP_MAX_MESSAGE_BYTES,
+            imap_max_page_bytes: crate::config::DEFAULT_IMAP_MAX_PAGE_BYTES,
             username: "user@example.com".to_string(),
             mailbox: "user@example.com".to_string(),
             auth: EmailAuth::Basic {
@@ -739,6 +780,36 @@ mod tests {
         assert_eq!(ch.kind(), "email");
     }
 
+    #[test]
+    fn same_imap_uid_in_two_accounts_has_distinct_new_keys_and_shared_legacy_key() {
+        let raw = "imap:mail.example.com:17:42";
+        let mut config_a = make_config("maintainer@example.com");
+        config_a.mailbox = "A@Example.com".to_string();
+        let mut config_b = make_config("maintainer@example.com");
+        config_b.mailbox = "b@example.com".to_string();
+        let a = build_channel_from(config_a, vec![]);
+        let b = build_channel_from(config_b, vec![]);
+        let a_env = a.disposition(vec![SelectedMessage::Email(Box::new(make_email(
+            "maintainer@example.com",
+            raw,
+        )))]);
+        let b_env = b.disposition(vec![SelectedMessage::Email(Box::new(make_email(
+            "maintainer@example.com",
+            raw,
+        )))]);
+        assert_eq!(
+            a_env[0].external_id.as_deref(),
+            Some("imap:mail.example.com:a@example.com:17:42")
+        );
+        assert_eq!(
+            b_env[0].external_id.as_deref(),
+            Some("imap:mail.example.com:b@example.com:17:42")
+        );
+        assert_ne!(a_env[0].external_id, b_env[0].external_id);
+        assert_eq!(a_env[0].legacy_external_id.as_deref(), Some(raw));
+        assert_eq!(b_env[0].legacy_external_id.as_deref(), Some(raw));
+    }
+
     // --- Authorization: authorized sender ---
 
     #[tokio::test]
@@ -750,8 +821,21 @@ mod tests {
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
         // external_id is now always the stable IMAP key, not Message-ID.
-        assert_eq!(envs[0].external_id.as_deref(), Some("imap:test:0:1"));
+        assert_eq!(
+            envs[0].external_id.as_deref(),
+            Some("imap:test:user@example.com:0:1")
+        );
+        assert_eq!(envs[0].legacy_external_id.as_deref(), Some("imap:test:0:1"));
         assert_eq!(envs[0].from, "email:maintainer@example.com");
+    }
+
+    #[test]
+    fn spaced_auth_results_passes_attribution_gate() {
+        let mut email = make_email("user@example.com", "imap:test:1:7");
+        email.authentication_results =
+            vec!["mx.example.com; dmarc = pass header . from = example.com".to_string()];
+        let channel = build_channel("user@example.com", vec![]);
+        assert_eq!(channel.evaluate_auth(&email), Ok(()));
     }
 
     #[tokio::test]
@@ -1392,7 +1476,7 @@ mod tests {
 
         let quarantined = envs
             .iter()
-            .find(|e| e.external_id.as_deref() == Some("imap:test:0:1"))
+            .find(|e| e.external_id.as_deref() == Some("imap:test:user@example.com:0:1"))
             .expect("unauthorized message must still be present, quarantined");
         assert_eq!(
             quarantined.from, EMAIL_QUARANTINE_SENDER,
@@ -1408,7 +1492,7 @@ mod tests {
 
         let attributed = envs
             .iter()
-            .find(|e| e.external_id.as_deref() == Some("imap:test:0:2"))
+            .find(|e| e.external_id.as_deref() == Some("imap:test:user@example.com:0:2"))
             .expect("authorized message must be attributed");
         assert_eq!(attributed.from, "email:maintainer@example.com");
     }
@@ -1723,7 +1807,7 @@ mod tests {
         );
         assert_eq!(
             page2.envelopes[0].external_id.as_deref(),
-            Some("imap:mail.example.com:7:6"),
+            Some("imap:mail.example.com:a@example.com:7:6"),
             "the fresh instance must correctly pick up the newly-arrived UID"
         );
         assert_eq!(
@@ -1904,7 +1988,9 @@ mod tests {
         let quarantined = page
             .envelopes
             .iter()
-            .find(|e| e.external_id.as_deref() == Some("imap:imap.example.com:4:1"))
+            .find(|e| {
+                e.external_id.as_deref() == Some("imap:imap.example.com:user@example.com:4:1")
+            })
             .expect(
                 "the malformed UID's stable external_id must be present on the \
                  envelope actually handed to comm.ingest",
@@ -1938,6 +2024,44 @@ mod tests {
             page.next_checkpoint.unwrap().high_water,
             Some(2),
             "the checkpoint candidate must advance past the poison UID"
+        );
+    }
+
+    #[test]
+    fn oversized_uid_is_quarantined_without_body_even_if_attribution_quarantine_is_off() {
+        let mut config = make_config("maintainer@example.com");
+        config.quarantine_store = false;
+        let ch = build_channel_from(config, vec![]);
+        let mut good = make_email("maintainer@example.com", "imap:imap.example.com:4:2");
+        good.uid = 2;
+        let envelopes = ch.disposition(vec![
+            SelectedMessage::Malformed {
+                uid: 1,
+                imap_external_id: "imap:imap.example.com:4:1".to_string(),
+                reason: MalformedReason::TooLarge,
+                raw_bytes: None,
+            },
+            SelectedMessage::Email(Box::new(good)),
+        ]);
+
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].from, EMAIL_QUARANTINE_SENDER);
+        assert_eq!(
+            envelopes[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("too-large")
+        );
+        assert!(envelopes[0]
+            .quarantine_replay
+            .as_ref()
+            .unwrap()
+            .bytes
+            .is_empty());
+        assert_eq!(
+            envelopes[1].external_id.as_deref(),
+            Some("imap:imap.example.com:user@example.com:4:2")
         );
     }
 

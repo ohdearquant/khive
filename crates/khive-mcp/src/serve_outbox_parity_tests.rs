@@ -13,6 +13,7 @@ mod outbox_parity_tests {
     pub(super) enum Outcome {
         Success,
         Transient,
+        RateLimited,
         Permanent,
         Auth,
     }
@@ -62,6 +63,10 @@ mod outbox_parity_tests {
             match *self.outcome.lock().unwrap() {
                 Outcome::Success => Ok(()),
                 Outcome::Transient => Err(ChannelError::Transport("temporary pressure".into())),
+                Outcome::RateLimited => Err(ChannelError::RateLimited {
+                    message: "Telegram asks us to wait".into(),
+                    retry_after: std::time::Duration::from_secs(2),
+                }),
                 Outcome::Permanent => Err(ChannelError::PermanentTransport(
                     "recipient rejected".into(),
                 )),
@@ -147,6 +152,7 @@ mod outbox_parity_tests {
         channel: &RecordingChannel,
         domains: &khive_runtime::EmailMessageIdDomains,
     ) {
+        let mut pause_until = None;
         outbox::outbox_once(
             outbox::OutboxChannels::Single(channel),
             outbox::OutboxPolicy::Email {
@@ -157,6 +163,7 @@ mod outbox_parity_tests {
             runtime,
             &Namespace::local(),
             &tokio_util::sync::CancellationToken::new(),
+            &mut pause_until,
         )
         .await
         .unwrap();
@@ -252,6 +259,55 @@ mod outbox_parity_tests {
             );
             assert_eq!(props(&runtime, &token, id).await["delivery"], "delivered");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telegram_rate_limit_holds_following_messages_until_retry_after() {
+        let (runtime, token) = fixture();
+        seed(&runtime, &token, "telegram", None).await;
+        seed(&runtime, &token, "telegram", None).await;
+        let channel = RecordingChannel::new("telegram", "sender@example.com", Outcome::RateLimited);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut pause_until = None;
+
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+            &runtime,
+            &Namespace::local(),
+            &cancellation,
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        *channel.outcome.lock().unwrap() = Outcome::Success;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+            &runtime,
+            &Namespace::local(),
+            &cancellation,
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        outbox::outbox_once(
+            outbox::OutboxChannels::Single(&channel),
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+            &runtime,
+            &Namespace::local(),
+            &cancellation,
+            &mut pause_until,
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.sent.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -448,6 +504,7 @@ mod outbox_parity_tests {
                 .await
                 .unwrap();
             let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
+            let mut pause_until = None;
             outbox::outbox_once(
                 outbox::OutboxChannels::Single(&channel),
                 outbox::OutboxPolicy::Email {
@@ -458,6 +515,7 @@ mod outbox_parity_tests {
                 &runtime,
                 &Namespace::local(),
                 &tokio_util::sync::CancellationToken::new(),
+                &mut pause_until,
             )
             .await
             .unwrap();
@@ -504,6 +562,7 @@ mod outbox_parity_tests {
         // after the owner hold succeeds.
         runtime.install_kind_registry(vec![], vec!["message".into()]);
         let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
+        let mut pause_until = None;
         let first = outbox::outbox_once(
             outbox::OutboxChannels::Single(&channel),
             outbox::OutboxPolicy::Email {
@@ -514,6 +573,7 @@ mod outbox_parity_tests {
             &runtime,
             &Namespace::local(),
             &tokio_util::sync::CancellationToken::new(),
+            &mut pause_until,
         )
         .await;
         assert!(matches!(

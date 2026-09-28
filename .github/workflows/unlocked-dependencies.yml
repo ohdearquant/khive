@@ -52,7 +52,7 @@ jobs:
         if: steps.update.outcome == 'success'
         continue-on-error: true
         working-directory: ${{ runner.temp }}/khive-unlocked/crates
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --no-fail-fast
 
       - name: Write workflow summary
         if: always()

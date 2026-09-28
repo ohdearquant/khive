@@ -39,6 +39,15 @@ use super::common::{
 /// number of superseding edges.
 const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
 
+fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (true, true) => std::cmp::Ordering::Equal,
+        (false, false) => right.total_cmp(&left),
+    }
+}
+
 fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, RuntimeError> {
     if scoring_cfg.default_token_budget == 0 {
         return Err(RuntimeError::InvalidInput(
@@ -110,6 +119,15 @@ async fn load_brain_profile(
             Some(RequestIdentity::from_token(token)),
         )
         .await
+}
+
+fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(), RuntimeError> {
+    if response.get("lifecycle").and_then(Value::as_str) == Some("archived") {
+        return Err(RuntimeError::InvalidInput(format!(
+            "profile_id {profile_id:?} is archived and cannot serve memory.recall"
+        )));
+    }
+    Ok(())
 }
 
 impl MemoryPack {
@@ -268,6 +286,7 @@ impl MemoryPack {
                             "profile_id {pid:?} is not a known profile: {e}"
                         ))
                     })?;
+                reject_archived_brain_profile(&resp, pid)?;
                 profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
                 (Some(pid.clone()), ServeAttribution::Profile)
             } else {
@@ -277,6 +296,7 @@ impl MemoryPack {
                 if let Some(profile_id) = resolved {
                     match load_brain_profile(registry, token, &profile_id).await {
                         Ok(resp) => {
+                            reject_archived_brain_profile(&resp, &profile_id)?;
                             profile_state =
                                 super::common::balanced_recall_state_from_profile_response(&resp);
                             (Some(profile_id), ServeAttribution::Profile)
@@ -742,6 +762,11 @@ impl MemoryPack {
                 rank_score
             };
             let final_score = pre_entity_term_score * entity_term;
+            let final_score = if final_score.is_finite() {
+                final_score
+            } else {
+                0.0
+            };
 
             let raw_score_opt = raw_vec_scores.get(&id).copied();
             let absolute_relevance = raw_score_opt.unwrap_or(final_score).clamp(0.0, 1.0);
@@ -775,6 +800,11 @@ impl MemoryPack {
         }
 
         if scoring_cfg.mmr_penalty > 0.0 && scoring_cfg.mmr_prefix_len > 0 {
+            // Choose the duplicate keeper from the full composite score, not
+            // the fused retrieval order that populated `ranked`.
+            ranked.sort_by(|a, b| {
+                compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
+            });
             let prefix_len = scoring_cfg.mmr_prefix_len;
             let prefixes: Vec<String> = ranked
                 .iter()
@@ -873,10 +903,7 @@ impl MemoryPack {
         }
 
         ranked.sort_by(|a, b| {
-            b.rank_score
-                .partial_cmp(&a.rank_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.id.cmp(&b.id))
+            compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
         });
         ranked.truncate(limit);
 
@@ -1345,6 +1372,23 @@ mod tests {
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[test]
+    fn rank_sort_keeps_nan_last_and_breaks_equal_scores_by_id() {
+        let mut scores = [
+            (f32::NAN, "nan-b"),
+            (0.5, "mid-b"),
+            (0.75, "high"),
+            (f32::NAN, "nan-a"),
+            (0.5, "mid-a"),
+            (-0.25, "low"),
+        ];
+        scores.sort_by(|a, b| super::compare_rank_scores_desc(a.0, b.0).then(a.1.cmp(b.1)));
+        assert_eq!(
+            scores.map(|(_, id)| id),
+            ["high", "mid-a", "mid-b", "low", "nan-a", "nan-b"]
+        );
+    }
 
     /// Keeps a file-backed test runtime alive before removing its database directory.
     /// Fields are declared in drop order: the runtime closes before the guard cleans up.
@@ -3384,6 +3428,48 @@ mod tests {
             found,
             "serve ledger row for the recalled target must appear within 2s"
         );
+
+        registry
+            .dispatch(
+                "brain.deactivate",
+                json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            )
+            .await
+            .expect("deactivate the bound profile");
+        registry
+            .dispatch(
+                "brain.archive",
+                json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            )
+            .await
+            .expect("archive the bound profile");
+        let resolution = registry
+            .dispatch(
+                "brain.resolve",
+                json!({"namespace": ns.as_str(), "consumer_kind": "recall"}),
+            )
+            .await
+            .expect("resolve after archiving");
+        assert_eq!(resolution["matched_binding"], false);
+
+        let after_archive = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "namespace": ns.as_str(),
+                    "query": "actor binding recall stamp note",
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect("recall falls through after archived binding");
+        let hits = after_archive.as_array().expect("bare array result");
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].get("served_by_profile_id").is_none()
+                || hits[0]["served_by_profile_id"].is_null()
+        );
+        assert_eq!(hits[0]["serve_attribution"], json!("unspecified"));
     }
 
     // The actor-resolved profile must both project weights and stamp the response.
@@ -4310,6 +4396,37 @@ mod tests {
         assert!(
             bad_result.is_err(),
             "unknown profile_id must be a per-op error, not a silent fallback to defaults"
+        );
+
+        registry
+            .dispatch(
+                "brain.deactivate",
+                json!({"namespace": ns.as_str(), "profile_id": "adr104-override-v1"}),
+            )
+            .await
+            .expect("deactivate explicit profile before archiving");
+        registry
+            .dispatch(
+                "brain.archive",
+                json!({"namespace": ns.as_str(), "profile_id": "adr104-override-v1"}),
+            )
+            .await
+            .expect("archive explicit profile");
+        let archived = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104 profile_id override note",
+                    "profile_id": "adr104-override-v1",
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect_err("archived profile must not serve recall");
+        assert!(
+            matches!(archived, RuntimeError::InvalidInput(ref message) if message.contains("archived")),
+            "archived explicit profile must be refused: {archived:?}"
         );
     }
 

@@ -96,17 +96,22 @@ impl CommPack {
     }
 }
 
-/// Message properties established only by the trusted channel-ingest path.
+/// Message properties established only by trusted transport bookkeeping.
 ///
-/// `comm.health` interprets these fields as transport evidence, so allowing a
-/// generic message create/update to supply them would turn ordinary caller
-/// metadata into a forged quarantine or channel attribution. `comm.ingest`
-/// writes through `try_create_note`, deliberately outside the generic write
-/// validator/hook seams, and therefore remains the sole legitimate writer.
+/// `comm.health` interprets quarantine/channel fields as transport evidence;
+/// outbound delivery and inbound thread resolution trust `external_id` as a
+/// transport identity; the outbox keeps a message with an unverifiable stored
+/// Message-ID out of delivery through the `delivery_hold*` fields and links
+/// its diagnostic note through `external_id_diagnostic_note_id`. Generic
+/// message creates/updates must not forge any of these fields. `comm.ingest`
+/// writes through the trusted ingest path, while the internal outbox claim
+/// establishes outbound `external_id` later and the outbox's owner-side hold
+/// establishes the delivery-hold and diagnostic fields.
 const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] = &[
     "quarantined",
     "channel_kind",
     "channel_slug",
+    "external_id",
     "delivery_hold",
     "delivery_hold_reason",
     "delivery_hold_at",
@@ -123,6 +128,14 @@ fn transport_owned_message_property_named_in(
 }
 
 fn refuse_transport_owned_message_property(key: &str) -> RuntimeError {
+    if key == "external_id" {
+        return RuntimeError::InvalidInput(
+            "`external_id` is transport-owned on a `message` note and cannot be supplied by a \
+             generic record mutation; only the internal outbox claim or `comm.ingest` may \
+             establish it"
+                .into(),
+        );
+    }
     RuntimeError::InvalidInput(format!(
         "`{key}` is transport-owned on a `message` note and cannot be supplied by a generic \
          record mutation; only `comm.ingest` may establish quarantine disposition and channel \

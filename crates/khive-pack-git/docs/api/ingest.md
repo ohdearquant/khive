@@ -53,8 +53,12 @@ tracker records therefore cannot turn a small bound into an unbounded database s
 An exact durable boundary acknowledgment skips the lookup and consumes no unit;
 these replays do not increment `*_skipped_existing` (that count measures actual
 existence checks). Related lookups and enrichment within one record are not separate
-units. The bound does not limit git snapshot construction, the size of a fetched
-remote page, or subprocess wall time. Exact-budget passes retain the conservative
+units. The bound caps the commit changed-path pass, but not the frozen commit
+metadata reconstruction. `gh` page fetches
+have a separate 60-second subprocess deadline and 32 MiB stdout ceiling; the
+repository probe has the same deadline and a 16 KiB stdout ceiling. Local
+git history work remains outside this remote-command bound. Exact-budget
+passes retain the conservative
 `done=false` result; a subsequent pass proves completion.
 
 ## Secret-gate refusal accounting
@@ -265,24 +269,32 @@ plus either `not in the object database` or `missing object`) so ordinary
 auth/network/`bad object`/spawn/local-source failures are never treated as
 corrupt-cache and never trigger a destructive repair.
 
-`walk_commits` shells out to `git log` with a stable, machine-parseable
-format (v0 choice per ADR-088 §5 — `git2`/`gix` are not workspace
-dependencies today, so shelling out avoids a new heavy dependency). Raw
-control-byte separators are embedded directly in the format string (not
-git's `%xHH` escape syntax) — passed as a single argv element (never
-through a shell), so the literal bytes survive intact and git's
-pretty-format engine emits any non-`%` character verbatim.
+`walk_commits` shells out to `git log` for Git-generated IDs and dates, then
+reads contributor-controlled author and message text through the byte-length
+framing of `git cat-file --batch` (v0 shell-out choice per ADR-088 §5 —
+`git2`/`gix` are not workspace dependencies). Control bytes in author names or
+messages cannot split a commit record; malformed metadata or batch framing is
+an error rather than a silent skipped commit.
+An explicit commit `encoding` header controls message decoding. Supported
+encodings are decoded without replacement; an unsupported label or invalid
+declared byte sequence fails the walk. Without a header, the existing lossy
+UTF-8 behavior remains. The subject is the first nonempty paragraph with
+its lines folded to spaces; the body begins after the separating blank line.
 
 `touched_files` is a separate `--name-only` pass, kept apart from
 `walk_commits`'s custom `--pretty=format` — interleaving file-name lines
 with the metadata format has no clean, unambiguous delimiter.
 
 `CommitSnapshot` bundles both passes so a classified failure in either one
-can be retried as a single unit. `load_commit_snapshot` mirrors
-`ingest_commits`'s original inline sequencing: `touched_files` (a second,
-`git log --name-only` pass over the frozen tip's whole history) is skipped
-entirely when `walk_commits` found no new commits, since there is nothing
-new to annotate with touched paths.
+can be retried as a single unit. `load_commit_snapshot` reconstructs the full
+frozen metadata walk and validates the checkpoint position before removing its
+acknowledged prefix. It then selects at most the remaining visit budget for
+the changed-path pass. `touched_files` calls `git log --no-walk=unsorted` with
+only those explicit commit SHAs, newest-first, in bounded argv chunks; an
+empty page launches no path command. The full unacknowledged remainder stays
+available for the existing visit-budget and completion decisions. Snapshot
+acquisition and its classified repair loop run in `spawn_blocking`, including
+the synchronous Git and cache operations.
 
 `CacheRepairStrategy` records which repair `RemoteCommitRecovery`
 (`handlers.rs`) performed, so `recover_commit_snapshot` can report exactly
@@ -476,8 +488,8 @@ not a complete signal.
 
 ## Changed paths and code-module annotations
 
-The commit snapshot's `git log -z --name-only --no-renames
---diff-merges=first-parent` pass is the authority for
+The commit snapshot's page-scoped `git log --no-walk=unsorted -z --name-only
+--no-renames --diff-merges=first-parent` pass is the authority for
 `commit.properties.changed_paths`. NUL-delimited paths bypass Git's quoted
 display encoding and are decoded with the same lossy UTF-8 normalization as
 ADR-085's filesystem path producer. At this parse stage tabs, newlines,
@@ -523,7 +535,9 @@ per-record, not per-stream: the missing sha has no path-set entry, so the
 run warns and stalls the cursor, but the polluted newer commit is created as
 usual — the orphaned tokens ride into its `changed_paths`, and commit notes
 are immutable, so the pollution persists (a re-ingest skips the stored sha;
-repair requires deleting the note and re-ingesting).
+repair requires deleting the note and re-ingesting). At a bounded command
+chunk boundary, a missing first header instead leaves an orphan token and
+fails that path pass without writing any commit from it.
 `ingest_stalls_cursor_for_commit_missing_touched_paths` pins both halves:
 its shim's `tr` round-trip splits git's combined `<header>\n<first-path>`
 token into two lines, so `grep -av` removes only the header line and the
@@ -548,7 +562,7 @@ ids, or the case where at most one has a parseable id — a row whose `id` does
 not parse as a UUID is still a live row for the key, so it marks the pair
 ambiguous, but can never itself be the annotated candidate) and the
 single-row sub-case whose one row's id does not parse (not ambiguous — just
-no bindable candidate). Each skip is counted only when an ingested commit's
+no bindable candidate). Each skip is counted only when a walked commit's
 path actually hits the key, so unusable keys untouched by the pass never
 inflate the count, and the run's bounded warning names the first skipped
 paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
@@ -559,3 +573,13 @@ the durable fact. This makes module churn and repeated
 cross-project co-change derivable from incoming `annotates` graph reads while
 retaining `changed_paths` as a durable path fact when no matching code map
 exists.
+
+Commit notes are keyed by SHA within a namespace, while commit checkpoints
+belong to individual projects. When a later project walks an already stored
+SHA, the ingester reuses that note and resolves its annotations from the
+later project's frozen snapshot and path map. It creates only absent links to
+that project and any matching module, document, or pull request before
+advancing the project's checkpoint. Existing live links retain their identity,
+weight, and metadata on a replay. An explicitly deleted link remains deleted
+without freezing the cursor; a failure to create a missing link freezes the
+cursor before that SHA so the next pass retries it.

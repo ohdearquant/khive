@@ -48,8 +48,8 @@ fn anisotropy_ratio(vecs: &[Vec<f32>]) -> f32 {
 ///
 /// Reports ns/call for:
 ///   f32_dot       — baseline LLVM-vectorized f32 dot product
-///   sq8_dot       — Sq8Codec::approx_dot (NEON u8 pass + per-dim residual)
-///   sq8_l2sq      — Sq8Codec::approx_l2_sq (NEON u8 pass + per-dim residual)
+///   sq8_dot       — Sq8Codec::approx_dot (per-dim f64 affine dot)
+///   sq8_l2sq      — Sq8Codec::approx_l2_sq (per-dim f64 weighted sum)
 ///   gs_l2_sq      — GsSq8Codec::l2_sq (pure NEON u8 integer path, ~13ns)
 #[test]
 #[ignore]
@@ -88,7 +88,7 @@ fn probe_sq8_distance_micro() {
     }
     let f32_ns = t0.elapsed().as_nanos() as f64 / n_pairs as f64;
 
-    // --- Sq8Codec approx_dot (NEON integer + f32 residual) ---
+    // --- Sq8Codec approx_dot (per-dim f64 affine dot) ---
     let mut sq8_dot_sink = 0.0f32;
     let t0 = Instant::now();
     for idx in 0..n_pairs as usize {
@@ -96,7 +96,7 @@ fn probe_sq8_distance_micro() {
     }
     let sq8_dot_ns = t0.elapsed().as_nanos() as f64 / n_pairs as f64;
 
-    // --- Sq8Codec approx_l2_sq (NEON + f32 residual) ---
+    // --- Sq8Codec approx_l2_sq (per-dim f64 weighted sum) ---
     let mut sq8_l2_sink = 0.0f32;
     let t0 = Instant::now();
     for idx in 0..n_pairs as usize {
@@ -118,8 +118,8 @@ fn probe_sq8_distance_micro() {
 
     println!("PROBE probe_sq8_distance_micro ({dims}d, {n_pairs}M evals, pool={pool_size}):");
     println!("  f32_dot:       {f32_ns:.1}ns/call  (sink={f32_sink:.1})");
-    println!("  sq8_dot:       {sq8_dot_ns:.1}ns/call  speedup={dot_speedup:.2}x  [NEON+residual]");
-    println!("  sq8_l2sq:      {sq8_l2_ns:.1}ns/call  speedup={l2_speedup:.2}x  [NEON+residual]");
+    println!("  sq8_dot:       {sq8_dot_ns:.1}ns/call  speedup={dot_speedup:.2}x  [f64 affine]");
+    println!("  sq8_l2sq:      {sq8_l2_ns:.1}ns/call  speedup={l2_speedup:.2}x  [f64 weighted]");
     println!(
         "  gs_l2_sq:      {gs_l2_ns:.1}ns/call  speedup={gs_speedup:.2}x  [NEON only, no residual]"
     );

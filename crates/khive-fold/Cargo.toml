@@ -15,18 +15,19 @@ description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
 bench = false
 
 [features]
-# serde: enables Serialize/Deserialize derives on all fold types.
+# serde: enables Serialize/Deserialize derives on fold types. Checkpoint
+# hashing still requires the Serialize trait when derives are disabled.
 # Enabled by default so existing callers compile without explicit opt-in.
 default = ["serde"]
-serde = ["dep:serde"]
+serde = []
 
 [dependencies]
-khive-score = { version = "0.8.0", path = "../khive-score" }
+khive-score = { version = "0.9.0", path = "../khive-score" }
 # ADR-024 boundary: khive-types + khive-score only.
 # blake3 feature enables Hash32::from_blake3 for checkpoint hashing.
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["blake3", "serde"] }
-# serde: optional, gated by the `serde` feature above.
-serde = { workspace = true, optional = true }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["blake3", "serde"] }
+# Checkpoint's state hash requires Serialize even without the derive feature.
+serde = { workspace = true }
 # serde_json: kept direct — serde_json::Value is used in FoldContext.extra,
 # ObjectiveContext.extra, and selector types as a concrete field type.
 # Removing it would require changing the public API.
