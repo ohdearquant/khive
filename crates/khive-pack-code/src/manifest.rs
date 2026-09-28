@@ -4,7 +4,7 @@
 //! walks skip common non-source, non-manifest-bearing trees (`.git`, `target`,
 //! `node_modules`, `__pycache__`, `.venv`) to keep discovery bounded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -311,43 +311,116 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
     })
 }
 
-/// Find the nearest governing manifest at or above `file_dir`, never walking
-/// above `ingest_root` (B4: "the nearest governing manifest at or above that
-/// file"; this ingest run only has visibility into `ingest_root`'s subtree).
-/// Returns `(project_root, project_name)`.
-pub(crate) fn find_governing_manifest(
-    file_dir: &Path,
-    ingest_root: &Path,
-    language: &str,
-    failures: &mut Vec<ManifestReadFailure>,
-) -> Option<(PathBuf, String)> {
-    let mut dir = Some(file_dir);
-    while let Some(d) = dir {
-        let found = match language {
-            "rust" => read_manifest_if_present(ingest_root, &d.join("Cargo.toml"), failures)
-                .and_then(|text| parse_cargo_toml(d, &text)),
-            "python" => read_manifest_if_present(ingest_root, &d.join("pyproject.toml"), failures)
-                .and_then(|text| parse_pyproject_toml(d, &text)),
-            "typescript" => {
-                read_manifest_if_present(ingest_root, &d.join("package.json"), failures)
-                    .and_then(|text| parse_package_json(d, &text))
-            }
-            _ => None,
-        };
-        if let Some(project) = found {
-            return Some((project.root, project.name));
-        }
-        if d == ingest_root {
-            break;
-        }
-        dir = d.parent();
+/// Resolve ownership against manifests parsed during this sweep. A
+/// workspace-only manifest has no index entry, so lookup continues upward.
+pub(crate) struct ManifestIndex {
+    names: HashMap<(PathBuf, &'static str), String>,
+}
+
+impl ManifestIndex {
+    pub(crate) fn new(projects: &[ManifestProject]) -> Self {
+        let names = projects
+            .iter()
+            .map(|project| {
+                (
+                    (project.root.clone(), project.language),
+                    project.name.clone(),
+                )
+            })
+            .collect();
+        Self { names }
     }
-    None
+
+    pub(crate) fn governing(
+        &self,
+        file_dir: &Path,
+        ingest_root: &Path,
+        language: &'static str,
+    ) -> Option<(PathBuf, String)> {
+        let mut dir = Some(file_dir);
+        while let Some(current) = dir {
+            if !current.starts_with(ingest_root) {
+                break;
+            }
+            if let Some(name) = self.names.get(&(current.to_path_buf(), language)) {
+                return Some((current.to_path_buf(), name.clone()));
+            }
+            if current == ingest_root {
+                break;
+            }
+            dir = current.parent();
+        }
+        None
+    }
+}
+
+/// L2 scans only manifests relevant to the canonical source files it walked.
+/// This preserves the L2-only boundary without a full manifest discovery pass
+/// and caches each ancestor directory for the duration of the sweep.
+pub(crate) fn discover_rust_manifests_for_sources(
+    files: &[PathBuf],
+    ingest_root: &Path,
+) -> (Vec<ManifestProject>, Vec<ManifestReadFailure>) {
+    let mut visited = BTreeSet::new();
+    let mut projects = Vec::new();
+    let mut failures = Vec::new();
+    for file in files {
+        let mut dir = file.parent();
+        while let Some(current) = dir {
+            if !current.starts_with(ingest_root) {
+                break;
+            }
+            if visited.insert(current.to_path_buf()) {
+                if let Some(text) = read_manifest_if_present(
+                    ingest_root,
+                    &current.join("Cargo.toml"),
+                    &mut failures,
+                ) {
+                    if let Some(project) = parse_cargo_toml(current, &text) {
+                        projects.push(project);
+                    }
+                }
+            }
+            if current == ingest_root {
+                break;
+            }
+            dir = current.parent();
+        }
+    }
+    (projects, failures)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn governing_manifest_index_uses_nearest_sweep_snapshot() {
+        use tempfile::TempDir;
+
+        let fixture = TempDir::new().expect("fixture");
+        let root = fixture.path().canonicalize().expect("canonical root");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"outer\"\n")
+            .expect("outer manifest");
+        fs::write(nested.join("Cargo.toml"), "[package]\nname = \"inner\"\n")
+            .expect("inner manifest");
+        let (projects, failures) =
+            discover_manifests(&root, &BTreeSet::from(["rust"])).expect("discovery");
+        assert!(failures.is_empty());
+        let index = ManifestIndex::new(&projects);
+        fs::remove_file(root.join("Cargo.toml")).expect("remove outer");
+        fs::remove_file(nested.join("Cargo.toml")).expect("remove inner");
+        assert_eq!(
+            index.governing(&nested, &root, "rust"),
+            Some((nested, "inner".to_string()))
+        );
+        assert_eq!(
+            index.governing(&root, &root, "rust"),
+            Some((root.clone(), "outer".to_string()))
+        );
+    }
 
     #[cfg(unix)]
     #[test]

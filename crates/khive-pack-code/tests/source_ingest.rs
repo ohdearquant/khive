@@ -54,6 +54,64 @@ fn write_two_package_fixture(root: &Path) {
     std::fs::write(pkg_b.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
 }
 
+#[tokio::test]
+async fn oversized_manifest_and_source_are_counted_without_losing_small_sibling() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(
+        root.path().join("pyproject.toml"),
+        "[project]\nname = \"small\"\n",
+    )
+    .expect("small manifest");
+    std::fs::write(root.path().join("app.py"), "import json\n").expect("small source");
+    std::fs::File::create(root.path().join("huge.py"))
+        .expect("huge source")
+        .set_len(2 * 1024 * 1024 + 1)
+        .expect("sparse oversized source");
+    let oversized_package = root.path().join("oversized_package");
+    std::fs::create_dir(&oversized_package).expect("package directory");
+    std::fs::File::create(oversized_package.join("pyproject.toml"))
+        .expect("huge manifest")
+        .set_len(2 * 1024 * 1024 + 1)
+        .expect("sparse oversized manifest");
+
+    let rt = rt_at(&root.path().join("map.db"));
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: ["python"].into_iter().collect(),
+            sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("ingest");
+
+    assert_eq!(report.manifest_files_refused, 1);
+    assert_eq!(report.source_files_refused, 1);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("huge.py")));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("pyproject.toml")));
+    assert!(
+        report.modules_created >= 1,
+        "small sibling must be ingested"
+    );
+    let names = entity_names(&rt).await;
+    assert!(names.iter().any(|name| name == "small"));
+    assert!(!names.iter().any(|name| name.contains("huge")));
+}
+
 /// Normalized `(relation, source name, target name, dependency kinds,
 /// dependency scopes)`
 /// triples for every non-deleted edge in the target db — comparable across
