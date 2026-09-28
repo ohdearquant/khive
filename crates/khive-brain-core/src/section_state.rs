@@ -148,27 +148,45 @@ impl SectionPosteriorState {
     }
 
     /// Apply a brain signal to update section posteriors in place.
-    /// Only `Feedback` events with `section_signals` affect section state.
+    /// Feedback events with `section_signals` affect section state regardless
+    /// of whether their scalar signal uses the legacy or semantic vocabulary.
     pub fn apply_signal(&mut self, signal: &BrainSignal) {
-        if let BrainSignal::Feedback {
-            section_signals: Some(ref signals),
-            ..
-        } = signal
-        {
-            self.apply_section_signals(signals);
+        match signal {
+            BrainSignal::Feedback {
+                section_signals: Some(signals),
+                ..
+            } => self.apply_section_signals(signals),
+            BrainSignal::SemanticFeedback {
+                section_signals: Some(signals),
+                effective_weight,
+                ..
+            } if *effective_weight > 0.0 => {
+                self.apply_section_signals_weighted(signals, *effective_weight);
+            }
+            _ => {}
         }
     }
 
     /// Apply section evidence without inventing an entity-level feedback signal.
     pub fn apply_section_signals(&mut self, signals: &HashMap<SectionType, FeedbackSignal>) {
+        self.apply_section_signals_weighted(signals, 1.0);
+    }
+
+    /// Semantic feedback uses its effective weight for section posteriors;
+    /// a clamped zero-weight implicit event cannot move them.
+    fn apply_section_signals_weighted(
+        &mut self,
+        signals: &HashMap<SectionType, FeedbackSignal>,
+        weight: f64,
+    ) {
         self.total_events += 1;
 
         for (section_type, feedback_signal) in signals {
             if let Some(posterior) = self.posteriors.get_mut(section_type) {
                 match feedback_signal {
-                    FeedbackSignal::Useful => posterior.update_success(),
-                    FeedbackSignal::NotUseful => posterior.update_failure(),
-                    FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
+                    FeedbackSignal::Useful => posterior.update_success_weighted(weight),
+                    FeedbackSignal::NotUseful => posterior.update_failure_weighted(weight),
+                    FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0 * weight),
                 }
                 if let Some(prior) = self.priors.get(section_type) {
                     if let Err(e) = posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP) {
