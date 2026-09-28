@@ -12,7 +12,7 @@ use crate::sql::sql;
 
 use khive_runtime::RuntimeError;
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::SqlAccess;
+use khive_storage::{SqlAccess, SqlWriter};
 
 pub use khive_brain_core::compute_query_class;
 use khive_brain_core::ServeAttribution;
@@ -267,20 +267,16 @@ pub async fn get_serve_row(
     }))
 }
 
-/// Backfill a serve row's grade after a scorer emits feedback for it
-/// (ADR-081 §6: "the fold... backfills the ledger row's grade").
-///
-/// Also stamps `scorer_run_id`, which is what `dedup` reads on a later call —
-/// idempotent per-row by `(scorer_run_id, id)` (ADR-081 §4).
-pub async fn backfill_grade(
-    sql: &dyn SqlAccess,
+/// Backfill the grade inside the scorer claim + fold + event transaction.
+/// A failed write rolls back the dedup claim, leaving the run retryable.
+pub(crate) async fn backfill_grade_on_writer(
+    writer: &mut dyn SqlWriter,
     id: &str,
     grade: &str,
     graded_at_us: i64,
     scorer_run_id: &str,
 ) -> Result<(), RuntimeError> {
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
-    writer
+    let affected = writer
         .execute(SqlStatement {
             sql: sql!("brain_serve_ledger_backfill_grade").into(),
             params: vec![
@@ -293,6 +289,11 @@ pub async fn backfill_grade(
         })
         .await
         .map_err(|e| sql_err("backfill grade", e))?;
+    if affected != 1 {
+        return Err(RuntimeError::Internal(format!(
+            "serve ledger backfill grade: expected one row for {id:?}, updated {affected}"
+        )));
+    }
     Ok(())
 }
 
