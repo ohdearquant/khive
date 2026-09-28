@@ -13,6 +13,8 @@ non-empty run is supplied, the function derives `audit.date:audit.commit`; missi
 The required audit identity strings (`date`, `scope`, `repo`, `branch`, `commit`, and
 `standards_file`) and every `findings[].id` must contain at least one non-whitespace character.
 Their original bytes are retained after validation; ingest does not trim or otherwise rewrite them.
+Additional audit keys are retained in the project's `audit_extra` properties, which producers can
+use for run-level status without changing finding identity.
 
 `observed_at` becomes record creation/update time but is excluded from identity, so retrying the
 same audit later reproduces the same IDs.
