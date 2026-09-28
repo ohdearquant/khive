@@ -25,7 +25,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Sparse, op, e)
+    e.into_storage_error(StorageCapability::Sparse, op)
 }
 
 /// Validate that a sparse vector is well-formed.
