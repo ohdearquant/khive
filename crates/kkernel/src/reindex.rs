@@ -421,13 +421,14 @@ async fn embed_and_store_batch(
                 let records = subset
                     .iter()
                     .zip(outcomes)
-                    .map(|((id, _), outcome)| VectorRecord {
+                    .map(|((id, _text), outcome)| VectorRecord {
                         subject_id: *id,
                         kind,
                         namespace: namespace.to_string(),
                         field: field.to_string(),
                         embedding_model: Some(model_name.clone()),
                         vectors: vec![outcome.vector],
+                        text_fingerprint: outcome.prepared_text_fingerprint,
                         updated_at: now,
                     })
                     .collect();
@@ -2749,6 +2750,7 @@ read_only = true
                 field: "note.content".to_string(),
                 embedding_model: Some(MODEL.to_string()),
                 vectors: vec![stale_vec.clone()],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             }])
             .await
@@ -2810,6 +2812,376 @@ read_only = true
             hits[0].score.to_f64() > 0.999,
             "surviving row must be the original stale vector, not a partial write"
         );
+    }
+
+    #[tokio::test]
+    async fn reindex_builtin_preparation_persists_exact_bounded_prefixed_note_content() {
+        use async_trait::async_trait;
+        use khive_runtime::{EmbedderProvider, RuntimeConfig, RuntimeError};
+        use khive_storage::ContentRef;
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
+        use std::sync::{Arc, Mutex};
+
+        struct CapturingService(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait]
+        impl EmbeddingService for CapturingService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                self.0.lock().unwrap().extend_from_slice(texts);
+                Ok(texts
+                    .iter()
+                    .map(|_| vec![0.5; model.dimensions()])
+                    .collect())
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "capturing-audited-reindex"
+            }
+        }
+
+        struct CapturingProvider(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait]
+        impl EmbedderProvider for CapturingProvider {
+            fn name(&self) -> &str {
+                "multilingual-e5-small"
+            }
+
+            fn dimensions(&self) -> usize {
+                EmbeddingModel::MultilingualE5Small.dimensions()
+            }
+
+            async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+                Ok(Arc::new(CapturingService(Arc::clone(&self.0))))
+            }
+        }
+
+        let model = EmbeddingModel::MultilingualE5Small;
+        let model_name = model.to_string();
+        assert_eq!(model_name, "multilingual-e5-small");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime with built-in model registration");
+        runtime.register_test_audited_embedder(model, CapturingProvider(Arc::clone(&captured)));
+        let token = runtime
+            .authorize(Namespace::parse("local").unwrap())
+            .unwrap();
+
+        // Note creation embeds the supplied short override while preserving the
+        // full content. Reindex later renders the stored content instead.
+        let full_content = "a".repeat(MAX_TEXT_BYTES + 17);
+        let creation_input = &full_content[..23];
+        let note = runtime
+            .create_note_with_embedding_content(
+                &token,
+                "observation",
+                None,
+                &full_content,
+                Some(creation_input),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create with a distinct embedding override");
+        assert_eq!(note.content, full_content);
+        let creation_prepared = format!("passage: {creation_input}");
+        assert_eq!(captured.lock().unwrap().as_slice(), &[creation_prepared]);
+
+        let vectors = runtime.vectors_for_model(&token, &model_name).unwrap();
+        let created = vectors.provenance(note.id).await.unwrap().unwrap();
+        assert_eq!(
+            created.text_fingerprint, None,
+            "raw create route is unknown"
+        );
+
+        let staged = vec![(note.id, note_embedding_text(&note))];
+        let expected_prepared = format!(
+            "passage: {}",
+            "a".repeat(MAX_TEXT_BYTES - "passage: ".len())
+        );
+        let expected_fingerprint = ContentRef::from_hex(
+            blake3::hash(expected_prepared.as_bytes())
+                .to_hex()
+                .to_string(),
+        )
+        .unwrap();
+        let mut truncation = BTreeMap::new();
+        assert_eq!(
+            embed_and_store_batch(
+                &runtime,
+                &token,
+                std::slice::from_ref(&model_name),
+                "local",
+                &staged,
+                SubstrateKind::Note,
+                "note.content",
+                true,
+                &mut truncation,
+            )
+            .await,
+            0
+        );
+        assert_eq!(captured.lock().unwrap().last(), Some(&expected_prepared));
+        let first = vectors.provenance(note.id).await.unwrap().unwrap();
+        assert_eq!(first.text_fingerprint, Some(expected_fingerprint.clone()));
+        assert!(first.updated_at.is_some());
+
+        // Re-embedding the same source has the same fingerprint; changing a
+        // byte inside the bounded input changes it even with identical vectors.
+        assert_eq!(
+            embed_and_store_batch(
+                &runtime,
+                &token,
+                std::slice::from_ref(&model_name),
+                "local",
+                &staged,
+                SubstrateKind::Note,
+                "note.content",
+                true,
+                &mut truncation,
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            vectors
+                .provenance(note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text_fingerprint,
+            Some(expected_fingerprint.clone())
+        );
+        let mut changed = full_content.clone();
+        changed.replace_range(..1, "z");
+        let changed_staged = vec![(note.id, changed)];
+        assert_eq!(
+            embed_and_store_batch(
+                &runtime,
+                &token,
+                &[model_name],
+                "local",
+                &changed_staged,
+                SubstrateKind::Note,
+                "note.content",
+                true,
+                &mut truncation,
+            )
+            .await,
+            0
+        );
+        let changed_prepared = format!(
+            "passage: z{}",
+            "a".repeat(MAX_TEXT_BYTES - "passage: ".len() - 1)
+        );
+        assert_eq!(captured.lock().unwrap().last(), Some(&changed_prepared));
+        let changed_fingerprint = ContentRef::from_hex(
+            blake3::hash(changed_prepared.as_bytes())
+                .to_hex()
+                .to_string(),
+        )
+        .unwrap();
+        assert_ne!(changed_fingerprint, expected_fingerprint);
+        assert_eq!(
+            vectors
+                .provenance(note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text_fingerprint,
+            Some(changed_fingerprint)
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_then_runtime_note_update_clears_same_blob_provenance() {
+        use async_trait::async_trait;
+        use khive_runtime::{EmbedderProvider, NotePatch, RuntimeConfig, RuntimeError};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::sync::Arc;
+
+        struct ConstantService;
+
+        #[async_trait]
+        impl EmbeddingService for ConstantService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.3, 0.4]).collect())
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "constant-provenance-test"
+            }
+        }
+
+        struct ConstantProvider;
+
+        #[async_trait]
+        impl EmbedderProvider for ConstantProvider {
+            fn name(&self) -> &str {
+                "provenance-test-model"
+            }
+
+            fn dimensions(&self) -> usize {
+                2
+            }
+
+            async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+                Ok(Arc::new(ConstantService))
+            }
+        }
+
+        const MODEL: &str = "provenance-test-model";
+        const NS: &str = "local";
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        rt.register_embedder(ConstantProvider);
+        let token = rt.authorize(Namespace::parse(NS).unwrap()).unwrap();
+        let note = rt
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "first body",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let staged = vec![(note.id, note_embedding_text(&note))];
+        assert_eq!(
+            embed_and_store_batch(
+                &rt,
+                &token,
+                &[MODEL.to_string()],
+                NS,
+                &staged,
+                SubstrateKind::Note,
+                "note.content",
+                true,
+                &mut BTreeMap::new(),
+            )
+            .await,
+            0
+        );
+        let vectors = rt.vectors_for_model(&token, MODEL).unwrap();
+        let indexed = vectors.provenance(note.id).await.unwrap().unwrap();
+        assert_eq!(indexed.text_fingerprint, None);
+
+        // A custom provider does not attest the prepared bytes. Seed a
+        // previously attributed row with the same constant vector so this
+        // checks that a later raw replacement clears known historical metadata.
+        let historical_fingerprint =
+            VectorRecord::fingerprint_text("previously attested prepared bytes");
+        let seed = vectors
+            .insert_batch(vec![VectorRecord {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                namespace: NS.to_string(),
+                field: "note.content".to_string(),
+                embedding_model: Some(MODEL.to_string()),
+                vectors: vec![vec![0.3, 0.4]],
+                text_fingerprint: Some(historical_fingerprint.clone()),
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(seed.affected, 1);
+        assert_eq!(seed.failed, 0);
+        let attributed = vectors.provenance(note.id).await.unwrap().unwrap();
+        assert_eq!(attributed.text_fingerprint, Some(historical_fingerprint));
+        assert!(attributed.updated_at.is_some());
+        let blob_before = rt
+            .sql()
+            .reader()
+            .await
+            .unwrap()
+            .query_scalar(SqlStatement {
+                sql: "SELECT hex(embedding) FROM vec_provenance_test_model \
+                      WHERE namespace=?1 AND subject_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(NS.into()),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+                label: Some("test.note_provenance_blob_before".into()),
+            })
+            .await
+            .unwrap();
+        let Some(SqlValue::Text(blob_before)) = blob_before else {
+            panic!("attributed vector blob missing")
+        };
+
+        let mut patch = NotePatch::default();
+        patch.content = Some("second body with different source text".into());
+        rt.update_note(&token, note.id, patch).await.unwrap();
+        let blob_after = rt
+            .sql()
+            .reader()
+            .await
+            .unwrap()
+            .query_scalar(SqlStatement {
+                sql: "SELECT hex(embedding) FROM vec_provenance_test_model \
+                      WHERE namespace=?1 AND subject_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(NS.into()),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+                label: Some("test.note_provenance_blob_after".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(blob_after, Some(SqlValue::Text(blob)) if blob == blob_before));
+        let changed = vectors.provenance(note.id).await.unwrap().unwrap();
+        assert_eq!(changed.text_fingerprint, None);
+        assert_eq!(changed.updated_at, None);
+        let sidecar_rows = rt
+            .sql()
+            .reader()
+            .await
+            .unwrap()
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance \
+                      WHERE model_key=?1 AND namespace=?2 AND subject_id=?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("provenance_test_model".into()),
+                    SqlValue::Text(NS.into()),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+                label: Some("test.note_provenance_sidecar_after".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(sidecar_rows, Some(SqlValue::Integer(0))));
     }
 
     #[test]

@@ -4,18 +4,21 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_score::{cmp_desc_then_id, try_score_from_distance, DeterministicScore, ScoreError};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, IndexRebuildScope,
-    OrphanSweepConfig, OrphanSweepResult, SqlStatement, SqlValue, VectorIndexKind, VectorRecord,
-    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    OrphanSweepConfig, OrphanSweepResult, SqlStatement, SqlValue, VectorIndexKind,
+    VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities,
+    VectorStoreInfo,
 };
-use khive_storage::StorageCapability;
 use khive_storage::StorageResult;
 use khive_storage::VectorStore;
+use khive_storage::{ContentRef, StorageCapability};
 use khive_types::{DistanceMetric, SubstrateKind};
 
 use crate::error::SqliteError;
@@ -26,7 +29,11 @@ use crate::sql_bridge::bind_params;
 /// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
 /// `table` must already be a trusted, sanitized table name (mirrors
 /// `delete`'s own pre-existing lack of a placeholder for table names).
-pub fn delete_vector_statement(table: &str, subject_id: Uuid, namespace: &str) -> SqlStatement {
+pub(crate) fn delete_vector_statement(
+    table: &str,
+    subject_id: Uuid,
+    namespace: &str,
+) -> SqlStatement {
     SqlStatement {
         sql: format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2"),
         params: vec![
@@ -35,6 +42,18 @@ pub fn delete_vector_statement(table: &str, subject_id: Uuid, namespace: &str) -
         ],
         label: Some(format!("vec-delete-{table}")),
     }
+}
+
+fn provenance_read_sql(table: &str) -> String {
+    format!(
+        "SELECT v.embedding_model, v.field, v.embedding, p.embedding_digest, \
+                p.text_fingerprint, p.updated_at \
+         FROM {table} AS v \
+         LEFT JOIN vector_provenance AS p \
+           ON p.model_key = ?1 AND p.subject_id = v.subject_id \
+          AND p.namespace = v.namespace \
+         WHERE v.subject_id = ?2 AND v.namespace = ?3"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +482,8 @@ impl SqliteVecStore {
                     field: &field,
                     embedding_model: &embedding_model,
                     embedding: &embedding,
+                    text_fingerprint: None,
+                    updated_at: None,
                 },
                 record_ann_delta,
                 failpoint_flag,
@@ -483,6 +504,8 @@ struct VectorRowRef<'a> {
     field: &'a str,
     embedding_model: &'a str,
     embedding: &'a [f32],
+    text_fingerprint: Option<&'a ContentRef>,
+    updated_at: Option<&'a DateTime<Utc>>,
 }
 
 /// Shared DELETE-then-INSERT replacement DML for a single vector row (#546);
@@ -567,6 +590,37 @@ fn replace_vector_row_dml(
         ],
     )?;
 
+    let model_key = table
+        .strip_prefix("vec_")
+        .expect("vector table names use the vec_ prefix");
+    // Bind provenance to the bytes the live vec0 table exposes, rather than
+    // assuming its read representation matches the input slice's layout.
+    let stored_embedding: Vec<u8> = conn.query_row(
+        &format!("SELECT embedding FROM {table} WHERE subject_id = ?1 AND namespace = ?2"),
+        rusqlite::params![&subject_id, row.namespace],
+        |stored| stored.get(0),
+    )?;
+    let embedding_digest = blake3::hash(&stored_embedding).to_hex().to_string();
+    let updated_at = row.updated_at.map(DateTime::to_rfc3339);
+    conn.execute(
+        "INSERT INTO vector_provenance \
+         (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(model_key, subject_id) DO UPDATE SET \
+         namespace = excluded.namespace, \
+         embedding_digest = excluded.embedding_digest, \
+         text_fingerprint = excluded.text_fingerprint, \
+         updated_at = excluded.updated_at",
+        rusqlite::params![
+            model_key,
+            &subject_id,
+            row.namespace,
+            embedding_digest,
+            row.text_fingerprint.map(ContentRef::as_str),
+            updated_at,
+        ],
+    )?;
+
     if record_ann_delta {
         // Delta record for the ANN restart classifier; rides the caller's
         // savepoint/transaction so a rolled-back upsert leaves no log row.
@@ -605,6 +659,34 @@ fn log_vector_deletes(
     conn.execute(&sql, params)
 }
 
+fn delete_vector_provenance(
+    conn: &rusqlite::Connection,
+    table: &str,
+    subject_ids: &[String],
+) -> Result<(), rusqlite::Error> {
+    if subject_ids.is_empty() {
+        return Ok(());
+    }
+    let model_key = table
+        .strip_prefix("vec_")
+        .expect("vector table names use the vec_ prefix");
+    let placeholders = (2..=subject_ids.len() + 1)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "DELETE FROM vector_provenance \
+         WHERE model_key = ?1 AND subject_id IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    statement.raw_bind_parameter(1, model_key)?;
+    for (index, subject_id) in subject_ids.iter().enumerate() {
+        statement.raw_bind_parameter(index + 2, subject_id.as_str())?;
+    }
+    statement.raw_execute()?;
+    Ok(())
+}
+
 /// DML-only multi-chunk subject deletion shared by both the legacy
 /// (flag-off) and WriterTask-routed (flag-on) `delete_subjects` paths.
 ///
@@ -636,6 +718,7 @@ fn delete_vector_subjects_dml(
             stmt.raw_bind_parameter(index + 1, id.as_str())?;
         }
         total_deleted += stmt.raw_execute()? as u64;
+        delete_vector_provenance(conn, table, chunk)?;
     }
 
     Ok(total_deleted)
@@ -654,15 +737,18 @@ pub fn delete_subject_from_vector_tables(
     subject_id: Uuid,
     namespace: &str,
 ) -> Result<(), rusqlite::Error> {
+    let subject_id = subject_id.to_string();
     for table in tables {
         log_vector_deletes(
             conn,
             table,
             "subject_id = ?1 AND namespace = ?2",
-            &[&subject_id.to_string(), &namespace],
+            &[&subject_id, &namespace],
         )?;
         let sql = format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
-        conn.execute(&sql, rusqlite::params![subject_id.to_string(), namespace])?;
+        if conn.execute(&sql, rusqlite::params![&subject_id, namespace])? > 0 {
+            delete_vector_provenance(conn, table, std::slice::from_ref(&subject_id))?;
+        }
     }
     Ok(())
 }
@@ -743,6 +829,8 @@ fn batch_insert_vectors_dml(
                 field: &record.field,
                 embedding_model: store_embedding_model,
                 embedding,
+                text_fingerprint: record.text_fingerprint.as_ref(),
+                updated_at: Some(&record.updated_at),
             },
             true,
             failpoint_flag.clone(),
@@ -799,6 +887,8 @@ fn vec_upsert_atomic_dml(
             field,
             embedding_model,
             embedding,
+            text_fingerprint: None,
+            updated_at: None,
         },
         record_ann_delta,
         failpoint_flag,
@@ -948,6 +1038,7 @@ fn orphan_sweep_dml(
             conn.prepare_cached(&log_sql)?.execute(params.as_slice())?;
             let del_sql = format!("DELETE FROM {t} WHERE {in_clause}", t = table);
             total += conn.prepare_cached(&del_sql)?.execute(params.as_slice())? as i64;
+            delete_vector_provenance(conn, table, &victim_ids)?;
             remaining -= victim_ids.len() as i64;
         }
         total
@@ -1077,6 +1168,71 @@ impl VectorStore for SqliteVecStore {
         .await
     }
 
+    async fn provenance(&self, subject_id: Uuid) -> Result<Option<VectorProvenance>, StorageError> {
+        let table = self.table_name.clone();
+        let model_key = self.model_key.clone();
+        let namespace = self.namespace.clone();
+        self.with_reader("vec_provenance", move |conn| {
+            let sql = provenance_read_sql(&table);
+            conn.query_row(
+                &sql,
+                rusqlite::params![model_key, subject_id.to_string(), namespace],
+                |row| {
+                    let embedding_model = row.get(0)?;
+                    let field = row.get(1)?;
+                    let live_embedding: Vec<u8> = row.get(2)?;
+                    let stored_digest: Option<String> = row.get(3)?;
+                    let live_digest = blake3::hash(&live_embedding).to_hex().to_string();
+                    if stored_digest.as_deref() != Some(live_digest.as_str()) {
+                        return Ok(VectorProvenance {
+                            embedding_model,
+                            field,
+                            text_fingerprint: None,
+                            updated_at: None,
+                        });
+                    }
+                    let fingerprint: Option<String> = row.get(4)?;
+                    let text_fingerprint = fingerprint
+                        .map(|raw| {
+                            ContentRef::from_hex(raw).map_err(|message| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        message,
+                                    )),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let timestamp: Option<String> = row.get(5)?;
+                    let updated_at = timestamp
+                        .map(|raw| {
+                            DateTime::parse_from_rfc3339(&raw)
+                                .map(|value| value.with_timezone(&Utc))
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        5,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })
+                        })
+                        .transpose()?;
+                    Ok(VectorProvenance {
+                        embedding_model,
+                        field,
+                        text_fingerprint,
+                        updated_at,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
     async fn update(
         &self,
         subject_id: Uuid,
@@ -1169,6 +1325,8 @@ impl VectorStore for SqliteVecStore {
                     field: &field,
                     embedding_model: &embedding_model,
                     embedding: &embedding,
+                    text_fingerprint: None,
+                    updated_at: None,
                 },
                 true,
                 failpoint_flag,
@@ -1195,7 +1353,11 @@ impl VectorStore for SqliteVecStore {
                 )?;
                 let mut stmt = conn.prepare(&statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
-                Ok(stmt.raw_execute()? > 0)
+                let deleted = stmt.raw_execute()? > 0;
+                if deleted {
+                    delete_vector_provenance(conn, &table, &[subject_id.to_string()])?;
+                }
+                Ok(deleted)
             })();
             match result {
                 Ok(v) => {
@@ -1813,6 +1975,10 @@ mod batch_exists_tests {
             model_key, dims
         );
         writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
+            .conn()
+            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+            .expect("create vector_provenance");
         writer
             .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
@@ -2462,6 +2628,7 @@ mod first_error_tests {
                     field: "body".to_string(),
                     embedding_model: None,
                     vectors: vec![vec![0.0f32; dims + 1]],
+                    text_fingerprint: None,
                     updated_at: chrono::Utc::now(),
                 },
                 VectorRecord {
@@ -2471,6 +2638,7 @@ mod first_error_tests {
                     field: "body".to_string(),
                     embedding_model: None,
                     vectors: vec![vec![0.0f32; dims + 2]],
+                    text_fingerprint: None,
                     updated_at: chrono::Utc::now(),
                 },
             ])
@@ -2639,6 +2807,10 @@ mod delete_subjects_atomic_tests {
         writer.conn().execute_batch(&ddl).expect("create vec table");
         writer
             .conn()
+            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+            .expect("create vector_provenance");
+        writer
+            .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
             .expect("create ann_write_log");
     }
@@ -2697,6 +2869,7 @@ mod delete_subjects_atomic_tests {
                 field: "body".to_string(),
                 embedding_model: None,
                 vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             })
             .collect();
@@ -2883,6 +3056,7 @@ mod delete_subjects_atomic_tests {
                 field: "body".to_string(),
                 embedding_model: None,
                 vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             }])
             .await
@@ -3000,6 +3174,10 @@ mod atomic_replace_tests {
         writer.conn().execute_batch(&ddl).expect("create vec table");
         writer
             .conn()
+            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+            .expect("create vector_provenance");
+        writer
+            .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
             .expect("create ann_write_log");
     }
@@ -3099,6 +3277,7 @@ mod atomic_replace_tests {
                     field: "body".to_string(),
                     embedding_model: None,
                     vectors: vec![vec![9.9f32; dims + 1]],
+                    text_fingerprint: None,
                     updated_at: chrono::Utc::now(),
                 },
                 VectorRecord {
@@ -3108,6 +3287,7 @@ mod atomic_replace_tests {
                     field: "body".to_string(),
                     embedding_model: None,
                     vectors: vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                    text_fingerprint: None,
                     updated_at: chrono::Utc::now(),
                 },
             ])
@@ -3240,6 +3420,7 @@ mod atomic_replace_tests {
                 field: "body".to_string(),
                 embedding_model: None,
                 vectors: vec![replacement_vec.clone()],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             }])
             .await
@@ -3340,6 +3521,7 @@ mod atomic_replace_tests {
                     field: "body".to_string(),
                     embedding_model: None,
                     vectors: vec![vec![0.5f32, 0.6, 0.7, 0.8]],
+                    text_fingerprint: None,
                     updated_at: chrono::Utc::now(),
                 },
                 VectorRecord {
@@ -3349,6 +3531,7 @@ mod atomic_replace_tests {
                     field: "body".to_string(),
                     embedding_model: None,
                     vectors: vec![new_vec.clone()],
+                    text_fingerprint: None,
                     updated_at: chrono::Utc::now(),
                 },
             ])
@@ -3614,6 +3797,7 @@ mod atomic_replace_tests {
                 field: "body".to_string(),
                 embedding_model: None,
                 vectors: vec![vec2.clone()],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             }])
             .await
@@ -3936,6 +4120,10 @@ mod orphan_sweep_tests {
         );
         let writer = pool.try_writer().expect("writer");
         writer.conn().execute_batch(&ddl).expect("create vec table");
+        writer
+            .conn()
+            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+            .expect("create vector_provenance");
         writer
             .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
@@ -4612,6 +4800,10 @@ mod write_queue_tests {
         writer.conn().execute_batch(&ddl).expect("create vec table");
         writer
             .conn()
+            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+            .expect("create vector_provenance");
+        writer
+            .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
             .expect("create ann_write_log");
     }
@@ -4662,6 +4854,7 @@ mod write_queue_tests {
                 field: "body".to_string(),
                 embedding_model: None,
                 vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             },
             VectorRecord {
@@ -4671,6 +4864,7 @@ mod write_queue_tests {
                 field: "body".to_string(),
                 embedding_model: None,
                 vectors: vec![vec![0.5, 0.6, 0.7, 0.8]],
+                text_fingerprint: None,
                 updated_at: chrono::Utc::now(),
             },
         ];
@@ -5319,5 +5513,595 @@ mod write_queue_tests {
                 .expect("write task must not panic")
                 .expect("insert must succeed once unblocked");
         });
+    }
+}
+
+#[cfg(all(test, feature = "vectors"))]
+mod provenance_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::pool::{ConnectionPool, PoolConfig};
+
+    fn make_store() -> (Arc<ConnectionPool>, SqliteVecStore) {
+        crate::extension::ensure_extensions_loaded();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool"),
+        );
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE vec_provenance_test USING vec0(\
+                     subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, \
+                     kind TEXT NOT NULL, field TEXT NOT NULL, \
+                     embedding_model TEXT NOT NULL, embedding float[2] distance_metric=cosine)",
+                )
+                .expect("create vec0 table");
+            writer
+                .conn()
+                .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
+                .expect("create ANN log");
+            writer
+                .conn()
+                .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+                .expect("create provenance table");
+        }
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            "provenance_test".into(),
+            "model/a".into(),
+            2,
+            "ns:test".into(),
+        )
+        .expect("vector store");
+        (pool, store)
+    }
+
+    fn record(subject_id: Uuid, text: &str, updated_at: &DateTime<Utc>) -> VectorRecord {
+        VectorRecord {
+            subject_id,
+            kind: SubstrateKind::Entity,
+            namespace: "ns:test".into(),
+            field: "entity.body".into(),
+            embedding_model: Some("model/a".into()),
+            vectors: vec![vec![0.1, 0.2]],
+            text_fingerprint: Some(VectorRecord::fingerprint_text(text)),
+            updated_at: *updated_at,
+        }
+    }
+
+    fn joined_provenance_count(
+        conn: &rusqlite::Connection,
+        table: &str,
+        model_key: &str,
+        subject_id: Uuid,
+        namespace: &str,
+    ) -> i64 {
+        let sql = format!(
+            "SELECT COUNT(embedding_digest) FROM ({})",
+            provenance_read_sql(table)
+        );
+        conn.query_row(
+            &sql,
+            rusqlite::params![model_key, subject_id.to_string(), namespace],
+            |row| row.get(0),
+        )
+        .expect("count sidecar matches through production read join")
+    }
+
+    #[tokio::test]
+    async fn persisted_vector_provenance_tracks_exact_embedded_text() {
+        let (pool, store) = make_store();
+        let subject_id = Uuid::new_v4();
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let original_text = "rendered title\nbody";
+        store
+            .insert_batch(vec![record(subject_id, original_text, &timestamp)])
+            .await
+            .expect("index original text");
+        let expected =
+            ContentRef::from_digest_bytes(blake3::hash(original_text.as_bytes()).as_bytes());
+        let stored = store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(stored.embedding_model, "model/a");
+        assert_eq!(stored.field, "entity.body");
+        assert_eq!(stored.text_fingerprint, Some(expected.clone()));
+        let raw: String = pool
+            .try_writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT text_fingerprint FROM vector_provenance \
+                 WHERE model_key = 'provenance_test' AND subject_id = ?1",
+                [subject_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, expected.as_str());
+        let (stored_digest, live_embedding): (String, Vec<u8>) = pool
+            .try_writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT p.embedding_digest, v.embedding \
+                 FROM vector_provenance AS p JOIN vec_provenance_test AS v \
+                   ON v.subject_id = p.subject_id \
+                 WHERE p.model_key = 'provenance_test' AND p.subject_id = ?1",
+                [subject_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_digest,
+            blake3::hash(&live_embedding).to_hex().to_string()
+        );
+
+        store
+            .insert_batch(vec![record(subject_id, original_text, &timestamp)])
+            .await
+            .expect("re-embed unchanged text");
+        assert_eq!(
+            store
+                .provenance(subject_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text_fingerprint,
+            Some(expected.clone())
+        );
+
+        store
+            .insert_batch(vec![record(
+                subject_id,
+                "rendered title\nchanged body",
+                &timestamp,
+            )])
+            .await
+            .expect("re-embed changed text");
+        let changed = store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(
+            changed.text_fingerprint,
+            Some(ContentRef::from_digest_bytes(
+                blake3::hash(b"rendered title\nchanged body").as_bytes()
+            ))
+        );
+        assert_ne!(changed.text_fingerprint, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn bypass_vector_replacement_makes_stale_sidecar_unknown() {
+        let (pool, store) = make_store();
+        let subject_id = Uuid::new_v4();
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .insert_batch(vec![record(subject_id, "original text", &timestamp)])
+            .await
+            .expect("index original text");
+
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "DELETE FROM vec_provenance_test WHERE subject_id = ?1",
+                    [subject_id.to_string()],
+                )
+                .unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO vec_provenance_test \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, 'ns:test', 'entity', 'entity.body', 'model/a', ?2)",
+                    rusqlite::params![subject_id.to_string(), f32_slice_as_bytes(&[0.7_f32, 0.8])],
+                )
+                .unwrap();
+        }
+        let present = store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(present.embedding_model, "model/a");
+        assert_eq!(present.field, "entity.body");
+        assert_eq!(present.text_fingerprint, None);
+        assert_eq!(present.updated_at, None);
+    }
+
+    #[tokio::test]
+    async fn model_scoped_identical_blob_provenance() {
+        let (pool, first_store) = make_store();
+        pool.try_writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE VIRTUAL TABLE vec_provenance_other USING vec0(\
+                 subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, \
+                 kind TEXT NOT NULL, field TEXT NOT NULL, \
+                 embedding_model TEXT NOT NULL, embedding float[2] distance_metric=cosine)",
+            )
+            .unwrap();
+        let second_store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            "provenance_other".into(),
+            "model/b".into(),
+            2,
+            "ns:test".into(),
+        )
+        .unwrap();
+        let subject_id = Uuid::new_v4();
+        let first_timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let second_timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:57.987654321Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        first_store
+            .insert_batch(vec![record(subject_id, "model a source", &first_timestamp)])
+            .await
+            .unwrap();
+        let mut other_record = record(subject_id, "model b source", &second_timestamp);
+        other_record.embedding_model = Some("model/b".into());
+        second_store.insert_batch(vec![other_record]).await.unwrap();
+
+        let first = first_store.provenance(subject_id).await.unwrap().unwrap();
+        let second = second_store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(
+            first.text_fingerprint,
+            Some(VectorRecord::fingerprint_text("model a source"))
+        );
+        assert_eq!(first.updated_at, Some(first_timestamp));
+        assert_eq!(
+            second.text_fingerprint,
+            Some(VectorRecord::fingerprint_text("model b source"))
+        );
+        assert_eq!(second.updated_at, Some(second_timestamp));
+
+        let writer = pool.try_writer().unwrap();
+        let first_blob: Vec<u8> = writer
+            .conn()
+            .query_row(
+                "SELECT embedding FROM vec_provenance_test WHERE subject_id = ?1",
+                [subject_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_blob: Vec<u8> = writer
+            .conn()
+            .query_row(
+                "SELECT embedding FROM vec_provenance_other WHERE subject_id = ?1",
+                [subject_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_blob, second_blob,
+            "the digests alone cannot separate models"
+        );
+        assert_eq!(
+            joined_provenance_count(
+                writer.conn(),
+                "vec_provenance_test",
+                "provenance_test",
+                subject_id,
+                "ns:test"
+            ),
+            1
+        );
+        assert_eq!(
+            joined_provenance_count(
+                writer.conn(),
+                "vec_provenance_other",
+                "provenance_other",
+                subject_id,
+                "ns:test"
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_scoped_identical_blob_provenance() {
+        let (pool, source_store) = make_store();
+        let subject_id = Uuid::new_v4();
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        source_store
+            .insert_batch(vec![record(subject_id, "source namespace", &timestamp)])
+            .await
+            .unwrap();
+
+        {
+            let writer = pool.try_writer().unwrap();
+            let live_blob: Vec<u8> = writer
+                .conn()
+                .query_row(
+                    "SELECT embedding FROM vec_provenance_test WHERE subject_id = ?1",
+                    [subject_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            writer
+                .conn()
+                .execute(
+                    "DELETE FROM vec_provenance_test WHERE subject_id = ?1",
+                    [subject_id.to_string()],
+                )
+                .unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO vec_provenance_test \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, 'ns:other', 'entity', 'entity.body', 'model/a', ?2)",
+                    rusqlite::params![subject_id.to_string(), live_blob],
+                )
+                .unwrap();
+            writer.conn().execute_batch("COMMIT").unwrap();
+            let sidecar_namespace: String = writer
+                .conn()
+                .query_row(
+                    "SELECT namespace FROM vector_provenance \
+                     WHERE model_key = 'provenance_test' AND subject_id = ?1",
+                    [subject_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sidecar_namespace, "ns:test");
+            assert_eq!(
+                joined_provenance_count(
+                    writer.conn(),
+                    "vec_provenance_test",
+                    "provenance_test",
+                    subject_id,
+                    "ns:other"
+                ),
+                0
+            );
+        }
+
+        let destination_store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            "provenance_test".into(),
+            "model/a".into(),
+            2,
+            "ns:other".into(),
+        )
+        .unwrap();
+        assert!(source_store.provenance(subject_id).await.unwrap().is_none());
+        let moved = destination_store
+            .provenance(subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.embedding_model, "model/a");
+        assert_eq!(moved.field, "entity.body");
+        assert_eq!(moved.text_fingerprint, None);
+        assert_eq!(moved.updated_at, None);
+    }
+
+    #[tokio::test]
+    async fn vector_provenance_timestamp_round_trips_and_unattributed_update_clears_it() {
+        let (_, store) = make_store();
+        let subject_id = Uuid::new_v4();
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .insert_batch(vec![record(subject_id, "indexed body", &timestamp)])
+            .await
+            .expect("index record");
+        let persisted = store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(persisted.updated_at, Some(timestamp));
+
+        store
+            .update(
+                subject_id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "entity.body",
+                vec![vec![0.3, 0.4]],
+            )
+            .await
+            .expect("replace without source text");
+        let replaced = store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(replaced.text_fingerprint, None);
+        assert_eq!(replaced.updated_at, None);
+    }
+
+    #[tokio::test]
+    async fn low_level_same_blob_reinsert_clears_provenance() {
+        let (pool, store) = make_store();
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for operation in ["insert", "update", "insert_exact_only"] {
+            let subject_id = Uuid::new_v4();
+            store
+                .insert_batch(vec![record(subject_id, "attributed source", &timestamp)])
+                .await
+                .unwrap();
+            let before: Vec<u8> = pool
+                .try_writer()
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT embedding FROM vec_provenance_test WHERE subject_id = ?1",
+                    [subject_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match operation {
+                "insert" => {
+                    store
+                        .insert(
+                            subject_id,
+                            SubstrateKind::Entity,
+                            "ns:test",
+                            "entity.body",
+                            vec![vec![0.1, 0.2]],
+                        )
+                        .await
+                        .unwrap();
+                }
+                "update" => {
+                    store
+                        .update(
+                            subject_id,
+                            SubstrateKind::Entity,
+                            "ns:test",
+                            "entity.body",
+                            vec![vec![0.1, 0.2]],
+                        )
+                        .await
+                        .unwrap();
+                }
+                "insert_exact_only" => {
+                    store
+                        .insert_exact_only(
+                            subject_id,
+                            SubstrateKind::Entity,
+                            "ns:test",
+                            "entity.body",
+                            vec![vec![0.1, 0.2]],
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let writer = pool.try_writer().unwrap();
+            let after: Vec<u8> = writer
+                .conn()
+                .query_row(
+                    "SELECT embedding FROM vec_provenance_test WHERE subject_id = ?1",
+                    [subject_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(after, before, "{operation} must replace with the same BLOB");
+            let fields: (Option<String>, Option<String>) = writer
+                .conn()
+                .query_row(
+                    "SELECT text_fingerprint, updated_at FROM vector_provenance \
+                     WHERE model_key = 'provenance_test' AND subject_id = ?1",
+                    [subject_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                fields,
+                (None, None),
+                "{operation} must clear sidecar fields"
+            );
+            drop(writer);
+            let observed = store.provenance(subject_id).await.unwrap().unwrap();
+            assert_eq!(observed.text_fingerprint, None, "{operation}");
+            assert_eq!(observed.updated_at, None, "{operation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_rolls_back_vector_and_bound_provenance() {
+        let (_, store) = make_store();
+        let subject_id = Uuid::new_v4();
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .insert_batch(vec![record(subject_id, "original text", &timestamp)])
+            .await
+            .unwrap();
+        let original = store.provenance(subject_id).await.unwrap().unwrap();
+        let mut replacement = record(subject_id, "replacement text", &timestamp);
+        replacement.vectors = vec![vec![0.7, 0.8]];
+
+        let _guard = failpoint::FailpointGuard::new();
+        let summary = store.insert_batch(vec![replacement]).await.unwrap();
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.affected, 0);
+        assert_eq!(
+            store.provenance(subject_id).await.unwrap().unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_and_deleted_vectors_have_no_current_provenance() {
+        let (pool, store) = make_store();
+        let subject_id = Uuid::new_v4();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("DROP TABLE vector_provenance")
+                .expect("simulate pre-migration database");
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO vec_provenance_test \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, 'ns:test', 'entity', 'entity.body', 'model/a', ?2)",
+                    rusqlite::params![subject_id.to_string(), f32_slice_as_bytes(&[0.1_f32, 0.2])],
+                )
+                .expect("write legacy vector without provenance");
+            writer
+                .conn()
+                .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)
+                .expect("migrate provenance sidecar");
+        }
+        let legacy = store.provenance(subject_id).await.unwrap().unwrap();
+        assert_eq!(legacy.text_fingerprint, None);
+        assert_eq!(legacy.updated_at, None);
+
+        let timestamp = DateTime::parse_from_rfc3339("2026-09-25T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .insert_batch(vec![record(subject_id, "new text", &timestamp)])
+            .await
+            .expect("replace legacy vector");
+        let other_namespace = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            "provenance_test".into(),
+            "model/a".into(),
+            2,
+            "ns:other".into(),
+        )
+        .unwrap();
+        assert!(!other_namespace.delete(subject_id).await.unwrap());
+        assert!(store
+            .provenance(subject_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .text_fingerprint
+            .is_some());
+        assert!(store.delete(subject_id).await.expect("delete vector"));
+        assert!(store.provenance(subject_id).await.unwrap().is_none());
+        let sidecar_count: i64 = pool
+            .try_writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM vector_provenance \
+                 WHERE model_key = 'provenance_test' AND subject_id = ?1",
+                [subject_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sidecar_count, 0);
     }
 }

@@ -887,6 +887,13 @@ impl StorageBackend {
         writer
             .conn()
             .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
+        // A direct StorageBackend::vectors() caller can create a vec0 table
+        // without running migrations first. Its vector writes still maintain
+        // provenance in the same transaction, so install V43's exact schema
+        // on that constructor path as well.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::VECTOR_PROVENANCE_DDL)?;
 
         // Create missing vec0 tables without changing existing vector data.
         for (model_key, dimensions) in models {
@@ -1776,6 +1783,37 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].subject_id, id);
         assert!(hits[0].score.to_f64() > 0.99);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "vectors")]
+    async fn vectors_direct_store_creates_provenance_sidecar() {
+        let backend = StorageBackend::memory().unwrap();
+        let store = backend
+            .vectors("direct_provenance", "direct_provenance", 3)
+            .unwrap();
+        let reader = backend.pool.reader().unwrap();
+        assert!(
+            sqlite_table_exists(reader.conn(), "vector_provenance").unwrap(),
+            "the direct vector-store constructor must install V43's sidecar"
+        );
+        drop(reader);
+
+        let id = uuid::Uuid::new_v4();
+        store
+            .insert(
+                id,
+                khive_types::SubstrateKind::Entity,
+                "local",
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
+            )
+            .await
+            .unwrap();
+        let provenance = store.provenance(id).await.unwrap().unwrap();
+        assert_eq!(provenance.embedding_model, "direct_provenance");
+        assert_eq!(provenance.text_fingerprint, None);
+        assert_eq!(provenance.updated_at, None);
     }
 
     #[tokio::test]

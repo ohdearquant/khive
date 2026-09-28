@@ -713,3 +713,414 @@ shipped commands; this amendment brings the ADR in line with them. No shipped ba
 until one does.
 
 **Refs.** Commit 3db44e9e8.
+
+## Amendment A4: persisted vector text provenance (#2878, accepted 2026-09-27)
+
+**Status**: Accepted (2026-09-27). The implementation takes the next free contiguous
+migration number at merge time; this amendment does not reserve a number.
+
+### Context and scope
+
+`VectorRecord.updated_at` is supplied by record producers, but the SQLite
+vector writer currently inserts only the six vec0 columns and discards that
+timestamp. A vec0 row also carries no evidence of the text given to the
+embedder. The presence of a row therefore cannot tell a reader whether the
+subject was re-rendered after that vector was computed. `VectorStore` has no
+per-subject provenance read. This amendment adds that contract to ADR-044's
+`VectorStore` extension surface. ADR-005 defines the base trait; ADR-043 §1.1
+records the existing `field` and `embedding_model` vec0 columns and the V17
+rebuild precedent. This amendment does not alter that model registry or the
+existing vec0 layout.
+
+The new evidence is optional. It allows a caller that has the exact current
+rendered text to compare it with a stored vector. It does not change search,
+ranking, presence-based reuse, or automatic re-indexing behavior.
+
+At A4 landing, provenance is populated only by the two producers that carry
+the embedding service's prepared-input attestation into a `VectorRecord`.
+Other routes keep the live vector or perform their existing purge, but do not
+claim a fingerprint or a vector write time they did not capture:
+
+| Route at landing                                                                                                          | Provenance after the route                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Knowledge index and `kkernel reindex` record-based writes                                                                 | Persist `updated_at` and the exact prepared-text `text_fingerprint` when the embedding outcome supplies it; an unattested provider leaves the fingerprint unknown. |
+| Raw note create, update, reindex, restore, and merge-survivor reindex through `atomic_message` (also comm message writes) | Clear the old sidecar in the same atomic unit as vec0 replacement; the present vector reads with both optional fields unknown.                                     |
+| Entity reindex through `curation`                                                                                         | Clear the old sidecar with the raw vec0 replacement; the present vector reads with both optional fields unknown.                                                   |
+| Lower-level `SqliteVecStore::insert`, `update`, and `insert_exact_only` without a record                                  | Write a sidecar with null fingerprint and null write time, including when the BLOB is unchanged.                                                                   |
+| Purge and delete routes                                                                                                   | Remove the matching sidecar with the vec0 row; a deleted vector is absent, not a present vector with invented provenance.                                          |
+| Namespace move                                                                                                            | Preserve the vector bytes and clear its sidecar in the move transaction; the moved vector reads with both optional fields unknown.                                 |
+
+Capturing prepared input and attributable write time for the raw routes is a
+separate, later amendment. ADR-189's namespace move keeps the vector rather
+than re-embedding it; clearing this additional sidecar does not change that
+vector move or its ANN write-log obligations.
+
+### Decision
+
+**A4.1: source fingerprint and interface.** Add
+`VectorRecord.text_fingerprint: Option<ContentRef>` with a serde default of
+`None`. When the producer can observe the exact document input sent to the
+embedding provider, it sets the field to BLAKE3-256 of those UTF-8 bytes,
+encoded by the existing lowercase-hex `ContentRef` convention. The input
+includes the configured document-byte bound and the selected model's document
+prefix, in their actual order. The producer captures the prepared input for
+the same embedding request; it must not re-render the subject afterward to
+obtain the hash. Whitespace, line endings, truncation, prefix, and other bytes
+are significant. Do not hash the vector, subject ID, or an unbounded or
+reconstructed source string. `Some(hash of empty text)` is distinct from
+`None`. A producer that cannot observe the exact prepared input sets `None`
+rather than inventing provenance. A change to the bound or prefix changes the
+fingerprint when it changes the provider input.
+
+There is no universal renderer for `note.content`: note creation may embed
+`embedding_content.unwrap_or(content)`, while `kkernel reindex` renders the
+stored `content`. A producer hashes the input it actually sent, and a strict
+caller compares only when it can reproduce that same renderer and model
+preparation. A model prefix supplied inside the embedding service must be
+exposed to the producer by that service or captured at its request boundary;
+hashing the pre-prefix argument is not comparable evidence.
+
+The fingerprint covers text only. The row's existing `embedding_model` value,
+its model table, and its `field` remain separate identity evidence that a
+strict caller must also compare. A `ContentRef` used here is a digest value;
+it does not claim the source text was stored in `BlobStore`.
+
+Add a `VectorStore::provenance(subject_id)` read with a conservative default of
+`StorageError::Unsupported` for backends without a provenance read. The
+SQLite implementation is scoped to its configured model table and namespace.
+It returns `None` only when that scope has no live vector row. A present row
+returns `VectorProvenance` with its stored `embedding_model`, `field`, optional
+`text_fingerprint`, and optional `updated_at: DateTime<Utc>`. Thus a caller
+can distinguish absent vector, present vector with unknown source text, and
+present vector with a comparable fingerprint. `Unsupported` is not an absent
+vector. A caller claiming the vector matches current text must compare the
+digest and embedding-space/model identity; a timestamp alone does not prove
+freshness. `updated_at` is the vector record's write time, not the substrate
+subject's edit time.
+
+```rust
+pub struct VectorProvenance {
+    pub embedding_model: String,
+    pub field: String,
+    pub text_fingerprint: Option<ContentRef>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+// Default on VectorStore: return StorageError::Unsupported.
+async fn provenance(&self, subject_id: Uuid) -> StorageResult<Option<VectorProvenance>>;
+```
+
+**A4.2: SQLite sidecar schema.** The next free contiguous migration creates
+`vector_provenance(model_key TEXT NOT NULL, subject_id TEXT NOT NULL, namespace
+TEXT NOT NULL, embedding_digest TEXT NOT NULL, text_fingerprint TEXT NULL,
+updated_at TEXT NULL, PRIMARY KEY (model_key, subject_id))`.
+`embedding_digest` is BLAKE3-256, as 64 lowercase hexadecimal characters, of
+the exact BLOB bytes SQLite returns for the live vec0 row's `embedding`
+column. It is computed after the vec0 write in the same transaction, not from
+the caller's in-memory float representation. `text_fingerprint`, when
+present, must also be 64 lowercase hexadecimal characters. `updated_at`,
+when present, is the `DateTime<Utc>` value serialized as RFC 3339 and parsed
+back into UTC. Each `vec_{model_key}` table has one vec0 row per `subject_id`;
+that table key plus
+`subject_id` is the logical vector-row identity. The sidecar repeats
+`namespace` so reads can require it to match the live vec0 row. The read
+joins from the live model table on `(model_key, subject_id, namespace)`. A
+sidecar row by itself never makes a deleted or differently scoped vector
+appear present. The read also recomputes `embedding_digest` over the live
+vec0 BLOB. A missing sidecar or a digest mismatch reports a present vector
+with both optional provenance fields `None`; it never returns metadata from
+an earlier vector incarnation. No foreign key to a dynamic vec0 virtual
+table is assumed.
+
+The sidecar is used instead of adding columns to each vec0 table: vec0
+columns are fixed at `CREATE VIRTUAL TABLE` time, and ADR-043's V17 required
+a table rebuild to add `field` and `embedding_model`. This migration must not
+rebuild every named model table just to add nullable provenance.
+
+**A4.3: one transaction per row lifecycle.** A successful vector insert,
+replacement, or upsert through `SqliteVecStore` writes the vec0 row and its
+sidecar value in the same transaction or savepoint. The sidecar binds its
+metadata to the bytes read back from the new row. Replacing a row with a
+record whose fingerprint is `None` must clear any previous fingerprint; it
+must not retain a digest for
+the old text. A new record-based write persists its supplied `updated_at`.
+Low-level `insert` or `update` calls without a timestamp or exact text clear
+both provenance fields to unknown. Deleting a vector, including a model-wide
+subject deletion or orphan sweep, removes the matching sidecar row in the
+same transaction. A failed write rolls back both rows. The read's live-row
+join and embedding-digest check guard against stale sidecar data after an
+out-of-band deletion or replacement; they do not substitute for transactional
+cleanup by a writer that knows about the sidecar. If a bypass writer replaces
+the row with different embedding bytes, the read reports unknown metadata
+even within one version of khive. An identical replacement BLOB cannot be
+distinguished by this digest; strict callers still compare the text
+fingerprint against the current prepared input. If an unrecognized writer
+replaces a row with identical bytes without clearing its sidecar, the old
+`updated_at` can still appear to be the new row's write time.
+
+At adoption of this amendment, the production vec0 writer inventory is:
+
+- `khive-db::stores::vectors` (`SqliteVecStore` insert, replacement, update,
+  delete, and orphan sweep), including the public free function
+  `delete_subject_from_vector_tables` used by entity and note merge cleanup;
+- `khive-runtime::atomic_message::vector_insert_statements`, a raw
+  DELETE+INSERT used by note create, note update/reindex, note restore, note
+  merge survivor reindex, and comm message writes;
+- `khive-runtime::atomic_prepare::purge_index_row_statement`, a raw vector
+  DELETE in atomic index-purge plans;
+- `khive-runtime::curation::entity_vector_insert_statements`, a raw
+  DELETE+INSERT run by `reindex_entity` in an `atomic_unit` after entity
+  update, merge, restore, or import;
+- `khive-runtime::note_write::NoteVectors::apply`, which enumerates existing
+  `vec_*` virtual tables and runs raw `DELETE FROM main.{table}`
+  by namespace and subject ID through its supplied `SqlWriter`. The note
+  creation-compensation path in `note_index` and an atomic note update with
+  `embed=false` call this purge. `NoteEmbeddingInheritance` also carries
+  `NoteVectors`, but its current atomic-runner branch calls only `has_rows`;
+  that read does not delete a vector or its provenance; and
+- `khive-db::namespace_move::move_vectors`, which stages and re-inserts vec0
+  rows when a namespace moves.
+
+Both raw DELETE+INSERT routes (`atomic_message` and `curation`) and the raw
+DELETE routes (`atomic_prepare` and `NoteVectors::apply`) must clear the
+matching sidecar row in the same atomic unit as their vec0 change. A sidecar
+clear must cover at least every row its vec0 DELETE can remove in that model
+table. In particular, `atomic_message` and `curation` delete vec0 by
+`subject_id` without a namespace predicate, so their sidecar clears cannot
+add a namespace predicate. The `atomic_prepare` and `NoteVectors::apply`
+vec0 DELETEs include namespace; their sidecar clears may use the same scope.
+`NoteVectors::apply` derives `model_key` from each validated `vec_{model_key}`
+table name and clears only the row matching that `model_key`, the note's
+`namespace`, and its `subject_id`. The sidecar DELETE predicate is
+`model_key=? AND namespace=? AND subject_id=?`; the vec0 DELETE and sidecar
+DELETE use the same supplied writer transaction. A `has_rows`-only inheritance
+check does not clear sidecar metadata. These paths cannot rely on the embedding
+digest: a replacement can have identical BLOB bytes and otherwise revive the
+old write time. For example, an entity-type-only update schedules
+`reindex_entity` although `entity_embedding_text` uses only name and
+description, so a deterministic provider can produce the same BLOB without
+an explicit reindex call. After a tag-only or property-only entity update,
+an explicit `reindex_entity` call can do the same; those patches do not
+schedule vector reindexing themselves. Until a raw route captures the exact
+prepared input and attributable write time required by A4.1, its new row
+remains present with unknown provenance.
+Namespace movement must clear the sidecar in the same transaction as the vec0
+row move, even when the re-inserted embedding BLOB is byte-identical. The
+moved vector remains present, but its optional provenance fields read as
+unknown; the move does not capture a new prepared input or write time. Clear
+by model and staged subject without a namespace predicate: a stale sidecar
+already scoped to the target could otherwise revive when its digest equals
+the moved BLOB.
+The digest-bound read is a fail-closed guard for an unrecognized or older
+bypass writer that changes embedding bytes, not a substitute for clearing
+metadata on known paths. A source-site census scans production and
+test-support Rust SQL construction sites for DELETE, INSERT/REPLACE, and
+UPDATE with either a literal `vec_*` target or a dynamic table target. It
+records each site's
+file, enclosing function, operation, occurrence count, and evidence for the
+target's producer. Here "production" means sites compiled without `cfg(test)`
+or `khive-db/test-support`; a build enabling
+`khive-runtime/test-internals` also enables that test-support feature, but
+does not turn its fixture SQL into a production writer. Pin three
+`khive-db::namespace_move_fixture` INSERT sites as a separate test-support
+class: `index_row` writes an FTS row and its `{table}_rowids` map through
+two dynamic SQL templates, while `add_vector_row` writes a vec0 row. Their
+presence under that feature must neither fail a correct production inventory
+nor silently add a production route. Every production dynamic-target DML
+site outside `khive-db::stores::vectors` is classified as one of the five
+named vec0 routes above or as an explicitly pinned non-vector site;
+store-owned vec0 sites are pinned separately. New, missing, or unclassified
+sites fail the census. Identical SQL templates do not imply identical target
+classes:
+`stores::text` and `atomic_prepare` use the same DELETE template for FTS and
+vec0 targets respectively. `namespace_move::move_vectors` is an INSERT
+candidate even though its column list comes from a separate variable. The
+census pins every caller of the exported
+`khive-db::stores::vectors::delete_vector_statement` builder, not only its
+SQL construction site. Its sole caller at this baseline is
+`SqliteVecStore::delete`; make the builder `pub(crate)` in the implementation
+and reject any additional in-crate caller until its sidecar behavior is
+classified. An out-of-store caller must not execute the returned vec0 DELETE
+without an atomic sidecar clear. The census is a bounded source-change
+detector, not proof that arbitrary generated SQL was discovered; changes to
+target producers or SQL assembly
+require code review. Re-derive this inventory at the implementation's merge
+base; a new vec0 writer must maintain the sidecar or demonstrably leave
+provenance unknown.
+
+**A4.4: upgrade and interoperability.** The provenance migration takes the
+next free version in the contiguous migration ledger when its code lands.
+It creates only the sidecar and does not backfill guessed fingerprints or
+timestamps. A vec0 row written before that migration has no sidecar row, so
+the read returns a present vector with both optional fields `None`. This
+remains true after restart until a provenance-aware
+writer replaces it. The sidecar must be created through that migration, not
+opportunistically by writable vector-store setup before the ledger records it.
+
+An upgraded database should have all writers quiesced and restarted on a
+provenance-aware binary before provenance is trusted. An already-running older
+process can modify vec0 without updating or clearing the sidecar; a later
+read detects changed embedding bytes and returns unknown, but an identical
+BLOB replacement cannot be distinguished. An older binary that boots through
+the canonical `run_migrations` path refuses a ledger version above its
+`latest_schema_version`, both on its initial read and after acquiring the
+migration write lock (`crates/khive-db/src/migrations.rs`, `run_migrations`;
+see also ADR-015's post-consolidation guard). This is a boot guard, not a
+SQLite connection-level fence: an older process that was already open, or
+one that bypasses that boot path, can still write. Mixed-version writes to
+one database are therefore unsupported during cutover. Read-only consumers
+may inspect legacy rows through the new read seam after migration. Other `VectorStore`
+backends may continue compiling through the default `Unsupported` read, but
+Rust code constructing `VectorRecord` literals must add the new optional
+field; the serde default only preserves deserialization of older payloads.
+The earlier Consequences statement that no migration was required applies
+to the original §1-5 trait extensions, not this A4 schema addition.
+
+### Acceptance and gates
+
+- Persist records from the knowledge index and `kkernel reindex` producers and
+  read their provenance back from SQLite. Capture each producer's exact
+  prepared embedding input, including bounding and model prefix, and compute
+  the expected fingerprint independently. Test the distinct note-creation
+  `embedding_content` and reindex `content` renderers. Re-embed unchanged
+  prepared input and observe the same fingerprint; change the prepared input
+  and observe a different one. Verify the supplied `updated_at` round-trips,
+  including fractional seconds. Give each producer claim a failing control.
+- Migrate a database with a vec0 row from the prior canonical ledger version.
+  Its persisted read reports a present vector with null fingerprint and null
+  `updated_at`, not a fabricated current value. A later attributed
+  replacement populates both fields. Test the actual migration chain, not a
+  recreated table that merely resembles the old schema.
+- Replace an attributed row through each lower-level `insert`, `update`, and
+  `insert_exact_only` path with no source text and **byte-identical** embedding
+  BLOB bytes. Assert directly that the resulting sidecar's `text_fingerprint`
+  and `updated_at` are SQL `NULL`, independently of the digest-bound read;
+  also assert the public read returns a present vector with both fields
+  unknown. Include `insert_exact_only`, used by moodboard's deterministic
+  visual embedding path, in the low-level fixture. Name the test
+  `low_level_same_blob_reinsert_clears_provenance`; retaining either old
+  sidecar field must turn it red. Delete a row and verify neither the read nor
+  the sidecar reports it. Inject a transactional failure and verify vec0 and
+  sidecar roll back together. Give rollback a fault-injection test and a
+  control that makes that test fail.
+- Start with attributed rows and a deterministic test embedder, then replace a
+  note through `atomic_message` with the **same** embedding BLOB. Separately,
+  change only an entity's validated `entity_type`, retaining name and
+  description. The normal update path must schedule `reindex_entity` without
+  an explicit call; `entity_embedding_text` omits `entity_type`, so the
+  prepared input and deterministic BLOB remain unchanged. A tag-only or
+  property-only update, followed by an explicit `reindex_entity` call, is a
+  separate same-BLOB case because those patches do not trigger reindexing.
+  After each raw replacement, the vector stays present, both optional fields
+  become unknown, and the old sidecar row is absent after commit. Name the
+  automatic entity-type case
+  `entity_type_update_same_blob_reindex_clears_provenance`; removing the
+  curation route's sidecar clear must fail it. Removing the atomic-message
+  route's clear must fail `atomic_message_same_blob_note_reindex_clears_provenance`:
+  its direct sidecar-row assertion must find the old row absent even though
+  the replacement BLOB is identical.
+- For each subject-only DELETE+INSERT route, seed an attributed vec0 row and
+  sidecar under namespace A, then invoke the raw insertion helper for the
+  same model and subject under namespace B. Its vec0 DELETE removes A's row;
+  assert directly that A's sidecar row is also absent after commit. Adding a
+  namespace-B predicate to either sidecar clear must fail the corresponding
+  `raw_vector_clear_covers_subject_only_delete` fixture.
+- Delete an attributed vector through `atomic_prepare` and assert directly
+  that the sidecar row is absent after commit. A sidecar-unaware fixture may
+  then re-insert identical vec0 bytes to check that the old metadata cannot
+  revive. Removing this route's clear must fail that test, independently of
+  the live-row join.
+- Attribute one note vector in each of two model tables, then update the note
+  with `embed=false`. The `NoteVectors::apply` purge must remove both live vec0
+  rows and their sidecars in the same atomic unit. Assert the sidecar DELETE
+  uses `model_key`, `namespace`, and `subject_id`, and does not remove metadata
+  for an unrelated model/subject. Put a sidecar and vec0 row for the same
+  `subject_id` in a **third** model table under a foreign namespace: the
+  sidecar primary key is `(model_key, subject_id)`, so two namespaces cannot
+  hold that subject in one model table. The local purge must leave that third
+  model's foreign vector and sidecar unchanged. Fault the second model's purge
+  and verify both models' vec0 and sidecar rows roll back. Name the runtime
+  test `note_vectors_embed_false_purge_clears_provenance_across_models`;
+  removing only this route's sidecar DELETE must turn it red.
+- Attribute a newly created note's vector, then run
+  `note_index::compensate_note_creation` at the matching note revision. Its
+  `NoteVectors::apply` purge and note deletion must leave no live vector or
+  matching sidecar. Repeat after advancing the note revision: compensation
+  declines and both vector and sidecar remain. Name the runtime test
+  `note_creation_compensation_clears_provenance`; bypassing the compensation
+  purge must turn it red. For the inheritance branch, start with an attributed
+  vector and a registered embedder, then prepare a text-changing note update
+  with `embed` omitted. Run its plan through `run_atomic_unit` and stop at the
+  committed atomic-unit boundary, **before** consuming post-commit effects.
+  `NoteEmbeddingInheritance::has_rows` is read-only: assert that the returned
+  effect is `ReindexNote` and that the vec0 BLOB and every sidecar column are
+  byte-identical to their pre-update values. Then consume that committed
+  effect separately and assert the ensuing post-commit `reindex_note` clears
+  the old sidecar through `atomic_message` when it replaces the vector. Name
+  the commit-boundary control
+  `note_embedding_inheritance_preserves_provenance_without_delete`; clearing
+  sidecar metadata in `has_rows` must turn its pre-effect assertion red.
+- Replace an attributed vec0 row with **different** embedding bytes through
+  raw test SQL that does not know about or clear the sidecar, standing in for
+  an older or unrecognized writer. The vector remains present, but both
+  optional fields read as unknown because the live-BLOB digest differs.
+  Removing only the digest comparison must fail this test; no known-path
+  clear may mask it.
+- Move an attributed vector between namespaces. Assert the vector remains
+  present under the target with the same embedding BLOB, both optional
+  provenance fields read unknown, and its old sidecar row is absent from
+  both namespaces. Repeat with a target-scoped stale sidecar for another
+  moved subject and an equal BLOB; that sidecar must be absent too. The
+  vector move and sidecar clear must commit atomically.
+  Removing that clear alone must fail a direct sidecar-row assertion, even
+  when the live-row namespace join still rejects stale data.
+- Run `raw_vec0_writer_census_includes_note_vectors_apply` over the production
+  source sites described in A4.3. Pin the exact site and multiplicity
+  inventory for store-owned vec0 DML, the five out-of-store vec0 routes, and
+  non-vector dynamic-target DML; separately pin
+  `namespace_move_fixture::index_row`'s FTS and `{table}_rowids` INSERT
+  templates and `namespace_move_fixture::add_vector_row`'s vec0 INSERT in
+  the test-support class. Do not classify a target from SQL text alone. Pin
+  `delete_vector_statement`'s sole baseline caller,
+  `SqliteVecStore::delete`, and require the builder to become `pub(crate)`.
+  An added caller, even when it reuses the same SQL construction site, must
+  turn the census red until its atomic sidecar behavior is classified.
+  Omitting `NoteVectors::apply` from the vec0 allow-list must turn the test
+  red. Inject an otherwise unlisted production-like function deriving
+  `table = format!("vec_{model_key}")` and issuing both a dynamic-target
+  `DELETE FROM {table}` and an `INSERT INTO {table} ({columns})` whose column
+  list is supplied indirectly. Each injected statement, alone, must add an
+  unclassified site and turn the census red. Removing a pinned dynamic-target
+  non-vector FTS site must also turn it red. Name those controls
+  `raw_vec0_writer_census_rejects_unlisted_dynamic_pair` and
+  `raw_vec0_writer_census_pins_non_vector_dynamic_dml`.
+- Verify two equal-dimension model tables cannot borrow each other's sidecar
+  rows. In one namespace, insert byte-identical vector BLOBs for the same
+  subject into both, but give their sidecars distinct fingerprints and
+  timestamps. Query each model and assert it returns only its own metadata;
+  also assert that the
+  production read statement's join has exactly one matching sidecar row for
+  each model. Deleting `model_key` from the join then creates two matches and
+  must fail this named `model_scoped_identical_blob_provenance` control despite
+  equal digests.
+  Separately, in `namespace_scoped_identical_blob_provenance`, create an
+  attributed vec0 row and sidecar for namespace A, then use raw test SQL to
+  move only that live vec0 row to namespace B while retaining its
+  byte-identical embedding BLOB and leaving A's sidecar untouched. Query B
+  through the production read statement: the vector is present but both
+  provenance fields are unknown, and its sidecar join has zero matches.
+  Removing only the namespace predicate from that join must turn this test
+  red; the equal digest and unchanged model key must not mask the mutation.
+  Reserve the migration number from the next free ledger slot at merge time;
+  do not gate code on a locally staged migration that has not landed in the
+  canonical ledger.
+
+### Alternatives considered
+
+| Alternative                                             | Disposition                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Hash the vector bytes or subject ID                     | Rejected. Neither identifies the exact text submitted to the embedder.                                                                                                                                                                                                                                                                                                                                                   |
+| Infer provenance from `updated_at` or backfill old rows | Rejected. A timestamp does not prove text equality, and legacy rows have no trustworthy vector write time.                                                                                                                                                                                                                                                                                                               |
+| Add nullable columns to every vec0 table                | Deferred for this change. Dynamic virtual tables need a rebuild to change their declared columns; ADR-043 V17 shows that this is possible. A bypass DELETE+INSERT omitting the nullable columns would leave unknown provenance even with identical embedding bytes. The chosen digest-bound sidecar avoids the rebuild but needs a complete raw-writer inventory to protect write time on an identical-BLOB replacement. |
+| Sidecar keyed only by model and subject                 | Rejected. A bypass writer can replace vec0 without touching that row and leave false provenance. Binding the chosen sidecar to the live embedding BLOB reports unknown when the bytes change; identical-byte replacements still require known writers to clear or maintain the sidecar.                                                                                                                                  |
+| Return `None` for unsupported backends                  | Rejected. It would conflate an unsupported read with a proven absent vector.                                                                                                                                                                                                                                                                                                                                             |

@@ -361,6 +361,20 @@ impl NoteVectors {
                     scope,
                 ))
                 .await?;
+            let model_key = table.strip_prefix("vec_").ok_or_else(|| {
+                StorageError::Internal("invalid persisted vector table name".into())
+            })?;
+            writer
+                .execute(statement(
+                    "DELETE FROM vector_provenance \
+                     WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
+                    vec![
+                        SqlValue::Text(model_key.to_string()),
+                        SqlValue::Text(self.namespace.clone()),
+                        SqlValue::Text(self.subject_id.to_string()),
+                    ],
+                ))
+                .await?;
         }
         Ok(())
     }

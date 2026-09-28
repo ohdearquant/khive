@@ -106,6 +106,7 @@ fn build_vector_corpus() -> Vec<VectorRecord> {
             field: "content".to_string(),
             embedding_model: Some(MODEL_KEY.to_string()),
             vectors: vec![gen_vector(&mut rng, VECTOR_DIMS)],
+            text_fingerprint: None,
             updated_at: Utc::now(),
         })
         .collect()
@@ -547,6 +548,7 @@ fn bench_vec_insert_batch(c: &mut Criterion) {
                                 field: "content".to_string(),
                                 embedding_model: Some(MODEL_KEY.to_string()),
                                 vectors: vec![gen_vector(&mut rng, VECTOR_DIMS)],
+                                text_fingerprint: None,
                                 updated_at: Utc::now(),
                             })
                             .collect();

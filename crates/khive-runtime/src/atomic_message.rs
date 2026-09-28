@@ -210,6 +210,9 @@ pub(crate) fn vector_insert_statements(
     label_prefix: &str,
 ) -> Vec<PlanStatement> {
     let subject = subject_id.to_string();
+    let model_key = table
+        .strip_prefix("vec_")
+        .expect("runtime vector tables use the vec_ prefix");
     let kind_str = SubstrateKind::Note.to_string();
     let blob = f32_vec_to_bytes(embedding);
     vec![
@@ -240,6 +243,21 @@ pub(crate) fn vector_insert_statements(
                 sql: format!("DELETE FROM {table} WHERE subject_id = ?1"),
                 params: vec![SqlValue::Text(subject.clone())],
                 label: Some(format!("{label_prefix}-delete")),
+            },
+            guard: None,
+        },
+        // A replacement through this raw atomic plan does not know the source
+        // text, even if its new vector bytes happen to equal the old bytes.
+        PlanStatement {
+            statement: SqlStatement {
+                sql: "DELETE FROM vector_provenance \
+                      WHERE model_key = ?1 AND subject_id = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(model_key.to_string()),
+                    SqlValue::Text(subject.clone()),
+                ],
+                label: Some(format!("{label_prefix}-clear-provenance")),
             },
             guard: None,
         },
