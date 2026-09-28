@@ -764,7 +764,8 @@ const UUID_CANONICAL_LEN: usize = 36;
 /// purpose is to give callers a stable chaining handle, so shortening them
 /// would produce a value that the corresponding strict verb rejects.
 fn should_shorten_uuid_field(key: &str) -> bool {
-    if key == "full_id" || ROUND_TRIP_FULL_UUID_FIELDS.contains(&key) {
+    if key == "full_id" || key == "bridge_instance_id" || ROUND_TRIP_FULL_UUID_FIELDS.contains(&key)
+    {
         return false;
     }
     key == "id" || key.ends_with("_id") || matches!(key, "superseded_by" | "replaced_by")
