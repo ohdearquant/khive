@@ -3,8 +3,20 @@ use serde_json::{json, Value};
 use std::{
     fs::{self, OpenOptions},
     io::{self, BufRead, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+fn wait_for_release(path: &str, suffix: &str) {
+    let marker = format!("{path}.{suffix}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(&marker).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture release marker missing: {suffix}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn main() {
     let Some(path) = std::env::args().nth(1).filter(|arg| !arg.starts_with('-')) else {
@@ -52,6 +64,9 @@ fn main() {
                 if let Some(delay_ms) = state["catalog_delay_ms"].as_u64() {
                     std::thread::sleep(Duration::from_millis(delay_ms));
                 }
+                if state["block_catalog"] == true {
+                    wait_for_release(&path, "release_catalog");
+                }
                 json!({"tools": state["tools"]})
             }
             "tools/call" => {
@@ -72,6 +87,7 @@ fn main() {
                     }
                     Some("timeout") => std::thread::sleep(Duration::from_secs(10)),
                     Some("delay") => std::thread::sleep(Duration::from_millis(300)),
+                    Some("block") => wait_for_release(&path, "release_call"),
                     Some("malformed") => {
                         println!(
                             "{}",

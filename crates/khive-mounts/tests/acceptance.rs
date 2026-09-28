@@ -81,6 +81,19 @@ fn count(path: &Path, suffix: &str) -> usize {
         .count()
 }
 
+async fn wait_for_count(path: &Path, suffix: &str, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if count(path, suffix) >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fixture did not reach {suffix} count {expected}"));
+}
+
 #[tokio::test]
 async fn pin_drift_unknown_repin_and_public_catalog() {
     let dir = tempfile::tempdir().unwrap();
@@ -169,24 +182,40 @@ async fn queued_call_expiring_during_catalog_refresh_never_reaches_source() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
     write_catalog(&path, &["A"], false);
-    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    state["catalog_delay_ms"] = json!(200);
-    fs::write(&path, state.to_string()).unwrap();
     let runtime = runtime();
     let mut cfg = config(&path, &["A"]);
-    cfg.timeout_ms = 600;
+    cfg.timeout_ms = 3000;
     let registry = registry(&runtime, cfg, false).await;
+    let starts = count(&path, ".starts");
 
-    let first = registry.dispatch("demo.A", json!({"mode": "delay"}));
-    let second = async {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        registry.dispatch("demo.A", json!({})).await
-    };
-    let (first, second) = tokio::join!(first, second);
+    // Keep the first source call in flight while the second call enters the
+    // client's queue. The fixture marker replaces the 600 ms timing race.
+    let first = registry.dispatch("demo.A", json!({"mode": "block"}));
+    tokio::pin!(first);
+    tokio::select! {
+        result = &mut first => panic!("first call completed before reaching the source: {result:?}"),
+        _ = wait_for_count(&path, ".calls", 1) => {}
+    }
+    let catalogs = count(&path, ".catalogs");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["block_catalog"] = json!(true);
+    fs::write(&path, state.to_string()).unwrap();
+    let second = registry.dispatch("demo.A", json!({}));
+    tokio::pin!(second);
+    tokio::select! {
+        result = &mut second => panic!("queued call completed before first was released: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+    }
+    fs::write(path.with_extension("release_call"), "").unwrap();
+    let first = first.await;
     assert!(
         first.is_ok(),
         "the first call must finish inside its deadline"
     );
+    wait_for_count(&path, ".catalogs", catalogs + 1).await;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second.as_mut())
+        .await
+        .expect("the queued call must return by its deadline");
     let error = second.expect_err("the queued call must expire during catalog refresh");
     let khive_runtime::RuntimeError::Khive(error) = error else {
         panic!("queued timeout must use the normal error envelope")
@@ -195,11 +224,28 @@ async fn queued_call_expiring_during_catalog_refresh_never_reaches_source() {
         serde_json::to_value(error).unwrap()["details"]["class"],
         "tool_timeout"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert_eq!(
         count(&path, ".calls"),
         1,
         "the expired queued call must not be sent"
+    );
+
+    // A timeout is fatal to this connection. The supervisor kills the blocked
+    // fixture before it can reply to tools/list, then starts a fresh one.
+    state["block_catalog"] = Value::Null;
+    let updated = path.with_extension("new");
+    fs::write(&updated, state.to_string()).unwrap();
+    fs::rename(updated, &path).unwrap();
+    wait_for_count(&path, ".starts", starts + 1).await;
+    assert_eq!(count(&path, ".starts"), starts + 1);
+    registry
+        .dispatch("demo.A", json!({}))
+        .await
+        .expect("the restarted source must accept a later call");
+    assert_eq!(
+        count(&path, ".calls"),
+        2,
+        "only the first and recovery calls may reach the source"
     );
 }
 
