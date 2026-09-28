@@ -8,14 +8,14 @@ The memory pack keeps one Vamana approximate-nearest-neighbor (ANN) index per em
 
 `AnnState` owns six production coordination mechanisms:
 
-| State              | Purpose                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------ |
-| `indexes`          | Installed `AnnBridge` values, keyed by model.                                              |
-| `warming`          | Synchronous fire-once guard for background rebuild tasks.                                  |
-| `model_locks`      | Async per-model single-flight locks shared by boot warm, background warm, and cold recall. |
-| `generations`      | In-process monotonic write generation for each model.                                      |
-| `last_epoch_check` | Debounce timestamps for the durable epoch query.                                           |
-| `rotation_watch_started` | Idempotence guard for the file-generation watcher.                                  |
+| State                    | Purpose                                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------------ |
+| `indexes`                | Installed `AnnBridge` values, keyed by model.                                              |
+| `warming`                | Synchronous fire-once guard for background rebuild tasks.                                  |
+| `model_locks`            | Async per-model single-flight locks shared by boot warm, background warm, and cold recall. |
+| `generations`            | In-process monotonic write generation for each model.                                      |
+| `last_epoch_check`       | Debounce timestamps for the durable epoch query.                                           |
+| `rotation_watch_started` | Idempotence guard for the file-generation watcher.                                         |
 
 `warming` deliberately uses `std::sync::Mutex`: its critical sections never await, and `WarmingGuard::drop` must release the key synchronously on success, error, or panic. The model-lock map is separate: `warming` prevents duplicate fire-and-forget tasks, while `model_locks` lets concurrent callers wait for the same actual warm attempt. The outer map lock is held only while looking up an `Arc<tokio::sync::Mutex<()>>`, so unrelated models do not contend during builds.
 
@@ -81,7 +81,7 @@ whole-session bound for abandoned stdio clients, but mmap release does not depen
 
 `ensure_ann_background` is the non-blocking stale-cache path. It captures the current generation before its fast-path freshness test, synchronously claims the `warming` key, and registers a tracked runtime task. Tracking matters: daemon shutdown drains these tasks instead of abandoning an unaccounted `tokio::spawn`.
 
-The task runs a bounded sequence of rebuild attempts. A write that lands during an attempt makes its generation floor stale. The task retries against the newer floor; if the attempt bound is exhausted and the graph is still stale, it releases `warming` before re-enqueueing. Releasing first is load-bearing because the chained call must be able to claim the same key. Chained tasks delay one second in production (five milliseconds in tests) so continuous writes coalesce instead of producing an unbounded immediate rebuild chain.
+The task runs a bounded sequence of rebuild attempts. A write that lands during an attempt makes its generation floor stale. The task retries against the newer floor; if the attempt bound is exhausted and the graph is still stale, it releases `warming` before re-enqueueing. Releasing first is load-bearing because the chained call must be able to claim the same key. Only the first attempt of a chained task delays; the initial rebuild does not. The delay defaults to 30 seconds in production (five milliseconds in tests), and `KHIVE_ANN_REBUILD_DEBOUNCE_MS` overrides it with a millisecond value. It coalesces continuous writes rather than bounding freshness for a read. See [ADR-107 Amendment 1](../../../../docs/adr/ADR-107-memory-ann-lifecycle.md#amendment-1-2026-09-27-chained-rebuild-debounce).
 
 The RAII `WarmingGuard` owns guard release on every exit path. Benign shutdown cancellation is logged at debug level; genuine build errors remain warnings.
 

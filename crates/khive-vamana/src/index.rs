@@ -1177,11 +1177,13 @@ impl VamanaIndex {
         })
     }
 
-    /// Crash-safe v2 save: writes `vectors.bin`, `graph.bin`, and `lifecycle.bin`, then
-    /// atomically renames `metadata.bin.tmp` → `metadata.bin` as the commit record. A
-    /// crash at any point before that rename leaves the previous `metadata.bin` (v1 or
-    /// v2) valid and untouched — [`Self::load_or_build`] never observes a torn v2
-    /// commit. Publication is serialized per directory; a candidate whose applied
+    /// Crash-safe v2 save: stages `vectors.bin`, `graph.bin`, `lifecycle.bin`, and
+    /// `codes.bin`, then renames and fsyncs `metadata.bin` before promoting the four
+    /// segments. A crash after metadata promotion can leave mixed-generation live
+    /// segments; raw [`Self::load`] rejects a checksum mismatch, while
+    /// [`Self::load_or_build`] rebuilds from the caller's corpus. See
+    /// [ADR-052 Amendment 1](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-052-ann-production-lifecycle.md#amendment-1-2026-09-27-v2-segment-promotion-after-metadata).
+    /// Publication is serialized per directory; a candidate whose applied
     /// sequence is lower than the incumbent returns
     /// [`VamanaError::CheckpointSequenceRegression`] before staging any files. See
     /// crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load for the
