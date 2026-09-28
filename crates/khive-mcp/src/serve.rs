@@ -3285,6 +3285,14 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         .apply_schema_plans_with_map(&backend_for_pack, main_ref)
         .map_err(|e| anyhow::anyhow!("pack schema boot failure: {e}"))?;
 
+    let mut quarantine_sources: Vec<_> = backends
+        .iter()
+        .map(|(name, backend)| (name.as_str(), backend.as_ref()))
+        .collect();
+    quarantine_sources.sort_by(|left, right| left.0.cmp(right.0));
+    crate::legacy_quarantine::repair_legacy_quarantine(&default_runtime, &quarantine_sources)
+        .await?;
+
     // Wrap runtimes in Arc for the coordinator's BackendRegistry.
     let per_pack_runtimes_arc: HashMap<String, Arc<KhiveRuntime>> = per_pack_runtimes_local
         .into_iter()
@@ -4036,6 +4044,8 @@ async fn build_single_backend_runtime_with_max_readers(
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
     }
+    crate::legacy_quarantine::repair_legacy_quarantine(&runtime, &[("main", runtime.backend())])
+        .await?;
     Ok(runtime)
 }
 
