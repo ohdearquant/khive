@@ -1456,19 +1456,26 @@ fn validate_entity_type_note_kind_collisions(
         }
     }
 
+    let check_definition = |definition: &EntityTypeDef, owner: &str| {
+        for name in std::iter::once(definition.type_name).chain(definition.aliases.iter().copied())
+        {
+            let normalized = khive_types::to_snake_case(name);
+            if let Some(note_owner) = note_kinds.get(&normalized) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "entity subtype {name:?} from {owner:?} collides with note kind {normalized:?} from pack {note_owner:?}"
+                )));
+            }
+        }
+        Ok(())
+    };
+
+    let builtin = khive_types::EntityTypeRegistry::builtin();
+    for definition in builtin.definitions() {
+        check_definition(definition, "builtin")?;
+    }
     for pack in packs {
         for definition in pack.entity_types() {
-            for name in
-                std::iter::once(definition.type_name).chain(definition.aliases.iter().copied())
-            {
-                let normalized = khive_types::to_snake_case(name);
-                if let Some(note_owner) = note_kinds.get(&normalized) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "entity subtype {name:?} from pack {:?} collides with note kind {normalized:?} from pack {note_owner:?}",
-                        pack.name()
-                    )));
-                }
-            }
+            check_definition(definition, pack.name())?;
         }
     }
     Ok(())
@@ -7469,6 +7476,84 @@ pub(crate) mod tests {
         let message = error.to_string();
         assert!(message.contains("entity subtype") && message.contains("note kind"));
         assert!(message.contains("reference") && message.contains("cross_kind_collision"));
+    }
+
+    #[test]
+    fn builtin_entity_subtype_cannot_shadow_a_note_kind_at_composition() {
+        macro_rules! note_pack {
+            ($name:ident, $pack_name:literal, $note_kind:literal) => {
+                struct $name;
+                impl Pack for $name {
+                    const NAME: &'static str = $pack_name;
+                    const NOTE_KINDS: &'static [&'static str] = &[$note_kind];
+                    const ENTITY_KINDS: &'static [&'static str] = &[];
+                    const HANDLERS: &'static [HandlerDef] = &[];
+                }
+                #[async_trait]
+                impl PackRuntime for $name {
+                    fn name(&self) -> &str {
+                        Self::NAME
+                    }
+                    fn note_kinds(&self) -> &'static [&'static str] {
+                        Self::NOTE_KINDS
+                    }
+                    fn entity_kinds(&self) -> &'static [&'static str] {
+                        Self::ENTITY_KINDS
+                    }
+                    fn handlers(&self) -> &'static [HandlerDef] {
+                        Self::HANDLERS
+                    }
+                    async fn dispatch(
+                        &self,
+                        _verb: &str,
+                        _params: Value,
+                        _registry: &VerbRegistry,
+                        _token: &NamespaceToken,
+                    ) -> Result<Value, RuntimeError> {
+                        Ok(Value::Null)
+                    }
+                }
+            };
+        }
+
+        note_pack!(
+            ResearchReportNotePack,
+            "builtin_report_collision",
+            "research_report"
+        );
+        note_pack!(PreprintNotePack, "builtin_preprint_collision", "preprint");
+        note_pack!(
+            SpacedReportNotePack,
+            "builtin_spaced_collision",
+            "Research Report"
+        );
+
+        fn expect_collision<P: Pack + PackRuntime + 'static>(pack: P, owner: &str, token: &str) {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(pack);
+            let error = builder
+                .build()
+                .err()
+                .expect("a built-in subtype/note-kind collision must refuse composition");
+            let message = error.to_string();
+            assert!(
+                message.contains("builtin")
+                    && message.contains(owner)
+                    && message.contains(token),
+                "collision must name the built-in subtype, note pack, and normalized token: {message}"
+            );
+        }
+        expect_collision(
+            ResearchReportNotePack,
+            "builtin_report_collision",
+            "research_report",
+        );
+        expect_collision(PreprintNotePack, "builtin_preprint_collision", "preprint");
+        expect_collision(
+            SpacedReportNotePack,
+            "builtin_spaced_collision",
+            "research_report",
+        );
     }
 
     // ---- Gate wiring ----
