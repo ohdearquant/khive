@@ -70,6 +70,26 @@ class LedgerRoundTripTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(bench_track.read_records("nonexistent", data_dir=pathlib.Path(tmp)), [])
 
+    def test_component_reader_keeps_shard_history_and_transitional_flat_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            shard_dir = data_dir / "components"
+            shard_dir.mkdir()
+            records = [
+                bench_track.build_record("components", {"m": float(i)}, char * 40, "main", run_id=str(i))
+                for i, char in enumerate(("a", "b", "c"), 1)
+            ]
+            for path, record in zip(
+                (shard_dir / "000001.jsonl", shard_dir / "000002.jsonl", data_dir / "components.jsonl"),
+                records,
+            ):
+                path.write_text(json.dumps(record, sort_keys=True) + "\n")
+
+            self.assertEqual(bench_track.read_records("components", data_dir=data_dir), records)
+            rendered = bench_track.render_trend_markdown("components", data_dir=data_dir)
+            self.assertIn("runs in window: 3 (of 3 total)", rendered)
+            self.assertIn("latest sha: `cccccccc`", rendered)
+
 
 class TrendMarkdownTests(unittest.TestCase):
     def test_render_empty_ledger(self):
