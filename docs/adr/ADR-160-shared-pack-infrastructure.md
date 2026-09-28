@@ -295,6 +295,26 @@ object whose stored bytes exceed its reported size still refused.
 
 **Refs.** #3325
 
+#### Amendment 3 (2026-09-28): prior blob size is a reservation only
+
+Status: Accepted (2026-09-28; #3484).
+
+**Context.** Amendment 2 correctly says that the earlier `size()` result is a reservation, not
+proof of the later read. Its following sentence incorrectly treats that result as an expected
+length: it says an object shorter than the earlier size fails with `BlobSizeMismatch`. D2 instead
+compares the bounded read's own metadata with the bytes read. `get_bounded_verified` accepts
+`max_bytes`, not an expected length.
+
+**Decision.** This amendment supersedes Amendment 2's sentence containing "a stored object longer than the size read
+fails with `BlobTooLarge`, a shorter one with `BlobSizeMismatch`".
+Bytes beyond the earlier size passed as `max_bytes` fail with `BlobTooLarge`. A complete object
+shorter than that bound does not fail merely for being shorter: read-local metadata and final
+length must agree, and the bytes must match `content_ref`. A read-local metadata/length
+disagreement fails with `BlobSizeMismatch`; a wrong digest fails with `BlobDigestMismatch`.
+`blob.get` checks requested ranges against the verified length after hydration. The earlier
+`size()` remains the admission reservation, with no equality guarantee; D2, D3, and Amendment 2's
+reservation decision are otherwise unchanged.
+
 ### D4 — Artifact consumers converge on ADR-121 attachments
 
 The shared blob operation is independent of record modeling. Packs attach original bytes through
