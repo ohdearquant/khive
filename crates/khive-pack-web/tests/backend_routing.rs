@@ -259,6 +259,7 @@ async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
     let main_attachments = fixture.main.attachments().unwrap();
     let web_attachments = fixture.routed.backend().attachments().unwrap();
     let mut rooted = 0;
+    let mut selected = 0;
     for entity in records {
         let roots = main_attachments.list_attachments(entity.id).await.unwrap();
         assert!(web_attachments
@@ -275,11 +276,27 @@ async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
             assert_eq!(roots[0].role, "content");
             assert_eq!(roots[0].content_ref.as_str(), reference);
             rooted += 1;
+            if entity
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("url"))
+                .is_some()
+            {
+                let properties = entity.properties.as_ref().unwrap();
+                assert_eq!(properties["request_headers"], json!({}));
+                assert_eq!(properties["vary"], json!([]));
+                assert!(
+                    entity.content_ref.is_none(),
+                    "the routed graph has no local content attachment projection"
+                );
+                selected += 1;
+            }
         } else {
             assert!(roots.is_empty());
         }
     }
     assert!(rooted >= 2, "page and resource each root their body");
+    assert_eq!(selected, 2, "both disk documents persist selection context");
     for note in notes {
         assert!(main_attachments
             .list_attachments(note.id)

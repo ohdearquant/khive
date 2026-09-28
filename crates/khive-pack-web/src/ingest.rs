@@ -77,6 +77,9 @@ async fn ingest_disk_file(
         Some((bytes, false)),
     )
     .await?;
+    // Disk content has no HTTP request at all: unlike an unnegotiated GET,
+    // it cannot claim the client's fixed Accept-Encoding was sent.
+    crate::fetch::persist_disk_context(runtime, token, &settled).await?;
 
     let canonical = identity::canonicalize(target_url);
     let request_record = json!({
@@ -570,6 +573,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(index_entity.entity_type.as_deref(), Some("page"));
+        let index_properties = index_entity.properties.as_ref().unwrap();
+        assert_eq!(index_properties["request_headers"], json!({}));
+        assert_eq!(index_properties["vary"], json!([]));
+        assert!(index_properties["content_language"].is_null());
         let sub_entity = runtime
             .entities(&token)
             .unwrap()
@@ -666,6 +673,7 @@ mod tests {
                     std::time::Instant::now() + std::time::Duration::from_secs(5),
                 )
                 .await?;
+                let response_headers = outcome.headers.clone();
                 let content_type = outcome
                     .headers
                     .get("content-type")
@@ -682,6 +690,8 @@ mod tests {
                     outcome.body,
                 )
                 .await?;
+                crate::fetch::persist_get_context(runtime, token, &settled, &[], &response_headers)
+                    .await?;
                 Ok(json!({ "id": settled.id.to_string() }))
             })
         }
@@ -891,7 +901,30 @@ mod tests {
         };
         assert_eq!(sorted_ids(&disk_reply).len(), 3);
         assert_eq!(sorted_ids(&disk_reply), sorted_ids(&crawl_reply));
-        assert_eq!(disk_graph, graph_snapshot(&http_runtime, &http_token).await);
+        let http_graph = graph_snapshot(&http_runtime, &http_token).await;
+        // Disk ingestion sent no HTTP request. The served GET sent the
+        // client's fixed gzip negotiation, so that one provenance field must
+        // differ even though document identities, bodies and edges agree.
+        for (graph, expected_context) in [
+            (&disk_graph, json!({})),
+            (&http_graph, json!({"accept-encoding": ["gzip"]})),
+        ] {
+            for entity in graph.0.as_array().unwrap() {
+                if entity["entity_type"] == "page" {
+                    assert_eq!(entity["properties"]["request_headers"], expected_context);
+                }
+            }
+        }
+        let comparable = |graph: &(Value, Vec<(Uuid, String, Uuid)>)| {
+            let mut entities = graph.0.clone();
+            for entity in entities.as_array_mut().unwrap() {
+                if let Some(properties) = entity["properties"].as_object_mut() {
+                    properties.remove("request_headers");
+                }
+            }
+            (entities, graph.1.clone())
+        };
+        assert_eq!(comparable(&disk_graph), comparable(&http_graph));
         assert_eq!(
             disk_graph,
             graph_snapshot(&disk_runtime, &disk_token).await,
