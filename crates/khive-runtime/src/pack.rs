@@ -1826,7 +1826,7 @@ fn extract_table_names(stmt: &str) -> Vec<String> {
             }
             continue;
         }
-        if matches!(ch, '"' | '`' | '[') {
+        if matches!(ch, '"' | '`' | '[' | '\'') {
             let closing = if ch == '[' { ']' } else { ch };
             let mut token = String::new();
             while let Some(next) = chars.next() {
@@ -1853,7 +1853,7 @@ fn extract_table_names(stmt: &str) -> Vec<String> {
             let begins_comment = (next == '-' && chars.clone().nth(1) == Some('-'))
                 || (next == '/' && chars.clone().nth(1) == Some('*'));
             if next.is_whitespace()
-                || matches!(next, '.' | '(' | ';' | '"' | '`' | '[')
+                || matches!(next, '.' | '(' | ';' | '"' | '`' | '[' | '\'')
                 || begins_comment
             {
                 break;
@@ -16190,6 +16190,83 @@ mod help_tests {
                 .query_row(
                     "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'shared'",
                     [],
+                    |row| row.get(0),
+                )
+                .expect("schema count");
+            assert_eq!(table_count, 0, "collision must precede all pack DDL");
+        }
+    }
+
+    #[test]
+    fn sqlite_accepts_single_quoted_table_names() {
+        let cases = [
+            ("shared", "CREATE TABLE 'shared' (id INTEGER)"),
+            ("sh'ared", "CREATE TABLE 'sh''ared' (id INTEGER)"),
+        ];
+        for (name, statement) in cases {
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            backend
+                .apply_pack_ddl_statements(&[statement])
+                .expect("SQLite accepts the table name");
+            let actual: String = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .expect("created table");
+            assert_eq!(actual, name);
+        }
+    }
+
+    #[test]
+    fn single_quoted_table_names_collide_before_ddl() {
+        let cases: [(
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+        ); 2] = [
+            (
+                "shared",
+                &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+                &["CREATE TABLE IF NOT EXISTS 'shared' (id INTEGER)"],
+            ),
+            (
+                "sh'ared",
+                &["CREATE TABLE IF NOT EXISTS \"sh'ared\" (id INTEGER)"],
+                &["CREATE TABLE IF NOT EXISTS 'sh''ared' (id INTEGER)"],
+            ),
+        ];
+        for (name, unquoted_or_double_quoted, single_quoted) in cases {
+            let backend = khive_db::StorageBackend::memory().expect("memory backend");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_alpha",
+                statements: unquoted_or_double_quoted,
+                column_additions: &[],
+            }));
+            builder.register_boxed(Box::new(SchemaPack {
+                pack_name: "pack_beta",
+                statements: single_quoted,
+                column_additions: &[],
+            }));
+            let registry = builder.build().expect("registry builds");
+            let error = registry
+                .apply_schema_plans_with_map(&HashMap::new(), &backend)
+                .expect_err("both declarations own one SQLite table");
+            assert_eq!(error.pack_a, "pack_alpha");
+            assert_eq!(error.pack_b, "pack_beta");
+            assert_eq!(error.table, name);
+            let table_count: i64 = backend
+                .pool()
+                .reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [name],
                     |row| row.get(0),
                 )
                 .expect("schema count");

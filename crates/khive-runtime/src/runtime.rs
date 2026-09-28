@@ -540,6 +540,9 @@ impl KhiveRuntime {
     /// After this call, `self.core()` returns a handle to `core` rather than
     /// cloning `self`. The caller (the boot path, not pack code) is responsible
     /// for passing the correct main backend.
+    /// Binding a different core clears its named-vector cache and prior main
+    /// embedder wiring. Call [`Self::with_core_embedders_from`] with the new main
+    /// runtime after rebinding when core-routed writes require its embedders.
     ///
     /// Panics in debug builds if `self.config.backend_id == BackendId::MAIN`,
     /// because the main runtime does not need a core pointer.
@@ -550,6 +553,14 @@ impl KhiveRuntime {
             "with_core_backend must not be called on the main runtime"
         );
         core.pool().main_pool_generation();
+        if self
+            .core_backend
+            .as_ref()
+            .is_some_and(|previous| !Arc::ptr_eq(previous, &core))
+        {
+            self.core_named_vector_stores = None;
+            self.core_embedders = None;
+        }
         if self.core_named_vector_stores.is_none() {
             self.core_named_vector_stores = Some(Arc::new(RwLock::new(HashMap::new())));
         }
@@ -4220,6 +4231,74 @@ mod tests {
             main_backend.pool().writer_acquisition_snapshot(),
             writer_before
         );
+    }
+
+    #[tokio::test]
+    async fn rebound_core_named_vector_lookup_uses_new_backend() {
+        let first_backend = migrated_memory_backend();
+        let second_backend = migrated_memory_backend();
+        let secondary = KhiveRuntime::from_backend(migrated_memory_backend(), secondary_config())
+            .with_core_backend(Arc::clone(&first_backend));
+        let identity = NamedVectorIdentity::new("rebound_visual", "model-a", 4).unwrap();
+        let first_core = secondary.core();
+        let first_token = first_core.authorize(Namespace::local()).expect("authorize");
+        let first_store = first_core
+            .vectors_for_named_identity(&first_token, &identity)
+            .await
+            .expect("first backend store");
+
+        let rebound = secondary.with_core_backend(Arc::clone(&second_backend));
+        let second_core = rebound.core();
+        let second_token = second_core
+            .authorize(Namespace::local())
+            .expect("authorize");
+        let second_store = second_core
+            .vectors_for_named_identity(&second_token, &identity)
+            .await
+            .expect("second backend store");
+        assert!(
+            !Arc::ptr_eq(&first_store, &second_store),
+            "the second backend needs its own vector store"
+        );
+        let registered = second_core
+            .list_embedding_models(Some("rebound_visual"))
+            .await
+            .expect("second backend model registry");
+        assert!(registered.iter().any(|record| {
+            record.model_id == "model-a"
+                && record.key_version == "rebound_visual"
+                && record.dimensions == 4
+        }));
+    }
+
+    #[test]
+    fn rebound_core_discards_previous_main_embedder_wiring() {
+        let first_backend = migrated_memory_backend();
+        let second_backend = migrated_memory_backend();
+        let first_main =
+            KhiveRuntime::from_backend(Arc::clone(&first_backend), RuntimeConfig::no_embeddings());
+        let second_main =
+            KhiveRuntime::from_backend(Arc::clone(&second_backend), RuntimeConfig::no_embeddings());
+        let secondary = KhiveRuntime::from_backend(migrated_memory_backend(), secondary_config())
+            .with_core_embedders_from(&first_main)
+            .with_core_backend(Arc::clone(&first_backend));
+        assert!(secondary.core_embedders.is_some());
+
+        let rebound = secondary.with_core_backend(Arc::clone(&second_backend));
+        assert!(
+            rebound.core_embedders.is_none(),
+            "the second backend cannot use the first main runtime's embedders"
+        );
+        assert!(Arc::ptr_eq(
+            &rebound.core().embedder_registry,
+            &rebound.embedder_registry
+        ));
+
+        let rewired = rebound.with_core_embedders_from(&second_main);
+        assert!(Arc::ptr_eq(
+            &rewired.core().embedder_registry,
+            &second_main.embedder_registry
+        ));
     }
 
     #[tokio::test]
