@@ -910,3 +910,37 @@ process doing the work: `KHIVE_ANN_FRESH_TAIL` (ADR-118; `crates/khive-runtime/s
 ### References (Amendment 2)
 
 - #3182, #3161
+
+---
+
+## Amendment 3 (2026-09-27): interrupted v2 save can require Cold/rebuild
+
+**Status**: Accepted (2026-09-27) ([#3463](https://github.com/ohdearquant/khive/issues/3463)).
+
+### Context
+
+§1 inherits ADR-052's original “segments first, metadata last” protocol. The
+implemented `VamanaIndex::save_atomic` stages four data segments under `.v2new`
+names, renames and fsyncs `metadata.bin`, then promotes the staged data segments
+and fsyncs again. Thus the original §1 assertion that metadata is written last is
+not an accurate description of the current file order. Amendment 1's crash window
+“between `save_atomic` and log compaction” starts **after a successful**
+`save_atomic`; it does not describe a process crash inside the save itself.
+
+### Correction
+
+Before metadata promotion, the previous metadata and live data segments remain
+together. After metadata promotion and before the last segment promotion, a process
+crash may leave a mixed generation. If any live segment differs from the new
+record's checksum, raw `VamanaIndex::load` fails, and a consumer with the live
+corpus must classify the unreadable segment Cold and rebuild it rather than adopt
+it as Hot or Stale. Identical old and new segment bytes may still validate.
+Registry raise, delta-log compaction, and mmap re-adoption follow only a successful
+save, so an interrupted save does not advance those steps on the basis of the
+unreadable commit. The database vector rows and delta log remain the recovery
+source of truth.
+
+This corrects §1's save-order and interrupted-save recovery wording while retaining
+Amendment 1's ordering for a **completed** save, the checksum/fingerprint gates,
+and the Hot/Stale/Cold decision table. ADR-052 Amendment 1 records the
+same index-level file sequence.
