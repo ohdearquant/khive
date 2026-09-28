@@ -252,10 +252,12 @@ fn with_git_diagnostics(
     operation: &str,
     run: impl FnOnce(&mut std::process::Child) -> Result<(), CacheError>,
 ) -> Result<(), CacheError> {
-    let mut child = command
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| CacheError::Git(format!("spawning {operation}: {error}")))?;
+    command.stderr(Stdio::piped());
+    let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .map_err(|error| CacheError::Git(format!("spawning {operation}: {error}")))?;
     let stderr = match DiagnosticPipe::new(child.stderr.take().expect("stderr configured as piped"))
     {
         Ok(stderr) => stderr,
@@ -310,10 +312,12 @@ fn with_git_diagnostics(
     operation: &str,
     run: impl FnOnce(&mut std::process::Child) -> Result<(), CacheError>,
 ) -> Result<(), CacheError> {
-    let mut child = command
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| CacheError::Git(format!("spawning {operation}: {error}")))?;
+    command.stderr(Stdio::null());
+    let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .map_err(|error| CacheError::Git(format!("spawning {operation}: {error}")))?;
     run(&mut child)
 }
 
@@ -1483,11 +1487,17 @@ fn advance_to_fetched_tip(repo: &Path, slot: &ValidatedSlot) -> Result<(), Cache
     // repository if the slot vanishes or is symlink-swapped mid-sequence.
     // (`set-head` also prints "origin/HEAD is unchanged..." to stdout, which
     // `git_at_slot` nulls so it cannot corrupt the caller's stdout stream.)
-    let _ = git_at_slot(repo, slot)
-        .args(["remote", "set-head", "origin", "--auto"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::null())
-        .status();
+    let _ = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || {
+            git_at_slot(repo, slot)
+                .args(["remote", "set-head", "origin", "--auto"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdout(Stdio::null())
+                .spawn()
+        },
+    )
+    .and_then(|mut child| child.wait());
 
     // A fresh slot's HEAD is a symref to the default branch, so the branch is
     // what has to move for `rev-parse HEAD` and `log` to resolve at the tip.
@@ -1495,10 +1505,18 @@ fn advance_to_fetched_tip(repo: &Path, slot: &ValidatedSlot) -> Result<(), Cache
     // the HEAD file itself is the target. Both shapes occur: the first is
     // what `git clone` produces, the second is reachable through repair paths
     // and through slots older than this code.
-    let symref = git_at_slot(repo, slot)
-        .args(["symbolic-ref", "-q", "HEAD"])
-        .output()
-        .map_err(|e| CacheError::Git(format!("spawning git symbolic-ref: {e}")))?;
+    let symref = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || {
+            git_at_slot(repo, slot)
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+        },
+    )
+    .and_then(|child| child.wait_with_output())
+    .map_err(|e| CacheError::Git(format!("spawning git symbolic-ref: {e}")))?;
     let branch = String::from_utf8_lossy(&symref.stdout).trim().to_string();
 
     let mut cmd = git_at_slot(repo, slot);
@@ -1510,11 +1528,13 @@ fn advance_to_fetched_tip(repo: &Path, slot: &ValidatedSlot) -> Result<(), Cache
     } else {
         cmd.arg("--no-deref").arg("HEAD");
     }
-    let status = cmd
-        .arg("refs/remotes/origin/HEAD")
-        .stdout(Stdio::null())
-        .status()
-        .map_err(|e| CacheError::Git(format!("spawning git update-ref: {e}")))?;
+    cmd.arg("refs/remotes/origin/HEAD").stdout(Stdio::null());
+    let status = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || cmd.spawn(),
+    )
+    .and_then(|mut child| child.wait())
+    .map_err(|e| CacheError::Git(format!("spawning git update-ref: {e}")))?;
     if !status.success() {
         return Err(CacheError::Git(format!(
             "advancing {} to the fetched tip failed (exit {status}); a stale \

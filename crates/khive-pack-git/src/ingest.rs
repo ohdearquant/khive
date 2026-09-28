@@ -28,6 +28,10 @@ use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
 use crate::sql::sql;
+use khive_runtime::process_retry::{
+    spawn_retrying_executable_busy, spawn_retrying_executable_busy_async,
+    EXECUTABLE_BUSY_BACKOFF_MS,
+};
 
 #[cfg(test)]
 #[path = "commit_text_tests.rs"]
@@ -43,7 +47,6 @@ const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const GH_STDOUT_LIMIT: usize = 32 * 1024 * 1024;
 const GH_STDERR_LIMIT: usize = 64 * 1024;
 const ORIGIN_STDOUT_LIMIT: usize = 16 * 1024;
-const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
 
 #[derive(Debug, PartialEq, Eq)]
 enum IngestCommandError {
@@ -92,23 +95,6 @@ async fn read_command_pipe(
     Ok(bytes)
 }
 
-/// A just-written executable may remain busy briefly when another fork still
-/// holds a write descriptor. Retry only that transient spawn error; retain
-/// the ordinary classification for every other failure.
-async fn spawn_retrying_executable_busy<T>(
-    mut spawn: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    for delay_ms in EXECUTABLE_BUSY_BACKOFF_MS {
-        match spawn() {
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            outcome => return outcome,
-        }
-    }
-    spawn()
-}
-
 async fn run_ingest_command(
     mut command: AsyncCommand,
     timeout: Duration,
@@ -119,15 +105,16 @@ async fn run_ingest_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = spawn_retrying_executable_busy(|| command.spawn())
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                IngestCommandError::NotFound
-            } else {
-                IngestCommandError::CouldNotStart
-            }
-        })?;
+    let mut child =
+        spawn_retrying_executable_busy_async(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    IngestCommandError::NotFound
+                } else {
+                    IngestCommandError::CouldNotStart
+                }
+            })?;
     let stdout = child.stdout.take().ok_or(IngestCommandError::Io)?;
     let stderr = child.stderr.take().ok_or(IngestCommandError::Io)?;
     tokio::time::timeout(timeout, async {
@@ -1270,8 +1257,9 @@ mod gh_command_tests {
     use std::time::Duration;
 
     use super::{
-        gh_json_with_command, probe_gh_repository_with_command, spawn_retrying_executable_busy,
-        GhProbeError, IngestCommandError, OriginIdentity,
+        gh_json_with_command, probe_gh_repository_with_command,
+        spawn_retrying_executable_busy_async as spawn_retrying_executable_busy, GhProbeError,
+        IngestCommandError, OriginIdentity, EXECUTABLE_BUSY_BACKOFF_MS,
     };
 
     fn executable(dir: &Path, body: &str) -> PathBuf {
@@ -1284,7 +1272,7 @@ mod gh_command_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn busy_executable_spawn_retries_only_within_its_budget() {
         let mut attempts = 0;
-        let value = spawn_retrying_executable_busy(|| {
+        let value = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
             attempts += 1;
             if attempts < 3 {
                 Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
@@ -1297,7 +1285,7 @@ mod gh_command_tests {
         assert_eq!((value, attempts), (17, 3));
 
         let mut denied_attempts = 0;
-        let denied = spawn_retrying_executable_busy(|| {
+        let denied = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
             denied_attempts += 1;
             Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         })
@@ -1307,7 +1295,7 @@ mod gh_command_tests {
         assert_eq!(denied_attempts, 1);
 
         let mut exhausted_attempts = 0;
-        let exhausted = spawn_retrying_executable_busy(|| {
+        let exhausted = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
             exhausted_attempts += 1;
             Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
         })
@@ -2089,11 +2077,16 @@ fn walk_commits(
         None => snapshot_head.to_string(),
     });
     args.push("--".into());
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(&args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|child| child.wait_with_output())
         .context("spawning git log")?;
     if !output.status.success() {
         return Err(anyhow::Error::new(GitLogError {
@@ -2136,12 +2129,16 @@ fn walk_commits(
         writeln!(input, "{sha}").context("writing cat-file request list")?;
     }
     input.seek(SeekFrom::Start(0))?;
-    let objects = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::from(input))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let objects = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|child| child.wait_with_output())
         .context("spawning git cat-file --batch")?;
     if !objects.status.success() {
         return Err(anyhow::Error::new(GitLogError {
@@ -2352,7 +2349,8 @@ fn touched_files(repo: &Path, page_shas: &[String]) -> Result<HashMap<String, Ve
     const SHAS_PER_COMMAND: usize = 256;
     let mut files_by_sha = HashMap::new();
     for shas in page_shas.chunks(SHAS_PER_COMMAND) {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(repo)
             .arg("log")
@@ -2367,8 +2365,13 @@ fn touched_files(repo: &Path, page_shas: &[String]) -> Result<HashMap<String, Ve
             .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
             .args(shas)
             .arg("--")
-            .output()
-            .context("spawning git log --name-only")?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output =
+            spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+                .and_then(|child| child.wait_with_output())
+                .context("spawning git log --name-only")?;
         if !output.status.success() {
             return Err(anyhow::Error::new(GitLogError {
                 phase: GitLogPhase::TouchedFiles,
@@ -2565,11 +2568,16 @@ struct CommitSnapshot {
 /// Resolve the ref without peeling objects so missing-promisor recovery still
 /// runs through the classified git-log boundary. Never retarget a retry to HEAD.
 fn resolve_commit_head(repo: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--verify", "HEAD"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|child| child.wait_with_output())
         .context("resolving commit snapshot HEAD")?;
     let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || !is_commit_oid(&head) {
@@ -3240,14 +3248,16 @@ fn last_sha_of(since: &Option<String>) -> Option<&str> {
 /// that is the correct reading: the walked source does not contain the
 /// history that advanced the cursor.
 fn is_ancestor_of_head(repo: &Path, sha: &str) -> bool {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["merge-base", "--is-ancestor", sha, "HEAD"])
         // This predicate consumes only status; diagnostics have no reader.
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|mut child| child.wait())
         .map(|s| s.success())
         .unwrap_or(false)
 }

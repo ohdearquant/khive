@@ -129,7 +129,12 @@ async fn run(
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command.spawn().map_err(|_| RemoteError::Unavailable)?;
+    let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy_async(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .await
+    .map_err(|_| RemoteError::Unavailable)?;
     let stdout = child.stdout.take().ok_or(RemoteError::Unavailable)?;
     let stderr = child.stderr.take().ok_or(RemoteError::Unavailable)?;
     let failure = if effect {
