@@ -318,31 +318,37 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let ns = token.namespace().as_str().to_owned();
-        // sanitize_fts5_query strips known-unsafe metacharacters, but residual
-        // punctuation can still trip the FTS5 parser at runtime; that error must
-        // fail loud rather than silently degrade to vector-only fusion. Errors
-        // from other legs (vector search) still propagate normally.
-        let text_search_result = self
-            .text(token)?
-            .search(TextSearchRequest {
-                query: query_text.to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            })
-            .await;
-        let text_hits = crate::error::fts_text_leg_or_err(
-            text_search_result.map_err(RuntimeError::from),
-            "hybrid_search_with_strategy",
-            query_text,
-        )?;
+        let text_hits = if matches!(&strategy, FusionStrategy::VectorOnly) {
+            Vec::new()
+        } else {
+            let ns = token.namespace().as_str().to_owned();
+            // sanitize_fts5_query strips known-unsafe metacharacters, but residual
+            // punctuation can still trip the FTS5 parser at runtime; that error must
+            // fail loud rather than silently degrade to vector-only fusion. Errors
+            // from other legs (vector search) still propagate normally.
+            let text_search_result = self
+                .text(token)?
+                .search(TextSearchRequest {
+                    query: query_text.to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(TextFilter {
+                        namespaces: vec![ns],
+                        ..TextFilter::default()
+                    }),
+                    top_k: candidates,
+                    snippet_chars: 200,
+                })
+                .await;
+            crate::error::fts_text_leg_or_err(
+                text_search_result.map_err(RuntimeError::from),
+                "hybrid_search_with_strategy",
+                query_text,
+            )?
+        };
 
-        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+        let vector_hits = if !matches!(&strategy, FusionStrategy::KeywordOnly)
+            && (query_vector.is_some() || self.config().embedding_model.is_some())
+        {
             self.vector_search(
                 token,
                 query_vector,
@@ -374,10 +380,11 @@ mod tests {
     use chrono::Utc;
     use khive_storage::types::{TextDocument, TextSearchHit, VectorSearchHit, VectorSearchRequest};
     use khive_storage::Entity;
-    use lattice_embed::EmbeddingModel;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use crate::RuntimeConfig;
+    use crate::{EmbedderProvider, RuntimeConfig};
 
     fn text_hit(id: Uuid, score: f64, title: &str) -> TextSearchHit {
         TextSearchHit {
@@ -409,6 +416,171 @@ mod tests {
                 ..RuntimeConfig::no_embeddings()
             },
         )
+    }
+
+    struct CountingEmbeddingService {
+        calls: Arc<AtomicUsize>,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for CountingEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fusion-counting-embedding"
+        }
+    }
+
+    struct CountingEmbedderProvider {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for CountingEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(CountingEmbeddingService {
+                calls: Arc::clone(&self.calls),
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    fn counting_embedding_runtime() -> (KhiveRuntime, Arc<AtomicUsize>) {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
+        let calls = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(CountingEmbedderProvider {
+            name: model.to_string(),
+            calls: Arc::clone(&calls),
+            dimensions: model.dimensions(),
+        });
+        (rt, calls)
+    }
+
+    #[tokio::test]
+    async fn keyword_only_search_skips_embedding_and_vector_arm() {
+        let (rt, embed_calls) = counting_embedding_runtime();
+        let tok = NamespaceToken::local();
+        let entity = Entity::new("local", "concept", "keyword candidate");
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entities(vec![entity.clone()])
+            .await
+            .unwrap();
+        rt.text(&tok)
+            .unwrap()
+            .upsert_document(TextDocument {
+                subject_id: entity.id,
+                kind: SubstrateKind::Entity,
+                record_kind: None,
+                namespace: "local".to_string(),
+                title: None,
+                body: "fusionkeyword".to_string(),
+                tags: vec![],
+                metadata: None,
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let hits = rt
+            .hybrid_search_with_strategy(
+                &tok,
+                "fusionkeyword",
+                None,
+                FusionStrategy::KeywordOnly,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, entity.id);
+        assert_eq!(hits[0].source, SearchSource::Text);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
+
+        let mixed = rt
+            .hybrid_search_with_strategy(&tok, "fusionkeyword", None, FusionStrategy::rrf(), 10)
+            .await
+            .unwrap();
+        assert_eq!(mixed[0].entity_id, entity.id);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn vector_only_search_skips_unavailable_text_arm() {
+        let (rt, embed_calls) = counting_embedding_runtime();
+        let tok = NamespaceToken::local();
+        let entity = Entity::new("local", "concept", "vector candidate");
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entities(vec![entity.clone()])
+            .await
+            .unwrap();
+        let query_vector = vec![1.0; EmbeddingModel::AllMiniLmL6V2.dimensions()];
+        rt.vectors(&tok)
+            .unwrap()
+            .insert(
+                entity.id,
+                SubstrateKind::Entity,
+                "local",
+                "entity.body",
+                vec![query_vector.clone()],
+            )
+            .await
+            .unwrap();
+        rt.text(&tok).unwrap();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "DROP TABLE fts_entities; CREATE TABLE fts_entities (id INTEGER PRIMARY KEY);"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let hits = rt
+            .hybrid_search_with_strategy(
+                &tok,
+                "fusionkeyword",
+                Some(query_vector),
+                FusionStrategy::VectorOnly,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, entity.id);
+        assert_eq!(hits[0].source, SearchSource::Vector);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
