@@ -1,5 +1,5 @@
 -- Recipient replay is independent of mutable/deletable message history.
-CREATE TABLE comm_recipient_replay (
+CREATE TABLE IF NOT EXISTS comm_recipient_replay (
     sender_agent_id TEXT NOT NULL,
     logical_message_id TEXT NOT NULL,
     recipient_agent_id TEXT NOT NULL,
@@ -9,7 +9,7 @@ CREATE TABLE comm_recipient_replay (
     created_at INTEGER NOT NULL,
     PRIMARY KEY(sender_agent_id,logical_message_id)
 );
-CREATE TABLE comm_ack_work (
+CREATE TABLE IF NOT EXISTS comm_ack_work (
     delivery_attempt_id TEXT PRIMARY KEY,
     sender_agent_id TEXT NOT NULL,
     logical_message_id TEXT NOT NULL,
@@ -19,8 +19,8 @@ CREATE TABLE comm_ack_work (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
-CREATE INDEX idx_comm_ack_pending ON comm_ack_work(state,created_at);
-CREATE TABLE comm_recipient_quarantine (
+CREATE INDEX IF NOT EXISTS idx_comm_ack_pending ON comm_ack_work(state,created_at);
+CREATE TABLE IF NOT EXISTS comm_recipient_quarantine (
     sender_agent_id TEXT NOT NULL,
     logical_message_id TEXT NOT NULL,
     delivery_item BLOB NOT NULL CHECK(length(delivery_item)<=98304),

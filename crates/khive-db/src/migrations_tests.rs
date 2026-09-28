@@ -5042,5 +5042,32 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
             run_migrations(&mut conn).unwrap(),
             RECIPIENT_TRANSPORT_VERSION
         );
+        conn.execute(
+            "INSERT INTO comm_recipient_replay \
+             (sender_agent_id, logical_message_id, recipient_agent_id, recipient_actor, \
+              note_id, disposition, created_at) \
+             VALUES ('sender', 'message', 'recipient', 'lambda:recipient', \
+                     'note', 'stored', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM _schema_migrations WHERE version = ?1",
+            [RECIPIENT_TRANSPORT_VERSION],
+        )
+        .unwrap();
+        assert_eq!(
+            run_migrations(&mut conn).unwrap(),
+            RECIPIENT_TRANSPORT_VERSION
+        );
+        let replay_rows: i64 = conn
+            .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            replay_rows, 1,
+            "replaying V43 must preserve recipient state"
+        );
     }
 }
