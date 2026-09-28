@@ -135,7 +135,8 @@ fn resolution_mode_key(mode: IdResolutionMode) -> &'static str {
     }
 }
 
-fn identifier_resolution_help() -> Value {
+/// Shared identifier-resolution contract included in every operation help schema.
+pub fn identifier_resolution_help() -> Value {
     let modes: serde_json::Map<String, Value> = [
         IdResolutionMode::UnscopedById,
         IdResolutionMode::PrefixScopedToPrimary,

@@ -30,8 +30,12 @@ pub(crate) mod executable;
 /// Snapshot the stdio bridge image before config discovery or database boot can
 /// wait across an installation. Daemon and one-shot exec entrypoints omit this.
 pub fn capture_bridge_executable() {
+    let _ = crate::server::bridge_instance_id();
     executable::capture_at_startup();
 }
+
+#[cfg(test)]
+mod bridge_diagnostics_tests;
 
 #[cfg(test)]
 mod memory_namespace_tests;
@@ -187,6 +191,53 @@ static FALLBACK_PROTOCOL_MISMATCH: std::sync::atomic::AtomicUsize =
 static FALLBACK_STRICT_VIOLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[derive(serde::Serialize)]
+pub(crate) struct BridgeFallbackReasons {
+    config_mismatch: usize,
+    namespace_mismatch: usize,
+    no_socket: usize,
+    parse_failure: usize,
+    protocol_mismatch: usize,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct BridgeDiagnosticsSnapshot {
+    bridge_instance_id: uuid::Uuid,
+    pid: u32,
+    fallback_reasons: BridgeFallbackReasons,
+    fallback_total: usize,
+    strict_violations: usize,
+}
+
+pub(crate) fn bridge_diagnostics_snapshot() -> Option<BridgeDiagnosticsSnapshot> {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let fallback_reasons = BridgeFallbackReasons {
+        config_mismatch: FALLBACK_CONFIG_MISMATCH.load(SeqCst),
+        namespace_mismatch: FALLBACK_NAMESPACE_MISMATCH.load(SeqCst),
+        no_socket: FALLBACK_NO_SOCKET.load(SeqCst),
+        parse_failure: FALLBACK_PARSE_FAILURE.load(SeqCst),
+        protocol_mismatch: FALLBACK_PROTOCOL_MISMATCH.load(SeqCst),
+    };
+    let fallback_total = [
+        fallback_reasons.config_mismatch,
+        fallback_reasons.namespace_mismatch,
+        fallback_reasons.no_socket,
+        fallback_reasons.parse_failure,
+        fallback_reasons.protocol_mismatch,
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)?;
+
+    Some(BridgeDiagnosticsSnapshot {
+        bridge_instance_id: crate::server::bridge_instance_id(),
+        pid: std::process::id(),
+        fallback_reasons,
+        fallback_total,
+        strict_violations: FALLBACK_STRICT_VIOLATIONS.load(SeqCst),
+    })
+}
+
 // REASON: these accessors have no production call site yet — this slice adds the
 // counters and their read path; a future metrics-export slice wires them to a real
 // exporter (see the `khive_daemon_fallback_total{reason}` doc comments above) without
@@ -334,6 +385,14 @@ fn fallback_or_reject(
     None
 }
 
+#[cfg(test)]
+pub(crate) fn test_recordable_fallback_rejected(reason: FallbackReason) -> bool {
+    matches!(
+        fallback_or_reject(reason, "client", None, "local"),
+        Some(Err(_))
+    )
+}
+
 // ── DaemonDispatch impl ───────────────────────────────────────────────────────
 
 #[async_trait]
@@ -379,6 +438,17 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, daemon::DaemonDispatchError> {
+        if khive_request::parse_request(&ops)
+            .is_ok_and(|parsed| parsed.ops.iter().any(|op| op.tool == "bridge.diagnostics"))
+        {
+            return Err(daemon::DaemonDispatchError::new(
+                "bridge.diagnostics is available only on the stdio bridge".to_string(),
+                Some(serde_json::json!({
+                    "kind": "invalid_input",
+                    "message": "bridge.diagnostics is available only on the stdio bridge",
+                })),
+            ));
+        }
         let params = RequestParams {
             plan: None,
             ops,
