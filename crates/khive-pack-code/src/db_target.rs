@@ -106,25 +106,91 @@ fn matches_protected_file(candidate: &Path, protected: &Path) -> Result<bool, St
     )
 }
 
+/// Include each final-component symlink destination, even when that destination
+/// does not exist yet. `metadata` follows a dangling link and reports only
+/// NotFound, so the ordinary missing-path comparison would otherwise compare
+/// the link's name rather than the file SQLite will open through it.
+fn target_spellings(candidate: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut spellings = vec![candidate.to_path_buf()];
+    let mut current = candidate.to_path_buf();
+    for _ in 0..40 {
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(spellings),
+            Err(error) => {
+                return Err(format!(
+                    "code.ingest cannot establish target database identity for {}: {error}",
+                    current.display()
+                ));
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(spellings);
+        }
+        let destination = std::fs::read_link(&current).map_err(|error| {
+            format!(
+                "code.ingest cannot establish target database identity for {}: {error}",
+                current.display()
+            )
+        })?;
+        current = if destination.is_absolute() {
+            destination
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(destination)
+        };
+        if spellings.contains(&current) {
+            return Err(format!(
+                "code.ingest cannot establish target database identity for {}: symlink loop",
+                candidate.display()
+            ));
+        }
+        spellings.push(current.clone());
+    }
+    Err(format!(
+        "code.ingest cannot establish target database identity for {}: too many symlinks",
+        candidate.display()
+    ))
+}
+
 fn append_sqlite_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
 }
 
-fn protected_store_members(base: &Path) -> Vec<PathBuf> {
-    let events = khive_runtime::events_split::events_db_path_beside(base);
-    [base, events.as_path()]
-        .into_iter()
-        .flat_map(|db| {
-            [
+fn protected_store_members(base: &Path) -> Result<Vec<PathBuf>, String> {
+    let canonical = match base.canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "code.ingest cannot establish target database identity for {}: {error}",
+                base.display()
+            ));
+        }
+    };
+    let mut bases = vec![base.to_path_buf()];
+    if let Some(physical) = canonical {
+        if physical.as_path() != base {
+            bases.push(physical);
+        }
+    }
+    let mut members = Vec::new();
+    for spelling in &bases {
+        let events = khive_runtime::events_split::events_db_path_beside(spelling);
+        for db in [spelling, events.as_path()] {
+            members.extend([
                 db.to_path_buf(),
                 append_sqlite_suffix(db, "-journal"),
                 append_sqlite_suffix(db, "-wal"),
                 append_sqlite_suffix(db, "-shm"),
-            ]
-        })
-        .collect()
+            ]);
+        }
+    }
+    Ok(members)
 }
 
 /// Reject SQLite URI spellings and relative explicit targets before filesystem
@@ -184,14 +250,17 @@ pub(crate) fn resolve_target_db(
     }
 
     forbidden.extend_from_slice(declared_backend_db_paths);
+    let candidate_spellings = target_spellings(&candidate)?;
     for base in &forbidden {
-        for forbidden_path in protected_store_members(base) {
-            if matches_protected_file(&candidate, &forbidden_path)? {
-                return Err(format!(
-                    "code.ingest refuses to target the shared production database ({}); \
-                     select a different dedicated map database",
-                    forbidden_path.display()
-                ));
+        for forbidden_path in protected_store_members(base)? {
+            for spelling in &candidate_spellings {
+                if matches_protected_file(spelling, &forbidden_path)? {
+                    return Err(format!(
+                        "code.ingest refuses to target the shared production database ({}); \
+                         select a different dedicated map database",
+                        forbidden_path.display()
+                    ));
+                }
             }
         }
     }
@@ -300,6 +369,56 @@ mod tests {
             assert!(error.contains(&target.display().to_string()), "{error}");
             assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_backend_physical_wal_companion_is_protected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let declared_dir = tmp.path().join("declared");
+        let physical_dir = tmp.path().join("physical");
+        std::fs::create_dir_all(&declared_dir).unwrap();
+        std::fs::create_dir_all(&physical_dir).unwrap();
+        let physical = physical_dir.join("real.db");
+        let declared = declared_dir.join("khive.db");
+        let physical_wal = append_sqlite_suffix(&physical, "-wal");
+        std::fs::write(&physical, b"backend").unwrap();
+        std::fs::write(&physical_wal, b"wal sentinel").unwrap();
+        std::os::unix::fs::symlink(&physical, &declared).unwrap();
+
+        let error = resolve_target_db(
+            Some(physical_wal.to_str().unwrap()),
+            tmp.path(),
+            None,
+            &[declared],
+        )
+        .expect_err("the physical SQLite WAL companion must be protected");
+        assert!(
+            error.contains(&physical_wal.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&physical_wal).unwrap(), b"wal sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_default_symlink_to_protected_events_store_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = tmp.path().join("backend.db");
+        let events = khive_runtime::events_split::events_db_path_beside(&backend);
+        let ingest = tmp.path().join("source");
+        let default_dir = ingest.join(".khive");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_map = default_dir.join("code-map.db");
+        let relative_events = Path::new("../..").join(events.file_name().unwrap());
+        std::os::unix::fs::symlink(&relative_events, &default_map).unwrap();
+        assert!(!events.exists());
+
+        let error = resolve_target_db(None, &ingest, Some(&backend), &[])
+            .expect_err("a dangling default link must not create a protected event store");
+        assert!(error.contains(&events.display().to_string()), "{error}");
+        assert!(!events.exists());
+        assert_eq!(std::fs::read_link(&default_map).unwrap(), relative_events);
     }
 
     #[cfg(any(unix, windows))]
