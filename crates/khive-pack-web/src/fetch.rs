@@ -62,6 +62,14 @@ pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> V
             }
         }
     }
+    let links: Vec<&str> = headers
+        .get_all("link")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    if !links.is_empty() {
+        out.insert("link".to_string(), json!(links));
+    }
     Value::Object(out)
 }
 
@@ -920,6 +928,9 @@ pub(crate) async fn settle_with_request_headers(
         // untouched. A HEAD has no bytes from which to infer either field.
         request_record["content_digest"] = json!(content_digest);
         request_record["size"] = json!(bytes);
+        if content_ref.is_some() {
+            request_record["body_entity_id"] = json!(final_entity_id);
+        }
     }
     let receipt_id = write_receipt(
         runtime,
@@ -935,6 +946,9 @@ pub(crate) async fn settle_with_request_headers(
             content_ref
         ))
     })?;
+    if let (Some(id), Some(reference)) = (final_entity_id, content_ref.as_deref()) {
+        crate::receipt::bind_capture_receipt(runtime, token, id, reference, receipt_id).await?;
+    }
     Ok(json!({
         "final_url": final_url.to_string(),
         "status": status,
@@ -1026,6 +1040,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebCredentialConfig;
+
     use khive_runtime::{Namespace, VerbRegistryBuilder};
     use khive_storage::{
         BlobStore, ContentRef, Direction, EntityFilter, PageRequest, StorageError, StorageResult,
@@ -1035,6 +1050,20 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn allowed_headers_keep_every_link_field_for_later_extraction() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("link", "</next>; rel=next".parse().unwrap());
+        headers.append("link", "</license>; rel=license".parse().unwrap());
+        headers.insert("x-private", "discard".parse().unwrap());
+        let kept = extract_allowed_headers(&headers);
+        assert_eq!(
+            kept["link"],
+            json!(["</next>; rel=next", "</license>; rel=license"])
+        );
+        assert!(kept.get("x-private").is_none());
+    }
 
     /// The in-crate test runtime carries no `VerbRegistry`, so the web
     /// pack's own `EDGE_RULES` (`site contains page|resource`) are never
