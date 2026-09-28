@@ -29,7 +29,7 @@
 //! otherwise.
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, Entity};
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
@@ -55,6 +55,14 @@ async fn latest_receipt(
         .await
 }
 
+fn document_id_for_url(url: &Url) -> Uuid {
+    let canonical = crate::identity::canonicalize(url.clone());
+    crate::identity::document_id(
+        crate::identity::site_id(&canonical),
+        &crate::identity::path_and_query(&canonical),
+    )
+}
+
 fn refresh_request_headers(properties: &Value) -> Result<Vec<(String, String)>, RuntimeError> {
     let url = stored_request_url(properties)?;
     refresh_headers_for_hop(properties, &url, &url, true)
@@ -66,18 +74,13 @@ fn refresh_request_headers(properties: &Value) -> Result<Vec<(String, String)>, 
 async fn apply_refresh_metadata(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    id: Uuid,
+    expected: &Entity,
     expected_content_ref: &str,
     status: u16,
     headers: &reqwest::header::HeaderMap,
-    request_headers: &[(String, String)],
+    request_context: Option<&[(String, String)]>,
 ) -> Result<bool, RuntimeError> {
-    let entity = runtime
-        .entities(token)?
-        .get_entity(id)
-        .await?
-        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
-    let properties = entity.properties.clone().unwrap_or(Value::Null);
+    let properties = expected.properties.clone().unwrap_or(Value::Null);
     if properties.get("blob_ref").and_then(Value::as_str) != Some(expected_content_ref) {
         return Ok(false);
     }
@@ -98,41 +101,56 @@ async fn apply_refresh_metadata(
         if header == "content-type" {
             if let Some(value) = value {
                 let classified = crate::fetch::classify_entity_type(Some(value));
-                if entity.entity_type.as_deref() != Some(classified) {
+                if expected.entity_type.as_deref() != Some(classified) {
                     entity_type = Some(classified);
                 }
             }
         }
     }
+    let vary = crate::fetch::vary_value(headers);
+    if status != 304 || vary.is_some() {
+        let value = vary.unwrap_or_else(|| json!([]));
+        if properties.get("vary") != Some(&value) {
+            patch.insert("vary".to_string(), value);
+        }
+    }
+    let content_language = crate::fetch::content_language_value(headers);
+    if status != 304 || content_language.is_some() {
+        let value = content_language.unwrap_or(Value::Null);
+        if properties.get("content_language") != Some(&value) {
+            patch.insert("content_language".to_string(), value);
+        }
+    }
     if status != 304 && properties.get("status") != Some(&json!(status)) {
         patch.insert("status".to_string(), json!(status));
     }
-    let negotiation = crate::fetch::negotiation_headers(request_headers);
-    if crate::fetch::negotiation_headers(&crate::fetch::stored_negotiation_headers(&properties)?)
-        != negotiation
-    {
-        patch.insert("request_headers".to_string(), json!(negotiation));
-    }
-    if !patch.is_empty() || entity_type.is_some() {
-        match runtime
-            .update_entity_if_unchanged(
-                token,
-                &entity,
-                khive_runtime::EntityPatch {
-                    entity_type: entity_type.map(|entity_type| Some(entity_type.to_string())),
-                    properties: Some(Value::Object(patch)),
-                    ..Default::default()
-                },
-                &[],
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
+    // A redirected GET establishes the terminal document's representation
+    // context, even if its bytes match an already stored body. Include that
+    // context in the same guarded patch as its response metadata.
+    if let Some(request_context) = request_context {
+        let selected = json!(crate::fetch::recorded_negotiation_headers(request_context));
+        if properties.get("request_headers") != Some(&selected) {
+            patch.insert("request_headers".to_string(), selected);
         }
+    }
+    match runtime
+        .update_entity_if_unchanged(
+            token,
+            expected,
+            khive_runtime::EntityPatch {
+                entity_type: entity_type.map(|entity_type| Some(entity_type.to_string())),
+                properties: (!patch.is_empty()).then_some(Value::Object(patch)),
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
     }
     Ok(true)
 }
@@ -147,15 +165,71 @@ fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
         .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))
 }
 
+/// A recorded empty array means the body response did not carry Vary.
+/// Missing, non-UTF-8 or malformed Vary is unknown, never replayable.
+fn vary_is_replayable(vary: &Value, headers: &[(String, String)]) -> bool {
+    let Some(lines) = vary.as_array() else {
+        return false;
+    };
+    let sent = crate::fetch::negotiation_headers(headers);
+    for line in lines {
+        let Some(line) = line.as_str() else {
+            return false;
+        };
+        for member in line.split(',') {
+            let name = member.trim();
+            if name.is_empty()
+                || name == "*"
+                || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            {
+                return false;
+            }
+            let name = name.to_ascii_lowercase();
+            if !matches!(
+                name.as_str(),
+                "accept" | "accept-language" | "accept-encoding"
+            ) || !sent.get(&name).is_some_and(|values| {
+                !values.is_empty() && values.iter().all(|value| !value.trim().is_empty())
+            }) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A 304's new Vary describes the request that actually reached the origin.
+/// The client fixes gzip on that wire request even for a legacy body whose
+/// stored map predates the encoding field. The cached-body gate above still
+/// requires an explicit stored selector before sending a later validator.
+fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bool {
+    let mut effective: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"))
+        .cloned()
+        .collect();
+    effective.push((
+        "accept-encoding".to_string(),
+        crate::fetch::FIXED_ACCEPT_ENCODING.to_string(),
+    ));
+    vary_is_replayable(vary, &effective)
+}
+
 fn conditional_headers_for_hop(
     properties: &Value,
     original_url: &Url,
     current_url: &Url,
     first_hop: bool,
 ) -> Vec<(String, String)> {
+    let Ok(negotiation) = crate::fetch::stored_negotiation_headers(properties) else {
+        return Vec::new();
+    };
     if !first_hop
         || current_url != original_url
         || properties.get("truncated").and_then(Value::as_bool) != Some(false)
+        || !properties
+            .get("vary")
+            .is_some_and(|vary| vary_is_replayable(vary, &negotiation))
     {
         return Vec::new();
     }
@@ -175,7 +249,9 @@ fn refresh_headers_for_hop(
     current_url: &Url,
     first_hop: bool,
 ) -> Result<Vec<(String, String)>, RuntimeError> {
-    let mut headers = crate::fetch::stored_negotiation_headers(properties)?;
+    // An unknown legacy map cannot be replayed. Preserve it as A5 requires,
+    // but make this and subsequent refreshes unconditional.
+    let mut headers = crate::fetch::stored_negotiation_headers(properties).unwrap_or_default();
     headers.extend(conditional_headers_for_hop(
         properties,
         original_url,
@@ -240,7 +316,8 @@ async fn run_refresh(
     // forwarded to another address after a redirect.
     let original_url = url.clone();
     let mut first_hop = true;
-    let (outcome, redirect_hops) = crate::fetch::run_hop_chain(
+    let mut first_observed_hop = true;
+    let (outcome, redirect_hops, terminal_request_snapshot) = crate::fetch::run_hop_chain_observed(
         resolver,
         cfg,
         url,
@@ -251,18 +328,37 @@ async fn run_refresh(
             let initial = std::mem::take(&mut first_hop);
             refresh_headers_for_hop(&properties, &original_url, current_url, initial)
         },
+        |current_url| {
+            let initial = std::mem::take(&mut first_observed_hop);
+            async move {
+                // The original row was already read before the first request.
+                // Only redirected hops need a separate terminal-row snapshot.
+                if initial {
+                    return Ok(None);
+                }
+                let document_id = document_id_for_url(&current_url);
+                let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
+                if let Some(entity) = &snapshot {
+                    crate::entities::require_entity_namespace(token, entity)?;
+                }
+                Ok(snapshot)
+            }
+        },
     )
     .await?;
 
-    settle_refresh_with_request_headers(
+    settle_refresh_from_snapshot(
         runtime,
         token,
+        &entity,
+        terminal_request_snapshot.as_ref(),
         params.id,
         &url_str,
         &stored_content_ref,
         outcome,
         &redirect_hops,
         &headers,
+        std::future::ready(()),
     )
     .await
 }
@@ -282,6 +378,7 @@ async fn run_refresh(
 /// when there was no redirect; on a redirect the terminal address's own row
 /// receives the body instead (identity is by address), `id` keeps its own
 /// recorded `url`, and the reply's `final_id` names the terminal row.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn settle_refresh_with_request_headers(
     runtime: &KhiveRuntime,
@@ -293,9 +390,99 @@ async fn settle_refresh_with_request_headers(
     redirect_hops: &[crate::fetch::RedirectHop],
     request_headers: &[(String, String)],
 ) -> Result<Value, RuntimeError> {
-    settle_refresh_with_request_headers_after_body_settlement(
+    let expected = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let terminal_request_snapshot = runtime
+        .entities(token)?
+        .get_entity(document_id_for_url(&outcome.final_url))
+        .await?;
+    settle_refresh_from_snapshot(
         runtime,
         token,
+        &expected,
+        terminal_request_snapshot.as_ref(),
+        id,
+        url_str,
+        stored_content_ref,
+        outcome,
+        redirect_hops,
+        request_headers,
+        std::future::ready(()),
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn settle_refresh_with_request_headers_after_body_settlement(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    url_str: &str,
+    stored_content_ref: &str,
+    outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
+    request_headers: &[(String, String)],
+    after_body_settlement: impl std::future::Future<Output = ()>,
+) -> Result<Value, RuntimeError> {
+    let expected = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let terminal_request_snapshot = runtime
+        .entities(token)?
+        .get_entity(document_id_for_url(&outcome.final_url))
+        .await?;
+    settle_refresh_from_snapshot(
+        runtime,
+        token,
+        &expected,
+        terminal_request_snapshot.as_ref(),
+        id,
+        url_str,
+        stored_content_ref,
+        outcome,
+        redirect_hops,
+        request_headers,
+        after_body_settlement,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn settle_refresh_with_request_headers_before_settlement(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    url_str: &str,
+    stored_content_ref: &str,
+    outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
+    request_headers: &[(String, String)],
+    before_settlement: impl std::future::Future<Output = ()>,
+) -> Result<Value, RuntimeError> {
+    let entities = runtime.entities(token)?;
+    let source_snapshot = entities
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    // The terminal URL is known before its request is sent. This test seam
+    // pauses after that request but before settlement, while retaining the
+    // snapshot that production captures immediately before the send.
+    let terminal_request_snapshot = entities
+        .get_entity(document_id_for_url(&outcome.final_url))
+        .await?;
+    before_settlement.await;
+    settle_refresh_from_snapshot(
+        runtime,
+        token,
+        &source_snapshot,
+        terminal_request_snapshot.as_ref(),
         id,
         url_str,
         stored_content_ref,
@@ -308,9 +495,11 @@ async fn settle_refresh_with_request_headers(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn settle_refresh_with_request_headers_after_body_settlement(
+async fn settle_refresh_from_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    source_snapshot: &Entity,
+    terminal_request_snapshot: Option<&Entity>,
     id: Uuid,
     url_str: &str,
     stored_content_ref: &str,
@@ -326,11 +515,7 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
     let final_id = if redirect_hops.is_empty() {
         id
     } else {
-        let canonical = crate::identity::canonicalize(outcome.final_url.clone());
-        crate::identity::document_id(
-            crate::identity::site_id(&canonical),
-            &crate::identity::path_and_query(&canonical),
-        )
+        document_id_for_url(&outcome.final_url)
     };
     if outcome.status == 304 && !redirect_hops.is_empty() {
         return Err(Refusal::new(
@@ -343,6 +528,11 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
     if let Some(entity) = &final_entity {
         crate::entities::require_entity_namespace(token, entity)?;
     }
+    let mut metadata_snapshot = if redirect_hops.is_empty() {
+        Some(source_snapshot.clone())
+    } else {
+        terminal_request_snapshot.cloned()
+    };
     let final_properties = final_entity
         .as_ref()
         .and_then(|entity| entity.properties.as_ref());
@@ -378,10 +568,73 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
                 .into());
             }
         }
+        let sent_validator = request_headers.iter().any(|(name, value)| {
+            (name.eq_ignore_ascii_case("if-none-match")
+                || name.eq_ignore_ascii_case("if-modified-since"))
+                && !value.trim().is_empty()
+        });
+        if !sent_validator {
+            return Err(Refusal::new(
+                "unsolicited_not_modified",
+                "a 304 cannot validate this body because no validator was sent",
+            )
+            .into());
+        }
+        if crate::fetch::vary_value(&outcome.headers)
+            .as_ref()
+            .is_some_and(|vary| !vary_is_represented_on_wire(vary, request_headers))
+        {
+            return Err(Refusal::new(
+                "unrepresented_vary",
+                "the 304 Vary cannot be matched to the cached body's request headers",
+            )
+            .into());
+        }
     }
     let mut response_content_ref = final_stored_content_ref
         .clone()
         .unwrap_or_else(|| stored_content_ref.to_owned());
+
+    // A redirected body settlement must use the same pre-request guard as
+    // the metadata-only path. If the terminal row did not exist before the
+    // request, claim its deterministic ID before redirect-hop settlement can
+    // mint it; a concurrent creator is a lost race, not our own empty row.
+    let terminal_body_guard = if redirect_hops.is_empty() {
+        None
+    } else if let Some(snapshot) = terminal_request_snapshot {
+        Some(snapshot.clone())
+    } else if final_entity.is_none() && outcome.status != 304 && outcome.body.is_some() {
+        let request_url = crate::identity::request_url(outcome.final_url.clone());
+        let canonical = crate::identity::canonicalize(request_url.clone());
+        let site = crate::fetch::canonical_site(runtime, token, &canonical).await?;
+        let (candidate, created) = crate::entities::get_or_create(
+            runtime,
+            token,
+            final_id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
+        )
+        .await?;
+        if created {
+            runtime
+                .link(
+                    token,
+                    site,
+                    final_id,
+                    khive_storage::EdgeRelation::Contains,
+                    1.0,
+                    None,
+                )
+                .await?;
+            Some(candidate)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut entities_touched: Vec<Uuid> = vec![id];
     for touched in crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await? {
@@ -395,11 +648,13 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
 
     let mut changed = false;
     let mut was_truncated = prior_truncated;
+    let body_present = outcome.body.is_some();
     let body_bytes = outcome
         .body
         .as_ref()
         .map_or(0, |(bytes, _)| bytes.len() as u64);
     let mut new_content_ref: Option<String> = None;
+    let mut body_settled = true;
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
             was_truncated = Some(truncated);
@@ -434,7 +689,20 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
                         body_bytes,
                     );
                     properties["truncated"] = json!(truncated);
-                    crate::entities::patch(runtime, token, id, Some(entity_type), properties)
+                    let expected = metadata_snapshot
+                        .as_ref()
+                        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+                    let mut settled = runtime
+                        .update_entity_if_unchanged(
+                            token,
+                            expected,
+                            khive_runtime::EntityPatch {
+                                entity_type: Some(Some(entity_type.to_string())),
+                                properties: Some(properties),
+                                ..Default::default()
+                            },
+                            &[],
+                        )
                         .await?;
                     if body_changed {
                         crate::fetch::root_body(
@@ -446,17 +714,25 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
                             body_bytes,
                         )
                         .await?;
+                        settled = crate::fetch::entity_after_body_root(
+                            runtime,
+                            token,
+                            &settled,
+                            &content_ref_str,
+                        )
+                        .await?;
                     }
+                    metadata_snapshot = Some(settled);
                 } else {
                     // Identity is by address: the body served at the terminal
-                    // hop belongs to that address's own row. Permanent hops
-                    // have already minted it; temporary hops leave that job
-                    // entirely to this terminal content settlement.
-                    // The caller-named row keeps its own url.
-                    let settled = crate::fetch::settle_content_body(
-                        runtime,
-                        token,
-                        &outcome.final_url,
+                    // hop belongs to that address's own row. The guard was
+                    // captured before its request; a GET that won meanwhile
+                    // must not be replaced even when the old response has
+                    // different bytes.
+                    let request_url = crate::identity::request_url(outcome.final_url.clone());
+                    let entity_type = crate::fetch::classify_entity_type(content_type.as_deref());
+                    let mut properties = crate::fetch::representation_patch(
+                        request_url.as_ref(),
                         content_type.as_deref(),
                         outcome.status,
                         outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
@@ -464,32 +740,98 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
                             .headers
                             .get("last-modified")
                             .and_then(|v| v.to_str().ok()),
-                        Some(crate::fetch::ContentBody::Stored {
-                            content_ref,
-                            bytes: body_bytes,
-                            truncated,
-                        }),
-                    )
-                    .await?;
-                    debug_assert_eq!(settled.id, final_id);
+                        Some(&content_ref_str),
+                        body_bytes,
+                    );
+                    properties["truncated"] = json!(truncated);
+                    let settled = match terminal_body_guard.as_ref() {
+                        Some(expected) => {
+                            match runtime
+                                .update_entity_if_unchanged(
+                                    token,
+                                    expected,
+                                    khive_runtime::EntityPatch {
+                                        entity_type: Some(Some(entity_type.to_string())),
+                                        properties: Some(properties),
+                                        ..Default::default()
+                                    },
+                                    &[],
+                                )
+                                .await
+                            {
+                                Ok(entity) => Some(entity),
+                                Err(RuntimeError::Khive(error))
+                                    if error.kind() == khive_types::ErrorKind::Conflict =>
+                                {
+                                    None
+                                }
+                                Err(RuntimeError::NotFound(_)) => None,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        None => None,
+                    };
+                    if let Some(mut settled) = settled {
+                        if body_changed {
+                            crate::fetch::root_body(
+                                runtime,
+                                final_id,
+                                khive_storage::AttachmentSubstrate::Entity,
+                                &content_ref,
+                                content_type.as_deref(),
+                                body_bytes,
+                            )
+                            .await?;
+                            settled = crate::fetch::entity_after_body_root(
+                                runtime,
+                                token,
+                                &settled,
+                                &content_ref_str,
+                            )
+                            .await?;
+                        }
+                        metadata_snapshot = Some(settled);
+                    } else {
+                        body_settled = false;
+                        metadata_snapshot = None;
+                    }
                 }
             }
-            new_content_ref = Some(content_ref_str);
+            if body_settled {
+                new_content_ref = Some(content_ref_str);
+            } else {
+                changed = false;
+                was_truncated = prior_truncated;
+                response_content_ref = final_stored_content_ref
+                    .clone()
+                    .unwrap_or_else(|| stored_content_ref.to_owned());
+            }
         }
     }
 
     after_body_settlement.await;
-    let metadata_applied = apply_refresh_metadata(
-        runtime,
-        token,
-        final_id,
-        &response_content_ref,
-        outcome.status,
-        &outcome.headers,
-        request_headers,
-    )
-    .await?;
+    let metadata_applied = match metadata_snapshot.as_ref() {
+        Some(expected) => {
+            apply_refresh_metadata(
+                runtime,
+                token,
+                expected,
+                &response_content_ref,
+                outcome.status,
+                &outcome.headers,
+                (!redirect_hops.is_empty() && final_id != id && body_present)
+                    .then_some(request_headers),
+            )
+            .await?
+        }
+        None => false,
+    };
     let lost_race = !metadata_applied;
+    if lost_race && !redirect_hops.is_empty() {
+        // The response's bytes were not committed as the terminal row's
+        // current representation. Do not bind a capture receipt to them.
+        new_content_ref = None;
+    }
 
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()
@@ -504,7 +846,7 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
         "final_url": final_url_str,
         "status": outcome.status,
         "headers": crate::fetch::extract_allowed_headers(&outcome.headers),
-        "request_headers": crate::fetch::negotiation_headers(request_headers),
+        "request_headers": crate::fetch::recorded_negotiation_headers(request_headers),
         "changed": changed,
         "lost_race": lost_race,
         "content_ref": new_content_ref,
@@ -872,7 +1214,7 @@ mod tests {
     fn refresh_conditionals_stay_on_complete_original_resource() {
         let original = Url::parse("https://example.test/original").unwrap();
         let redirected = Url::parse("https://example.test/other").unwrap();
-        let complete = json!({ "etag": "\"v1\"", "last_modified": "Mon, 21 Sep 2026 12:00:00 GMT", "truncated": false });
+        let complete = json!({ "etag": "\"v1\"", "last_modified": "Mon, 21 Sep 2026 12:00:00 GMT", "truncated": false, "vary": [], "request_headers": {} });
         assert_eq!(
             conditional_headers_for_hop(&complete, &original, &original, true).len(),
             2
@@ -886,6 +1228,7 @@ mod tests {
             "url": original.as_str(),
             "etag": "\"v1\"",
             "truncated": false,
+            "vary": ["accept, accept-language"],
             "request_headers": {
                 "accept": ["application/json"],
                 "accept-language": ["fr"]
@@ -1077,9 +1420,20 @@ mod tests {
         let body = b"stable body".to_vec();
         let (port, hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
         let id = seed(&runtime, &token, port, &body).await;
-        crate::entities::patch(&runtime, &token, id, None, json!({"status": 200}))
-            .await
-            .unwrap();
+        crate::entities::patch(
+            &runtime,
+            &token,
+            id,
+            None,
+            json!({
+                "status": 200,
+                "vary": [],
+                "content_language": null,
+                "request_headers": {"accept-encoding": ["gzip"]}
+            }),
+        )
+        .await
+        .unwrap();
         let before = runtime
             .entities(&token)
             .unwrap()
@@ -1540,9 +1894,12 @@ mod tests {
                 assert_eq!(terminal.entity_type.as_deref(), Some("page"));
                 if terminal_body == Some(b"same body".as_slice()) {
                     let before = before_terminal.unwrap();
-                    let mut expected_properties = before.properties.unwrap();
-                    expected_properties["capture_receipt_id"] = reply["receipt_id"].clone();
-                    assert_eq!(terminal.properties, Some(expected_properties));
+                    let mut expected = before.properties.unwrap();
+                    expected["request_headers"] =
+                        json!({"accept-encoding": [crate::fetch::FIXED_ACCEPT_ENCODING]});
+                    expected["vary"] = json!([]);
+                    expected["capture_receipt_id"] = reply["receipt_id"].clone();
+                    assert_eq!(terminal.properties, Some(expected));
                     assert!(
                         terminal.version > before.version,
                         "the terminal capture pointer follows the new body-storing receipt"

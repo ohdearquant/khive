@@ -299,6 +299,15 @@ async fn not_modified_refresh_never_puts_cached_bytes_again() {
             old_url.clone()
         };
         let source = seed(&runtime, &token, &old_url, b"cached body").await;
+        crate::fetch::persist_get_context(
+            &runtime,
+            &token,
+            &source,
+            &[],
+            &reqwest::header::HeaderMap::new(),
+        )
+        .await
+        .unwrap();
         let hops = if redirected {
             vec![crate::fetch::RedirectHop {
                 from: old_url.clone(),
