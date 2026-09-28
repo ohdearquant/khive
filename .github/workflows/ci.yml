@@ -633,6 +633,8 @@ jobs:
         run: bash scripts/check-json-data.sh --all
       - name: Guard fixture test (staged blobs judged from the index)
         run: bash scripts/tests/check-json-data-test.sh
+      - name: Cargo hook fixture tests
+        run: python3 scripts/tests/test_hook_cargo.py
 
   secret-scan:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
