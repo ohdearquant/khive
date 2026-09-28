@@ -6,6 +6,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::Namespace;
+use std::path::PathBuf;
 
 struct Fixture {
     runtime: KhiveRuntime,
@@ -17,6 +18,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_digest_timeout(None)
+    }
+
+    fn with_digest_timeout(binary_digest_timeout_s: Option<u64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("exec-root");
         let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -24,6 +29,7 @@ impl Fixture {
             actor_id: None,
             exec: khive_runtime::engine_config::ExecSectionConfig {
                 root: Some(root.to_string_lossy().into_owned()),
+                binary_digest_timeout_s,
                 ..Default::default()
             },
             ..RuntimeConfig::no_embeddings()
@@ -125,6 +131,99 @@ impl Fixture {
             label:Some("test_grant_pin_only_mutation".into()),
         }).await.unwrap(), 1);
     }
+}
+
+#[tokio::test]
+async fn denied_tool_never_starts_binary_digest() {
+    let f = Fixture::new();
+    let binary = f._dir.path().join("digest-probe");
+    std::fs::write(&binary, b"registered tool").unwrap();
+    let canonical = std::fs::canonicalize(&binary).unwrap();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *HASH_PROBE.lock().unwrap() = Some((canonical, attempts.clone()));
+    f.call(
+        "tool.register",
+        json!({
+            "name":"digest-probe", "kind":"tool",
+            "source":format!("exec:{}", binary.display()),
+            "side_effect":"write", "trust":"first_party"
+        }),
+    )
+    .await;
+    let error = f
+        .registry
+        .dispatch(
+            "exec.run",
+            json!({"tool":"digest-probe", "actor":"agent:pin", "tree":"invalid-tree"}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    let observed = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    *HASH_PROBE.lock().unwrap() = None;
+    assert!(error.contains("= ask from default"), "{error}");
+    assert_eq!(observed, 0, "a denied tool triggered a binary digest read");
+}
+
+#[tokio::test]
+async fn stalled_digest_refuses_at_deadline_without_publishing_a_digest() {
+    let f = Fixture::with_digest_timeout(Some(1));
+    let binary = f._dir.path().join("slow-digest-tool");
+    std::fs::write(&binary, b"registered tool").unwrap();
+    let canonical = std::fs::canonicalize(&binary).unwrap();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    *DIGEST_STALL.lock().unwrap() = Some((canonical, Arc::clone(&entered), Arc::clone(&release)));
+
+    f.call(
+        "tool.register",
+        json!({
+            "name":"slow-digest-tool", "kind":"tool",
+            "source":format!("exec:{}", binary.display()),
+            "side_effect":"write", "trust":"first_party"
+        }),
+    )
+    .await;
+    let request = f
+        .call(
+            "tool.request",
+            json!({"tool":"slow-digest-tool", "actor":"agent:pin"}),
+        )
+        .await;
+    f.call("tool.grant", json!({"id":request["request_id"]}))
+        .await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.registry.dispatch(
+            "exec.run",
+            json!({"tool":"slow-digest-tool", "actor":"agent:pin", "tree":"invalid-tree"}),
+        ),
+    )
+    .await;
+    {
+        let (lock, signal) = &*release;
+        *lock.lock().unwrap() = true;
+        signal.notify_all();
+    }
+    *DIGEST_STALL.lock().unwrap() = None;
+    let error = outcome
+        .expect("the digest deadline did not bound the stalled reader")
+        .unwrap_err();
+    assert!(entered.load(Ordering::SeqCst), "the reader did not stall");
+    assert!(error.to_string().contains("binary_digest_time_limit"));
+
+    let runs = f.call("exec.runs", json!({"actor":"agent:pin"})).await;
+    let receipt = f
+        .call("exec.receipt", json!({"id":runs["runs"][0]["id"]}))
+        .await;
+    assert_eq!(receipt["refusal"]["code"], "binary_digest_time_limit");
+    let detail = &receipt["refusal"]["detail"];
+    assert_eq!(detail["time_cap_ms"], 1000);
+    assert!(detail["elapsed_ms"].as_u64().unwrap() >= detail["time_cap_ms"].as_u64().unwrap());
+    assert_eq!(detail["path_class"], "regular_file");
+    assert!(receipt["sandbox"].is_null());
+    assert!(!receipt.to_string().contains("tool_binary_digest"));
 }
 
 #[tokio::test]

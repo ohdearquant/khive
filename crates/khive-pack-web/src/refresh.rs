@@ -675,6 +675,7 @@ async fn settle_refresh_from_snapshot(
         "changed": changed,
         "lost_race": lost_race,
         "content_ref": new_content_ref,
+        "body_entity_id": new_content_ref.as_ref().map(|_| final_id.to_string()),
         "truncated": was_truncated,
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
@@ -690,6 +691,10 @@ async fn settle_refresh_from_snapshot(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.refresh: receipt write failed: {error}"))
     })?;
+    if let Some(reference) = new_content_ref.as_deref() {
+        crate::receipt::bind_capture_receipt(runtime, token, final_id, reference, receipt_id)
+            .await?;
+    }
     if let Some(previous) = previous_receipt {
         runtime
             .link(
@@ -1006,6 +1011,7 @@ mod tests {
             Some(reference.as_str())
         );
         assert_eq!(first_properties["truncated"], false);
+        assert_eq!(first_properties["capture_receipt_id"], first["receipt_id"]);
 
         let second = settle_refresh(
             &runtime,
@@ -1020,8 +1026,13 @@ mod tests {
         .unwrap();
         assert_eq!(second["changed"], false);
         let after_second = entities.get_entity(id).await.unwrap().unwrap();
-        assert_eq!(after_second.properties, after_first.properties);
-        assert_eq!(after_second.updated_at, after_first.updated_at);
+        let mut expected_properties = after_first.properties.unwrap();
+        expected_properties["capture_receipt_id"] = second["receipt_id"].clone();
+        assert_eq!(after_second.properties, Some(expected_properties));
+        assert!(
+            after_second.version > after_first.version,
+            "a new body-storing receipt rebinds the capture pointer"
+        );
     }
 
     #[test]
@@ -1712,7 +1723,12 @@ mod tests {
                     expected["request_headers"] =
                         json!({"accept-encoding": [crate::fetch::FIXED_ACCEPT_ENCODING]});
                     expected["vary"] = json!([]);
+                    expected["capture_receipt_id"] = reply["receipt_id"].clone();
                     assert_eq!(terminal.properties, Some(expected));
+                    assert!(
+                        terminal.version > before.version,
+                        "the terminal capture pointer follows the new body-storing receipt"
+                    );
                 }
                 let roots = runtime
                     .attachments()

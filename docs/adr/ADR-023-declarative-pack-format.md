@@ -590,7 +590,7 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 | Two packs declare the same verb name                           | `BootError::VerbCollision` at registration                  |
 | Static `Visibility::Subhandler` handler in a loaded pack       | Excluded from MCP capability list                           |
 | Substrate verb with kind-owning pack registering KindHook      | `create(kind=X, ...)` routes through prepare_create         |
-| Subhandler invoked via MCP `request("pack.subhandler_x(...)")` | `RuntimeError::HandlerNotExposed`                           |
+| Subhandler invoked via MCP `request("pack.subhandler_x(...)")` | Permission denied; internal subhandler; `not_committed`     |
 | Subhandler visible through operator introspection              | Listed as `Visibility::Subhandler`, not MCP-callable        |
 | Future `verbs_disabled` config policy                          | Deferred; requires parser, validation, and capability tests |
 | Pack template-generated crate compiles + passes smoke test     | Yes                                                         |

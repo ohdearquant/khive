@@ -87,8 +87,10 @@ async fn ingest_disk_file(
         "mode": "disk",
         "url": canonical.to_string(),
         "bytes": settled.bytes,
+        "content_ref": settled.content_ref,
+        "body_entity_id": settled.id.to_string(),
     });
-    write_receipt(
+    let receipt_id = write_receipt(
         runtime,
         token,
         &format!("web.ingest (disk) {canonical}"),
@@ -96,6 +98,10 @@ async fn ingest_disk_file(
         vec![settled.id],
     )
     .await?;
+    if let Some(reference) = settled.content_ref.as_deref() {
+        crate::receipt::bind_capture_receipt(runtime, token, settled.id, reference, receipt_id)
+            .await?;
+    }
     Ok(settled.id)
 }
 
@@ -196,7 +202,7 @@ async fn ingest_urls(
 
 fn extracted_target_count(reply: &Value) -> u32 {
     [
-        &reply["result"]["links"]["edges_created"],
+        &reply["result"]["links"]["admitted_targets"],
         &reply["result"]["sitemap"]["entries"],
         &reply["result"]["feed"]["entries"],
     ]
@@ -396,6 +402,21 @@ mod tests {
     use khive_types::Namespace;
     use std::sync::Arc;
 
+    #[test]
+    fn crawl_budget_charges_admitted_targets_even_when_legacy_edges_collide() {
+        let extraction = json!({
+            "result": {
+                "links": {
+                    "edges_created": 0,
+                    "admitted_targets": 2,
+                    "ownership_collisions": 2,
+                },
+                "sitemap": { "entries": 1 },
+            },
+        });
+        assert_eq!(extracted_target_count(&extraction), 3);
+    }
+
     /// See `fetch::tests::install_web_edge_rules` for why this is needed:
     /// the in-crate test runtime carries no `VerbRegistry`, so the web
     /// pack's own `EDGE_RULES` are never installed on it by default.
@@ -471,6 +492,7 @@ mod tests {
                 let mut properties = entity.properties.unwrap_or(Value::Null);
                 if let Some(properties) = properties.as_object_mut() {
                     properties.remove("fetched_at");
+                    properties.remove("capture_receipt_id");
                 }
                 json!({"id": entity.id, "kind": entity.kind, "entity_type": entity.entity_type,
                     "name": entity.name, "properties": properties})

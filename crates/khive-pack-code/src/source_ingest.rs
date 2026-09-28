@@ -26,7 +26,7 @@
 //! records only the information needed to recompute its target's id later,
 //! and the synchronous re-resolve pass (`reresolve_pass`) does exactly that.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,7 @@ use crate::extractor::{DeclKind, ExtractedDeclaration, ExtractedFile};
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+use crate::safe_source::{self, SourceReadError};
 
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
 const RUST_L2_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -170,6 +171,13 @@ pub struct CodeSourceIngestReport {
     /// could be derived — counted instead of silently skipping them.
     #[serde(default)]
     pub files_skipped_without_module_path: u64,
+    /// Source file opens refused because the candidate disappeared, was not
+    /// regular, or could not be verified inside the ingest root.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub source_files_refused: u64,
+    /// Manifest opens refused for the same file and containment checks.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub manifest_files_refused: u64,
     /// Entity documents successfully written to the map database's FTS index.
     /// A successful ingest indexes every non-blocked entity upsert, so generic
     /// KG `search` and query-anchored `context` can read the resulting map.
@@ -193,6 +201,10 @@ pub struct CodeSourceIngestReport {
     pub source_revision: String,
 }
 
+fn count_is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodeSourceIngestError {
     #[error("path {0:?} does not exist or is not a directory")]
@@ -201,6 +213,52 @@ pub enum CodeSourceIngestError {
     Runtime(#[from] RuntimeError),
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+fn record_manifest_failures(
+    report: &mut CodeSourceIngestReport,
+    failures: Vec<manifest::ManifestReadFailure>,
+) {
+    for failure in failures {
+        let refused = matches!(&failure.error, SourceReadError::Refused(_));
+        let warning = if refused {
+            format!(
+                "refused manifest {}: {}",
+                failure.path.display(),
+                failure.error
+            )
+        } else {
+            format!(
+                "reading manifest {}: {}",
+                failure.path.display(),
+                failure.error
+            )
+        };
+        if !report.warnings.contains(&warning) {
+            if refused {
+                report.manifest_files_refused += 1;
+            }
+            report.warnings.push(warning);
+        }
+    }
+}
+
+fn record_source_read_failure(
+    report: &mut CodeSourceIngestReport,
+    tier: &str,
+    path: &Path,
+    error: SourceReadError,
+) {
+    if matches!(&error, SourceReadError::Refused(_)) {
+        report.source_files_refused += 1;
+        report
+            .warnings
+            .push(format!("{tier} refused source {}: {error}", path.display()));
+    } else {
+        report
+            .warnings
+            .push(format!("reading {}: {error}", path.display()));
+    }
 }
 
 pub struct CodeSourceIngestOptions<'a> {
@@ -440,7 +498,7 @@ fn edge_uuid(relation: EdgeRelation, source_id: Uuid, target_id: Uuid) -> Uuid {
 /// A `uuid5`-recomputable unresolved reference recorded on a source entity
 /// (B6). Content-hash-free by design: only the fields needed to recompute
 /// the target's identity and the edge's metadata are kept.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct UnresolvedSpec {
     specifier: String,
     target_kind: String,
@@ -449,6 +507,13 @@ struct UnresolvedSpec {
     dependency_scope: String,
     language: String,
 }
+
+struct PendingUnresolved {
+    spec: UnresolvedSpec,
+    file: String,
+}
+
+type PendingUnresolvedByOwner = BTreeMap<Uuid, Vec<PendingUnresolved>>;
 
 fn read_unresolved(properties: &Value) -> Vec<UnresolvedSpec> {
     let mut specs: Vec<UnresolvedSpec> = properties
@@ -1158,34 +1223,108 @@ async fn upsert_module(
     Ok(Some(id))
 }
 
-/// Append `spec` to `entity_id`'s `unresolved_specifiers` (deduped), without
-/// disturbing any other property already stamped this sweep (project/module
-/// upsert already ran first, so this always reads back the row this pass
-/// just wrote).
+/// Append one sweep's unresolved specs to an owner in encounter order with a
+/// single guarded entity/FTS write. Project/module upserts have already run,
+/// and the fresh-read rebase preserves their other properties.
 ///
-/// When the gate refuses the updated properties (e.g. `spec.specifier` is
-/// itself secret-shaped), the refusal is recorded in `report.blocked` keyed
-/// by `file` and the specifier is simply not recorded this sweep — the
-/// entity itself is untouched, since the guarded mutation blocks before writing.
-async fn record_unresolved(
+/// Screen each candidate separately before batching, so a secret-shaped
+/// specifier is quarantined under its own source file without discarding safe
+/// siblings. The full replacement still passes `mutate_entity`'s secret gate.
+async fn record_unresolved_batch(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     entity_id: Uuid,
-    spec: UnresolvedSpec,
-    file: &str,
+    pending: &[PendingUnresolved],
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let outcome = mutate_entity(rt, token, entity_id, file, report, |current| {
+    // A pre-existing spec (or an earlier safe candidate in this batch) was
+    // already a no-op in the per-spec path, before its gate check. Preserve
+    // that behavior and avoid screening duplicates repeatedly. The guarded
+    // mutation below reads again and rebases if another sweep wrote meanwhile.
+    let current = rt
+        .entities(token)?
+        .get_entity_including_deleted(entity_id)
+        .await
+        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let mut staged_seen: HashSet<_> = current
+        .properties
+        .as_ref()
+        .map(read_unresolved)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if pending.iter().all(|item| staged_seen.contains(&item.spec)) {
+        return Ok(());
+    }
+    // If the owner already carries a gate-refused value, every new per-spec
+    // mutation used to be refused before any of them could write. Keep that
+    // per-item report behavior without rebuilding and rechecking the growing
+    // list K times.
+    if let Err(error) = gate_check(&current) {
+        match error {
+            RuntimeError::SecretDetected(secret) => {
+                for item in pending {
+                    if !staged_seen.contains(&item.spec) {
+                        report.blocked_count += 1;
+                        report.blocked.push(BlockedWrite {
+                            file: item.file.clone(),
+                            detector: secret.detector.to_string(),
+                            masked_excerpt: secret.masked.clone(),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            other => return Err(other.into()),
+        }
+    }
+    let mut allowed = Vec::with_capacity(pending.len());
+    for item in pending {
+        if staged_seen.contains(&item.spec) {
+            continue;
+        }
+        let candidate = serde_json::to_value(&item.spec).expect("serializes");
+        match secret_gate::check_json_at(&candidate, "entity", "properties") {
+            Ok(()) => {
+                staged_seen.insert(item.spec.clone());
+                allowed.push(item);
+            }
+            Err(RuntimeError::SecretDetected(secret)) => {
+                report.blocked_count += 1;
+                report.blocked.push(BlockedWrite {
+                    file: item.file.clone(),
+                    detector: secret.detector.to_string(),
+                    masked_excerpt: secret.masked,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+    }
+    let Some(first) = allowed.first() else {
+        return Ok(());
+    };
+    let mut appended = 0usize;
+    let outcome = mutate_entity(rt, token, entity_id, &first.file, report, |current| {
         let mut entity = current?.clone();
         let mut list = entity
             .properties
             .as_ref()
             .map(read_unresolved)
             .unwrap_or_default();
-        if list.contains(&spec) {
+        let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
+        appended = 0;
+        for item in &allowed {
+            if seen.insert(item.spec.clone()) {
+                list.push(item.spec.clone());
+                appended += 1;
+            }
+        }
+        if appended == 0 {
             return None;
         }
-        list.push(spec.clone());
         let mut props = entity
             .properties
             .clone()
@@ -1200,7 +1339,7 @@ async fn record_unresolved(
     })
     .await?;
     if outcome.wrote() {
-        report.unresolved_recorded += 1;
+        report.unresolved_recorded += appended as u64;
     }
     Ok(())
 }
@@ -1402,6 +1541,7 @@ async fn reresolve_pass(
         }
         let original_list = list.clone();
         let mut still_unresolved = Vec::new();
+        let mut still_seen = HashSet::new();
         let mut changed = false;
         for mut spec in list.drain(..) {
             let selected = if spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
@@ -1410,6 +1550,7 @@ async fn reresolve_pass(
                 tiers.l1
             };
             if !selected {
+                still_seen.insert(spec.clone());
                 still_unresolved.push(spec);
                 continue;
             }
@@ -1475,7 +1616,7 @@ async fn reresolve_pass(
                     // normalize to the same specifier as the freshly
                     // scanned form above. Keep the durable queue deduped
                     // after that repair as well as before it.
-                    if still_unresolved.contains(&spec) {
+                    if !still_seen.insert(spec.clone()) {
                         changed = true;
                     } else {
                         still_unresolved.push(spec);
@@ -1485,6 +1626,7 @@ async fn reresolve_pass(
         }
         if changed {
             let entity_label = id.to_string();
+            let original_set: HashSet<_> = original_list.iter().cloned().collect();
             mutate_entity(rt, token, id, &entity_label, report, |current| {
                 let mut entity = current?.clone();
                 let mut rebased = entity
@@ -1492,9 +1634,10 @@ async fn reresolve_pass(
                     .as_ref()
                     .map(read_unresolved)
                     .unwrap_or_default();
-                rebased.retain(|specifier| !original_list.contains(specifier));
+                rebased.retain(|specifier| !original_set.contains(specifier));
+                let mut seen: HashSet<_> = rebased.iter().cloned().collect();
                 for specifier in &still_unresolved {
-                    if !rebased.contains(specifier) {
+                    if seen.insert(specifier.clone()) {
                         rebased.push(specifier.clone());
                     }
                 }
@@ -1713,21 +1856,16 @@ fn content_hash(content: &str) -> String {
 /// Read at most the L2 scanner's byte limit plus one. A refused file keeps
 /// module metadata and a parse-failure row, but its `refused:` fingerprint is
 /// deliberately not represented as a hash of unread source bytes.
-fn read_l2_source(path: &Path) -> io::Result<L2Source> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Ok(L2Source::Refused {
-            hash: "refused:non-regular-file".to_string(),
-            reason: "scanner safety limit: Rust source is not a regular file".to_string(),
-        });
-    }
+fn read_l2_source(canonical_root: &Path, path: &Path) -> Result<L2Source, SourceReadError> {
+    let source = safe_source::open_contained_file(canonical_root, path)?;
+    let metadata = source.metadata()?;
     if metadata.len() > RUST_L2_MAX_SOURCE_BYTES as u64 {
         return Ok(L2Source::Refused {
             hash: format!("refused:size:{}", metadata.len()),
             reason: "scanner safety limit: Rust source is too large".to_string(),
         });
     }
-    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut reader = BufReader::new(source);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -2054,6 +2192,7 @@ pub async fn run_code_ingest(
     // L1/L1.5 calls to preserve their established write/counter behavior.
     let mut project_ids: HashMap<(String, String), Uuid> = HashMap::new();
     let mut previous_l2_sweep_stamps = PreviousL2SweepStamps::new();
+    let mut pending_unresolved = PendingUnresolvedByOwner::new();
 
     // Manifest discovery supplies bounded identity, alias, and scope context
     // to L1.5 without implying L1 output. No selected L1/L1.5 tier means no
@@ -2061,8 +2200,11 @@ pub async fn run_code_ingest(
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
         let canonical_ingest_root = fs::canonicalize(opts.path)
             .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
-        manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
-            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?
+        let (manifests, failures) =
+            manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
+                .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+        record_manifest_failures(&mut report, failures);
+        manifests
     } else {
         Vec::new()
     };
@@ -2128,7 +2270,7 @@ pub async fn run_code_ingest(
                 // A renamed dependency's alias row and package row both
                 // index the same declared fact; canonicalizing the alias to
                 // the package at record time makes the two rows produce one
-                // identical spec (deduped by `record_unresolved`) targeting
+                // identical spec (deduped by the per-owner batch) targeting
                 // the package's project identity — never a phantom alias
                 // project.
                 let specifier =
@@ -2140,7 +2282,13 @@ pub async fn run_code_ingest(
                     dependency_scope: dep_scope.clone(),
                     language: m.language.to_string(),
                 };
-                record_unresolved(rt, token, source_id, spec, &file_label, &mut report).await?;
+                pending_unresolved
+                    .entry(source_id)
+                    .or_default()
+                    .push(PendingUnresolved {
+                        spec,
+                        file: file_label.clone(),
+                    });
             }
         }
     }
@@ -2167,10 +2315,18 @@ pub async fn run_code_ingest(
                 &mut project_ids,
                 &mut previous_l2_sweep_stamps,
                 &mut module_scans,
+                &mut pending_unresolved,
                 &mut report,
             )
             .await?;
         }
+    }
+
+    // Flush after all project/module refreshes, before synchronous B6
+    // re-resolution observes the unresolved queue. Each owner gets one
+    // guarded write regardless of how many files/specifiers contributed.
+    for (entity_id, pending) in pending_unresolved {
+        record_unresolved_batch(rt, token, entity_id, &pending, &mut report).await?;
     }
 
     if opts.enable_l1 || opts.enable_l1_5 {
@@ -2250,6 +2406,7 @@ async fn run_import_scan(
     project_ids: &mut HashMap<(String, String), Uuid>,
     previous_l2_sweep_stamps: &mut PreviousL2SweepStamps,
     module_scans: &mut HashMap<Uuid, ModuleScan>,
+    pending_unresolved: &mut PendingUnresolvedByOwner,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let Some(ext) = imports::extension_for_language(language) else {
@@ -2313,14 +2470,20 @@ async fn run_import_scan(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, language)
-                .unwrap_or_else(|| {
-                    (
-                        canonical_ingest_root.clone(),
-                        basename_project_name(ingest_root),
-                    )
-                });
+        let mut manifest_failures = Vec::new();
+        let governing = manifest::find_governing_manifest(
+            file_dir,
+            &canonical_ingest_root,
+            language,
+            &mut manifest_failures,
+        );
+        record_manifest_failures(report, manifest_failures);
+        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+            (
+                canonical_ingest_root.clone(),
+                basename_project_name(ingest_root),
+            )
+        });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             report.files_skipped_without_module_path += 1;
             continue;
@@ -2352,12 +2515,10 @@ async fn run_import_scan(
             continue;
         };
 
-        let content = match fs::read_to_string(&file) {
+        let content = match safe_source::read_contained_to_string(&canonical_ingest_root, &file) {
             Ok(c) => c,
             Err(e) => {
-                report
-                    .warnings
-                    .push(format!("reading {}: {e}", file.display()));
+                record_source_read_failure(report, "L1.5", &file, e);
                 continue;
             }
         };
@@ -2421,7 +2582,13 @@ async fn run_import_scan(
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
-                    record_unresolved(rt, token, module_id, spec, &file_label, report).await?;
+                    pending_unresolved
+                        .entry(module_id)
+                        .or_default()
+                        .push(PendingUnresolved {
+                            spec,
+                            file: file_label.clone(),
+                        });
                 }
                 Resolved::ExternalProject(target_name) => {
                     let resolution = project_import_target_and_scope(
@@ -2440,7 +2607,13 @@ async fn run_import_scan(
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
-                    record_unresolved(rt, token, proj_id, spec, &file_label, report).await?;
+                    pending_unresolved
+                        .entry(proj_id)
+                        .or_default()
+                        .push(PendingUnresolved {
+                            spec,
+                            file: file_label.clone(),
+                        });
                 }
             }
         }
@@ -3717,14 +3890,20 @@ async fn run_l2_sweep(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let (proj_root, proj_name) =
-            manifest::find_governing_manifest(file_dir, &canonical_ingest_root, LANGUAGE)
-                .unwrap_or_else(|| {
-                    (
-                        canonical_ingest_root.clone(),
-                        basename_project_name(ingest_root),
-                    )
-                });
+        let mut manifest_failures = Vec::new();
+        let governing = manifest::find_governing_manifest(
+            file_dir,
+            &canonical_ingest_root,
+            LANGUAGE,
+            &mut manifest_failures,
+        );
+        record_manifest_failures(report, manifest_failures);
+        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+            (
+                canonical_ingest_root.clone(),
+                basename_project_name(ingest_root),
+            )
+        });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, LANGUAGE) else {
             report.files_skipped_without_module_path += 1;
             continue;
@@ -3753,12 +3932,10 @@ async fn run_l2_sweep(
             continue;
         };
 
-        let source = match read_l2_source(&file) {
+        let source = match read_l2_source(&canonical_ingest_root, &file) {
             Ok(source) => source,
             Err(e) => {
-                report
-                    .warnings
-                    .push(format!("reading {}: {e}", file.display()));
+                record_source_read_failure(report, "L2", &file, e);
                 continue;
             }
         };
@@ -4412,7 +4589,9 @@ mod tests {
         let path = root.path().join("oversized.rs");
         let source = " ".repeat(RUST_L2_MAX_SOURCE_BYTES + 1);
         fs::write(&path, &source).expect("source file");
-        let L2Source::Refused { hash, reason } = read_l2_source(&path).expect("bounded read")
+        let L2Source::Refused { hash, reason } =
+            read_l2_source(&root.path().canonicalize().expect("canonical root"), &path)
+                .expect("bounded read")
         else {
             panic!("oversized source must not be retained for parsing");
         };
@@ -4676,29 +4855,23 @@ mod tests {
         let pause_b = std::sync::Arc::new(race_seam::OneShotPause::new(barrier));
         let mut report_a = CodeSourceIngestReport::default();
         let mut report_b = CodeSourceIngestReport::default();
+        let pending_a = [PendingUnresolved {
+            spec: specifier_a.clone(),
+            file: "alpha.rs".to_string(),
+        }];
+        let pending_b = [PendingUnresolved {
+            spec: specifier_b.clone(),
+            file: "beta.rs".to_string(),
+        }];
 
         let (result_a, result_b) = tokio::join!(
             race_seam::AFTER_ROW_READ.scope(
                 pause_a,
-                record_unresolved(
-                    &runtime_a,
-                    &token_a,
-                    entity_id,
-                    specifier_a.clone(),
-                    "alpha.rs",
-                    &mut report_a,
-                ),
+                record_unresolved_batch(&runtime_a, &token_a, entity_id, &pending_a, &mut report_a),
             ),
             race_seam::AFTER_ROW_READ.scope(
                 pause_b,
-                record_unresolved(
-                    &runtime_b,
-                    &token_b,
-                    entity_id,
-                    specifier_b.clone(),
-                    "beta.rs",
-                    &mut report_b,
-                ),
+                record_unresolved_batch(&runtime_b, &token_b, entity_id, &pending_b, &mut report_b),
             ),
         );
         result_a.expect("writer A completes");
@@ -4728,6 +4901,82 @@ mod tests {
         assert_eq!(report_b.unresolved_recorded, 1);
         assert_eq!(report_a.fts_indexed, 1);
         assert_eq!(report_b.fts_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_batch_keeps_order_and_dedup_with_one_owner_write() {
+        let root = TempDir::new().expect("temporary database directory");
+        let (runtime, token) = runtime_on(&root.path().join("unresolved-batch.db"));
+        let entity_id = project_uuid("batch-fixture");
+        let existing = UnresolvedSpec {
+            specifier: "existing".to_string(),
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let mut entity = Entity::new(token.namespace().as_str(), "project", "batch-fixture");
+        entity.id = entity_id;
+        entity.properties = Some(json!({
+            "source_project": "batch-fixture",
+            "unresolved_specifiers": [existing],
+        }));
+        runtime
+            .entities(&token)
+            .expect("entity store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let spec = |name: String| UnresolvedSpec {
+            specifier: name,
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let mut pending: Vec<_> = (0..64)
+            .map(|i| PendingUnresolved {
+                spec: spec(format!("missing_{i:02}")),
+                file: "Cargo.toml".to_string(),
+            })
+            .collect();
+        pending.insert(
+            1,
+            PendingUnresolved {
+                spec: spec("existing".to_string()),
+                file: "Cargo.toml".to_string(),
+            },
+        );
+        pending.push(PendingUnresolved {
+            spec: spec("missing_00".to_string()),
+            file: "Cargo.toml".to_string(),
+        });
+        pending.push(PendingUnresolved {
+            spec: spec("scheme://user:pass@host".to_string()),
+            file: "blocked.toml".to_string(),
+        });
+        let mut report = CodeSourceIngestReport::default();
+        record_unresolved_batch(&runtime, &token, entity_id, &pending, &mut report)
+            .await
+            .expect("batch appends safe siblings");
+
+        let stored = runtime
+            .entities(&token)
+            .expect("entity store")
+            .get_entity(entity_id)
+            .await
+            .expect("read entity")
+            .expect("entity remains");
+        let list = read_unresolved(stored.properties.as_ref().expect("properties"));
+        let expected: Vec<_> = std::iter::once(spec("existing".to_string()))
+            .chain((0..64).map(|i| spec(format!("missing_{i:02}"))))
+            .collect();
+        assert_eq!(list, expected, "append order and dedup must be stable");
+        assert_eq!(report.unresolved_recorded, 64);
+        assert_eq!(report.fts_indexed, 1, "one owner gets one FTS upsert");
+        assert_eq!(report.blocked_count, 1);
+        assert_eq!(report.blocked[0].file, "blocked.toml");
     }
 
     #[tokio::test]

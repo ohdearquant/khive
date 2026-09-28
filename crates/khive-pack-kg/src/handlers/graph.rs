@@ -113,13 +113,10 @@ impl KgPack {
             }
         }
         // #1670: the SQL neighbor query aliases one edge endpoint to `node_id`
-        // and discards the other, so the stored source/target must be
-        // recovered with a per-hit edge read. This is one read per hit (N+1);
-        // `limit` is optional, so the read count is capped only when the
-        // caller supplies one. An edge deleted between the two reads reports
-        // `null` endpoints rather than failing the whole response; it must not
-        // report nil UUIDs, which would be indistinguishable from a real
-        // direction and would defeat the purpose of the fields.
+        // and discards the other. Record and Edge projections recover stored
+        // source/target with one edge read per returned hit; Summary does not
+        // return endpoints and needs no edge read. An edge deleted between the
+        // adjacency and endpoint reads yields `null` rather than nil UUIDs.
         let has_more = effective_limit.is_some_and(|limit| hits.len() > limit as usize);
         if let Some(limit) = effective_limit {
             hits.truncate(limit as usize);
@@ -135,11 +132,14 @@ impl KgPack {
         };
         let mut responses = Vec::with_capacity(hits.len());
         for hit in hits {
-            let endpoints = self
-                .runtime
-                .get_edge(token, hit.edge_id)
-                .await?
-                .map(|e| (e.source_id, e.target_id));
+            let endpoints = match projection {
+                NeighborProjection::Summary => None,
+                _ => self
+                    .runtime
+                    .get_edge(token, hit.edge_id)
+                    .await?
+                    .map(|e| (e.source_id, e.target_id)),
+            };
             let response = match projection {
                 NeighborProjection::Edge => serde_json::json!({
                     "origin_id": node_id,
@@ -312,6 +312,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    async fn pooled_reader_checkouts(runtime: &KhiveRuntime) -> u64 {
+        runtime
+            .db_diagnostics()
+            .await
+            .expect("reader diagnostics")
+            .reader_contention
+            .pooled_reader_checkouts
+    }
 
     /// Regression for #1670: `neighbors` response must carry the edge's
     /// stored `source_id`/`target_id`, independent of `direction` and
@@ -526,7 +535,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         let registry = builder.build().expect("registry build");
-        let pack = KgPack::new(rt);
+        let pack = KgPack::new(rt.clone());
 
         let root = pack
             .dispatch(
@@ -706,6 +715,108 @@ mod tests {
         assert!(summary_projection["neighbors"][0]
             .get("source_id")
             .is_none());
+
+        let record_projection = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": root_id, "direction": "out", "limit": 1, "projection": "record"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("record projection must succeed");
+        let record_hit = &record_projection["neighbors"][0];
+        let expected_summary = json!({
+            "neighbors": [{
+                "origin_id": record_hit["origin_id"],
+                "id": record_hit["id"],
+                "edge_id": record_hit["edge_id"],
+                "relation": record_hit["relation"],
+                "weight": record_hit["weight"],
+                "name": record_hit["name"],
+                "kind": record_hit["kind"],
+                "entity_type": record_hit["entity_type"],
+            }],
+            "next_after": record_projection["next_after"],
+            "requested_limit": 1,
+            "effective_limit": 1,
+            "limit_clamped": false,
+        });
+        assert_eq!(
+            serde_json::to_vec(&summary_projection).expect("serialize summary"),
+            serde_json::to_vec(&expected_summary).expect("serialize expected summary"),
+            "Summary must keep its existing wire response"
+        );
+
+        // The pool counter measures the actual reader calls behind the handler.
+        // Both projections run the same adjacency query; only Record needs the
+        // additional per-hit edge reads. Account for diagnostics' own fixed
+        // read cost by measuring one pair of empty snapshots first.
+        let diagnostics_before = pooled_reader_checkouts(&rt).await;
+        let diagnostics_after = pooled_reader_checkouts(&rt).await;
+        let diagnostics_cost = diagnostics_after - diagnostics_before;
+        let before_query = pooled_reader_checkouts(&rt).await;
+        let query_hits = rt
+            .neighbors_with_query_page(
+                &token,
+                root_id.parse().expect("root UUID"),
+                NeighborQuery {
+                    direction: parse_direction(Some("out")).expect("direction"),
+                    relations: None,
+                    limit: Some(4),
+                    min_weight: None,
+                },
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("adjacency query");
+        let query_cost = pooled_reader_checkouts(&rt).await - before_query;
+        assert_eq!(query_hits.len(), 4, "three hits plus a pagination probe");
+
+        let before_summary = pooled_reader_checkouts(&rt).await;
+        let summary = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": root_id, "direction": "out", "limit": 3, "projection": "summary"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("summary projection");
+        let summary_cost = pooled_reader_checkouts(&rt).await - before_summary;
+        assert_eq!(summary["neighbors"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            summary_cost, query_cost,
+            "Summary must perform zero extra edge reads"
+        );
+
+        let before_edge = pooled_reader_checkouts(&rt).await;
+        rt.get_edge(&token, query_hits[0].edge_id)
+            .await
+            .expect("edge read")
+            .expect("existing edge");
+        let edge_cost = pooled_reader_checkouts(&rt).await - before_edge - diagnostics_cost;
+        assert!(edge_cost > 0, "edge read must be visible in pool counters");
+
+        let before_record = pooled_reader_checkouts(&rt).await;
+        let record = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": root_id, "direction": "out", "limit": 3, "projection": "record"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("record projection");
+        let record_cost = pooled_reader_checkouts(&rt).await - before_record;
+        assert_eq!(record["neighbors"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            record_cost,
+            query_cost + 3 * edge_cost,
+            "Record must fetch one edge per returned hit"
+        );
 
         let context_over_cap = pack
             .dispatch(
