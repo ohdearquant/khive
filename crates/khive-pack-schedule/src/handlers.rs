@@ -95,6 +95,12 @@ fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
         .map_err(RuntimeError::InvalidInput)
 }
 
+fn store_monthly_anchor(properties: &mut Value, repeat: Option<&str>, trigger_at: &str) {
+    if repeat.is_some_and(|value| value.trim() == "monthly") {
+        properties["repeat_anchor"] = json!(trigger_at);
+    }
+}
+
 /// Validates `action` parses as DSL via `khive_request::parse_request`,
 /// catching garbage at write time rather than trigger time. Returns the
 /// parsed request so callers can inspect verb names without re-parsing.
@@ -717,7 +723,7 @@ pub(crate) async fn handle_remind(
         validate_repeat(r)?;
     }
 
-    let properties = json!({
+    let mut properties = json!({
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "provisioning",
@@ -727,6 +733,7 @@ pub(crate) async fn handle_remind(
         "fired_at": null,
         "cancelled_at": null,
     });
+    store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
 
     let note = runtime
         .create_note(
@@ -791,7 +798,7 @@ pub(crate) async fn handle_schedule(
         validate_repeat(r)?;
     }
 
-    let properties = json!({
+    let mut properties = json!({
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "provisioning",
@@ -801,6 +808,7 @@ pub(crate) async fn handle_schedule(
         "fired_at": null,
         "cancelled_at": null,
     });
+    store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
 
     let note = runtime
         .create_note(

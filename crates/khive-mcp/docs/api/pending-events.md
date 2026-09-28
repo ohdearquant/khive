@@ -204,9 +204,10 @@ bound, not the last word.
 
 ## Executable recurrence boundary
 
-Creation and `next_trigger_at` share one parser, `khive_pack_schedule::repeat`:
-`daily`, `weekly`, `monthly`, `every:<N><s|m|h|d>` intervals from the previous
-trigger, and five-field cron expressions evaluated in UTC. Anything else is
+Creation and the executor share one parser, `khive_pack_schedule::repeat`:
+`daily`, `weekly`, and `every:<N><s|m|h|d>` intervals from the previous trigger;
+`monthly` dates from the stored `repeat_anchor`, clamped within each month;
+and five-field cron expressions evaluated in UTC. Anything else is
 rejected at creation instead of being stored and silently consumed as a
 one-shot, and a legacy row the parser refuses fails closed before action
 invocation.

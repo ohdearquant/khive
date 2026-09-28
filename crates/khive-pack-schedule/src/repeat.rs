@@ -14,7 +14,7 @@ pub enum Repeat {
     Daily,
     /// The previous trigger plus seven days.
     Weekly,
-    /// The previous trigger plus one calendar month.
+    /// A calendar month from the row's fixed anchor, clamped independently.
     Monthly,
     /// A fixed interval from the previous trigger: `every:<N><s|m|h|d>`.
     Every(Duration),
@@ -138,7 +138,8 @@ fn parse_every(spec: &str) -> Result<Duration, String> {
 }
 
 impl Repeat {
-    /// The occurrence after `current`.
+    /// The occurrence after `current`. For a stored monthly series, use
+    /// `first_after` with its fixed anchor once the first month has clamped.
     pub fn next_after(&self, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             Repeat::Daily => current.checked_add_signed(Duration::days(1)),
@@ -154,8 +155,9 @@ impl Repeat {
     /// The first occurrence strictly after `now`, given the missed occurrence
     /// `current`: the missed-event advance without a catch-up burst. An
     /// interval jumps arithmetically and stays phase-locked to the original
-    /// trigger; cron asks the pattern from `now`; the calendar aliases step
-    /// one occurrence at a time, each strictly later than the last.
+    /// trigger; cron asks the pattern from `now`; daily and weekly step one
+    /// occurrence at a time. For monthly rows, `current` is the original
+    /// anchor, and each candidate is that anchor plus n calendar months.
     pub fn first_after(&self, current: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             Repeat::Every(interval) => {
@@ -169,7 +171,17 @@ impl Repeat {
                 current.checked_add_signed(advance)
             }
             Repeat::Cron(cron) => cron.find_next_occurrence(&now, false).ok(),
-            Repeat::Daily | Repeat::Weekly | Repeat::Monthly => {
+            Repeat::Monthly => {
+                let mut months = 1u32;
+                loop {
+                    let next = current.checked_add_months(Months::new(months))?;
+                    if next > now {
+                        return Some(next);
+                    }
+                    months = months.checked_add(1)?;
+                }
+            }
+            Repeat::Daily | Repeat::Weekly => {
                 let mut current = current;
                 loop {
                     let next = self.next_after(current)?;
