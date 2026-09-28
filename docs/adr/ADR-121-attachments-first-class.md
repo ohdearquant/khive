@@ -490,32 +490,48 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    (or stronger serialization) with the sweep, including writes from a pack routed to a secondary.
    This item extends ADR-111 §8 and ADR-160 Phase 4's attachment-only liveness rule for these pack
    objects while keeping the canonical main backend as the sole SQL authority.
-8. **Bind the root to its main database at cutover.** A filesystem blob root has one durable owning
-   main database. For a provably new empty root, a new attachment cutover first records a pending
-   store ID in the main database, then durably writes and verifies the matching anchored marker in
-   the canonical root. A populated root instead requires a separately invoked verified adoption
-   that establishes this same pending ID and marker before cutover can complete; daemon boot never
-   claims it automatically. Only then does one database transaction mark both the binding and
-   cutover complete with that same ID.
-   A crash before this final transaction leaves the cutover incomplete and sweeps refuse. Recovery
-   reuses and verifies the pending ID and any existing matching root marker; it never mints a new ID
-   for that attempt or overwrites a different owner's marker. A cutover completed under this rule implies a durable
-   verified root marker. A database already cut over before this rule obtains its store ID only
-   through the separate verified adoption action below; the
-   old V21 completion marker alone cannot mint one. The database binding and root marker identify
-   the same `store_id`, root and owner, including a durable database identity and canonical
-   database file identity; a copied database at another path cannot inherit ownership by copying
-   its rows. A completed attachment cutover, empty `attachments`, a database path supplied by
-   `--db`, or the path-derived GC claim key is not binding proof. `FsBlobStore` checks the binding
+8. **Bind the root to its main database after cutover.** A filesystem blob root has one durable
+   owning main database. The migration that adds binding state and the attachment cutover do not
+   mint a store ID, bind a root or write its marker. On any daemon boot while the main database holds
+   no completed binding, the daemon may bind its configured canonical root only when attachment
+   cutover is complete, the main database has no pending or completed binding, and it proves the
+   root empty: no blob objects
+   and no root ownership marker of any owner. It checks this under database GC ownership and the
+   root write lock. This is the only automatic fresh-root bind. It first records a pending store ID
+   in main, then durably writes and verifies the matching anchored marker in the canonical root,
+   then uses one main-database transaction to mark binding complete with that same ID. The completed
+   cutover state is unchanged by that transaction. A populated root, even with one object, or a
+   root with a preexisting marker cannot enter this fresh path; neither boot nor sweep claims it
+   automatically.
+
+   A boot that dies before the pending ID is recorded leaves no state, so the next boot is a fresh
+   attempt. A crash after recording the pending ID but before the completing transaction leaves
+   binding pending and both sweep modes refuse. Recovery reuses the pending ID, rechecks that no
+   blob objects appeared and verifies its own matching root marker if one was already written. It
+   never mints a replacement ID, overwrites a foreign or mismatched marker, or completes an
+   automatic bind for a populated root. A marker without a matching pending ID is not a recoverable
+   fresh-root attempt. A completed
+   binding implies a durable verified root marker. A database cut over before this rule may take
+   the fresh-root path only for a provably empty configured root; a pre-rule completed root with
+   objects, and every populated root, requires separately invoked verified adoption. The old V21
+   completion marker alone cannot mint a store ID or change ADR-160's historical exact-V21
+   predicate. The database binding and root marker identify the same `store_id`, root and owner,
+   including a durable database identity and canonical database file identity; a copied database at
+   another path cannot inherit ownership by copying its rows. A completed attachment cutover, empty
+   `attachments`, a database path supplied by `--db`, or the path-derived GC claim key is not
+   binding proof. `FsBlobStore` checks the binding
    against the supplied `SqlAccess` for _both_ sweep modes before any database/root ownership lock
    or filesystem walk, then rechecks after holding both the database GC owner and root write lock,
    immediately before walking or deleting. A reviewed epoch with a missing or different `store_id`
    is `Unsupported` just like an unreviewed epoch. Missing, corrupt, stale or mismatched evidence
-   returns a typed refusal with no fallback. An in-memory database cannot own a
-   durable filesystem root under this rule. Binding or rebinding a populated root is a separate
-   verified adoption action, never an automatic side effect of a sweep or boot. Adoption records a
-   pending database store ID, durably writes and verifies the root marker under the same owner/root
-   locks, and records binding completion only after they match. Recovery reuses that pending ID;
+   returns a typed refusal with no fallback. An in-memory database cannot own a durable filesystem
+   root under this rule. A live sweep also requires daemon/GC exclusion keyed by the opened main
+   database file identity across different `HOME` values or path spellings, as in
+   #3069 or an equivalent fix; a socket or path-derived lock alone does not satisfy that gate.
+   Binding or rebinding a populated root is a separate verified adoption action, never an automatic
+   side effect of a sweep or boot. Adoption records a pending database store ID, durably writes and
+   verifies the root marker under the same owner/root locks, and records binding completion only
+   after they match. Recovery reuses that pending ID;
    adoption cannot infer an ID from a path or silently overwrite another owner's marker.
    Provisioning proves the selected database is the effective topology's canonical main (`KhiveRuntime::core()` in a
    daemon); with no declared `[[backends]]`, a selected `--db` becomes main only through an existing
@@ -596,12 +612,20 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   secondary's empty-attachment SQL refuses in both modes before a lock or walk. A second migrated
   database sharing that root, once through the default same-directory root and once through
   `KHIVE_BLOB_ROOT`, refuses through `--db` and the direct API in both modes, even when it has a
-  copied database UUID. Crashes before the root marker, after that marker but before database
-  completion, and after completion are replayed: both sweep modes refuse before any lock or walk
-  until the final state has matching durable IDs, and replay preserves the pending `store_id`
-  without overwriting another owner's marker. A populated-root cutover without explicit adoption
-  also refuses; an already-completed cutover never silently mints or replaces an ID. The same
-  reviewed epoch with an absent or mismatched cutover `store_id`
+  copied database UUID. A completed cutover with no binding and a configured root containing no
+  objects and no marker binds on a daemon boot while no binding is completed: the test observes the
+  pending ID, verified marker and one completing main-database transaction. After the completing
+  transaction, a sweep in either mode is admitted on that root. A root with exactly one object
+  refuses that automatic path, leaving the object untouched, and sweeps stay refused; a foreign
+  marker likewise refuses and remains untouched, and sweeps stay refused. A mutant that removes
+  the emptiness check fails the one-object control. Crashes before the first-boot marker, after that
+  marker but before binding completion, and after completion are
+  replayed: both sweep modes refuse before any lock or walk until the final state has matching
+  durable IDs, and replay preserves the pending `store_id` without overwriting another owner's
+  marker or claiming a root that gained an object. A populated-root cutover without explicit
+  adoption also refuses; a pre-rule completed root with objects never silently mints or replaces
+  an ID. A second daemon under a different `HOME` cannot serve the same opened main database while
+  live sweeps are enabled. The same reviewed epoch with an absent or mismatched cutover `store_id`
   refuses before a lock or walk. Missing, corrupt and stale binding markers, root relocation and an unbound
   database/store pair refuse likewise. No command treats an arbitrary `--db` as proof of ownership.
 - `kkernel blob sweep --live` started while a scheduled run in the daemon holds ownership either
