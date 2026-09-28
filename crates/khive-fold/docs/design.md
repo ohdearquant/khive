@@ -32,8 +32,10 @@
 ## Dependency Boundary
 
 `khive-fold` is a foundation-layer crate. Accepted direct dependencies:
-`khive-types`, `khive-score`, `serde`/`serde_json` (optional feature), `uuid`, `chrono`
+`khive-types`, `khive-score`, `serde`/`serde_json`, `uuid`, `chrono`
 (DateTime type only, no clock feature), `thiserror`, `blake3` (checkpoint hashing).
+The `serde` feature controls derives on fold types; the direct `serde` dependency
+remains required because checkpoint hashing accepts any `Serialize` state.
 
 ## ADR Compliance
 

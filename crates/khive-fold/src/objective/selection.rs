@@ -29,6 +29,7 @@ pub struct Selection<T> {
     pub reason: Option<String>,
 }
 
+#[cfg(feature = "serde")]
 fn default_precision() -> f64 {
     1.0
 }
