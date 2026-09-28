@@ -117,6 +117,40 @@ fn record_post_commit_degradation(
     degradations.push(degradation);
 }
 
+/// Legacy methods cannot return both their original result and the new report.
+/// Give direct callers a typed, non-retryable error with the committed record
+/// handle and every failed stage instead of silently dropping the report.
+fn legacy_post_commit_result<T>(
+    operation: &'static str,
+    id: Uuid,
+    value: T,
+    degradations: Vec<PostCommitDegradation>,
+) -> RuntimeResult<T> {
+    if degradations.is_empty() {
+        return Ok(value);
+    }
+    let failures = serde_json::Value::Array(
+        degradations
+            .iter()
+            .map(|failure| {
+                serde_json::json!({"stage": failure.stage, "error": failure.error.as_str()})
+            })
+            .collect(),
+    );
+    Err(KhiveError::internal(format!(
+        "{operation} committed record {id}, but post-commit work failed; do not retry the mutation; reconcile by record_id"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "post_commit_degraded".to_string()),
+        ("operation", operation.to_string()),
+        ("record_id", id.to_string()),
+        ("committed", "true".to_string()),
+        ("retryable", "false".to_string()),
+        ("post_commit_degradations", failures.to_string()),
+    ]))
+    .into())
+}
+
 // Test-only fault-injection state; see docs/operations.md#fault-injection-static-state.
 #[cfg(test)]
 std::thread_local! {
@@ -1475,7 +1509,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
-        Ok(self
+        let (entity, _, degradations) = self
             .create_entity_with_embedding_report_inner(
                 token,
                 kind,
@@ -1486,8 +1520,8 @@ impl KhiveRuntime {
                 tags,
                 Vec::new(),
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result("create_entity", entity.id, entity, degradations)
     }
 
     /// Create an entity with role-keyed bytes already published to `BlobStore`.
@@ -1539,7 +1573,7 @@ impl KhiveRuntime {
             }
         }
         let validated_type = self.validate_entity_type_for_kind(kind, entity_type)?;
-        Ok(self
+        let (entity, _, degradations) = self
             .create_entity_with_embedding_report_inner(
                 token,
                 kind,
@@ -1550,8 +1584,13 @@ impl KhiveRuntime {
                 tags,
                 attachments,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result(
+            "create_entity_with_attachments",
+            entity.id,
+            entity,
+            degradations,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1565,7 +1604,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, embedding, _) = self
+        let (entity, embedding, degradations) = self
             .create_entity_with_embedding_report_inner(
                 token,
                 kind,
@@ -1577,7 +1616,12 @@ impl KhiveRuntime {
                 Vec::new(),
             )
             .await?;
-        Ok((entity, embedding))
+        legacy_post_commit_result(
+            "create_entity_with_embedding_report",
+            entity.id,
+            (entity, embedding),
+            degradations,
+        )
     }
 
     /// The committed entity and its non-retryable post-commit diagnostics.
@@ -3544,12 +3588,12 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        Ok(self
+        let (note, _, degradations) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result("create_note", note.id, note, degradations)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3574,7 +3618,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        Ok(self
+        let (note, _, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -3587,8 +3631,13 @@ impl KhiveRuntime {
                 annotates,
                 None,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_embedding_content",
+            note.id,
+            note,
+            degradations,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3603,7 +3652,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
-        let (note, embedding, _) = self
+        let (note, embedding, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -3617,7 +3666,12 @@ impl KhiveRuntime {
                 None,
             )
             .await?;
-        Ok((note, embedding))
+        legacy_post_commit_result(
+            "create_note_with_embedding_content_and_report",
+            note.id,
+            (note, embedding),
+            degradations,
+        )
     }
 
     /// The committed note and its non-retryable post-commit diagnostics.
@@ -3698,7 +3752,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
-        Ok(self
+        let (note, _, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -3711,8 +3765,13 @@ impl KhiveRuntime {
                 annotates,
                 embedding_model,
             )
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_decay_for_embedding_model",
+            note.id,
+            note,
+            degradations,
+        )
     }
 
     /// Insert a note using `INSERT OR IGNORE` semantics for atomic deduplication.
@@ -5544,10 +5603,10 @@ impl KhiveRuntime {
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        Ok(self
+        let (deleted, degradations) = self
             .delete_note_with_post_commit_report(token, id, hard)
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result("delete_note", id, deleted, degradations)
     }
 
     /// Delete the note and return diagnostics for any failed work after the
@@ -5939,10 +5998,10 @@ impl KhiveRuntime {
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        Ok(self
+        let (deleted, degradations) = self
             .delete_entity_with_post_commit_report(token, id, hard)
-            .await?
-            .0)
+            .await?;
+        legacy_post_commit_result("delete_entity", id, deleted, degradations)
     }
 
     /// The committed delete together with non-retryable index/telemetry errors.
@@ -13658,6 +13717,209 @@ mod tests {
         assert!(note_degradations[0]
             .error
             .contains("injected created-event failure"));
+    }
+
+    fn assert_legacy_post_commit_error(
+        error: RuntimeError,
+        operation: &str,
+        expected_stages: &[&str],
+    ) -> Uuid {
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("legacy caller lost its typed post-commit signal: {error:?}");
+        };
+        assert_eq!(domain.kind(), khive_types::ErrorKind::Internal);
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(details.get("operation"), Some(operation));
+        assert_eq!(details.get("committed"), Some("true"));
+        assert_eq!(details.get("retryable"), Some("false"));
+        let id = details
+            .get("record_id")
+            .expect("committed id")
+            .parse::<Uuid>()
+            .expect("canonical committed id");
+        let failures: serde_json::Value = serde_json::from_str(
+            details
+                .get("post_commit_degradations")
+                .expect("complete degradation list"),
+        )
+        .expect("degradations are JSON");
+        let stages: Vec<&str> = failures
+            .as_array()
+            .expect("degradation array")
+            .iter()
+            .map(|failure| {
+                assert!(
+                    failure["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("legacy")),
+                    "the original injected failure must remain in the report: {failure:?}"
+                );
+                failure["stage"].as_str().expect("named failure stage")
+            })
+            .collect();
+        assert_eq!(stages, expected_stages);
+        let projected =
+            crate::error_projection::runtime_error_value(error, crate::DomainDisposition::Unknown);
+        assert_eq!(projected["domain_disposition"], "committed");
+        id
+    }
+
+    #[tokio::test]
+    async fn legacy_create_callers_receive_committed_id_and_failed_event_detail() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_legacy_created_events BEFORE INSERT ON events \
+                 WHEN NEW.kind IN ('entity_created', 'note_created') \
+                 BEGIN SELECT RAISE(ABORT, 'legacy created-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let entity_error = rt
+            .create_entity(&tok, "concept", None, "legacy entity", None, None, vec![])
+            .await
+            .expect_err("legacy create_entity must report the committed degradation");
+        let entity_id =
+            assert_legacy_post_commit_error(entity_error, "create_entity", &["event_append"]);
+        assert_eq!(rt.get_entity(&tok, entity_id).await.unwrap().id, entity_id);
+
+        let report_error = rt
+            .create_entity_with_embedding_report(
+                &tok,
+                "concept",
+                None,
+                "legacy report entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("legacy embedding-report wrapper must retain degradation");
+        let report_id = assert_legacy_post_commit_error(
+            report_error,
+            "create_entity_with_embedding_report",
+            &["event_append"],
+        );
+        assert_eq!(rt.get_entity(&tok, report_id).await.unwrap().id, report_id);
+
+        let note_error = rt
+            .create_note(&tok, "observation", None, "legacy note", None, None, vec![])
+            .await
+            .expect_err("legacy create_note must report the committed degradation");
+        let note_id = assert_legacy_post_commit_error(note_error, "create_note", &["event_append"]);
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let decay_error = rt
+            .create_note_with_decay_for_embedding_model(
+                &tok,
+                "observation",
+                None,
+                "legacy decay note",
+                None,
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect_err("legacy decay wrapper must retain degradation");
+        let decay_id = assert_legacy_post_commit_error(
+            decay_error,
+            "create_note_with_decay_for_embedding_model",
+            &["event_append"],
+        );
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(decay_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_callers_receive_committed_id_and_all_failed_cleanup_stages() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "delete legacy entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "delete legacy note",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_legacy_deleted_events BEFORE INSERT ON events \
+                 WHEN NEW.kind IN ('entity_deleted', 'note_deleted') \
+                 BEGIN SELECT RAISE(ABORT, 'legacy deleted-event failure'); END; \
+                 CREATE TRIGGER reject_legacy_note_fts_cleanup BEFORE DELETE ON fts_notes_rowids \
+                 BEGIN SELECT RAISE(ABORT, 'legacy note FTS cleanup failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let note_error = rt
+            .delete_note(&tok, note.id, true)
+            .await
+            .expect_err("legacy delete_note must report committed cleanup failures");
+        let note_id = assert_legacy_post_commit_error(
+            note_error,
+            "delete_note",
+            &["fts_cleanup", "event_append"],
+        );
+        assert_eq!(note_id, note.id);
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let entity_error = rt
+            .delete_entity(&tok, entity.id, true)
+            .await
+            .expect_err("legacy delete_entity must report committed event failure");
+        let entity_id =
+            assert_legacy_post_commit_error(entity_error, "delete_entity", &["event_append"]);
+        assert_eq!(entity_id, entity.id);
+        assert!(matches!(
+            rt.get_entity(&tok, entity.id).await,
+            Err(RuntimeError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
