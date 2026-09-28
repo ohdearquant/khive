@@ -1456,7 +1456,7 @@ guarantee.
 
 Each claim uses a persistent `.DATABASE.khived.lock` sibling of the canonical
 database pathname. After the sidecar lock is held, freeze that canonical path
-as the *only* path passed to SQLite. Re-resolve the configured spelling once
+as the _only_ path passed to SQLite. Re-resolve the configured spelling once
 for validation before opening; if a symlink now targets another path, refuse
 and name both the claimed and current paths. Validation must not replace the
 frozen open target.
