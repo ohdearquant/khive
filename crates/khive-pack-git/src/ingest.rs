@@ -35,6 +35,7 @@ const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const GH_STDOUT_LIMIT: usize = 32 * 1024 * 1024;
 const GH_STDERR_LIMIT: usize = 64 * 1024;
 const ORIGIN_STDOUT_LIMIT: usize = 16 * 1024;
+const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
 
 #[derive(Debug, PartialEq, Eq)]
 enum IngestCommandError {
@@ -83,6 +84,23 @@ async fn read_command_pipe(
     Ok(bytes)
 }
 
+/// A just-written executable may remain busy briefly when another fork still
+/// holds a write descriptor. Retry only that transient spawn error; retain
+/// the ordinary classification for every other failure.
+async fn spawn_retrying_executable_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for delay_ms in EXECUTABLE_BUSY_BACKOFF_MS {
+        match spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            outcome => return outcome,
+        }
+    }
+    spawn()
+}
+
 async fn run_ingest_command(
     mut command: AsyncCommand,
     timeout: Duration,
@@ -93,13 +111,15 @@ async fn run_ingest_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            IngestCommandError::NotFound
-        } else {
-            IngestCommandError::CouldNotStart
-        }
-    })?;
+    let mut child = spawn_retrying_executable_busy(|| command.spawn())
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                IngestCommandError::NotFound
+            } else {
+                IngestCommandError::CouldNotStart
+            }
+        })?;
     let stdout = child.stdout.take().ok_or(IngestCommandError::Io)?;
     let stderr = child.stderr.take().ok_or(IngestCommandError::Io)?;
     tokio::time::timeout(timeout, async {
@@ -1242,8 +1262,8 @@ mod gh_command_tests {
     use std::time::Duration;
 
     use super::{
-        gh_json_with_command, probe_gh_repository_with_command, GhProbeError, IngestCommandError,
-        OriginIdentity,
+        gh_json_with_command, probe_gh_repository_with_command, spawn_retrying_executable_busy,
+        GhProbeError, IngestCommandError, OriginIdentity,
     };
 
     fn executable(dir: &Path, body: &str) -> PathBuf {
@@ -1251,6 +1271,104 @@ mod gh_command_tests {
         std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         program
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_executable_spawn_retries_only_within_its_budget() {
+        let mut attempts = 0;
+        let value = spawn_retrying_executable_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok(17)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((value, attempts), (17, 3));
+
+        let mut denied_attempts = 0;
+        let denied = spawn_retrying_executable_busy(|| {
+            denied_attempts += 1;
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(denied_attempts, 1);
+
+        let mut exhausted_attempts = 0;
+        let exhausted = spawn_retrying_executable_busy(|| {
+            exhausted_attempts += 1;
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(exhausted.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        assert_eq!(exhausted_attempts, 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_fixture_survives_a_transient_busy_executable() {
+        let test_name = std::thread::current()
+            .name()
+            .expect("libtest names test threads")
+            .to_owned();
+        if std::env::var("KHIVE_GIT_BUSY_FIXTURE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(test_name.as_str())
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    test_name.as_str(),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("KHIVE_GIT_BUSY_FIXTURE_CHILD", &test_name)
+                .env("HOME", &home)
+                .output()
+                .expect("spawn isolated busy-executable fixture");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "busy-executable fixture failed: {output:?}"
+            );
+            assert!(std::fs::read_dir(home).unwrap().next().is_none());
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "printf '[]'");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .unwrap();
+        let refused = tokio::process::Command::new(&program).spawn().unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ExecutableFileBusy);
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(writer);
+        });
+        let output = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["pr", "list"],
+            &program,
+            Duration::from_secs(1),
+            128,
+        )
+        .await
+        .expect("the busy fixture should run once its writer closes");
+        release.await.unwrap();
+        assert_eq!(output, "[]");
     }
 
     #[tokio::test(flavor = "current_thread")]
