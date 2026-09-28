@@ -32,27 +32,31 @@ impl KgPack {
 
         // #849: bare "entity" means no kind filter, not a literal entities.kind value.
         // See docs/api/resolve-verb.md#handler-shape.
-        let entity_kind = match &p.kind {
+        let (entity_kind, entity_type) = match &p.kind {
             Some(raw) => match resolve_kind_spec(raw, registry)? {
-                KindSpec::Entity { specific } => specific,
+                KindSpec::Entity {
+                    specific,
+                    entity_type,
+                } => (specific, entity_type),
                 _ => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "resolve only supports entity kinds; kind={raw:?} is not an entity kind"
                     )))
                 }
             },
-            None => None,
+            None => (None, None),
         };
 
         let mut results = Vec::with_capacity(p.refs.len());
         for (index, nl_ref) in p.refs.iter().enumerate() {
-            let mut resolution = khive_runtime::resolve_reference(
+            let mut resolution = khive_runtime::resolve_reference_with_entity_type(
                 &self.runtime,
                 ring,
                 token,
                 nl_ref,
                 limit,
                 entity_kind.as_deref(),
+                entity_type.as_deref(),
             )
             .await?;
             let mut redirected_from = Vec::new();

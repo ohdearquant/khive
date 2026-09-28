@@ -753,8 +753,13 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
 /// itself: the kkernel seam does the pack-aware resolution and passes down
 /// only what `prepare_update` needs to enforce the mismatch check.
 pub enum AtomicUpdateKind {
-    Entity { specific: Option<String> },
-    Note { specific: Option<String> },
+    Entity {
+        specific: Option<String>,
+        entity_type: Option<String>,
+    },
+    Note {
+        specific: Option<String>,
+    },
     Edge,
 }
 
@@ -1058,6 +1063,7 @@ pub async fn prepare_update(
                 None => {}
                 Some(AtomicUpdateKind::Entity {
                     specific: Some(expected),
+                    ..
                 }) if &entity.kind != expected => {
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
@@ -1067,6 +1073,19 @@ pub async fn prepare_update(
                 }
                 Some(AtomicUpdateKind::Edge) => {
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
+                }
+            }
+            if let Some(AtomicUpdateKind::Entity {
+                entity_type: Some(expected),
+                ..
+            }) = &expected_kind
+            {
+                if entity
+                    .entity_type
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected.as_str())
+                {
+                    return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
             }
             // Decide step lives in curation.rs's `prepare_update_entity` —
@@ -1092,7 +1111,11 @@ pub async fn prepare_update(
                     })
                 })
                 .transpose()?;
-            prepare_update_entity_plan_with_version(
+            let required_entity_type = match &expected_kind {
+                Some(AtomicUpdateKind::Entity { entity_type, .. }) => entity_type.as_deref(),
+                _ => None,
+            };
+            prepare_update_entity_plan_with_version_and_type(
                 runtime,
                 token,
                 id,
@@ -1104,6 +1127,7 @@ pub async fn prepare_update(
                     entity_type,
                 },
                 expected_version,
+                required_entity_type,
             )
             .await
         }
@@ -1167,9 +1191,37 @@ pub(crate) async fn prepare_update_entity_plan_with_version(
     patch: crate::curation::EntityPatch,
     expected_version: Option<i64>,
 ) -> RuntimeResult<AtomicOpPlan> {
+    prepare_update_entity_plan_with_version_and_type(
+        runtime,
+        token,
+        id,
+        patch,
+        expected_version,
+        None,
+    )
+    .await
+}
+
+async fn prepare_update_entity_plan_with_version_and_type(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+    expected_version: Option<i64>,
+    required_entity_type: Option<&str>,
+) -> RuntimeResult<AtomicOpPlan> {
     crate::entity_write::validate_expected_version(expected_version)?;
+    let explicit_entity_type_patch = patch.entity_type.is_some();
     let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
         runtime.prepare_update_entity(token, id, patch).await?;
+    if required_entity_type.is_some_and(|expected| {
+        (explicit_entity_type_patch || entity.entity_type.is_some())
+            && entity.entity_type.as_deref() != Some(expected)
+    }) {
+        return Err(RuntimeError::InvalidInput(
+            "kind subtype contradicts the requested entity_type update".into(),
+        ));
+    }
     let mut statements = vec![PlanStatement {
         statement: entity_replace_if_unchanged_statement(
             &entity,
@@ -1443,8 +1495,13 @@ async fn prepare_update_edge(
 /// `Edge` variant. `Event`/`Proposal` remain rejected at the kkernel seam
 /// (not v1-admissible for atomic delete at all).
 pub enum AtomicDeleteKind {
-    Entity { specific: Option<String> },
-    Note { specific: Option<String> },
+    Entity {
+        specific: Option<String>,
+        entity_type: Option<String>,
+    },
+    Note {
+        specific: Option<String>,
+    },
     Edge,
 }
 
@@ -1483,6 +1540,7 @@ pub async fn prepare_delete(
                 None => {}
                 Some(AtomicDeleteKind::Entity {
                     specific: Some(expected),
+                    ..
                 }) if &entity.kind != expected => {
                     return Err(RuntimeError::NotFound(format!("{expected} {id}")));
                 }
@@ -1492,6 +1550,19 @@ pub async fn prepare_delete(
                 }
                 Some(AtomicDeleteKind::Edge) => {
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
+                }
+            }
+            if let Some(AtomicDeleteKind::Entity {
+                entity_type: Some(expected),
+                ..
+            }) = &expected_kind
+            {
+                if entity
+                    .entity_type
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected.as_str())
+                {
+                    return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
             }
             let namespace = entity.namespace.clone();
@@ -1805,6 +1876,7 @@ async fn prepare_link(
         metadata,
         optional_str(args, "dependency_kind").map(String::from),
     )?;
+    validate_edge_metadata(relation, metadata.as_ref())?;
 
     validate_edge_weight(weight)?;
     runtime
@@ -3287,6 +3359,230 @@ mod tests {
                 "inferred dependency_kind for (service, service) must persist: {json_str}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_link_rejects_malformed_metadata_before_inference() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let left = khive_storage::Entity::new("local", "document", "Left");
+        let right = khive_storage::Entity::new("local", "document", "Right");
+        let (left_id, right_id) = (left.id, right.id);
+        entities.upsert_entity(left).await.expect("seed left");
+        entities.upsert_entity(right).await.expect("seed right");
+
+        for metadata in [json!(false), json!({"optional": "false"})] {
+            let error = prepare_link(
+                &runtime,
+                &token,
+                &json!({
+                    "source_id": left_id.to_string(),
+                    "target_id": right_id.to_string(),
+                    "relation": "depends_on",
+                    "metadata": metadata,
+                }),
+            )
+            .await
+            .expect_err("malformed metadata cannot produce a link plan");
+            assert!(format!("{error}").contains("metadata"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_entity_kind_hint_checks_subtype_before_mutation() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "document", "Typed Document");
+        entity.entity_type = Some("paper".to_string());
+        let id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let wrong_update = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": id.to_string(), "name": "Wrong Type"}),
+            Some(AtomicUpdateKind::Entity {
+                specific: Some("document".to_string()),
+                entity_type: Some("report".to_string()),
+            }),
+        )
+        .await
+        .expect_err("subtype mismatch must refuse atomic update");
+        assert!(matches!(wrong_update, RuntimeError::NotFound(_)));
+
+        let wrong_delete = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": id.to_string()}),
+            Some(AtomicDeleteKind::Entity {
+                specific: Some("document".to_string()),
+                entity_type: Some("report".to_string()),
+            }),
+        )
+        .await
+        .expect_err("subtype mismatch must refuse atomic delete");
+        assert!(matches!(wrong_delete, RuntimeError::NotFound(_)));
+
+        let changed_type = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": id.to_string(), "entity_type": "report"}),
+            Some(AtomicUpdateKind::Entity {
+                specific: Some("document".to_string()),
+                entity_type: Some("paper".to_string()),
+            }),
+        )
+        .await
+        .expect_err("subtype-qualified update cannot change subtype");
+        assert!(format!("{changed_type}").contains("contradicts"));
+    }
+
+    #[tokio::test]
+    async fn atomic_update_subtype_hint_accepts_legacy_null_but_refuses_conflicts() {
+        let runtime = scratch_runtime();
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let legacy = khive_storage::Entity::new("local", "document", "Legacy Document");
+        let legacy_id = legacy.id;
+        let mut typed = khive_storage::Entity::new("local", "document", "Typed Report");
+        typed.entity_type = Some("report".into());
+        let typed_id = typed.id;
+        let entities = runtime.entities(&token).expect("entities store");
+        entities
+            .upsert_entity(legacy)
+            .await
+            .expect("seed legacy row");
+        entities.upsert_entity(typed).await.expect("seed typed row");
+
+        let kind = || AtomicUpdateKind::Entity {
+            specific: Some("document".into()),
+            entity_type: Some("paper".into()),
+        };
+        let wrong_base = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string(), "name": "Wrong Base"}),
+            Some(AtomicUpdateKind::Entity {
+                specific: Some("artifact".into()),
+                entity_type: Some("paper".into()),
+            }),
+        )
+        .await
+        .expect_err("legacy NULL subtype cannot override a conflicting base kind");
+        assert!(matches!(wrong_base, RuntimeError::NotFound(_)));
+        let wrong_type = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": typed_id.to_string(), "name": "Wrong Type"}),
+            Some(kind()),
+        )
+        .await
+        .expect_err("stored non-NULL report must refuse a paper hint");
+        assert!(matches!(wrong_type, RuntimeError::NotFound(_)));
+        let clear = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string(), "entity_type": null}),
+            Some(kind()),
+        )
+        .await
+        .expect_err("an explicit clear still contradicts a paper hint");
+        assert!(matches!(clear, RuntimeError::InvalidInput(_)));
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string(), "name": "Renamed Legacy Document"}),
+            Some(kind()),
+        )
+        .await
+        .expect("matching base kind permits a paper hint on a legacy NULL row");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("commit legacy update");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        let updated = runtime
+            .get_entity(&token, legacy_id)
+            .await
+            .expect("read updated row");
+        assert_eq!(updated.name, "Renamed Legacy Document");
+        assert_eq!(updated.entity_type, None);
+    }
+
+    #[tokio::test]
+    async fn atomic_delete_subtype_hint_accepts_legacy_null_but_refuses_conflicts() {
+        let runtime = scratch_runtime();
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let legacy = khive_storage::Entity::new("local", "document", "Legacy Deletion");
+        let legacy_id = legacy.id;
+        let mut typed = khive_storage::Entity::new("local", "document", "Typed Deletion");
+        typed.entity_type = Some("report".into());
+        let typed_id = typed.id;
+        let entities = runtime.entities(&token).expect("entities store");
+        entities
+            .upsert_entity(legacy)
+            .await
+            .expect("seed legacy row");
+        entities.upsert_entity(typed).await.expect("seed typed row");
+
+        let kind = || AtomicDeleteKind::Entity {
+            specific: Some("document".into()),
+            entity_type: Some("paper".into()),
+        };
+        let wrong_base = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string()}),
+            Some(AtomicDeleteKind::Entity {
+                specific: Some("artifact".into()),
+                entity_type: Some("paper".into()),
+            }),
+        )
+        .await
+        .expect_err("legacy NULL subtype cannot override a conflicting base kind");
+        assert!(matches!(wrong_base, RuntimeError::NotFound(_)));
+        let wrong_type = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": typed_id.to_string()}),
+            Some(kind()),
+        )
+        .await
+        .expect_err("stored non-NULL report must refuse a paper hint");
+        assert!(matches!(wrong_type, RuntimeError::NotFound(_)));
+
+        let plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string()}),
+            Some(kind()),
+        )
+        .await
+        .expect("matching base kind permits a paper hint on a legacy NULL row");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("commit legacy delete");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        assert!(runtime
+            .resolve_by_id(&token, legacy_id)
+            .await
+            .expect("resolve deleted row")
+            .is_none());
     }
 
     /// Raw natural-key probe of `graph_edges` (namespace, source_id,
