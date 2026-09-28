@@ -48,6 +48,12 @@ pub enum ConfigError {
     #[error("engine {name:?}: fusion_weight must be > 0, got {value}")]
     InvalidFusionWeight { name: String, value: f64 },
 
+    #[error(
+        "engine {name:?}: fusion_weight is not applied by current retrieval; \
+         remove it until weighted multi-engine fusion is wired"
+    )]
+    UnsupportedFusionWeight { name: String },
+
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
 
@@ -186,15 +192,13 @@ pub struct EngineConfig {
     #[serde(default)]
     pub default: bool,
 
-    /// RRF fusion weight for weighted multi-engine fusion.
+    /// Reserved RRF fusion weight for future weighted multi-engine fusion.
     ///
-    /// Only meaningful when multiple engines are loaded. Must be `> 0` when
-    /// present. `None` means the engine participates in fusion with equal weight
-    /// to other engines that also lack a `fusion_weight`.
-    ///
-    /// For RRF: `fusion_weight` provides per-engine relative importance during
-    /// weighted RRF; it does NOT apply to rank-based unweighted RRF (the weights
-    /// are injected into `FusionStrategy::Weighted` only).
+    /// Current retrieval does not consume this field. Config loading rejects
+    /// any explicit value rather than silently treating it as applied. Leave
+    /// it unset until per-engine weighted fusion is implemented. The loader
+    /// still distinguishes invalid (non-finite or non-positive) values from
+    /// valid but unsupported ones.
     pub fusion_weight: Option<f64>,
 
     /// Expected output dimensionality (optional sanity check).
@@ -1500,7 +1504,8 @@ impl KhiveConfig {
     /// - Exactly one engine has `default = true` (when the list is non-empty).
     /// - Engine names are unique.
     /// - Every engine model is recognized by the runtime's alias parser.
-    /// - `fusion_weight`, when present, is `> 0`.
+    /// - `fusion_weight`, when present, is finite and `> 0`, then rejected as
+    ///   unsupported until the retrieval path actually consumes it.
     pub fn validate(&self) -> Result<(), ConfigError> {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
@@ -1792,6 +1797,15 @@ impl KhiveConfig {
                     });
                 }
             }
+        }
+        if let Some(engine) = self
+            .engines
+            .iter()
+            .find(|engine| engine.fusion_weight.is_some())
+        {
+            return Err(ConfigError::UnsupportedFusionWeight {
+                name: engine.name.clone(),
+            });
         }
 
         Ok(())
@@ -2381,7 +2395,7 @@ blob_hydration_bytes = 134217728
     }
 
     #[test]
-    fn test_multi_engine_positive_fusion_weight() {
+    fn configured_fusion_weight_is_refused_instead_of_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
             &dir,
@@ -2398,12 +2412,37 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 fusion_weight = 0.3
 "#,
         );
-        let cfg = KhiveConfig::load(Some(&path))
-            .expect("load should succeed")
+        let err = KhiveConfig::load(Some(&path))
+            .expect_err("an explicit fusion weight must not be silently ignored");
+        assert!(
+            matches!(
+                config_error_root(&err),
+                ConfigError::UnsupportedFusionWeight { name } if name == "primary"
+            ),
+            "expected UnsupportedFusionWeight for primary, got {err:?}"
+        );
+
+        let unweighted_path = write_toml(
+            &dir,
+            r#"
+[[engines]]
+name = "primary"
+model = "all-minilm-l6-v2"
+default = true
+
+[[engines]]
+name = "secondary"
+model = "paraphrase-multilingual-minilm-l12-v2"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&unweighted_path))
+            .expect("unweighted multi-engine config remains valid")
             .expect("file should be found");
         assert_eq!(cfg.engines.len(), 2);
-        assert_eq!(cfg.engines[0].fusion_weight, Some(0.7));
-        assert_eq!(cfg.engines[1].fusion_weight, Some(0.3));
+        assert!(cfg
+            .engines
+            .iter()
+            .all(|engine| engine.fusion_weight.is_none()));
     }
 
     #[test]
