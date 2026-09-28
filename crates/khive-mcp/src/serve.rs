@@ -1082,6 +1082,7 @@ async fn channel_poll_loop(
                             "channel_kind": kind,
                             "channel_slug": slug,
                             "external_id": env.external_id.clone(),
+                            "legacy_external_id": env.legacy_external_id.clone(),
                             "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id.clone(),
                             "default_inbound_actor": default_inbound_actor,

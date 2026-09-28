@@ -2896,7 +2896,7 @@ fn v26_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
     .expect("section FTS must remain consistent after hard delete");
 }
 
-// ── V5: external_id unique index tests ──────────────────────────────────────
+// ── External-ID unique index tests (V5 and V42) ─────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
@@ -2954,6 +2954,55 @@ fn v5_duplicate_external_id_insert_rejected() {
         rusqlite::params![now],
     );
     assert!(dup.is_err(), "duplicate external_id must be rejected");
+}
+
+#[test]
+fn v42_external_id_uniqueness_uses_exact_channel_provenance() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    let insert = |id: &str, properties: serde_json::Value| {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, status, content, properties, created_at, updated_at) \
+             VALUES (?1, 'local', 'message', 'active', 'body', ?2, 1, 1)",
+            rusqlite::params![id, properties.to_string()],
+        )
+    };
+
+    let scoped = |slug: &str| {
+        serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "email",
+            "channel_slug": slug,
+        })
+    };
+    insert("upper", scoped("User@Example.com")).expect("first slug");
+    insert("lower", scoped("user@example.com")).expect("case-distinct slug");
+    assert!(
+        insert("upper-retry", scoped("User@Example.com")).is_err(),
+        "the same exact channel and external ID must remain unique"
+    );
+    insert(
+        "other-kind",
+        serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "telegram",
+            "channel_slug": "User@Example.com",
+        }),
+    )
+    .expect("channel kind is part of the dedup scope");
+    insert(
+        "unscoped",
+        serde_json::json!({"external_id": "imap:host:user@example.com:17:42"}),
+    )
+    .expect("an unattributed row has its own dedup scope");
+    assert!(
+        insert(
+            "unscoped-retry",
+            serde_json::json!({"external_id": "imap:host:user@example.com:17:42"}),
+        )
+        .is_err(),
+        "unattributed duplicates must remain unique"
+    );
 }
 
 #[test]

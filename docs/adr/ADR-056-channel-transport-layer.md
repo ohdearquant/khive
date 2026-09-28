@@ -1,12 +1,14 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication;
+**Status**: Accepted (amended 2026-09-27 -- channel-scoped external-ID deduplication;
+amended 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication;
 amended 2026-09-25 -- `external_id` on a message note is transport-owned at creation; amended 2026-09-25 --
 inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
 identifiers in dedup acknowledgements; see
+[§Amendment 2026-09-27, channel-scoped external-ID deduplication](#amendment-2026-09-27----channel-scoped-external-id-deduplication),
 [§Amendment 2026-09-25, Telegram outbound delivery](#amendment-2026-09-25----telegram-outbound-delivery-is-at-least-once-without-deduplication),
 [§Amendment 2026-09-25, `external_id`](#amendment-2026-09-25----external_id-on-a-message-note-is-transport-owned-at-creation),
 [§Amendment 2026-09-25, inbound email byte cap](#amendment-2026-09-25----inbound-email-has-a-per-message-byte-cap),
@@ -18,7 +20,7 @@ identifiers in dedup acknowledgements; see
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
 [§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25, 2026-09-27)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -27,10 +29,32 @@ and Schedule Packs), ADR-127 (authenticated principal and grant authority),
 ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this amendment)\
 **Related**: superseded ADR-053, retained only as the historical caller-threading problem
 statement; its SessionStore design was not carried forward\
+
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
 by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
 #1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment)
+
+## Amendment 2026-09-27 -- Channel-scoped external-ID deduplication
+
+An email adapter lowercases the mailbox address in its account-scoped IMAP UID key,
+while `Channel::slug` retains the configured credential identity. Consequently,
+`User@Example.com` and `user@example.com` can deliver the same UID with the
+same `external_id` but remain distinct channels. The V5 index and the new-key
+lookup treated the second channel as a duplicate of the first.
+
+**Decision.** A live note's durable dedup key is `(namespace, kind,
+external_id, channel_kind, channel_slug)`, comparing channel values exactly.
+Absent channel values occupy an empty partition, preserving uniqueness among
+unattributed notes. Migration V42 replaces V5's global external-ID index with
+this widened expression index; V5 remains historical and no stored note is
+rewritten by V42. The new-key prelookup, post-insert duplicate lookup, and
+storage's `INSERT OR IGNORE` verification use the same channel scope. The
+one-release legacy IMAP lookup continues to require an inbound email row with
+the exact slug. A `comm.ingest` instance must hold its channel-ingest grant
+before any of these lookups or acknowledgements. Sections 10 and 11 below
+describe the original V5 key and are superseded by this amendment where their
+key shape differs.
 
 ## Amendment 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication
 
