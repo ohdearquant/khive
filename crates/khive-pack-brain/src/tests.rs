@@ -6991,6 +6991,37 @@ mod router_section_tests {
     }
 
     #[tokio::test]
+    async fn semantic_feedback_moves_section_posterior_on_live_handler_path() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        let before =
+            SectionPosteriorState::default_priors()[&SectionType::OperationalGuidance].alpha();
+
+        pack.dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "explicit_positive",
+                "section_signals": {"operational_guidance": "useful"}
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("semantic feedback with a section judgment must succeed");
+
+        let state = pack.state.lock().unwrap();
+        let section = state
+            .section_states
+            .get("balanced-recall-v1")
+            .expect("semantic feedback must seed section state");
+        let alpha = section.posteriors[&SectionType::OperationalGuidance].alpha();
+        assert!((alpha - before - 1.5).abs() < 1e-12);
+    }
+
+    #[tokio::test]
     async fn feedback_section_signals_updates_custom_profile_with_seeded_priors() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
