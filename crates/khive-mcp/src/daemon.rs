@@ -19,6 +19,7 @@ use khive_runtime::daemon::{
     self, acquire_recovery_lock, env_truthy, pid_path, read_frame, socket_path, write_frame,
     DaemonRequestFrame, DaemonResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+use khive_runtime::process_retry::{spawn_retrying_executable_busy, EXECUTABLE_BUSY_BACKOFF_MS};
 use rmcp::ErrorData as McpError;
 use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
@@ -1312,29 +1313,6 @@ fn spawn_daemon_with_exe_and_config(
     // error, with a short finite budget; every other spawn failure remains
     // immediate and unchanged.
     spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || cmd.spawn())
-}
-
-/// Short finite backoff budget for a transient `ExecutableFileBusy` spawn
-/// failure — see the call site in [`spawn_daemon_with_exe_and_config`].
-const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
-
-/// Retry `spawn` up to `delays_ms.len()` extra times, sleeping the
-/// corresponding delay between attempts, but only when the failure is
-/// `ErrorKind::ExecutableFileBusy`. Any other error — or the final attempt
-/// after the backoff budget is exhausted — is returned immediately.
-fn spawn_retrying_executable_busy<T>(
-    delays_ms: &[u64],
-    mut spawn: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    for delay_ms in delays_ms {
-        match spawn() {
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            }
-            outcome => return outcome,
-        }
-    }
-    spawn()
 }
 
 /// Return `true` if `args` (the full `ps -o args=` output for a process)

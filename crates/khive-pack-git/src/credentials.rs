@@ -323,6 +323,15 @@ async fn resolve_reference(
     config: &GitWriteSectionConfig,
     reference: &str,
 ) -> Result<Secret, CredentialError> {
+    resolve_reference_with_spawn(config, reference, Command::spawn).await
+}
+
+#[cfg(unix)]
+async fn resolve_reference_with_spawn(
+    config: &GitWriteSectionConfig,
+    reference: &str,
+    mut spawn: impl FnMut(&mut Command) -> std::io::Result<Child>,
+) -> Result<Secret, CredentialError> {
     let mut command = Command::new(&config.credential_resolver[0]);
     command
         .args(config.credential_resolver[1..].iter().map(|arg| {
@@ -345,7 +354,15 @@ async fn resolve_reference(
     }
     command.current_dir("/").process_group(0);
 
-    let child = command.spawn().map_err(|_error| {
+    // fs::write closes our fixture before exec; a sibling test's fork can still
+    // inherit its write descriptor. Real installs see the same transient
+    // ETXTBSY while an executable is being replaced.
+    let child = khive_runtime::process_retry::spawn_retrying_executable_busy_async(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || spawn(&mut command),
+    )
+    .await
+    .map_err(|_error| {
         #[cfg(test)]
         eprintln!(
             "remote credential diagnostic: spawn errno={:?}",
@@ -486,6 +503,56 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolver_spawn_retries_only_transient_executable_busy() {
+        let config = GitWriteSectionConfig {
+            credential_resolver: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "printf synthetic-value".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let mut attempts = 0;
+        let secret = resolve_reference_with_spawn(&config, "unused", |command| {
+            attempts += 1;
+            if attempts <= 2 {
+                Err(std::io::ErrorKind::ExecutableFileBusy.into())
+            } else {
+                command.spawn()
+            }
+        })
+        .await
+        .expect("transient executable busy must retry");
+        assert_eq!(secret.value(), "synthetic-value");
+        assert_eq!(attempts, 3, "two busy failures plus one successful spawn");
+
+        let mut exhausted_attempts = 0;
+        assert!(resolve_reference_with_spawn(&config, "unused", |_command| {
+            exhausted_attempts += 1;
+            Err(std::io::ErrorKind::ExecutableFileBusy.into())
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            exhausted_attempts, 4,
+            "the finite budget permits three retries"
+        );
+
+        let mut non_busy_attempts = 0;
+        assert!(resolve_reference_with_spawn(&config, "unused", |_command| {
+            non_busy_attempts += 1;
+            Err(std::io::ErrorKind::NotFound.into())
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            non_busy_attempts, 1,
+            "other spawn errors must return immediately"
+        );
     }
 
     #[cfg(unix)]
