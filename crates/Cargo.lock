@@ -2070,6 +2070,7 @@ dependencies = [
 name = "khive-hnsw"
 version = "0.9.0"
 dependencies = [
+ "chrono",
  "criterion",
  "khive-fold",
  "khive-score",

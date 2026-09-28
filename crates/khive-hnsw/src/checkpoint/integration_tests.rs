@@ -1,4 +1,5 @@
 use super::*;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use khive_fold::{Checkpoint, CheckpointStore, FoldContext, InMemoryCheckpointStore};
 use uuid::Uuid;
 
@@ -146,13 +147,14 @@ fn store_and_load_checkpoint_with_tombstones() {
 #[test]
 fn load_latest_hnsw_checkpoint() {
     let store: HnswCheckpointStore = InMemoryCheckpointStore::new();
+    let base = DateTime::<Utc>::default();
 
     for i in 0..3 {
         let mut snap = sample_snapshot();
         snap.total_nodes = (i + 1) * 100;
         snap.live_nodes = (i + 1) * 100;
 
-        let checkpoint: HnswCheckpoint = Checkpoint::new(
+        let mut checkpoint: HnswCheckpoint = Checkpoint::new(
             format!("hnsw_idx:ckpt-{i}"),
             snap,
             Uuid::new_v4(),
@@ -161,8 +163,8 @@ fn load_latest_hnsw_checkpoint() {
             1,
         )
         .expect("Checkpoint::new");
+        checkpoint.created_at = base + ChronoDuration::milliseconds(i as i64);
         store.save(checkpoint).expect("save");
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     let latest = store
