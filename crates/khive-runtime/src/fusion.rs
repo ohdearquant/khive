@@ -12,7 +12,7 @@ use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::retrieval::{SearchHit, SearchSource};
+use crate::retrieval::{RankScoreKind, SearchHit, SearchSignals, SearchSource};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 pub use khive_fusion::FusionStrategy;
@@ -34,6 +34,9 @@ pub type RankedHit = (Uuid, DeterministicScore);
 /// it can reject malformed `params` instead of degrading silently.
 #[async_trait::async_trait]
 pub trait FusionExecutor: Send + Sync + 'static {
+    /// Declare the strategy represented by the executor's ordering score.
+    fn rank_score_kind(&self) -> RankScoreKind;
+
     /// Combine `streams` into a single ranked list, honoring `limit` as a
     /// hint (the dispatch boundary re-sorts and truncates the result with the
     /// crate's canonical comparator regardless, so an executor need not sort
@@ -106,6 +109,10 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let mut metadata: HashMap<Uuid, SearchHit> =
             HashMap::with_capacity(text_hits.len() + vector_hits.len());
+        let prefer_maximum_signal = matches!(
+            strategy,
+            FusionStrategy::Weighted { .. } | FusionStrategy::Union
+        );
 
         let text_source: Vec<(Uuid, DeterministicScore)> = text_hits
             .into_iter()
@@ -113,13 +120,18 @@ impl KhiveRuntime {
                 let hit = SearchHit {
                     entity_id: h.subject_id,
                     score: h.score,
+                    rank_score_kind: RankScoreKind::Keyword,
+                    signals: SearchSignals {
+                        vector_similarity: None,
+                        keyword_score: Some(h.score),
+                    },
                     source: SearchSource::Text,
                     title: h.title,
                     snippet: h.snippet,
                 };
                 let id = hit.entity_id;
                 let score = hit.score;
-                merge_metadata(&mut metadata, hit);
+                merge_metadata(&mut metadata, hit, prefer_maximum_signal);
                 (id, score)
             })
             .collect();
@@ -130,13 +142,18 @@ impl KhiveRuntime {
                 let hit = SearchHit {
                     entity_id: h.subject_id,
                     score: h.score,
+                    rank_score_kind: RankScoreKind::Vector,
+                    signals: SearchSignals {
+                        vector_similarity: Some(h.score),
+                        keyword_score: None,
+                    },
                     source: SearchSource::Vector,
                     title: None,
                     snippet: None,
                 };
                 let id = hit.entity_id;
                 let score = hit.score;
-                merge_metadata(&mut metadata, hit);
+                merge_metadata(&mut metadata, hit, prefer_maximum_signal);
                 (id, score)
             })
             .collect();
@@ -145,13 +162,14 @@ impl KhiveRuntime {
         // place: removing one would shift the surviving arm onto the wrong weight.
         let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![vector_source, text_source];
 
-        let fused = self.dispatch_fusion(sources, strategy, limit).await?;
+        let (rank_score_kind, fused) = self.dispatch_fusion(sources, strategy, limit).await?;
 
         Ok(fused
             .into_iter()
             .filter_map(|(id, score)| {
                 let mut hit = metadata.remove(&id)?;
                 hit.score = score;
+                hit.rank_score_kind = rank_score_kind;
                 Some(hit)
             })
             .collect())
@@ -170,29 +188,62 @@ impl KhiveRuntime {
         sources: Vec<Vec<(Uuid, DeterministicScore)>>,
         strategy: &FusionStrategy,
         limit: usize,
-    ) -> RuntimeResult<Vec<(Uuid, DeterministicScore)>> {
-        let FusionStrategy::Custom { name, params } = strategy else {
-            return Ok(khive_fusion::fuse(sources, strategy, limit)?);
+    ) -> RuntimeResult<(RankScoreKind, Vec<RankedHit>)> {
+        let rank_score_kind = match strategy {
+            FusionStrategy::Rrf { .. } => RankScoreKind::Rrf,
+            FusionStrategy::VectorOnly => RankScoreKind::Vector,
+            FusionStrategy::KeywordOnly => RankScoreKind::Keyword,
+            FusionStrategy::Weighted { .. } => RankScoreKind::Weighted,
+            FusionStrategy::Union => RankScoreKind::Union,
+            FusionStrategy::Custom { name, params } => {
+                let executor = self.fusion_executor(name)?;
+                let rank_score_kind = executor.rank_score_kind();
+                if limit == 0 || sources.iter().all(Vec::is_empty) {
+                    return Ok((rank_score_kind, Vec::new()));
+                }
+                let mut hits = executor.fuse(sources, params, limit).await?;
+                hits.sort_by(khive_fusion::cmp_desc_then_id);
+                hits.truncate(limit);
+                return Ok((rank_score_kind, hits));
+            }
         };
-
-        let executor = self.fusion_executor(name)?;
-
-        if limit == 0 || sources.iter().all(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
-
-        let mut hits = executor.fuse(sources, params, limit).await?;
-        hits.sort_by(khive_fusion::cmp_desc_then_id);
-        hits.truncate(limit);
-        Ok(hits)
+        Ok((
+            rank_score_kind,
+            khive_fusion::fuse(sources, strategy, limit)?,
+        ))
     }
 }
 
-fn merge_metadata(metadata: &mut HashMap<Uuid, SearchHit>, hit: SearchHit) {
+fn merge_metadata(
+    metadata: &mut HashMap<Uuid, SearchHit>,
+    hit: SearchHit,
+    prefer_maximum_signal: bool,
+) {
     match metadata.entry(hit.entity_id) {
         Entry::Occupied(mut entry) => {
             let existing = entry.get_mut();
             existing.source = merge_sources(existing.source, hit.source);
+            // RRF and pass-through retain the first occurrence; weighted and
+            // union use the maximum contribution from each retrieval leg.
+            existing.signals.vector_similarity = if prefer_maximum_signal {
+                existing
+                    .signals
+                    .vector_similarity
+                    .max(hit.signals.vector_similarity)
+            } else {
+                existing
+                    .signals
+                    .vector_similarity
+                    .or(hit.signals.vector_similarity)
+            };
+            existing.signals.keyword_score = if prefer_maximum_signal {
+                existing
+                    .signals
+                    .keyword_score
+                    .max(hit.signals.keyword_score)
+            } else {
+                existing.signals.keyword_score.or(hit.signals.keyword_score)
+            };
             if existing.title.is_none() {
                 existing.title = hit.title;
             }
@@ -267,31 +318,37 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let ns = token.namespace().as_str().to_owned();
-        // sanitize_fts5_query strips known-unsafe metacharacters, but residual
-        // punctuation can still trip the FTS5 parser at runtime; that error must
-        // fail loud rather than silently degrade to vector-only fusion. Errors
-        // from other legs (vector search) still propagate normally.
-        let text_search_result = self
-            .text(token)?
-            .search(TextSearchRequest {
-                query: query_text.to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            })
-            .await;
-        let text_hits = crate::error::fts_text_leg_or_err(
-            text_search_result.map_err(RuntimeError::from),
-            "hybrid_search_with_strategy",
-            query_text,
-        )?;
+        let text_hits = if matches!(&strategy, FusionStrategy::VectorOnly) {
+            Vec::new()
+        } else {
+            let ns = token.namespace().as_str().to_owned();
+            // sanitize_fts5_query strips known-unsafe metacharacters, but residual
+            // punctuation can still trip the FTS5 parser at runtime; that error must
+            // fail loud rather than silently degrade to vector-only fusion. Errors
+            // from other legs (vector search) still propagate normally.
+            let text_search_result = self
+                .text(token)?
+                .search(TextSearchRequest {
+                    query: query_text.to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(TextFilter {
+                        namespaces: vec![ns],
+                        ..TextFilter::default()
+                    }),
+                    top_k: candidates,
+                    snippet_chars: 200,
+                })
+                .await;
+            crate::error::fts_text_leg_or_err(
+                text_search_result.map_err(RuntimeError::from),
+                "hybrid_search_with_strategy",
+                query_text,
+            )?
+        };
 
-        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+        let vector_hits = if !matches!(&strategy, FusionStrategy::KeywordOnly)
+            && (query_vector.is_some() || self.config().embedding_model.is_some())
+        {
             self.vector_search(
                 token,
                 query_vector,
@@ -323,10 +380,11 @@ mod tests {
     use chrono::Utc;
     use khive_storage::types::{TextDocument, TextSearchHit, VectorSearchHit, VectorSearchRequest};
     use khive_storage::Entity;
-    use lattice_embed::EmbeddingModel;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use crate::RuntimeConfig;
+    use crate::{EmbedderProvider, RuntimeConfig};
 
     fn text_hit(id: Uuid, score: f64, title: &str) -> TextSearchHit {
         TextSearchHit {
@@ -344,6 +402,409 @@ mod tests {
             score: DeterministicScore::from_f64(score),
             rank: 1,
         }
+    }
+
+    fn evidence_runtime() -> KhiveRuntime {
+        let backend = Arc::new(crate::StorageBackend::memory().expect("in-memory backend"));
+        backend.prepare_core_schema().expect("core schema");
+        KhiveRuntime::from_backend(
+            backend,
+            RuntimeConfig {
+                db_path: None,
+                events_split: None,
+                actor_id: Some("test:fusion-evidence".into()),
+                ..RuntimeConfig::no_embeddings()
+            },
+        )
+    }
+
+    struct CountingEmbeddingService {
+        calls: Arc<AtomicUsize>,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for CountingEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fusion-counting-embedding"
+        }
+    }
+
+    struct CountingEmbedderProvider {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for CountingEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(CountingEmbeddingService {
+                calls: Arc::clone(&self.calls),
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    fn counting_embedding_runtime() -> (KhiveRuntime, Arc<AtomicUsize>) {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
+        let calls = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(CountingEmbedderProvider {
+            name: model.to_string(),
+            calls: Arc::clone(&calls),
+            dimensions: model.dimensions(),
+        });
+        (rt, calls)
+    }
+
+    #[tokio::test]
+    async fn keyword_only_search_skips_embedding_and_vector_arm() {
+        let (rt, embed_calls) = counting_embedding_runtime();
+        let tok = NamespaceToken::local();
+        let entity = Entity::new("local", "concept", "keyword candidate");
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entities(vec![entity.clone()])
+            .await
+            .unwrap();
+        rt.text(&tok)
+            .unwrap()
+            .upsert_document(TextDocument {
+                subject_id: entity.id,
+                kind: SubstrateKind::Entity,
+                record_kind: None,
+                namespace: "local".to_string(),
+                title: None,
+                body: "fusionkeyword".to_string(),
+                tags: vec![],
+                metadata: None,
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let hits = rt
+            .hybrid_search_with_strategy(
+                &tok,
+                "fusionkeyword",
+                None,
+                FusionStrategy::KeywordOnly,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, entity.id);
+        assert_eq!(hits[0].source, SearchSource::Text);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
+
+        let mixed = rt
+            .hybrid_search_with_strategy(&tok, "fusionkeyword", None, FusionStrategy::rrf(), 10)
+            .await
+            .unwrap();
+        assert_eq!(mixed[0].entity_id, entity.id);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn vector_only_search_skips_unavailable_text_arm() {
+        let (rt, embed_calls) = counting_embedding_runtime();
+        let tok = NamespaceToken::local();
+        let entity = Entity::new("local", "concept", "vector candidate");
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entities(vec![entity.clone()])
+            .await
+            .unwrap();
+        let query_vector = vec![1.0; EmbeddingModel::AllMiniLmL6V2.dimensions()];
+        rt.vectors(&tok)
+            .unwrap()
+            .insert(
+                entity.id,
+                SubstrateKind::Entity,
+                "local",
+                "entity.body",
+                vec![query_vector.clone()],
+            )
+            .await
+            .unwrap();
+        rt.text(&tok).unwrap();
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "DROP TABLE fts_entities; CREATE TABLE fts_entities (id INTEGER PRIMARY KEY);"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let hits = rt
+            .hybrid_search_with_strategy(
+                &tok,
+                "fusionkeyword",
+                Some(query_vector),
+                FusionStrategy::VectorOnly,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, entity.id);
+        assert_eq!(hits[0].source, SearchSource::Vector);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fusion_evidence_labels_builtin_strategies_and_preserves_components() {
+        let rt = evidence_runtime();
+        let id = Uuid::from_u128(1);
+        let keyword = DeterministicScore::from_raw(1_i64 << 30);
+        let vector = DeterministicScore::from_raw(3_i64 << 30);
+        for (strategy, kind, raw_score, signals) in [
+            (
+                FusionStrategy::Rrf { k: 60 },
+                RankScoreKind::Rrf,
+                140_818_600,
+                SearchSignals {
+                    vector_similarity: Some(vector),
+                    keyword_score: Some(keyword),
+                },
+            ),
+            (
+                FusionStrategy::VectorOnly,
+                RankScoreKind::Vector,
+                vector.to_raw(),
+                SearchSignals {
+                    vector_similarity: Some(vector),
+                    keyword_score: None,
+                },
+            ),
+            (
+                FusionStrategy::KeywordOnly,
+                RankScoreKind::Keyword,
+                keyword.to_raw(),
+                SearchSignals {
+                    vector_similarity: None,
+                    keyword_score: Some(keyword),
+                },
+            ),
+            (
+                FusionStrategy::weighted(vec![0.5, 0.5]),
+                RankScoreKind::Weighted,
+                1_i64 << 32,
+                SearchSignals {
+                    vector_similarity: Some(vector),
+                    keyword_score: Some(keyword),
+                },
+            ),
+            (
+                FusionStrategy::Union,
+                RankScoreKind::Union,
+                vector.to_raw(),
+                SearchSignals {
+                    vector_similarity: Some(vector),
+                    keyword_score: Some(keyword),
+                },
+            ),
+        ] {
+            let hits = rt
+                .fuse_with_strategy(
+                    vec![text_hit(id, 0.25, "candidate")],
+                    vec![vector_hit(id, 0.75)],
+                    &strategy,
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].entity_id, id);
+            assert_eq!(hits[0].score.to_raw(), raw_score);
+            assert_eq!(hits[0].rank_score_kind, kind);
+            assert_eq!(hits[0].signals, signals);
+        }
+        assert_eq!(RankScoreKind::Rrf.as_str(), "rrf");
+        assert_eq!(RankScoreKind::Vector.as_str(), "vector");
+        assert_eq!(RankScoreKind::Keyword.as_str(), "keyword");
+        assert_eq!(RankScoreKind::Weighted.as_str(), "weighted");
+        assert_eq!(RankScoreKind::Union.as_str(), "union");
+    }
+
+    #[tokio::test]
+    async fn fusion_evidence_distinguishes_absence_from_zero() {
+        let rt = evidence_runtime();
+        let id = Uuid::from_u128(1);
+        for (text, vector, signals) in [
+            (
+                vec![text_hit(id, 0.0, "zero keyword")],
+                vec![],
+                SearchSignals {
+                    vector_similarity: None,
+                    keyword_score: Some(DeterministicScore::ZERO),
+                },
+            ),
+            (
+                vec![],
+                vec![vector_hit(id, 0.0)],
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::ZERO),
+                    keyword_score: None,
+                },
+            ),
+        ] {
+            let hits = rt
+                .fuse_with_strategy(text, vector, &FusionStrategy::rrf(), 10)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].signals, signals);
+        }
+        assert_eq!(
+            SearchSignals::default(),
+            SearchSignals {
+                vector_similarity: None,
+                keyword_score: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fusion_evidence_golden_preserves_true_ties_across_permutations() {
+        let rt = evidence_runtime();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let expected = vec![
+            (
+                a,
+                139_682_966,
+                RankScoreKind::Rrf,
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::from_raw(1_i64 << 31)),
+                    keyword_score: Some(DeterministicScore::from_raw(1_i64 << 30)),
+                },
+            ),
+            (
+                b,
+                139_682_966,
+                RankScoreKind::Rrf,
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::from_raw(1_i64 << 32)),
+                    keyword_score: Some(DeterministicScore::from_raw(3_i64 << 30)),
+                },
+            ),
+        ];
+        for (text_ids, vector_ids) in [([a, b], [b, a]), ([b, a], [a, b])] {
+            for _ in 0..4 {
+                let text = text_ids
+                    .into_iter()
+                    .map(|id| text_hit(id, if id == a { 0.25 } else { 0.75 }, "candidate"))
+                    .collect();
+                let vector = vector_ids
+                    .into_iter()
+                    .map(|id| vector_hit(id, if id == a { 0.5 } else { 1.0 }))
+                    .collect();
+                let hits = rt
+                    .fuse_with_strategy(text, vector, &FusionStrategy::Rrf { k: 60 }, 10)
+                    .await
+                    .unwrap();
+                assert_eq!(hits.len(), 2);
+                assert_eq!(hits[0].score, hits[1].score);
+                assert!(hits.iter().all(|hit| hit.source == SearchSource::Both));
+                let snapshot: Vec<_> = hits
+                    .iter()
+                    .map(|hit| {
+                        (
+                            hit.entity_id,
+                            hit.score.to_raw(),
+                            hit.rank_score_kind,
+                            hit.signals,
+                        )
+                    })
+                    .collect();
+                assert_eq!(snapshot, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fusion_evidence_duplicate_selection_follows_strategy() {
+        let rt = evidence_runtime();
+        let id = Uuid::from_u128(1);
+        for (strategy, keyword_raw) in [
+            (FusionStrategy::rrf(), 1_i64 << 30),
+            (FusionStrategy::Union, 3_i64 << 30),
+            (FusionStrategy::weighted(vec![0.5, 0.5]), 3_i64 << 30),
+        ] {
+            let hits = rt
+                .fuse_with_strategy(
+                    vec![text_hit(id, 0.25, "first"), text_hit(id, 0.75, "second")],
+                    vec![vector_hit(id, 0.5)],
+                    &strategy,
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0].signals,
+                SearchSignals {
+                    vector_similarity: Some(DeterministicScore::from_raw(1_i64 << 31)),
+                    keyword_score: Some(DeterministicScore::from_raw(keyword_raw)),
+                }
+            );
+            assert_eq!(hits[0].title.as_deref(), Some("first"));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_fusion_evidence_uses_declared_kind() {
+        let rt = evidence_runtime();
+        let id = Uuid::from_u128(1);
+        rt.register_fusion_strategy("invert", Arc::new(InvertScoreExecutor));
+        let strategy =
+            FusionStrategy::try_custom("invert".into(), serde_json::Value::Null).unwrap();
+        let hits = rt
+            .fuse_with_strategy(vec![text_hit(id, 0.75, "candidate")], vec![], &strategy, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score.to_raw(), 1_i64 << 30);
+        assert_eq!(hits[0].rank_score_kind, RankScoreKind::Weighted);
+        assert_eq!(
+            hits[0].signals,
+            SearchSignals {
+                vector_similarity: None,
+                keyword_score: Some(DeterministicScore::from_raw(3_i64 << 30)),
+            }
+        );
     }
 
     fn cosine_fixture_vector(dimensions: usize, x: f32, y: f32) -> Vec<f32> {
@@ -705,6 +1166,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FusionExecutor for ReverseOrderExecutor {
+        fn rank_score_kind(&self) -> RankScoreKind {
+            RankScoreKind::Union
+        }
+
         async fn fuse(
             &self,
             streams: Vec<CandidateStream>,
@@ -726,6 +1191,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FusionExecutor for InvertScoreExecutor {
+        fn rank_score_kind(&self) -> RankScoreKind {
+            RankScoreKind::Weighted
+        }
+
         async fn fuse(
             &self,
             streams: Vec<CandidateStream>,
@@ -748,6 +1217,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FusionExecutor for EqualScoreExecutor {
+        fn rank_score_kind(&self) -> RankScoreKind {
+            RankScoreKind::Weighted
+        }
+
         async fn fuse(
             &self,
             streams: Vec<CandidateStream>,

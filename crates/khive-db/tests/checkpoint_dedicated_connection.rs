@@ -126,7 +126,7 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
         ConnectionPool::new(PoolConfig {
             path: Some(path.clone()),
             checkout_timeout: CHECKOUT_TIMEOUT,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open"),
     );

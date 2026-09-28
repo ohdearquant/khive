@@ -18,8 +18,9 @@ use crate::vocab::{GIT_ENTITY_TYPES, GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS}
 /// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendments 1 and 2, plus
 /// ADR-108) — registers `commit` / `issue` / `pull_request` note kinds populated by
 /// the batch ingester in `src/ingest.rs`, the agent-facing verb
-/// `git.digest` (`src/handlers.rs`), the read `git.ingest_cursor`, and write verbs `git.commit` /
-/// `git.branch` / `git.push` (`src/write_handlers.rs`, ADR-108). Extends the
+/// `git.digest` (`src/handlers.rs`), the read `git.ingest_cursor`, write verbs `git.commit` /
+/// `git.branch` / `git.push` (`src/write_handlers.rs`, ADR-108), and `git.update_ref`
+/// (`src/local_handlers.rs`). Extends the
 /// base edge contract with `precedes` commit→commit (parent→child lineage,
 /// ADR-088 Amendment 1 ingest enrichment) — the only new endpoint rule this
 /// pack contributes; everything else uses the base `annotates` contract.
@@ -165,6 +166,7 @@ impl PackRuntime for GitPack {
             }
             "git.commit" => self.handle_commit(token, registry, params).await,
             "git.branch" => self.handle_local(token, registry, verb, params).await,
+            "git.update_ref" => self.handle_local(token, registry, verb, params).await,
             "git.push" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
                 self.handle_remote(token, registry, verb, params).await
             }

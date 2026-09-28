@@ -686,7 +686,9 @@ async fn driver_deadline_recovers_admission_capacity_from_a_stalled_generation()
         store,
         AuditBatchConfig {
             admission_deadline: std::time::Duration::from_millis(20),
-            resolution_deadline: std::time::Duration::from_millis(30),
+            // Keep the driver's 3x generation bound well beyond this test's
+            // 20ms admission deadline, so the refusal check runs first.
+            resolution_deadline: std::time::Duration::from_secs(1),
             max_pending_rows: std::num::NonZeroUsize::new(2).unwrap(),
             ..AuditBatchConfig::default()
         },
@@ -750,10 +752,10 @@ async fn driver_deadline_recovers_admission_capacity_from_a_stalled_generation()
     );
 
     // (b): once the driver's own per-generation bound elapses (3x
-    // `resolution_deadline` = 90ms here), it abandons generation 1 and loops
+    // `resolution_deadline` = 3s here), it abandons generation 1 and loops
     // back to drain the two filler rows into generation 2 — which stalls
     // the same way, but draining `pending` is what frees admission.
-    wait_until(std::time::Duration::from_secs(5), || {
+    wait_until(std::time::Duration::from_secs(15), || {
         batch.test_snapshot().pending_rows == 0
     })
     .await;

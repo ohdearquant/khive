@@ -1031,7 +1031,7 @@ fn prepare_graph(
             .then_with(|| left.source_path.cmp(&right.source_path))
     });
 
-    let tracked = tracked_paths(&request.repo_path)?;
+    let tracked = tracked_paths(&request.repo_path, head)?;
     let derived = derive_rust_module_keys(&request.repo_path, &tracked)?;
     let files = derived.len() as u64;
     let mut derived_keys = BTreeSet::new();

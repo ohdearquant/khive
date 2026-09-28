@@ -1,6 +1,6 @@
 //! Handler-level git-write policy allowlist (ADR-108 Amendment).
 //!
-//! `git.commit` / `git.branch` / `git.push` fail closed at the handler when
+//! `git.commit` / `git.branch` / `git.update_ref` / `git.push` fail closed at the handler when
 //! no policy artifact is configured, or the artifact is empty — the same
 //! enforcement class as [`crate::write_argv::reject_force`]'s unconditional
 //! force-push denial: deliberately not dependent on Gate configuration. The

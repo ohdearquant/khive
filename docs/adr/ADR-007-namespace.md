@@ -102,6 +102,64 @@ internal note constructors keep their prior behavior. There is no new actor-base
 authorization rule, by-ID namespace check, data migration or change to Rule 8.
 The qualification requires acceptance before its dependent implementation merges.
 
+### Qualification: `neighbors` and `traverse` on an anchor outside the read scope
+
+**Status**: accepted, dated 2026-09-25.
+
+**Context.** Rule 9 says "several parameters declare prefix-scoped-to-primary resolution instead,
+`neighbors(node_id)` among them, where the _prefix_ form resolves within the caller's primary
+namespace while a full UUID is still unchecked", and "Rule 3b's visible set governs multi-record
+reads; it does not narrow by-ID resolution". Rule 3b says "The scope applies to all multi-record
+reads for all packs: list, search, recall, neighbors, traverse, query." The kg pack declares
+`neighbors(node_id)` and `traverse(roots)` prefix-scoped to the primary namespace
+(`crates/khive-pack-kg/src/handler_defs.rs`), a mode whose schema text says a full UUID "resolves as
+given, with no namespace check performed by this resolver" (`crates/khive-runtime/src/pack.rs`).
+After resolution, however, `crates/khive-runtime/src/operations.rs` checks the anchor against the
+caller's visible set (`substrate_exists_in_ns`, called by `neighbors_with_query_page`,
+`neighbors_with_query_directed` and the `traverse` root loop) and returns an empty result when the
+anchor is outside it or does not exist. A caller cannot tell an anchor outside its read scope, an
+absent id, and an anchor with no edges apart (#3204), while `get` on the same id returns the record
+(Rule 2).
+
+**Decision.** The anchor is a by-ID argument and the returned edges are a multi-record read, so each
+follows its own rule:
+
+1. A full-UUID anchor resolves with no namespace predicate, as `get` does (Rule 2). An id that
+   resolves to no live record is refused as not found; `traverse` refuses such a root the same way,
+   naming it. The runtime already has this check for `annotates` endpoints
+   (`substrate_exists_by_id`).
+2. The edges and neighbour records returned are those in the caller's read scope (Rule 3b),
+   unchanged.
+3. The prefix form keeps resolving in the caller's primary namespace (Rule 9), unchanged.
+
+An anchor outside the read scope therefore answers with its in-scope edges, possibly none, and an
+absent anchor answers not found.
+
+**Alternatives considered.**
+
+- Refuse an out-of-scope anchor as not found. This separates the cases #3204 names, but it reports
+  as not found a record `get` returns for the same id, and it is a per-record namespace check on a
+  by-ID argument, which Rule 9 point 6 declines to add ("present on the verbs someone remembered,
+  absent on the next verb added"). It also withholds the in-scope edges of such an anchor, which is
+  the navigation a deployment writing different record types into different namespaces needs.
+- Keep the visible-set check and the empty answer (the implementation today). The ambiguity #3204
+  reports stays, and an absent id still answers like an isolated record.
+- Declare these anchors scoped to the primary namespace for full UUIDs too. That is narrower than
+  the Rule 3b read scope the returned edges use, so an anchor visible through `visible_namespaces`
+  would be refused.
+
+**Consequences.** Two behaviour changes: an absent anchor returns an error instead of an empty list,
+and an anchor outside the read scope returns its in-scope edges instead of nothing. Nothing new is
+disclosed, since `get` already resolves the same id. Separation between tenants does not rest on
+this rule: a hosted deployment keeps tenants apart in the service layer above the runtime, and inside
+one runtime the governing rule for a full-UUID argument is Rule 2. Rule 9's "a full UUID is still unchecked" then
+holds for the operation, not only for the resolver. Acceptance arms: an absent anchor is not found;
+an out-of-scope anchor with one in-scope edge returns that edge; an out-of-scope anchor with no
+in-scope edges returns an empty list; control, an in-scope anchor with no edges returns an empty
+list.
+
+**Refs.** #3204.
+
 ---
 
 ## Decision

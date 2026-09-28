@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-27
+
 ### Removed
 
 - `KindHook::prepare_note_update`, the trait method that sequenced a pack's
@@ -38,8 +40,155 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `links_to` edge relation support the ontology; identity is deterministic by canonicalized
   address, so an unfetched link target and its later-fetched body are the same row.
 
+- A new Python client package, `khive-py` (`python/`): a unified record interface
+  (id/kind/namespace/properties/metadata/tags/lifecycle timestamps, with kind as
+  the universal discriminator) over the daemon's Unix-socket wire, with a
+  weighted-incidence model underneath it — an edge is a record plus N
+  incidences, so a binary edge is the two-incidence special case rather than
+  the schema, `link()` takes `source_weight`/`target_weight`, and `hyperlink()`
+  takes an explicit member list. It also ships an `HttpTransport` /
+  `AsyncHttpTransport` for a khive-cloud deployment with typed errors
+  (`AuthError`, `RateLimited`, `BadRequest`, `ServerError`), an MCP session
+  helper, an `AsyncSession` over the local daemon socket for callers already
+  inside an event loop, a typed `Session.recall`, and a `khive-cloud` console
+  script (`whoami`, `exec`, `tools`, `health`) whose credential comes only from
+  `KHIVE_CLOUD_API_KEY` and is never echoed, including when a server response
+  reflects it back.
+
+- A new `tool` pack (ADR-180) and `exec` pack (ADR-181), both loaded by
+  default: a policy-gated registry for tools, skills, plugins and verbs
+  (`tool.suggest`, `tool.request`, `tool.grant`, `tool.check`, and more)
+  joined to graph capability concepts by `implements` edges, with asynchronous
+  grant approval and a fast path for a pre-granted tool; and sandboxed tool
+  execution over content-addressed trees (`exec.tree`, `exec.tree_get`,
+  `exec.tree_diff`, `exec.tree_put`, `exec.run`, `exec.receipt`, `exec.runs`,
+  `exec.events`, `exec.identity`) under a seatbelt profile built from
+  configured read roots and resource limits, recording a receipt for every
+  outcome including refusals.
+
+- Git dev-loop verbs (ADR-182): local, receipted `git.checkout`, `git.diff`,
+  `git.branch`, `git.commit`, `git.receipts`, `git.reconcile`, `git.status`,
+  `git.log`, `git.init`, and `git.update_ref` (a compare-and-swap move of a
+  branch to an existing commit); guarded remote `git.push`, `git.pr_open`,
+  `git.pr_review`, and `git.pr_merge`, which prove fast-forward ancestry,
+  push with an explicit `--force-with-lease`, and write a durable receipt for
+  every attempt including refusals. A `git_write.repositories` row may set
+  `merge_refusals = ["opener", "last_pusher"]` to refuse a merge dispatched by
+  the pull request's own opener or by the account that pushed the head being
+  merged. An operator may name a configured git executable
+  (`git_write.program`) for the write surface, and a repository mapping may
+  target an explicit local push destination instead of a remote platform.
+
+- Ordered streams and keyed, versioned notes (ADR-172, ADR-174): `stream.append`,
+  `stream.read` and `stream.stat` give a run dense, gapless per-stream sequence
+  numbers with a conditional `expected_seq` append and a lease fence against
+  competing writers; `create`, `get`, `update` and `list` accept a caller-chosen
+  `key` so a note can serve as a durable, addressable head, and `update` accepts
+  `expected_version` for compare-and-set instead of last-write-wins; a write may
+  also carry a fence naming another key, kind and expected version, checked in
+  the same transaction as the write it guards. `stream.batch` appends in atomic
+  or per-member modes.
+
+- A new optional `telemetry` pack (`KHIVE_PACKS=kg,telemetry` or `--pack kg
+  --pack telemetry`; not in the default set): an operator-declared `[telemetry]`
+  channel table classifies event kinds onto a `durable` or `ephemeral` carrier
+  with a `stop`/`gap` failure posture. `telemetry.emit` accepts a kind and an
+  arbitrary JSON payload; `telemetry.read` counts and returns durable records;
+  `telemetry.channels` reports the effective table.
+
+- `gtd.repair(items=[{id, changes}], apply=false)`: an explicit, caller-reviewed
+  way to correct a stored task's `created_at`, `updated_at` or `status` when it
+  was written outside the lifecycle rules, defaulting to a dry run that returns
+  the plan without writing.
+
+- `gtd` task creation accepts an optional `timezone` (an IANA zone name) for
+  anchoring a date-only `due` to a caller's own zone instead of the runtime's
+  single configured display zone, and echoes the zone actually used back as
+  `due_timezone` on every task carrying a `due`, including when the zone was
+  defaulted rather than named explicitly.
+
+- `gtd.tasks` accepts `tags`, `tag_mode` (`any`, the default, or `all`), and
+  `context_entity_id` filters, applied before pagination and honored when
+  computing the excluded-terminal-task hint.
+
+- `comm.send` and `comm.reply` accept an optional caller key. A retried call
+  with the same key and an unchanged payload returns the original message
+  pair's ids, thread and timestamp with no new write, instead of creating a
+  duplicate; a different payload under the same key is refused as a conflict.
+
+- `comm.inbox` and `comm.thread` accept `mailbox_actor`. An owner can name
+  trusted readers in a new `[actor] mailbox_readers` config, and a granted
+  reader can inspect that owner's inbox or thread without changing caller
+  identity, marking anything read, or gaining any right to reply.
+
+- `comm.read` returns the message body (`subject`, `content`, `from`, `to`,
+  `direction`, `created_at`) by default once the read mark succeeds, so reading
+  a message no longer needs a follow-up `comm.thread` call. Pass `body=false`
+  to keep the previous acknowledgement-only shape; `comm.mark_read` is
+  unchanged in both modes.
+
+- `knowledge.upsert_atoms` accepts `dry_run`: it runs every per-item input
+  check, the secret-gate check, and the read-only-target checks the write path
+  runs, over the whole batch, and returns a verdict per submitted item in
+  submission order, without acquiring an atom writer or writing an atom row,
+  index entry, or refusal event.
+
+- `search` accepts `text_mode` (`all_terms`, the existing default, or
+  `any_term`) for the lexical arm of KG entity and note search. KG search
+  responses also carry `arm_participation`: per-arm (text and vector) evidence
+  of whether each arm ran, was skipped, or errored, with bounded final
+  candidate counts.
+
+- A new admin capability moves records between namespaces, backed by a
+  namespace schema census derived from the live composed registry rather than
+  a fixed table list, so a migration that adds a namespace-bearing table is
+  refused by name instead of being silently left unmoved by an older sweep.
+
+- `kkernel entity-type-backfill --dry-run|--apply`: an admin subcommand that
+  promotes an entity's legacy `properties.type` value into the `entity_type`
+  column, classifying against the full composed runtime registry (the
+  built-in table plus every loaded pack) rather than the built-in table alone.
+
+- `schedule.remind` and `schedule.schedule` accept fixed intervals
+  (`every:<N><s|m|h|d>`) and five-field cron expressions evaluated in UTC,
+  alongside the existing `daily`/`weekly`/`monthly` aliases. One parser now
+  serves both creation and the executor, so a stored repeat is always one the
+  drain can advance; an impossible or malformed pattern is refused at
+  creation rather than stored and silently never firing.
+
+- `[gate].deny_writes_for`: actor-id patterns (`*` as the only wildcard)
+  matched against it restrict a matching enrolled caller to explicitly
+  reviewed read operations; writes and unclassified operation names fail
+  closed for a matching actor.
+
+- The daemon refuses to start a second `khived` instance on a socket a
+  supervisor has already claimed, reading a marker file written beside the
+  socket instead of losing the race to a client's on-demand spawn, which
+  previously won by cadence and left the machine served by whichever process
+  happened to call first.
+
+- The `@khive-ai/cli` npm compatibility package is now published alongside the
+  umbrella package on every release, with matching versions validated before
+  publish.
+
 ### Changed
 
+- KG and coordinated search publish `rank_score`, `rank_score_kind`, and retained
+  component `signals`. The deprecated `score` field is an exact compatibility
+  alias. `min_rank_score` applies an inclusive fixed-point floor before the final
+  result limit, including time ordering; `min_score` remains a deprecated alias,
+  and supplying both names is rejected. Agent presentation rounds the new score
+  fields after filtering and omits an empty evidence object. Knowledge search
+  and memory recall keep their existing scoring contracts.
+- **Breaking**: runtime `SearchHit` and `NoteSearchHit` values now include
+  `rank_score_kind` and typed `signals`. Struct constructors must identify the
+  ordering strategy and explicitly retain available component scores; an absent
+  signal uses `None`. `FusionExecutor` implementers must add
+  `rank_score_kind()`, choosing `rrf`, `vector`, `keyword`, `weighted`, or `union`
+  according to the executor's ordering strategy. The existing `score` field
+  remains the canonical deterministic ordering value. Note search computes its
+  salience weight with fixed-point arithmetic, so rounding at the smallest score
+  increment can differ from the previous floating-point calculation.
 - **Breaking**: the `web` pack no longer reads a `.well-known` application manifest or emits
   `machine_view`/`agent_tool`/`agent_skill` entities — see the `web.*` entries above and
   `docs/packs/web.md`.
@@ -55,6 +204,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `KHIVE_TELEGRAM_DEFAULT_ACTOR`; the unset or blank default remains the isolated
   `telegram:bot` inbox. Routing them to `local` requires an access policy that
   protects the local inbox from anonymous readers.
+- **Breaking**: `gtd.complete` and `gtd.transition` to `done` now refuse with
+  `reason=dependency_blocked` when the task's dependency edges are unresolved,
+  naming each blocker, its state, and the count; a cancelled or missing
+  blocker refuses on the same grounds, because neither establishes that the
+  depended-on work happened. Cancelling a blocked task, and every non-terminal
+  move, stays legal. Pass `ignore_dependencies=true` on either verb to keep
+  the previous always-succeeds behavior.
+- `memory.prune` accepts `min_effective_salience`, selecting on the same
+  decay-adjusted salience value `memory.recall` already ranks with, instead of
+  only the raw stored `salience` column. A memory whose effective salience has
+  decayed near zero can now be selected for pruning even though its stored
+  `salience` alone would not clear a `min_salience` floor; `min_salience` is
+  unchanged and the two selectors union rather than replace one another.
+- `active` and `waiting` tasks can move directly to `someday` instead of first
+  requiring an intermediate `next` transition.
+- `gtd.tasks`'s default listing now excludes a task whose stored status is not
+  one of the canonical open states, the same way it already excluded terminal
+  ones, instead of listing an unrecognized legacy status as open work; the
+  empty-result hint gains `unrecognized_status` alongside `done` and
+  `cancelled`.
+- `brain.create_profile`'s `seed_priors` now rejects an unrecognized top-level
+  key (for example a `relevance` shape the handler never read) with
+  `InvalidInput` naming the key, before any profile is written, instead of
+  silently ignoring it and creating the profile anyway.
 
 ### Fixed
 
@@ -66,6 +239,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpointed, and unlinked the sidecars while the daemon kept writing to the
   unlinked files. Hardening now runs before the open, the post-open check uses
   `lstat` only, and a cross-process test asserts the locks are held.
+- The email channel stopped receiving mail for up to about an hour after the
+  host woke from sleep: its OAuth token cache measured freshness on a
+  monotonic clock that does not advance while the system sleeps, so a token
+  fetched before sleeping read as fresh long after it had actually expired in
+  wall time. The cache now checks both the monotonic and wall-clock deadline,
+  and a token the server rejects is invalidated immediately so the next poll
+  fetches a replacement.
+- Inbound IMAP fetches are now capped per message
+  (`KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES`, default 25 MiB) and per page
+  (`KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES`, default 50 MiB); a message over the
+  per-message cap is quarantined without its body instead of stalling the
+  poll or exhausting memory, and later messages on the same page still
+  ingest.
+- The Telegram channel now honors a 429 response's `retry_after` interval,
+  pausing outbound sending for that interval, instead of retrying a
+  rate-limited channel at its normal cadence.
+- A cron expression that can never occur on any real calendar date (for
+  example `0 9 30 2 *`, February 30th) is now refused when a schedule is
+  created, instead of being accepted and stored without ever firing.
+- Daily and weekly schedule recurrence no longer panics when the next
+  occurrence would fall outside the representable date range; it reports
+  that no successor exists instead.
+- A remote git URL with an `@` inside a path segment (for example
+  `https://evil.example/x@github.com/org/repo`) no longer has its real host
+  silently dropped when the git pack derives a GitHub `owner/repo` slug for
+  policy checks.
+
+- Knowledge-graph sync now refuses an entity carrying the reserved
+  `khive:secret_gate` property before it can replace the database, stores an
+  entity kind given as an alias or case variant under its canonical name, and
+  hashes a symmetric edge (`competes_with`, `composed_with`) the same way in
+  either endpoint order, so status no longer reports a change right after a
+  clean sync.
+- `neighbors` and `traverse` resolve a full-id anchor or root by id, the same
+  way `get` does. An absent anchor or root is now a not-found error, naming the
+  missing root for `traverse`, instead of an empty result; the edges and
+  neighbor records returned stay scoped to the caller's visible namespaces.
+- Remote issue and pull-request ingest no longer blocks a runtime worker on a
+  slow or hung `gh` call: the probe and page fetches run as async child
+  processes with a 60-second deadline and bounded output, and a failed page
+  reports its typed reason (timeout, output limit, missing program). Moodboard
+  raster decode, resize and encode run off the async workers.
+- Pack schema ownership recognizes a table however its DDL spells the name
+  (quoted, bracketed, `main.`-qualified, `TEMP`, or behind a comment), and
+  every pack's tables are claimed before any DDL runs, so a collision between
+  two packs fails boot by name with nothing applied. A repeated named-vector
+  lookup reuses the verified store instead of re-scanning the vector table and
+  taking the writer on every call.
+- Brain profile accounting: the dispatch hook no longer holds a namespace lock
+  across unrelated requests, and pending signals are bounded (drops are counted
+  in `brain.state`). Feedback that names a served row must match that row's
+  namespace, target and accounting profile. An archived profile no longer
+  accumulates automatic updates, an explicit recall naming an archived profile
+  is refused, and the default profile can no longer be deactivated or archived.
 
 ### Security
 
@@ -78,6 +305,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must be writable only by trusted processes, including processes under the same
   account. A handle-based replacement is follow-up work and needs native coverage
   on the affected platform before it can be believed.
+- `rustls` bumped to 0.23.45 for RUSTSEC-2026-0285: a TLS 1.3 handshake
+  message could be accepted across an encryption level boundary in 0.23.42
+  and earlier.
+- The web pack's pinned egress HTTP client no longer picks up a proxy from
+  the process environment or system configuration, and IPv4-mapped, NAT64,
+  and 6to4 IPv6 address forms carrying a private or loopback IPv4 destination
+  are now classified and refused instead of being read as ordinary public
+  addresses.
+- **Breaking**: the Telegram channel now accepts an inbound message only when
+  both the chat id and the sender id match. A deployment whose configured
+  chat is a group must set `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID`, or the
+  channel refuses to start; previously a group chat needed no such setting,
+  and a message from any member of that group was accepted and attributed to
+  the maintainer.
+- Secret-detection gate hardening across the release: a PEM private key is
+  now matched by its body under the header rather than the header alone,
+  lookup-key labels match whole rather than by suffix, masking is scoped to
+  inline credential values, and a technical reference (a path or a hash)
+  beside a credential word no longer triggers a false refusal.
+- A generic `create` or update of a `message` note now refuses a
+  caller-supplied `external_id`. The value is set only by inbound ingest and
+  by the outbound delivery claim, so a caller can no longer choose an
+  outgoing `Message-ID` or steer reply threading into another conversation.
 
 ## [0.8.0] - 2026-08-27
 

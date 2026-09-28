@@ -67,8 +67,8 @@ fn run_one_cold_boot(db_path: std::path::PathBuf, writer_label: &'static str, co
         .expect("build per-thread tokio runtime");
 
     rt_handle.block_on(async {
-        let rt =
-            KhiveRuntime::new(file_backed_config(db_path)).expect("cold-boot migrations succeed");
+        let rt = KhiveRuntime::new_for_test(file_backed_config(db_path))
+            .expect("cold-boot migrations succeed");
         let token = rt
             .authorize(Namespace::local())
             .expect("authorize local namespace");
@@ -100,7 +100,7 @@ fn verify_no_corruption(db_path: std::path::PathBuf, expected_count: usize) {
         .expect("build verification tokio runtime");
 
     rt_handle.block_on(async {
-        let verify_rt = KhiveRuntime::new(file_backed_config(db_path))
+        let verify_rt = KhiveRuntime::new_for_test(file_backed_config(db_path))
             .expect("post-race runtime opens cleanly");
         let token = verify_rt
             .authorize(Namespace::local())

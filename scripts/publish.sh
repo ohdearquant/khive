@@ -62,17 +62,21 @@ CRATES=(
     khive-query
     khive-gate
     khive-gate-rego
+    khive-channel          # no khive-* deps; transport abstraction; dep of khive-runtime
+    khive-request        # needs khive-types only; versioned dev-dep of khive-runtime, so publish first
     khive-runtime
-    khive-request
     khive-retrieval
     khive-vcs-adapters
-    khive-vcs
     khive-changeset      # needs khive-types (above)
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
+    khive-vcs            # needs khive-pack-kg (normal dep) + khive-runtime/storage/types (all above)
     khive-pack-agent     # needs khive-runtime/storage/types + dev-dep khive-pack-kg (all above)
-    khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above)
+    khive-pack-blob      # needs khive-runtime/storage/types (all above); dep of khive-mcp, dev-dep of khive-pack-git/exec
+    khive-pack-tool      # needs khive-runtime/storage/types (all above); dep of khive-pack-exec/git
+    khive-pack-exec      # needs khive-pack-tool + dev-deps khive-pack-blob/kg (all above)
+    khive-pack-git       # needs khive-pack-exec/tool + khive-runtime/storage + dev-deps khive-pack-kg/blob (all above)
     khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-gtd
     khive-brain-core
@@ -85,11 +89,11 @@ CRATES=(
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
     khive-pack-template
-    khive-pack-blob        # needs khive-runtime/storage/types (all above); dep of khive-mcp
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
-    khive-channel          # no khive-* deps; transport abstraction
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
     khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
+    khive-mounts         # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
+    khive-pack-web       # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-mcp
     khive-repo-showcase    # no khive-* dependencies; normal dep of kkernel, so publish first
     kkernel

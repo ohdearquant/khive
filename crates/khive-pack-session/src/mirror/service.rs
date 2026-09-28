@@ -2987,6 +2987,7 @@ mod cursor_retry_tests {
                 scanned: 0,
                 new_offset: 4096,
                 skipped_oversized_bytes: true,
+                replay_mismatches: 0,
             }),
             start_offset,
         ));
@@ -3035,6 +3036,7 @@ mod cursor_retry_tests {
                 scanned: 1,
                 new_offset: 4200,
                 skipped_oversized_bytes: true,
+                replay_mismatches: 0,
             }),
             start_offset,
         ));

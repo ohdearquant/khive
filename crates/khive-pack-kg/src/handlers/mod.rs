@@ -35,10 +35,10 @@ pub use params::{DeleteParams, LinkParams, UpdateParams};
 /// resolves kinds/ids and renders results through the exact canonical logic the
 /// handlers use, rather than reimplementing it.
 pub use common::{
-    normalize_entity_timestamps, resolve_kind_spec, resolve_uuid_unfiltered,
+    normalize_entity_timestamps, remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered,
     resolve_uuid_unfiltered_including_deleted, KindSpec,
 };
-pub use search::{SearchOrder, SearchSubstrate, ValidatedSearchRequest};
+pub use search::{search_rank_fields, SearchOrder, SearchSubstrate, ValidatedSearchRequest};
 
 #[cfg(test)]
 pub(crate) use common::{

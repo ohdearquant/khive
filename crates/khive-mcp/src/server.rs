@@ -31,11 +31,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
-use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
+use khive_pack_kg::handlers::{search_rank_fields, SearchSubstrate, ValidatedSearchRequest};
 use khive_request::{
     parse_request, parse_typed_json_batch, unit_write_key_conflicts, ArgValue, DslError,
     ExecutionMode, ParsedOp, ParsedRequest, PrevFailure, TypedJsonOp,
 };
+use khive_runtime::daemon::DAEMON_LEXICAL_TIMEOUT_MARKER;
 use khive_runtime::presentation::{
     prepare_format_value_with_note_content, render_format_with_note_content, NoteContentScope,
 };
@@ -134,6 +135,7 @@ struct SearchArmEvidence {
 struct SearchArmParticipation {
     text: SearchArmEvidence,
     vector: SearchArmEvidence,
+    text_mode: &'static str,
 }
 
 impl SearchArmParticipation {
@@ -151,6 +153,7 @@ impl SearchArmParticipation {
                 },
                 candidate_count: 0,
             },
+            text_mode: "all_terms",
         }
     }
 
@@ -202,7 +205,11 @@ impl SearchDegradation {
         }
     }
 
-    fn from_result(result: &CoordSearchResult, final_result: &Value) -> Self {
+    fn from_result(
+        result: &CoordSearchResult,
+        final_result: &Value,
+        text_mode: &'static str,
+    ) -> Self {
         let vector_selected = result
             .per_backend
             .iter()
@@ -252,6 +259,7 @@ impl SearchDegradation {
                 },
                 candidate_count: 0,
             },
+            text_mode,
         };
         arm_participation.observe_result(final_result);
         let failed_backend_count = result
@@ -349,6 +357,13 @@ impl SearchDegradation {
         }
     }
 
+    fn with_text_mode(mut self, text_mode: &'static str) -> Self {
+        if let Some(participation) = self.arm_participation.as_mut() {
+            participation.text_mode = text_mode;
+        }
+        self
+    }
+
     fn is_partial(&self) -> bool {
         self.status == Some(SearchStatus::Partial)
     }
@@ -377,6 +392,7 @@ fn search_arm_participation_value(participation: SearchArmParticipation) -> Valu
         "text": {
             "status": participation.text.status.as_str(),
             "candidate_count": participation.text.candidate_count,
+            "mode": participation.text_mode,
         },
         "vector": {
             "status": participation.vector.status.as_str(),
@@ -385,9 +401,11 @@ fn search_arm_participation_value(participation: SearchArmParticipation) -> Valu
     });
     if participation.text.status == SearchArmStatus::Ran && participation.text.candidate_count == 0
     {
-        value["text"]["reason"] = json!(
+        value["text"]["reason"] = json!(if participation.text_mode == "all_terms" {
             "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
-        );
+        } else {
+            "No text candidate survived matching, filtering, fusion, and the result limit."
+        });
     }
     value
 }
@@ -522,15 +540,29 @@ fn op_success_from_registry_result(
     is_help: bool,
     result: Value,
     vector_selected: bool,
+    text_mode: &'static str,
 ) -> OpSuccess {
     if tool == "search" && !is_help {
         OpSuccess {
-            degradation: SearchDegradation::complete(&result, vector_selected),
+            degradation: SearchDegradation::complete(&result, vector_selected)
+                .with_text_mode(text_mode),
             result,
         }
     } else {
         OpSuccess::complete(result)
     }
+}
+
+fn validated_search_text_mode(
+    args: &Value,
+    registry: &VerbRegistry,
+) -> Result<&'static str, RuntimeError> {
+    let mut handler_args = args.clone();
+    if let Some(fields) = handler_args.as_object_mut() {
+        fields.remove("namespace");
+    }
+    ValidatedSearchRequest::from_value(handler_args, registry)
+        .map(|request| request.text_mode_name())
 }
 
 /// Structured error for a search whose selected backends failed such that no
@@ -786,16 +818,18 @@ fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
-/// Two servers produce the same id iff they can safely share one warm engine:
+/// Identical resolved configurations produce the same id. A daemon may also
+/// serve a compatible client with a different id when it has a superset of
+/// the client's requested extra embedders. Every other field must match:
 /// same pack set (order-independent), same storage target and effective access
-/// mode, same embedders, same backend topology/routing, and same
+/// mode, same primary embedder, same backend topology/routing, and same
 /// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
 /// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
-/// compares this against each forwarded request's `config_id` and rejects
-/// mismatches so a restricted client (e.g. `--pack kg`, `--db :memory:`) cannot
-/// execute through the broader default daemon.
+/// compares this against each forwarded request's `config_id` and rejects any
+/// difference outside the extra-embedder superset rule, so a restricted client
+/// cannot execute through a broader runtime with incompatible behavior.
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
 /// declaration, the backend topology (sorted backend list, explicit read-only
@@ -2062,11 +2096,15 @@ impl KhiveMcpServer {
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let max_outstanding_requests = stdio_bridge_max_outstanding_requests_from_env();
+        let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
+            let write =
+                crate::transport::DeadlineWriter::new(write, response_deadline, root.clone());
             crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
-                    read, write,
+                    crate::stdio_line_limit::BoundedLineReader::new(read, max_line_bytes),
+                    write,
                 )),
                 root,
                 idle_timeout,
@@ -2111,10 +2149,15 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
+        let max_line_bytes = crate::stdio_line_limit::max_line_bytes_from_env()?;
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let write = crate::transport::DeadlineWriter::new(write, response_deadline, root.clone());
         let transport =
             crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
-                AsyncRwTransport::new_server(read, write),
+                AsyncRwTransport::new_server(
+                    crate::stdio_line_limit::BoundedLineReader::new(read, max_line_bytes),
+                    write,
+                ),
                 root.clone(),
                 stdio_bridge_idle_timeout_from_env(),
                 Some(response_deadline),
@@ -2274,12 +2317,25 @@ impl KhiveMcpServer {
             return coord_result.and_then(|result| chain_ok_envelope_or_depth_error(tool, result));
         }
 
+        let search_args = (tool == "search" && !is_help).then(|| args_value.clone());
         match self
             .registry
             .dispatch_with_disposition(&tool, args_value, identity.cloned())
             .await
         {
             Ok(result) => {
+                let text_mode = match search_args.as_ref() {
+                    Some(args) => match validated_search_text_mode(args, &self.registry) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            return Err(DispatchFailure::before_dispatch(
+                                &tool,
+                                json!(error.to_string()),
+                            ));
+                        }
+                    },
+                    None => "all_terms",
+                };
                 let result = decorate_schedule_agenda_with_ticker_health(
                     &tool,
                     is_help,
@@ -2290,8 +2346,13 @@ impl KhiveMcpServer {
                     .runtime
                     .as_ref()
                     .is_some_and(|runtime| runtime.vector_arm_selected());
-                let success =
-                    op_success_from_registry_result(&tool, is_help, result, vector_selected);
+                let success = op_success_from_registry_result(
+                    &tool,
+                    is_help,
+                    result,
+                    vector_selected,
+                    text_mode,
+                );
                 chain_ok_envelope_or_depth_error(tool, success)
             }
             Err(error) => Err(DispatchFailure::from_dispatch(&tool, error)),
@@ -2551,11 +2612,28 @@ impl KhiveMcpServer {
                             }
                         }
 
+                        let search_args =
+                            (tool == "search" && !is_help).then(|| args_value.clone());
                         match registry
                             .dispatch_with_disposition(&tool, args_value, op_identity)
                             .await
                         {
                             Ok(result) => {
+                                let text_mode = match search_args.as_ref() {
+                                    Some(args) => {
+                                        match validated_search_text_mode(args, &registry) {
+                                            Ok(mode) => mode,
+                                            Err(error) => {
+                                                return DispatchFailure::before_dispatch(
+                                                    &tool,
+                                                    json!(error.to_string()),
+                                                )
+                                                .into_entry();
+                                            }
+                                        }
+                                    }
+                                    None => "all_terms",
+                                };
                                 let result = decorate_schedule_agenda_with_ticker_health(
                                     &tool,
                                     is_help,
@@ -2568,6 +2646,7 @@ impl KhiveMcpServer {
                                         is_help,
                                         result,
                                         op_vector_selected,
+                                        text_mode,
                                     );
                                 let content_scope = note_content_scope(
                                     parse_content && !is_help, &tool, &success.result, &registry,
@@ -3093,6 +3172,7 @@ async fn dispatch_via_coordinator_inner(
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             let metadata = args_value.get("metadata").cloned();
+            let dependency_kind = args_value.get("dependency_kind").cloned();
             let resurrect = args_value
                 .get("resurrect")
                 .and_then(Value::as_bool)
@@ -3104,6 +3184,20 @@ async fn dispatch_via_coordinator_inner(
                     args_value,
                     identity,
                     |namespace| async move {
+                        // The coordinator receives the same metadata as the KG
+                        // handler: a top-level dependency_kind fills the key only
+                        // when metadata does not already contain it.
+                        let dependency_kind = match dependency_kind {
+                            None | Some(Value::Null) => None,
+                            Some(Value::String(value)) => Some(value),
+                            Some(_) => {
+                                return Err(RuntimeError::InvalidInput(
+                                    "dependency_kind must be a string".into(),
+                                ));
+                            }
+                        };
+                        let metadata =
+                            khive_runtime::merge_entry_metadata(metadata, dependency_kind)?;
                         let coord_result = coord
                             .link(
                                 &namespace, source_id, target_id, relation, weight, metadata,
@@ -3160,14 +3254,14 @@ async fn dispatch_via_coordinator_inner(
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
-                        // entity_kind/note_kind), `name`, and `created_at`.
-                        // Entity hits: [{id, kind, entity_kind, name, score, source, title, snippet, created_at}]
-                        // Note hits:   [{id, kind, note_kind, name, score, source, title, snippet, created_at}]
+                        // entity_kind/note_kind), `name`, `created_at`, `updated_at`,
+                        // and `version`. Shared KG rank conversion also adds
+                        // `score`, `rank_score`, `rank_score_kind`, and `signals`.
                         let result_val = if request.substrate() == SearchSubstrate::Note {
                             let items: Vec<Value> = coord_result
                                 .note_hits
                                 .iter()
-                                .filter(|h| h.score.to_f64() >= request.min_score())
+                                .filter(|h| h.score >= request.min_rank_score())
                                 .filter_map(|h| {
                                     let version = coord_result.note_versions.get(&h.note_id)?;
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
@@ -3181,19 +3275,24 @@ async fn dispatch_via_coordinator_inner(
                                         .note_updated_at
                                         .get(&h.note_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
-                                    Some(json!({
+                                    let ranking =
+                                        search_rank_fields(h.score, h.rank_score_kind, h.signals);
+                                    let mut row = json!({
                                         "id": h.note_id.to_string(),
                                         "kind": note_kind,
                                         "note_kind": note_kind,
                                         "name": name,
-                                        "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
                                         "updated_at": updated_at,
                                         "version": version,
-                                    }))
+                                    });
+                                    row.as_object_mut().expect("search row object").extend(
+                                        ranking.as_object().expect("ranking fields object").clone(),
+                                    );
+                                    Some(row)
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
@@ -3201,7 +3300,7 @@ async fn dispatch_via_coordinator_inner(
                             let items: Vec<Value> = coord_result
                                 .entity_hits
                                 .iter()
-                                .filter(|h| h.score.to_f64() >= request.min_score())
+                                .filter(|h| h.score >= request.min_rank_score())
                                 .map(|h| {
                                     let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
                                     let created_at = coord_result
@@ -3212,26 +3311,34 @@ async fn dispatch_via_coordinator_inner(
                                         .entity_updated_at
                                         .get(&h.entity_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
+                                    let ranking =
+                                        search_rank_fields(h.score, h.rank_score_kind, h.signals);
                                     let version = coord_result.entity_versions.get(&h.entity_id);
-                                    json!({
+                                    let mut row = json!({
                                         "id": h.entity_id.to_string(),
                                         "kind": entity_kind,
                                         "entity_kind": entity_kind,
                                         "name": h.title,
-                                        "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
                                         "updated_at": updated_at,
                                         "version": version,
-                                    })
+                                    });
+                                    row.as_object_mut().expect("search row object").extend(
+                                        ranking.as_object().expect("ranking fields object").clone(),
+                                    );
+                                    row
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
                         };
-                        let degradation =
-                            SearchDegradation::from_result(&coord_result, &result_val);
+                        let degradation = SearchDegradation::from_result(
+                            &coord_result,
+                            &result_val,
+                            request.text_mode_name(),
+                        );
 
                         Ok(InterceptedDispatchResult::new(result_val, degradation))
                     },
@@ -3245,7 +3352,7 @@ async fn dispatch_via_coordinator_inner(
                         .map(|items| items.is_empty())
                         .unwrap_or(true);
                     // ADR-130 §1: a backend failure with zero surviving hits
-                    // (post server-side filtering, min_score included) is a
+                    // (post server-side filtering, min_rank_score included) is a
                     // failed operation, not a successful empty result — the
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
@@ -3755,8 +3862,9 @@ Response shape:
 
 Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
-`status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
-it (or summary) rather than relying on the absence of a top-level error.
+`status` is "partial" whenever summary.failed or summary.aborted is non-zero.
+The MCP tool result sets isError=true only when no op succeeded and at least
+one failed or aborted. For mixed batches inspect each result and the summary.
 
 A parallel write-heavy batch is best-effort, not atomic: `results` ordering is
 not a commit prefix (an earlier entry succeeding implies nothing about a later
@@ -3933,6 +4041,7 @@ impl KhiveMcpServer {
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        validate_request_overrides(&p, parsed.ops.len())?;
         #[cfg(unix)]
         let replay_read_only = !parsed.ops.is_empty()
             && parsed
@@ -4000,7 +4109,7 @@ impl KhiveMcpServer {
             // actually left on the REQUEST's own deadline, not by a fresh
             // full ceiling starting from whenever cancellation happens to
             // arrive. Also propagated into the spawned task itself
-            // (`inherit_request_read_context`) so `try_forward_inner`'s
+            // (`inherit_request_read_context`) so the forwarding path's
             // socket-exchange deadline is this exact same instant, instead
             // of a second, independently-ticking relative timer.
             let post_cancellation_deadline = khive_storage::capture_request_read_context()
@@ -4649,6 +4758,7 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         policy: ParsedDispatchPolicy,
     ) -> Result<String, McpError> {
+        validate_request_overrides(&p, parsed.ops.len())?;
         let ParsedDispatchPolicy {
             strict_refusals,
             max_batch_concurrency,
@@ -4716,6 +4826,17 @@ impl KhiveMcpServer {
                 None
             };
 
+        // Reserve and validate the destination before any operation can run.
+        // Wire requests are restricted to the export root; the trusted CLI
+        // keeps its documented unrestricted destination policy.
+        let save_sink = save_to
+            .as_deref()
+            .map(|path| {
+                crate::save_sink::JsonlSaveSink::new(std::path::Path::new(path), from_wire)
+                    .map_err(|error| invalid_request_error(format!("save_to: {error}")))
+            })
+            .transpose()?;
+
         let (mut result, content_scopes) = self
             .run_parsed(
                 parsed.ops,
@@ -4738,18 +4859,17 @@ impl KhiveMcpServer {
             attach_strict_refusal_reasons(&mut result);
         }
 
-        if let Some(path_str) = save_to {
-            let path = std::path::Path::new(&path_str);
-            // `from_wire` gates the destination policy: the agent-facing MCP
-            // `request` tool (`from_wire = true`) restricts `save_to` to the
-            // allowed export root; the trusted operator CLI path
-            // (`kkernel exec --save-file`, `from_wire = false`) is unrestricted,
-            // matching its documented "write anywhere" behavior.
-            let manifest = crate::save_sink::write_and_manifest(&result, path, from_wire)
-                .map_err(|e| request_internal_error(format!("save_to: {e}")))?;
+        if let Some(sink) = save_sink {
+            let manifest = sink
+                .write_envelope(&result)
+                .map_err(|error| save_to_write_error(format!("save_to: {error}"), &result))?;
             // Manifests are always compact JSON regardless of format (lossless metadata).
             return serde_json::to_string(&manifest)
                 .map_err(|e| request_internal_error(format!("serialize manifest: {e}")));
+        }
+
+        if origin == DispatchOrigin::Daemon {
+            mark_daemon_lexical_timeout(&mut result);
         }
 
         // Apply per-op format rendering (ADR-078 §8.4 and §9).
@@ -4866,6 +4986,67 @@ fn request_internal_error(message: String) -> McpError {
     )
 }
 
+/// A sink can still fail after domain dispatch. Preserve the known per-op
+/// receipts while bounding error details for results too large to return inline.
+fn save_to_write_error(message: String, result: &Value) -> McpError {
+    const MAX_INLINE_OUTCOME_BYTES: usize = 8 * 1024;
+
+    let outcomes = result
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, row)| {
+            let ok = row.get("ok").and_then(Value::as_bool);
+            let disposition = if ok == Some(true) {
+                DomainDisposition::Committed.as_str()
+            } else {
+                row.get("domain_disposition")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DomainDisposition::Unknown.as_str())
+            };
+            let mut outcome = json!({
+                "op_index": row.get("op_index").and_then(Value::as_u64).unwrap_or(index as u64),
+                "tool": row.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                "ok": ok,
+                "domain_disposition": disposition,
+            });
+            for field in ["result", "error"] {
+                if let Some(value) = row.get(field) {
+                    if serialized_response_len(value) <= MAX_INLINE_OUTCOME_BYTES {
+                        outcome[field] = value.clone();
+                    } else {
+                        outcome
+                            .as_object_mut()
+                            .expect("outcome is an object")
+                            .insert(format!("{field}_omitted"), Value::Bool(true));
+                    }
+                }
+            }
+            for field in ["reason", "aborted"] {
+                if let Some(value) = row.get(field) {
+                    outcome[field] = value.clone();
+                }
+            }
+            outcome
+        })
+        .collect::<Vec<_>>();
+    let mut detail = json!({
+        "kind": "internal",
+        "message": message.clone(),
+        "summary": result.get("summary"),
+        "results": outcomes,
+    });
+    if let Some(atomic) = result.get("atomic") {
+        detail["atomic"] = atomic.clone();
+    }
+    McpError::internal_error(
+        message,
+        Some(error_with_disposition(detail, DomainDisposition::Unknown)),
+    )
+}
+
 fn dsl_err_to_mcp(e: DslError) -> McpError {
     McpError::invalid_params(
         e.to_string(),
@@ -4906,10 +5087,71 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
     }
 }
 
+/// Validate envelope presentation/format overrides before daemon framing and
+/// before local dispatch. A surplus per-op array is never meaningful and can
+/// otherwise make a valid request exceed the daemon's frame budget.
+fn validate_request_overrides(p: &RequestParams, op_count: usize) -> Result<(), McpError> {
+    parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
+    parse_output_format(p.format.as_deref()).map_err(invalid_request_error)?;
+    if let Some(entries) = &p.presentation_per_op {
+        if entries.len() > op_count {
+            return Err(invalid_request_error(format!(
+                "presentation_per_op has {} entries for {op_count} operations",
+                entries.len()
+            )));
+        }
+        for entry in entries {
+            if let Some(value) = entry.as_deref() {
+                parse_presentation_mode(Some(value)).map_err(invalid_request_error)?;
+            }
+        }
+    }
+    if let Some(entries) = &p.format_per_op {
+        if entries.len() > op_count {
+            return Err(invalid_request_error(format!(
+                "format_per_op has {} entries for {op_count} operations",
+                entries.len()
+            )));
+        }
+        for entry in entries {
+            if let Some(value) = entry.as_deref() {
+                parse_output_format(Some(value)).map_err(invalid_request_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Registered policies and per-operation content scopes used during rendering.
 struct RenderContext<'a> {
     registry: &'a VerbRegistry,
     content_scopes: &'a [NoteContentScope],
+}
+
+/// Preserve a daemon-only signal before auto/table rendering turns a result
+/// into display text. The daemon moves it into response-frame metadata.
+fn mark_daemon_lexical_timeout(response: &mut Value) {
+    let timed_out = response
+        .get("results")
+        .and_then(Value::as_array)
+        .is_some_and(|results| {
+            results.iter().any(|entry| {
+                entry.get("ok").and_then(Value::as_bool) == Some(true)
+                    && matches!(
+                        entry.get("tool").and_then(Value::as_str),
+                        Some("knowledge.search" | "knowledge.suggest")
+                    )
+                    && entry
+                        .get("result")
+                        .and_then(|result| result.get("degraded"))
+                        .and_then(|degraded| degraded.get("lexical_timeout"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        });
+    if timed_out {
+        response[DAEMON_LEXICAL_TIMEOUT_MARKER] = Value::Bool(true);
+    }
 }
 
 /// Render the `run_parsed` result envelope using per-op format dispatch (ADR-078 §8.4).
@@ -5463,6 +5705,142 @@ fn build_instructions(catalog: &str, loaded: &str, unloaded: &str) -> String {
     )
 }
 
+/// Preserve the request envelope verbatim while making its all-failed state
+/// visible to MCP clients that inspect `isError` instead of parsing text.
+fn mark_all_failed_request_result(result: &mut rmcp::model::CallToolResult) {
+    let Some(text) = result.content.iter().find_map(|content| content.as_text()) else {
+        return;
+    };
+    let Ok(envelope) = serde_json::from_str::<Value>(&text.text) else {
+        return;
+    };
+    let Some(summary) = envelope.get("summary") else {
+        return;
+    };
+    let (Some(succeeded), Some(failed), Some(aborted)) = (
+        summary.get("succeeded").and_then(Value::as_u64),
+        summary.get("failed").and_then(Value::as_u64),
+        summary.get("aborted").and_then(Value::as_u64),
+    ) else {
+        return;
+    };
+    if succeeded == 0 && failed.saturating_add(aborted) > 0 {
+        result.is_error = Some(true);
+    }
+}
+
+#[cfg(test)]
+mod request_result_error_tests {
+    use super::{mark_all_failed_request_result, KhiveMcpServer};
+    use khive_runtime::{KhiveRuntime, RuntimeConfig};
+    use rmcp::model::{CallToolResult, Content};
+    use std::time::Duration;
+
+    fn result_with_summary(succeeded: u64, failed: u64, aborted: u64) -> CallToolResult {
+        CallToolResult::success(vec![Content::text(format!(
+            "{{\"results\":[],\"summary\":{{\"succeeded\":{succeeded},\"failed\":{failed},\"aborted\":{aborted}}},\"status\":\"partial\"}}"
+        ))])
+    }
+
+    #[test]
+    fn all_failed_request_sets_mcp_is_error_without_changing_envelope() {
+        let mut result = result_with_summary(0, 1, 2);
+        let original = result.content.clone();
+        mark_all_failed_request_result(&mut result);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content, original);
+    }
+
+    #[test]
+    fn mixed_request_does_not_set_mcp_is_error() {
+        let mut result = result_with_summary(1, 1, 0);
+        mark_all_failed_request_result(&mut result);
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn plan_response_without_summary_keeps_its_original_mcp_status() {
+        let mut result = CallToolResult::success(vec![Content::text("{\"parsed\":false}")]);
+        mark_all_failed_request_result(&mut result);
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn all_failed_request_is_error_on_tools_call_wire() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server with kg pack");
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            rmcp::transport::async_rw::AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(2)),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(server, transport, None, root.clone());
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"request\",\"arguments\":{\"ops\":\"not_loaded()\"}}}\n",
+            )
+            .await
+            .expect("send request tool call");
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client_read.read_line(&mut line))
+            .await
+            .expect("request tool response deadline")
+            .expect("read request tool response");
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("JSON-RPC response");
+        assert_eq!(wire["result"]["isError"], true, "response: {wire}");
+        let envelope: serde_json::Value = serde_json::from_str(
+            wire["result"]["content"][0]["text"]
+                .as_str()
+                .expect("request result text"),
+        )
+        .expect("unchanged request envelope");
+        assert_eq!(envelope["summary"]["succeeded"], 0);
+        assert_eq!(envelope["summary"]["failed"], 1);
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"request\",\"arguments\":{\"ops\":\"[stats(), not_loaded()]\"}}}\n",
+            )
+            .await
+            .expect("send mixed request tool call");
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(2), client_read.read_line(&mut line))
+            .await
+            .expect("mixed request response deadline")
+            .expect("read mixed request response");
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("mixed JSON-RPC response");
+        assert_eq!(wire["result"]["isError"], false, "response: {wire}");
+        let envelope: serde_json::Value = serde_json::from_str(
+            wire["result"]["content"][0]["text"]
+                .as_str()
+                .expect("mixed request result text"),
+        )
+        .expect("mixed request envelope");
+        assert_eq!(envelope["status"], "partial");
+        assert_eq!(envelope["summary"]["succeeded"], 1);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        root.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for KhiveMcpServer {
     async fn call_tool(
@@ -5470,6 +5848,7 @@ impl ServerHandler for KhiveMcpServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
+        let is_request_tool = request.name == "request";
         // The router turns parameter-deserialization failures into tool errors.
         // Plan isolation requires the JSON-RPC invalid_params response instead.
         if request.name == "request" {
@@ -5486,7 +5865,11 @@ impl ServerHandler for KhiveMcpServer {
             }
         }
         let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::tool_router().call(context).await
+        let mut result = Self::tool_router().call(context).await?;
+        if is_request_tool {
+            mark_all_failed_request_result(&mut result);
+        }
+        Ok(result)
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -5590,8 +5973,59 @@ mod tests {
     use std::{collections::BTreeMap, future::Future, sync::Arc};
     include!("server/plan_tests.rs");
     include!("server/search_text_reason_tests.rs");
+    include!("server/search_text_mode_tests.rs");
+    include!("server/search_ranking_tests.rs");
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[test]
+    fn daemon_timeout_marker_requires_successful_knowledge_result_flag() {
+        let mut response = json!({
+            "results": [
+                {"ok": false, "tool": "knowledge.search", "result": {
+                    "degraded": {"lexical_timeout": true}
+                }},
+                {"ok": true, "tool": "stats", "result": {
+                    "degraded": {"lexical_timeout": true}
+                }},
+                {"ok": true, "tool": "knowledge.search", "result": {
+                    "content": "lexical_timeout: true", "degraded": {"lexical_timeout": false}
+                }}
+            ]
+        });
+        super::mark_daemon_lexical_timeout(&mut response);
+        assert!(response.get(super::DAEMON_LEXICAL_TIMEOUT_MARKER).is_none());
+        response["results"][2]["result"]["degraded"]["lexical_timeout"] = json!(true);
+        super::mark_daemon_lexical_timeout(&mut response);
+        assert_eq!(response[super::DAEMON_LEXICAL_TIMEOUT_MARKER], true);
+    }
+
+    #[test]
+    fn per_op_overrides_are_bounded_and_validated_before_forwarding() {
+        let mut p = RequestParams {
+            ops: "stats()".into(),
+            presentation_per_op: Some(vec![None, None]),
+            ..Default::default()
+        };
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("presentation_per_op"));
+
+        p.presentation_per_op = Some(vec![Some("bogus".into())]);
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("unknown presentation mode"));
+
+        p.presentation_per_op = None;
+        p.format_per_op = Some(vec![None, None]);
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("format_per_op"));
+
+        p.format_per_op = Some(vec![Some("bogus".into())]);
+        let error = super::validate_request_overrides(&p, 1).unwrap_err();
+        assert!(error.message.contains("unknown output format"));
+
+        p.format_per_op = Some(vec![Some("table".into())]);
+        super::validate_request_overrides(&p, 1).unwrap();
+    }
 
     #[test]
     fn remember_key_named_disposition_preserves_details_and_other_errors() {
@@ -6036,8 +6470,10 @@ mod tests {
                     "comm.mark_read(ids=[\"00000000-0000-0000-0000-000000000001\"], atomic=true)",
                     false,
                 ),
-                ("search(kind=\"entity\", query=\"policy-fixture\")", true),
-                ("memory.recall(query=\"policy-fixture\")", true),
+                // These assertive reads append fresh durable search/serve
+                // records, so transport cannot replay them after a lost reply.
+                ("search(kind=\"entity\", query=\"policy-fixture\")", false),
+                ("memory.recall(query=\"policy-fixture\")", false),
                 ("get(id=\"00000000-0000-0000-0000-000000000001\")", true),
             ];
 
@@ -7428,6 +7864,147 @@ mod tests {
 
     struct LargeResultPack;
 
+    struct LexicalTimeoutResultPack;
+
+    impl khive_types::Pack for LexicalTimeoutResultPack {
+        const NAME: &'static str = "lexical-timeout-result-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "knowledge.search",
+                description: "returns a deterministic lexical timeout result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "knowledge.suggest",
+                description: "returns a deterministic lexical timeout result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for LexicalTimeoutResultPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "degraded": {"lexical_timeout": true},
+                "items": [{"name": "first"}, {"name": "second"}],
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_timeout_marker_survives_explicit_and_configured_auto_table_rendering() {
+        use khive_runtime::daemon::{DaemonDispatch, DaemonResponseFrame, PROTOCOL_VERSION};
+
+        for (requested, configured) in [
+            (Some("auto"), OutputFormat::Json),
+            (Some("table"), OutputFormat::Json),
+            (None, OutputFormat::Auto),
+            (None, OutputFormat::Table),
+        ] {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(LexicalTimeoutResultPack);
+            let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"))
+                .with_default_output_format(configured);
+            let ops = "[knowledge.search(), knowledge.suggest()]";
+            let raw = server
+                .dispatch(
+                    ops.to_string(),
+                    None,
+                    None,
+                    requested.map(str::to_string),
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .expect("daemon dispatch");
+            let mut expected: Value = serde_json::from_str(&raw).expect("daemon envelope");
+            assert_eq!(
+                expected[super::DAEMON_LEXICAL_TIMEOUT_MARKER],
+                json!(true),
+                "requested={requested:?}, configured={configured:?}: {expected}"
+            );
+            for entry in expected["results"].as_array().expect("results") {
+                assert_eq!(entry["ok"], true);
+                assert!(
+                    entry["result"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("| name |")),
+                    "auto/table must hide the structured timeout: {entry}"
+                );
+            }
+            expected
+                .as_object_mut()
+                .expect("envelope")
+                .remove(super::DAEMON_LEXICAL_TIMEOUT_MARKER);
+            let public_result = expected.to_string();
+            let frame = DaemonResponseFrame {
+                ok: true,
+                result: Some(public_result.clone()),
+                error: None,
+                error_detail: Some(json!({"lexical_timeout": true})),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id: Some(server.config_id().to_string()),
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: None,
+            };
+            let public = crate::daemon::map_response_for_test(
+                frame,
+                server.config_id(),
+                server.default_namespace(),
+            )
+            .expect("accepted daemon response")
+            .expect("successful daemon response");
+            assert_eq!(public, public_result);
+            assert!(!public.contains(super::DAEMON_LEXICAL_TIMEOUT_MARKER));
+
+            let local = server
+                .dispatch_request_local(RequestParams {
+                    ops: ops.to_string(),
+                    format: requested.map(str::to_string),
+                    ..Default::default()
+                })
+                .await
+                .expect("local dispatch");
+            let local: Value = serde_json::from_str(&local).expect("local envelope");
+            assert!(local.get(super::DAEMON_LEXICAL_TIMEOUT_MARKER).is_none());
+        }
+    }
+
     impl khive_types::Pack for LargeResultPack {
         const NAME: &'static str = "large-result-test";
         const NOTE_KINDS: &'static [&'static str] = &[];
@@ -8719,6 +9296,112 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn invalid_save_to_refuses_before_create_on_wire_and_cli() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("save_to fixture directory");
+        std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
+        let server = make_daemon_save_to_test_server(Some(dir.path().join("main.db")));
+        let create = "create(kind=\"concept\", name=\"save-to-preflight\")";
+
+        let wire_error = server
+            .request(
+                Parameters(RequestParams {
+                    ops: create.to_string(),
+                    save_to: Some("../outside-export-root.jsonl".to_string()),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect_err("a wire destination outside the export root must fail before create");
+        assert_eq!(
+            wire_error.data.as_ref().unwrap()["domain_disposition"],
+            "not_committed"
+        );
+
+        let stats = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("read post-refusal stats");
+        let stats: Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["results"][0]["result"]["entities"], 0);
+
+        let valid_path = dir.path().join("inside.jsonl");
+        let manifest = server
+            .request(
+                Parameters(RequestParams {
+                    ops: create.to_string(),
+                    save_to: Some(valid_path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the same create must succeed with a valid destination");
+        let manifest: Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(manifest["summary"]["succeeded"], 1);
+
+        let cli_error = server
+            .dispatch_request_inner(
+                RequestParams {
+                    ops: "create(kind=\"concept\", name=\"cli-save-to-preflight\")".to_string(),
+                    save_to: Some(dir.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                false,
+                None,
+                DispatchOrigin::Local,
+            )
+            .await
+            .expect_err("an operator destination that is a directory must fail before create");
+        assert_eq!(
+            cli_error.data.as_ref().unwrap()["domain_disposition"],
+            "not_committed"
+        );
+
+        let stats = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("read post-CLI-refusal stats");
+        let stats: Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["results"][0]["result"]["entities"], 1);
+
+        std::env::remove_var("KHIVE_SAVE_TO_ROOT");
+    }
+
+    #[test]
+    fn save_to_write_failure_retains_known_operation_outcomes() {
+        let result = json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {"id": "created-id"}},
+                {"ok": false, "tool": "link", "domain_disposition": "not_committed",
+                 "error": {"kind": "invalid_input", "message": "missing endpoint"}},
+            ],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        });
+        let error = super::save_to_write_error("save_to: disk full".to_string(), &result);
+        let details = error.data.as_ref().expect("save error details");
+        assert_eq!(details["domain_disposition"], "unknown");
+        assert_eq!(details["summary"]["succeeded"], 1);
+        assert_eq!(details["results"][0]["domain_disposition"], "committed");
+        assert_eq!(details["results"][0]["result"]["id"], "created-id");
+        assert_eq!(details["results"][1]["domain_disposition"], "not_committed");
+        assert_eq!(details["results"][1]["error"]["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn local_dispatch_returns_result_larger_than_daemon_frame() {
         let server = large_result_test_server();
@@ -9199,8 +9882,10 @@ mod tests {
             }
         }
 
-        let forward = SearchDegradation::from_result(&degraded_result(false), &json!([]));
-        let reversed = SearchDegradation::from_result(&degraded_result(true), &json!([]));
+        let forward =
+            SearchDegradation::from_result(&degraded_result(false), &json!([]), "all_terms");
+        let reversed =
+            SearchDegradation::from_result(&degraded_result(true), &json!([]), "all_terms");
 
         assert!(!forward.backend_errors.is_empty());
         assert!(forward.backend_errors.len() <= MAX_BACKEND_ERROR_ENTRIES);
@@ -9275,7 +9960,7 @@ mod tests {
             note_names: std::collections::HashMap::new(),
         };
 
-        let degradation = SearchDegradation::from_result(&result, &json!([]));
+        let degradation = SearchDegradation::from_result(&result, &json!([]), "all_terms");
         let arm_participation = degradation
             .arm_participation
             .expect("arm participation must be computed");
@@ -9321,7 +10006,7 @@ mod tests {
             .without_time()
             .finish();
         let degradation = tracing::subscriber::with_default(subscriber, || {
-            SearchDegradation::from_result(&result, &json!([]))
+            SearchDegradation::from_result(&result, &json!([]), "all_terms")
         });
         let wire = search_diagnostic_value(&degradation).to_string();
         let logs = captured.contents();
@@ -9379,8 +10064,11 @@ mod tests {
             BackendSearchFailure::timeout("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic =
-            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &result,
+            &json!([]),
+            "all_terms",
+        ));
 
         assert_eq!(diagnostic["retryable"], json!(true));
         assert_eq!(diagnostic["retry_after_ms"], json!(2_000));
@@ -9405,8 +10093,11 @@ mod tests {
             BackendSearchFailure::backend("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic =
-            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &result,
+            &json!([]),
+            "all_terms",
+        ));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -9429,8 +10120,11 @@ mod tests {
             ),
         ]);
 
-        let diagnostic =
-            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(
+            &result,
+            &json!([]),
+            "all_terms",
+        ));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -9458,8 +10152,11 @@ mod tests {
             "zzzz-hidden-backend".to_string(),
             BackendSearchFailure::backend("storage unavailable"),
         ));
-        let degradation =
-            SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
+        let degradation = SearchDegradation::from_result(
+            &degraded_search_result(failures),
+            &json!([]),
+            "all_terms",
+        );
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
@@ -9481,8 +10178,11 @@ mod tests {
                 BackendSearchFailure::timeout("backend search timed out after 5000ms"),
             )
         });
-        let degradation =
-            SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
+        let degradation = SearchDegradation::from_result(
+            &degraded_search_result(failures),
+            &json!([]),
+            "all_terms",
+        );
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
@@ -9501,7 +10201,7 @@ mod tests {
                 "result": "oversized",
                 "status": "complete",
                 "arm_participation": {
-                    "text": {"status": "ran", "candidate_count": 0},
+                    "text": {"mode": "all_terms", "status": "ran", "candidate_count": 0},
                     "vector": {"status": "skipped", "candidate_count": 0}
                 },
             }),
@@ -9517,7 +10217,7 @@ mod tests {
         assert_eq!(
             omitted["error"]["search"]["arm_participation"],
             json!({
-                "text": {"status": "ran", "candidate_count": 0},
+                "text": {"mode": "all_terms", "status": "ran", "candidate_count": 0},
                 "vector": {"status": "skipped", "candidate_count": 0}
             })
         );
@@ -9539,7 +10239,7 @@ mod tests {
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
             "arm_participation": {
-                "text": {"status": "error", "candidate_count": 0},
+                "text": {"mode": "all_terms", "status": "error", "candidate_count": 0},
                 "vector": {"status": "error", "candidate_count": 0}
             },
             "missing_backends": ["archive"],
@@ -10266,6 +10966,22 @@ mod tests {
             .dispatch("stats", serde_json::json!({}))
             .await
             .expect("kg.stats dispatch succeeds");
+        let after_irrelevant = server
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch after irrelevant stats");
+        assert_eq!(after_irrelevant["balanced_recall"]["total_events"], 0);
+
+        // Search is a relevant BrainSignal even when the corpus is empty.
+        server
+            .registry
+            .dispatch(
+                "search",
+                serde_json::json!({"kind": "entity", "query": "hook-wiring-regression"}),
+            )
+            .await
+            .expect("kg.search dispatch succeeds");
 
         let state = server
             .registry
@@ -10275,8 +10991,8 @@ mod tests {
         let total_events = state["balanced_recall"]["total_events"]
             .as_u64()
             .unwrap_or(0);
-        assert!(
-            total_events > 0,
+        assert_eq!(
+            total_events, 1,
             "dispatch hook must update the same BrainPack instance the registry \
              dispatches brain.* verbs to; got snapshot {state:?}"
         );
@@ -11085,6 +11801,7 @@ mod tests {
                         status: SearchArmStatus::Error,
                         candidate_count: 0,
                     },
+                    text_mode: "all_terms",
                 }),
                 retry_after_ms: None,
                 missing_backends: vec!["archive".to_string()],
@@ -11960,6 +12677,7 @@ mod tests {
             search["arm_participation"],
             json!({
                 "text": {
+                    "mode": "all_terms",
                     "status": "ran",
                     "candidate_count": 0,
                     "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
@@ -12000,7 +12718,7 @@ mod tests {
         assert_eq!(
             search["arm_participation"],
             json!({
-                "text": {"status": "ran", "candidate_count": 1},
+                "text": {"mode": "all_terms", "status": "ran", "candidate_count": 1},
                 "vector": {"status": "skipped", "candidate_count": 0}
             }),
             "an exact-name presence check must expose its text-arm evidence"

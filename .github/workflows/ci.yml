@@ -503,7 +503,10 @@ jobs:
         run: cargo build --manifest-path crates/Cargo.toml --locked -p kkernel --bin kkernel
       - name: Install dependencies and run Python tests
         # pytest exits nonzero when no tests are collected; no separate floor is needed.
-        run: uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' --with 'blake3>=1' pytest python/tests
+        run: |
+          set -o pipefail
+          uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' --with 'blake3>=1' --with 'httpx>=0.27' --with 'mcp>=1.2,<2' --with 'uvicorn>=0.30' --with 'starlette>=0.37' pytest -rs python/tests 2>&1 | tee "$RUNNER_TEMP/python-tests.txt"
+          python3 scripts/ci/python-skip-guard.py "$RUNNER_TEMP/python-tests.txt"
 
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
@@ -660,10 +663,17 @@ jobs:
       # so a credential reachable from any branch is still found within a day.
       # If that scheduled run is ever removed, filtered, or given a range, this
       # narrowing must be reverted in the same change.
+      #
+      # An integration/train-* branch is created by a single push of a new ref,
+      # so its push event carries no `before` commit and would otherwise widen to
+      # every ref, which takes most of this job's time budget. Its new commits are
+      # exactly the ones not on main; main's own push runs and the nightly scan
+      # cover the rest. Every other new branch still widens.
       - name: Resolve scan scope
         id: scope
         env:
           REPLAY_SHA: ${{ needs.resolve-revision.outputs.checkout_sha }}
+          PUSH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           range=""
@@ -686,6 +696,14 @@ jobs:
                  && [ "$before" != "0000000000000000000000000000000000000000" ] \
                  && git cat-file -e "${before}^{commit}" 2>/dev/null; then
                 range="${before}..${{ github.sha }}"
+              else
+                case "$PUSH_REF" in
+                  refs/heads/integration/train-*)
+                    if main=$(git rev-parse --verify -q 'refs/remotes/origin/main^{commit}'); then
+                      range="${main}..${{ github.sha }}"
+                    fi
+                    ;;
+                esac
               fi
               ;;
           esac
@@ -1111,6 +1129,27 @@ jobs:
             kill "$(cat "$RUNNER_TEMP/minio.pid")" || true
           fi
 
+  msrv-check:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
+    needs: resolve-revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          key: msrv-1.95
+      - name: Check workspace on the declared minimum Rust version
+        run: cargo +1.95.0 check --workspace --locked
+
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
     needs: resolve-revision
@@ -1375,6 +1414,7 @@ jobs:
       - wasm-parity
       - vamana-portability
       - minio-blob-compat
+      - msrv-check
     if: always()
     steps:
       - name: Check aggregated job results

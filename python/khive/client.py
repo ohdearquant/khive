@@ -155,9 +155,33 @@ class Khive:
         *,
         kind: str = "entity",
         limit: int | None = None,
+        min_rank_score: float | None = None,
+        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
+        """KG search with a strategy-local, inclusive rank floor in [0, 1].
+
+        ``min_score`` is a deprecated exact alias of ``min_rank_score``;
+        supplying both is invalid, even when equal. Hit dictionaries retain
+        ``rank_score``, ``rank_score_kind``, and available ``signals`` unchanged.
+        ``score`` is the deprecated rank alias, not calibrated relevance.
+        """
+        if min_rank_score is not None and min_score is not None:
+            raise ValueError("supply only one of min_rank_score and min_score")
         raw = _one(
-            self.session.request(encode([op("search", kind=kind, query=query, limit=limit)]))
+            self.session.request(
+                encode(
+                    [
+                        op(
+                            "search",
+                            kind=kind,
+                            query=query,
+                            limit=limit,
+                            min_rank_score=min_rank_score,
+                            min_score=min_score,
+                        )
+                    ]
+                )
+            )
         )
         if isinstance(raw, dict):
             return raw.get("items", raw.get("results", []))

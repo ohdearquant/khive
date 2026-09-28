@@ -106,7 +106,7 @@ pub fn merge_entities(
 
             (
                 Some(EntityChange::Modified {
-                    base: _,
+                    base: e_base,
                     branch: e_ours,
                 }),
                 Some(EntityChange::Modified {
@@ -114,7 +114,8 @@ pub fn merge_entities(
                     branch: e_theirs,
                 }),
             ) => {
-                let (entity_result, field_conflicts) = field_level_merge(*id, e_ours, e_theirs);
+                let (entity_result, field_conflicts) =
+                    field_level_merge(*id, e_base, e_ours, e_theirs);
                 if field_conflicts.is_empty() {
                     merged.push(entity_result);
                 } else {
@@ -150,6 +151,7 @@ pub fn merge_entities(
 /// Reconciles one double-modified entity and reports unresolvable fields.
 fn field_level_merge(
     id: Uuid,
+    base: &ExportedEntity,
     ours: &ExportedEntity,
     theirs: &ExportedEntity,
 ) -> (ExportedEntity, Vec<MergeConflict>) {
@@ -197,61 +199,96 @@ fn field_level_merge(
         result.tags = tags;
     }
 
-    let (merged_props, prop_conflicts) = merge_properties(id, &ours.properties, &theirs.properties);
+    let (merged_props, prop_conflicts) =
+        merge_properties(id, &base.properties, &ours.properties, &theirs.properties);
     result.properties = merged_props;
     conflicts.extend(prop_conflicts);
 
     (result, conflicts)
 }
 
-/// Merges object properties per key, retaining ours on reported collisions.
+/// Merges object properties per key against the common base.
+///
+/// Absent keys are values in the three-way comparison, so an unchanged branch
+/// cannot restore a key deleted on the other branch. Legacy non-object payloads
+/// are selected atomically when one-sided and conflict when both sides diverge.
 fn merge_properties(
     id: Uuid,
+    base_props: &Option<serde_json::Value>,
     ours_props: &Option<serde_json::Value>,
     theirs_props: &Option<serde_json::Value>,
 ) -> (Option<serde_json::Value>, Vec<MergeConflict>) {
     use serde_json::{Map, Value};
 
-    let ours_obj = match ours_props {
-        Some(Value::Object(m)) => Some(m),
-        _ => None,
-    };
-    let theirs_obj = match theirs_props {
-        Some(Value::Object(m)) => Some(m),
-        _ => None,
-    };
+    if properties_equal(ours_props, theirs_props) {
+        return (ours_props.clone(), vec![]);
+    }
+    if properties_equal(ours_props, base_props) {
+        return (theirs_props.clone(), vec![]);
+    }
+    if properties_equal(theirs_props, base_props) {
+        return (ours_props.clone(), vec![]);
+    }
 
-    match (ours_obj, theirs_obj) {
-        (None, None) => (None, vec![]),
-        (Some(o), None) => (Some(Value::Object(o.clone())), vec![]),
-        (None, Some(t)) => (Some(Value::Object(t.clone())), vec![]),
-        (Some(o), Some(t)) => {
-            let mut merged: Map<String, Value> = o.clone();
-            let mut conflicts = Vec::new();
-            let all_keys: HashSet<&String> = o.keys().chain(t.keys()).collect();
-            let mut all_keys_sorted: Vec<&String> = all_keys.into_iter().collect();
-            all_keys_sorted.sort();
+    let all_object_like = [base_props, ours_props, theirs_props]
+        .into_iter()
+        .all(|props| matches!(props, None | Some(Value::Object(_))));
+    if !all_object_like {
+        return (
+            ours_props.clone(),
+            vec![MergeConflict::PropertyMismatch {
+                entity_id: id,
+                key: "properties".into(),
+                ours: ours_props.clone().unwrap_or(Value::Null),
+                theirs: theirs_props.clone().unwrap_or(Value::Null),
+            }],
+        );
+    }
 
-            for key in all_keys_sorted {
-                match (o.get(key), t.get(key)) {
-                    (Some(ov), Some(tv)) if ov != tv => {
-                        conflicts.push(MergeConflict::PropertyMismatch {
-                            entity_id: id,
-                            key: key.clone(),
-                            ours: ov.clone(),
-                            theirs: tv.clone(),
-                        });
-                    }
-                    (None, Some(tv)) => {
-                        merged.insert(key.clone(), tv.clone());
-                    }
-                    _ => {}
-                }
-            }
+    let base_obj = base_props.as_ref().and_then(Value::as_object);
+    let ours_obj = ours_props.as_ref().and_then(Value::as_object);
+    let theirs_obj = theirs_props.as_ref().and_then(Value::as_object);
+    let all_keys: HashSet<&String> = [base_obj, ours_obj, theirs_obj]
+        .into_iter()
+        .flatten()
+        .flat_map(|object| object.keys())
+        .collect();
+    let mut all_keys_sorted: Vec<&String> = all_keys.into_iter().collect();
+    all_keys_sorted.sort();
 
-            (Some(Value::Object(merged)), conflicts)
+    let mut merged = Map::new();
+    let mut conflicts = Vec::new();
+    for key in all_keys_sorted {
+        let base_value = base_obj.and_then(|object| object.get(key));
+        let ours_value = ours_obj.and_then(|object| object.get(key));
+        let theirs_value = theirs_obj.and_then(|object| object.get(key));
+        let selected = if ours_value == theirs_value {
+            ours_value
+        } else if ours_value == base_value {
+            theirs_value
+        } else if theirs_value == base_value {
+            ours_value
+        } else {
+            conflicts.push(MergeConflict::PropertyMismatch {
+                entity_id: id,
+                key: key.clone(),
+                ours: ours_value.cloned().unwrap_or(Value::Null),
+                theirs: theirs_value.cloned().unwrap_or(Value::Null),
+            });
+            ours_value
+        };
+
+        if let Some(value) = selected {
+            merged.insert(key.clone(), value.clone());
         }
     }
+
+    let merged = if merged.is_empty() && (ours_props.is_none() || theirs_props.is_none()) {
+        None
+    } else {
+        Some(Value::Object(merged))
+    };
+    (merged, conflicts)
 }
 
 /// Lists content fields that differ for a duplicate UUID addition.
@@ -445,5 +482,49 @@ mod tests {
             Some("Smith"),
             "theirs-only key 'author' must be preserved in merged output"
         );
+    }
+
+    #[test]
+    fn independent_property_edits_merge_against_base() {
+        let id = Uuid::new_v4();
+        let mut common = entity(id, "E");
+        common.properties = Some(serde_json::json!({"x": 0, "y": 0}));
+        let mut ours_entity = common.clone();
+        ours_entity.properties = Some(serde_json::json!({"x": 1, "y": 0}));
+        let mut theirs_entity = common.clone();
+        theirs_entity.properties = Some(serde_json::json!({"x": 0, "y": 1}));
+
+        let (merged, conflicts) = merge_entities(
+            &archive_with(vec![common]),
+            &archive_with(vec![ours_entity]),
+            &archive_with(vec![theirs_entity]),
+        );
+        assert!(conflicts.is_empty(), "independent edits: {conflicts:?}");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].properties,
+            Some(serde_json::json!({"x": 1, "y": 1}))
+        );
+    }
+
+    #[test]
+    fn one_sided_property_removal_survives_other_side_tag_edit() {
+        let id = Uuid::new_v4();
+        let mut common = entity(id, "E");
+        common.properties = Some(serde_json::json!({"k": 1}));
+        let mut ours_entity = common.clone();
+        ours_entity.properties = Some(serde_json::json!({}));
+        let mut theirs_entity = common.clone();
+        theirs_entity.tags = vec!["t".into()];
+
+        let (merged, conflicts) = merge_entities(
+            &archive_with(vec![common]),
+            &archive_with(vec![ours_entity]),
+            &archive_with(vec![theirs_entity]),
+        );
+        assert!(conflicts.is_empty(), "one-sided removal: {conflicts:?}");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].properties, Some(serde_json::json!({})));
+        assert_eq!(merged[0].tags, vec!["t"]);
     }
 }

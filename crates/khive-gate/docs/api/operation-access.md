@@ -21,7 +21,7 @@ when that feature is not built. Workspace and formal declare no handlers.
 
 The implementation is [operation.rs](../../src/operation.rs). Its classifier
 version is part of every nonempty restriction's policy fingerprint.
-Revision `domain-effects-v4` explicitly classifies `gtd.repair` as
+Revision `domain-effects-v6` explicitly classifies `git.update_ref` as
 `Write`. Adding this classification changes that identity even though unknown
 operations were already denied. Empty restrictions retain their enrollment-only
 fingerprint.
@@ -106,6 +106,7 @@ fingerprint.
 | `git.receipts`               | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L44)   |
 | `git.reconcile`              | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L64)   |
 | `git.status`                 | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L72)   |
+| `git.update_ref`             | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L24)   |
 | `gtd.assign`                 | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.census`                 | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.complete`               | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)              |
@@ -165,10 +166,11 @@ fingerprint.
 | `schedule.remind`            | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L25)     |
 | `schedule.schedule`          | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L54)     |
 | `search`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L716)  |
-| `session.export`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L154)      |
-| `session.list`               | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L98)       |
-| `session.resume`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L141)      |
-| `session.store`              | Write  | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L55)       |
+| `session.export`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L171)      |
+| `session.list`               | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L115)      |
+| `session.resume`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L158)      |
+| `session.search`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L193)      |
+| `session.store`              | Write  | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L72)       |
 | `stats`                      | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L475)  |
 | `stream.append`              | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L18)   |
 | `stream.batch`               | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L57)   |

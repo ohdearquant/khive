@@ -30,7 +30,7 @@
 //!
 //! | Variable | Default | Description |
 //! |---|---|---|
-//! | `KHIVE_EMAIL_DEFAULT_ACTOR` | `local` | Actor that receives fresh inbound email (no In-Reply-To match) |
+//! | `KHIVE_EMAIL_DEFAULT_ACTOR` | `local` | Actor for fresh inbound email with no thread match. Set to `channel:email` to opt into a separate mailbox. The anonymous `local` caller cannot read that mailbox; configure `[actor].id = "channel:email"` and `[actor].mailbox_readers` on the serving process, then have a listed actor call `comm.inbox(mailbox_actor="channel:email")`. |
 //! | `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` | maintainer address | Comma-separated allowlist of recipient addresses the outbox loop may deliver to; defaults to the single maintainer address |
 //! | `KHIVE_EMAIL_INGEST_NAMESPACE` | `local` | Namespace used when persisting inbound and outbound messages |
 

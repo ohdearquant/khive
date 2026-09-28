@@ -1776,3 +1776,219 @@ non-SQL await, service call, filesystem/process/network I/O or unbounded computa
 while holding the writer. This adds no migration, batch-wide atomicity or stronger
 guarantee for other callers' previously prepared writes. The domain contract
 remains in ADR-019 Amendment 7.
+
+### 2026-09-25 amendment (Amendment 21): the oldest pinned frame, and when its pin was first observed
+
+**Status: Accepted (2026-09-25).** Refs #1830. Amends the Amendment 2 census report; Amendment 2's
+census rules, the Plank C probe and the Amendment 15 reconciliation are otherwise unchanged.
+
+**Motivation.** When a checkpoint stops advancing, the operator's question is which holder pins the
+oldest frame. The census names the holders but not the pin, so the only next step has been to stop
+candidates one at a time and re-measure: a destructive probe that returns one bit per attempt.
+Per-holder read marks are not reachable through a documented SQLite interface (the read-mark slots
+live in the `-shm` WAL-index, whose layout Amendment 2 already struck from scope), so this amendment
+reports what the documented checkpoint interface does give: the frame the pin sits at, and since when
+it has been held there.
+
+**Read marks are not snapshots.** This amendment relies on SQLite's read-mark behaviour as implemented
+in `walTryBeginRead` in SQLite 3.53.2, the amalgamation bundled by `libsqlite3-sys` 0.38.1. The WAL
+index has five read-mark slots (`WAL_NREADER`); slot 0 is reserved for readers that ignore the WAL, so
+four slots can carry a frame. A connection starting a read selects the slot with the largest mark not
+greater than the WAL's current last frame. It writes a fresh mark equal to that frame only when it can
+take a slot exclusively. When every slot is held, it shares the selected slot, and its snapshot is
+still the current last frame. SQLite states its invariant as an inequality: a reader holding slot `K`
+has `aReadMark[K]` no greater than its snapshot's last frame. A checkpoint backfills only up to the
+smallest mark still held. Two consequences follow. A connection holding mark `N` can have a snapshot
+past `N`, and can have begun its read after frame `N + 1` was committed. And overlapping connections
+sharing one slot keep mark `N` held for longer than any one of them lasts. Both need more concurrent
+read transactions on one database than there are slots. The reader pool's default size is the host's
+available parallelism capped at eight (`PoolConfig::default`, reported as
+`reader_admission_capacity`), and write transactions and other processes hold read marks too, so this
+is the loaded case rather than a corner case.
+
+**Decision.**
+
+1. **`backfill_ceiling` and `oldest_pinned_frame`.** `db_diagnostics` reports, beside the Plank C
+   probe row, the probe's `checkpointed_frames` as `backfill_ceiling` when that row has `busy = 0`,
+   `checkpointed_frames >= 0` and `log_frames > checkpointed_frames`. One such row does not establish
+   a pin. `log_frames` is the WAL size in the header the checkpoint read when it started, and
+   `checkpointed_frames` is read after it finished. A connection committing in between holds the
+   read snapshot its transaction began with until the transaction ends, after its new frames already
+   count in the log, and a connection that restarts the WAL in between resets the counter to 0.
+   Either leaves the row short of its log although no connection is reading. Measured with one
+   connection committing in a loop, one running PASSIVE checkpoints and no reading connection: such
+   rows appeared in each of three four-second runs, 529 to 15,853 of 37,167 to 71,278 results, and
+   consecutive results repeated one ceiling while the log did not grow. A held read mark keeps the
+   ceiling where it is for as long as any connection holds it, while a single commit holds its mark
+   only until its transaction ends: in six three-second runs of that loop, no run of results at one
+   ceiling spanned more than 0.16 ms. `oldest_pinned_frame` is therefore the ceiling only when item
+   2's run is at that frame and was first observed at least one second before this probe, two
+   checkpoint intervals at the 500 ms default. A read mark held continuously that long pins the WAL,
+   whether one connection holds it or overlapping connections share it (see above), and whether they
+   are reading or committing; every such process is in the census. Both values come from the same
+   probe row as the existing counters, never from a separate call. Both are null, with a stated
+   reason, when the probe errored, returned `busy = 1`, returned `-1`, or found nothing pinned
+   (`log_frames == checkpointed_frames`), and `oldest_pinned_frame` is also null, with its reason,
+   when the run at the ceiling is younger than one second.
+2. **When the pin was first observed.** The checkpoint task keeps, per backend, one run: the frame
+   `N` and the time of the first checkpoint result in an unbroken sequence of results that each show
+   `busy = 0`, `checkpointed_frames == N < log_frames`, and `log_frames` no smaller than the previous
+   result's. Any other result ends the run: a full backfill, a busy or failed checkpoint, a different
+   ceiling, or a smaller `log_frames`. Every `wal_checkpoint` the process issues feeds this rule,
+   including the TRUNCATE path and the `db_diagnostics` probe, so a full backfill the process performs
+   is never missed. `db_diagnostics` reports the run (`frame`, `first_observed_at_unix_ms`) when its
+   frame equals `oldest_pinned_frame`, and null with a reason otherwise. State is one run per backend,
+   with no sample history. A process without the checkpoint task (sessions, one-shot CLI) reports
+   null with that reason.
+3. **Holder start times, reported as raw census data.** For each PID in the OS census,
+   `db_diagnostics` reads the process start time through the platform interface the walpin module
+   already uses for beacon identity. That interface returns whole epoch seconds, each truncated: the
+   start time on macOS, the boot time plus the ticks since boot on Linux (two truncations), and the
+   creation time on Windows. The resolution is therefore 1 second on macOS and Windows and 2 seconds
+   on Linux; on any other platform no start time is read. The report carries each holder's start
+   time, or null with a reason, and the platform's `start_time_resolution_secs`. It draws no
+   conclusion from them and excludes no holder. A process that started after the run's first
+   observation can hold the pinning read mark, because it can share a slot at `N` (read marks above),
+   so no comparison of a start time with `first_observed_at_unix_ms` rules a holder out. Nothing else
+   in the census changes.
+4. **The reporting process.** The census reports `reporting_pid` and `reporting_process_is_holder`.
+   The census already treats its own absence as incomplete (the self-canary); these fields make it
+   visible, so "no internal pin" and "did not look" read differently.
+
+**What the run assumes.** Frame numbers restart when the WAL restarts, and no documented SQLite
+interface exposes the WAL generation. Item 2's run is therefore continuous only if no WAL restart fell
+between its first observation and the probe. A restart needs a full backfill, which ends the run at
+`N`. The process sees every full backfill it performs itself (item 2). The case it cannot see is a full
+backfill by another process: a session or one-shot CLI with Amendment 10's bounded autocheckpoint, or a
+non-khive client. That backfill would have to be followed, before the next observation, by a restart
+and by a new read mark held at exactly the same frame `N`. Only then does the run appear continuous
+across two different pins, making `first_observed_at_unix_ms` earlier than the current pin began, so
+that `oldest_pinned_frame` can be reported for a pin held less than one second. With no holder
+exclusion, that is the only effect, so the report carries no flag for this assumption.
+
+**Non-goals.** No per-holder frame: probing `-shm` read-lock bytes is rejected (undocumented and
+version-fragile). If per-holder attribution is needed later, it comes through the heartbeat carrying
+its own snapshot identity via a documented interface, as a separate amendment. No exclusion of holders
+by start time: under shared read marks a process started after the pin can hold it. No enforcement or
+checkpoint-policy change. The Amendment 13 connection census is a different population and is
+untouched.
+
+**Acceptance.**
+
+- A second process holds a read snapshot while the writer appends frames. Within the first second of
+  the run, `db_diagnostics` reports `backfill_ceiling` with `oldest_pinned_frame` null and its reason;
+  after it, `oldest_pinned_frame` equal to the `checkpointed_frames` of its own probe row, and a run
+  with that frame. After the reader ends and a tick fully backfills, both are null and the run is
+  gone.
+- One connection commits in a loop while the checkpoint task and repeated `db_diagnostics` probes
+  run, and no connection reads. Probes report `backfill_ceiling` values, and none reports an
+  `oldest_pinned_frame`.
+- A test pins the read-mark behaviour above to the bundled SQLite. Four connections begin reads at
+  four successive last frames, so that all four frame-carrying slots are held, the last at frame `N`.
+  A writer commits, a fifth connection begins a read and holds it, and the first four end. A PASSIVE
+  checkpoint then stops at `N`, although the only reader began after frame `N + 1` was committed. If
+  a SQLite upgrade changes this behaviour, the test fails and this amendment is re-read.
+- A process started after the run's first observation, and holding the database open, is reported
+  with its start time and is not excluded. The report carries `start_time_resolution_secs` for the
+  platform and no exclusion list.
+- A probe returning `busy = 1` or an error yields null with the reason, never the last good value.
+- A full backfill between two pins ends the first run. The second pin, at a different frame, starts a
+  new run with a later `first_observed_at_unix_ms`.
+- The daemon's report shows `reporting_process_is_holder = true`.
+
+### 2026-09-25 amendment (Amendment 22): a single probe row is a backfill gap, and a busy result is neutral to the pinned-frame run
+
+**Status: Accepted (2026-09-25).** Refs #3185, #3191, #1830. It does
+not edit Plank C or Amendment 21 in place; it amends Plank C's reading of the probe row
+and the busy clause of Amendment 21 item 2. Everything else in both stands.
+
+**Context.**
+
+- Plank C (Amendment 2) says: "report pin depth as `log` minus `checkpointed` from its 3-column return
+  row — the number of frames pinned behind the backfill boundary. Equivalent signal to reader-mark
+  introspection". Amendment 21 item 1 has since measured that one such row does not establish a pin:
+  a connection committing between the checkpoint's header read and its end, or restarting the WAL in
+  that interval, leaves `checkpointed` short of `log` with no connection reading. The code follows
+  Plank C's wording. `crates/khive-db/src/checkpoint.rs` `log_wal_pin_depth` logs
+  `wal_pin_depth = (log - checkpointed).max(0)` after a TRUNCATE no-progress event, from the PASSIVE
+  row `query_wal_pin_depth` returns, and `crates/khive-db/src/diagnostics.rs`
+  `CheckpointProbe::pin_depth` returns the same difference for the `db_diagnostics` probe.
+- Amendment 21 item 2 ends the run on "a busy or failed checkpoint". In the bundled SQLite (3.53.2,
+  `sqlite3WalCheckpoint` and `OP_Checkpoint`), a PASSIVE checkpoint reports `busy = 1` when it cannot
+  take the checkpoint lock or read the WAL-index header, typically because another connection is
+  checkpointing at that moment, and its `log` and `checkpointed` columns are then `-1`: the row carries
+  no reading of the ceiling at all. A TRUNCATE checkpoint that stops short of the end of the WAL also
+  reports `busy = 1`, with the columns filled in. The TRUNCATE path runs when WAL pressure has crossed
+  its high-water mark, which a held pin produces, and the `db_diagnostics` probe can collide with the
+  task's own tick. Both feed item 2, so both can restart the one-second clock on a pin that was never
+  released. #3191 measured this with a reader holding one snapshot for 2.5 s: at a tight checkpoint
+  cadence no run reached one second, and 150 of 1,166 run endings were busy results. At the 500 ms
+  default the same harness produced a 1,517 ms run. The error runs in the fail-safe direction (a real
+  pin reads as younger than one second), so this is a precision defect, not a false report.
+
+**Decision.**
+
+1. **One row's difference is a backfill gap, not a pin depth.** `log_frames - checkpointed_frames`
+   from a single probe row is named the backfill gap and reported only under that name: the TRUNCATE
+   no-progress log field and the `CheckpointProbe` accessor carry it as `backfill_gap_frames`, and
+   the "pin depth" wording is removed from both. The sentence "Equivalent signal to reader-mark
+   introspection" in Plank C is withdrawn. The rest of Plank C is unchanged: the PASSIVE probe still
+   runs on a TRUNCATE no-progress event, and shm parsing is still excluded.
+2. **Pin depth exists only where Amendment 21 reports a pin.** A report that names a pin depth
+   computes it as `log_frames - oldest_pinned_frame` from the same probe row, and only when that row's
+   `oldest_pinned_frame` is non-null under Amendment 21 item 1. Otherwise pin depth is null with
+   Amendment 21's reason. Until Amendment 21's run is implemented (#1830), no surface reports a pin
+   depth.
+3. **A busy result is neutral to the run.** A checkpoint result with `busy = 1` neither extends nor
+   ends the run of Amendment 21 item 2, whatever its other columns hold. The next result with
+   `busy = 0` is compared with the run's frame `N` and with the `log_frames` of the last `busy = 0`
+   result, so a WAL restart that fell inside a busy span is still caught when it shrinks `log_frames`.
+   A full backfill, a different ceiling, a smaller `log_frames` and a failed checkpoint (an error
+   rather than a busy row) still end the run.
+4. **The neutral span is bounded.** When a `busy = 0` result arrives more than two checkpoint
+   intervals (`KHIVE_CHECKPOINT_INTERVAL_MS`, one second at the 500 ms default) after the run's last
+   `busy = 0` result, and at least one busy result fell between them, the run ends before that result
+   is applied, and the result starts a new run if it qualifies. The bound keeps the interval in which a
+   pin could be released and a new one taken at the same frame unobserved to at most two checkpoint
+   intervals, instead of however long a busy span lasts.
+5. **The probe row's own nulls are unchanged.** Amendment 21 item 1 still reports
+   `backfill_ceiling` and `oldest_pinned_frame` as null, with a reason, when the probe row itself is
+   busy; item 3 above governs only the run that item 2 keeps.
+
+**Alternatives considered.**
+
+- _Keep "pin depth" as the name and correct only the documentation._ Rejected: the name is the claim.
+  An operator reading `wal_pin_depth` in a WARN acts on it as a pin, and the same value appears under a
+  commit loop with no reader.
+- _Stop running the probe on a TRUNCATE no-progress event._ Rejected: the gap is still a useful
+  measure of how far the backfill is behind the log, and it costs one PASSIVE checkpoint.
+- _Keep "busy ends the run" (Amendment 21 as accepted)._ Rejected on the measurement above: it never
+  reports a pin wrongly, but at checkpoint cadences above the default it can fail to report a pin at
+  all, and the TRUNCATE path produces busy results precisely while a pin holds.
+- _Treat a busy TRUNCATE row whose `checkpointed` equals `N` as extending the run._ Rejected for now:
+  whether a busy row carries columns depends on which lock or stage produced it, and a neutral rule
+  needs no such distinction.
+- _No bound on the neutral span._ Rejected: a long busy span, which is also the signature of another
+  process checkpointing, would let a release and a same-frame re-pin read as one run for as long as the
+  span lasts.
+
+**Consequences.**
+
+- Code that must change with this amendment: `log_wal_pin_depth` and `query_wal_pin_depth` in
+  `crates/khive-db/src/checkpoint.rs` (log field name and message), `CheckpointProbe::pin_depth` and
+  the module and type documentation in `crates/khive-db/src/diagnostics.rs`, and their tests. The log
+  field rename changes what an operator's log query matches.
+- The widened unobserved interval is the same exposure Amendment 21's "What the run assumes" section
+  already describes (a full backfill by another process, a WAL restart and a new read mark at exactly
+  `N`), now bounded at two checkpoint intervals rather than one result interval. Its only effect is
+  still that `oldest_pinned_frame` can be reported for a pin held less than one second.
+- Amendment 21's acceptance arms stand. Arms added:
+  - A reader holds one snapshot for longer than one second while PASSIVE checkpoints are issued faster
+    than the default cadence and a second connection checkpoints concurrently so that some results are
+    busy. The run reaches one second and `oldest_pinned_frame` is non-null.
+  - A span of busy results longer than two checkpoint intervals, followed by a `busy = 0` result at
+    the same frame, ends the run: the new run's `first_observed_at_unix_ms` is later than the old one.
+  - With several writer connections committing and no reader, at the tight and the default cadence,
+    no run reaches one second, and no report carries a pin depth.
+  - A TRUNCATE no-progress event under a commit loop with no reader logs `backfill_gap_frames` and no
+    field named as a pin depth.

@@ -468,7 +468,14 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 name: "external_id",
                 param_type: "string",
                 required: false,
-                description: "Stable transport dedup key. For email: `imap:{host}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.",
+                description: "Stable transport dedup key. For email: `imap:{host}:{account}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "legacy_external_id",
+                param_type: "string",
+                required: false,
+                description: "Pre-account IMAP key for a one-release read-only duplicate lookup, scoped to the supplied email channel slug. Never stored on new rows.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

@@ -779,7 +779,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -795,6 +795,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "string",
                 required: true,
                 description: "Free-text search query.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "text_mode",
+                param_type: "string",
+                required: false,
+                description: "Lexical matching: all_terms (default, every normalized term group must match) | any_term (one or more term groups may match). Changes only the text arm of entity and note search.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -854,10 +861,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "min_rank_score",
+                param_type: "number",
+                required: false,
+                description: "Inclusive strategy-local rank floor (0.0–1.0, default 0), applied after fusion, exact-title boosts and note salience weighting, before the final limit for every order. Not a similarity or probability threshold. Cannot be supplied together with min_score, even if either value is null.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Optional caller-supplied score floor (0.0–1.0). Results below this threshold are discarded. No server default is applied; RRF rank-1 scores are typically 0.013–0.033 on small corpora. Pass e.g. 0.02 to suppress near-zero noise hits.",
+                description: "Deprecated exact alias of min_rank_score (0.0–1.0). Uses the same deterministic ordering score, never a component signal. Supplying both spellings is invalid, even with equal or null values.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

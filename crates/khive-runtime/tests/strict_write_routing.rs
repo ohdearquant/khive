@@ -26,7 +26,7 @@ struct SeedIds {
 }
 
 fn runtime(path: &Path) -> (KhiveRuntime, NamespaceToken) {
-    let backend = Arc::new(StorageBackend::sqlite(path).unwrap());
+    let backend = Arc::new(StorageBackend::sqlite_for_test(path).unwrap());
     backend.prepare_core_schema().unwrap();
     let runtime = KhiveRuntime::from_backend(
         backend,

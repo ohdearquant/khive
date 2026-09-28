@@ -55,7 +55,7 @@ fn assert_harness_refuses_with_direct_binary_instruction(path: PathBuf) {
 fn harness_refusal(path: PathBuf) -> String {
     let error = match ConnectionPool::new(PoolConfig {
         path: Some(path),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     }) {
         Ok(_) => panic!("test harness opened a database under HOME/.khive"),
         Err(error) => error,

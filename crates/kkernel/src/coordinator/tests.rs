@@ -217,6 +217,8 @@ fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
     SearchHit {
         entity_id,
         score: DeterministicScore::from_f64(1.0),
+        rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+        signals: khive_runtime::SearchSignals::default(),
         source,
         title: None,
         snippet: None,
@@ -227,6 +229,8 @@ fn note_search_hit(note_id: Uuid, source: SearchSource) -> NoteSearchHit {
     NoteSearchHit {
         note_id,
         score: DeterministicScore::from_f64(1.0),
+        rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+        signals: khive_runtime::SearchSignals::default(),
         source,
         title: None,
         snippet: None,
@@ -601,6 +605,86 @@ async fn fan_out_search_single_backend_returns_hits() {
     assert!(!hits.is_empty(), "should find the entity");
     assert_eq!(per_backend.len(), 1, "single backend report");
     assert!(per_backend[0].error.is_none(), "no error");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_passes_text_mode_to_entity_and_note_backends() {
+    for multi_backend in [false, true] {
+        let runtime = memory_runtime();
+        let coordinator = if multi_backend {
+            let mut registry = BackendRegistry::new();
+            registry.register(backend_id("main"), Arc::clone(&runtime));
+            registry.register(backend_id("spare"), memory_runtime());
+            SubstrateCoordinator::new(registry)
+        } else {
+            SubstrateCoordinator::single(Arc::clone(&runtime))
+        };
+        let namespace = Namespace::local();
+        let token = runtime
+            .authorize(namespace.clone())
+            .expect("authorize local");
+        let entity = runtime
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "solstice beacon",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let note = runtime
+            .create_note(
+                &token,
+                "observation",
+                Some("solstice beacon"),
+                "solstice beacon",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("seed note");
+
+        for (kind, expected_id) in [("entity", entity.id), ("note", note.id)] {
+            let default_request = validated_kg_search(serde_json::json!({
+                "kind": kind,
+                "query": "solstice beacon harbor",
+                "source": "text",
+            }));
+            let (default_entities, default_notes, default_backends) = coordinator
+                .fan_out_search(&default_request, &namespace)
+                .await;
+            assert!(default_entities.is_empty() && default_notes.is_empty());
+            assert!(default_backends
+                .iter()
+                .all(|backend| backend.error.is_none()));
+
+            let any_request = validated_kg_search(serde_json::json!({
+                "kind": kind,
+                "query": "solstice beacon harbor",
+                "source": "text",
+                "text_mode": "any_term",
+            }));
+            let (entities, notes, backends) =
+                coordinator.fan_out_search(&any_request, &namespace).await;
+            assert!(backends.iter().all(|backend| backend.error.is_none()));
+            if kind == "entity" {
+                assert_eq!(entities.len(), 1, "multi_backend={multi_backend}");
+                assert_eq!(entities[0].entity_id, expected_id);
+                assert_eq!(entities[0].source, SearchSource::Text);
+                assert!(notes.is_empty());
+            } else {
+                assert_eq!(notes.len(), 1, "multi_backend={multi_backend}");
+                assert_eq!(notes[0].note_id, expected_id);
+                assert_eq!(notes[0].source, SearchSource::Text);
+                assert!(entities.is_empty());
+            }
+        }
+    }
 }
 
 /// A vector-arm failure after a successful text leg must not discard the

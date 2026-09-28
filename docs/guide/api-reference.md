@@ -26,8 +26,8 @@ An always-machine-readable copy of this page is at
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
@@ -36,9 +36,9 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its sixteen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
-stored ingest cursor and checkpoint for one project and source kind), the three
-write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
+`kkernel git-ingest` CLI drive. Its seventeen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+stored ingest cursor and checkpoint for one project and source kind), the four
+write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
@@ -567,18 +567,21 @@ request(ops="merge(into_id=\"<canonical-uuid>\", from_id=\"<dup-uuid>\")")
 
 Hybrid FTS + vector search with RRF fusion.
 
-| Param                | Type    | Required | Notes                                                                                                                                  |
-| -------------------- | ------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                  |
-| `query`              | string  | yes      | Free-text query.                                                                                                                       |
-| `limit`              | integer | no       | Default 10.                                                                                                                            |
-| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                        |
-| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                        |
-| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                          |
-| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                            |
-| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window. |
-| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                    |
-| `min_score`          | number  | no       | Score floor 0.0–1.0. No server default; RRF rank-1 scores on small corpora are typically 0.013–0.033.                                  |
+| Param                | Type    | Required | Notes                                                                                                                                                               |
+| -------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                               |
+| `query`              | string  | yes      | Free-text query.                                                                                                                                                    |
+| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                               |
+| `limit`              | integer | no       | Default 10.                                                                                                                                                         |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                       |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                         |
+| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                              |
+| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                 |
+| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
+| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
+| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -627,14 +630,24 @@ Every successful KG search also carries `arm_participation` beside `result`;
 ```json
 {
   "arm_participation": {
-    "text": { "status": "ran", "candidate_count": 0 },
+    "text": {
+      "status": "ran",
+      "candidate_count": 0,
+      "mode": "all_terms",
+      "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
+    },
     "vector": { "status": "ran", "candidate_count": 8 }
   }
 }
 ```
 
-Each arm status is `ran`, `skipped`, or `error`. `ran` with zero candidates
-means that arm completed but contributed no final hit; `skipped` means it was
+Each arm status is `ran`, `skipped`, or `error`. The text arm always reports
+its effective `mode`; the vector arm has no mode. Text `ran` with zero final
+candidates carries the exact all-terms reason shown above, or the shorter
+`No text candidate survived matching, filtering, fusion, and the result limit.`
+for `any_term`. Other text statuses and positive counts omit `reason`.
+An arm with `status: "ran"` and zero candidates completed but contributed no
+final hit; `skipped` means it was
 not selected (for example, vector search without a configured embedding model);
 and `error` means that arm itself failed on at least one backend where it was
 selected — including a backend whose _other_ arm completed normally. A backend
@@ -662,7 +675,9 @@ the response carries no `arm_participation` at all.
 For an entity-name presence check, issue the short bare canonical name and
 require the matching row itself to report `source: "text"` or `"both"`. An
 all-vector response, or text-arm status `error`/`skipped`, is not evidence that
-the name is absent. Long keyword-dense queries may legitimately report text
+the name is absent. This check uses the default `all_terms` mode; an `any_term`
+hit matching only one token does not establish the full canonical name. Long
+keyword-dense queries may legitimately report text
 `ran` with `candidate_count: 0` because the lexical expression is selective;
 the explicit arm evidence makes that different from a silent skip or failure.
 
@@ -673,6 +688,9 @@ Response shape (`kind="entity"` rows, `presentation="verbose"`):
   {
     "id": "3f2a9c1e-...",
     "entity_kind": "concept",
+    "rank_score": 0.0909,
+    "rank_score_kind": "rrf",
+    "signals": { "keyword_score": 12.5 },
     "score": 0.0909,
     "title": "LoRA",
     "snippet": "matched text from the description/properties"
@@ -690,8 +708,20 @@ FTS/vector hit carried no snippet text. `search` is not on the `AlwaysVerbose` v
 than returned as `null` (they are not on the lifecycle-preserve list), and `id` is shortened to
 an 8-character prefix (`crates/khive-runtime/src/presentation.rs`).
 
-`score` is an implementation-defined ranking value, not a normalized 0.0-1.0 similarity, and its
-construction differs by kind (see the `min_score` row above for typical magnitudes):
+`rank_score` is the deterministic ordering value under the strategy named by
+`rank_score_kind`: `rrf`, `vector`, `keyword`, `weighted`, or `union`. It is not
+a probability, a percentage match, or comparable across queries. In v0.8,
+deprecated `score` equals `rank_score` exactly after conversion to JSON. The
+`min_rank_score` range is an input constraint, not a calibration claim.
+
+`signals` carries available pre-fusion `vector_similarity` and/or `keyword_score`.
+Absent evidence keys are omitted, never synthesized as zero. Component scores
+are scoped to the producing backend and model; vector similarities from different
+embedding models are not comparable. Canonical evidence-free hits carry `{}`;
+Agent presentation drops that empty object and rounds ranking and signal values
+to three significant figures after all ranking and filtering decisions.
+
+The local RRF construction differs by substrate:
 
 - **Entity** (`crates/khive-runtime/src/retrieval.rs`): each retrieval leg (lexical, vector) that
   returns the entity contributes `1 / (k + rank)` with `k = 10`; contributions from every leg
@@ -703,8 +733,15 @@ construction differs by kind (see the `min_score` row above for typical magnitud
   `0.5` when unset), so the fused rank score is scaled down for low-salience notes and left
   closer to unscaled for high-salience ones.
 
+Both local modifiers retain kind `rrf` and leave component signals unchanged.
+A coordinator with one selected backend preserves that backend's hit. With
+multiple selected backends, it sums deterministic outer RRF contributions and
+publishes kind `rrf`. For a repeated ID, the complete signal set comes from the
+hit with the best within-backend rank, ties following deterministic backend
+order; it is never combined across backends.
+
 This row shape never includes the full entity/note record (no `description`, `content`,
-`properties`, `tags`, timestamps, …) in either presentation mode, only enough to rank and
+`properties`, or `tags`) in either presentation mode, only enough to rank and
 identify the hit. It diverges from both `neighbors` and `list`'s row shapes above; see `list`'s
 "Row shape" note above for the full comparison.
 
@@ -1787,12 +1824,12 @@ no `all_actors` binding-list mode.
 
 Create a new brain profile with a given name and optional seed priors.
 
-| Param           | Type   | Required | Notes                                                                                                                                                               |
-| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                |
-| `description`   | string | no       | Human-readable description.                                                                                                                                         |
-| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                 |
-| `seed_priors`   | object | no       | For `knowledge_compose`: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}, ...}}`; for `recall`: `{"relevance": {"alpha": 7.0, "beta": 3.0}, ...}`. |
+| Param           | Type   | Required | Notes                                                                                                                                                                    |
+| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`          | string | yes      | Profile ID (alphanumeric + hyphens), must be unique.                                                                                                                     |
+| `description`   | string | no       | Human-readable description.                                                                                                                                              |
+| `consumer_kind` | string | no       | Default `"recall"`.                                                                                                                                                      |
+| `seed_priors`   | object | no       | Section priors only: `{"section_posteriors": {"overview": {"alpha": 2.0, "beta": 2.0}}}`. Recall priors cannot be seeded at creation; other top-level keys are rejected. |
 
 ```
 request(ops="brain.create_profile(name=\"implementer-recall-v2\", consumer_kind=\"recall\")")
@@ -2536,7 +2573,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 4 verbs
+## `session` pack — 5 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2602,6 +2639,24 @@ Serialize one stored session as json or markdown.
 request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 ```
 
+### `session.search` — Assertive (dependency gated)
+
+Search mirrored message text within the request's resolved tenant scope. The
+public handler currently refuses until transcript deletion and resume/export
+continuity support are available. Serving multiple principals also requires
+authenticated connection identity.
+
+| Param    | Type    | Required | Notes                                                         |
+| -------- | ------- | -------- | ------------------------------------------------------------- |
+| `query`  | string  | yes      | Words to match in mirror text.                                |
+| `limit`  | integer | no       | 1–200, default 20.                                            |
+| `since`  | string  | no       | Inclusive RFC 3339 message creation lower bound.              |
+| `source` | string  | no       | Exact source; `unknown` returns migration orphans when named. |
+| `cwd`    | string  | no       | Exact session working directory.                              |
+
+The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
+specifies the scoped key, migration, and search result identity.
+
 ---
 
 ## `exec` tree manifests
@@ -2646,7 +2701,7 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 16 verbs
+## `git` pack — 17 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
@@ -2762,7 +2817,7 @@ snapshot. Values are exact opaque strings, not a completion receipt or a guarant
 resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor
 writes (ADR-088 Amendment 1).
 
-### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
+### `git.commit` / `git.branch` / `git.update_ref` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell
 interpolation). Branch/ref names, remotes, messages, and authors are validated before they
@@ -2773,7 +2828,7 @@ Unicode, and caller text such as `:(top)` remain literal filename text. `force` 
 force-push through this surface.
 
 The handler-level `[git_write]` allowlist is mandatory and independent of Gate policy
-(ADR-018). With no `[[git_write.allowed]]` entries, all three write verbs deny every request,
+(ADR-018). With no `[[git_write.allowed]]` entries, all four write verbs deny every request,
 including under `AllowAllGate`. Repository paths are compared after canonicalization, so an
 entry names exactly one real repository; branch patterns are exact names or a glob containing
 at most one `*` wildcard.
@@ -2803,6 +2858,28 @@ request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.p
 ```
 
 ---
+
+### `git.update_ref` — Commissive
+
+Move an existing branch to an existing commit with an exact expected-head compare. The
+`[git_write]` repository and branch allowlist and Gate policy apply before the repository is touched.
+`expected` is required and must be the exact 40-hex current head; either hex case is accepted.
+`to` must be the full object id of an existing commit; branch names, tags, trees, unknown ids,
+and the zero object id refuse. `require_fast_forward`
+defaults to true. The expected-head compare, ancestry check, and ref
+compare-and-swap run while holding the same per-repository write lock. The result includes the
+observed `from`, requested `to`, whether the move was a fast-forward, and `receipt_id`. An optional
+`reason` is stored with the receipt.
+
+| Param                  | Type    | Required | Notes                                                 |
+| ---------------------- | ------- | -------- | ----------------------------------------------------- |
+| `repo`                 | string  | yes      | Absolute local path to an allowlisted git repository. |
+| `branch`               | string  | yes      | Existing branch to move.                              |
+| `to`                   | string  | yes      | Full 40-hex object id of an existing commit.          |
+| `expected`             | string  | yes      | Exact 40-hex current branch head.                     |
+| `require_fast_forward` | boolean | no       | Defaults to true.                                     |
+| `reason`               | string  | no       | Operator note stored with the receipt.                |
+| `session_id`           | string  | no       | Session label copied to the receipt.                  |
 
 ## `code` pack — 1 verb
 

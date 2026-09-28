@@ -44,7 +44,7 @@ struct Fixture {
 impl Fixture {
     fn new(file_backed: bool) -> Self {
         let directory = file_backed.then(|| tempfile::tempdir().expect("fixture directory"));
-        let runtime = KhiveRuntime::new(RuntimeConfig {
+        let runtime = KhiveRuntime::new_for_test(RuntimeConfig {
             db_path: directory.as_ref().map(|dir| dir.path().join("merge.db")),
             actor_id: Some("lambda:merge-reservation-fixture".into()),
             brain_profile: None,

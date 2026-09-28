@@ -66,7 +66,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
                 count += 1
                 self.assertTrue(body.strip().startswith(ISOLATION),
                                 f"{filename}:{name} atomic caller must enter exact child")
-        self.assertEqual(count, 21, "all direct atomic execution witnesses must be counted")
+        self.assertEqual(count, 22, "all direct atomic execution witnesses must be counted")
 
     def test_reindex_command_cases_choose_explicit_offline_setup(self):
         zero_model_cases = {

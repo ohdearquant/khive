@@ -24,7 +24,7 @@ fn runtime_routing_refuses_strict_fallbacks_and_attributes_only_enabled_queue_de
             path: Some(dir.path().join("runtime-routing.db")),
             write_queue_enabled: Some(enabled),
             write_routing_strict: strict,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let (_, events) = capture_direct_routes(|| {

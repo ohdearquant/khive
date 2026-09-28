@@ -1556,7 +1556,7 @@ async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -1633,7 +1633,7 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -1694,7 +1694,7 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -1853,7 +1853,7 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2164,7 +2164,7 @@ fn batch_write_refreshes_writer_task_after_construction_outside_runtime() {
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("entity-late-writer-task.db")),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );

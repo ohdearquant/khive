@@ -27,12 +27,26 @@ khive offers five retrieval verbs, each suited to a different question shape:
 request(ops="search(kind=\"entity\", query=\"memory efficient attention\")")
 ```
 
-Returns a scored list:
+Returns a ranked list. This abbreviated example shows the ranking fields:
 
 ```json
 [
-  {"id": "a1b2c3d4", "name": "FlashAttention", "score": 0.82, ...},
-  {"id": "e5f6g7h8", "name": "PagedAttention", "score": 0.71, ...}
+  {
+    "id": "a1b2c3d4",
+    "name": "FlashAttention",
+    "rank_score": 0.0325,
+    "rank_score_kind": "rrf",
+    "signals": { "vector_similarity": 0.842, "keyword_score": 18.4 },
+    "score": 0.0325
+  },
+  {
+    "id": "e5f6a7b8",
+    "name": "PagedAttention",
+    "rank_score": 0.0161,
+    "rank_score_kind": "rrf",
+    "signals": { "keyword_score": 12.1 },
+    "score": 0.0161
+  }
 ]
 ```
 
@@ -55,12 +69,28 @@ request(ops="search(kind=\"entity\", query=\"attention\", entity_kind=\"concept\
 
 ### Score interpretation
 
-Scores from `search` are RRF fusion scores. Raw RRF values are typically small
-(0.01-0.03). When `rerank` is active (via `knowledge.search`), scores are
-normalized to [0,1].
+`rank_score` is the deterministic ordering value for this query and strategy.
+It is not a probability, a percentage match, or comparable across queries.
+`rank_score_kind` names the strategy: `rrf`, `vector`, `keyword`, `weighted`,
+or `union`. Entity exact-title boosts and note salience weighting affect the
+rank score while retaining the `rrf` kind.
 
-A practical floor: results below 0.3 are usually noise. Results above 0.7 are
-strong matches.
+`signals` contains available component evidence before fusion and modifiers:
+`vector_similarity` and/or `keyword_score`. Missing evidence has no key;
+it is never filled with zero. Scores belong to the backend and embedding model
+that produced them, so vector similarities from different models are not
+comparable. Canonical responses carry an empty object when no evidence was
+retained; Agent presentation omits that empty object and rounds numeric scores.
+
+Use `min_rank_score` for an inclusive, strategy-local floor in `[0,1]`. The
+server compares fixed-point scores after fusion and modifiers, before the
+final result limit, including when sorting by creation or update time. This
+input range does not make the score a calibrated relevance measure.
+
+In v0.8, `score` is a deprecated exact alias of `rank_score`, and `min_score`
+is a deprecated exact alias of `min_rank_score`. Supplying both parameter names
+is an error, even when equal. Prefer the canonical names in new callers.
+`knowledge.search` and `memory.recall` retain their separate scoring contracts.
 
 ## Structured browse: `list`
 

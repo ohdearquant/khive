@@ -43,7 +43,7 @@ fn in_memory_pool_first_then_file_backed_pool_second_carries_file_backed_identit
     let db_path = dir.path().join("ordering_test.db");
     let file_cfg = PoolConfig {
         path: Some(db_path.clone()),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let file_pool = Arc::new(ConnectionPool::new(file_cfg).expect("file-backed pool should open"));
 

@@ -22,6 +22,7 @@ kkernel <command> [flags]
   db        Schema migration lifecycle (migrate, check)
   engine    Embedding model lifecycle (list, status, migrate, drift-check)
   vector    Vector store capabilities and orphan sweep
+  blob      Read-only attachment ownership report
   reindex   Re-embed entities, notes, and the knowledge corpus (multi-engine)
   exec      Run a verb DSL expression through the pack registry
   mcp       Serve the MCP `request` surface (stdio / daemon / transports)
@@ -55,6 +56,12 @@ kkernel mcp --db :memory: --no-embed
 Key flags: `--db`, `--actor`/`--namespace`, `--no-embed`, `--pack` (repeatable),
 `--config`, `--daemon`, `--transport <name>`, `--bind <addr>`.
 
+For stdio, `KHIVE_MCP_STDIO_MAX_LINE_BYTES` sets the maximum raw JSON-RPC
+line length, including its newline. It defaults to 8,454,144 bytes and accepts
+1 through 67,108,864; an invalid value fails startup. An oversized line gets
+a JSON-RPC parse error when it crosses the cap, then the reader discards its
+remainder and serves the next complete request.
+
 Every successful startup writes the resolved actor to stderr as
 `actor: "<id>" (resolved; attributed)` or explicitly marks the unattributed
 `local` fallback. This line is emitted at the forced `khive.boot` log target,
@@ -73,6 +80,10 @@ for network transports and is ignored by stdio.
 (`~/.khive/khived.sock`) and takes precedence over `--transport`. On first use, stdio
 clients auto-spawn `kkernel mcp --daemon` and forward request frames to it; set
 `KHIVE_NO_DAEMON=1` to force local dispatch (used by the smoke/contract tests).
+Once demand-mode retirement ([ADR-049](../../../docs/adr/ADR-049-khived-daemon.md)
+Amendment 11) ships, an automatically started daemon runs no email channel loops and no
+schedules; to run either, start the daemon yourself with `kkernel mcp --daemon` or under a
+supervisor.
 
 ---
 
@@ -462,8 +473,46 @@ newer build. Recreate it from the current schema; in-place downgrade is unsuppor
 kkernel sync --repo . --db ~/.khive/working.db --namespace local
 ```
 
-Reads `.khive/kg/{entities,edges}.ndjson`, builds a queryable SQLite DB, and replaces
-the target atomically (tmp + rename). Consumed by the deno CLI's `khive kg sync`.
+Reads `.khive/kg/{entities,edges}.ndjson`, builds a queryable SQLite DB in a
+unique sibling file, and renames it over the target after checkpointing. Close
+all SQLite clients using the target first. Sync refuses existing `-wal` or
+`-shm` sidecars and serializes concurrent sync calls with a sibling lock file.
+Errors before the rename leave the previous database intact. Consumed by the
+deno CLI's `khive kg sync`.
+
+---
+
+## Investigate attachment rows with `kkernel blob ownerless-rows`
+
+```bash
+kkernel blob ownerless-rows --config ~/.khive/khive.toml
+kkernel blob ownerless-rows --config ~/.khive/khive.toml --with-db /path/to/retired.db
+```
+
+Use the report only after every roster member is quiesced for the whole command,
+or against frozen database copies with any required matching WAL and SHM sidecars.
+Stop all writers for those files, including local dispatch outside the daemon;
+stopping one daemon alone is insufficient. The command has no cross-process
+writer lock, so the operator must keep the inputs stable until it exits.
+
+The JSON report reads attachments from canonical main and probes main, every
+configured backend, and each extra `--with-db` database for the referenced
+entity or note, including soft-deleted records. Duplicate paths to one file
+are probed once. Every member must open read-only at the current schema. A WAL
+database with a writable `-shm` is refused; a nonempty `-wal` without a frozen
+read-only `-shm` is also refused. The writable `-shm` permission check is an
+open-time heuristic, not proof that no writer can start later. A missing or
+unreadable member or a probe error fails the whole command without printing a
+partial row list. A member whose canonical path is not UTF-8 is refused before
+opening, with its roster name in the error, because that path cannot be
+represented in the JSON header.
+
+The report records which members were probed and when. Its counters describe
+observations over stable inputs, not one atomic snapshot across all databases.
+The roster is probed as of quiescence or freeze; a record committed after that
+snapshot is not visible to this report.
+A listed row is a candidate for investigation, never a deletion manifest. The
+command has no removal mode and does not reclaim blobs.
 
 ---
 
@@ -477,6 +526,7 @@ kkernel backend info main --human
 kkernel engine list                        # embedding engines + model history
 kkernel engine status                      # active model + migration status
 kkernel vector --help                      # vector store capabilities, orphan sweep
+kkernel blob ownerless-rows --help         # read-only attachment ownership report
 kkernel kg --help                          # KG validation, init, pre-commit hook
 ```
 

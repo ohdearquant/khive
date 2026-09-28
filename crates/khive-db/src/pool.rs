@@ -28,7 +28,85 @@ const DEFAULT_READER_CAP: usize = 8;
 
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
+const DB_FREE_SPACE_FLOOR_ENV: &str = "KHIVE_DB_FREE_SPACE_FLOOR_BYTES";
+const DEFAULT_DB_FREE_SPACE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+type SpaceProbe = dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync;
+
+/// The SQLite write reserve is sampled at each operation admission. SQLite
+/// does not expose the size of an arbitrary upcoming transaction, so the
+/// reserve is a warning boundary, not a guarantee that a single very large
+/// transaction cannot consume more than the remaining headroom.
+pub(crate) struct WriteAdmission {
+    volume: Option<PathBuf>,
+    floor_bytes: u64,
+    #[cfg(test)]
+    space_probe: Mutex<Option<Arc<SpaceProbe>>>,
+}
+
+impl WriteAdmission {
+    fn new(volume: Option<PathBuf>, floor_bytes: u64) -> Self {
+        Self {
+            volume,
+            floor_bytes,
+            #[cfg(test)]
+            space_probe: Mutex::new(None),
+        }
+    }
+
+    fn available_space(&self, volume: &Path) -> std::io::Result<u64> {
+        #[cfg(test)]
+        if let Some(probe) = self.space_probe.lock().as_ref() {
+            return probe(volume);
+        }
+        fs4::available_space(volume)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), SqliteError> {
+        let Some(volume) = self.volume.as_deref() else {
+            return Ok(());
+        };
+        if self.floor_bytes == 0 {
+            return Ok(());
+        }
+        let available = self.available_space(volume)?;
+        // SQL does not tell admission how many bytes the next transaction
+        // will append. At equality, even its first byte would cross the floor.
+        if available <= self.floor_bytes {
+            return Err(SqliteError::CapacityFloor {
+                volume: volume.display().to_string(),
+                available_bytes: available,
+                floor_bytes: self.floor_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_test_space_probe(
+        &self,
+        probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
+    ) {
+        *self.space_probe.lock() = Some(Arc::new(probe));
+    }
+}
+
+fn db_free_space_floor_from_env() -> Result<u64, SqliteError> {
+    let Some(value) = std::env::var_os(DB_FREE_SPACE_FLOOR_ENV) else {
+        return Ok(DEFAULT_DB_FREE_SPACE_FLOOR_BYTES);
+    };
+    let parsed = value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            SqliteError::InvalidConfig(format!(
+                "{DB_FREE_SPACE_FLOOR_ENV} must be a nonnegative byte count"
+            ))
+        })?;
+    Ok(parsed)
+}
 
 struct OpenPoolIdentity {
     count: usize,
@@ -480,6 +558,20 @@ impl Default for PoolConfig {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl PoolConfig {
+    /// A small concurrent pool for private test databases.
+    ///
+    /// Tests of reader admission or production sizing should set their required
+    /// count explicitly. Ordinary fixtures need not reserve a CPU-sized pool.
+    pub fn for_test() -> Self {
+        Self {
+            max_readers: 2,
+            ..Self::default()
+        }
+    }
+}
+
 /// Prevent Cargo-launched tests and test subprocesses from opening the
 /// operator's default data tree in every build profile. Activation is solely
 /// the runtime `KHIVE_TEST_HARNESS=1` marker; production/installed binaries do
@@ -620,6 +712,9 @@ pub struct ConnectionPool {
     /// acquisition boundaries means new verbs inherit instrumentation without
     /// per-verb classification (ADR-133 D8 / issue #1389).
     writer_acquisition_counters: Arc<WriterAcquisitionCounters>,
+    /// Shared with the long-lived writer task so it can resample at every
+    /// dequeued request rather than only when its connection is opened.
+    write_admission: Arc<WriteAdmission>,
     /// Pool-scoped reader route, saturation, and hold-lifecycle counters.
     /// Instrumentation lives at the acquisition boundary so every typed
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
@@ -1487,6 +1582,18 @@ impl ConnectionPool {
             }
             None => (TxOrigin::Memory, None),
         };
+        let write_admission = if !config.read_only {
+            if let Some(volume) = identity_path.as_deref().and_then(Path::parent) {
+                Arc::new(WriteAdmission::new(
+                    Some(volume.to_path_buf()),
+                    db_free_space_floor_from_env()?,
+                ))
+            } else {
+                Arc::new(WriteAdmission::new(None, 0))
+            }
+        } else {
+            Arc::new(WriteAdmission::new(None, 0))
+        };
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
         let writer = open_writer_connection(&config, read_only_open_target.as_deref())?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
@@ -1500,6 +1607,7 @@ impl ConnectionPool {
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
+            write_admission,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
             readers,
             max_readers,
@@ -1727,6 +1835,7 @@ impl ConnectionPool {
             });
         };
         self.ensure_pooled_writer_active()?;
+        self.write_admission.check()?;
         self.writer_acquisition_counters
             .pooled_acquisitions
             .fetch_add(1, Ordering::Relaxed);
@@ -1771,6 +1880,7 @@ impl ConnectionPool {
                     return Ok(None);
                 }
                 self.ensure_pooled_writer_active()?;
+                self.write_admission.check()?;
                 self.writer_acquisition_counters
                     .pooled_acquisitions
                     .fetch_add(1, Ordering::Relaxed);
@@ -1813,6 +1923,11 @@ impl ConnectionPool {
     /// writer causes the background task to skip its current tick rather than
     /// stalling for up to `checkout_timeout` (default 5s) while write traffic
     /// is in progress.
+    ///
+    /// This public checkout deliberately bypasses the disk-space admission
+    /// floor so checkpoint and recovery can run when the volume is low. It
+    /// returns a general writer guard; callers must reserve it for maintenance
+    /// and use `try_writer` for ordinary writes.
     pub fn try_writer_nowait(&self) -> Result<WriterGuard<'_>, SqliteError> {
         self.ensure_pooled_writer_active()?;
         let guard = self.writer.try_lock().ok_or_else(|| {
@@ -1872,6 +1987,28 @@ impl ConnectionPool {
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.
     pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
         Arc::clone(&self.writer_acquisition_counters)
+    }
+
+    pub(crate) fn write_admission(&self) -> Arc<WriteAdmission> {
+        Arc::clone(&self.write_admission)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_write_admission(
+        &mut self,
+        floor_bytes: u64,
+        probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
+    ) {
+        let volume = if self.config.read_only {
+            None
+        } else {
+            self.canonical_path()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        };
+        let admission = Arc::new(WriteAdmission::new(volume, floor_bytes));
+        admission.set_test_space_probe(probe);
+        self.write_admission = admission;
     }
 
     /// Get the current number of available reader connections.
@@ -2250,6 +2387,7 @@ impl ConnectionPool {
     /// writer enforces via `query_only`. A fully configured successful open
     /// increments the standalone acquisition class exactly once.
     pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
+        self.write_admission.check()?;
         let conn = self.open_standalone_writer_untracked()?;
         self.writer_acquisition_counters
             .standalone_acquisitions
@@ -2800,11 +2938,45 @@ fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
     Ok(())
 }
 
+/// Order-preserving UTC key across Chrono's signed timestamp range, with
+/// nanoseconds kept after the sign-adjusted epoch seconds.
+pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    let mut key = Vec::with_capacity(12);
+    key.extend_from_slice(&((instant.timestamp() as u64) ^ (1_u64 << 63)).to_be_bytes());
+    key.extend_from_slice(&instant.timestamp_subsec_nanos().to_be_bytes());
+    key
+}
+
+fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::types::ValueRef;
+
+    conn.create_scalar_function(
+        "khive_rfc3339_key",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let text = match ctx.get_raw(0) {
+                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let key = text
+                .and_then(|text| text.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .map(rfc3339_instant_key);
+            Ok(key)
+        },
+    )?;
+    Ok(())
+}
+
 fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
     register_writer_clock(conn)?;
+    register_rfc3339_key(conn)?;
     if config.read_only {
         // Read-only writer slot: skip write-intent PRAGMAs (journal_mode,
         // wal_autocheckpoint, journal_size_limit all require write access to
@@ -2853,6 +3025,7 @@ fn configure_writer_connection(
 }
 
 fn configure_reader_connection(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    register_rfc3339_key(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
     conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
@@ -3323,7 +3496,7 @@ mod tests {
             path: Some(path),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
 
@@ -3405,7 +3578,7 @@ mod tests {
             path: Some(snapshot.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a non-empty WAL without its frozen -shm must fail closed"),
             Err(error) => error,
@@ -3480,7 +3653,7 @@ mod tests {
             path: Some(snapshot.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3572,7 +3745,7 @@ mod tests {
             path: Some(alias.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3641,7 +3814,7 @@ mod tests {
             path: Some(path.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         let reader = pool.reader().unwrap();
@@ -3684,7 +3857,7 @@ mod tests {
             path: Some(path),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap();
         {
@@ -4209,7 +4382,7 @@ mod tests {
             path: Some(path.clone()),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a live WAL database with writable -shm must fail closed"),
             Err(error) => error,
@@ -4314,7 +4487,7 @@ mod tests {
             path: Some(alias),
             read_only: true,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         }) {
             Ok(_) => panic!("a symlink must not hide the target's writable -shm"),
             Err(error) => error,
@@ -4360,7 +4533,7 @@ mod tests {
         let path = dir.path().join("legacy_autocheckpoint_env.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         {
@@ -4578,7 +4751,7 @@ mod tests {
             path: Some(path),
             journal_size_limit_bytes: configured_limit,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("WAL pool open");
 
@@ -4608,7 +4781,7 @@ mod tests {
             wal_mode: false,
             journal_size_limit_bytes: configured_limit,
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("rollback-journal pool open");
 
@@ -4626,7 +4799,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
 
@@ -4690,7 +4863,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_secs(5),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4754,7 +4927,7 @@ mod tests {
                 path: Some(path),
                 checkout_timeout: Duration::from_secs(5),
                 write_queue_enabled: Some(false),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             })
             .expect("pool open"),
         );
@@ -4806,7 +4979,7 @@ mod tests {
             path: Some(path),
             checkout_timeout: Duration::from_millis(1),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
 
@@ -4851,7 +5024,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         pool.claim_checkpoint_ownership()
@@ -4898,7 +5071,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool open");
         let writer = pool.writer().expect("pooled writer");
@@ -4943,7 +5116,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: None,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(true));
@@ -4987,7 +5160,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(false));
@@ -5081,7 +5254,7 @@ mod tests {
         let path = dir.path().join("standalone_writer_counter.db");
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool");
 
@@ -5204,6 +5377,105 @@ mod tests {
         let _writer2 = pool
             .writer()
             .expect("second writer checkout should succeed");
+    }
+
+    #[test]
+    fn db_capacity_floor_refuses_pooled_writer_before_sqlite_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("capacity.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(100, |_| Ok(100));
+
+        let error = match pool.writer() {
+            Ok(_) => panic!("the reserve must refuse this checkout"),
+            Err(error) => error,
+        };
+        let mapped = error.into_storage_error(StorageCapability::Sql, "test_write");
+        assert!(
+            matches!(
+                mapped,
+                StorageError::CapacityFloor {
+                    capability: StorageCapability::Sql,
+                    available_bytes: 100,
+                    floor_bytes: 100,
+                    ..
+                }
+            ),
+            "the refusal must keep its typed capacity classification"
+        );
+        assert_eq!(pool.writer_acquisition_snapshot().pooled_acquisitions, 0);
+    }
+
+    #[test]
+    fn db_capacity_floor_samples_each_pooled_writer_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("fresh-capacity.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&samples);
+        pool.set_test_write_admission(100, move |_| {
+            match observed.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(102),
+                1 => Ok(100),
+                extra => panic!("unexpected capacity sample {extra}"),
+            }
+        });
+
+        drop(pool.writer().expect("first admission clears the reserve"));
+        let second = pool.writer();
+        assert!(
+            matches!(
+                second,
+                Err(SqliteError::CapacityFloor {
+                    available_bytes: 100,
+                    ..
+                })
+            ),
+            "the second admission must see the lower free-space sample"
+        );
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.writer_acquisition_snapshot().pooled_acquisitions, 1);
+    }
+
+    #[test]
+    fn db_capacity_floor_covers_standalone_and_cancellable_writer_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("other-capacity.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(100, |_| Ok(99));
+
+        assert!(matches!(
+            pool.open_standalone_writer(),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        assert!(matches!(
+            pool.writer_until(|| false),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        let counters = pool.writer_acquisition_snapshot();
+        assert_eq!(counters.standalone_acquisitions, 0);
+        assert_eq!(counters.pooled_acquisitions, 0);
+    }
+
+    #[test]
+    fn db_capacity_floor_does_not_probe_in_memory_pool() {
+        let mut pool = ConnectionPool::new(PoolConfig::for_test()).unwrap();
+        pool.set_test_write_admission(u64::MAX, |_| {
+            panic!("an in-memory writer has no filesystem volume to probe")
+        });
+        drop(pool.writer().expect("in-memory writer remains available"));
     }
 
     #[test]
@@ -5334,7 +5606,7 @@ mod tests {
         let cfg = PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
 
@@ -5361,7 +5633,7 @@ mod tests {
             path: Some(dir.path().join("strict_writer_task_no_runtime.db")),
             write_queue_enabled: Some(true),
             write_routing_strict: true,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
 
@@ -5385,7 +5657,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
 
@@ -5577,7 +5849,7 @@ mod tests {
         let pool_for = |path: &Path| -> Arc<ConnectionPool> {
             let cfg = PoolConfig {
                 path: Some(path.to_path_buf()),
-                ..PoolConfig::default()
+                ..PoolConfig::for_test()
             };
             Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"))
         };

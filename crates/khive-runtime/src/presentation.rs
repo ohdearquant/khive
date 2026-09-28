@@ -742,6 +742,9 @@ const ROUND_TRIP_FULL_UUID_FIELDS: &[&str] = &[
 /// Score field names that are truncated to 3 significant figures in Agent mode.
 const SCORE_FIELDS: &[&str] = &[
     "score",
+    "rank_score",
+    "vector_similarity",
+    "keyword_score",
     "salience",
     "decay_factor",
     "rrf_score",
@@ -1402,6 +1405,32 @@ mod tests {
         let out = agent(v);
         let s = out["score"].as_f64().unwrap();
         assert!((s - 0.123).abs() < 1e-9, "expected ~0.123, got {s}");
+    }
+
+    #[test]
+    fn agent_presents_ranking_alias_and_nested_evidence() {
+        let canonical = json!([
+            {
+                "rank_score": 0.0325224749,
+                "score": 0.0325224749,
+                "rank_score_kind": "rrf",
+                "signals": {"vector_similarity": 0.842567, "keyword_score": 18.375}
+            },
+            {"rank_score": 0.0, "score": 0.0, "rank_score_kind": "keyword", "signals": {}}
+        ]);
+        for mode in [PresentationMode::Verbose, PresentationMode::Human] {
+            assert_eq!(present(canonical.clone(), mode, NOW), canonical);
+        }
+        let shown = agent(canonical);
+        assert_eq!(shown[0]["rank_score"], json!(0.0325));
+        assert_eq!(shown[0]["score"], shown[0]["rank_score"]);
+        assert_eq!(shown[0]["rank_score_kind"], "rrf");
+        assert_eq!(shown[0]["signals"]["vector_similarity"], json!(0.843));
+        assert_eq!(shown[0]["signals"]["keyword_score"], json!(18.4));
+        assert_eq!(shown[1]["rank_score"], json!(0.0));
+        assert_eq!(shown[1]["score"], shown[1]["rank_score"]);
+        assert_eq!(shown[1]["rank_score_kind"], "keyword");
+        assert!(shown[1].get("signals").is_none());
     }
 
     #[test]

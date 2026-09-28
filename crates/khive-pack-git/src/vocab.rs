@@ -68,11 +68,11 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// Illocutionary classification (Searle 1976): `git.digest` commits data to
 /// the graph (ingests notes and edges), so it is `Commissive` — the same
 /// category `create`/`link`/`remember` use. `git.commit` / `git.branch` /
-/// `git.push` (ADR-108) mutate a git repository, not the graph, but are
+/// `git.push` (ADR-108), and `git.update_ref` mutate a git repository, not the graph, but are
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 16] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 17] = [
     crate::local_vocab::INIT,
     crate::local_vocab::CHECKOUT,
     crate::local_vocab::DIFF,
@@ -229,6 +229,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 16] = [
             },
         ],
     },
+    crate::local_vocab::UPDATE_REF,
     crate::remote_vocab::PUSH,
     crate::remote_vocab::PR_OPEN,
     crate::remote_vocab::PR_REVIEW,

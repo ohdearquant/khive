@@ -6,11 +6,11 @@
 //! or XML parser crate is a workspace dependency, so every extraction here
 //! uses regex matches and a fixed-capacity text scan rather than a DOM walk.
 //!
-//! - `links`: every `<a href="...">` in an HTML body becomes a
-//!   `page links_to page|resource` edge (D2's new base row) to a target
+//! - `links`: up to the per-page limit of `<a href="...">` values in an HTML
+//!   body become `page links_to page|resource` edges to a target
 //!   minted, if absent, as an unfetched `resource` (`status: null`) — never
 //!   overwritten if the target already exists and has been fetched.
-//! - `sitemap`/`feed`: every `<loc>`/`<link>` entry becomes a `resource`
+//! - `sitemap`/`feed`: admitted `<loc>`/`<link>` entries become a `resource`
 //!   under the document's own `site`, linked `site contains resource` (the
 //!   pack's second `EDGE_RULES` row) — a feed/sitemap entry is the site's
 //!   content, not the feed document's.
@@ -20,21 +20,24 @@
 //!   repeated extraction over an unchanged document converges on one row.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
 use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
-use crate::egress::Refusal;
+use crate::egress::{self, Refusal};
 use crate::identity;
 use crate::vocab::ExtractParams;
 use crate::WebPack;
 
 const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
+pub(crate) const DEFAULT_LINK_LIMIT: u32 = 100;
+const MAX_LINK_LIMIT: u32 = 1_000;
 // Two fixed text buffers plus at most three UTF-8 bytes per raw byte (U+FFFD).
 // This pack-local aggregate budget is separate from raw blob admission. A
 // request acquires it once, after hydration, and never upgrades its reservation.
@@ -422,10 +425,16 @@ async fn extract_links(
     document_id: Uuid,
     base_url: &Url,
     body: &str,
-) -> Result<u32, RuntimeError> {
+    link_limit: u32,
+) -> Result<(u32, u32), RuntimeError> {
     let mut seen = std::collections::HashSet::new();
-    let mut count = 0u32;
+    let mut targets = Vec::new();
+    let mut skipped = 0u32;
     for capture in HREF_RE.captures_iter(body) {
+        if targets.len() >= link_limit as usize {
+            skipped += 1;
+            continue;
+        }
         let href = capture[1].trim();
         if href.is_empty() || href.starts_with("javascript:") || href.starts_with("mailto:") {
             continue;
@@ -433,7 +442,8 @@ async fn extract_links(
         let Some(target_url) = resolve_against(base_url, href) else {
             continue;
         };
-        let canonical = identity::canonicalize(target_url);
+        let request_url = identity::request_url(target_url);
+        let canonical = identity::canonicalize(request_url.clone());
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
@@ -441,6 +451,13 @@ async fn extract_links(
             continue;
         }
         let site = identity::site_id(&canonical);
+        let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
+        targets.push((request_url, canonical, site, target_id));
+    }
+
+    let processed = targets.len() as u32;
+    let mut link_specs = Vec::with_capacity(targets.len() * 2);
+    for (request_url, canonical, site, target_id) in targets {
         crate::entities::get_or_create(
             runtime,
             token,
@@ -455,7 +472,6 @@ async fn extract_links(
             }),
         )
         .await?;
-        let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
         crate::entities::get_or_create(
             runtime,
             token,
@@ -463,25 +479,30 @@ async fn extract_links(
             "document",
             "resource",
             canonical.as_ref(),
-            json!({ "url": canonical.to_string(), "status": Value::Null }),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
-        runtime
-            .link(token, site, target_id, EdgeRelation::Contains, 1.0, None)
-            .await?;
-        runtime
-            .link(
-                token,
-                document_id,
-                target_id,
-                EdgeRelation::LinksTo,
-                1.0,
-                None,
-            )
-            .await?;
-        count += 1;
+        link_specs.push(LinkSpec {
+            namespace: None,
+            source_id: site,
+            target_id,
+            relation: EdgeRelation::Contains,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        });
+        link_specs.push(LinkSpec {
+            namespace: None,
+            source_id: document_id,
+            target_id,
+            relation: EdgeRelation::LinksTo,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        });
     }
-    Ok(count)
+    runtime.link_many(token, link_specs).await?;
+    Ok((processed, skipped))
 }
 
 async fn extract_entries(
@@ -490,31 +511,36 @@ async fn extract_entries(
     site_id: Uuid,
     body: &str,
     kind: &str,
-) -> Result<u32, RuntimeError> {
-    let mut urls: Vec<String> = Vec::new();
-    match kind {
-        "sitemap" => {
-            urls.extend(LOC_RE.captures_iter(body).map(|c| c[1].trim().to_string()));
-        }
-        "feed" => {
-            urls.extend(
-                ATOM_LINK_HREF_RE
-                    .captures_iter(body)
-                    .map(|c| c[1].trim().to_string()),
-            );
-            urls.extend(
-                RSS_LINK_RE
-                    .captures_iter(body)
-                    .map(|c| c[1].trim().to_string()),
-            );
-        }
-        _ => {}
-    }
+    entry_limit: u32,
+) -> Result<(u32, u32), RuntimeError> {
+    // Iterate directly over the stored body rather than collecting every
+    // remotely supplied entry before the ceiling can be applied.
+    let urls: Box<dyn Iterator<Item = String> + Send + '_> = match kind {
+        "sitemap" => Box::new(LOC_RE.captures_iter(body).map(|c| c[1].trim().to_string())),
+        "feed" => Box::new(
+            ATOM_LINK_HREF_RE
+                .captures_iter(body)
+                .map(|c| c[1].trim().to_string())
+                .chain(
+                    RSS_LINK_RE
+                        .captures_iter(body)
+                        .map(|c| c[1].trim().to_string()),
+                ),
+        ),
+        _ => Box::new(std::iter::empty()),
+    };
     let mut seen = std::collections::HashSet::new();
     let mut count = 0u32;
+    let mut skipped = 0u32;
+    let mut link_specs = Vec::with_capacity((entry_limit as usize).saturating_mul(2));
     for raw in urls {
+        if count >= entry_limit {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         let Ok(url) = Url::parse(&raw) else { continue };
-        let canonical = identity::canonicalize(url);
+        let request_url = identity::request_url(url);
+        let canonical = identity::canonicalize(request_url.clone());
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
@@ -530,7 +556,7 @@ async fn extract_entries(
             "document",
             "resource",
             canonical.as_ref(),
-            json!({ "url": canonical.to_string(), "status": Value::Null }),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
         )
         .await?;
         // Entries belong to the SITE that published the feed/sitemap, which
@@ -539,9 +565,15 @@ async fn extract_entries(
         // entry's own site when the entry points elsewhere, so both edges
         // are recorded: containment under the publishing site, plus the
         // entry's own site if it differs.
-        runtime
-            .link(token, site_id, target_id, EdgeRelation::Contains, 1.0, None)
-            .await?;
+        link_specs.push(LinkSpec {
+            namespace: None,
+            source_id: site_id,
+            target_id,
+            relation: EdgeRelation::Contains,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        });
         if entry_site != site_id {
             crate::entities::get_or_create(
                 runtime,
@@ -557,20 +589,20 @@ async fn extract_entries(
                 }),
             )
             .await?;
-            runtime
-                .link(
-                    token,
-                    entry_site,
-                    target_id,
-                    EdgeRelation::Contains,
-                    1.0,
-                    None,
-                )
-                .await?;
+            link_specs.push(LinkSpec {
+                namespace: None,
+                source_id: entry_site,
+                target_id,
+                relation: EdgeRelation::Contains,
+                weight: 1.0,
+                metadata: None,
+                resurrect: false,
+            });
         }
         count += 1;
     }
-    Ok(count)
+    runtime.link_many(token, link_specs).await?;
+    Ok((count, skipped))
 }
 
 async fn extract_text(
@@ -611,6 +643,15 @@ async fn extract_text(
         }),
     )
     .await?;
+    crate::fetch::root_body(
+        runtime,
+        text_id,
+        khive_storage::AttachmentSubstrate::Entity,
+        &content_ref,
+        Some("text/plain"),
+        excerpt_bytes as u64,
+    )
+    .await?;
     runtime
         .link(
             token,
@@ -644,11 +685,18 @@ async fn put_excerpt(
         .map_err(RuntimeError::from)
 }
 
-async fn run_extract(
+async fn run_extract_with_link_selection(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: ExtractParams,
+    include_links: bool,
 ) -> Result<Value, RuntimeError> {
+    let link_limit = egress::check_ceiling(
+        params.link_limit.map(u64::from),
+        u64::from(DEFAULT_LINK_LIMIT),
+        u64::from(MAX_LINK_LIMIT),
+        "link_limit",
+    )? as u32;
     let (target_id, entity) = resolve_target(runtime, token, &params).await?;
     let properties = entity.properties.clone().unwrap_or(Value::Null);
     let content_ref = properties
@@ -682,13 +730,16 @@ async fn run_extract(
     let entity_type = entity.entity_type.as_deref().unwrap_or("resource");
     let content_type = properties.get("content_type").and_then(Value::as_str);
 
-    let kinds: Vec<String> = match params.kinds {
+    let mut kinds: Vec<String> = match params.kinds {
         Some(k) if !k.is_empty() => k,
         _ => applicable_kinds(entity_type, content_type)
             .into_iter()
             .map(str::to_string)
             .collect(),
     };
+    if !include_links {
+        kinds.retain(|kind| kind != "links");
+    }
     for kind in &kinds {
         if !ALL_KINDS.contains(&kind.as_str()) {
             return Err(RuntimeError::InvalidInput(format!(
@@ -696,6 +747,8 @@ async fn run_extract(
             )));
         }
     }
+    let mut seen = HashSet::new();
+    kinds.retain(|kind| seen.insert(kind.clone()));
 
     // Text consumes raw UTF-8 lazily, including replacement characters. Only
     // the other extraction kinds need a fully decoded body; a text-only
@@ -722,19 +775,44 @@ async fn run_extract(
     };
 
     let mut result = serde_json::Map::new();
+    let mut targets_remaining = link_limit;
     for kind in &kinds {
         match kind.as_str() {
             "links" => {
-                let count = extract_links(runtime, token, target_id, &base_url, &body).await?;
-                result.insert("links".to_string(), json!({ "edges_created": count }));
+                let (count, skipped) = extract_links(
+                    runtime,
+                    token,
+                    target_id,
+                    &base_url,
+                    &body,
+                    targets_remaining,
+                )
+                .await?;
+                targets_remaining = targets_remaining.saturating_sub(count);
+                result.insert(
+                    "links".to_string(),
+                    json!({ "edges_created": count, "skipped": skipped }),
+                );
             }
             "sitemap" => {
-                let count = extract_entries(runtime, token, site_id, &body, "sitemap").await?;
-                result.insert("sitemap".to_string(), json!({ "entries": count }));
+                let (count, skipped) =
+                    extract_entries(runtime, token, site_id, &body, "sitemap", targets_remaining)
+                        .await?;
+                targets_remaining = targets_remaining.saturating_sub(count);
+                result.insert(
+                    "sitemap".to_string(),
+                    json!({ "entries": count, "skipped": skipped }),
+                );
             }
             "feed" => {
-                let count = extract_entries(runtime, token, site_id, &body, "feed").await?;
-                result.insert("feed".to_string(), json!({ "entries": count }));
+                let (count, skipped) =
+                    extract_entries(runtime, token, site_id, &body, "feed", targets_remaining)
+                        .await?;
+                targets_remaining = targets_remaining.saturating_sub(count);
+                result.insert(
+                    "feed".to_string(),
+                    json!({ "entries": count, "skipped": skipped }),
+                );
             }
             "text" => {
                 let text_id = extract_text(
@@ -759,18 +837,47 @@ async fn run_extract(
     }))
 }
 
+#[cfg(test)]
+async fn run_extract(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: ExtractParams,
+) -> Result<Value, RuntimeError> {
+    run_extract_with_link_selection(runtime, token, params, true).await
+}
+
 impl WebPack {
     pub(crate) async fn handle_extract(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        self.handle_extract_with_link_selection(token, params, true)
+            .await
+    }
+
+    pub(crate) async fn handle_extract_without_links(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.handle_extract_with_link_selection(token, params, false)
+            .await
+    }
+
+    async fn handle_extract_with_link_selection(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        include_links: bool,
+    ) -> Result<Value, RuntimeError> {
         let params: ExtractParams = serde_json::from_value(params).map_err(|error| {
             RuntimeError::InvalidInput(format!("invalid web.extract arguments: {error}"))
         })?;
         let effective_token =
             crate::namespace::resolve_effective_token(token, params.namespace.as_deref())?;
-        run_extract(&self.runtime, &effective_token, params).await
+        run_extract_with_link_selection(&self.runtime, &effective_token, params, include_links)
+            .await
     }
 }
 
@@ -1186,6 +1293,7 @@ mod tests {
                 id: Some(page_id),
                 url: None,
                 kinds: Some(vec!["links".to_string()]),
+                link_limit: None,
                 namespace: None,
             },
         )
@@ -1224,6 +1332,121 @@ mod tests {
         }
     }
 
+    // Set-like kind selection must not hide work committed by an earlier pass.
+    #[tokio::test]
+    async fn duplicate_sitemap_kind_preserves_admitted_count() {
+        for repetitions in [1usize, 2] {
+            let (runtime, token, _dir) = test_runtime().await;
+            let document = seed_page(
+                &runtime,
+                &token,
+                "https://duplicate-kind.example.test/map.xml",
+                "application/xml",
+                b"<urlset><url><loc>https://duplicate-kind.example.test/entry</loc></url></urlset>",
+            )
+            .await;
+            let kinds = vec!["sitemap"; repetitions];
+            let pack = crate::WebPack::new(runtime.clone());
+            let reply = pack
+                .handle_extract(
+                    &token,
+                    json!({ "id": document, "kinds": kinds, "link_limit": 1 }),
+                )
+                .await
+                .unwrap();
+            let site = identity::site_id(
+                &Url::parse("https://duplicate-kind.example.test/map.xml").unwrap(),
+            );
+            let neighbors = runtime
+                .neighbors(
+                    &token,
+                    site,
+                    khive_storage::Direction::Out,
+                    None,
+                    Some(vec![EdgeRelation::Contains]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                neighbors.len(),
+                1,
+                "the admitted target remains in the graph"
+            );
+            assert_eq!(
+                reply["result"]["sitemap"]["entries"], 1,
+                "duplicate kind must not overwrite earlier admitted work with zero"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sitemap_and_feed_share_a_bounded_entry_budget_and_report_skips() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let mut body = String::from("<urlset>");
+        for index in 0..5_000 {
+            body.push_str(&format!(
+                "<url><loc>https://entries.example.test/{index}</loc></url>"
+            ));
+        }
+        body.push_str("<link href=\"https://entries.example.test/feed-a\"/><link href=\"https://entries.example.test/feed-b\"/></urlset>");
+        let document = seed_page(
+            &runtime,
+            &token,
+            "https://publisher.example.test/map.xml",
+            "application/xml",
+            body.as_bytes(),
+        )
+        .await;
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(document),
+                url: None,
+                kinds: Some(vec!["sitemap".into(), "feed".into()]),
+                link_limit: Some(3),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["sitemap"]["entries"], 3);
+        assert_eq!(reply["result"]["sitemap"]["skipped"], 4_997);
+        assert_eq!(reply["result"]["feed"]["entries"], 0);
+        assert_eq!(reply["result"]["feed"]["skipped"], 2);
+
+        let site =
+            identity::site_id(&Url::parse("https://publisher.example.test/map.xml").unwrap());
+        let neighbors = runtime
+            .neighbors(
+                &token,
+                site,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Contains]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors.len(),
+            3,
+            "only admitted entries acquire graph edges"
+        );
+        let fourth = Url::parse("https://entries.example.test/3").unwrap();
+        let fourth_id = identity::document_id(
+            identity::site_id(&fourth),
+            &identity::path_and_query(&fourth),
+        );
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(fourth_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     // extract(text) mints a derived_from resource holding tag-stripped
     // text, and repeating the call converges on the same id.
     #[tokio::test]
@@ -1246,6 +1469,7 @@ mod tests {
                 id: Some(page_id),
                 url: None,
                 kinds: Some(vec!["text".to_string()]),
+                link_limit: None,
                 namespace: None,
             },
         )
@@ -1260,6 +1484,7 @@ mod tests {
                 id: Some(page_id),
                 url: None,
                 kinds: Some(vec!["text".to_string()]),
+                link_limit: None,
                 namespace: None,
             },
         )
@@ -1287,6 +1512,22 @@ mod tests {
             .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
             .await
             .unwrap();
+        let roots = runtime
+            .core()
+            .attachments()
+            .unwrap()
+            .list_attachments(entity.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            roots.len(),
+            1,
+            "repeated extraction retains one content root"
+        );
+        assert_eq!(roots[0].role, "content");
+        assert_eq!(roots[0].content_ref, content_ref);
+        assert_eq!(roots[0].media_type.as_deref(), Some("text/plain"));
+        assert_eq!(roots[0].size_bytes, Some(bytes.len() as u64));
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("Hello world"), "{text:?}");
         assert!(
@@ -1408,6 +1649,7 @@ mod tests {
                 id: Some(id),
                 url: None,
                 kinds: None,
+                link_limit: None,
                 namespace: None,
             },
         )

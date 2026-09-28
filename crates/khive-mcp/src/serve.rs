@@ -566,8 +566,8 @@ fn ingest_namespace_from_env() -> String {
 /// Resolve the default inbound actor for fresh (uncorrelated) channel messages.
 ///
 /// Reads the supplied environment variable; falls back to the channel's
-/// recipient when it is unset or blank. Telegram's fallback is isolated from
-/// the anonymous `local` mailbox.
+/// recipient when it is unset or blank. Email defaults to `local`; Telegram's
+/// fallback is isolated from the anonymous `local` mailbox.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> String {
     std::env::var(actor_variable)
@@ -1082,6 +1082,7 @@ async fn channel_poll_loop(
                             "channel_kind": kind,
                             "channel_slug": slug,
                             "external_id": env.external_id.clone(),
+                            "legacy_external_id": env.legacy_external_id.clone(),
                             "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id.clone(),
                             "default_inbound_actor": default_inbound_actor,
@@ -1280,6 +1281,7 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
             "auth"
         }
         khive_channel::ChannelError::Transport(_)
+        | khive_channel::ChannelError::RateLimited { .. }
         | khive_channel::ChannelError::PermanentTransport(_) => "transport",
         khive_channel::ChannelError::Config(_)
         | khive_channel::ChannelError::UnauthorizedSender(_)
@@ -1476,14 +1478,21 @@ async fn record_outbound_send_failure(
 
     match error.delivery_failure_class() {
         DeliveryFailureClass::Transient => {
+            let (base_delay, max_delay) = match error {
+                khive_channel::ChannelError::RateLimited { retry_after, .. } => (
+                    OUTBOUND_RETRY_BASE.max(*retry_after),
+                    OUTBOUND_RETRY_CEILING.max(*retry_after),
+                ),
+                _ => (OUTBOUND_RETRY_BASE, OUTBOUND_RETRY_CEILING),
+            };
             runtime
                 .mark_outbound_message_transient_failure(
                     token,
                     note_id,
                     chrono::Utc::now(),
                     error.to_string(),
-                    OUTBOUND_RETRY_BASE,
-                    OUTBOUND_RETRY_CEILING,
+                    base_delay,
+                    max_delay,
                 )
                 .await
         }
@@ -1579,20 +1588,31 @@ pub(crate) async fn channel_outbox_loop(
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    outbox::validate_loop_channel(email_channel.as_ref(), "email")?;
+    let slug = email_channel.slug();
+    let mut channels = khive_channel::ChannelRegistry::new();
+    channels.register(email_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
         }
-        channel_outbox_once(
-            email_channel.as_ref(),
+        outbox::outbox_once(
+            outbox::OutboxChannels::Registered {
+                registry: &channels,
+                slug: &slug,
+            },
+            outbox::OutboxPolicy::Email {
+                mailbox: &mailbox,
+                domain: &domain,
+                allowlist: &allowlist,
+            },
             &runtime,
             &namespace,
-            &mailbox,
-            &domain,
-            &allowlist,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -1603,7 +1623,7 @@ pub(crate) async fn channel_outbox_loop(
 /// routing and owner-claim behavior can be verified without sleeping or
 /// opening a network transport. Account-wide authentication errors propagate
 /// to the supervisor without becoming per-message terminal failures.
-#[cfg(feature = "channel-email")]
+#[cfg(all(test, feature = "channel-email"))]
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
     email_channel: &dyn khive_channel::Channel,
@@ -1614,253 +1634,20 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
-    use chrono::Utc;
-    use khive_channel::ChannelEnvelope;
-
-    // Query outbound messages through the runtime's non-wire outbox scan.
-    // The generic wire `list` verb runs on the kg pack's runtime, which under
-    // a `[packs.comm]` backend assignment is not the backend holding comm's
-    // notes — the scan must use the comm-routed handle this loop was given.
-    // The `email:` prefix is applied INSIDE the scan (before its limit), so a
-    // backlog of another channel's pending rows cannot starve this one; the
-    // per-note checks below are defensive re-checks only.
-    let token = match runtime.authorize(namespace.clone()) {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
-            return Err(crate::components::ComponentError::Permanent(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes = match runtime
-        .list_undelivered_outbound_messages(&token, Some("email:"), 200)
-        .await
-    {
-        Ok(notes) => notes,
-        Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: outbox scan failed");
-            return Err(crate::components::ComponentError::Retryable(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes: Vec<serde_json::Value> = notes
-        .iter()
-        .filter_map(|note| serde_json::to_value(note).ok())
-        .collect();
-    for note_val in &notes {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let props = match note_val.get("properties") {
-            Some(serde_json::Value::Object(properties)) => properties.clone(),
-            _ => continue,
-        };
-
-        if props.get("direction").and_then(|value| value.as_str()) != Some("outbound") {
-            continue;
-        }
-        let to_actor = match props.get("to_actor").and_then(|value| value.as_str()) {
-            Some(actor) if actor.starts_with("email:") => actor.to_string(),
-            _ => continue,
-        };
-        if note_already_delivered(&props) {
-            continue;
-        }
-        let note_id = match note_val.get("id").and_then(|value| value.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-        let recipient = to_actor
-            .strip_prefix("email:")
-            .unwrap_or(to_actor.as_str())
-            .to_string();
-        if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-            // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
-            // must be recorded — skipping with only a log line leaves the row
-            // pending forever while the sender saw `ok: true`.
-            let failed_at = Utc::now().to_rfc3339();
-            let last_error = format!("recipient {recipient} not in outbound allowlist");
-            let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                Ok(uuid) => runtime
-                    .mark_outbound_message_failed(&token, uuid, failed_at, last_error.clone())
-                    .await
-                    .map(|_| ()),
-                Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                    "note id {note_id} is not a valid UUID: {error}"
-                ))),
-            };
-            match mark_result {
-                Ok(_) => tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    "outbox loop: recipient not in allowlist; recorded permanent failure"
-                ),
-                Err(error) => tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    error = %error,
-                    "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
-                ),
-            }
-            continue;
-        }
-
-        let subject = props
-            .get("subject")
-            .and_then(|value| value.as_str())
-            .unwrap_or("(no subject)")
-            .to_string();
-        let content = match note_val.get("content").and_then(|value| value.as_str()) {
-            Some(content) => content.to_string(),
-            None => continue,
-        };
-        let thread_id = props
-            .get("thread_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let in_reply_to = props
-            .get("in_reply_to_message_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let references = props
-            .get("references_chain")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-
-        // Mint-before-send through the comm-routed runtime's owner-only path.
-        // Generic `update` correctly refuses caller patches to `external_id`.
-        let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
-            Some(external_id) if !external_id.is_empty() => external_id.to_string(),
-            _ => {
-                let message_id = format!("<{note_id}@{domain}>");
-                let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => {
-                        runtime
-                            .claim_outbound_message_external_id(&token, uuid, message_id.clone())
-                            .await
-                    }
-                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {error}"
-                    ))),
-                };
-                if let Err(error) = claim_result {
-                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                        Ok(uuid) => {
-                            record_outbound_claim_failure(runtime, &token, uuid, &error).await
-                        }
-                        Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(
-                            format!("note id {note_id} is not a valid UUID: {parse_error}"),
-                        )),
-                    };
-                    match mark_result {
-                        Ok(note) => tracing::warn!(
-                            note_id = %note_id,
-                            error = %error,
-                            permanent = outbound_claim_failure_is_permanent(&error),
-                            delivery = ?note.properties.as_ref().and_then(|p| p.get("delivery")).and_then(|v| v.as_str()),
-                            "outbox loop: claim failure handled; existing claim or terminal state preserved"
-                        ),
-                        Err(mark_error) => tracing::warn!(
-                            note_id = %note_id,
-                            error = %error,
-                            mark_error = %mark_error,
-                            "outbox loop: claim failed and failure state could not be recorded"
-                        ),
-                    }
-                    continue;
-                }
-                message_id
-            }
-        };
-
-        let mut envelope = ChannelEnvelope::new(
-            format!("email:{mailbox}"),
-            format!("email:{recipient}"),
-            content,
-        )
-        .with_subject(subject)
-        .with_message_id(message_id.clone());
-        if let Some(thread_id) = thread_id {
-            envelope = envelope.with_correlation(thread_id);
-        }
-        if let Some(in_reply_to) = in_reply_to {
-            envelope = envelope.with_in_reply_to(in_reply_to);
-        }
-        if let Some(references) = references {
-            envelope = envelope.with_references(references);
-        }
-
-        match email_channel.send(envelope).await {
-            Ok(()) => {
-                let delivered_at = Utc::now().to_rfc3339();
-                let delivered_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => runtime
-                        .mark_outbound_message_delivered(
-                            &token,
-                            uuid,
-                            delivered_at,
-                            Some(message_id.clone()),
-                        )
-                        .await
-                        .map(|_| ()),
-                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {error}"
-                    ))),
-                };
-                match delivered_result {
-                    Ok(_) => tracing::info!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        message_id = %message_id,
-                        "outbox loop: delivered"
-                    ),
-                    Err(error) => tracing::warn!(
-                        note_id = %note_id,
-                        error = %error,
-                        "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                    ),
-                }
-            }
-            Err(
-                khive_channel::ChannelError::Auth(error)
-                | khive_channel::ChannelError::Config(error),
-            ) => {
-                return Err(crate::components::ComponentError::Permanent(error));
-            }
-            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
-                return Err(crate::components::ComponentError::Retryable(error));
-            }
-            Err(error) => {
-                let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => record_outbound_send_failure(runtime, &token, uuid, &error)
-                        .await
-                        .map(|_| ()),
-                    Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                        "note id {note_id} is not a valid UUID: {parse_error}"
-                    ))),
-                };
-                match mark_result {
-                    Ok(()) => tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %error,
-                        classification = ?error.delivery_failure_class(),
-                        "outbox loop: send failure recorded"
-                    ),
-                    Err(mark_error) => tracing::warn!(
-                        note_id = %note_id,
-                        recipient = %recipient,
-                        error = %error,
-                        mark_error = %mark_error,
-                        "outbox loop: send failed and retry state could not be recorded"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(())
+    let mut pause_until = None;
+    outbox::outbox_once(
+        outbox::OutboxChannels::Single(email_channel),
+        outbox::OutboxPolicy::Email {
+            mailbox,
+            domain,
+            allowlist,
+        },
+        runtime,
+        namespace,
+        cancellation,
+        &mut pause_until,
+    )
+    .await
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
@@ -2149,127 +1936,50 @@ pub(crate) async fn telegram_outbox_loop(
     ingest_namespace: String,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
+    outbox::validate_loop_channel(telegram_channel.as_ref(), "telegram")?;
+    let slug = telegram_channel.slug();
+    let mut channels = khive_channel::ChannelRegistry::new();
+    channels.register(telegram_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
         }
-        telegram_outbox_once(
-            telegram_channel.as_ref(),
+        outbox::outbox_once(
+            outbox::OutboxChannels::Registered {
+                registry: &channels,
+                slug: &slug,
+            },
+            outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
     }
 }
 
-#[cfg(feature = "channel-telegram")]
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
 async fn telegram_outbox_once(
     telegram_channel: &dyn khive_channel::Channel,
     runtime: &khive_runtime::KhiveRuntime,
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
-    use khive_channel::ChannelEnvelope;
-
-    let token = match runtime.authorize(namespace.clone()) {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(error = %error, "telegram outbox loop: namespace authorization failed");
-            return Err(crate::components::ComponentError::Permanent(
-                error.to_string(),
-            ));
-        }
-    };
-    let notes = match runtime
-        .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
-        .await
-    {
-        Ok(notes) => notes,
-        Err(error) => {
-            tracing::warn!(error = %error, "telegram outbox loop: outbox scan failed");
-            return Err(crate::components::ComponentError::Retryable(
-                error.to_string(),
-            ));
-        }
-    };
-
-    for note in notes {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let Some(props) = note
-            .properties
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-        else {
-            continue;
-        };
-        if props.get("direction").and_then(serde_json::Value::as_str) != Some("outbound") {
-            continue;
-        }
-        let Some(to_actor) = props
-            .get("to_actor")
-            .and_then(serde_json::Value::as_str)
-            .filter(|actor| actor.starts_with("telegram:"))
-        else {
-            continue;
-        };
-        if note_already_delivered(props) {
-            continue;
-        }
-
-        let envelope = ChannelEnvelope::new("telegram:bot", to_actor, note.content.clone());
-        match telegram_channel.send(envelope).await {
-            Ok(()) => {
-                match runtime
-                    .mark_outbound_message_delivered(
-                        &token,
-                        note.id,
-                        chrono::Utc::now().to_rfc3339(),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(_) => tracing::info!(note_id = %note.id, "telegram outbox loop: delivered"),
-                    Err(error) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                    ),
-                }
-            }
-            Err(
-                khive_channel::ChannelError::Auth(error)
-                | khive_channel::ChannelError::Config(error),
-            ) => {
-                return Err(crate::components::ComponentError::Permanent(error));
-            }
-            Err(khive_channel::ChannelError::RetryableAuth(error)) => {
-                return Err(crate::components::ComponentError::Retryable(error));
-            }
-            Err(error) => {
-                match record_outbound_send_failure(runtime, &token, note.id, &error).await {
-                    Ok(_) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        classification = ?error.delivery_failure_class(),
-                        "telegram outbox loop: send failure recorded"
-                    ),
-                    Err(mark_error) => tracing::warn!(
-                        note_id = %note.id,
-                        error = %error,
-                        mark_error = %mark_error,
-                        "telegram outbox loop: send failed and retry state could not be recorded"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(())
+    let mut pause_until = None;
+    outbox::outbox_once(
+        outbox::OutboxChannels::Single(telegram_channel),
+        outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
+        runtime,
+        namespace,
+        cancellation,
+        &mut pause_until,
+    )
+    .await
 }
 
 /// Serve a pre-built server (ADR-029 Phase 2 boot path).
@@ -3059,6 +2769,16 @@ struct PreparedStorageTopology {
     shared_hydrator: Option<Arc<BlobHydrator>>,
 }
 
+fn declared_backend_db_paths(config: &KhiveConfig) -> Arc<[PathBuf]> {
+    config
+        .backends
+        .iter()
+        .filter(|backend| backend.kind == BackendKind::Sqlite)
+        .filter_map(|backend| backend.path.as_deref().map(khive_runtime::expand_tilde))
+        .collect::<Vec<_>>()
+        .into()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageTopologyPurpose {
     Serving,
@@ -3328,6 +3048,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     )
     .await?;
 
+    // Every pack sees the whole serving topology, including stores assigned
+    // to other packs, before handlers can accept a code.ingest target.
+    let declared_backend_db_paths = declared_backend_db_paths(khive_cfg);
+
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
     // main's models even when the pack itself is `no_embed`.
@@ -3335,7 +3059,8 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         let mut cfg = base_config.clone();
         cfg.backend_id = BackendId::main();
         cfg
-    });
+    })
+    .with_declared_backend_db_paths(declared_backend_db_paths.clone());
 
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
@@ -3367,6 +3092,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
                 rt_config,
                 &main_backend,
                 &default_runtime,
+                declared_backend_db_paths.clone(),
             ),
         );
     }
@@ -4250,7 +3976,8 @@ async fn build_single_backend_runtime_with_max_readers(
     )
     .await?;
 
-    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?;
+    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?
+        .with_declared_backend_db_paths(declared_backend_db_paths(khive_cfg));
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
     }
@@ -4353,11 +4080,14 @@ fn build_pack_runtime(
     rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
+    declared_backend_db_paths: Arc<[PathBuf]>,
 ) -> KhiveRuntime {
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
-    let rt = KhiveRuntime::from_backend(backend, rt_config).with_core_embedders_from(main_runtime);
+    let rt = KhiveRuntime::from_backend(backend, rt_config)
+        .with_declared_backend_db_paths(declared_backend_db_paths)
+        .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -6729,6 +6459,22 @@ id = "lambda:project-actor"
             .dispatch("stats", serde_json::json!({}))
             .await
             .expect("kg.stats dispatch succeeds");
+        let after_irrelevant = multi
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch after irrelevant stats");
+        assert_eq!(after_irrelevant["balanced_recall"]["total_events"], 0);
+
+        // Search is a relevant BrainSignal even when the corpus is empty.
+        multi
+            .registry
+            .dispatch(
+                "search",
+                serde_json::json!({"kind": "entity", "query": "hook-wiring-regression"}),
+            )
+            .await
+            .expect("kg.search dispatch succeeds");
 
         let state = multi
             .registry
@@ -6738,8 +6484,8 @@ id = "lambda:project-actor"
         let total_events = state["balanced_recall"]["total_events"]
             .as_u64()
             .unwrap_or(0);
-        assert!(
-            total_events > 0,
+        assert_eq!(
+            total_events, 1,
             "multi-backend dispatch hook must update the same BrainPack instance \
              the registry dispatches brain.* verbs to; got snapshot {state:?}"
         );
@@ -7968,6 +7714,47 @@ region = "us-east-1"
             },
             ..KhiveConfig::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_path = temp.path().join("main.db");
+        let secondary_path = temp.path().join("secondary.db");
+        let mut config = sqlite_multi_backend_config(main_path.clone(), secondary_path.clone());
+        config.packs.clear();
+        config.packs.insert(
+            "code".to_string(),
+            khive_runtime::PackConfig {
+                backend: "secondary".to_string(),
+                no_embed: false,
+            },
+        );
+        config.backends.push(BackendConfig {
+            name: "volatile".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: None,
+            read_only: false,
+        });
+        let mut base = base_runtime_config_for_multi_backend();
+        base.packs = vec!["kg".into(), "code".into()];
+
+        let multi = build_registry_for_multi_backend(base, &config, None)
+            .await
+            .expect("multi-backend code pack boots");
+        let expected = [main_path, secondary_path];
+        assert_eq!(
+            multi.default_runtime.declared_backend_db_paths(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            multi.per_pack_runtimes["code"].declared_backend_db_paths(),
+            expected.as_slice()
+        );
     }
 
     #[tokio::test]
@@ -9970,6 +9757,62 @@ region = "us-east-1"
     mod default_inbound_actor_tests {
         use super::*;
 
+        const EMAIL_READER: &str = "lambda:email-reader";
+
+        fn email_test_registry(runtime: KhiveRuntime) -> khive_runtime::VerbRegistry {
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg and comm through the factory path");
+            builder.with_gate(runtime.config().gate.clone());
+            builder.with_actor_id(runtime.config().actor_id.clone());
+            builder.build().expect("build email comm registry")
+        }
+
+        async fn ingest_fresh_email(
+            registry: &khive_runtime::VerbRegistry,
+            external_id: &str,
+            default_actor: &str,
+        ) {
+            registry
+                .dispatch(
+                    "comm.ingest",
+                    serde_json::json!({
+                        "namespace": "local",
+                        "from": "email:sender@example.com",
+                        "to": "email:mailbox@example.com",
+                        "content": "fresh email",
+                        "channel_kind": "email",
+                        "external_id": external_id,
+                        "default_inbound_actor": default_actor,
+                    }),
+                )
+                .await
+                .expect("fresh email ingests");
+        }
+
+        async fn dispatch_as(
+            registry: &khive_runtime::VerbRegistry,
+            actor_id: Option<&str>,
+            verb: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, khive_runtime::RuntimeError> {
+            registry
+                .dispatch_with_identity(
+                    verb,
+                    params,
+                    Some(khive_runtime::RequestIdentity {
+                        namespace: "local".to_string(),
+                        actor_id: actor_id.map(str::to_string),
+                        ..Default::default()
+                    }),
+                )
+                .await
+        }
+
         #[test]
         #[serial]
         fn default_inbound_actor_defaults_to_local() {
@@ -9998,6 +9841,217 @@ region = "us-east-1"
             let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "local", "blank env var must fall back to default");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn fresh_uncorrelated_email_defaults_to_local_inbox() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor =
+                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            assert_eq!(default_actor, "local");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let registry = email_test_registry(runtime);
+            ingest_fresh_email(&registry, "email-default-local", &default_actor).await;
+
+            let inbox = registry
+                .dispatch("comm.inbox", serde_json::json!({}))
+                .await
+                .expect("the default caller can read its inbox");
+            let messages = inbox["messages"].as_array().expect("inbox messages");
+            assert_eq!(
+                messages.len(),
+                1,
+                "fresh email must be in the default inbox"
+            );
+            assert_eq!(messages[0]["content"], "fresh email");
+            assert_eq!(messages[0]["properties"]["to_actor"], "local");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn opt_in_email_mailbox_is_visible_only_to_a_configured_reader() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email");
+            let default_actor =
+                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(default_actor, "channel:email");
+
+            let config: KhiveConfig = toml::from_str(&format!(
+                "[actor]\nid = 'channel:email'\nmailbox_readers = ['{EMAIL_READER}']\n"
+            ))
+            .expect("valid serving actor configuration");
+            config
+                .validate()
+                .expect("validate serving actor configuration");
+            let runtime_config = runtime_config_from_khive_config(
+                &config,
+                RuntimeConfig {
+                    db_path: None,
+                    ..RuntimeConfig::no_embeddings()
+                },
+            );
+            let runtime = KhiveRuntime::new(runtime_config).expect("configured runtime");
+            let registry = email_test_registry(runtime);
+            ingest_fresh_email(&registry, "email-opt-in-reader", &default_actor).await;
+
+            let inbox = dispatch_as(
+                &registry,
+                Some(EMAIL_READER),
+                "comm.inbox",
+                serde_json::json!({"mailbox_actor": "channel:email"}),
+            )
+            .await
+            .expect("the configured reader can select the email mailbox");
+            let messages = inbox["messages"].as_array().expect("inbox messages");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["content"], "fresh email");
+
+            let denied = dispatch_as(
+                &registry,
+                None,
+                "comm.inbox",
+                serde_json::json!({"mailbox_actor": "channel:email"}),
+            )
+            .await
+            .expect_err("the anonymous local caller has no delegated mailbox grant");
+            assert!(matches!(
+                denied,
+                khive_runtime::RuntimeError::PermissionDenied {
+                    ref verb,
+                    ref reason,
+                    ..
+                } if verb == "comm.inbox" && reason == "mailbox_read_not_granted"
+            ));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn email_sender_prefix_filters_fresh_ingest_from_local_sends() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor =
+                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let registry = email_test_registry(runtime);
+            ingest_fresh_email(&registry, "email-prefix-filter", &default_actor).await;
+            registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({"to": "local", "content": "local message"}),
+                )
+                .await
+                .expect("the local caller can send its control message");
+
+            let all = registry
+                .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                .await
+                .expect("read all local inbox messages");
+            let all_messages = all["messages"].as_array().expect("inbox messages");
+            assert_eq!(all_messages.len(), 2, "both messages must be present");
+            assert!(all_messages.iter().any(|message| {
+                message["content"] == "local message"
+                    && message["properties"]["from_actor"] == "local"
+            }));
+
+            let email = registry
+                .dispatch(
+                    "comm.inbox",
+                    serde_json::json!({"status": "all", "from_prefix": "email:"}),
+                )
+                .await
+                .expect("filter the inbox by email sender prefix");
+            let email_messages = email["messages"].as_array().expect("filtered messages");
+            assert_eq!(email_messages.len(), 1);
+            assert_eq!(email_messages[0]["content"], "fresh email");
+            assert!(email_messages[0]["properties"]["from_actor"]
+                .as_str()
+                .is_some_and(|actor| actor.starts_with("email:")));
+        }
+
+        #[tokio::test]
+        async fn send_rejects_a_forged_from_actor_and_stores_the_caller_identity() {
+            let mut config = RuntimeConfig {
+                db_path: None,
+                ..RuntimeConfig::no_embeddings()
+            };
+            config.actor_id = Some("lambda:sender".to_string());
+            let runtime = KhiveRuntime::new(config).expect("sender runtime");
+            let registry = email_test_registry(runtime);
+
+            let forged = registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "lambda:recipient",
+                        "content": "forged sender probe",
+                        "from_actor": "email:forged@example.com",
+                    }),
+                )
+                .await
+                .expect_err("from_actor is not a comm.send argument");
+            assert!(forged.to_string().contains("unknown field `from_actor`"));
+
+            registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "lambda:recipient",
+                        "content": "caller attribution control",
+                    }),
+                )
+                .await
+                .expect("valid send from the configured actor");
+            let sent = registry
+                .dispatch(
+                    "comm.inbox",
+                    serde_json::json!({"box": "sent", "fields": ["from_actor"]}),
+                )
+                .await
+                .expect("read the caller's sent message");
+            let messages = sent["messages"].as_array().expect("sent messages");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["from_actor"], "lambda:sender");
+        }
+
+        #[test]
+        fn email_shaped_actor_label_resolves_but_fails_toml_namespace_validation() {
+            let label = "email:forged@example.com";
+            let actor = khive_runtime::resolve_actor(Some(label));
+            assert_eq!(actor.kind, "actor");
+            assert_eq!(actor.id, label);
+
+            let config: KhiveConfig = toml::from_str(&format!("[actor]\nid = '{label}'\n"))
+                .expect("actor label parses as TOML text");
+            let error = config
+                .validate()
+                .expect_err("actor.id must satisfy namespace validation")
+                .to_string();
+            assert!(error.contains("invalid character"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn comm_ingest_without_a_channel_capability_is_refused() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime));
+            let registry = builder.build().expect("build direct comm composition");
+
+            let error = registry
+                .dispatch(
+                    "comm.ingest",
+                    serde_json::json!({
+                        "from": "email:sender@example.com",
+                        "to": "email:mailbox@example.com",
+                        "content": "fresh email",
+                        "default_inbound_actor": "local",
+                    }),
+                )
+                .await
+                .expect_err("a direct comm pack without the grant must refuse ingest");
+            assert!(error
+                .to_string()
+                .contains("no channel-ingest capability grant"));
         }
     }
 
@@ -14757,6 +14811,16 @@ mod poll_timing_tests;
 #[cfg(all(test, feature = "channel-email"))]
 #[path = "serve_outbox_claim_tests.rs"]
 mod outbox_claim_tests;
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox.rs"]
+mod outbox;
+
+include!("serve_outbox_parity_tests.rs");
+
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox_slug_tests.rs"]
+mod outbox_slug_tests;
 
 #[cfg(all(test, unix))]
 #[path = "serve_reader_pool_tests.rs"]

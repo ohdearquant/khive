@@ -127,9 +127,10 @@ impl PackRuntime for SessionPack {
             "session.list" => handlers::list::handle_list(runtime, token, params).await,
             "session.resume" => handlers::resume::handle_resume(runtime, token, params).await,
             "session.export" => handlers::export::handle_export(runtime, token, params).await,
+            "session.search" => handlers::search::handle_search(runtime, token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "session pack does not handle verb {verb:?}; valid verbs: \
-                 session.store, session.list, session.resume, session.export"
+                 session.store, session.list, session.resume, session.export, session.search"
             ))),
         }
     }

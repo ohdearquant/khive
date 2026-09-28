@@ -292,7 +292,7 @@ fn pack_column_read_only_validation_reports_all_missing_and_incompatible_columns
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("incompatible-columns.db");
     {
-        let backend = StorageBackend::sqlite(&path).unwrap();
+        let backend = StorageBackend::sqlite_for_test(&path).unwrap();
         backend
             .apply_pack_ddl_statements(&["CREATE TABLE upgrade_records (id INTEGER PRIMARY KEY, \
                  revision INTEGER NOT NULL, invalidated_at TEXT DEFAULT 'unknown')"])
@@ -300,7 +300,7 @@ fn pack_column_read_only_validation_reports_all_missing_and_incompatible_columns
     }
     #[cfg(unix)]
     khive_storage::test_support::freeze_snapshot_sidecars(&path);
-    let backend = StorageBackend::sqlite_read_only(&path).unwrap();
+    let backend = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
     let before = backend.pool().writer_acquisition_snapshot();
     assert_eq!(before, crate::pool::WriterAcquisitionSnapshot::default());
     let additions = [

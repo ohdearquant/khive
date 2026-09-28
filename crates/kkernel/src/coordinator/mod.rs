@@ -2,6 +2,7 @@
 
 mod dispatch;
 mod locator;
+mod ranking;
 mod registry;
 pub mod service;
 
@@ -12,5 +13,7 @@ pub use locator::LocatorCache;
 pub use registry::{BackendEntry, BackendRegistrationError, BackendRegistry};
 pub use service::SubstrateCoordinatorService;
 
+#[cfg(test)]
+mod ranking_tests;
 #[cfg(test)]
 mod tests;

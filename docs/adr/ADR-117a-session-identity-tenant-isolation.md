@@ -1,6 +1,6 @@
 # ADR-117a: Session Identity and Tenant Isolation
 
-**Status**: accepted (amended 2026-09-23)
+**Status**: accepted (amended 2026-09-24)
 **Date**: 2026-07-19
 **Authors**: khive maintainers
 **Implements**: [ADR-117](ADR-117-session-continuity-search.md) D1, D2, D4 (the direction ADR names
@@ -112,6 +112,12 @@ It must never pick one silently.
   stored provider value, which D2 promises to preserve, and it breaks lookups by the provider's own identifier.
 - **A per-source table.** Rejected. It multiplies every query and index by the source count for no gain over
   a key column.
+
+## Amendment 2 (2026-09-24): the D2 step lands in the global migration ledger
+
+**Status: Accepted (2026-09-24).** Refs #1469.
+
+Two sentences of this ADR are superseded. The Depends-on entry for ADR-028 says the session mirror schema is "pack-owned; this migration evolves that pack schema, not the core `migrations.rs`", and D2 opens "A pack-level migration (a versioned step in the session pack's schema evolution, not a new idempotent `CREATE`)". The versioned step D2 describes lands in the global versioned `MIGRATIONS` ledger in `khive-db` instead. The per-service `ServiceSchemaPlan` / `_schema_versions` API is legacy: `crates/khive-db/docs/migration.md` keeps it for backward compatibility and directs new schema changes to the versioned `MIGRATIONS` array. The target schema that D2 and Amendment 1 specify is unchanged, as are the migration's steps and its acceptance; only the ledger that records the step changes, and the step takes the next free version in that ledger when it merges.
 
 ## Context
 

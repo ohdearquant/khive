@@ -5,7 +5,7 @@ use std::any::Any;
 use std::path::PathBuf;
 
 fn file_runtime(path: PathBuf) -> KhiveRuntime {
-    let runtime = KhiveRuntime::new(crate::RuntimeConfig {
+    let runtime = KhiveRuntime::new_for_test(crate::RuntimeConfig {
         db_path: Some(path),
         embedding_model: None,
         additional_embedding_models: vec![],

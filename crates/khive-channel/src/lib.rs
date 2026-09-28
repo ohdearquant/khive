@@ -56,13 +56,17 @@ pub struct ChannelEnvelope {
     pub sent_at: Option<DateTime<Utc>>,
     /// External deduplication key.
     ///
-    /// For IMAP email the format is `imap:{host}:{uidvalidity}:{uid}` (e.g.
-    /// `imap:mail.example.com:1234567:42`).  This key is derived from the IMAP
-    /// UIDVALIDITY and UID values, not from the RFC 822 `Message-ID` header.
+    /// For IMAP email the format is `imap:{host}:{account}:{uidvalidity}:{uid}`.
+    /// This key is derived from the account, UIDVALIDITY and UID values, not
+    /// from the RFC 822 `Message-ID` header.
     /// Adapters must not populate this field when UIDVALIDITY or UID is absent
     /// or zero; `comm.ingest` performs atomic dedup against the unique index on
     /// this field.
     pub external_id: Option<String>,
+    /// The pre-account IMAP dedup key, used only to recognize stored rows
+    /// during the one-release migration window. Never persisted on new rows.
+    #[serde(default)]
+    pub legacy_external_id: Option<String>,
     /// External correlation key used to resolve the thread (e.g. X-Khive-Thread-ID header
     /// or In-Reply-To header value for email). The handler resolves this to an internal UUID.
     pub correlation_external_id: Option<String>,
@@ -108,6 +112,7 @@ impl ChannelEnvelope {
             subject: None,
             sent_at: None,
             external_id: None,
+            legacy_external_id: None,
             correlation_external_id: None,
             metadata: HashMap::new(),
             quarantine_replay: None,
@@ -134,6 +139,12 @@ impl ChannelEnvelope {
     /// Attach an external deduplication key.
     pub fn with_external_id(mut self, id: impl Into<String>) -> Self {
         self.external_id = Some(id.into());
+        self
+    }
+
+    /// Carry the old IMAP key for a read-only migration lookup on ingest.
+    pub fn with_legacy_external_id(mut self, id: impl Into<String>) -> Self {
+        self.legacy_external_id = Some(id.into());
         self
     }
 
@@ -282,9 +293,31 @@ pub enum SendOutcome {
     /// The legacy adapter accepted the send; not a recipient commit receipt.
     LegacyAccepted,
     /// The sender retains the message until a verified recipient receipt arrives.
-    Pending,
+    Pending(PendingDetail),
     RecipientStored(DeliveryReceipt),
     RecipientQuarantined(DeliveryReceipt),
+}
+
+/// Admission or hold information retained while waiting for a verified recipient receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDetail {
+    /// The service admitted the submission (`202`, or `200` with state `pending`).
+    /// The runtime uses this timestamp to schedule resubmission if no receipt arrives.
+    Admitted { admitted_at: DateTime<Utc> },
+    /// The service refused with an outcome that holds the message until the owner acts.
+    Held(HoldReason),
+    /// A receipt failed sender verification; the message stays pending with retry backoff.
+    ReceiptUnverified { reason: String },
+}
+
+/// A service refusal that suspends retry until the owner acts, leaving the message pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReason {
+    /// The sender's account cannot pay for admission (`402 insufficient_credit`).
+    InsufficientCredit,
+    /// The recipient's device or key epoch changed (`409 recipient_key_changed`).
+    /// Retry waits for the owner's confirmation of the new fingerprint.
+    RecipientKeyChanged,
 }
 
 impl SendOutcome {
@@ -407,6 +440,13 @@ pub enum ChannelError {
     /// Transport-level connection or I/O failure.
     #[error("transport error: {0}")]
     Transport(String),
+    /// A remote service rejected the request temporarily and supplied a
+    /// channel-wide wait before another request may be sent.
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: std::time::Duration,
+    },
     /// A definitive transport rejection for which retrying the same envelope
     /// cannot help (for example SMTP 5xx or a Telegram client-error response).
     #[error("permanent transport error: {0}")]
@@ -437,7 +477,9 @@ impl ChannelError {
     /// Classify this error for durable outbound-note delivery state.
     pub fn delivery_failure_class(&self) -> DeliveryFailureClass {
         match self {
-            Self::Transport(_) | Self::RetryableAuth(_) => DeliveryFailureClass::Transient,
+            Self::Transport(_) | Self::RetryableAuth(_) | Self::RateLimited { .. } => {
+                DeliveryFailureClass::Transient
+            }
             Self::Config(_)
             | Self::PermanentTransport(_)
             | Self::Auth(_)
@@ -856,7 +898,26 @@ mod tests {
         let stored = receipt(ReceiptDisposition::Stored);
         let quarantined = receipt(ReceiptDisposition::Quarantined);
         assert!(SendOutcome::LegacyAccepted.validate_receipt().is_ok());
-        assert!(SendOutcome::Pending.validate_receipt().is_ok());
+        assert!(SendOutcome::Pending(PendingDetail::Admitted {
+            admitted_at: Utc::now(),
+        })
+        .validate_receipt()
+        .is_ok());
+        assert!(
+            SendOutcome::Pending(PendingDetail::Held(HoldReason::InsufficientCredit))
+                .validate_receipt()
+                .is_ok()
+        );
+        assert!(
+            SendOutcome::Pending(PendingDetail::Held(HoldReason::RecipientKeyChanged))
+                .validate_receipt()
+                .is_ok()
+        );
+        assert!(SendOutcome::Pending(PendingDetail::ReceiptUnverified {
+            reason: "receipt signature does not match the pinned key".into(),
+        })
+        .validate_receipt()
+        .is_ok());
         assert!(SendOutcome::RecipientStored(stored.clone())
             .validate_receipt()
             .is_ok());

@@ -2,8 +2,8 @@
 //!
 //! `code.ingest` never writes to the shared production graph: it defaults to
 //! a dedicated map database colocated with the ingested path, and rejects an
-//! explicit `db` that resolves to the well-known production database path or
-//! to the calling runtime's actual configured database, with no override.
+//! explicit `db` that resolves to any production store known to this process,
+//! including declared backends, event stores and SQLite companions.
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +55,78 @@ fn same_path(a: &Path, b: &Path) -> bool {
     normalize(a) == normalize(b)
 }
 
+fn existing_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "code.ingest cannot establish target database identity for {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn same_existing_file(a: &Path, b: &Path) -> Result<Option<bool>, String> {
+    let Some(a_metadata) = existing_metadata(a)? else {
+        return Ok(None);
+    };
+    let Some(b_metadata) = existing_metadata(b)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(
+            a_metadata.dev() == b_metadata.dev() && a_metadata.ino() == b_metadata.ino(),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let _ = (a_metadata, b_metadata);
+        // Stable std metadata does not expose a Windows file id. The helper
+        // compares volume and file-index through read-only handles.
+        same_file::is_same_file(a, b).map(Some).map_err(|error| {
+            format!(
+                "code.ingest cannot establish target database identity for {}: {error}",
+                b.display()
+            )
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a_metadata, b_metadata);
+        Err("code.ingest cannot establish target database identity on this platform".to_string())
+    }
+}
+
+fn matches_protected_file(candidate: &Path, protected: &Path) -> Result<bool, String> {
+    Ok(
+        same_existing_file(candidate, protected)?
+            .unwrap_or_else(|| same_path(candidate, protected)),
+    )
+}
+
+fn append_sqlite_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn protected_store_members(base: &Path) -> Vec<PathBuf> {
+    let events = khive_runtime::events_split::events_db_path_beside(base);
+    [base, events.as_path()]
+        .into_iter()
+        .flat_map(|db| {
+            [
+                db.to_path_buf(),
+                append_sqlite_suffix(db, "-journal"),
+                append_sqlite_suffix(db, "-wal"),
+                append_sqlite_suffix(db, "-shm"),
+            ]
+        })
+        .collect()
+}
+
 /// Reject SQLite URI spellings and relative explicit targets before filesystem
 /// access (ADR-085 E7). This is syntax admission, not an open-time identity fence.
 pub(crate) fn validate_explicit_db_path(db: &str) -> Result<(), String> {
@@ -70,11 +142,10 @@ pub(crate) fn validate_explicit_db_path(db: &str) -> Result<(), String> {
 
 /// Resolve the `db` verb argument into a concrete target database path,
 /// defaulting to `<path>/.khive/code-map.db` when absent, and rejecting a
-/// target that resolves to the shared production database — either its
-/// well-known `$HOME/.khive/khive.db` default, or `runtime_db_path`, the
-/// database the calling `KhiveRuntime` was actually constructed against
-/// (`self.runtime.config().db_path` at the call site), so an operator running
-/// a non-default production location (`--db` / `KHIVE_DB`) is covered too.
+/// target that resolves to a production store known to this process: the
+/// default anchor, the calling runtime's configured database (or `KHIVE_DB`
+/// if unresolved), and every declared backend. Each store's event database
+/// and SQLite companions are protected as well.
 /// An explicit target must already be a regular file. This prevents typo-driven
 /// creation before runtime construction; it does not pin identity or protect
 /// against concurrent unlink/replacement between this check and SQLite open.
@@ -82,6 +153,7 @@ pub(crate) fn resolve_target_db(
     db_param: Option<&str>,
     ingest_path: &Path,
     runtime_db_path: Option<&Path>,
+    declared_backend_db_paths: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let candidate = match db_param {
         Some(p) => {
@@ -111,14 +183,16 @@ pub(crate) fn resolve_target_db(
         }
     }
 
-    for forbidden_path in &forbidden {
-        if same_path(&candidate, forbidden_path) {
-            return Err(format!(
-                "code.ingest refuses to target the shared production database ({}); pass \
-                 db=<path> pointing at a dedicated map database, or omit db to use the \
-                 workspace-local default",
-                forbidden_path.display()
-            ));
+    forbidden.extend_from_slice(declared_backend_db_paths);
+    for base in &forbidden {
+        for forbidden_path in protected_store_members(base) {
+            if matches_protected_file(&candidate, &forbidden_path)? {
+                return Err(format!(
+                    "code.ingest refuses to target the shared production database ({}); \
+                     select a different dedicated map database",
+                    forbidden_path.display()
+                ));
+            }
         }
     }
     if db_param.is_some() {
@@ -156,7 +230,7 @@ mod tests {
             "relative-map.db".to_string(),
             "".to_string(),
         ] {
-            let error = resolve_target_db(Some(&db), tmp.path(), None)
+            let error = resolve_target_db(Some(&db), tmp.path(), None, &[])
                 .expect_err("non-plain or relative explicit target must refuse");
             assert!(error.contains("absolute, plain filesystem path"), "{error}");
         }
@@ -167,7 +241,7 @@ mod tests {
     #[test]
     fn default_target_is_workspace_local() {
         let path = Path::new("/tmp/some-repo");
-        let db = resolve_target_db(None, path, None).expect("default resolves");
+        let db = resolve_target_db(None, path, None, &[]).expect("default resolves");
         assert_eq!(db, path.join(".khive").join("code-map.db"));
     }
 
@@ -180,7 +254,7 @@ mod tests {
         let _guard = KHIVE_DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::var("HOME").expect("HOME set in test env");
         let prod = format!("{home}/.khive/khive.db");
-        let err = resolve_target_db(Some(&prod), Path::new("/tmp/some-repo"), None)
+        let err = resolve_target_db(Some(&prod), Path::new("/tmp/some-repo"), None, &[])
             .expect_err("must reject the shared production database");
         assert!(err.contains("shared production database"));
     }
@@ -194,9 +268,78 @@ mod tests {
             Some(target.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None,
+            &[],
         )
         .expect("dedicated path accepted");
         assert_eq!(db, target);
+    }
+
+    #[test]
+    fn declared_backend_and_its_event_companions_are_protected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = tmp.path().join("secondary.db");
+        let events = khive_runtime::events_split::events_db_path_beside(&backend);
+        for target in [
+            backend.clone(),
+            append_sqlite_suffix(&backend, "-journal"),
+            append_sqlite_suffix(&backend, "-wal"),
+            append_sqlite_suffix(&backend, "-shm"),
+            events.clone(),
+            append_sqlite_suffix(&events, "-journal"),
+            append_sqlite_suffix(&events, "-wal"),
+            append_sqlite_suffix(&events, "-shm"),
+        ] {
+            std::fs::write(&target, b"unchanged").expect("sentinel file");
+            let error = resolve_target_db(
+                Some(target.to_str().expect("utf8 temp path")),
+                tmp.path(),
+                None,
+                std::slice::from_ref(&backend),
+            )
+            .expect_err("known production member must refuse");
+            assert!(error.contains(&target.display().to_string()), "{error}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hardlink_alias_is_protected_but_byte_copy_is_a_distinct_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = tmp.path().join("secondary.db");
+        let alias = tmp.path().join("alias.db");
+        let copy = tmp.path().join("copy.db");
+        std::fs::write(&backend, b"same bytes").unwrap();
+        std::fs::hard_link(&backend, &alias).unwrap();
+        std::fs::copy(&backend, &copy).unwrap();
+        let known = [backend];
+        let error = resolve_target_db(Some(alias.to_str().unwrap()), tmp.path(), None, &known)
+            .expect_err("hard link has the same file identity");
+        assert!(error.contains(&known[0].display().to_string()), "{error}");
+        assert_eq!(
+            resolve_target_db(Some(copy.to_str().unwrap()), tmp.path(), None, &known),
+            Ok(copy)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_error_refuses_instead_of_falling_back_to_pathnames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("dedicated.db");
+        let backend = tmp.path().join("backend.db");
+        let loop_target = tmp.path().join("loop.db");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&loop_target, &backend).unwrap();
+        std::os::unix::fs::symlink(&backend, &loop_target).unwrap();
+
+        let error = resolve_target_db(Some(target.to_str().unwrap()), tmp.path(), None, &[backend])
+            .expect_err("an uninspectable production member cannot be ignored");
+        assert!(
+            error.contains("cannot establish target database identity"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
     }
 
     #[test]
@@ -208,6 +351,7 @@ mod tests {
             Some(prod.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             Some(&prod),
+            &[],
         )
         .expect_err("must reject the runtime's actual configured production db");
         assert!(err.contains("shared production database"));
@@ -232,6 +376,7 @@ mod tests {
             Some(candidate.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             Some(&configured),
+            &[],
         )
         .expect_err("symlinked-parent alias of the configured db must be rejected");
         assert!(err.contains("shared production database"));
@@ -256,6 +401,7 @@ mod tests {
             Some(env_db.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None, // config().db_path unresolved — the #1042 gap
+            &[],
         );
         unsafe {
             std::env::remove_var("KHIVE_DB");
@@ -278,6 +424,7 @@ mod tests {
             Some(target.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None,
+            &[],
         )
         .expect("dedicated path accepted with no env override");
         assert_eq!(db, target);
@@ -339,6 +486,7 @@ mod tests {
             Some(prod.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None, // config().db_path unresolved — the #1042/#1062 gap
+            &[],
         )
         .expect_err("must reject the canonical production db even with HOME unset");
         assert!(err.contains("shared production database"));
@@ -363,6 +511,7 @@ mod tests {
             Some(prod.to_str().unwrap()),
             Path::new("/tmp/some-repo"),
             None,
+            &[],
         );
         // SAFETY: serialized by KHIVE_DB_ENV_LOCK above.
         unsafe {

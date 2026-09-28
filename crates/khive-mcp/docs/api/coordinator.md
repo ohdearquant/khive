@@ -11,10 +11,14 @@ subset of the search JSON.
 ## Complete search-filter contract (#1377)
 
 The validated request represents `kind`, `query`, `limit`, `entity_kind`,
-`entity_type`, `note_kind`, `include_superseded`, `properties`, `tags`, and
-`min_score`. The coordinator receives that type, forwards every applicable
-storage filter to every backend, and the MCP seam applies `min_score` to the
-merged ranking. `namespace` remains a transport/authentication field: it is
+`entity_type`, `note_kind`, `include_superseded`, `properties`, `tags`, `source`,
+`order_by`, and `min_rank_score`. In v0.8, `min_score` is its deprecated exact
+alias; supplying both names is invalid even when their values are equal. The
+floor retains its `[0,1]` input range and compares fixed-point final rank scores
+inclusively. The coordinator forwards storage filters to every backend, then
+applies the rank floor before the final time ordering and result limit. The MCP
+boundary also checks the deterministic floor before serialization.
+`namespace` remains a transport/authentication field: it is
 removed before KG parameter validation and resolved fail-closed by the registry
 gate seam.
 
@@ -26,6 +30,17 @@ note-only fields (`note_kind`, `include_superseded`) on an entity search are
 rejected with a substrate-specific validation error. `properties` must be an
 object and `tags` must be an array of strings. No accepted filter is silently
 dropped.
+
+Every hit publishes `rank_score`, `rank_score_kind`, and `signals`, with `score`
+as an exact compatibility alias of `rank_score`. Rank scores are strategy-local
+ordering values, not probabilities or comparable cross-query relevance. One
+selected backend preserves its rank, kind and evidence. Multiple selected
+backends use deterministic outer RRF and publish kind `rrf`; for repeated IDs,
+the complete evidence object comes from the contributing hit with the best
+within-backend rank, breaking ties by deterministic backend order. Missing
+signal keys remain absent rather than being filled from another backend.
+Component scores remain scoped to the producing backend and model. Agent
+presentation rounds numeric fields and drops an empty `signals` object.
 
 ## Partial-result advisory (#1370)
 

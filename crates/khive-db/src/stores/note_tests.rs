@@ -776,7 +776,7 @@ async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
         ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -985,7 +985,7 @@ async fn filtered_count_free_page_keeps_one_statement_snapshot_and_total_order()
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("note-count-free-snapshot.db")),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -1142,7 +1142,7 @@ async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQue
         ConnectionPool::new(PoolConfig {
             path: Some(path),
             write_queue_enabled: Some(false),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -1731,7 +1731,7 @@ async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("atomic-note-property-writer-task.db")),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -2243,6 +2243,39 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
     );
 }
 
+#[tokio::test]
+async fn try_insert_note_pk_collision_is_not_other_channel_dedup() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.writer().unwrap();
+        let v42 = crate::migrations::MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 42)
+            .expect("channel-scoped external ID migration");
+        writer.conn().execute_batch(v42.up).unwrap();
+    }
+
+    let existing =
+        make_note("ns1", "message", "lowercase channel").with_properties(serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "email",
+            "channel_slug": "user@example.com",
+        }));
+    assert!(store.try_insert_note(existing.clone()).await.unwrap());
+
+    let mut colliding_id =
+        make_note("ns1", "message", "other channel").with_properties(serde_json::json!({
+            "external_id": "imap:host:user@example.com:17:42",
+            "channel_kind": "email",
+            "channel_slug": "User@Example.com",
+        }));
+    colliding_id.id = existing.id;
+    assert!(
+        store.try_insert_note(colliding_id).await.is_err(),
+        "a primary-key collision must not be called deduplication merely because another channel owns the external ID"
+    );
+}
+
 // ── #827: single-note insert + notes_seq assignment atomicity ────────────
 
 /// Regression for #827: on the default flag-off (pool-mutex) path,
@@ -2716,7 +2749,7 @@ async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2773,7 +2806,7 @@ async fn upsert_note_routes_through_writer_task_when_flag_enabled() {
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
         write_queue_enabled: Some(true),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2867,7 +2900,7 @@ async fn upsert_note_reports_configured_write_queue_admission_deadline() {
         write_queue_enabled: Some(true),
         write_queue_capacity: 1,
         write_admission_deadline_ms: 100,
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
@@ -2973,7 +3006,7 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
         ConnectionPool::new(PoolConfig {
             path: Some(dir.path().join("note-late-writer-task.db")),
             write_queue_enabled: Some(true),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .unwrap(),
     );
@@ -4282,6 +4315,206 @@ async fn seek_after_paging_matches_offset_paging_exactly() {
     assert_eq!(
         offset_ids, cursor_ids,
         "keyset paging must reassemble the identical total order offset paging produces"
+    );
+}
+
+#[tokio::test]
+async fn instant_ordered_window_excludes_outside_rows() {
+    use khive_storage::note::{FilterOp, PropertyFilter, SortDir};
+
+    let store = setup_memory_store();
+    for (id, at) in [
+        (1, "2098-12-31T23:59:59.999999999Z"),
+        (2, "2099-01-01T05:00:00-05:00"),
+        (3, "2099-01-01T10:00:00.000000001Z"),
+        (4, "2099-01-01T10:00:01Z"),
+        (5, "not-a-date"),
+    ] {
+        let mut note = make_note("local", "scheduled_event", at);
+        note.id = Uuid::from_u128(id);
+        note.properties = Some(serde_json::json!({ "trigger_at": at }));
+        store.upsert_note(note).await.unwrap();
+    }
+    let filter = NoteFilter {
+        kind: Some("scheduled_event".into()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.trigger_at".into(),
+                op: FilterOp::Rfc3339Valid,
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.trigger_at".into(),
+                op: FilterOp::Rfc3339Gte,
+                value: SqlValue::Text("2099-01-01T10:00:00Z".into()),
+            },
+            PropertyFilter {
+                json_path: "$.trigger_at".into(),
+                op: FilterOp::Rfc3339Lte,
+                value: SqlValue::Text("2099-01-01T10:00:00.000000001Z".into()),
+            },
+        ],
+        order_by: Some(("$.trigger_at".into(), SortDir::Asc)),
+        order_by_instant: true,
+        ..Default::default()
+    };
+    let page = store
+        .query_notes_filtered_count_free(
+            "local",
+            &filter,
+            PageRequest {
+                limit: 20,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        vec![Uuid::from_u128(2), Uuid::from_u128(3)],
+        "SQL must return only the exact UTC window, including a crossing offset and nanosecond bound"
+    );
+}
+
+#[tokio::test]
+async fn instant_window_handles_utc_years_outside_rfc3339_text_range() {
+    use khive_storage::note::{FilterOp, PropertyFilter, SortDir};
+
+    let store = setup_memory_store();
+    for (id, at) in [
+        (1, "0000-01-01T00:00:00+23:59"),
+        (2, "9999-12-31T23:59:59-23:59"),
+    ] {
+        let mut note = make_note("local", "scheduled_event", at);
+        note.id = Uuid::from_u128(id);
+        note.properties = Some(serde_json::json!({ "trigger_at": at }));
+        store.upsert_note(note).await.unwrap();
+    }
+    for (id, at) in [
+        (1, "0000-01-01T00:00:00+23:59"),
+        (2, "9999-12-31T23:59:59-23:59"),
+    ] {
+        let instant = at.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let filter = NoteFilter {
+            kind: Some("scheduled_event".into()),
+            property_filters: vec![
+                PropertyFilter {
+                    json_path: "$.trigger_at".into(),
+                    op: FilterOp::Rfc3339Gte,
+                    value: SqlValue::Timestamp(instant),
+                },
+                PropertyFilter {
+                    json_path: "$.trigger_at".into(),
+                    op: FilterOp::Rfc3339Lte,
+                    value: SqlValue::Timestamp(instant),
+                },
+            ],
+            order_by: Some(("$.trigger_at".into(), SortDir::Asc)),
+            order_by_instant: true,
+            ..Default::default()
+        };
+        let page = store
+            .query_notes_filtered_count_free(
+                "local",
+                &filter,
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, Uuid::from_u128(id));
+    }
+}
+
+#[tokio::test]
+async fn instant_seek_survives_inserts_around_cursor() {
+    use khive_storage::note::{FilterOp, NoteInstantSeekAfter, PropertyFilter, SortDir};
+
+    let store = setup_memory_store();
+    let insert = |id: u128, at: &'static str| {
+        let mut note = make_note("local", "scheduled_event", at);
+        note.id = Uuid::from_u128(id);
+        note.properties = Some(serde_json::json!({ "trigger_at": at }));
+        note
+    };
+    for note in [
+        insert(1, "2099-01-01T05:00:00-05:00"),
+        insert(2, "2099-01-01T10:00:00Z"),
+        insert(3, "2099-01-01T11:00:00Z"),
+    ] {
+        store.upsert_note(note).await.unwrap();
+    }
+    let mut filter = NoteFilter {
+        kind: Some("scheduled_event".into()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.trigger_at".into(),
+            op: FilterOp::Rfc3339Valid,
+            value: SqlValue::Null,
+        }],
+        order_by: Some(("$.trigger_at".into(), SortDir::Asc)),
+        order_by_instant: true,
+        ..Default::default()
+    };
+    let first = store
+        .query_notes_filtered_count_free(
+            "local",
+            &filter,
+            PageRequest {
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.items[0].id, Uuid::from_u128(1));
+    filter.after_instant = Some(NoteInstantSeekAfter {
+        value: "2099-01-01T05:00:00-05:00".into(),
+        id: Uuid::from_u128(1),
+    });
+
+    // A new row before the cursor shifts every OFFSET page. A row behind the
+    // cursor must still be visible, including inside this equal-instant group.
+    store
+        .upsert_note(insert(4, "2099-01-01T04:00:00-06:00"))
+        .await
+        .unwrap();
+    store
+        .upsert_note(insert(5, "2099-01-01T09:00:00-01:00"))
+        .await
+        .unwrap();
+    let second = store
+        .query_notes_filtered_count_free(
+            "local",
+            &filter,
+            PageRequest {
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.items[0].id, Uuid::from_u128(5));
+    filter.after_instant = Some(NoteInstantSeekAfter {
+        value: "2099-01-01T09:00:00-01:00".into(),
+        id: Uuid::from_u128(5),
+    });
+    let third = store
+        .query_notes_filtered_count_free(
+            "local",
+            &filter,
+            PageRequest {
+                limit: 2,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        third.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        vec![Uuid::from_u128(2), Uuid::from_u128(3)]
     );
 }
 

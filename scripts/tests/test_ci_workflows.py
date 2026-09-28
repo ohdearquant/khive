@@ -1701,6 +1701,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "vamana-portability": "vamana portability (ADR-110 Layer A)",
         "minio-blob-compat": "MinIO BlobStore compatibility (ADR-111 Amendment 2)",
         "check-windows": "Windows compile check",
+        "msrv-check": "MSRV compile check",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
     }

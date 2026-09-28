@@ -186,6 +186,49 @@ async fn extract_text_keeps_unclosed_tag_text_across_removed_script_spans() {
 }
 
 #[tokio::test]
+async fn extract_links_respects_page_limit_and_reports_skipped_hrefs() {
+    let (runtime, registry, store, _dir) = fixture();
+    let body = br#"<a href="/one">one</a><a href="/two">two</a><a href="/three">three</a>"#;
+    let id = seed_page(&runtime, store.as_ref(), body.to_vec()).await;
+
+    let response = registry
+        .dispatch(
+            "web.extract",
+            json!({ "id": id, "kinds": ["links"], "link_limit": 2 }),
+        )
+        .await
+        .expect("web.extract accepts the per-page link limit");
+
+    assert_eq!(response["result"]["links"]["edges_created"], 2);
+    assert_eq!(response["result"]["links"]["skipped"], 1);
+    let links = runtime
+        .neighbors(
+            &runtime.authorize(Namespace::local()).unwrap(),
+            id,
+            khive_storage::Direction::Out,
+            None,
+            Some(vec![khive_storage::EdgeRelation::LinksTo]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 2, "the third target must not be written");
+}
+
+#[tokio::test]
+async fn extract_rejects_page_link_limits_above_the_supported_ceiling() {
+    let (runtime, registry, store, _dir) = fixture();
+    let id = seed_page(&runtime, store.as_ref(), b"<p>page</p>".to_vec()).await;
+
+    let error = registry
+        .dispatch("web.extract", json!({ "id": id, "link_limit": 1_001 }))
+        .await
+        .expect_err("the page link limit has a fixed upper bound");
+
+    assert!(error.to_string().contains("ceiling_exceeded"), "{error}");
+    assert!(error.to_string().contains("link_limit=1001"), "{error}");
+}
+
+#[tokio::test]
 async fn extract_refuses_foreign_source_before_parsing_its_blob_reference() {
     let (runtime, registry, _store, _dir) = fixture();
     let token = runtime.authorize(Namespace::local()).unwrap();
