@@ -103,9 +103,11 @@ pre-created empty dedicated file may initialize and migrate. Omitting `db` still
 an inode or prevent concurrent unlink/replacement between the check and SQLite open. Both explicit
 and default targets are checked against every production database this process knows: the default
 anchor, its runtime database, every declared backend, each adjacent events database, and their
-SQLite companions. Existing files are compared by file identity to catch hard links; missing
-members use normalized paths. An unrelated database unknown to this process is outside this
-preflight fence.
+SQLite companions. A declared backend reached through a symlink protects companions beside both
+the declared name and its physical database. Target symlinks are checked at their destination,
+including a dangling default-map link. Existing files are compared by file identity to catch hard
+links; missing members use normalized paths. An unrelated database unknown to this process is
+outside this preflight fence.
 
 The dedicated map is an ordinary khive database, not a private code-pack format. Every
 non-blocked entity upsert also updates its FTS document, and `code.ingest` reports the completed
