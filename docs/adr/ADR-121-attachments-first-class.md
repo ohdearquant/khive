@@ -1055,3 +1055,68 @@ add a row for every new version, advance `REVIEWED_SCHEMA_EPOCH` to that tip, an
 snapshot SHA before the collector accepts that epoch. Changes to pack-owned liveness schema,
 blob producers, or manifests independently repeat the review and gate updates required by
 Amendment 1 item 6.
+
+## Amendment 5 (2026-09-28): reviewed core-schema epoch 43 for blob GC
+
+**Status: Accepted (2026-09-28).** Amendment 4 requires this review whenever a migration lands after its table
+("a migration added after this table was reviewed invalidates the review"). The review covers V43.
+
+The reviewed core migration chain is V22–V43 at snapshot `e6f90dd41fc526c0ae78ea841b6fdbe4df48111e`. The
+terminal version is V43 because the final entry of `MIGRATIONS` is version 43
+(`crates/khive-db/src/migrations.rs:454-458`).
+
+The chain was re-read from V22. Between Amendment 4's snapshot `e6b34cb5e255d2e6572d20a979f45746484356c2` and
+this snapshot, the only changes under `crates/khive-db/sql/`, `crates/khive-db/src/migrations.rs` and
+`crates/khive-db/src/session_identity_migration.rs` are:
+
+- the added `crates/khive-db/sql/043-vector-provenance.sql`;
+- the `migrations.rs` lines that register it.
+
+Amendment 4's rows for V22–V42 therefore stand unchanged. One row is added:
+
+| Migration               | Tables touched                  | Blob-liveness effect | Source                                               |
+| ----------------------- | ------------------------------- | -------------------- | ---------------------------------------------------- |
+| V43 `vector_provenance` | `vector_provenance` table (new) | None                 | `crates/khive-db/sql/043-vector-provenance.sql:3-21` |
+
+V43 adds a sidecar that records, for each stored embedding:
+
+- the model key, subject, namespace and write time;
+- `embedding_digest`, a BLAKE3 hex digest of the stored embedding bytes (`crates/khive-db/src/stores/vectors.rs:622`);
+- optionally `text_fingerprint`, a BLAKE3 digest of the exact prepared input text.
+
+`text_fingerprint` is carried as a `ContentRef` value, but it names no stored object. Nothing is written to a
+`BlobStore` under it, and nothing dereferences it through one. The files that write or clear the sidecar make no
+`BlobStore` call:
+
+- `crates/khive-db/src/stores/vectors.rs`
+- `crates/khive-db/src/namespace_move.rs`
+- `crates/khive-runtime/src/note_write.rs`
+- `crates/khive-runtime/src/atomic_message.rs`
+- `crates/khive-runtime/src/atomic_prepare.rs`
+- `crates/khive-runtime/src/curation.rs`
+- `crates/kkernel/src/reindex.rs`
+
+The same search finds `BlobStore` calls in `crates/khive-pack-blob/src/uploads/tests.rs`, which serves as its
+positive control. V43 thus adds no producer and changes no blob reference. The collector does not read
+`vector_provenance`: `crates/khive-db/src/stores/blob.rs`, which holds `blob_gc_fencing_complete`, names it
+nowhere, while it names `attachments` throughout. A matching digest there keeps no blob alive.
+
+For this reviewed snapshot, `REVIEWED_SCHEMA_EPOCH = 43`. This value supersedes Amendment 4's
+`REVIEWED_SCHEMA_EPOCH = 42`. Every other sentence of Amendment 4 stands:
+
+- admission at exactly the named epoch;
+- `latest_schema_version()` equal to it;
+- a contiguous, canonically named ledger;
+- refusal of unknown and newer versions before root locking;
+- the ownership and store-binding checks of Amendment 1 items 7 and 8;
+- the #3497 quarantine-original repair.
+
+At this snapshot the named epoch is not yet in code. `blob_gc_fencing_complete` still admits exactly the
+completed V21 epoch (`crates/khive-db/src/stores/blob.rs:1576-1627`), and `REVIEWED_SCHEMA_EPOCH` appears only in ADR
+text (this ADR and ADR-160), not in code. A collector naming 42 would refuse every store migrated to V43, so it must not ship at 42. The change
+that implements the named-epoch admission names the migration tip at its own landing.
+
+A later migration invalidates this review, as Amendment 4 already requires. In particular, the blob pack-owner
+and blob root-binding migrations for Amendment 1 items 7 and 8 add blob owners and a store binding. They take
+the next free versions when they land, and they need their own reviewed rows, with their liveness effect
+stated, in the change that adds them. This row set does not cover them.
