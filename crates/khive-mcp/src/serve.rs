@@ -883,6 +883,19 @@ async fn cleanup_expired_channel_quarantine(
             }),
         )
         .await?;
+    // Historical quarantines predate channel slugs. Drain one bounded page
+    // per poll, with the same hold-on-error behavior as the exact-slug pass.
+    registry
+        .dispatch(
+            "comm.cleanup_expired_quarantine",
+            json!({
+                "namespace": ingest_namespace,
+                "channel_kind": channel_kind,
+                "channel_slug": "",
+                "mode": "legacy_slugless",
+            }),
+        )
+        .await?;
     Ok(())
 }
 
@@ -13981,6 +13994,229 @@ backend = "kg-backend"
                 .await
                 .unwrap();
             assert!(blob_attachment_refs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn legacy_slugless_cleanup_honors_retention_and_unowns_original() {
+            let (_blob_dir, runtime, registry, old_id, content_ref) =
+                retained_quarantine_fixture().await;
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            let notes = runtime.notes(&token).unwrap();
+            let attachments = runtime.attachments().unwrap();
+            let other = registry
+                .dispatch(
+                    "blob.put",
+                    json!({"bytes": BASE64.encode(b"other retained original")}),
+                )
+                .await
+                .unwrap();
+            let other_ref = other["content_ref"].as_str().unwrap().to_string();
+            let ingest = |external_id: &str, slug: &str| {
+                json!({
+                    "namespace": "retention-ns",
+                    "from": "email:quarantine",
+                    "to": "email:maintainer@example.com",
+                    "content": "Inbound message quarantined",
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "external_id": external_id,
+                    "metadata": {
+                        "quarantined": "true",
+                        "quarantine_content_ref": other_ref,
+                    }
+                })
+            };
+            let young = registry
+                .dispatch("comm.ingest", ingest("imap:retention:1:2", "young"))
+                .await
+                .unwrap();
+            let young_id: uuid::Uuid = young["full_id"].as_str().unwrap().parse().unwrap();
+            let slugged = registry
+                .dispatch("comm.ingest", ingest("imap:retention:1:3", "named"))
+                .await
+                .unwrap();
+            let slugged_id: uuid::Uuid = slugged["full_id"].as_str().unwrap().parse().unwrap();
+            let as_of = Utc::now().timestamp_micros();
+            let retention_us = 14 * 24 * 60 * 60 * 1_000_000;
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.unwrap();
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_remove(properties, '$.channel_slug'), \
+                              expires_at = NULL, created_at = ?1 WHERE id = ?2"
+                            .into(),
+                        params: vec![
+                            SqlValue::Integer(as_of - retention_us - 1),
+                            SqlValue::Text(old_id.to_string()),
+                        ],
+                        label: Some("old_slugless_retention_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_set(properties, '$.channel_slug', '  '), \
+                              expires_at = NULL, created_at = ?1 WHERE id = ?2"
+                            .into(),
+                        params: vec![
+                            SqlValue::Integer(as_of - retention_us + 1),
+                            SqlValue::Text(young_id.to_string()),
+                        ],
+                        label: Some("young_slugless_retention_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET expires_at = ?1 WHERE id = ?2".into(),
+                        params: vec![
+                            SqlValue::Integer(as_of - 1),
+                            SqlValue::Text(slugged_id.to_string()),
+                        ],
+                        label: Some("due_slugged_retention_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            drop(writer);
+
+            let ordinary_blank = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "",
+                        "as_of_micros": as_of,
+                    }),
+                )
+                .await;
+            assert!(matches!(
+                ordinary_blank,
+                Err(khive_runtime::RuntimeError::InvalidInput(_))
+            ));
+
+            let legacy_args = json!({
+                "namespace": "retention-ns",
+                "channel_kind": "email",
+                "channel_slug": "",
+                "mode": "legacy_slugless",
+                "as_of_micros": as_of,
+            });
+            let first = registry
+                .dispatch("comm.cleanup_expired_quarantine", legacy_args.clone())
+                .await
+                .unwrap();
+            assert_eq!(first["deleted"], 1);
+            assert!(notes.get_note(old_id).await.unwrap().is_none());
+            assert!(
+                attachments
+                    .get_attachment(old_id, "quarantine-original")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "expired original must be unowned"
+            );
+            assert!(
+                runtime
+                    .blob_store()
+                    .unwrap()
+                    .exists(&khive_storage::ContentRef::from_hex(content_ref.clone()).unwrap())
+                    .await
+                    .unwrap(),
+                "retention cleanup leaves blob reclamation to the collector"
+            );
+            let original_owners = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(SqlStatement {
+                    sql: "SELECT record_uuid FROM attachments WHERE content_ref = ?1".into(),
+                    params: vec![SqlValue::Text(content_ref.clone())],
+                    label: Some("legacy_slugless_original_owners".into()),
+                })
+                .await
+                .unwrap();
+            assert!(
+                original_owners.is_empty(),
+                "expired original must have no owner rows"
+            );
+            for id in [young_id, slugged_id] {
+                assert!(notes.get_note(id).await.unwrap().is_some());
+                assert!(
+                    attachments
+                        .get_attachment(id, "quarantine-original")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "nonselected originals stay rooted"
+                );
+            }
+            let second = registry
+                .dispatch("comm.cleanup_expired_quarantine", legacy_args)
+                .await
+                .unwrap();
+            assert_eq!(second["deleted"], 0);
+        }
+
+        #[tokio::test]
+        async fn channel_poll_cleanup_drains_legacy_slugless_partition() {
+            let (_blob_dir, runtime, registry, note_id, _content_ref) =
+                retained_quarantine_fixture().await;
+            let old = Utc::now().timestamp_micros() - 14 * 24 * 60 * 60 * 1_000_000 - 1;
+            assert_eq!(
+                runtime
+                    .sql()
+                    .writer()
+                    .await
+                    .unwrap()
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_remove(properties, '$.channel_slug'), \
+                              expires_at = NULL, created_at = ?1 WHERE id = ?2"
+                            .into(),
+                        params: vec![SqlValue::Integer(old), SqlValue::Text(note_id.to_string())],
+                        label: Some("daemon_legacy_cleanup_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            cleanup_expired_channel_quarantine(
+                &registry,
+                "retention-ns",
+                "email",
+                "mailbox@example.com",
+            )
+            .await
+            .unwrap();
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            assert!(runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note_id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(runtime
+                .attachments()
+                .unwrap()
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]

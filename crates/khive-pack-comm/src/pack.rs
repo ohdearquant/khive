@@ -383,7 +383,13 @@ impl PackRuntime for CommPack {
                 .await
             }
             "comm.cleanup_expired_quarantine" => {
-                handlers::handle_cleanup_expired_quarantine(self.runtime(), token, params).await
+                handlers::handle_cleanup_expired_quarantine(
+                    self.runtime(),
+                    token,
+                    params,
+                    self.quarantine_retention,
+                )
+                .await
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
