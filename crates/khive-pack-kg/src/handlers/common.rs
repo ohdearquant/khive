@@ -335,15 +335,24 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
     }
 
     // A registered subtype can also be a legacy base-kind alias (notably
-    // `paper`, `benchmark`, and `library`). Resolve the governed token before
-    // FromStr discards its subtype. Only canonical subtype tokens serve as
-    // `kind` values; subtype aliases remain available through `entity_type`.
+    // `paper`, `benchmark`, and `library`). Preserve the subtype only when its
+    // base agrees with that legacy parser. In particular, the KG Resource
+    // aliases `tool` and `skill` must not turn into Project rows merely
+    // because their names are registered as Project subtypes.
+    let legacy_base = EntityKind::from_str(raw)
+        .ok()
+        .map(EntityKind::name)
+        .or_else(|| {
+            crate::vocab::EntityKind::from_str(raw)
+                .ok()
+                .map(|kind| kind.name())
+        });
     let token = khive_types::to_snake_case(raw.trim());
     let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
-    let mut matches = composed
-        .definitions()
-        .iter()
-        .filter(|definition| definition.type_name == token.as_str());
+    let mut matches = composed.definitions().iter().filter(|definition| {
+        definition.type_name == token.as_str()
+            && legacy_base.is_none_or(|base| base == definition.kind.name())
+    });
     if let Some(first) = matches.next() {
         if matches.any(|definition| definition.kind != first.kind) {
             return Err(RuntimeError::InvalidInput(format!(
@@ -356,15 +365,9 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
         });
     }
 
-    if let Ok(k) = EntityKind::from_str(raw) {
+    if let Some(base) = legacy_base {
         return Ok(KindSpec::Entity {
-            specific: Some(k.name().to_string()),
-            entity_type: None,
-        });
-    }
-    if let Ok(k) = crate::vocab::EntityKind::from_str(raw) {
-        return Ok(KindSpec::Entity {
-            specific: Some(k.name().to_string()),
+            specific: Some(base.to_string()),
             entity_type: None,
         });
     }
@@ -408,13 +411,16 @@ pub(crate) fn reconcile_entity_type(
     }
 }
 
+/// A by-ID kind hint rejects a conflicting stored subtype. Legacy rows with
+/// NULL `entity_type` retain only their separately checked base-kind identity;
+/// list and search continue to apply their narrower subtype filters.
 pub(crate) fn ensure_entity_subtype(
     id: Uuid,
     actual: Option<&str>,
     expected: Option<&str>,
 ) -> Result<(), RuntimeError> {
-    if let Some(expected) = expected {
-        if actual != Some(expected) {
+    if let (Some(actual), Some(expected)) = (actual, expected) {
+        if actual != expected {
             return Err(RuntimeError::InvalidInput(format!(
                 "kind mismatch: {id} exists with entity_type {actual:?}, not {expected:?}"
             )));

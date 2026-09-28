@@ -1080,7 +1080,11 @@ pub async fn prepare_update(
                 ..
             }) = &expected_kind
             {
-                if entity.entity_type.as_deref() != Some(expected) {
+                if entity
+                    .entity_type
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected.as_str())
+                {
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
             }
@@ -1207,10 +1211,13 @@ async fn prepare_update_entity_plan_with_version_and_type(
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<AtomicOpPlan> {
     crate::entity_write::validate_expected_version(expected_version)?;
+    let explicit_entity_type_patch = patch.entity_type.is_some();
     let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
         runtime.prepare_update_entity(token, id, patch).await?;
-    if required_entity_type.is_some_and(|expected| entity.entity_type.as_deref() != Some(expected))
-    {
+    if required_entity_type.is_some_and(|expected| {
+        (explicit_entity_type_patch || entity.entity_type.is_some())
+            && entity.entity_type.as_deref() != Some(expected)
+    }) {
         return Err(RuntimeError::InvalidInput(
             "kind subtype contradicts the requested entity_type update".into(),
         ));
@@ -1550,7 +1557,11 @@ pub async fn prepare_delete(
                 ..
             }) = &expected_kind
             {
-                if entity.entity_type.as_deref() != Some(expected) {
+                if entity
+                    .entity_type
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected.as_str())
+                {
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
             }
@@ -3434,6 +3445,144 @@ mod tests {
         .await
         .expect_err("subtype-qualified update cannot change subtype");
         assert!(format!("{changed_type}").contains("contradicts"));
+    }
+
+    #[tokio::test]
+    async fn atomic_update_subtype_hint_accepts_legacy_null_but_refuses_conflicts() {
+        let runtime = scratch_runtime();
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let legacy = khive_storage::Entity::new("local", "document", "Legacy Document");
+        let legacy_id = legacy.id;
+        let mut typed = khive_storage::Entity::new("local", "document", "Typed Report");
+        typed.entity_type = Some("report".into());
+        let typed_id = typed.id;
+        let entities = runtime.entities(&token).expect("entities store");
+        entities
+            .upsert_entity(legacy)
+            .await
+            .expect("seed legacy row");
+        entities.upsert_entity(typed).await.expect("seed typed row");
+
+        let kind = || AtomicUpdateKind::Entity {
+            specific: Some("document".into()),
+            entity_type: Some("paper".into()),
+        };
+        let wrong_base = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string(), "name": "Wrong Base"}),
+            Some(AtomicUpdateKind::Entity {
+                specific: Some("artifact".into()),
+                entity_type: Some("paper".into()),
+            }),
+        )
+        .await
+        .expect_err("legacy NULL subtype cannot override a conflicting base kind");
+        assert!(matches!(wrong_base, RuntimeError::NotFound(_)));
+        let wrong_type = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": typed_id.to_string(), "name": "Wrong Type"}),
+            Some(kind()),
+        )
+        .await
+        .expect_err("stored non-NULL report must refuse a paper hint");
+        assert!(matches!(wrong_type, RuntimeError::NotFound(_)));
+        let clear = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string(), "entity_type": null}),
+            Some(kind()),
+        )
+        .await
+        .expect_err("an explicit clear still contradicts a paper hint");
+        assert!(matches!(clear, RuntimeError::InvalidInput(_)));
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string(), "name": "Renamed Legacy Document"}),
+            Some(kind()),
+        )
+        .await
+        .expect("matching base kind permits a paper hint on a legacy NULL row");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("commit legacy update");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        let updated = runtime
+            .get_entity(&token, legacy_id)
+            .await
+            .expect("read updated row");
+        assert_eq!(updated.name, "Renamed Legacy Document");
+        assert_eq!(updated.entity_type, None);
+    }
+
+    #[tokio::test]
+    async fn atomic_delete_subtype_hint_accepts_legacy_null_but_refuses_conflicts() {
+        let runtime = scratch_runtime();
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let legacy = khive_storage::Entity::new("local", "document", "Legacy Deletion");
+        let legacy_id = legacy.id;
+        let mut typed = khive_storage::Entity::new("local", "document", "Typed Deletion");
+        typed.entity_type = Some("report".into());
+        let typed_id = typed.id;
+        let entities = runtime.entities(&token).expect("entities store");
+        entities
+            .upsert_entity(legacy)
+            .await
+            .expect("seed legacy row");
+        entities.upsert_entity(typed).await.expect("seed typed row");
+
+        let kind = || AtomicDeleteKind::Entity {
+            specific: Some("document".into()),
+            entity_type: Some("paper".into()),
+        };
+        let wrong_base = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string()}),
+            Some(AtomicDeleteKind::Entity {
+                specific: Some("artifact".into()),
+                entity_type: Some("paper".into()),
+            }),
+        )
+        .await
+        .expect_err("legacy NULL subtype cannot override a conflicting base kind");
+        assert!(matches!(wrong_base, RuntimeError::NotFound(_)));
+        let wrong_type = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": typed_id.to_string()}),
+            Some(kind()),
+        )
+        .await
+        .expect_err("stored non-NULL report must refuse a paper hint");
+        assert!(matches!(wrong_type, RuntimeError::NotFound(_)));
+
+        let plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": legacy_id.to_string()}),
+            Some(kind()),
+        )
+        .await
+        .expect("matching base kind permits a paper hint on a legacy NULL row");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("commit legacy delete");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        assert!(runtime
+            .resolve_by_id(&token, legacy_id)
+            .await
+            .expect("resolve deleted row")
+            .is_none());
     }
 
     /// Raw natural-key probe of `graph_edges` (namespace, source_id,

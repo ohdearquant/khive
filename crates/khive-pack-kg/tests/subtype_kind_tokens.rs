@@ -7,23 +7,32 @@ use khive_runtime::{
 use khive_types::{EntityKind, EntityTypeDef, Pack};
 use serde_json::{json, Value};
 
-struct BrainTypeFixture;
+struct RegisteredSubtypeFixture;
 
-impl Pack for BrainTypeFixture {
-    const NAME: &'static str = "brain_type_fixture";
+impl Pack for RegisteredSubtypeFixture {
+    const NAME: &'static str = "registered_subtype_fixture";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[];
     const REQUIRES: &'static [&'static str] = &["kg"];
-    const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
-        kind: EntityKind::Artifact,
-        type_name: "brain_profile",
-        aliases: &[],
-    }];
+    const ENTITY_TYPES: &'static [EntityTypeDef] = &[
+        EntityTypeDef {
+            kind: EntityKind::Artifact,
+            type_name: "brain_profile",
+            aliases: &[],
+        },
+        // The tool pack registers this Project subtype; its spelling also
+        // predates the pack as a KG Resource alias.
+        EntityTypeDef {
+            kind: EntityKind::Project,
+            type_name: "skill",
+            aliases: &[],
+        },
+    ];
 }
 
 #[async_trait]
-impl PackRuntime for BrainTypeFixture {
+impl PackRuntime for RegisteredSubtypeFixture {
     fn name(&self) -> &str {
         Self::NAME
     }
@@ -56,7 +65,7 @@ impl PackRuntime for BrainTypeFixture {
         _token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         Err(RuntimeError::InvalidInput(format!(
-            "BrainTypeFixture does not handle {verb:?}"
+            "RegisteredSubtypeFixture does not handle {verb:?}"
         )))
     }
 }
@@ -65,7 +74,14 @@ fn registry() -> VerbRegistry {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(runtime));
-    builder.register(BrainTypeFixture);
+    builder.register(RegisteredSubtypeFixture);
+    builder.build().expect("registry builds")
+}
+
+fn bare_registry() -> VerbRegistry {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime));
     builder.build().expect("registry builds")
 }
 
@@ -155,7 +171,12 @@ async fn registry_kind_tokens_preserve_their_subtypes() {
 #[tokio::test]
 async fn explicit_pairs_and_legacy_base_aliases_remain_distinct() {
     let registry = registry();
-    for (kind, entity_type) in [("artifact", "snapshot"), ("service", "api")] {
+    for (kind, entity_type) in [
+        ("artifact", "snapshot"),
+        ("service", "api"),
+        ("project", "tool"),
+        ("project", "skill"),
+    ] {
         let row = registry
             .dispatch(
                 "create",
@@ -182,9 +203,14 @@ async fn explicit_pairs_and_legacy_base_aliases_remain_distinct() {
         assert_eq!(row["kind"], base);
         assert!(row["entity_type"].is_null());
     }
-    let tool = create(&registry, "tool", "Governed Tool").await;
-    assert_eq!(tool["kind"], "project");
-    assert_eq!(tool["entity_type"], "tool");
+    let bare = bare_registry();
+    for (label, checked_registry) in [("bare", &bare), ("extra types", &registry)] {
+        for alias in ["tool", "skill"] {
+            let row = create(checked_registry, alias, &format!("{label} Legacy {alias}")).await;
+            assert_eq!(row["kind"], "resource", "{label}: {alias}");
+            assert!(row["entity_type"].is_null(), "{label}: {alias}");
+        }
+    }
 
     let wrong_base = registry
         .dispatch(
@@ -266,6 +292,82 @@ async fn subtype_tokens_reject_conflicting_fields_and_mutations() {
         .await
         .expect_err("a subtype-qualified merge must check both operands");
     assert!(error.to_string().contains("entity_type"), "{error}");
+}
+
+#[tokio::test]
+async fn subtype_qualified_by_id_verbs_accept_legacy_null_entity_type() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+
+    // Rows written before subtype persistence still carry the right base kind.
+    let first = runtime
+        .create_entity(&token, "document", None, "Legacy Paper", None, None, vec![])
+        .await
+        .expect("legacy document");
+    let second = runtime
+        .create_entity(
+            &token,
+            "document",
+            None,
+            "Legacy Paper Updated",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("second legacy document");
+
+    registry
+        .dispatch(
+            "update",
+            json!({"id": first.id, "kind": "paper", "name": "Legacy Paper Updated"}),
+        )
+        .await
+        .expect("subtype-qualified update accepts legacy null subtype");
+    let persisted = runtime
+        .get_entity(&token, first.id)
+        .await
+        .expect("read updated legacy row");
+    assert_eq!(persisted.kind, "document");
+    assert_eq!(
+        persisted.entity_type, None,
+        "update does not invent a subtype"
+    );
+
+    registry
+        .dispatch("delete", json!({"id": first.id, "kind": "paper"}))
+        .await
+        .expect("subtype-qualified delete accepts legacy null subtype");
+    registry
+        .dispatch("restore", json!({"id": first.id, "kind": "paper"}))
+        .await
+        .expect("subtype-qualified restore accepts legacy null subtype");
+    let merge = registry
+        .dispatch(
+            "merge",
+            json!({
+                "kind": "paper",
+                "into_id": first.id,
+                "from_id": second.id,
+                "dry_run": true,
+            }),
+        )
+        .await
+        .expect("subtype-qualified merge can inspect two legacy null rows");
+    assert_eq!(merge["dry_run"], true);
+
+    let wrong_base = runtime
+        .create_entity(&token, "artifact", None, "Wrong Base", None, None, vec![])
+        .await
+        .expect("artifact without subtype");
+    let error = registry
+        .dispatch("update", json!({"id": wrong_base.id, "kind": "paper"}))
+        .await
+        .expect_err("a null subtype never bypasses the base-kind check");
+    assert!(error.to_string().contains("kind mismatch"), "{error}");
 }
 
 #[tokio::test]
