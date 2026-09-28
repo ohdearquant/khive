@@ -241,6 +241,53 @@ SMTP `Message-ID` equals the claimed `external_id`, that a successful delivery
 stamps the same value in `transport_message_id`, and that redelivery reuses the
 claim rather than deriving a new ID.
 
+## Amendment 3 (2026-09-28): bind outbound Message-ID to its own note
+
+**Status: Accepted (2026-09-28).**
+
+### Context
+
+Accepted Amendment 2 persists `external_id` before SMTP and reuses any existing nonempty value verbatim. That protects at-least-once resend identity but treats the stored value as owner-claimed. Merged #3380 now rejects caller-supplied `external_id` at generic/wire message create and update. It does not prove the origin of pre-#3380 rows or of trusted in-process writes. On current main, the outbox reuses a nonempty value without checking it (`serve_outbox.rs:399-400`), `comm.ingest` searches outbound `$.external_id` for reply attribution (`handlers.rs:2410-2441`), and `comm.reply` derives outbound-parent `In-Reply-To`/`References` from it (`handlers.rs:1591-1597,3650-3662`). A caller could have copied a victim's Message-ID onto another outbound note before #3380. Matching only a plausible UUID or domain would not bind the ID to the row that presents it.
+
+### Decision
+
+1. For an outbound **email** message note with ID `N`, an accepted stored `external_id` has the exact canonical form `<N@D>`: `N` is that row's own canonical note UUID, and `D` is one of the selected sending channel's configured current or explicitly configured historical sending domains. The allowlist is configuration, never a hard-coded domain list or a domain inferred from the untrusted stored value. The current sender mailbox domain used to mint new IDs is included. No global `localhost` exception exists; the existing no-domain mailbox fallback is accepted only when the selected channel's derived/configured domain is `localhost`.
+2. If `external_id` is absent or empty, the owner-only claim persists `<N@current-domain>` **before** SMTP as Amendment 2 requires. If it is nonempty, the outbox may reuse it only after the exact own-ID and configured-domain check. It neither normalizes nor overwrites an unverifiable value automatically. A mailbox-domain change preserves redelivery identity when the former domain remains explicitly configured as historical.
+3. An unverifiable nonempty value is a **visible parked refusal**, not a send and not a silent skip. The owner path records a typed `external_id_unverifiable` hold on the message with a diagnostic reason, leaves it undelivered and out of automatic send selection, and emits one keyed, operator-visible non-message diagnostic note linked to the offending message. It never calls SMTP. If recording the hold or note fails, the current pass still refuses SMTP and reports that diagnostic-write failure; a later pass may retry the diagnostic. Clearing the hold or replacing the value requires explicit owner remediation under a separately reviewed path. No implicit terminal `delivery="failed"` stamp is used to hide an unresolved row.
+4. `comm.ingest` may attribute a Message-ID reply to an outbound note only after validating that candidate row's own-ID-bound `external_id` and configured domain. Selection must validate before taking a one-row result; an unverified duplicate cannot shadow a valid owner row. When no verified outbound row matches, it does not adopt the unverified row's thread or actor. Existing UUID thread-root fallback is independent and remains subject to its own contract.
+5. `comm.reply` must not put an unverifiable outbound parent's `external_id` into `In-Reply-To` or `References`. A requested reply that would do so returns a typed `external_id_unverifiable` refusal before creating the reply; absence of an `external_id` retains Amendment 2's existing no-header behavior. Inbound-parent `wire_message_id` semantics are unchanged.
+
+This supersedes Amendment 2's unconditional reuse of **any** nonempty stored outbound email `external_id`, while retaining its mint-before-send value and at-least-once resend contract for verified values. The direct runtime/typed-store API remains a trusted in-process boundary; this amendment defines checks at the three sinks rather than asserting that old rows were retroactively provenance-marked.
+
+### Evidence
+
+A read-only review of delivered outbound email rows across deployments dated
+2026-07-24 through 2026-08-01 found 58 nonempty `external_id` values whose UUID
+was not the row's own ID. All 58 used the legacy
+`<uuid_v5(fixed namespace, row's own ID)@khive.invalid>` form. Every other
+nonempty value in that review had the canonical `<own-id@khive.ai>` form.
+The retired `khive-component-email` writer at
+`crates/khive-component-email/src/lib.rs:773-775` in commit `1c518c01d`
+minted the legacy form. Its exact removal point remains unverified.
+
+Those 58 values fail the own-ID check and are parked if their rows become
+eligible for another send; earlier deliveries are not rewritten. Replies that
+cite those Message-IDs cannot use `external_id` to claim an outbound row; only
+the independent UUID thread-root fallback may apply. `comm.reply` with one of
+those outbound rows as its parent refuses with `external_id_unverifiable` before
+creating a reply.
+
+### Acceptance arms
+
+- Valid current-domain and configured historical-domain own-ID values are reused unchanged after a crash; an absent value is claimed before SMTP. An unconfigured domain, malformed ID, or other row's ID is parked with the typed refusal and one diagnostic note, and sends nothing.
+- A victim note and a second outbound note carrying the victim's otherwise well-formed `<victim-id@allowed-domain>` are distinguished by **row ownership**. The second row is parked at send. An inbound reply using the victim ID attributes to the victim, never the second row even if it sorts first. `comm.reply` on the second row cannot emit that value as `In-Reply-To` or `References`.
+- Independent mutation controls remove the own-ID comparison at each of the outbox, ingest-correlation, and parent-header sinks; each must turn its named acceptance test red. A test that checks only angle brackets, UUID parseability, or allowed domain does not satisfy this arm.
+- Generic/wire `create` and `update` still reject caller-supplied `external_id` as #3380 requires; trusted `comm.ingest` and owner claim remain possible.
+
+### Consequences and scope
+
+The current behavior may have already delivered or correlated legacy rows. A3 does not rewrite past sends or claims cryptographic provenance. Historical sending domains must be explicitly configured to preserve otherwise valid own-ID claims after a mailbox-domain change. This amendment requires source changes at all three sinks and at the hold/diagnostic path in the same coherent implementation; a one-method runtime guard does not implement the decision.
+
 ## Consequences
 
 - Operator-configured-recipient email delivery works, including the backlog written

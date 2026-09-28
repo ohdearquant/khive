@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
+    EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan,
+    VerbRegistry,
 };
 use khive_types::{HandlerDef, Pack};
 
@@ -30,6 +31,7 @@ pub struct CommPack {
     /// to `self` so each instance's grant reflects only what was explicitly
     /// given to it.
     channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
+    email_message_id_domains: Result<Option<EmailMessageIdDomains>, String>,
 }
 
 impl Pack for CommPack {
@@ -54,7 +56,21 @@ impl CommPack {
             runtime,
             inbox_signal: InboxSignal::new(),
             channel_ingest: std::sync::OnceLock::new(),
+            email_message_id_domains: EmailMessageIdDomains::from_env(),
         }
+    }
+
+    /// Explicit composition of the selected email channel's domain policy.
+    pub fn new_with_email_message_id_domains(
+        runtime: KhiveRuntime,
+        domains: EmailMessageIdDomains,
+    ) -> Self {
+        Self::new(runtime).with_email_message_id_domains(domains)
+    }
+
+    pub fn with_email_message_id_domains(mut self, domains: EmailMessageIdDomains) -> Self {
+        self.email_message_id_domains = Ok(Some(domains));
+        self
     }
 
     /// Create a new `CommPack` with the trusted channel-ingest capability
@@ -87,8 +103,15 @@ impl CommPack {
 /// metadata into a forged quarantine or channel attribution. `comm.ingest`
 /// writes through `try_create_note`, deliberately outside the generic write
 /// validator/hook seams, and therefore remains the sole legitimate writer.
-const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug"];
+const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] = &[
+    "quarantined",
+    "channel_kind",
+    "channel_slug",
+    "delivery_hold",
+    "delivery_hold_reason",
+    "delivery_hold_at",
+    "external_id_diagnostic_note_id",
+];
 
 fn transport_owned_message_property_named_in(
     properties: &serde_json::Map<String, Value>,
@@ -351,7 +374,14 @@ impl PackRuntime for CommPack {
             "comm.mark_read" => handlers::handle_mark_read(self.runtime(), token, params).await,
             "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
             "comm.reply" => {
-                handlers::handle_reply(self.runtime(), &self.inbox_signal, token, params).await
+                handlers::handle_reply(
+                    self.runtime(),
+                    &self.inbox_signal,
+                    &self.email_message_id_domains,
+                    token,
+                    params,
+                )
+                .await
             }
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             "comm.ingest" => {
@@ -359,6 +389,7 @@ impl PackRuntime for CommPack {
                     self.runtime(),
                     &self.inbox_signal,
                     self.channel_ingest_capability(),
+                    &self.email_message_id_domains,
                     token,
                     params,
                 )

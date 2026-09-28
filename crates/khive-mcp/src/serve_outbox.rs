@@ -6,7 +6,7 @@ pub(super) enum OutboxPolicy<'a> {
     #[cfg(feature = "channel-email")]
     Email {
         mailbox: &'a str,
-        domain: &'a str,
+        domains: &'a khive_runtime::EmailMessageIdDomains,
         allowlist: &'a [String],
     },
     #[cfg(feature = "channel-telegram")]
@@ -138,25 +138,71 @@ impl OutboxPolicy<'_> {
         runtime: &KhiveRuntime,
         token: &khive_runtime::NamespaceToken,
         note: &Note,
-    ) -> Option<Prepared> {
+    ) -> Result<Option<Prepared>, crate::components::ComponentError> {
         match self {
             #[cfg(feature = "channel-email")]
             Self::Email {
                 mailbox,
-                domain,
+                domains,
                 allowlist,
-            } => prepare_email(runtime, token, note, mailbox, domain, allowlist).await,
+            } => prepare_email(runtime, token, note, mailbox, domains, allowlist).await,
             #[cfg(feature = "channel-telegram")]
             Self::Telegram(_) => {
                 let _ = (runtime, token);
-                let to = note.properties.as_ref()?.get("to_actor")?.as_str()?;
-                Some(Prepared {
+                let Some(to) = note
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get("to_actor"))
+                    .and_then(|v| v.as_str())
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Prepared {
                     envelope: ChannelEnvelope::new("telegram:bot", to, note.content.clone()),
                     external_id: None,
                     recipient: to.to_string(),
-                })
+                }))
             }
         }
+    }
+    async fn retry_held_diagnostics(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &khive_runtime::NamespaceToken,
+    ) -> Result<(), crate::components::ComponentError> {
+        #[cfg(feature = "channel-email")]
+        if matches!(self, Self::Email { .. }) {
+            match runtime
+                .list_outbound_external_id_holds_missing_diagnostic(token, 200)
+                .await
+            {
+                Ok(held) => {
+                    for note in held {
+                        let reason = note
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.get("delivery_hold_reason"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("stored Message-ID failed ownership validation");
+                        persist_email_diagnostic(runtime, token, note.id, reason)
+                            .await
+                            .map_err(|error| crate::components::ComponentError::Retryable(
+                                format!("external_id_unverifiable: held diagnostic write failed for {}: {error}", note.id)
+                            ))?;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(target: "khive_mcp::serve", error = %error,
+                        "external_id_unverifiable: failed to scan held diagnostic retries");
+                    return Err(crate::components::ComponentError::Retryable(format!(
+                        "external_id_unverifiable: held diagnostic scan failed: {error}"
+                    )));
+                }
+            }
+        }
+        #[cfg(not(feature = "channel-email"))]
+        let _ = (runtime, token);
+        Ok(())
     }
     fn scan_error(&self, error: &khive_runtime::RuntimeError, authorization: bool) {
         match (self.kind(), authorization) {
@@ -239,6 +285,7 @@ pub(super) async fn outbox_once(
         policy.scan_error(&error, true);
         ComponentError::Permanent(error.to_string())
     })?;
+    policy.retry_held_diagnostics(runtime, &token).await?;
     let notes = runtime
         .list_undelivered_outbound_messages(&token, Some(policy.prefix()), 200)
         .await
@@ -260,6 +307,9 @@ pub(super) async fn outbox_once(
         };
         if props.get("direction").and_then(serde_json::Value::as_str) != Some("outbound")
             || note_already_delivered(props)
+            || props
+                .get("delivery_hold")
+                .is_some_and(|value| !value.is_null())
         {
             continue;
         }
@@ -273,7 +323,7 @@ pub(super) async fn outbox_once(
         let Some(channel) = channels.select(policy.kind(), props, &mut warned) else {
             continue;
         };
-        let Some(prepared) = policy.prepare(runtime, &token, &note).await else {
+        let Some(prepared) = policy.prepare(runtime, &token, &note).await? else {
             continue;
         };
         match channel.channel().send(prepared.envelope).await {
@@ -315,17 +365,62 @@ async fn prepare_email(
     token: &khive_runtime::NamespaceToken,
     note: &Note,
     mailbox: &str,
-    domain: &str,
+    domains: &khive_runtime::EmailMessageIdDomains,
     allowlist: &[String],
-) -> Option<Prepared> {
+) -> Result<Option<Prepared>, crate::components::ComponentError> {
     use chrono::Utc;
-    let props = note.properties.as_ref()?.as_object()?;
+    let Some(props) = note
+        .properties
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(None);
+    };
     let note_id = note.id.to_string();
-    let recipient = props
-        .get("to_actor")?
-        .as_str()?
-        .strip_prefix("email:")?
-        .to_string();
+    let Some(recipient) = props
+        .get("to_actor")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|to| to.strip_prefix("email:"))
+    else {
+        return Ok(None);
+    };
+    let recipient = recipient.to_string();
+    // Verify a pre-existing claim before any other per-row disposition. Even
+    // an allowlist-denied recipient must not turn an unverifiable Message-ID
+    // into a terminal failure that hides the operator-visible hold.
+    let stored_external_id = props
+        .get("external_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|external_id| !external_id.is_empty());
+    if let Some(external_id) = stored_external_id {
+        if !domains.verifies_channel_slug(props.get("channel_slug").and_then(|v| v.as_str()))
+            || !domains.verify(note.id, external_id)
+        {
+            let reason = format!(
+                "stored external_id is not the canonical Message-ID for outbound note {note_id} under its configured sending domains"
+            );
+            let hold = runtime
+                .hold_outbound_message_external_id_unverifiable(token, note.id, reason.clone())
+                .await;
+            if let Err(error) = &hold {
+                tracing::error!(target: "khive_mcp::serve", note_id = %note_id, error = %error,
+                    "external_id_unverifiable: failed to record outbound hold");
+            }
+            let diagnostic = persist_email_diagnostic(runtime, token, note.id, &reason).await;
+            tracing::error!(target: "khive_mcp::serve", note_id = %note_id, reason = %reason,
+                "external_id_unverifiable: outbound email parked without SMTP");
+            if let Some(error) = hold
+                .err()
+                .map(|error| error.to_string())
+                .or_else(|| diagnostic.err().map(|error| error.to_string()))
+            {
+                return Err(crate::components::ComponentError::Retryable(format!(
+                    "external_id_unverifiable: diagnostic write failed for {note_id}: {error}"
+                )));
+            }
+            return Ok(None);
+        }
+    }
     if !allowlist.is_empty() && !allowlist.contains(&recipient) {
         // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
         // must be recorded — skipping with only a log line leaves the row
@@ -354,7 +449,7 @@ async fn prepare_email(
                 "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
             ),
         }
-        return None;
+        return Ok(None);
     }
 
     let subject = props
@@ -378,10 +473,10 @@ async fn prepare_email(
 
     // Mint-before-send through the comm-routed runtime's owner-only path.
     // Generic `update` correctly refuses caller patches to `external_id`.
-    let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
-        Some(external_id) if !external_id.is_empty() => external_id.to_string(),
+    let message_id = match stored_external_id {
+        Some(external_id) => external_id.to_string(),
         _ => {
-            let message_id = format!("<{note_id}@{domain}>");
+            let message_id = domains.mint(note.id);
             let claim_result = match uuid::Uuid::parse_str(&note_id) {
                 Ok(uuid) => {
                     runtime
@@ -414,7 +509,7 @@ async fn prepare_email(
                         "outbox loop: claim failed and failure state could not be recorded"
                     ),
                 }
-                return None;
+                return Ok(None);
             }
             message_id
         }
@@ -437,11 +532,30 @@ async fn prepare_email(
         envelope = envelope.with_references(references);
     }
 
-    Some(Prepared {
+    Ok(Some(Prepared {
         envelope,
         external_id: Some(message_id),
         recipient,
-    })
+    }))
+}
+
+#[cfg(feature = "channel-email")]
+async fn persist_email_diagnostic(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    note_id: uuid::Uuid,
+    reason: &str,
+) -> khive_runtime::RuntimeResult<()> {
+    match runtime
+        .record_outbound_external_id_diagnostic(token, note_id, reason)
+        .await
+    {
+        Ok(diagnostic) => runtime
+            .mark_outbound_external_id_diagnostic_recorded(token, note_id, diagnostic.id)
+            .await
+            .map(|_| ()),
+        Err(error) => Err(error),
+    }
 }
 
 /// A loop with no selectable adapter must fail before emitting liveness.

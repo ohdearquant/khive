@@ -21,6 +21,7 @@ pub mod config_ledger;
 pub mod cost_unit;
 pub mod curation;
 pub mod daemon;
+pub mod email_message_id;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod entity_write;
@@ -109,6 +110,7 @@ pub use daemon::{
     track_named_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard,
     PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
 };
+pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,

@@ -129,8 +129,16 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             error.insert("domain_result".into(), domain_result);
             Value::Object(error)
         }
-        RuntimeError::Khive(k) => serde_json::to_value(&k)
-            .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
+        RuntimeError::Khive(k) => {
+            let mut value = serde_json::to_value(&k)
+                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+            if k.kind() == khive_types::ErrorKind::InvalidInput
+                && k.details().and_then(|d| d.get("reason")) == Some("external_id_unverifiable")
+            {
+                value["code"] = json!("external_id_unverifiable");
+            }
+            value
+        }
         RuntimeError::RemoteFetchError { remote, message } => json!({
             "kind": "remote_fetch_error",
             "remote": remote,

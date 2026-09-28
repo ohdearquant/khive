@@ -2349,6 +2349,11 @@ impl KhiveRuntime {
                 ]),
                 value: SqlValue::Null,
             },
+            PropertyFilter {
+                json_path: "$.delivery_hold".to_string(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Null,
+            },
         ];
         if let Some(prefix) = to_prefix {
             property_filters.push(PropertyFilter {
@@ -2741,6 +2746,208 @@ impl KhiveRuntime {
         props.insert("last_error".into(), Value::String(last_error));
         self.replace_outbound_message_properties(token, snapshot, props)
             .await
+    }
+
+    /// Owner-only visible hold for an outbound email whose stored Message-ID
+    /// cannot be bound to its own row and configured sending domain.
+    pub async fn hold_outbound_message_external_id_unverifiable(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        reason: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        crate::secret_gate::check_at(&reason, "message", "delivery_hold_reason")?;
+        let snapshot = self.outbound_message(token, id).await?;
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        if props
+            .and_then(|p| p.get("delivery_hold"))
+            .and_then(Value::as_str)
+            == Some("external_id_unverifiable")
+        {
+            return Ok(snapshot);
+        }
+        if Self::outbound_delivery_is_terminal(props)
+            || props
+                .and_then(|p| p.get("delivered_at"))
+                .is_some_and(|v| !v.is_null())
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} is no longer pending delivery"
+            )));
+        }
+        if props
+            .and_then(|p| p.get("external_id"))
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.is_empty())
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} has no nonempty external_id to hold"
+            )));
+        }
+        let mut properties = props.cloned().unwrap_or_default();
+        properties.remove("delivery_attempts");
+        properties.remove("next_attempt_at");
+        properties.insert(
+            "delivery_hold".into(),
+            Value::String("external_id_unverifiable".into()),
+        );
+        properties.insert("delivery_hold_reason".into(), Value::String(reason));
+        properties.insert(
+            "delivery_hold_at".into(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        self.replace_outbound_message_properties_as_owner(token, snapshot, properties)
+            .await
+    }
+
+    /// Bounded maintenance scan for holds whose keyed diagnostic still needs
+    /// confirmation. These rows never enter the ordinary send selection.
+    pub async fn list_outbound_external_id_holds_missing_diagnostic(
+        &self,
+        token: &NamespaceToken,
+        limit: u32,
+    ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
+        let filter = NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                PropertyFilter {
+                    json_path: "$.direction".into(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("outbound".into()),
+                },
+                PropertyFilter {
+                    json_path: "$.to_actor".into(),
+                    op: FilterOp::TextStartsWithIndexed,
+                    value: SqlValue::Text("email:".into()),
+                },
+                PropertyFilter {
+                    json_path: "$.delivery_hold".into(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("external_id_unverifiable".into()),
+                },
+                PropertyFilter {
+                    json_path: "$.external_id_diagnostic_note_id".into(),
+                    op: FilterOp::JsonTypeMissingOrNullIndexed,
+                    value: SqlValue::Null,
+                },
+            ],
+            ..Default::default()
+        };
+        Ok(self
+            .notes(token)?
+            .query_notes_filtered_count_free(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit: limit.min(200),
+                    offset: 0,
+                },
+            )
+            .await?
+            .items)
+    }
+
+    pub async fn mark_outbound_external_id_diagnostic_recorded(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        diagnostic_id: Uuid,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let snapshot = self.outbound_message(token, id).await?;
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        let diagnostic_id_text = diagnostic_id.to_string();
+        if props
+            .and_then(|p| p.get("external_id_diagnostic_note_id"))
+            .and_then(Value::as_str)
+            == Some(diagnostic_id_text.as_str())
+        {
+            return Ok(snapshot);
+        }
+        if props
+            .and_then(|p| p.get("external_id_diagnostic_note_id"))
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} already names a different diagnostic"
+            )));
+        }
+        if props
+            .and_then(|p| p.get("delivery_hold"))
+            .and_then(Value::as_str)
+            != Some("external_id_unverifiable")
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} has no external_id_unverifiable hold"
+            )));
+        }
+        let mut properties = props.cloned().unwrap_or_default();
+        properties.insert(
+            "external_id_diagnostic_note_id".into(),
+            Value::String(diagnostic_id_text),
+        );
+        self.replace_outbound_message_properties_as_owner(token, snapshot, properties)
+            .await
+    }
+
+    /// One keyed operator-visible observation, atomically annotated to the
+    /// offending message. A replay cannot create a second diagnostic.
+    pub async fn record_outbound_external_id_diagnostic(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        reason: &str,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let key = format!("outbound-email-external-id-unverifiable:{id}");
+        let content = format!("Outbound email message {id} is held: {reason}");
+        let properties = serde_json::json!({
+            "diagnostic_code": "external_id_unverifiable",
+            "offending_message_id": id.to_string(),
+        });
+        let (note, _) = self
+            .create_note_with_options(
+                token,
+                "observation",
+                Some("Outbound email Message-ID unverifiable"),
+                &content,
+                None,
+                None,
+                None,
+                Some(properties),
+                vec![id],
+                None,
+                crate::note_write::NoteWriteOptions {
+                    key: Some(key.clone()),
+                    embed: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        // A keyed replay can return an existing note without running the
+        // creation-only annotation work. Verify the link before marking the
+        // message's diagnostic as recorded.
+        let linked = self
+            .list_edges(
+                token,
+                EdgeListFilter {
+                    source_id: Some(note.id),
+                    target_id: Some(id),
+                    relations: vec![EdgeRelation::Annotates],
+                    ..Default::default()
+                },
+                1,
+                0,
+            )
+            .await?
+            .len()
+            == 1;
+        if linked {
+            Ok(note)
+        } else {
+            Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} diagnostic has no annotation link"
+            )))
+        }
     }
 
     /// Park a deterministic external-id claim refusal only while the exact
@@ -4588,7 +4795,18 @@ pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
 /// Unlike OWNER_ESTABLISHED_PROPERTIES, these names remain ordinary metadata
 /// on other kinds, including tasks and memories.
 const KIND_OWNED_PROPERTIES: &[(&str, &[&str])] = &[
-    ("message", &["quarantined", "channel_kind", "channel_slug"]),
+    (
+        "message",
+        &[
+            "quarantined",
+            "channel_kind",
+            "channel_slug",
+            "delivery_hold",
+            "delivery_hold_reason",
+            "delivery_hold_at",
+            "external_id_diagnostic_note_id",
+        ],
+    ),
     ("channel_health", &["channel_kind", "channel_slug"]),
 ];
 
