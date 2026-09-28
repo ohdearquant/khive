@@ -1244,6 +1244,7 @@ impl VerbRegistryBuilder {
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
         validate_unique_entity_types(&ordered_packs)?;
+        validate_entity_type_note_kind_collisions(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
         if activate {
             for pack in &ordered_packs {
@@ -1438,6 +1439,39 @@ fn validate_unique_entity_types(packs: &[Box<dyn PackRuntime>]) -> Result<(), Ru
         .flat_map(|p| p.entity_types().iter().map(move |def| (p.name(), def)));
     khive_types::EntityTypeRegistry::check_extra_collisions(owned_defs)
         .map_err(RuntimeError::InvalidInput)
+}
+
+/// A granular kind token must identify only one substrate after pack composition.
+/// Check aliases too: both subtype and note-kind spellings are normalized at
+/// the request boundary, so a cosmetic spelling difference is still a clash.
+fn validate_entity_type_note_kind_collisions(
+    packs: &[Box<dyn PackRuntime>],
+) -> Result<(), RuntimeError> {
+    let mut note_kinds = HashMap::new();
+    for pack in packs {
+        for &kind in pack.note_kinds() {
+            note_kinds
+                .entry(khive_types::to_snake_case(kind))
+                .or_insert(pack.name());
+        }
+    }
+
+    for pack in packs {
+        for definition in pack.entity_types() {
+            for name in
+                std::iter::once(definition.type_name).chain(definition.aliases.iter().copied())
+            {
+                let normalized = khive_types::to_snake_case(name);
+                if let Some(note_owner) = note_kinds.get(&normalized) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "entity subtype {name:?} from pack {:?} collides with note kind {normalized:?} from pack {note_owner:?}",
+                        pack.name()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_pack_dependency_cycle(
@@ -7382,6 +7416,59 @@ pub(crate) mod tests {
             msg.contains("gamma_report"),
             "collision error must name the colliding entity_type key: {msg}"
         );
+    }
+
+    #[test]
+    fn entity_subtype_cannot_shadow_a_note_kind_at_composition() {
+        struct CollisionPack;
+        impl Pack for CollisionPack {
+            const NAME: &'static str = "cross_kind_collision";
+            const NOTE_KINDS: &'static [&'static str] = &["reference"];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
+            const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
+                kind: khive_types::EntityKind::Document,
+                type_name: "reference",
+                aliases: &[],
+            }];
+        }
+        #[async_trait]
+        impl PackRuntime for CollisionPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            fn entity_types(&self) -> &'static [EntityTypeDef] {
+                Self::ENTITY_TYPES
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(CollisionPack);
+        let error = builder
+            .build()
+            .err()
+            .expect("a note-kind/entity-subtype collision must refuse composition");
+        let message = error.to_string();
+        assert!(message.contains("entity subtype") && message.contains("note kind"));
+        assert!(message.contains("reference") && message.contains("cross_kind_collision"));
     }
 
     // ---- Gate wiring ----
