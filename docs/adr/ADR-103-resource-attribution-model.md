@@ -1009,7 +1009,7 @@ requires.
 
 ## Amendment 4 (2026-09-01): Extending the Admission-Degrade Allowlist to Operational Read Verbs
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-28).
 
 Amendment 3 scoped the admission-pressure read-cost undercount to eleven KG-base verbs. A
 store-pressure incident measured on 2026-08-31 showed the cost of that scoping: during a
@@ -1113,6 +1113,33 @@ amendment signed before that branch lands. The census equality assertion enforce
 mechanically: a wider list fails the test until its amendment exists.
 
 ADR-133 Amendment 2 carries the corresponding qualification of D4/INV-1 scope.
+
+### Evidence re-derived and as built (2026-09-28)
+
+The per-verb review was re-derived at `fe272269` with two instruments. The lexical scan above,
+same pattern with comment-only mentions excluded, over each handler's brace-scoped extent, the
+eight named helpers (all still present, at moved lines) and one level of same-crate callees, finds
+no hit for any of the eight verbs; the same pass over known writers finds hits (`comm.heartbeat`
+2, `comm.cursor_get` 2, `comm.send` 1, `gtd.transition` 7). That pass also shows the pattern's
+limit: `gtd.assign`, which writes tasks through `create_note` and `create_note_with_options`,
+scores zero on it, so the pattern alone cannot show a path write-free. The second instrument is a
+listing of every method call in the same extents: the eight verbs call only store reads
+(`query_notes_*`, `count_notes_*`, `get_note*`, `query_row`, `query_all`, `snapshot`,
+`wait_for_change`), and the same listing over `gtd.assign` shows `create_note`. All eight verbs
+remain registered, declared `VerbCategory::Assertive` and dispatched: eight of eight eligible, the
+table unchanged.
+
+As built, three of the mechanical requirements above differ from the code, and the code is the
+record. Requirement 1: an allowlist entry is an `(owning pack, verb)` pair
+(`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS: &[(&str, &str)]`,
+`crates/khive-runtime/src/pack.rs:2351`), not a bare verb string. Requirement 2(b) and the
+sequencing paragraph above: the allowlist grew beyond this enumeration, from Amendment 3's eleven
+entries to 39 in #2311 (cross-pack reads kept available under audit pressure) and to 61 at
+`fe272269` (`pack.rs:2351-2433`), all eight verbs here included; the equality with nineteen is
+superseded, and the allowlist is the census-tested set. Requirement 2's named census test: the
+live guard is `admission_degrade_safe_assertive_census_matches_live_pack_sources`
+(`pack.rs:6064`), which checks every Assertive verb's declared category and its reviewed
+safe-versus-incidental classification against the live pack sources.
 
 ## Amendment 5 (2026-09-10): Caller-Scoped Brain Reads
 
