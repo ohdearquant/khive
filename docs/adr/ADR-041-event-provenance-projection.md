@@ -178,18 +178,18 @@ future). Roles are closed; extending requires this ADR.
 
 Per-verb role mapping (the v1 contract emitters MUST honor):
 
-| Event kind                                        | Roles emitted                                                                    | Notes                                                                                           |
-| ------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `RecallExecuted`                                  | `Candidate` (per candidate, ordered by pre-rerank score), `Selected` (per top-K) | The selected list is a subset of candidates; both rows exist (different `role` discriminators). |
-| `SearchExecuted`                                  | `Candidate`, `Selected`                                                          | Mirror of recall.                                                                               |
-| `RerankExecuted` (ADR-042)                        | `Candidate`, `Selected`                                                          | Rerank's input candidates from recall; rerank's output as selected.                             |
+| Event kind                                        | Roles emitted                                                                    | Notes                                                                                                                                  |
+| ------------------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `RecallExecuted`                                  | `Candidate` (per candidate, ordered by pre-rerank score), `Selected` (per top-K) | The selected list is a subset of candidates; both rows exist (different `role` discriminators).                                        |
+| `SearchExecuted`                                  | `Candidate`, `Selected`                                                          | Mirror of recall.                                                                                                                      |
+| `RerankExecuted` (ADR-042)                        | `Candidate`, `Selected`                                                          | Rerank's input candidates from recall; rerank's output as selected.                                                                    |
 | `LinkCreated`                                     | `Target` (source), `Target` (target), `Target` (edge) — positions 0, 1, and 2    | Endpoint `referent_kind` follows `source_kind` and `target_kind`; the edge row is `edge`. An event endpoint has no row (Amendment A4). |
-| `EdgeUpdated`, `EdgeDeleted`                      | `Target` (edge) — `position=0`                                                  | Edge-only projection; these kinds do not reproject link endpoints.                             |
-| `EntityCreated`, `EntityUpdated`, `EntityDeleted` | `Target`                                                                         | The acted-upon entity.                                                                          |
-| `NoteCreated`, `NoteUpdated`, `NoteDeleted`       | `Target`                                                                         | The acted-upon note.                                                                            |
-| `TaskTransitioned`                                | `Target`                                                                         | The task.                                                                                       |
-| `FeedbackExplicit`                                | `Signal`                                                                         | The entity/note the feedback is about.                                                          |
-| `MemoryConsolidated` (future)                     | `Candidate` (memories merged), `Selected` (resulting memory)                     | Future.                                                                                         |
+| `EdgeUpdated`, `EdgeDeleted`                      | `Target` (edge) — `position=0`                                                   | Edge-only projection; these kinds do not reproject link endpoints.                                                                     |
+| `EntityCreated`, `EntityUpdated`, `EntityDeleted` | `Target`                                                                         | The acted-upon entity.                                                                                                                 |
+| `NoteCreated`, `NoteUpdated`, `NoteDeleted`       | `Target`                                                                         | The acted-upon note.                                                                                                                   |
+| `TaskTransitioned`                                | `Target`                                                                         | The task.                                                                                                                              |
+| `FeedbackExplicit`                                | `Signal`                                                                         | The entity/note the feedback is about.                                                                                                 |
+| `MemoryConsolidated` (future)                     | `Candidate` (memories merged), `Selected` (resulting memory)                     | Future.                                                                                                                                |
 
 Other event kinds (e.g., audit-only events with no substrate references) project zero
 rows. The projection is opt-in per event kind, not mandatory.
@@ -594,16 +594,16 @@ vector. Future automatic delivery must first satisfy ADR-017's prerequisites.
 
 ### Tests
 
-| Scenario                                           | Assert                                                                                       |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `recall` emits event                               | `event_observations` rows exist for candidates + selected with correct positions             |
+| Scenario                                           | Assert                                                                                                                                        |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recall` emits event                               | `event_observations` rows exist for candidates + selected with correct positions                                                              |
 | `link` emits `LinkCreated` event                   | Endpoint `Target` rows at positions 0 and 1 with their substrate kinds, plus an `edge` `Target` row at position 2; event endpoint row omitted |
-| EventFilter `observed=[mem_id]`                    | Returns only events that observed `mem_id`; one JOIN in the EXPLAIN plan                     |
-| EventView storage shape                            | Payload is accessed via `view.event.payload` (NOT `view.payload` — no Deref)                 |
-| Synthetic edge in GQL                              | `MATCH (e:event)-[:observed_as_selected]->(m:memory) RETURN m` returns the selected memories |
-| `link(event_id, entity_id, observed_as_candidate)` | Returns `InvalidRelation` — synthetic edges are read-only                                    |
-| Session reconstruction                             | `session_id = :sid ORDER BY (created_at, id)` returns events in causal order                 |
-| Cross-session reuse JOIN                           | The session-A→session-B JOIN returns correct memory ids                                      |
+| EventFilter `observed=[mem_id]`                    | Returns only events that observed `mem_id`; one JOIN in the EXPLAIN plan                                                                      |
+| EventView storage shape                            | Payload is accessed via `view.event.payload` (NOT `view.payload` — no Deref)                                                                  |
+| Synthetic edge in GQL                              | `MATCH (e:event)-[:observed_as_selected]->(m:memory) RETURN m` returns the selected memories                                                  |
+| `link(event_id, entity_id, observed_as_candidate)` | Returns `InvalidRelation` — synthetic edges are read-only                                                                                     |
+| Session reconstruction                             | `session_id = :sid ORDER BY (created_at, id)` returns events in causal order                                                                  |
+| Cross-session reuse JOIN                           | The session-A→session-B JOIN returns correct memory ids                                                                                       |
 
 ---
 
@@ -699,9 +699,9 @@ referents. `RecallExecuted` and `RerankExecuted` are unchanged by this amendment
 
 ---
 
-## Amendment A4: `LinkCreated` carries endpoint substrates (Proposed, khive#3538)
+## Amendment A4: `LinkCreated` carries endpoint substrates
 
-**Status: Proposed.** Set to Accepted (2026-09-28) when this amendment lands.
+**Status: Accepted (2026-09-28).** Refs khive#3538.
 
 `LinkCreated` projects the link source, link target, and created edge as `Target`
 observations at positions 0, 1, and 2. Its `source_id` and `target_id` may name
