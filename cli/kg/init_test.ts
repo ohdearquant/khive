@@ -272,6 +272,7 @@ Deno.test("kg init: .khive/.gitignore excludes remote cache and backup markers",
     );
 
     const cachePaths = [
+      ".khive/kg/.remote-cache/legacy.txt",
       ".khive/kg/remotes/upstream/meta.json",
       ".khive/kg/remotes/upstream.replaced~1234/.khive-backup-owner",
     ];
@@ -323,6 +324,37 @@ Deno.test("kg init: .khive/.gitignore excludes remote cache and backup markers",
       false,
       "remote cache files must not enter the repository status",
     );
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("checked-in .khive ignore template retains legacy cache exclusion", async () => {
+  const dir = await makeTempRepo();
+  try {
+    await Deno.mkdir(join(dir, ".khive/kg/.remote-cache"), { recursive: true });
+    const template = await Deno.readTextFile(
+      new URL("../../.khive/.gitignore", import.meta.url),
+    );
+    await Deno.writeTextFile(join(dir, ".khive/.gitignore"), template);
+    const legacy = ".khive/kg/.remote-cache/legacy.txt";
+    await Deno.writeTextFile(join(dir, legacy), "legacy cache fixture\n");
+    const check = await new Deno.Command("git", {
+      args: [
+        "-C",
+        dir,
+        "-c",
+        "core.excludesFile=/dev/null",
+        "check-ignore",
+        "--no-index",
+        "-q",
+        "--",
+        legacy,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    assertEquals(check.code, 0, "the checked-in template must ignore legacy cache files");
   } finally {
     await removeDir(dir);
   }

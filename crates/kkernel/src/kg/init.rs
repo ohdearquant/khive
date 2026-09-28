@@ -44,7 +44,7 @@ include = ["name", "description"]
 strict = true
 "#;
 
-const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/remotes/\n!khive.toml\n";
+const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!khive.toml\n";
 
 const PRE_COMMIT_HOOK: &str = r#"#!/usr/bin/env bash
 # .khive/kg/hooks/pre-commit
@@ -296,6 +296,7 @@ mod tests {
         .unwrap();
 
         for path in [
+            ".khive/kg/.remote-cache/legacy.txt",
             ".khive/kg/remotes/upstream/meta.json",
             ".khive/kg/remotes/upstream.replaced~1234/.khive-backup-owner",
         ] {

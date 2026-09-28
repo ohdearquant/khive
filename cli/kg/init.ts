@@ -64,6 +64,8 @@ const KHIVE_GITIGNORE = `\
 !config.toml
 
 # Remote cache and derived working state are never committed.
+kg/.remote-cache/
+kg/.remote-cache/**
 kg/remotes/
 `;
 

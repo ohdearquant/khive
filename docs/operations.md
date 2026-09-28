@@ -170,15 +170,17 @@ kkernel kg fetch upstream --url https://github.com/org/kg-data.git --ref main \
   `atomic_replace_dir`); a crash between the two renames may leave the target briefly absent,
   with the old directory in a `.replaced~*` sibling recovered by the next publish.
   `.khive/.gitignore` excludes the entire `kg/remotes/` tree, including swap backups, even though
-  the repository's own KG export is committed. Recovery accepts only backups carrying the
+  the repository's own KG export is committed. Before writing any cache generation, fetch also
+  creates `kg/remotes/.gitignore` with `*`, protecting repositories with the older parent rule.
+  Recovery accepts only backups carrying the
   ownership marker written before the swap. A matching
   directory without that marker is left untouched and reported on stderr; inspect it before
   manual recovery. A reader never sees a mix of old and new files within the target.
   `meta.json` records `fetched_at`, the resolved `git_ref`, `commit_sha`, and `content_hash`.
   An older `.replaced-<digits>` sibling is also left untouched because it may be a valid
   remote cache.
-  Repositories initialized before this ignore rule must update their tracked `.khive/.gitignore`;
-  Git ignore rules do not untrack cache files that were already committed.
+  Repositories initialized before this ignore rule should update their tracked `.khive/.gitignore`;
+  neither the parent nor the nested ignore rule untracks cache files that were already committed.
 - Git remote URLs and any embedded credentials are redacted from error messages before they reach
   stdout/stderr (`khive-vcs/src/sync.rs:462-523`).
 - Remote validation uses the same full deterministic gate as local sync. Edge properties are part
