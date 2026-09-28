@@ -1424,3 +1424,110 @@ interrupted by idle retirement, and a write that outlives the ordinary drain int
 reaches its own commit or rollback boundary without duplication. An exclusively owned events
 child is drained and reaped only after its acknowledged handoffs settle; a shared or
 independently supervised events child is never killed by this process.
+
+## Amendment (2026-09-28): bridge-local fallback diagnostics
+
+**Status: Proposed.** Addresses #3495. This amendment defines a read path for the five
+bridge-process fallback counters and the strict-violation counter specified by Amendment 2.
+It does not create daemon-owned counters or change KG `stats()` or the daemon's
+`db_diagnostics.process` identity.
+
+### Bridge-only operation and response
+
+The stdio bridge answers `request(ops="bridge.diagnostics()")` before daemon forwarding or
+local pack dispatch. `bridge.diagnostics` is a bridge control operation, not a pack verb. This
+one operation is an explicit exception to ADR-016's pack-registration rule and is discoverable
+in the bridge's `request` tool description. It reads only the stdio bridge's process memory:
+no runtime, database, blob store, socket, daemon, or executable-file check is needed to answer
+it. The daemon does not implement this operation, and the bridge never puts it in a daemon
+frame. A direct daemon request naming it is refused.
+
+A successful single-operation response uses the ordinary request success envelope. Its result
+has these fields:
+
+- `bridge_instance_id`: an opaque canonical UUID minted once per stdio bridge process image
+  before it handles requests. It is the counter-generation identifier. An in-place re-exec
+  mints a new value even when the PID and operating-system process start time stay the same.
+  The full 36-character value survives Agent, Verbose and Human presentation and JSON, auto
+  and table formatting. This field is a narrow exception to ADR-045's usual Agent-mode
+  shortening of `*_id` fields: an eight-character prefix cannot reliably distinguish
+  counter generations.
+- `pid`: the serving stdio bridge's process ID, for operator correlation; it is not the
+  counter-generation key on its own.
+- `fallback_reasons`: an object with exactly the five Amendment 2 keys `config_mismatch`,
+  `namespace_mismatch`, `no_socket`, `parse_failure` and `protocol_mismatch`, each a
+  nonnegative count sampled once for this response. A reserved reason with no current
+  production fallback remains present with count zero.
+- `fallback_total`: the checked sum of those five sampled counts, not a separately sampled
+  counter. If that sum cannot be represented, the read refuses rather than wrapping.
+- `strict_violations`: the bridge-process count of Amendment 2's illegitimate fallback
+  events observed while strict mode was active, sampled for this response. It is separate
+  from the five-reason sum.
+
+The five atomics are read individually, so a concurrent fallback can appear in a later read;
+`fallback_total` still equals the sum of the five counts in its own response. The result does
+not report `counters_since`: a wall-clock instant would not establish an atomic sampling
+boundary or survive an in-place re-exec as a continuous window. Consumers compare
+`bridge_instance_id` before comparing counts across reads; a new ID resets the window.
+
+`bridge.diagnostics(help=true)` is also answered by the bridge and returns the local
+operation's argument and result schema together with ADR-016's shared
+`identifier_resolution` object. Any other operation argument is invalid. The ordinary JSON,
+auto and table renderers and presentation modes render the same named result fields;
+formatting never substitutes daemon `db_diagnostics` or drops or shortens the generation ID.
+The operation is single-only: if it appears in a parallel batch, a chain, or a bracketed batch
+of chains, the entire request is rejected as invalid parameters before any sibling operation
+executes or forwards. This is a narrow exception to ADR-016's ordinary per-operation batch
+failure isolation. `save_to` is rejected before creating a sink, so the diagnostics read
+remains store-free. These restrictions also apply to `help=true`.
+
+With `plan=true`, a single `bridge.diagnostics()` or
+`bridge.diagnostics(help=true)` is parsed without execution and reported as
+`known=true`, `pack="bridge-control"` in the normal plan stages. The latter is a
+plan-only catalog label, not a registered pack. This bridge-control plan path performs no daemon
+forward or executable-file check. An otherwise syntactically valid mixed plan may list this
+stage as known, because plan checks syntax and catalog membership, not execution admission;
+executing the same mixed request still refuses the whole request. ADR-016's ordinary
+`plan=true` envelope exclusions continue to apply.
+
+### Strict mode and reset behavior
+
+`KHIVE_DAEMON_STRICT=1` still rejects every ordinary request that would take a local
+fallback, using Amendment 2's structured refusal. The bridge-local diagnostics operation is
+not a fallback: after normal request parsing and cancellation admission, it is intercepted
+before `BridgeExecutable::check`, `fallback_or_reject` and the forwarding path. It remains
+readable when the on-disk bridge executable has been replaced but re-exec has not yet
+occurred; an ordinary request retains the existing executable-check behavior. Reading
+diagnostics neither increments a fallback reason nor weakens strict refusal for any other
+operation. A strict-mode outage can therefore report counters from earlier refused requests
+without contacting a daemon. This amendment narrows Amendment 2's proof statement:
+"strict mode active and fallback count zero" proves daemon dispatch for every **served
+ordinary request**; this explicitly bridge-local control read is not daemon-dispatched and
+must not be used as evidence of an ordinary request's route.
+
+A new bridge process image starts all six counters at zero and mints a new
+`bridge_instance_id` before admitting its first request. An in-place re-exec has that same
+reset behavior; preserving PID or OS start time does not preserve a counter window. The
+resumed bridge must not reuse an ID supplied by the prior image or by the client.
+
+### Rejected alternatives and acceptance
+
+Appending a bridge section to `db_diagnostics()` was rejected because the forward must
+succeed before the counters could be read, precisely when the bridge may need diagnosis; it
+would also mix bridge state beside `db_diagnostics.process`, which identifies the daemon
+serving that request. A transport sidecar on every response was rejected because an
+operator-only reading does not justify enlarging every ordinary response or changing
+response composition. This standalone operation changes no pack response-composition rule
+in ADR-023, so that ADR is unchanged.
+
+Acceptance requires a no-daemon bridge to answer this operation after a real ordinary
+`no_socket` fallback and report `no_socket > 0`; `fallback_total` equals the sum of the five
+reason fields in that same response. During a strict-mode outage, an ordinary request is
+refused and counted while this operation still answers; a must-deny control proves another
+ordinary request is still refused, and a mixed diagnostics-plus-write batch is refused
+before the write. A single `plan=true` reports the bridge operation as known without
+executing it; `help=true` carries `identifier_resolution`. Default Agent presentation and
+auto/table formats preserve the full `bridge_instance_id`. A replaced bridge executable
+does not mask this memory-only read. A real in-place re-exec leaves PID continuity possible
+but changes `bridge_instance_id` and restarts all counts. A daemon-side frame counter or log
+proves that the diagnostics operation, including help and formatted reads, was never forwarded.
