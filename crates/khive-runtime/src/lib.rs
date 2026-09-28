@@ -184,7 +184,7 @@ pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
     BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
-    NoteMutationHookFn, NoteWriteValidatorFn, RuntimeConfig,
+    NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use telemetry_config::{

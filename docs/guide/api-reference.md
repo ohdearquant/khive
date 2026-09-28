@@ -1076,12 +1076,22 @@ request(ops="scan(content=\"api_key=sk-...\")")
 
 ### `db_diagnostics` — Assertive
 
-Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
-main database: build and process identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
-`-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
+Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for
+all database files already opened by this server. The existing top-level fields still describe
+main: build and process identity, checkpoint counters, a PASSIVE checkpoint probe, the `-wal`
+sidecar file size, page-level database size composition, and a WAL-pin holder census.
 Takes no parameters.
 
-Every report includes `process` alongside `build`:
+`databases` is an array with one entry per canonical database file (or distinct in-memory
+pool), main first. Each entry has
+`backend_names` (all configured names that share the file), canonical `path`, `diagnostics`
+(the same field set as the existing top-level report), and `error`. Successful entries have
+`error: null`; a failed inspection has `diagnostics: null` and an error string while other files
+still report. If main itself fails, its error remains in the first entry and the root contains
+only `databases` because there is no valid primary report to flatten. The list uses only pools
+opened at startup; it does not open an unserved path or create a missing database file.
+
+Every successful per-file report includes `process` alongside `build`:
 
 ```json
 {
@@ -1104,9 +1114,12 @@ restarts: PIDs can be reused, and two processes can start within the same second
 
 `pool_generation` starts at 1 in each process and increments whenever the main pool is
 reconstructed. Additional handles to the same pool and secondary-pool construction do not
-advance it. Reader counters and writer acquisition/task counters belong to that main pool;
-compare `(pid, started_at, pool_generation)` and start a fresh counter window whenever the
-triple changes. Checkpoint counters remain process-global. Point-in-time gauges and
+advance it. The root reader and writer counters belong to main; compare
+`(pid, started_at, pool_generation)` to identify its counter window. Within `databases`, reader
+and writer counters belong to the entry's pool. A secondary pool can be reconstructed without
+advancing the main `pool_generation`, so compare its canonical `path` and process identity and
+treat a secondary-pool restart as a new counter window. Checkpoint counters and audit failure
+counters remain process-global. Point-in-time gauges and
 consecutive-failure counts can also decrease during normal operation.
 
 `reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is

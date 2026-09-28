@@ -10,8 +10,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, BlobHydrator, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat,
-    RuntimeConfig, StorageBackend,
+    BackendKind, BlobHydrator, ConnectionPool, KhiveConfig, KhiveRuntime, OpenedDiagnosticBackend,
+    OutputFormat, RuntimeConfig, StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -3106,6 +3106,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // Every pack sees the whole serving topology, including stores assigned
     // to other packs, before handlers can accept a code.ingest target.
     let declared_backend_db_paths = declared_backend_db_paths(khive_cfg);
+    let diagnostic_backends = opened_diagnostic_backends(&backends);
 
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
@@ -3115,7 +3116,8 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         cfg.backend_id = BackendId::main();
         cfg
     })
-    .with_declared_backend_db_paths(declared_backend_db_paths.clone());
+    .with_declared_backend_db_paths(declared_backend_db_paths.clone())
+    .with_diagnostic_backends(diagnostic_backends.clone());
 
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
@@ -3148,6 +3150,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
                 &main_backend,
                 &default_runtime,
                 declared_backend_db_paths.clone(),
+                diagnostic_backends.clone(),
             ),
         );
     }
@@ -4132,6 +4135,47 @@ pub fn install_resolved_blob_store(
     Ok(hydrator)
 }
 
+/// Group the pools opened during boot by canonical file. Every configured name
+/// survives aliasing, including names not assigned to a loaded pack. In-memory
+/// pools have no file identity and are grouped only when they share one pool.
+fn opened_diagnostic_backends(
+    backends: &HashMap<String, Arc<StorageBackend>>,
+) -> Arc<[OpenedDiagnosticBackend]> {
+    let mut names: Vec<_> = backends.keys().cloned().collect();
+    names.sort();
+    names.sort_by_key(|name| name != BackendId::MAIN);
+    let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
+    let mut by_memory_pool: HashMap<usize, usize> = HashMap::new();
+    let mut opened: Vec<OpenedDiagnosticBackend> = Vec::new();
+    for name in names {
+        let pool = backends[&name].pool_arc();
+        let path = pool.canonical_path().map(PathBuf::from);
+        let existing = match &path {
+            Some(path) => by_path.get(path).copied(),
+            None => by_memory_pool.get(&(Arc::as_ptr(&pool) as usize)).copied(),
+        };
+        if let Some(index) = existing {
+            opened[index].backend_names.push(name);
+            continue;
+        }
+        let index = opened.len();
+        match &path {
+            Some(path) => {
+                by_path.insert(path.clone(), index);
+            }
+            None => {
+                by_memory_pool.insert(Arc::as_ptr(&pool) as usize, index);
+            }
+        }
+        opened.push(OpenedDiagnosticBackend {
+            backend_names: vec![name],
+            canonical_path: path,
+            pool,
+        });
+    }
+    opened.into()
+}
+
 /// Construct one per-pack runtime, wiring `core_backend` for secondary-backend packs.
 ///
 /// Centralizing this in one helper ensures that both `build_registry_for_multi_backend`
@@ -4146,12 +4190,14 @@ fn build_pack_runtime(
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
     declared_backend_db_paths: Arc<[PathBuf]>,
+    diagnostic_backends: Arc<[OpenedDiagnosticBackend]>,
 ) -> KhiveRuntime {
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
+        .with_diagnostic_backends(diagnostic_backends)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
@@ -6023,6 +6069,170 @@ id = "lambda:project-actor"
             backend_id: BackendId::main(),
             ..RuntimeConfig::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn db_diagnostics_lists_main_and_routed_secondary() {
+        use crate::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let second_path = dir.path().join("second.db");
+        let config = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".into(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "second".into(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(second_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                },
+            ],
+            packs: HashMap::from([(
+                "comm".into(),
+                PackConfig {
+                    backend: "second".into(),
+                    no_embed: false,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let server =
+            build_server_multi_backend(base_runtime_config_for_multi_backend(), &config, None)
+                .await
+                .expect("two-backend boot");
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "db_diagnostics()".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("diagnostics dispatch");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["results"][0]["ok"],
+            serde_json::json!(true),
+            "{response}"
+        );
+        let result = &response["results"][0]["result"];
+        let databases = result["databases"].as_array().expect("database entries");
+        assert_eq!(databases.len(), 2, "{result}");
+        assert_eq!(databases[0]["backend_names"], serde_json::json!(["main"]));
+        assert_eq!(databases[1]["backend_names"], serde_json::json!(["second"]));
+        assert_eq!(
+            databases[0]["path"],
+            serde_json::json!(main_path.canonicalize().unwrap().display().to_string())
+        );
+        assert_eq!(
+            databases[1]["path"],
+            serde_json::json!(second_path.canonicalize().unwrap().display().to_string())
+        );
+        assert_eq!(result["db_path"], databases[0]["diagnostics"]["db_path"]);
+        for database in databases {
+            assert!(database["error"].is_null(), "{database}");
+            assert!(
+                database["diagnostics"]["wal_file"].is_object(),
+                "{database}"
+            );
+            assert!(
+                database["diagnostics"]["reader_contention"].is_object(),
+                "{database}"
+            );
+            assert!(
+                database["diagnostics"]["writer_contention"].is_object(),
+                "{database}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn db_diagnostics_deduplicates_shared_canonical_file_and_keeps_all_names() {
+        use crate::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let shared_path = dir.path().join("shared.db");
+        let alias_path = dir.path().join(".").join("shared.db");
+        let sqlite = |name: &str, path: &PathBuf| BackendConfig {
+            name: name.into(),
+            kind: BackendKind::Sqlite,
+            path: Some(path.clone()),
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: None,
+            read_only: false,
+        };
+        let config = KhiveConfig {
+            backends: vec![
+                sqlite("main", &main_path),
+                sqlite("second", &shared_path),
+                sqlite("alias", &alias_path),
+            ],
+            packs: HashMap::from([
+                (
+                    "kg".into(),
+                    PackConfig {
+                        backend: "alias".into(),
+                        no_embed: false,
+                    },
+                ),
+                (
+                    "comm".into(),
+                    PackConfig {
+                        backend: "second".into(),
+                        no_embed: false,
+                    },
+                ),
+            ]),
+            ..KhiveConfig::default()
+        };
+        let server =
+            build_server_multi_backend(base_runtime_config_for_multi_backend(), &config, None)
+                .await
+                .expect("shared-backend boot");
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "db_diagnostics()".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("diagnostics dispatch");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["results"][0]["ok"],
+            serde_json::json!(true),
+            "{response}"
+        );
+        let result = &response["results"][0]["result"];
+        let databases = result["databases"].as_array().expect("database entries");
+        assert_eq!(databases.len(), 2, "{result}");
+        assert_eq!(databases[0]["backend_names"], serde_json::json!(["main"]));
+        assert_eq!(
+            databases[1]["backend_names"],
+            serde_json::json!(["alias", "second"])
+        );
+        assert_eq!(
+            databases[1]["path"],
+            serde_json::json!(shared_path.canonicalize().unwrap().display().to_string())
+        );
+        assert!(databases[1]["diagnostics"]["reader_contention"].is_object());
     }
 
     #[tokio::test]

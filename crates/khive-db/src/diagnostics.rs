@@ -57,7 +57,8 @@
 //! Every payload carries [`BuildIdentity`](crate::diagnostics::BuildIdentity) and
 //! [`ProcessIdentity`](crate::diagnostics::ProcessIdentity) for the
 //! process producing the reading. The PID, OS start time, and main-pool generation
-//! identify the reader/writer counter window; checkpoint counters remain global.
+//! identify the main pool's counter window; a secondary pool's reader/writer
+//! counters have their own reconstruction window. Checkpoint counters remain global.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1701,9 +1702,31 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
     audit_append_failures: u64,
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> StorageResult<DbDiagnostics> {
+    let process = ProcessIdentity::current(&pool);
+    collect_with_runtime_audit_metrics_for_process_interruptibly(
+        pool,
+        build,
+        process,
+        sweep_interval,
+        audit_append_failures,
+        runtime_audit_batch_metrics,
+    )
+    .await
+}
+
+/// Collect one already-open pool while retaining the main pool's process and
+/// generation identity. A secondary pool must not claim or advance the main
+/// pool generation when its pool-scoped counters are inspected.
+pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
+    pool: Arc<ConnectionPool>,
+    build: BuildIdentity,
+    process: ProcessIdentity,
+    sweep_interval: Duration,
+    audit_append_failures: u64,
+    runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
+) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
     let started = Instant::now();
-    let process = ProcessIdentity::current(&pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
