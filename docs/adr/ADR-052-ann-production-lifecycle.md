@@ -280,3 +280,32 @@ the claim is made load-bearing.
   stays opt-in by design (cosine residual pass eats the gain).
 - Crash safety becomes a tested property (commit-record save + checksum-verified load), not an
   assumption.
+
+## Amendment 1 (2026-09-27): v2 segment promotion after metadata
+
+**Status**: Accepted (2026-09-27) ([#3463](https://github.com/ohdearquant/khive/issues/3463)).
+
+### Context
+
+The original §3 says `save_atomic` writes the live bulk segments first and
+`metadata.bin` last, leaving the previous snapshot loadable if a save is interrupted.
+The implemented `VamanaIndex::save_atomic` instead stages `vectors.bin`, `graph.bin`,
+`lifecycle.bin`, and `codes.bin` under `.v2new` names. It renames the new metadata
+record first, fsyncs the directory, promotes the staged segments to live names, and
+fsyncs again. The metadata record carries hashes for the three mandatory segments
+and, in extended records, `codes.bin`.
+
+### Correction
+
+The crash guarantee is **integrity with rebuild fallback**, not continuous
+availability of the previous snapshot. A crash before metadata promotion leaves the
+old metadata and live segments together. A crash after metadata promotion but before
+all segment promotions can leave new metadata with old or mixed-generation segments.
+If any live segment differs from the new record's checksum, raw `load` returns an
+error and `load_or_build` rebuilds from the caller's corpus and saves a fresh
+generation. Identical old and new segment bytes may still validate. No reader may
+adopt mismatched segment bytes as a valid v2 snapshot.
+
+This correction replaces only the §3 save-order and interrupted-save availability
+claims. The fingerprint gate, lifecycle format, and rebuild-on-corrupt-snapshot
+behavior remain as decided.
