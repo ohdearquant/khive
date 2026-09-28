@@ -105,6 +105,9 @@ HEADING_STATUS = re.compile(r"^ {0,3}#{1,6}\s+status\s*$", re.IGNORECASE)
 # three leading spaces before an ATX heading's `#`s; a fourth space (or a
 # tab) makes it indented code instead, which `INDENTED_CODE` handles.
 SECTION_HEADING = re.compile(r"^ {0,3}#{2,6}\s+\S")
+# A heading starts a new block even when it is not a section heading that
+# closes the ADR header (for example, the document's level-one title).
+ATX_HEADING = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+|$)")
 # Fenced code blocks and HTML comments are display text, not declarations. A
 # line-based parser with no notion of either counts a status-shaped example
 # inside them as real, which lets an ADR with no visible header status pass.
@@ -182,33 +185,6 @@ def header_declarations(lines: list[str]) -> list[Declaration]:
     return found
 
 
-def strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
-    """The text of one line with HTML-comment spans removed, plus the state.
-
-    Character-position based, not `startswith`: a comment that opens after
-    other text on the line (`Some text <!-- hidden`) must still open, or every
-    status-shaped line until the matching `-->` is parsed as a declaration.
-    A declaration BEFORE the comment opener on the same line survives.
-    """
-    out: list[str] = []
-    i = 0
-    while True:
-        if in_comment:
-            j = line.find("-->", i)
-            if j == -1:
-                return "".join(out), True
-            i = j + 3
-            in_comment = False
-        else:
-            j = line.find("<!--", i)
-            if j == -1:
-                out.append(line[i:])
-                return "".join(out), False
-            out.append(line[i:j])
-            i = j + 4
-            in_comment = True
-
-
 def strip_inline_noise(line: str) -> str:
     """`line` with inline code spans, link destinations, and autolinks removed.
 
@@ -222,37 +198,104 @@ def strip_inline_noise(line: str) -> str:
     return AUTOLINK.sub("", line)
 
 
-def strip_code_spans(line: str, open_ticks: str | None) -> tuple[str, str | None]:
-    """`line` with backtick code-span content removed, plus the carried span state.
+def fence_opener(line: str) -> re.Match[str] | None:
+    """A valid fence opener under the same rule used by ``visible_view``."""
+    opener = FENCE_OPEN.match(line)
+    if opener and (opener.group("chars")[0] != "`" or "`" not in opener.group("info")):
+        return opener
+    return None
 
-    A span opened by a run of N backticks stays open — including across a
-    line break within the same paragraph — until a run of exactly N
-    backticks is found (a shorter or longer run does not close it, same rule
-    as `INLINE_CODE_SPAN`). The caller resets `open_ticks` to None on a blank
-    line: a code span cannot cross a paragraph boundary, so an opener with no
-    closer before one is display text from there on, not a permanently
-    hidden span. Text outside spans, and text after a span closes, survives.
+
+def starts_new_block(line: str) -> bool:
+    """A paragraph boundary for multiline code-span matching.
+
+    An indented-code region in this lint starts only after a blank line, so
+    the blank boundary already separates it from the preceding paragraph.
+    """
+    return (
+        not line.strip()
+        or ATX_HEADING.match(line) is not None
+        or fence_opener(line) is not None
+    )
+
+
+def matching_backtick_runs(lines: list[str]) -> list[set[int]]:
+    """Backtick-run starts with an exact closer later in the same block.
+
+    Scan once in source order, resetting at block boundaries. Each run is
+    visited once, including on lines with no matching closer; no line tail is
+    copied or rescanned for each potential opener.
+    """
+    matches: list[set[int]] = [set() for _ in range(len(lines))]
+    previous_by_length: dict[int, tuple[int, int]] = {}
+    for line_no, line in enumerate(lines):
+        boundary = starts_new_block(line)
+        if boundary:
+            previous_by_length.clear()
+        for run in BACKTICK_RUN.finditer(line):
+            length = run.end() - run.start()
+            previous = previous_by_length.get(length)
+            if previous is not None:
+                previous_line, previous_start = previous
+                matches[previous_line].add(previous_start)
+            previous_by_length[length] = (line_no, run.start())
+        if boundary:
+            previous_by_length.clear()
+    return matches
+
+
+def strip_inline_constructs(
+    line: str,
+    matching_runs: set[int],
+    in_comment: bool,
+    open_ticks: str | None,
+) -> tuple[str, bool, str | None]:
+    """Mask comments and code spans in source order on one header line.
+
+    A code span suppresses comment openers within it; a comment suppresses
+    backticks within it. An unpaired backtick run is literal, so it cannot
+    hide a later declaration or stop a later comment from opening.
     """
     out: list[str] = []
     i = 0
-    while True:
+    while i < len(line):
+        if in_comment:
+            close = line.find("-->", i)
+            if close == -1:
+                return "".join(out), True, open_ticks
+            i = close + 3
+            in_comment = False
+            continue
         if open_ticks is not None:
-            close = re.search(rf"(?<!`){re.escape(open_ticks)}(?!`)", line[i:])
+            close = next(
+                (run for run in BACKTICK_RUN.finditer(line, i) if run.group() == open_ticks),
+                None,
+            )
             if close is None:
-                return "".join(out), open_ticks
-            i += close.end()
+                return "".join(out), False, open_ticks
+            i = close.end()
             open_ticks = None
             continue
-        m = BACKTICK_RUN.search(line, i)
-        if m is None:
+
+        comment_start = line.find("<!--", i)
+        run = BACKTICK_RUN.search(line, i)
+        if comment_start == -1 and run is None:
             out.append(line[i:])
-            return "".join(out), None
-        out.append(line[i : m.start()])
-        ticks = m.group()
-        close = re.search(rf"(?<!`){re.escape(ticks)}(?!`)", line[m.end() :])
-        if close is None:
-            return "".join(out), ticks
-        i = m.end() + close.end()
+            break
+        if comment_start != -1 and (run is None or comment_start < run.start()):
+            out.append(line[i:comment_start])
+            i = comment_start + 4
+            in_comment = True
+            continue
+        assert run is not None
+        if run.start() not in matching_runs:
+            out.append(line[i:run.end()])
+            i = run.end()
+            continue
+        out.append(line[i:run.start()])
+        i = run.end()
+        open_ticks = run.group()
+    return "".join(out), in_comment, open_ticks
 
 
 def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
@@ -280,10 +323,9 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
     indented line after a blank would be hidden and a continuation line
     (a second line of an indented example) would read as ordinary text.
 
-    A backtick code span (see `strip_code_spans`) that opens but does not
-    close on one line carries its open state into the next line the same
-    way, so a status label sitting on the second line of a multi-line span
-    is not read as a separate declaration.
+    A matched backtick code span can cross a line break within one paragraph;
+    an unmatched run remains visible literal text. Comments and code spans
+    are masked in the order their openers occur.
     """
     visible: list[str | None] = []
     hidden: list[bool] = []
@@ -292,7 +334,8 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
     in_indented_code = False
     code_open: str | None = None
     prev_blank = True
-    for line in lines:
+    matching_runs = matching_backtick_runs(lines)
+    for line_no, line in enumerate(lines):
         if fence_close is not None:
             if fence_close.match(line):
                 fence_close = None
@@ -303,11 +346,9 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
                 hidden.append(False)
             prev_blank = line.strip() == ""
             continue
-        if not in_comment:
-            opener = FENCE_OPEN.match(line)
-            if opener and not (
-                opener.group("chars")[0] == "`" and "`" in opener.group("info")
-            ):
+        if not in_comment and code_open is None:
+            opener = fence_opener(line)
+            if opener:
                 chars = opener.group("chars")
                 fence_close = re.compile(
                     rf"^ {{0,3}}{re.escape(chars[0])}{{{len(chars)},}}[ \t]*$"
@@ -330,10 +371,11 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
                 hidden.append(True)
                 prev_blank = line.strip() == ""
                 continue
-        text, in_comment = strip_comments(line, in_comment)
         if line.strip() == "":
             code_open = None  # a code span cannot cross a paragraph boundary
-        text, code_open = strip_code_spans(text, code_open)
+        text, in_comment, code_open = strip_inline_constructs(
+            line, matching_runs[line_no], in_comment, code_open
+        )
         visible.append(text)
         hidden.append(False)
         prev_blank = line.strip() == ""
@@ -640,6 +682,26 @@ MUST_FAIL = {
         "\n"
         "## Context\n"
     ),
+    # A stray backtick has no closer, so both declarations remain visible.
+    "ADR-958-unmatched-backtick-two-statuses.md": (
+        "# ADR-958: Something\n"
+        "\n"
+        "**Status**: Accepted `\n"
+        "**Status**: Proposed\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A comment opener inside code is display text; it cannot hide the next
+    # declaration across the intervening blank line.
+    "ADR-960-comment-marker-inside-code-span.md": (
+        "# ADR-960: Something\n"
+        "\n"
+        "**Status**: Accepted `<!--`\n"
+        "\n"
+        "**Status**: Proposed\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 MUST_PASS = {
@@ -842,6 +904,38 @@ MUST_PASS = {
         "\n"
         "## Context\n"
     ),
+    # A stray backtick before the only declaration is literal text, not a
+    # code span swallowing the next line.
+    "ADR-959-unmatched-backtick-before-status.md": (
+        "# ADR-959: Something\n"
+        "\n"
+        "Some header prose has a stray `\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A stray backtick in the header cannot use one in the body as its closer
+    # across a section heading. Otherwise the heading is masked and the body
+    # status is misread as a second header declaration.
+    "ADR-961-backtick-stops-at-heading.md": (
+        "# ADR-961: Something\n"
+        "\n"
+        "**Status**: Accepted `\n"
+        "## Context\n"
+        "Body text\n"
+        "`Status: proposed\n"
+    ),
+    # A fence opener also starts a new block. A header backtick must not
+    # pair with one inside the fenced example and expose its status label.
+    "ADR-962-backtick-stops-at-fence.md": (
+        "# ADR-962: Something\n"
+        "\n"
+        "**Status**: Accepted `\n"
+        "```text\n"
+        "`Status: proposed\n"
+        "```\n"
+        "## Context\n"
+    ),
 }
 
 
@@ -870,6 +964,38 @@ def self_test() -> int:
                 )
                 problems += 1
             path.unlink()
+
+        # A line-counting sequence makes repeated tail scans and suffix copies
+        # deterministic failures, without an unreliable wall-clock threshold.
+        class CountedLines:
+            def __init__(self, source: list[str]) -> None:
+                self.source = source
+                self.reads = 0
+
+            def __len__(self) -> int:
+                return len(self.source)
+
+            def __getitem__(self, index: int) -> str:
+                if isinstance(index, slice):
+                    raise AssertionError("lookahead copied a line suffix")
+                self.reads += 1
+                return self.source[index]
+
+        source_lines = [f"text {'`' * length}" for length in range(1, 257)]
+        counted_lines = CountedLines(source_lines)
+        try:
+            visible, hidden = visible_view(counted_lines)
+        except AssertionError:
+            print("SELF-TEST: linear backtick lookahead copied a line suffix.", file=sys.stderr)
+            problems += 1
+        else:
+            if (
+                counted_lines.reads > 3 * len(source_lines)
+                or visible != source_lines
+                or any(hidden)
+            ):
+                print("SELF-TEST: linear backtick lookahead reread line suffixes.", file=sys.stderr)
+                problems += 1
 
         # The empty-corpus arm: a glob that matches nothing must be reported as a
         # broken invocation, never as a clean pass. Without this the whole check
@@ -1004,7 +1130,7 @@ def self_test() -> int:
             )
             problems += 1
 
-    total = len(MUST_FAIL) + len(MUST_PASS) + 7
+    total = len(MUST_FAIL) + len(MUST_PASS) + 8
     print(f"lint-adr-status self-test: {total - problems}/{total} cases correct.")
     return 1 if problems else 0
 
