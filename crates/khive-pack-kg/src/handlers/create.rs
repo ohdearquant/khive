@@ -985,18 +985,16 @@ impl KgPack {
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let mut annotates = Vec::new();
-                for s in p.annotates.unwrap_or_default() {
-                    annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
-                }
+                let annotation_refs = p.annotates.unwrap_or_default();
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
                 let result = if canonical == "head"
                     || p.key.is_some()
                     || p.embed.is_some()
                     || p.fence.is_some()
                 {
+                    let runtime = &self.runtime;
                     self.runtime
-                        .create_note_with_options(
+                        .create_note_with_options_resolving_annotations(
                             token,
                             &canonical,
                             p.name.as_deref(),
@@ -1005,7 +1003,15 @@ impl KgPack {
                             p.salience,
                             None,
                             properties,
-                            annotates,
+                            async move {
+                                let mut annotates = Vec::with_capacity(annotation_refs.len());
+                                for reference in annotation_refs {
+                                    annotates.push(
+                                        resolve_uuid_unfiltered(&reference, runtime, token).await?,
+                                    );
+                                }
+                                Ok(annotates)
+                            },
                             None,
                             khive_runtime::note_write::NoteWriteOptions {
                                 key: p.key.clone(),
@@ -1016,6 +1022,11 @@ impl KgPack {
                         )
                         .await
                 } else {
+                    let mut annotates = Vec::with_capacity(annotation_refs.len());
+                    for reference in annotation_refs {
+                        annotates
+                            .push(resolve_uuid_unfiltered(&reference, &self.runtime, token).await?);
+                    }
                     self.runtime
                         .create_note_with_embedding_content_and_report(
                             token,
