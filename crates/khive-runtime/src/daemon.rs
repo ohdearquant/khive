@@ -46,6 +46,12 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 8;
 
+/// Internal signal carried in a dispatch result until the daemon moves it to
+/// response-frame metadata. It must never be sent in `result`: older v8
+/// clients publish that string without inspecting its contents.
+#[doc(hidden)]
+pub const DAEMON_LEXICAL_TIMEOUT_MARKER: &str = "__khive_daemon_lexical_timeout";
+
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 /// An accepted local socket must finish its first frame within this window.
 /// Dispatch deadlines start only after decoding, so they cannot reap peers
@@ -902,7 +908,9 @@ pub struct DaemonResponseFrame {
     pub ok: bool,
     pub result: Option<String>,
     pub error: Option<String>,
-    /// Additive error metadata; legacy protocol-v4 peers still read `error` as text.
+    /// Additive failure metadata; legacy protocol-v4 peers still read `error` as text.
+    /// On a successful response, `{"lexical_timeout":true}` is a daemon-only
+    /// diagnostic that old clients ignore and new clients log locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<serde_json::Value>,
     pub namespace_mismatch: bool,
@@ -945,6 +953,40 @@ pub struct DaemonResponseFrame {
     /// rather than a parse error.
     #[serde(default)]
     pub request_id: Option<u64>,
+}
+
+/// Move the private dispatch signal out of the result before any client can
+/// observe it. Unmarked results retain their exact bytes. The marked result
+/// was serialized from a JSON Value by the MCP server, so reserializing after
+/// removal reproduces its public envelope. The marker's escaped frame cost
+/// equals `error_detail:{"lexical_timeout":true}`, keeping the server's exact
+/// frame-fit calculation valid after this move.
+#[cfg(unix)]
+fn take_daemon_lexical_timeout_marker(raw: String) -> (String, Option<serde_json::Value>) {
+    if !raw.contains(DAEMON_LEXICAL_TIMEOUT_MARKER) {
+        return (raw, None);
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (raw, None);
+    };
+    let Some(fields) = value.as_object_mut() else {
+        return (raw, None);
+    };
+    if !fields
+        .get("results")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return (raw, None);
+    }
+    let Some(marker) = fields.remove(DAEMON_LEXICAL_TIMEOUT_MARKER) else {
+        return (raw, None);
+    };
+    let detail =
+        (marker.as_bool() == Some(true)).then(|| serde_json::json!({"lexical_timeout": true}));
+    (
+        serde_json::to_string(&value).expect("serde_json::Value is serializable"),
+        detail,
+    )
 }
 
 /// One checkpoint store in this daemon's fixed topology. IDs are process-local:
@@ -1953,19 +1995,22 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             }
         };
         match dispatch_result {
-            Ok(result) => DaemonResponseFrame {
-                ok: true,
-                result: Some(result),
-                error: None,
-                error_detail: None,
-                namespace_mismatch: false,
-                config_mismatch: false,
-                served_config_id,
-                version_mismatch: false,
-                daemon_protocol_version: PROTOCOL_VERSION,
-                metrics: None,
-                request_id: frame.request_id,
-            },
+            Ok(result) => {
+                let (result, detail) = take_daemon_lexical_timeout_marker(result);
+                DaemonResponseFrame {
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                    error_detail: detail,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id,
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: frame.request_id,
+                }
+            }
             Err(error) => {
                 let error = DaemonDispatchError::new(error.message, Some(error.error_detail));
                 DaemonResponseFrame {
@@ -3322,6 +3367,50 @@ mod tests {
     }
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn lexical_timeout_detail_hides_marker_from_old_clients_without_changing_frame_fit() {
+        let public = serde_json::json!({
+            "results": [{"ok": true, "tool": "knowledge.search", "result": "| name |\n|---|\n| first |\n"}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0}
+        });
+        let public_raw = public.to_string();
+        let mut marked = public;
+        marked[DAEMON_LEXICAL_TIMEOUT_MARKER] = serde_json::json!(true);
+        let marked_raw = marked.to_string();
+        let (result, detail) = take_daemon_lexical_timeout_marker(marked_raw.clone());
+        assert_eq!(result, public_raw);
+        assert_eq!(detail, Some(serde_json::json!({"lexical_timeout": true})));
+
+        let frame = |result, error_detail| DaemonResponseFrame {
+            ok: true,
+            result: Some(result),
+            error: None,
+            error_detail,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some("test".to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: Some(u64::MAX),
+        };
+        let internal_len = serde_json::to_vec(&frame(marked_raw, None)).unwrap().len();
+        let sent = frame(result, detail);
+        assert_eq!(sent.result.as_deref(), Some(public_raw.as_str()));
+        assert!(!sent
+            .result
+            .as_deref()
+            .unwrap()
+            .contains(DAEMON_LEXICAL_TIMEOUT_MARKER));
+        assert_eq!(serde_json::to_vec(&sent).unwrap().len(), internal_len);
+
+        let untouched = " {\"results\":[],\"summary\":{}} ".to_string();
+        assert_eq!(
+            take_daemon_lexical_timeout_marker(untouched.clone()),
+            (untouched, None)
+        );
+    }
 
     #[tokio::test]
     async fn incomplete_initial_frames_release_the_connection_deadline() {
