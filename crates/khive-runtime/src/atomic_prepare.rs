@@ -33,8 +33,8 @@ use crate::atomic_runner::CommittedPostCommitEffects;
 use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{
-    canonical_edge_endpoints, merge_dependency_kind, validate_edge_metadata, validate_edge_weight,
-    Resolved,
+    canonical_edge_endpoint_kinds, canonical_edge_endpoints, merge_dependency_kind,
+    validate_edge_metadata, validate_edge_weight, Resolved,
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -1925,11 +1925,13 @@ async fn prepare_link(
     validate_edge_metadata(relation, metadata.as_ref())?;
 
     validate_edge_weight(weight)?;
-    runtime
+    let (source_kind, target_kind) = runtime
         .validate_edge_relation_endpoints(token, source_id, target_id, relation)
         .await?;
 
     let (canon_source, canon_target) = canonical_edge_endpoints(relation, source_id, target_id);
+    let (source_kind, target_kind) =
+        canonical_edge_endpoint_kinds(source_id, canon_source, source_kind, target_kind);
 
     // Endpoint-kind `dependency_kind` inference for `depends_on` edges,
     // matching operations.rs `link()`: only applies when both endpoints
@@ -2021,6 +2023,21 @@ async fn prepare_link(
             EventKind::EdgeUpdated
         }
     };
+    let mut payload = serde_json::json!({
+        "id": edge_id,
+        "namespace": namespace,
+        "mutation": disposition.name(),
+        "source_id": canon_source,
+        "target_id": canon_target,
+        "relation": relation,
+        "weight": weight,
+        "metadata": metadata,
+        "previous": previous,
+    });
+    if kind == EventKind::LinkCreated {
+        payload["source_kind"] = serde_json::json!(source_kind.name());
+        payload["target_kind"] = serde_json::json!(target_kind.name());
+    }
     statements.extend(event_append_statements(
         token,
         &namespace,
@@ -2028,17 +2045,7 @@ async fn prepare_link(
         kind,
         SubstrateKind::Entity,
         edge_id,
-        serde_json::json!({
-            "id": edge_id,
-            "namespace": namespace,
-            "mutation": disposition.name(),
-            "source_id": canon_source,
-            "target_id": canon_target,
-            "relation": relation,
-            "weight": weight,
-            "metadata": metadata,
-            "previous": previous,
-        }),
+        payload,
     )?);
 
     Ok(AtomicOpPlan::Link(LinkPlan {
@@ -6270,6 +6277,8 @@ mod tests {
         assert_eq!(page.items.len(), 1, "link must append one created event");
         let event = &page.items[0];
         assert_eq!(event.payload["mutation"], "created");
+        assert_eq!(event.payload["source_kind"], "entity");
+        assert_eq!(event.payload["target_kind"], "entity");
         let edge_id = event.target_id.expect("link event targets its edge");
         let observed = event_store
             .query_events(
@@ -6283,6 +6292,87 @@ mod tests {
             .expect("query observed edge");
         assert_eq!(observed.items.len(), 1);
         assert_eq!(observed.items[0].id, event.id);
+    }
+
+    #[tokio::test]
+    async fn atomic_note_link_projects_note_endpoints() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let source = khive_storage::note::Note::new("local", "observation", "source");
+        let target = khive_storage::note::Note::new("local", "insight", "target");
+        let (source_id, target_id) = (source.id, target.id);
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(source)
+            .await
+            .expect("seed source");
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(target)
+            .await
+            .expect("seed target");
+
+        let plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": source_id.to_string(),
+                "target_id": target_id.to_string(),
+                "relation": "supports",
+            }),
+        )
+        .await
+        .expect("prepare note link");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("commit note link");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+
+        let page = runtime
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::LinkCreated],
+                    ..khive_storage::EventFilter::default()
+                },
+                khive_storage::types::PageRequest::default(),
+            )
+            .await
+            .expect("query link event");
+        assert_eq!(page.items.len(), 1);
+        let event = &page.items[0];
+        assert_eq!(event.payload["source_kind"], "note");
+        assert_eq!(event.payload["target_kind"], "note");
+
+        let query = format!(
+            "MATCH (ev)-[:observed_as_target]->(t) WHERE ev.id = '{}' RETURN t.id",
+            event.id
+        );
+        let rows = runtime
+            .query(&token, &query)
+            .await
+            .expect("query observations");
+        assert_eq!(rows.len(), 2);
+        let observed_ids: std::collections::BTreeSet<_> = rows
+            .iter()
+            .flat_map(|row| row.columns.iter())
+            .filter_map(|column| match &column.value {
+                khive_storage::types::SqlValue::Text(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed_ids,
+            std::collections::BTreeSet::from([source_id.to_string(), target_id.to_string()])
+        );
     }
 
     // ------------------------------------------------------------------

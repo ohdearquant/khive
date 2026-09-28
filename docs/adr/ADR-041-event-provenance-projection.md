@@ -183,7 +183,8 @@ Per-verb role mapping (the v1 contract emitters MUST honor):
 | `RecallExecuted`                                  | `Candidate` (per candidate, ordered by pre-rerank score), `Selected` (per top-K) | The selected list is a subset of candidates; both rows exist (different `role` discriminators). |
 | `SearchExecuted`                                  | `Candidate`, `Selected`                                                          | Mirror of recall.                                                                               |
 | `RerankExecuted` (ADR-042)                        | `Candidate`, `Selected`                                                          | Rerank's input candidates from recall; rerank's output as selected.                             |
-| `LinkCreated`                                     | `Target` (source), `Target` (target) — `position=0` and `position=1`             | Both endpoints.                                                                                 |
+| `LinkCreated`                                     | `Target` (source), `Target` (target), `Target` (edge) — positions 0, 1, and 2    | Endpoint `referent_kind` follows `source_kind` and `target_kind`; the edge row is `edge`. An event endpoint has no row (Amendment A4). |
+| `EdgeUpdated`, `EdgeDeleted`                      | `Target` (edge) — `position=0`                                                  | Edge-only projection; these kinds do not reproject link endpoints.                             |
 | `EntityCreated`, `EntityUpdated`, `EntityDeleted` | `Target`                                                                         | The acted-upon entity.                                                                          |
 | `NoteCreated`, `NoteUpdated`, `NoteDeleted`       | `Target`                                                                         | The acted-upon note.                                                                            |
 | `TaskTransitioned`                                | `Target`                                                                         | The task.                                                                                       |
@@ -576,8 +577,10 @@ The generated V13 SQL adds `events.session_id TEXT`, creates `event_observations
 - `RecallExecuted` / `SearchExecuted` / `RerankExecuted`: `payload.candidates` →
   `Candidate` note rows; `payload.selected` / `payload.reranked` / `payload.final_scores`
   → `Selected` note rows.
-- `LinkCreated`: `payload.source_id` and `payload.target_id` → two entity `Target`
-  rows at `position=0` and `position=1`.
+- `LinkCreated`: `payload.source_id` and `payload.target_id` → endpoint `Target`
+  rows at `position=0` and `position=1`, typed by `payload.source_kind` and
+  `payload.target_kind`; the link edge ID → an `edge` `Target` row at `position=2`
+  (Amendment A4 and ADR-004). Event endpoints omit their endpoint row.
 - `FeedbackExplicit`: `event.target_id` → entity **or note** `Signal` row, per
   `event.substrate` (Amendment A1, A2).
 
@@ -594,7 +597,7 @@ vector. Future automatic delivery must first satisfy ADR-017's prerequisites.
 | Scenario                                           | Assert                                                                                       |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `recall` emits event                               | `event_observations` rows exist for candidates + selected with correct positions             |
-| `link` emits event                                 | Two `Target` rows at positions 0 and 1                                                       |
+| `link` emits `LinkCreated` event                   | Endpoint `Target` rows at positions 0 and 1 with their substrate kinds, plus an `edge` `Target` row at position 2; event endpoint row omitted |
 | EventFilter `observed=[mem_id]`                    | Returns only events that observed `mem_id`; one JOIN in the EXPLAIN plan                     |
 | EventView storage shape                            | Payload is accessed via `view.event.payload` (NOT `view.payload` — no Deref)                 |
 | Synthetic edge in GQL                              | `MATCH (e:event)-[:observed_as_selected]->(m:memory) RETURN m` returns the selected memories |
@@ -693,6 +696,42 @@ event log is append-only and historical events remain valid as written.
 matching follow the projected `referent_kind`; entity-search observations resolve to entity
 referents. `RecallExecuted` and `RerankExecuted` are unchanged by this amendment: their
 `Candidate`/`Selected` projections remain note rows (memory recall serves memory notes).
+
+---
+
+## Amendment A4: `LinkCreated` carries endpoint substrates (Proposed, khive#3538)
+
+**Status: Proposed.** Set to Accepted (2026-09-28) when this amendment lands.
+
+`LinkCreated` projects the link source, link target, and created edge as `Target`
+observations at positions 0, 1, and 2. Its `source_id` and `target_id` may name
+different substrates: valid `supports`/`refutes`/`supersedes` links can have note
+endpoints, and `annotates` starts at a note and may target an entity, note, edge,
+or event. A fixed `ReferentKind::Entity` for both endpoints makes note observations
+unreachable through `observed_as_target`, whose query join matches both ID and
+`referent_kind`.
+
+The `LinkCreated` payload gains `source_kind` and `target_kind` strings from the
+validated endpoints. Each field is independently decoded. `"entity"`, `"note"`, and
+`"edge"` map to ADR-004's existing `referent_kind` vocabulary and emit the
+corresponding endpoint row. `"event"` identifies an event endpoint but emits no
+endpoint observation: ADR-004 has no event `referent_kind`. For a note annotating
+an event, position 0 remains a note `Target`, position 1 is absent, and position 2
+remains an edge `Target`. The event-endpoint gap requires a separate ADR-004
+amendment and follow-up issue; this amendment does not extend the observation
+vocabulary.
+
+An absent `source_kind` or `target_kind` decodes as `"entity"` for that endpoint,
+preserving the exact historical projection and idempotent replay comparison of
+older payloads. Present values outside the four listed strings are decode errors.
+The A2 precedent likewise preserves the pre-amendment projection for historical
+events. No existing event or observation row is rewritten.
+
+The runtime's local and bulk link paths, atomic prepare path, and coordinator
+path supply the endpoint kinds from validated endpoint resolution. A link update
+emits `EdgeUpdated`, and deletion emits `EdgeDeleted`; both retain their existing
+edge-only projection at position 0. There is no `LinkDeleted` event kind in the
+shipped vocabulary.
 
 ---
 
