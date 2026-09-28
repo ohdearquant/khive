@@ -276,7 +276,6 @@ Amendments to accepted records:
 - [ADR-061 Amendment 1](ADR-061-pack-extensible-by-id-resolution.md#amendment-1-unsupported-generic-mutation-of-pack-private-records) (2026-09-14): unsupported generic mutation of pack-private records.
 - [ADR-087 Amendment 1](ADR-087-workspace-mirror.md#amendment-1-2026-07-15-self-standing-content-convention-blob-backed-binaries-durability-separation) (2026-07-15): self-standing content convention, blob-backed binaries, durability separation.
 - [ADR-088 Amendment 1, operational rider](ADR-088-amendment-1-git-digest.md#proposed-operational-rider-persisted-cursor-inspection-2026-09-10) (2026-09-10): persisted cursor inspection. Its heading marks it Proposed; it has no separate status line.
-- [ADR-103 Amendment 4](ADR-103-resource-attribution-model.md#amendment-4-2026-09-01-extending-the-admission-degrade-allowlist-to-operational-read-verbs) (2026-09-01): extending the admission-degrade allowlist to operational read verbs.
 - [ADR-104 Amendment 1](ADR-104-posterior-serving-recall.md#amendment-1-2026-07-12-prior-preserving-evidence-decay-for-per-entity-posteriors) (2026-07-12): prior-preserving evidence decay for per-entity posteriors.
 - [ADR-105 Appendix A](ADR-105-cross-node-comm-transport.md#appendix-a-2026-09-23----node-wire-protocol-version-1) (2026-09-23): node wire protocol, version 1, proposed as part of the 2026-09-14 amendment.
 - [ADR-119 Amendment 6](ADR-119-daemon-component-supervision.md#amendment-6-cancellation-during-inbound-transport-reads-2026-09-14) (2026-09-14): cancellation during inbound transport reads.
@@ -286,6 +285,6 @@ Amendments to accepted records:
 
 Amendments inside records whose own status is Proposed:
 
-- [ADR-133 Amendment 2](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-2-2026-09-01-extending-amendment-1s-verb-set-to-operational-reads) (2026-09-01) and [Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
+- [ADR-133 Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
 - [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
 - [ADR-172 Amendment 2](ADR-172-versioned-notes-compare-and-set.md#amendment-2-2026-09-08-a-head-note-kind-for-keyed-documents-the-document-kind-as-a-tag-embed-and-the-in-transaction-arm) (2026-09-08), [Amendment 3](ADR-172-versioned-notes-compare-and-set.md#amendment-3-2026-09-09-ordered-fence-lists) (2026-09-09), [Amendment 4](ADR-172-versioned-notes-compare-and-set.md#amendment-4-2026-09-11-absence-as-a-fence-predicate) (2026-09-11) and [Amendment 5](ADR-172-versioned-notes-compare-and-set.md#amendment-5-2026-09-14-an-accepted-fenced-write-always-mints-a-version-the-no-op-answer-is-for-unfenced-updates-only) (2026-09-14).
