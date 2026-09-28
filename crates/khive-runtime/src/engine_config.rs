@@ -782,6 +782,7 @@ pub struct ExecLimitsConfig {
 /// max_output_bytes = 1048576
 /// timeout_default_s = 30
 /// timeout_max_s = 600
+/// binary_digest_timeout_s = 10 # 1..=60; independent of run timeout
 /// keep = false
 ///
 /// [exec.limits]
@@ -804,11 +805,17 @@ pub struct ExecSectionConfig {
     pub timeout_default_s: Option<f64>,
     #[serde(default)]
     pub timeout_max_s: Option<f64>,
+    /// Stalled-mount guard for hashing an authorized binary (1..=60 seconds).
+    #[serde(default)]
+    pub binary_digest_timeout_s: Option<u64>,
     #[serde(default)]
     pub keep: bool,
     #[serde(default)]
     pub limits: ExecLimitsConfig,
 }
+
+pub const DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S: u64 = 10;
+pub const MAX_EXEC_BINARY_DIGEST_TIMEOUT_S: u64 = 60;
 
 // ---- web fetch/search policy (ADR-175 Amendment 1, carried into ADR-191 D3) ----
 
@@ -1572,6 +1579,16 @@ impl KhiveConfig {
                 ),
             });
         }
+        let binary_digest_timeout = self
+            .exec
+            .binary_digest_timeout_s
+            .unwrap_or(DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S);
+        if !(1..=MAX_EXEC_BINARY_DIGEST_TIMEOUT_S).contains(&binary_digest_timeout) {
+            return Err(ConfigError::InvalidExecConfig {
+                key: "binary_digest_timeout_s".to_string(),
+                reason: format!("must be between 1 and {MAX_EXEC_BINARY_DIGEST_TIMEOUT_S} seconds"),
+            });
+        }
 
         if let Some(value) = self.runtime.blob_hydration_bytes {
             let min = khive_storage::MAX_BLOB_WHOLE_BYTES;
@@ -1947,6 +1964,27 @@ mod tests {
         config.exec.timeout_default_s = None;
         config.exec.timeout_max_s = Some(600.0);
         config.validate().expect("valid resolved exec bounds");
+    }
+
+    #[test]
+    fn exec_binary_digest_timeout_is_bounded_at_load() {
+        let mut config = KhiveConfig::default();
+        assert_eq!(
+            config
+                .exec
+                .binary_digest_timeout_s
+                .unwrap_or(DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S),
+            10
+        );
+        for invalid in [0, MAX_EXEC_BINARY_DIGEST_TIMEOUT_S + 1] {
+            config.exec.binary_digest_timeout_s = Some(invalid);
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidExecConfig { key, .. }) if key == "binary_digest_timeout_s"
+            ));
+        }
+        config.exec.binary_digest_timeout_s = Some(20);
+        config.validate().expect("bounded digest timeout override");
     }
 
     #[test]

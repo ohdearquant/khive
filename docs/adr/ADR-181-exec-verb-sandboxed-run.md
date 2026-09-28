@@ -453,3 +453,34 @@ this amendment does not change step 3.
   name and a `never` path is refused, `/bin/echo` is the control) are the arms this guarantee rests on
   and stay required. The `[exec]` configuration documentation and the `exec.identity` description are
   updated to the wording in item 3 in the same change that accepts this amendment.
+
+## Amendment 10 (2026-09-28): bounded binary digest and one run deadline
+
+The registered binary's canonical path and forbidden-binary identity are checked before the tool
+policy decision, as Amendment 1 item 8 requires. Reading its content for the receipt's
+`tool_binary_digest` begins only after `tool.check` allows the selected registry row. An `ask` or
+`deny` decision never hashes that binary.
+
+The digest reads at most 256 MiB plus one byte to detect an over-limit file, using the same 256 MiB
+budget as run input materialization. `[exec] binary_digest_timeout_s` defaults to 10 seconds and
+accepts an integer from 1 through 60; it is independent of `timeout_s`, which governs the spawned
+run. This deadline guards against stalled mounts and is not a performance budget. Exceeding the
+byte budget refuses with `binary_digest_byte_limit`; exceeding the digest deadline refuses with
+`binary_digest_time_limit`. A failed or incomplete digest never appears in a receipt as a valid
+digest.
+
+Digest refusals carry a typed wire code and structured evidence: `elapsed_ms`, `bytes_read`,
+`byte_cap`, `time_cap_ms`, and `path_class` when the opened file type is known (`null` otherwise).
+The durable refusal receipt keeps the same code and evidence under `refusal`. A read or worker
+failure has its own `binary_digest_read` or `binary_digest_worker` code and may carry a cause.
+
+The run wall deadline is established when spawning begins. Reading the child's resource-limit
+report and waiting for the child spend that same `timeout_s` budget. If the deadline expires
+during report collection, the report is uncertified and the existing timeout branch kills and
+reaps the process group with `timed_out: true`.
+
+Acceptance: a denied registered tool causes no binary digest attempt; an over-budget binary gets
+the named byte-limit refusal; a digest reader stalled past `binary_digest_timeout_s` gets
+`binary_digest_time_limit` with `elapsed_ms >= time_cap_ms` and no digest in any receipt; a delayed
+report consumes the wall budget so a child cannot receive a fresh full timeout after report
+collection.

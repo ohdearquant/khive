@@ -4,11 +4,15 @@
 //! receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::future::Future;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -28,6 +32,7 @@ use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
 
 const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOOL_BINARY_BYTES: u64 = MAX_RUN_INPUT_BYTES;
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -327,6 +332,7 @@ pub fn identity(cfg: &Resolved) -> Value {
         "max_output_bytes": cfg.max_output_bytes,
         "timeout_default_s": cfg.timeout_default_s,
         "timeout_max_s": cfg.timeout_max_s,
+        "binary_digest_timeout_s": cfg.binary_digest_timeout_s,
         "keep": cfg.keep,
         "limits": cfg.limits.to_json(),
         "digest": "blake3-hex",
@@ -350,6 +356,8 @@ struct Receipt {
     denied: bool,
     success: bool,
     reason: Option<String>,
+    refusal_code: &'static str,
+    refusal_detail: Value,
     decision: Option<Value>,
     stdout_ref: Option<String>,
     stderr_ref: Option<String>,
@@ -381,7 +389,7 @@ struct Receipt {
 
 impl Receipt {
     fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "actor": self.actor,
             "tool": self.tool,
@@ -422,7 +430,14 @@ impl Receipt {
                 (Some(s), Some(f)) => Some((f - s) / 1000),
                 _ => None,
             },
-        })
+        });
+        if self.refusal_code != "exec_refused" {
+            value["refusal"] = json!({
+                "code": self.refusal_code,
+                "detail": self.refusal_detail,
+            });
+        }
+        value
     }
 }
 
@@ -529,31 +544,262 @@ fn tool_binary(entity: &khive_storage::Entity) -> Result<String, RuntimeError> {
     }
 }
 
-fn hash_tool_binary(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
+#[derive(Clone, Copy)]
+struct BinaryDigestBudget {
+    started: Instant,
+    timeout: Duration,
+    max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryDigestErrorKind {
+    Read,
+    ByteLimit,
+    TimeLimit,
+    Worker,
+}
+
+impl BinaryDigestErrorKind {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Read => "binary_digest_read",
+            Self::ByteLimit => "binary_digest_byte_limit",
+            Self::TimeLimit => "binary_digest_time_limit",
+            Self::Worker => "binary_digest_worker",
+        }
+    }
+}
+
+#[derive(Default)]
+struct BinaryDigestProgress {
+    bytes_read: AtomicU64,
+    path_class: Mutex<Option<&'static str>>,
+}
+
+#[derive(Debug)]
+struct BinaryDigestError {
+    kind: BinaryDigestErrorKind,
+    elapsed_ms: u64,
+    bytes_read: u64,
+    byte_cap: u64,
+    time_cap_ms: u64,
+    path_class: Option<&'static str>,
+    cause: Option<String>,
+}
+
+impl BinaryDigestError {
+    fn new(
+        kind: BinaryDigestErrorKind,
+        budget: BinaryDigestBudget,
+        progress: &BinaryDigestProgress,
+        cause: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            elapsed_ms: u64::try_from(budget.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bytes_read: progress.bytes_read.load(Ordering::Relaxed),
+            byte_cap: budget.max_bytes,
+            time_cap_ms: u64::try_from(budget.timeout.as_millis()).unwrap_or(u64::MAX),
+            path_class: *progress.path_class.lock().unwrap(),
+            cause,
+        }
+    }
+
+    fn detail(&self) -> Value {
+        json!({
+            "elapsed_ms": self.elapsed_ms,
+            "bytes_read": self.bytes_read,
+            "byte_cap": self.byte_cap,
+            "time_cap_ms": self.time_cap_ms,
+            "path_class": self.path_class,
+            "cause": self.cause,
+        })
+    }
+}
+
+impl std::fmt::Display for BinaryDigestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            BinaryDigestErrorKind::Read | BinaryDigestErrorKind::Worker => write!(
+                f,
+                "{}: {}",
+                self.kind.code(),
+                self.cause
+                    .as_deref()
+                    .unwrap_or("registered tool could not be read")
+            ),
+            BinaryDigestErrorKind::ByteLimit => write!(
+                f,
+                "{}: registered tool exceeds {} bytes",
+                self.kind.code(),
+                self.byte_cap
+            ),
+            BinaryDigestErrorKind::TimeLimit => write!(
+                f,
+                "{}: registered tool digest exceeded {} ms",
+                self.kind.code(),
+                self.time_cap_ms
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+static HASH_PROBE: std::sync::Mutex<
+    Option<(PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+type DigestStall = (
+    PathBuf,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<(Mutex<bool>, std::sync::Condvar)>,
+);
+
+#[cfg(test)]
+static DIGEST_STALL: Mutex<Option<DigestStall>> = Mutex::new(None);
+
+#[cfg(test)]
+struct TestStalledReader<R> {
+    inner: R,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl<R: Read> Read for TestStalledReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let stall = DIGEST_STALL.lock().unwrap().clone();
+        if let Some((target, entered, release)) = stall {
+            if target == self.path {
+                entered.store(true, Ordering::SeqCst);
+                let (lock, signal) = &*release;
+                let held = lock.lock().unwrap();
+                let _held = signal
+                    .wait_timeout_while(held, Duration::from_secs(4), |released| !*released)
+                    .unwrap();
+            }
+        }
+        self.inner.read(buffer)
+    }
+}
+
+fn hash_tool_binary(
+    path: &Path,
+    budget: BinaryDigestBudget,
+    progress: &BinaryDigestProgress,
+) -> Result<String, BinaryDigestError> {
+    #[cfg(test)]
+    if let Some((target, count)) = HASH_PROBE.lock().unwrap().as_ref() {
+        if target == path {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let failure = |kind, cause| BinaryDigestError::new(kind, budget, progress, cause);
+    if budget.started.elapsed() >= budget.timeout {
+        return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)
+        .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
+    let class = if metadata.is_file() {
+        "regular_file"
+    } else if metadata.is_dir() {
+        "directory"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+    *progress.path_class.lock().unwrap() = Some(class);
+    if !metadata.is_file() {
+        return Err(failure(
+            BinaryDigestErrorKind::Read,
+            Some("registered tool is not a regular file".into()),
+        ));
+    }
+    #[cfg(test)]
+    {
+        let mut reader = TestStalledReader {
+            inner: file,
+            path: path.to_path_buf(),
+        };
+        hash_tool_binary_reader(&mut reader, budget, progress)
+    }
+    #[cfg(not(test))]
+    {
+        let mut file = file;
+        hash_tool_binary_reader(&mut file, budget, progress)
+    }
+}
+
+fn hash_tool_binary_reader(
+    reader: &mut impl Read,
+    budget: BinaryDigestBudget,
+    progress: &BinaryDigestProgress,
+) -> Result<String, BinaryDigestError> {
+    let failure = |kind, cause| BinaryDigestError::new(kind, budget, progress, cause);
     let mut hasher = blake3::Hasher::new();
     let mut chunk = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
     loop {
-        let read = file.read(&mut chunk)?;
+        if budget.started.elapsed() >= budget.timeout {
+            return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
+        }
+        let remaining = budget.max_bytes.saturating_sub(total).saturating_add(1);
+        let read_len = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(chunk.len()));
+        let read = reader
+            .read(&mut chunk[..read_len])
+            .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
+        total += read as u64;
+        progress.bytes_read.store(total, Ordering::Relaxed);
+        if budget.started.elapsed() >= budget.timeout {
+            return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
+        }
         if read == 0 {
             break;
+        }
+        if total > budget.max_bytes {
+            return Err(failure(BinaryDigestErrorKind::ByteLimit, None));
         }
         hasher.update(&chunk[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn refusal_error(reason: &str, id: &str, effective_max_output_bytes: u64) -> RuntimeError {
+fn refusal_error(reason: &str, receipt: &Receipt) -> RuntimeError {
+    let mut detail = receipt
+        .refusal_detail
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    detail.insert(
+        "effective_max_output_bytes".into(),
+        json!(receipt.effective_max_output_bytes),
+    );
     RuntimeError::RefusedWithReceipt(Box::new(khive_runtime::ReceiptRefusal {
-        code: "exec_refused",
+        code: receipt.refusal_code,
         // Unchanged wording: the id stays inside the sentence for readers that
         // already parse it, and rides beside it as `receipt_id` for readers that
         // should not have to. `reason` and the resolved cap ride the same way,
         // so the envelope carries what the denied receipt records.
-        message: format!("exec.run refused: {reason} (receipt_id={id})"),
-        receipt_id: id.to_string(),
+        message: format!("exec.run refused: {reason} (receipt_id={})", receipt.id),
+        receipt_id: receipt.id.clone(),
         reason: reason.to_string(),
-        detail: json!({ "effective_max_output_bytes": effective_max_output_bytes }),
+        detail: Value::Object(detail),
     }))
 }
 
@@ -582,6 +828,8 @@ pub async fn run(
         denied: false,
         success: false,
         reason: None,
+        refusal_code: "exec_refused",
+        refusal_detail: Value::Null,
         decision: None,
         stdout_ref: None,
         stderr_ref: None,
@@ -646,11 +894,7 @@ pub async fn run(
             receipt.reason = Some(reason.clone());
             let value = receipt.to_json();
             receipts::insert(rt, &ns, &value).await?;
-            Err(refusal_error(
-                &reason,
-                &id,
-                receipt.effective_max_output_bytes,
-            ))
+            Err(refusal_error(&reason, &receipt))
         }
     }
 }
@@ -762,10 +1006,6 @@ async fn preflight(
     // Binary identity (Amendment 1 item 8) before policy: a forbidden binary
     // is refused whatever the policy says.
     let binary = check_binary(&registered, &cfg.never).map_err(|e| e.to_string())?;
-    let binary_digest = tokio::task::spawn_blocking(move || hash_tool_binary(&binary))
-        .await
-        .map_err(|error| format!("reading registered tool for digest: {error}"))?
-        .map_err(|error| format!("reading registered tool for digest: {error}"))?;
     receipt.argv = std::iter::once(registered.clone())
         .chain(req.args.iter().cloned())
         .collect();
@@ -785,6 +1025,47 @@ async fn preflight(
             req.actor, entity.name, decision.decision, decision.source
         ));
     }
+    let maximum_digest_timeout = khive_runtime::engine_config::MAX_EXEC_BINARY_DIGEST_TIMEOUT_S;
+    if !(1..=maximum_digest_timeout).contains(&cfg.binary_digest_timeout_s) {
+        return Err(format!(
+            "binary_digest_timeout_s is outside the configured 1..={maximum_digest_timeout} second range"
+        ));
+    }
+    let budget = BinaryDigestBudget {
+        started: Instant::now(),
+        timeout: Duration::from_secs(cfg.binary_digest_timeout_s),
+        max_bytes: MAX_TOOL_BINARY_BYTES,
+    };
+    let progress = Arc::new(BinaryDigestProgress::default());
+    let worker_progress = Arc::clone(&progress);
+    let digest_result = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(budget.started + budget.timeout),
+        tokio::task::spawn_blocking(move || hash_tool_binary(&binary, budget, &worker_progress)),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(BinaryDigestError::new(
+            BinaryDigestErrorKind::Worker,
+            budget,
+            &progress,
+            Some(error.to_string()),
+        )),
+        Err(_) => Err(BinaryDigestError::new(
+            BinaryDigestErrorKind::TimeLimit,
+            budget,
+            &progress,
+            None,
+        )),
+    };
+    let binary_digest = match digest_result {
+        Ok(digest) => digest,
+        Err(error) => {
+            receipt.refusal_code = error.kind.code();
+            receipt.refusal_detail = error.detail();
+            return Err(error.to_string());
+        }
+    };
     // Tree and cwd.
     let entries = tree::load(rt, &req.tree_in)
         .await
@@ -1218,6 +1499,7 @@ async fn execute(
     }
 
     let started = Instant::now();
+    let wall_started = tokio::time::Instant::now();
     receipt.started_at = Some(receipts::now_micros());
     let spawn = command.spawn();
     // Parent side of the pipe: close the writer, read the child's report.
@@ -1237,8 +1519,6 @@ async fn execute(
         }
     };
     let report_wait = req.timeout.min(Duration::from_secs(1));
-    let enforced = collect_limit_report(limit_reader, report_wait).await;
-    receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
     let pid = child.id().unwrap_or_default() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
@@ -1259,7 +1539,15 @@ async fn execute(
     let out_task = tokio::spawn(async move { drain(stdout, cap).await });
     let err_task = tokio::spawn(async move { drain(stderr, cap).await });
 
-    let status = match tokio::time::timeout(req.timeout, child.wait()).await {
+    let (enforced, waited) = collect_report_and_wait(
+        wall_started,
+        req.timeout,
+        collect_limit_report(limit_reader, report_wait),
+        child.wait(),
+    )
+    .await;
+    receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
+    let status = match waited {
         Ok(Ok(status)) => {
             use std::os::unix::process::ExitStatusExt;
             // Only the delivered signal for a configured limit is observable
@@ -1543,6 +1831,24 @@ fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
 }
 
 #[cfg(unix)]
+async fn collect_report_and_wait<R, W, T>(
+    started: tokio::time::Instant,
+    timeout: Duration,
+    report: R,
+    wait: W,
+) -> (Value, Result<T, tokio::time::error::Elapsed>)
+where
+    R: Future<Output = Value>,
+    W: Future<Output = T>,
+{
+    let deadline = started + timeout;
+    let enforced = tokio::time::timeout_at(deadline, report)
+        .await
+        .unwrap_or_else(|_| json!({}));
+    (enforced, tokio::time::timeout_at(deadline, wait).await)
+}
+
+#[cfg(unix)]
 async fn collect_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     let task = tokio::task::spawn_blocking(move || read_limit_report(reader, wait));
     match tokio::time::timeout(wait, task).await {
@@ -1721,9 +2027,117 @@ mod tests {
         let binary = dir.path().join("tool");
         let bytes = vec![0x5a; 128 * 1024];
         std::fs::write(&binary, &bytes).unwrap();
-        assert_eq!(hash_tool_binary(&binary).unwrap(), digest_hex(&bytes));
+        let budget = BinaryDigestBudget {
+            started: Instant::now(),
+            timeout: Duration::from_secs(5),
+            max_bytes: MAX_TOOL_BINARY_BYTES,
+        };
+        let progress = BinaryDigestProgress::default();
+        assert_eq!(
+            hash_tool_binary(&binary, budget, &progress).unwrap(),
+            digest_hex(&bytes)
+        );
         std::fs::remove_file(&binary).unwrap();
-        assert!(hash_tool_binary(&binary).is_err());
+        let missing_budget = BinaryDigestBudget {
+            started: Instant::now(),
+            ..budget
+        };
+        let missing = hash_tool_binary(&binary, missing_budget, &BinaryDigestProgress::default());
+        assert!(matches!(
+            missing,
+            Err(BinaryDigestError {
+                kind: BinaryDigestErrorKind::Read,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn binary_digest_refuses_over_cap_without_returning_a_partial_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("oversize-tool");
+        std::fs::write(&binary, vec![0x5a; 2 * 1024]).unwrap();
+        let budget = BinaryDigestBudget {
+            started: Instant::now(),
+            timeout: Duration::from_secs(5),
+            max_bytes: 1024,
+        };
+        let progress = BinaryDigestProgress::default();
+        let error = hash_tool_binary(&binary, budget, &progress).unwrap_err();
+        assert_eq!(error.kind, BinaryDigestErrorKind::ByteLimit);
+        assert_eq!(error.kind.code(), "binary_digest_byte_limit");
+        assert_eq!(error.detail()["bytes_read"], 1025);
+        assert_eq!(error.detail()["byte_cap"], 1024);
+        assert_eq!(error.detail()["path_class"], "regular_file");
+    }
+
+    #[test]
+    fn binary_digest_refuses_expired_deadline_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, b"tool").unwrap();
+        let budget = BinaryDigestBudget {
+            started: Instant::now() - Duration::from_secs(2),
+            timeout: Duration::from_secs(1),
+            max_bytes: MAX_TOOL_BINARY_BYTES,
+        };
+        let error =
+            hash_tool_binary(&binary, budget, &BinaryDigestProgress::default()).unwrap_err();
+        assert_eq!(error.kind, BinaryDigestErrorKind::TimeLimit);
+        assert_eq!(error.kind.code(), "binary_digest_time_limit");
+        assert_eq!(error.detail()["bytes_read"], 0);
+        assert_eq!(error.detail()["time_cap_ms"], 1000);
+    }
+
+    #[test]
+    fn binary_digest_refuses_reader_that_stalls_past_its_deadline() {
+        struct SlowEof {
+            read_called: bool,
+        }
+        impl Read for SlowEof {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.read_called = true;
+                std::thread::sleep(Duration::from_millis(75));
+                Ok(0)
+            }
+        }
+
+        let budget = BinaryDigestBudget {
+            started: Instant::now(),
+            timeout: Duration::from_millis(50),
+            max_bytes: MAX_TOOL_BINARY_BYTES,
+        };
+        let mut reader = SlowEof { read_called: false };
+        let error = hash_tool_binary_reader(&mut reader, budget, &BinaryDigestProgress::default())
+            .unwrap_err();
+        assert!(
+            reader.read_called,
+            "the reader did not consume the deadline"
+        );
+        assert_eq!(error.kind.code(), "binary_digest_time_limit");
+        assert!(error.elapsed_ms >= error.time_cap_ms);
+        assert_eq!(error.bytes_read, 0);
+        assert_eq!(error.time_cap_ms, 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn report_collection_spends_the_same_wall_budget_as_child_wait() {
+        let started = tokio::time::Instant::now();
+        let (report, status) = collect_report_and_wait(
+            started,
+            Duration::from_secs(1),
+            async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                json!({"delayed": true})
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                "exited"
+            },
+        )
+        .await;
+        assert_eq!(report, json!({"delayed": true}));
+        assert!(status.is_err(), "child outlived the shared wall deadline");
     }
 
     #[test]
