@@ -3,7 +3,9 @@
 //! `RuntimeConfig`, `BackendId`, `NamespaceToken`, and embedding model helpers
 //! live in `super::config` and are re-exported from here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use khive_db::StorageBackend;
@@ -23,6 +25,72 @@ use crate::config::{
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::pack::KindHook;
+
+#[cfg(all(test, target_os = "macos"))]
+const IN_PROCESS_TEST_NOFILE_LIMIT: libc::rlim_t = 4096;
+#[cfg(all(test, target_os = "macos"))]
+static IN_PROCESS_TEST_NOFILE_INIT: std::sync::Once = std::sync::Once::new();
+
+#[cfg(all(test, target_os = "macos"))]
+fn ensure_in_process_test_nofile_limit() {
+    IN_PROCESS_TEST_NOFILE_INIT.call_once(|| {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limits` is writable, and only this test binary's soft
+        // limit may change; the inherited hard limit is preserved.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) }, 0);
+        assert!(
+            limits.rlim_max >= IN_PROCESS_TEST_NOFILE_LIMIT,
+            "in-process SQLite tests require a hard open-file limit of at least {IN_PROCESS_TEST_NOFILE_LIMIT}"
+        );
+        if limits.rlim_cur < IN_PROCESS_TEST_NOFILE_LIMIT {
+            limits.rlim_cur = IN_PROCESS_TEST_NOFILE_LIMIT;
+            // SAFETY: the new soft limit does not exceed the observed hard
+            // limit, which is left unchanged.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        }
+    });
+}
+
+tokio::task_local! {
+    static REQUEST_EMBEDDER_EXCLUSIONS: Arc<HashSet<String>>;
+}
+
+/// Run one request with daemon-only embedding models excluded from registry access.
+pub fn scope_request_embedder_exclusions<F>(
+    excluded: Vec<String>,
+    future: F,
+) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    REQUEST_EMBEDDER_EXCLUSIONS.scope(Arc::new(excluded.into_iter().collect()), future)
+}
+
+/// Carry the current request's embedder exclusions into a spawned task.
+pub fn inherit_request_embedder_scope<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let exclusions = REQUEST_EMBEDDER_EXCLUSIONS.try_with(Arc::clone).ok();
+    async move {
+        match exclusions {
+            Some(exclusions) => REQUEST_EMBEDDER_EXCLUSIONS.scope(exclusions, future).await,
+            None => future.await,
+        }
+    }
+}
+
+fn request_excludes_embedder(name: &str) -> bool {
+    let canonical = parse_embedding_model_alias(name)
+        .map(|model| model.to_string())
+        .unwrap_or_else(|| name.to_string());
+    REQUEST_EMBEDDER_EXCLUSIONS
+        .try_with(|excluded| excluded.contains(&canonical))
+        .unwrap_or(false)
+}
 
 /// Callback type for pack-installed entity-type validators.
 ///
@@ -84,6 +152,32 @@ pub struct NamedVectorIdentity {
     model_key: String,
     model_name: String,
     dimensions: usize,
+}
+
+struct CachedNamedVectorStores {
+    identity: NamedVectorIdentity,
+    by_namespace: HashMap<String, Arc<dyn VectorStore>>,
+}
+
+fn check_cached_named_vector_identity(
+    cached: &NamedVectorIdentity,
+    requested: &NamedVectorIdentity,
+) -> RuntimeResult<()> {
+    if cached.dimensions() != requested.dimensions() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "named vector model_key {:?} is already bound to {} dimensions, expected {}",
+            requested.model_key(),
+            cached.dimensions(),
+            requested.dimensions()
+        )));
+    }
+    if cached.model_name() != requested.model_name() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "named vector model_key {:?} is already bound to a different active model identity",
+            requested.model_key()
+        )));
+    }
+    Ok(())
 }
 
 impl NamedVectorIdentity {
@@ -169,11 +263,21 @@ struct CoreEmbedderState {
 #[derive(Clone)]
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
+    /// Successful named-vector bindings and their namespace-scoped stores.
+    /// Shared by runtime clones so repeated reads do not enter the writer or
+    /// rescan the vector table after the first verified binding.
+    named_vector_stores: Arc<RwLock<HashMap<String, CachedNamedVectorStores>>>,
+    /// The main backend's cache, used when a secondary runtime creates a
+    /// `core()` handle. It must never reuse a secondary backend's store.
+    core_named_vector_stores: Option<Arc<RwLock<HashMap<String, CachedNamedVectorStores>>>>,
     /// When `Some`, holds the main backend so that `core()` can return a
     /// main-bound runtime handle without constructing a new connection.
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
+    /// All SQLite backends declared by the host process, including those
+    /// assigned to other packs. The code pack fences these from ingest.
+    declared_backend_db_paths: Arc<[PathBuf]>,
     /// ADR-118 exact-leg policy, sampled once at runtime construction.
     /// Request-time memory/knowledge serving must never re-read the process
     /// environment because tests and embedded runtimes share one process.
@@ -299,6 +403,8 @@ impl KhiveRuntime {
         config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        #[cfg(all(test, target_os = "macos"))]
+        ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -349,6 +455,8 @@ impl KhiveRuntime {
         config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        #[cfg(all(test, target_os = "macos"))]
+        ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => open_file(path)?,
             None => StorageBackend::memory()?,
@@ -410,8 +518,11 @@ impl KhiveRuntime {
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
             backend,
+            named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
+            core_named_vector_stores: None,
             core_backend: None,
             config,
+            declared_backend_db_paths: Vec::new().into(),
             ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
@@ -434,6 +545,9 @@ impl KhiveRuntime {
     /// After this call, `self.core()` returns a handle to `core` rather than
     /// cloning `self`. The caller (the boot path, not pack code) is responsible
     /// for passing the correct main backend.
+    /// Binding a different core clears its named-vector cache and prior main
+    /// embedder wiring. Call [`Self::with_core_embedders_from`] with the new main
+    /// runtime after rebinding when core-routed writes require its embedders.
     ///
     /// Panics in debug builds if `self.config.backend_id == BackendId::MAIN`,
     /// because the main runtime does not need a core pointer.
@@ -444,6 +558,17 @@ impl KhiveRuntime {
             "with_core_backend must not be called on the main runtime"
         );
         core.pool().main_pool_generation();
+        if self
+            .core_backend
+            .as_ref()
+            .is_some_and(|previous| !Arc::ptr_eq(previous, &core))
+        {
+            self.core_named_vector_stores = None;
+            self.core_embedders = None;
+        }
+        if self.core_named_vector_stores.is_none() {
+            self.core_named_vector_stores = Some(Arc::new(RwLock::new(HashMap::new())));
+        }
         self.core_backend = Some(core);
         self
     }
@@ -465,6 +590,10 @@ impl KhiveRuntime {
             embedding_model: main.config.embedding_model,
             additional_embedding_models: main.config.additional_embedding_models.clone(),
         });
+        self.core_named_vector_stores = Some(main.named_vector_stores.clone());
+        if Arc::ptr_eq(&self.backend, &main.backend) {
+            self.named_vector_stores = main.named_vector_stores.clone();
+        }
         self
     }
 
@@ -531,8 +660,14 @@ impl KhiveRuntime {
                 };
                 KhiveRuntime {
                     backend: main_arc.clone(),
+                    named_vector_stores: self
+                        .core_named_vector_stores
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
+                    core_named_vector_stores: None,
                     core_backend: None,
                     config: core_config,
+                    declared_backend_db_paths: self.declared_backend_db_paths.clone(),
                     ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
                     embedder_registry,
                     default_embedder_name,
@@ -584,6 +719,17 @@ impl KhiveRuntime {
     /// Return a reference to the runtime config.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// Install the host's full declared SQLite topology before pack registration.
+    pub fn with_declared_backend_db_paths(mut self, paths: Arc<[PathBuf]>) -> Self {
+        self.declared_backend_db_paths = paths;
+        self
+    }
+
+    /// All declared SQLite backend paths known to this runtime's host.
+    pub fn declared_backend_db_paths(&self) -> &[PathBuf] {
+        &self.declared_backend_db_paths
     }
 
     /// Whether this runtime selects the vector arm for a hybrid search —
@@ -939,6 +1085,9 @@ impl KhiveRuntime {
     /// Resolve the storage identity and declared dimensions together so guarded
     /// SQL publication agrees with VectorStore, including built-in aliases.
     pub(crate) fn vector_model_metadata(&self, model_name: &str) -> RuntimeResult<(String, usize)> {
+        if request_excludes_embedder(model_name) {
+            return Err(crate::RuntimeError::UnknownModel(model_name.to_string()));
+        }
         let registry = self
             .embedder_registry
             .read()
@@ -969,11 +1118,23 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         identity: &NamedVectorIdentity,
     ) -> RuntimeResult<Arc<dyn VectorStore>> {
+        let namespace = token.namespace().as_str();
+        {
+            let cached = self.named_vector_stores.read().map_err(|_| {
+                RuntimeError::Internal("named vector store cache lock poisoned".into())
+            })?;
+            if let Some(entry) = cached.get(identity.model_key()) {
+                check_cached_named_vector_identity(&entry.identity, identity)?;
+                if let Some(store) = entry.by_namespace.get(namespace) {
+                    return Ok(Arc::clone(store));
+                }
+            }
+        }
         let store = self.backend.vectors_for_namespace(
             identity.model_key(),
             identity.model_name(),
             identity.dimensions(),
-            token.namespace().as_str(),
+            namespace,
         )?;
 
         let table = format!("vec_{}", identity.model_key());
@@ -1060,6 +1221,20 @@ impl KhiveRuntime {
                 }
             })?;
 
+        let mut cached = self
+            .named_vector_stores
+            .write()
+            .map_err(|_| RuntimeError::Internal("named vector store cache lock poisoned".into()))?;
+        let entry = cached
+            .entry(identity.model_key().to_owned())
+            .or_insert_with(|| CachedNamedVectorStores {
+                identity: identity.clone(),
+                by_namespace: HashMap::new(),
+            });
+        check_cached_named_vector_identity(&entry.identity, identity)?;
+        entry
+            .by_namespace
+            .insert(namespace.to_owned(), Arc::clone(&store));
         Ok(store)
     }
 
@@ -1070,6 +1245,9 @@ impl KhiveRuntime {
     /// custom provider's declared `dimensions()`. `None` when no such model
     /// is registered.
     pub fn embedder_dimensions(&self, model_name: &str) -> Option<usize> {
+        if request_excludes_embedder(model_name) {
+            return None;
+        }
         if let Some(model) = parse_embedding_model_alias(model_name) {
             let key = model.to_string();
             let in_registry = self
@@ -1814,6 +1992,12 @@ impl KhiveRuntime {
                 .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?,
         };
         let key = model.to_string();
+        if request_excludes_embedder(&key) {
+            return Err(crate::RuntimeError::UnknownModel(
+                name.unwrap_or_else(|| self.default_embedder_name())
+                    .to_string(),
+            ));
+        }
         let contains = self
             .embedder_registry
             .read()
@@ -1838,7 +2022,12 @@ impl KhiveRuntime {
     pub fn registered_embedding_model_names(&self) -> Vec<String> {
         self.embedder_registry
             .read()
-            .map(|reg| reg.names())
+            .map(|reg| {
+                reg.names()
+                    .into_iter()
+                    .filter(|name| !request_excludes_embedder(name))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1877,6 +2066,9 @@ impl KhiveRuntime {
             Some(model) => model.to_string(),
             None => name.to_owned(),
         };
+        if request_excludes_embedder(&canonical_key) {
+            return Err(crate::RuntimeError::UnknownModel(name.to_string()));
+        }
         // Clone the entry so we don't hold the RwLockGuard across the
         // async OnceCell initialisation (Send bound).
         let entry = {
@@ -2082,6 +2274,25 @@ mod tests {
     use khive_gate::GateRef;
     use serial_test::serial;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_process_runtime_tests_have_4096_open_file_slots() {
+        let _runtime = KhiveRuntime::memory().expect("test runtime");
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limits` is a writable local value.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(
+            limits.rlim_cur >= IN_PROCESS_TEST_NOFILE_LIMIT,
+            "a parallel runtime suite needs at least 4096 open-file slots"
+        );
+    }
+
     fn test_blob_hydrator() -> (tempfile::TempDir, Arc<crate::BlobHydrator>) {
         let root = tempfile::tempdir().expect("blob root");
         let store = Arc::new(
@@ -2181,9 +2392,19 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_db_diagnostics_supplies_both_contention_counter_sources() {
-        let rt = KhiveRuntime::memory().expect("memory runtime should create");
+        let dir = tempfile::tempdir().expect("diagnostics database directory");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = Some(dir.path().join("runtime-diagnostics.db"));
+        let rt = KhiveRuntime::new_for_test(config).expect("file-backed runtime should create");
 
         let report = rt.db_diagnostics().await.expect("diagnostics succeed");
+
+        #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(
+            report.wal_pin.reporting_process_is_holder,
+            Some(true),
+            "the runtime report identifies its own process as a database holder"
+        );
 
         assert!(
             report.writer_contention.writer_acquisitions >= 1,
@@ -3987,6 +4208,124 @@ mod tests {
             panic!("same key cannot change model identity");
         };
         assert!(model_error.to_string().contains("already bound"));
+    }
+
+    #[tokio::test]
+    async fn repeated_named_vector_lookup_avoids_writer_acquisition() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let identity = NamedVectorIdentity::new("visual_cached", "model-a", 4).unwrap();
+        runtime
+            .vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("first lookup validates and registers");
+        let writer_before = runtime.backend().pool().writer_acquisition_snapshot();
+
+        runtime
+            .clone()
+            .vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("clone reuses verified store");
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            writer_before,
+            "repeated reads must not reach vector-table setup or model registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_projection_reuses_main_named_vector_cache() {
+        let main_backend = migrated_memory_backend();
+        let main =
+            KhiveRuntime::from_backend(Arc::clone(&main_backend), RuntimeConfig::no_embeddings());
+        let secondary = KhiveRuntime::from_backend(migrated_memory_backend(), secondary_config())
+            .with_core_embedders_from(&main)
+            .with_core_backend(Arc::clone(&main_backend));
+        let core = secondary.core();
+        let token = core.authorize(Namespace::local()).expect("authorize");
+        let identity = NamedVectorIdentity::new("core_visual_cached", "model-a", 4).unwrap();
+        core.vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("first lookup validates on main");
+        let writer_before = main_backend.pool().writer_acquisition_snapshot();
+
+        secondary
+            .core()
+            .vectors_for_named_identity(&token, &identity)
+            .await
+            .expect("new core projection reuses main store");
+        assert_eq!(
+            main_backend.pool().writer_acquisition_snapshot(),
+            writer_before
+        );
+    }
+
+    #[tokio::test]
+    async fn rebound_core_named_vector_lookup_uses_new_backend() {
+        let first_backend = migrated_memory_backend();
+        let second_backend = migrated_memory_backend();
+        let secondary = KhiveRuntime::from_backend(migrated_memory_backend(), secondary_config())
+            .with_core_backend(Arc::clone(&first_backend));
+        let identity = NamedVectorIdentity::new("rebound_visual", "model-a", 4).unwrap();
+        let first_core = secondary.core();
+        let first_token = first_core.authorize(Namespace::local()).expect("authorize");
+        let first_store = first_core
+            .vectors_for_named_identity(&first_token, &identity)
+            .await
+            .expect("first backend store");
+
+        let rebound = secondary.with_core_backend(Arc::clone(&second_backend));
+        let second_core = rebound.core();
+        let second_token = second_core
+            .authorize(Namespace::local())
+            .expect("authorize");
+        let second_store = second_core
+            .vectors_for_named_identity(&second_token, &identity)
+            .await
+            .expect("second backend store");
+        assert!(
+            !Arc::ptr_eq(&first_store, &second_store),
+            "the second backend needs its own vector store"
+        );
+        let registered = second_core
+            .list_embedding_models(Some("rebound_visual"))
+            .await
+            .expect("second backend model registry");
+        assert!(registered.iter().any(|record| {
+            record.model_id == "model-a"
+                && record.key_version == "rebound_visual"
+                && record.dimensions == 4
+        }));
+    }
+
+    #[test]
+    fn rebound_core_discards_previous_main_embedder_wiring() {
+        let first_backend = migrated_memory_backend();
+        let second_backend = migrated_memory_backend();
+        let first_main =
+            KhiveRuntime::from_backend(Arc::clone(&first_backend), RuntimeConfig::no_embeddings());
+        let second_main =
+            KhiveRuntime::from_backend(Arc::clone(&second_backend), RuntimeConfig::no_embeddings());
+        let secondary = KhiveRuntime::from_backend(migrated_memory_backend(), secondary_config())
+            .with_core_embedders_from(&first_main)
+            .with_core_backend(Arc::clone(&first_backend));
+        assert!(secondary.core_embedders.is_some());
+
+        let rebound = secondary.with_core_backend(Arc::clone(&second_backend));
+        assert!(
+            rebound.core_embedders.is_none(),
+            "the second backend cannot use the first main runtime's embedders"
+        );
+        assert!(Arc::ptr_eq(
+            &rebound.core().embedder_registry,
+            &rebound.embedder_registry
+        ));
+
+        let rewired = rebound.with_core_embedders_from(&second_main);
+        assert!(Arc::ptr_eq(
+            &rewired.core().embedder_registry,
+            &second_main.embedder_registry
+        ));
     }
 
     #[tokio::test]

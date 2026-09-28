@@ -25,7 +25,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Sparse, op, e)
+    e.into_storage_error(StorageCapability::Sparse, op)
 }
 
 /// Validate that a sparse vector is well-formed.
@@ -103,6 +103,7 @@ fn batch_insert_sparse_dml(
          (subject_id, namespace, kind, field, indices_json, values_blob, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          ON CONFLICT(subject_id, namespace, field) DO UPDATE SET \
+         kind = excluded.kind, \
          indices_json = excluded.indices_json, \
          values_blob = excluded.values_blob, \
          updated_at = excluded.updated_at"
@@ -941,6 +942,61 @@ mod tests {
         assert_eq!(summary.affected, 2);
         assert_eq!(summary.failed, 0);
         assert_eq!(store.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn insert_batch_upsert_updates_kind_and_kind_filtered_search() {
+        use chrono::Utc;
+
+        let store = make_store("test_batch_kind_upsert");
+        let id = Uuid::new_v4();
+        let record = |kind, vector| SparseRecord {
+            subject_id: id,
+            kind,
+            namespace: "ns:test".into(),
+            field: "body".into(),
+            vector,
+            updated_at: Utc::now(),
+        };
+
+        let first = store
+            .insert_batch(vec![record(SubstrateKind::Entity, sv(vec![0], vec![1.0]))])
+            .await
+            .unwrap();
+        assert_eq!(first.affected, 1);
+
+        let replacement = store
+            .insert_batch(vec![record(SubstrateKind::Note, sv(vec![1], vec![1.0]))])
+            .await
+            .unwrap();
+        assert_eq!(replacement.affected, 1);
+        assert_eq!(store.count().await.unwrap(), 1);
+
+        let stored_kind: String = {
+            let writer = store.pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .query_row(
+                    "SELECT kind FROM sparse_test_batch_kind_upsert \
+                     WHERE subject_id = ?1 AND namespace = ?2 AND field = ?3",
+                    rusqlite::params![id.to_string(), "ns:test", "body"],
+                    |row| row.get(0),
+                )
+                .expect("stored kind")
+        };
+        assert_eq!(stored_kind, "note");
+
+        let hits = store
+            .search_sparse(SparseSearchRequest {
+                query: sv(vec![1], vec![1.0]),
+                top_k: 1,
+                namespace: Some("ns:test".into()),
+                kind: Some(SubstrateKind::Note),
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_id, id);
     }
 
     /// ADR-067 Component A entry 6: with `KHIVE_WRITE_QUEUE=1`, `insert_batch`

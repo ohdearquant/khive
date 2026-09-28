@@ -24,7 +24,7 @@ fn map_err(error: rusqlite::Error, operation: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(error: SqliteError, operation: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Attachments, operation, error)
+    error.into_storage_error(StorageCapability::Attachments, operation)
 }
 
 /// Build the canonical upsert for one already-validated attachment.

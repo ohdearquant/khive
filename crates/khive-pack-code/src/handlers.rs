@@ -115,8 +115,13 @@ impl CodePack {
         }
 
         let runtime_db_path = self.runtime.config().db_path.clone();
-        let db_path = resolve_target_db(db.as_deref(), &path, runtime_db_path.as_deref())
-            .map_err(RuntimeError::InvalidInput)?;
+        let db_path = resolve_target_db(
+            db.as_deref(),
+            &path,
+            runtime_db_path.as_deref(),
+            self.runtime.declared_backend_db_paths(),
+        )
+        .map_err(RuntimeError::InvalidInput)?;
 
         let config = RuntimeConfig {
             db_path: Some(db_path.clone()),

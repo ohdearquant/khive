@@ -22,8 +22,7 @@ pub enum EntityChange {
     Deleted,
     /// Modified in branch (fields differ from base).
     Modified {
-        // Retained for future “was → now” conflict displays.
-        #[allow(dead_code)]
+        // Used by three-way property reconciliation and future “was → now” displays.
         base: ExportedEntity,
         branch: ExportedEntity,
     },

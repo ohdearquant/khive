@@ -5,25 +5,141 @@
 //! and crates/khive-pack-git/docs/ingest.md for the full design notes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
 
-use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    secret_gate, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_types::EdgeRelation;
 
 use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
 use crate::sql::sql;
 
+#[cfg(test)]
+#[path = "commit_text_tests.rs"]
+mod commit_text_tests;
+
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
+}
+
+/// The GitHub CLI is an optional network dependency, so neither a stalled
+/// process nor an unbounded response may occupy an ingest worker indefinitely.
+const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_STDOUT_LIMIT: usize = 32 * 1024 * 1024;
+const GH_STDERR_LIMIT: usize = 64 * 1024;
+const ORIGIN_STDOUT_LIMIT: usize = 16 * 1024;
+const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
+
+#[derive(Debug, PartialEq, Eq)]
+enum IngestCommandError {
+    NotFound,
+    CouldNotStart,
+    TimedOut,
+    StdoutTooLarge,
+    StderrTooLarge,
+    Io,
+}
+
+impl std::fmt::Display for IngestCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::NotFound => "command not found on PATH",
+            Self::CouldNotStart => "command could not be started",
+            Self::TimedOut => "command timed out",
+            Self::StdoutTooLarge => "command stdout exceeded limit",
+            Self::StderrTooLarge => "command stderr exceeded limit",
+            Self::Io => "command I/O failed",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for IngestCommandError {}
+
+struct IngestCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+}
+
+async fn read_command_pipe(
+    pipe: impl AsyncRead + Unpin,
+    limit: usize,
+    overflow: IngestCommandError,
+) -> std::result::Result<Vec<u8>, IngestCommandError> {
+    let mut bytes = Vec::new();
+    pipe.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| IngestCommandError::Io)?;
+    if bytes.len() > limit {
+        return Err(overflow);
+    }
+    Ok(bytes)
+}
+
+/// A just-written executable may remain busy briefly when another fork still
+/// holds a write descriptor. Retry only that transient spawn error; retain
+/// the ordinary classification for every other failure.
+async fn spawn_retrying_executable_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for delay_ms in EXECUTABLE_BUSY_BACKOFF_MS {
+        match spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            outcome => return outcome,
+        }
+    }
+    spawn()
+}
+
+async fn run_ingest_command(
+    mut command: AsyncCommand,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> std::result::Result<IngestCommandOutput, IngestCommandError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = spawn_retrying_executable_busy(|| command.spawn())
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                IngestCommandError::NotFound
+            } else {
+                IngestCommandError::CouldNotStart
+            }
+        })?;
+    let stdout = child.stdout.take().ok_or(IngestCommandError::Io)?;
+    let stderr = child.stderr.take().ok_or(IngestCommandError::Io)?;
+    tokio::time::timeout(timeout, async {
+        let (stdout, _stderr, status) = tokio::try_join!(
+            read_command_pipe(stdout, stdout_limit, IngestCommandError::StdoutTooLarge),
+            read_command_pipe(stderr, GH_STDERR_LIMIT, IngestCommandError::StderrTooLarge),
+            async { child.wait().await.map_err(|_| IngestCommandError::Io) }
+        )?;
+        Ok(IngestCommandOutput { status, stdout })
+    })
+    .await
+    .map_err(|_| IngestCommandError::TimedOut)?
 }
 
 /// Which record kinds a `run_ingest` pass processes. `Default` selects all
@@ -422,7 +538,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     opts: IngestOptions,
-    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send + 'static,
 ) -> Result<IngestReport> {
     run_ingest_inner(
         runtime,
@@ -441,7 +557,7 @@ async fn run_ingest_inner(
     registry: &VerbRegistry,
     opts: IngestOptions,
     origin_identity: OriginIdentity,
-    mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send + 'static,
 ) -> Result<IngestReport> {
     let mut report = IngestReport {
         done: true,
@@ -485,7 +601,8 @@ async fn run_ingest_inner(
             &opts.repo,
             opts.expected_github_repo.as_deref(),
             origin_identity,
-        );
+        )
+        .await;
         if let Ok(gh_repo) = &gh_probe {
             report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
@@ -671,7 +788,7 @@ async fn run_ingest_inner(
             &mut report,
             &mut budget,
             &mut new_records,
-            &mut recover,
+            recover,
             &mut commits_complete,
         )
         .await
@@ -810,10 +927,10 @@ async fn resolve_id(
         .map_err(anyhow::Error::new)
 }
 
-/// Resolve `raw` (a full UUID or an 8+ hex prefix) to an existing `project`
-/// entity id, unfiltered by namespace. Returns `Ok(None)` when no entity
-/// matches; never creates one. Used by the `git.digest` verb handler to
-/// resolve an explicitly supplied `project` argument.
+/// Resolve an explicit `git.digest(project)` UUID or 8+ hex prefix without a
+/// namespace filter. A full UUID is accepted as supplied; only a prefix is
+/// looked up, returning `Ok(None)` when it matches no record. This helper
+/// does not check that the resolved id is a live `project` entity.
 pub async fn resolve_project_id(runtime: &KhiveRuntime, raw: &str) -> Result<Option<Uuid>> {
     if let Ok(u) = Uuid::parse_str(raw) {
         return Ok(Some(u));
@@ -905,19 +1022,58 @@ async fn link_references(
 /// checkout, passed explicitly to `gh repo view` (never argument-less
 /// selection). Failure strings are stable and credential-safe — see the
 /// module overview in crates/khive-pack-git/docs/api/ingest.md.
-fn probe_gh_repository(
+#[derive(Debug, PartialEq, Eq)]
+enum GhProbeError {
+    Reason(&'static str),
+    GhTimedOut,
+    OriginTimedOut,
+}
+
+impl std::fmt::Display for GhProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reason(reason) => f.write_str(reason),
+            Self::GhTimedOut => f.write_str("gh CLI repository probe timed out"),
+            Self::OriginTimedOut => f.write_str("git origin repository probe timed out"),
+        }
+    }
+}
+
+impl std::error::Error for GhProbeError {}
+
+async fn probe_gh_repository(
     repo: &Path,
     expected: Option<&str>,
     origin_identity: OriginIdentity,
-) -> std::result::Result<String, &'static str> {
+) -> std::result::Result<String, GhProbeError> {
+    probe_gh_repository_with_command(
+        repo,
+        expected,
+        origin_identity,
+        Path::new("gh"),
+        GH_COMMAND_TIMEOUT,
+    )
+    .await
+}
+
+async fn probe_gh_repository_with_command(
+    repo: &Path,
+    expected: Option<&str>,
+    origin_identity: OriginIdentity,
+    gh_program: &Path,
+    timeout: Duration,
+) -> std::result::Result<String, GhProbeError> {
     let expected = match (expected, origin_identity) {
-        (Some(expected), _) => validate_owner_repo(expected)?,
-        (None, OriginIdentity::DeriveFromCwd) => github_repository_from_origin(repo)?,
+        (Some(expected), _) => validate_owner_repo(expected).map_err(GhProbeError::Reason)?,
+        (None, OriginIdentity::DeriveFromCwd) => github_repository_from_origin(repo).await?,
         (None, OriginIdentity::Never) => {
-            return Err("remote source has no usable github.com repository identity")
+            return Err(GhProbeError::Reason(
+                "remote source has no usable github.com repository identity",
+            ))
         }
     };
-    let output = Command::new("gh")
+    let mut command = AsyncCommand::new(gh_program);
+    command
         .args([
             "repo",
             "view",
@@ -930,42 +1086,57 @@ fn probe_gh_repository(
         // checkout appear usable by probing a different repo or host.
         .env_remove("GH_REPO")
         .env_remove("GH_HOST")
-        .env("GH_PROMPT_DISABLED", "1")
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "gh CLI not found on PATH"
-            } else {
-                "gh CLI could not be started"
+        .env("GH_PROMPT_DISABLED", "1");
+    let output = run_ingest_command(command, timeout, ORIGIN_STDOUT_LIMIT)
+        .await
+        .map_err(|error| match error {
+            IngestCommandError::TimedOut => GhProbeError::GhTimedOut,
+            IngestCommandError::NotFound => GhProbeError::Reason("gh CLI not found on PATH"),
+            IngestCommandError::CouldNotStart => {
+                GhProbeError::Reason("gh CLI could not be started")
             }
+            IngestCommandError::StdoutTooLarge | IngestCommandError::StderrTooLarge => {
+                GhProbeError::Reason("gh CLI repository probe output exceeded limit")
+            }
+            IngestCommandError::Io => GhProbeError::Reason("gh CLI repository probe I/O failed"),
         })?;
     if !output.status.success() {
-        return Err(
+        return Err(GhProbeError::Reason(
             "gh CLI could not resolve an authenticated GitHub repository for this checkout",
-        );
+        ));
     }
-    parse_gh_repository_identity(&output.stdout, &expected)
+    parse_gh_repository_identity(&output.stdout, &expected).map_err(GhProbeError::Reason)
 }
 
 /// Derive a GitHub `owner/repo` from the checkout's fetch identity. Only the
 /// configured `origin` is authoritative: another remote, or `gh`'s own local
 /// default, must never select the issue/PR source for this ingest.
-fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, &'static str> {
-    let output = Command::new("git")
+async fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, GhProbeError> {
+    let mut command = AsyncCommand::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["remote", "get-url", "origin"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|_| "git CLI could not resolve this checkout's origin repository")?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_ingest_command(command, GH_COMMAND_TIMEOUT, ORIGIN_STDOUT_LIMIT)
+        .await
+        .map_err(|error| match error {
+            IngestCommandError::TimedOut => GhProbeError::OriginTimedOut,
+            _ => {
+                GhProbeError::Reason("git CLI could not resolve this checkout's origin repository")
+            }
+        })?;
     if !output.status.success() {
-        return Err("checkout has no usable github.com origin repository");
+        return Err(GhProbeError::Reason(
+            "checkout has no usable github.com origin repository",
+        ));
     }
     let origin = std::str::from_utf8(&output.stdout)
         .map(str::trim)
-        .map_err(|_| "checkout has no usable github.com origin repository")?;
-    let slug =
-        remote_url_to_slug(origin).ok_or("checkout has no usable github.com origin repository")?;
+        .map_err(|_| GhProbeError::Reason("checkout has no usable github.com origin repository"))?;
+    let slug = remote_url_to_slug(origin).ok_or(GhProbeError::Reason(
+        "checkout has no usable github.com origin repository",
+    ))?;
     let mut segments = slug.split('/');
     let (Some(host), Some(owner), Some(name), None) = (
         segments.next(),
@@ -973,12 +1144,16 @@ fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, &'s
         segments.next(),
         segments.next(),
     ) else {
-        return Err("checkout has no usable github.com origin repository");
+        return Err(GhProbeError::Reason(
+            "checkout has no usable github.com origin repository",
+        ));
     };
     if !host.eq_ignore_ascii_case("github.com") {
-        return Err("checkout has no usable github.com origin repository");
+        return Err(GhProbeError::Reason(
+            "checkout has no usable github.com origin repository",
+        ));
     }
-    validate_owner_repo(&format!("{owner}/{name}"))
+    validate_owner_repo(&format!("{owner}/{name}")).map_err(GhProbeError::Reason)
 }
 
 fn validate_owner_repo(slug: &str) -> std::result::Result<String, &'static str> {
@@ -1086,6 +1261,343 @@ mod gh_repository_identity_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod gh_command_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        gh_json_with_command, probe_gh_repository_with_command, spawn_retrying_executable_busy,
+        GhProbeError, IngestCommandError, OriginIdentity,
+    };
+
+    fn executable(dir: &Path, body: &str) -> PathBuf {
+        let program = dir.join("fake-gh");
+        std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_executable_spawn_retries_only_within_its_budget() {
+        let mut attempts = 0;
+        let value = spawn_retrying_executable_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok(17)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((value, attempts), (17, 3));
+
+        let mut denied_attempts = 0;
+        let denied = spawn_retrying_executable_busy(|| {
+            denied_attempts += 1;
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(denied_attempts, 1);
+
+        let mut exhausted_attempts = 0;
+        let exhausted = spawn_retrying_executable_busy(|| {
+            exhausted_attempts += 1;
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(exhausted.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        assert_eq!(exhausted_attempts, 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_fixture_survives_a_transient_busy_executable() {
+        let test_name = std::thread::current()
+            .name()
+            .expect("libtest names test threads")
+            .to_owned();
+        if std::env::var("KHIVE_GIT_BUSY_FIXTURE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(test_name.as_str())
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    test_name.as_str(),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("KHIVE_GIT_BUSY_FIXTURE_CHILD", &test_name)
+                .env("HOME", &home)
+                .output()
+                .expect("spawn isolated busy-executable fixture");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "busy-executable fixture failed: {output:?}"
+            );
+            assert!(std::fs::read_dir(home).unwrap().next().is_none());
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "printf '[]'");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .unwrap();
+        let refused = tokio::process::Command::new(&program).spawn().unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ExecutableFileBusy);
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(writer);
+        });
+        let output = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["pr", "list"],
+            &program,
+            Duration::from_secs(1),
+            128,
+        )
+        .await
+        .expect("the busy fixture should run once its writer closes");
+        release.await.unwrap();
+        assert_eq!(output, "[]");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gh_page_timeout_is_typed_while_executor_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "exec sleep 5");
+        let ticked = Arc::new(AtomicBool::new(false));
+        let pulse = Arc::clone(&ticked);
+        let tick = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            pulse.store(true, Ordering::SeqCst);
+        });
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_millis(200),
+            128,
+        )
+        .await
+        .expect_err("a hung gh page must time out");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::TimedOut)
+        );
+        assert!(
+            ticked.load(Ordering::SeqCst),
+            "the runtime worker must remain available during a hung gh page"
+        );
+        tick.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gh_probe_timeout_is_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "exec sleep 5");
+        let error = probe_gh_repository_with_command(
+            dir.path(),
+            Some("fixture/repository"),
+            OriginIdentity::Never,
+            &program,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("a hung repository probe must time out");
+        assert_eq!(error, GhProbeError::GhTimedOut);
+    }
+
+    #[tokio::test]
+    async fn gh_page_stdout_is_bounded_before_json_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(
+            dir.path(),
+            "printf '1234567890123456789012345678901234567890'",
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["pr", "list"],
+            &program,
+            Duration::from_secs(1),
+            16,
+        )
+        .await
+        .expect_err("an oversized page must be refused");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::StdoutTooLarge)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_timeout_reason_survives_plain_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "exec sleep 5");
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_millis(200),
+            128,
+        )
+        .await
+        .expect_err("timeout fixture must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::TimedOut)
+        );
+        assert!(
+            error.to_string().contains("command timed out"),
+            "public report loses timeout cause: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_stdout_limit_reason_survives_plain_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(
+            dir.path(),
+            "printf '1234567890123456789012345678901234567890'",
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["pr", "list"],
+            &program,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("overflow fixture must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::StdoutTooLarge)
+        );
+        assert!(
+            error.to_string().contains("command stdout exceeded limit"),
+            "public report loses stdout limit cause: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_stderr_limit_reason_survives_plain_display_without_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "SYNTHETIC_STDERR_NOT_A_SECRET";
+        let payload = format!("{sentinel}{}", "x".repeat(super::GH_STDERR_LIMIT + 1));
+        let program = executable(
+            dir.path(),
+            &format!("printf '%s' '{payload}' >&2\nprintf '[]'"),
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("stderr overflow must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::StderrTooLarge)
+        );
+        let display = error.to_string();
+        assert!(
+            display.contains("command stderr exceeded limit"),
+            "public report loses stderr limit cause: {display}"
+        );
+        assert!(
+            !display.contains(sentinel),
+            "stderr payload must remain private"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_missing_program_reason_survives_plain_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent-synthetic-gh");
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &missing,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("missing program must fail");
+        assert_eq!(
+            error.downcast_ref::<IngestCommandError>(),
+            Some(&IngestCommandError::NotFound)
+        );
+        assert!(
+            error.to_string().contains("command not found on PATH"),
+            "public report loses start failure cause: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_exact_stdout_limit_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable(dir.path(), "printf '[]'");
+        let output = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_secs(5),
+            2,
+        )
+        .await
+        .expect("exact-limit output must remain accepted");
+        assert_eq!(output, "[]");
+    }
+
+    #[tokio::test]
+    async fn page_nonzero_exit_still_omits_stderr_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "SYNTHETIC_STDERR_NOT_A_SECRET";
+        let program = executable(
+            dir.path(),
+            &format!("printf '%s' '{sentinel}' >&2\nexit 23"),
+        );
+        let error = gh_json_with_command(
+            dir.path(),
+            "fixture/repository",
+            &["issue", "list"],
+            &program,
+            Duration::from_secs(5),
+            16,
+        )
+        .await
+        .expect_err("nonzero fixture must fail");
+        assert_eq!(error.to_string(), "gh issue list failed");
+        assert!(!error.to_string().contains(sentinel));
+    }
+}
+
 /// Look up an existing `commit` note by its `properties.sha` (natural-key
 /// idempotence — dedupe before create).
 async fn find_commit_by_sha(
@@ -1107,6 +1619,34 @@ async fn find_commit_by_sha(
         .await
         .map_err(anyhow::Error::new)?;
     Ok(row.and_then(|r| row_uuid(&r)))
+}
+
+/// Include tombstones: a deleted annotation is a deliberate curation choice,
+/// not a missing link for replay to recreate.
+async fn commit_annotation_targets(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    commit_id: Uuid,
+) -> Result<BTreeSet<Uuid>> {
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.map_err(anyhow::Error::new)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: sql!("commit_annotation_targets_select").into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(commit_id.to_string()),
+            ],
+            label: Some("git_ingest_commit_annotation_targets".into()),
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
+    rows.iter()
+        .map(|row| {
+            row_uuid(row)
+                .ok_or_else(|| anyhow!("stored commit annotation has an invalid target ID"))
+        })
+        .collect()
 }
 
 /// Look up an existing `issue`/`pull_request` note by its `properties.number`,
@@ -1474,7 +2014,6 @@ async fn write_page_checkpoint(
 // ── commits ─────────────────────────────────────────────────────────────────
 
 const RECORD_SEP: char = '\u{1e}';
-const FIELD_SEP: char = '\u{1f}';
 const TOUCHED_HEADER_PREFIX: &[u8] = b"/\x1e";
 
 struct RawCommit {
@@ -1496,7 +2035,7 @@ pub(crate) enum GitLogPhase {
     TouchedFiles,
 }
 
-/// A non-zero-exit `git log` failure, carrying its phase and raw stderr for
+/// A non-zero-exit history command failure, carrying its phase and raw stderr for
 /// classification by `is_missing_promisor_object`.
 #[derive(Debug)]
 pub(crate) struct GitLogError {
@@ -1507,7 +2046,7 @@ pub(crate) struct GitLogError {
 impl std::fmt::Display for GitLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cmd = match self.phase {
-            GitLogPhase::Metadata => "git log",
+            GitLogPhase::Metadata => "git log/cat-file",
             GitLogPhase::TouchedFiles => "git log --name-only",
         };
         write!(f, "{cmd} failed: {}", self.stderr)
@@ -1528,18 +2067,17 @@ impl GitLogError {
     }
 }
 
-/// Walk local git history via `git log` with a stable, machine-parseable
-/// format. See crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
+/// Walk local history using `git log` only for fixed-format metadata, then
+/// length-framed raw objects from `git cat-file --batch` for contributor text.
+/// See crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
 fn walk_commits(
     repo: &Path,
     since_sha: Option<&str>,
     snapshot_head: &str,
 ) -> Result<Vec<RawCommit>> {
-    // Raw control-byte separators embedded directly in the format string
-    // (not git's `%xHH` escape syntax) — passed as a single argv element
-    // (never through a shell), so the literal bytes survive intact and git's
-    // pretty-format engine emits any non-`%` character verbatim.
-    let format = format!("%H{FIELD_SEP}%h{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%cI{FIELD_SEP}%P{FIELD_SEP}%s{FIELD_SEP}%b{RECORD_SEP}");
+    // These four fields are Git-generated IDs/date only. Contributor-controlled
+    // author and message bytes never enter this line-delimited stream.
+    let format = "%H%x00%h%x00%cI%x00%P%x00";
     let mut args = vec![
         "log".to_string(),
         "--reverse".to_string(),
@@ -1563,69 +2101,283 @@ fn walk_commits(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut commits = Vec::new();
-    for record in text.split(RECORD_SEP) {
-        let record = record.trim_matches('\n');
+    let mut metadata = Vec::new();
+    for record in output.stdout.split(|byte| *byte == b'\n') {
         if record.is_empty() {
             continue;
         }
-        let fields: Vec<&str> = record.splitn(8, FIELD_SEP).collect();
-        if fields.len() < 8 {
-            continue;
+        let fields: Vec<&[u8]> = record.split(|byte| *byte == 0).collect();
+        if fields.len() != 5 || !fields[4].is_empty() {
+            bail!("git log returned a malformed commit metadata record");
         }
-        let sha = fields[0].to_string();
-        let short_sha = fields[1].to_string();
-        let author = fields[2].to_string();
-        let author_email = fields[3].to_string();
-        let committed_at = fields[4].to_string();
-        let parents = fields[5]
-            .split_whitespace()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let subject = fields[6].to_string();
-        let body = fields[7].trim_end_matches('\n').to_string();
-        commits.push(RawCommit {
+        let text = |field: &[u8]| String::from_utf8_lossy(field).into_owned();
+        let sha = text(fields[0]);
+        if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("git log returned a malformed commit id");
+        }
+        metadata.push((
             sha,
-            short_sha,
+            text(fields[1]),
+            text(fields[2]),
+            text(fields[3])
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    if metadata.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A regular file avoids a bidirectional pipe deadlock for long histories:
+    // cat-file can read every SHA while its length-framed stdout is collected.
+    let mut input = tempfile::tempfile().context("creating cat-file request list")?;
+    for (sha, _, _, _) in &metadata {
+        writeln!(input, "{sha}").context("writing cat-file request list")?;
+    }
+    input.seek(SeekFrom::Start(0))?;
+    let objects = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::from(input))
+        .output()
+        .context("spawning git cat-file --batch")?;
+    if !objects.status.success() {
+        return Err(anyhow::Error::new(GitLogError {
+            phase: GitLogPhase::Metadata,
+            stderr: String::from_utf8_lossy(&objects.stderr).into_owned(),
+        }));
+    }
+    parse_batch_commits(&metadata, &objects.stdout)
+}
+
+type CommitMetadata = (String, String, String, Vec<String>);
+
+fn decode_commit_message(headers: &[u8], raw: &[u8]) -> Result<String> {
+    let Some(label) = headers
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"encoding "))
+    else {
+        return Ok(String::from_utf8_lossy(raw).into_owned());
+    };
+    // WHATWG labels map ISO-8859-1 to Windows-1252; Git's declared Latin-1 is literal.
+    if label.eq_ignore_ascii_case(b"iso-8859-1")
+        || label.eq_ignore_ascii_case(b"iso8859-1")
+        || label.eq_ignore_ascii_case(b"latin1")
+        || label.eq_ignore_ascii_case(b"latin-1")
+    {
+        return Ok(raw.iter().map(|byte| char::from(*byte)).collect());
+    }
+    let encoding = encoding_rs::Encoding::for_label_no_replacement(label)
+        .context("git commit declares unsupported message encoding")?;
+    let decoded = encoding
+        .decode_without_bom_handling_and_without_replacement(raw)
+        .context("git commit message is invalid for its declared encoding")?;
+    Ok(decoded.into_owned())
+}
+
+fn parse_batch_commits(metadata: &[CommitMetadata], bytes: &[u8]) -> Result<Vec<RawCommit>> {
+    let mut offset = 0;
+    let mut commits = Vec::with_capacity(metadata.len());
+    for (sha, short_sha, committed_at, parents) in metadata {
+        let line_end = bytes[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| offset + index)
+            .context("git cat-file returned a truncated object header")?;
+        let header = std::str::from_utf8(&bytes[offset..line_end])
+            .context("git cat-file returned a non-UTF-8 object header")?;
+        let expected = format!("{sha} commit ");
+        let length: usize = header
+            .strip_prefix(&expected)
+            .context("git cat-file returned an unexpected object")?
+            .parse()
+            .context("git cat-file returned an invalid object length")?;
+        offset = line_end + 1;
+        let end = offset
+            .checked_add(length)
+            .context("git cat-file object length overflow")?;
+        let object = bytes
+            .get(offset..end)
+            .context("git cat-file returned a truncated object")?;
+        if bytes.get(end) != Some(&b'\n') {
+            bail!("git cat-file omitted the object terminator");
+        }
+        offset = end + 1;
+        let separator = object
+            .windows(2)
+            .position(|part| part == b"\n\n")
+            .context("git commit object has no message separator")?;
+        let headers = &object[..separator];
+        let author_line = headers
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"author "))
+            .context("git commit object has no author")?;
+        let author_text = String::from_utf8_lossy(author_line);
+        let email_end = author_text
+            .rfind('>')
+            .context("git commit author has no email end")?;
+        let email_start = author_text[..email_end]
+            .rfind(" <")
+            .context("git commit author has no email start")?;
+        let author = author_text[..email_start].to_string();
+        let author_email = author_text[email_start + 2..email_end].to_string();
+        let message = decode_commit_message(headers, &object[separator + 2..])?;
+        let mut lines = message.lines().skip_while(|line| line.trim().is_empty());
+        let subject = lines
+            .by_ref()
+            .take_while(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = lines
+            .skip_while(|line| line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        commits.push(RawCommit {
+            sha: sha.clone(),
+            short_sha: short_sha.clone(),
             author,
             author_email,
-            committed_at,
-            parents,
+            committed_at: committed_at.clone(),
+            parents: parents.clone(),
             subject,
-            body,
+            body: body.trim_end_matches('\n').to_string(),
         });
+    }
+    if offset != bytes.len() {
+        bail!("git cat-file returned trailing object data");
     }
     Ok(commits)
 }
 
-/// `sha -> [touched paths]` for every commit in `repo`'s history, via a
-/// separate NUL-delimited `--name-only` pass. See
-/// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
-fn touched_files(repo: &Path, snapshot_head: &str) -> Result<HashMap<String, Vec<String>>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("log")
-        .arg("-z")
-        .arg("--name-only")
-        .arg("--no-renames")
-        .arg("--diff-merges=first-parent")
-        // Git paths are always repository-relative, so no tracked path token
-        // can start with `/`. This absolute-looking prefix is therefore an
-        // unambiguous header sentinel in the NUL-delimited token stream.
-        .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
-        .arg(snapshot_head)
-        .arg("--")
-        .output()
-        .context("spawning git log --name-only")?;
-    if !output.status.success() {
-        return Err(anyhow::Error::new(GitLogError {
-            phase: GitLogPhase::TouchedFiles,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }));
+#[cfg(test)]
+mod commit_framing_tests {
+    use super::*;
+
+    #[test]
+    fn contributor_control_bytes_do_not_split_or_drop_commits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-w", "-t", "tree", "--stdin"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+
+        let cases = [
+            (
+                "Author",
+                "body separator",
+                format!("first\n\npart{RECORD_SEP}tail\n"),
+            ),
+            (
+                "Author",
+                "subject separator",
+                format!("second{RECORD_SEP}part\n\nbody\n"),
+            ),
+            (
+                "Name\u{1f}Tail",
+                "author separator",
+                "third\n\nbody\n".to_string(),
+            ),
+        ];
+        let mut parent: Option<String> = None;
+        for (author, _, message) in &cases {
+            let parent_header = parent
+                .as_ref()
+                .map(|sha| format!("parent {sha}\n"))
+                .unwrap_or_default();
+            let raw = format!(
+                "tree {tree}\n{parent_header}author {author} <author@example.invalid> 1760000000 +0000\ncommitter Test <test@example.invalid> 1760000000 +0000\n\n{message}"
+            );
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "hash-object",
+                    "--literally",
+                    "-w",
+                    "-t",
+                    "commit",
+                    "--stdin",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(raw.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            parent = Some(String::from_utf8(output.stdout).unwrap().trim().to_string());
+        }
+        let commits = walk_commits(repo, None, parent.as_deref().unwrap()).unwrap();
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].subject, "first");
+        assert_eq!(commits[0].body, format!("part{RECORD_SEP}tail"));
+        assert_eq!(commits[1].subject, format!("second{RECORD_SEP}part"));
+        assert_eq!(commits[1].body, "body");
+        assert_eq!(commits[2].author, "Name\u{1f}Tail");
+        assert_eq!(commits[2].author_email, "author@example.invalid");
     }
-    parse_touched_files(&output.stdout)
+}
+
+/// `sha -> [touched paths]` for only the selected page, via separate
+/// NUL-delimited `--name-only` passes. See
+/// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
+fn touched_files(repo: &Path, page_shas: &[String]) -> Result<HashMap<String, Vec<String>>> {
+    // Keep argv bounded for the unbounded internal ingest API. The caller
+    // supplies this page newest-first, preserving the parser's orphan-header
+    // containment rule even when one page spans several commands.
+    const SHAS_PER_COMMAND: usize = 256;
+    let mut files_by_sha = HashMap::new();
+    for shas in page_shas.chunks(SHAS_PER_COMMAND) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("log")
+            .arg("--no-walk=unsorted")
+            .arg("-z")
+            .arg("--name-only")
+            .arg("--no-renames")
+            .arg("--diff-merges=first-parent")
+            // Git paths are always repository-relative, so no tracked path
+            // token can start with `/`. This absolute-looking prefix is an
+            // unambiguous header sentinel in the NUL-delimited stream.
+            .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
+            .args(shas)
+            .arg("--")
+            .output()
+            .context("spawning git log --name-only")?;
+        if !output.status.success() {
+            return Err(anyhow::Error::new(GitLogError {
+                phase: GitLogPhase::TouchedFiles,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }));
+        }
+        files_by_sha.extend(parse_touched_files(&output.stdout)?);
+    }
+    Ok(files_by_sha)
 }
 
 /// Decode the `-z --name-only` stream [`touched_files`] produces. See
@@ -1801,7 +2553,7 @@ mod touched_file_parser_tests {
     }
 }
 
-/// The two `git log` passes a commit-ingest phase needs, loaded together so
+/// The metadata and page-path `git log` passes a commit-ingest phase needs, loaded together so
 /// a classified failure in either one can be retried as a single unit.
 struct CommitSnapshot {
     commits: Vec<RawCommit>,
@@ -1826,23 +2578,31 @@ fn resolve_commit_head(repo: &Path) -> Result<String> {
     Ok(head)
 }
 
-/// Load one commit-history snapshot; skips `touched_files` entirely when
-/// `walk_commits` found no new commits.
+/// Load one commit-history snapshot. Validate and remove the acknowledged
+/// prefix before selecting paths, but retain the entire remaining walk for
+/// the existing budget and completion decisions.
 fn load_commit_snapshot(
     repo: &Path,
     since_sha: Option<&str>,
     snapshot_head: &str,
+    last_completed_sha: Option<&str>,
+    page_limit: Option<usize>,
 ) -> Result<CommitSnapshot> {
-    let commits = walk_commits(repo, since_sha, snapshot_head)?;
-    if commits.is_empty() {
-        return Ok(CommitSnapshot {
-            commits,
-            files_by_sha: HashMap::new(),
-            head: snapshot_head.to_string(),
-            repo: repo.to_path_buf(),
-        });
+    let mut commits = walk_commits(repo, since_sha, snapshot_head)?;
+    if let Some(last_completed_sha) = last_completed_sha {
+        let position = commits
+            .iter()
+            .position(|record| record.sha == last_completed_sha)
+            .ok_or_else(|| anyhow!("commits checkpoint position is absent from its frozen snapshot; reset both commit cursor rows to replay history"))?;
+        commits.drain(..=position);
     }
-    let files_by_sha = touched_files(repo, snapshot_head)?;
+    let page_shas: Vec<String> = commits
+        .iter()
+        .take(page_limit.unwrap_or(usize::MAX))
+        .map(|commit| commit.sha.clone())
+        .rev()
+        .collect();
+    let files_by_sha = touched_files(repo, &page_shas)?;
     Ok(CommitSnapshot {
         commits,
         files_by_sha,
@@ -1885,6 +2645,8 @@ fn recover_commit_snapshot(
     repo: &Path,
     since_sha: Option<&str>,
     snapshot_head: Option<&str>,
+    last_completed_sha: Option<&str>,
+    page_limit: Option<usize>,
     mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>>,
 ) -> Result<(CommitSnapshot, Option<String>)> {
     let snapshot_head = match snapshot_head {
@@ -1894,7 +2656,13 @@ fn recover_commit_snapshot(
     let mut repo_path = repo.to_path_buf();
     let mut recovery_warning: Option<String> = None;
     loop {
-        match load_commit_snapshot(&repo_path, since_sha, &snapshot_head) {
+        match load_commit_snapshot(
+            &repo_path,
+            since_sha,
+            &snapshot_head,
+            last_completed_sha,
+            page_limit,
+        ) {
             Ok(snapshot) => return Ok((snapshot, recovery_warning)),
             Err(e) => {
                 let classified = e
@@ -2008,7 +2776,7 @@ async fn ingest_commits(
     report: &mut IngestReport,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
-    recover: &mut (dyn FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send),
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send + 'static,
     walk_complete: &mut bool,
 ) -> Result<()> {
     let (since, checkpoint) = read_commit_checkpoint(runtime, token, project_id).await?;
@@ -2027,25 +2795,34 @@ async fn ingest_commits(
             "invalid commits cursor; reset both commit cursor rows to replay history"
         ));
     }
-    let (snapshot, recovery_warning) = recover_commit_snapshot(
-        repo,
-        base_cursor.as_deref(),
-        pending.map(|c| c.snapshot_head.as_str()),
-        recover,
-    )?;
+    let repo_path = repo.to_path_buf();
+    let since_sha = base_cursor.clone();
+    let frozen_head = pending.map(|c| c.snapshot_head.clone());
+    let last_completed_sha = pending.map(|c| c.last_completed_sha.clone());
+    let page_limit = budget
+        .remaining
+        .map(|remaining| usize::try_from(remaining).unwrap_or(usize::MAX));
+    // The metadata walk, page-path pass, and any classified cache repair all
+    // use blocking git/cache operations. Keep them in one worker so retries
+    // still bind to the original frozen tip without blocking a Tokio worker.
+    let (snapshot, recovery_warning) = tokio::task::spawn_blocking(move || {
+        recover_commit_snapshot(
+            &repo_path,
+            since_sha.as_deref(),
+            frozen_head.as_deref(),
+            last_completed_sha.as_deref(),
+            page_limit,
+            recover,
+        )
+    })
+    .await
+    .context("commit snapshot task failed")??;
     let CommitSnapshot {
-        mut commits,
+        commits,
         files_by_sha,
         head: snapshot_head,
         repo: snapshot_repo,
     } = snapshot;
-    if let Some(c) = pending {
-        let position = commits.iter().position(|record| record.sha == c.last_completed_sha)
-            .ok_or_else(|| anyhow!("commits checkpoint position is absent from its frozen snapshot; reset both commit cursor rows to replay history"))?;
-        // Reconstructing the snapshot does no natural-key lookups. Its
-        // acknowledged prefix consumes no fresh-record visit budget.
-        commits.drain(..=position);
-    }
     if commits.is_empty() {
         // An empty range is a genuine completion only when the cursor is an
         // ancestor of HEAD. See crates/khive-pack-git/docs/ingest.md
@@ -2139,15 +2916,7 @@ async fn ingest_commits(
             ));
             break;
         }
-        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
-            local_sha_to_id.insert(c.sha.clone(), existing);
-            report.commits_skipped_existing += 1;
-            if !cursor_stalled {
-                checkpoint.last_completed_sha.clone_from(&c.sha);
-                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
-            }
-            continue;
-        }
+        let existing = find_commit_by_sha(runtime, token, &c.sha).await?;
 
         let masked = MaskedCommitFields::new(c);
         let content = if masked.body.trim().is_empty() {
@@ -2156,9 +2925,10 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        // Both `git log` passes walk the same history, so every walked
-        // commit should have a path-set entry. A missing entry means the two
-        // passes disagree; surface it instead of silently storing the `[]`
+        // The path pass requests this page's commits from the frozen metadata
+        // walk, so every visited commit should have a path-set entry. A
+        // missing entry means the passes disagree; surface it instead of
+        // silently storing the `[]`
         // the contract reserves for a genuinely empty commit.
         let Some(touched_paths) = files_by_sha.get(&c.sha) else {
             stall_cursor(&mut cursor_stalled, report);
@@ -2254,6 +3024,40 @@ async fn ingest_commits(
         };
         if let Some(pr_id) = pr_id {
             annotates.insert(pr_id.to_string());
+        }
+
+        if let Some(existing) = existing {
+            // A SHA is shared across project anchors. The natural-key hit
+            // skips note creation, but still adds this project's missing
+            // annotations before advancing its checkpoint. Existing live
+            // edges may have curated fields; tombstones stay deleted.
+            let existing_targets = commit_annotation_targets(runtime, token, existing).await?;
+            let links = annotates
+                .iter()
+                .map(|target| Uuid::parse_str(target).expect("annotation target is a UUID"))
+                .filter(|target| !existing_targets.contains(target))
+                .map(|target_id| LinkSpec {
+                    namespace: None,
+                    source_id: existing,
+                    target_id,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                })
+                .collect();
+            if let Err(error) = runtime.link_many(token, links).await {
+                record_write_failure(report, "link", "commit", c.sha.clone(), error);
+                stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+            local_sha_to_id.insert(c.sha.clone(), existing);
+            report.commits_skipped_existing += 1;
+            if !cursor_stalled {
+                checkpoint.last_completed_sha.clone_from(&c.sha);
+                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
+            }
+            continue;
         }
 
         let mut properties = json!({
@@ -2630,19 +3434,45 @@ fn canonical_issue_timestamp(
     }
 }
 
-fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
+async fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
+    gh_json_with_command(
+        repo,
+        gh_repo,
+        args,
+        Path::new("gh"),
+        GH_COMMAND_TIMEOUT,
+        GH_STDOUT_LIMIT,
+    )
+    .await
+}
+
+async fn gh_json_with_command(
+    repo: &Path,
+    gh_repo: &str,
+    args: &[&str],
+    gh_program: &Path,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<String> {
     // gh has no `-C` flag (unlike git). Keep cwd for local git configuration,
     // but target the repository explicitly so later remote/cwd drift cannot
     // redirect a resumed digest to a different repository.
-    let output = Command::new("gh")
+    let mut command = AsyncCommand::new(gh_program);
+    command
         .current_dir(repo)
         .args(args)
         .args(["--repo", gh_repo])
         .env_remove("GH_REPO")
         .env_remove("GH_HOST")
-        .env("GH_PROMPT_DISABLED", "1")
-        .output()
-        .context("spawning gh")?;
+        .env("GH_PROMPT_DISABLED", "1");
+    let output = run_ingest_command(command, timeout, stdout_limit)
+        .await
+        .map_err(|error| {
+            // IngestCommandError displays only fixed, credential-safe reasons.
+            // Public ingest reports use ordinary Display, not the cause chain.
+            let context = format!("running gh: {error}");
+            anyhow::Error::new(error).context(context)
+        })?;
     if !output.status.success() {
         let operation = args.get(0..2).unwrap_or(args).join(" ");
         return Err(anyhow!("gh {operation} failed"));
@@ -2724,7 +3554,7 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
-fn fetch_pr_page(
+async fn fetch_pr_page(
     repo: &Path,
     gh_repo: &str,
     floor: Option<&str>,
@@ -2747,11 +3577,12 @@ fn fetch_pr_page(
             "--json",
             PR_FIELDS,
         ],
-    )?;
+    )
+    .await?;
     serde_json::from_str(&raw).context("parsing gh pr list --json")
 }
 
-fn fetch_issue_page(
+async fn fetch_issue_page(
     repo: &Path,
     gh_repo: &str,
     floor: Option<&str>,
@@ -2774,7 +3605,8 @@ fn fetch_issue_page(
             "--json",
             ISSUE_FIELDS,
         ],
-    )?;
+    )
+    .await?;
     serde_json::from_str(&raw).context("parsing gh issue list --json")
 }
 
@@ -2900,7 +3732,7 @@ async fn ingest_prs(
         // and the arms below specialize the reason when they fire.
         let first_page = report.sources.pull_requests.is_none();
         let requested_limit = page_fetch_limit(budget, &checkpoint, floor.as_deref());
-        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref(), requested_limit) {
+        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref(), requested_limit).await {
             Ok(page) => {
                 if first_page {
                     report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
@@ -3181,7 +4013,7 @@ async fn ingest_issues(
         // leaving the loop early implies.
         let first_page = report.sources.issues.is_none();
         let requested_limit = page_fetch_limit(budget, &checkpoint, floor.as_deref());
-        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref(), requested_limit) {
+        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref(), requested_limit).await {
             Ok(page) => {
                 if first_page {
                     report.sources.issues = Some(IngestSourceState::StoppedEarly(
@@ -3570,11 +4402,12 @@ mod recovery_classifier_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         init_repo_with_commit(dir.path());
         let mut recover_calls = 0;
-        let (snapshot, warning) = recover_commit_snapshot(dir.path(), None, None, |_repo, _err| {
-            recover_calls += 1;
-            Ok(None)
-        })
-        .expect("healthy repo loads");
+        let (snapshot, warning) =
+            recover_commit_snapshot(dir.path(), None, None, None, None, |_repo, _err| {
+                recover_calls += 1;
+                Ok(None)
+            })
+            .expect("healthy repo loads");
         assert_eq!(snapshot.commits.len(), 1);
         assert_eq!(warning, None);
         assert_eq!(recover_calls, 0);
@@ -3589,7 +4422,7 @@ mod recovery_classifier_tests {
         // Not a git repo at all -- `git log` fails with a plain spawn/repo
         // error, not a classified promisor one.
         let mut recover_calls = 0;
-        let result = recover_commit_snapshot(dir.path(), None, None, |_repo, _err| {
+        let result = recover_commit_snapshot(dir.path(), None, None, None, None, |_repo, _err| {
             recover_calls += 1;
             Ok(Some(RecoveredRepo {
                 repo: dir.path().to_path_buf(),

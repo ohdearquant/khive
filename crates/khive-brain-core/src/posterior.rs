@@ -1,7 +1,9 @@
 //! Beta-Binomial posterior primitive.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -166,17 +168,15 @@ impl Default for BetaPosterior {
 
 /// Bounded LRU map for per-entity posteriors.
 pub struct EntityPosteriors {
-    map: HashMap<Uuid, BetaPosterior>,
-    order: VecDeque<Uuid>,
-    capacity: usize,
+    map: LruCache<Uuid, BetaPosterior>,
 }
 
 impl EntityPosteriors {
     pub fn new(capacity: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
-            capacity,
+            // The reference-returning insertion API has always retained one
+            // entry even when callers requested zero capacity.
+            map: LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap()),
         }
     }
 
@@ -185,20 +185,11 @@ impl EntityPosteriors {
         id: Uuid,
         default: impl FnOnce() -> BetaPosterior,
     ) -> &mut BetaPosterior {
-        if !self.map.contains_key(&id) {
-            if self.map.len() >= self.capacity {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.map.remove(&evicted);
-                }
-            }
-            self.map.insert(id, default());
-            self.order.push_back(id);
-        }
-        self.map.get_mut(&id).unwrap()
+        self.map.get_or_insert_mut(id, default)
     }
 
     pub fn get(&self, id: &Uuid) -> Option<&BetaPosterior> {
-        self.map.get(id)
+        self.map.peek(id)
     }
 
     pub fn len(&self) -> usize {
@@ -211,16 +202,18 @@ impl EntityPosteriors {
 
     pub fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
     }
 
     pub fn to_snapshot(&self) -> HashMap<Uuid, BetaPosterior> {
-        self.map.clone()
+        self.map
+            .iter()
+            .map(|(id, posterior)| (*id, posterior.clone()))
+            .collect()
     }
 
     /// Current eviction order, oldest (next to evict) first.
     pub fn order(&self) -> Vec<Uuid> {
-        self.order.iter().copied().collect()
+        self.map.iter().rev().map(|(id, _)| *id).collect()
     }
 
     /// Rebuild from a persisted map plus an explicit eviction order.
@@ -230,14 +223,15 @@ impl EntityPosteriors {
     /// map entries missing from `order` (legacy snapshots with no order
     /// metadata, or partially-ordered snapshots) are appended afterward in
     /// ascending `Uuid` order so restore is deterministic across processes.
-    /// The combined id list is then truncated to `capacity`, so a snapshot
-    /// with more entries than the configured cache capacity restores bounded
-    /// rather than exceeding it.
+    /// An explicit order retains its newest `capacity` ids. Legacy snapshots
+    /// without order metadata retain the ascending-UUID prefix, preserving
+    /// their historical deterministic restore rule.
     pub fn from_snapshot(
         map: HashMap<Uuid, BetaPosterior>,
         order: Vec<Uuid>,
         capacity: usize,
     ) -> Self {
+        let has_explicit_order = !order.is_empty();
         let mut seen = std::collections::HashSet::with_capacity(map.len());
         let mut ids: Vec<Uuid> = Vec::with_capacity(map.len());
 
@@ -254,13 +248,18 @@ impl EntityPosteriors {
             .collect();
         remaining.sort();
         ids.extend(remaining);
-        ids.truncate(capacity);
+        let capacity = capacity.max(1);
+        let keep_from = if has_explicit_order {
+            ids.len().saturating_sub(capacity)
+        } else {
+            ids.truncate(capacity);
+            0
+        };
 
         let mut ep = Self::new(capacity);
-        for id in ids {
+        for id in ids.into_iter().skip(keep_from) {
             if let Some(posterior) = map.get(&id).cloned() {
-                ep.map.insert(id, posterior);
-                ep.order.push_back(id);
+                ep.map.put(id, posterior);
             }
         }
         ep
@@ -488,6 +487,36 @@ mod tests {
         assert!(ep.get(&id3).is_some());
     }
 
+    #[test]
+    fn entity_posteriors_hit_moves_the_entry_out_of_eviction_position() {
+        let mut ep = EntityPosteriors::new(2);
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        ep.get_or_insert(id1, BetaPosterior::default);
+        ep.get_or_insert(id2, BetaPosterior::default);
+        ep.get_or_insert(id1, BetaPosterior::default);
+        assert_eq!(ep.order(), vec![id2, id1]);
+
+        ep.get_or_insert(id3, BetaPosterior::default);
+        assert!(ep.get(&id1).is_some(), "recently used entity must survive");
+        assert!(ep.get(&id2).is_none(), "least recently used entity evicts");
+        assert_eq!(ep.order(), vec![id1, id3]);
+    }
+
+    #[test]
+    fn oversized_snapshot_keeps_the_newest_entities() {
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let map = ids
+            .iter()
+            .map(|id| (*id, BetaPosterior::default()))
+            .collect();
+        let restored = EntityPosteriors::from_snapshot(map, ids.clone(), 2);
+        assert_eq!(restored.order(), ids[2..].to_vec());
+        assert!(restored.get(&ids[0]).is_none());
+        assert!(restored.get(&ids[1]).is_none());
+    }
+
     /// BRAINCORE-AUD-001: eviction equivalence across snapshot/restore.
     /// See crates/khive-brain-core/docs/testing-strategy.md#posteriorrssnapshot_restore_eviction_equivalence-braincore-aud-001
     #[test]
@@ -500,6 +529,7 @@ mod tests {
         let mut live = EntityPosteriors::new(capacity);
         live.get_or_insert(id_a, BetaPosterior::default);
         live.get_or_insert(id_b, BetaPosterior::default);
+        live.get_or_insert(id_a, BetaPosterior::default);
 
         let map = live.to_snapshot();
         let order = live.order();
@@ -509,10 +539,13 @@ mod tests {
 
         assert_eq!(restored.len(), 2);
         assert!(
-            restored.get(&id_a).is_none(),
-            "A must be evicted after restore, matching uninterrupted execution"
+            restored.get(&id_b).is_none(),
+            "B must be evicted after restore, matching uninterrupted execution"
         );
-        assert!(restored.get(&id_b).is_some(), "B must survive eviction");
+        assert!(
+            restored.get(&id_a).is_some(),
+            "recently touched A must survive"
+        );
         assert!(
             restored.get(&id_c).is_some(),
             "C must be present after insert"

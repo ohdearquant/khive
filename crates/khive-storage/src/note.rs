@@ -547,6 +547,12 @@ pub enum FilterOp {
     /// numeric field never matches. `PropertyFilter.value` is the prefix and
     /// must be `SqlValue::Text`; an empty prefix matches every text value.
     TextStartsWithIndexed,
+    /// Keep only RFC 3339 text values that parse as UTC instants.
+    Rfc3339Valid,
+    /// Compare parsed UTC instants, including subsecond precision and offsets.
+    /// The value is a `Timestamp` or RFC 3339 `Text`.
+    Rfc3339Gte,
+    Rfc3339Lte,
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.
@@ -569,6 +575,15 @@ pub struct PropertyFilter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteSeekAfter {
     pub created_at: i64,
+    pub id: Uuid,
+}
+
+/// Boundary in an ascending RFC 3339 property order. Equal instants sort by
+/// their stored text and then note ID, so this cursor identifies one row even
+/// when distinct offsets encode the same instant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteInstantSeekAfter {
+    pub value: String,
     pub id: Uuid,
 }
 
@@ -609,6 +624,10 @@ pub struct NoteFilter {
     pub property_filters: Vec<PropertyFilter>,
     /// `(json_path, direction)` — `None` defaults to `created_at DESC`.
     pub order_by: Option<(String, SortDir)>,
+    /// Interpret `order_by`'s text property as an RFC 3339 UTC instant before
+    /// sorting. Only ascending order is currently supported.
+    #[serde(default)]
+    pub order_by_instant: bool,
     /// When true, omit the SQL ordering clause from count-free pages. The
     /// caller is responsible for ordering the bounded result set.
     #[serde(default)]
@@ -641,6 +660,10 @@ pub struct NoteFilter {
     /// a seek boundary.
     #[serde(default)]
     pub after: Option<NoteSeekAfter>,
+    /// Seek after a row in the `order_by_instant` total order. Honoured only
+    /// by `query_notes_filtered_count_free` with `offset: 0`.
+    #[serde(default)]
+    pub after_instant: Option<NoteInstantSeekAfter>,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.

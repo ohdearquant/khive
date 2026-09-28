@@ -1133,6 +1133,7 @@ async fn channel_poll_loop(
                             "channel_kind": kind,
                             "channel_slug": slug,
                             "external_id": env.external_id.clone(),
+                            "legacy_external_id": env.legacy_external_id.clone(),
                             "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id.clone(),
                             "default_inbound_actor": default_inbound_actor,
@@ -1331,6 +1332,7 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
             "auth"
         }
         khive_channel::ChannelError::Transport(_)
+        | khive_channel::ChannelError::RateLimited { .. }
         | khive_channel::ChannelError::PermanentTransport(_) => "transport",
         khive_channel::ChannelError::Config(_)
         | khive_channel::ChannelError::UnauthorizedSender(_)
@@ -1527,14 +1529,21 @@ async fn record_outbound_send_failure(
 
     match error.delivery_failure_class() {
         DeliveryFailureClass::Transient => {
+            let (base_delay, max_delay) = match error {
+                khive_channel::ChannelError::RateLimited { retry_after, .. } => (
+                    OUTBOUND_RETRY_BASE.max(*retry_after),
+                    OUTBOUND_RETRY_CEILING.max(*retry_after),
+                ),
+                _ => (OUTBOUND_RETRY_BASE, OUTBOUND_RETRY_CEILING),
+            };
             runtime
                 .mark_outbound_message_transient_failure(
                     token,
                     note_id,
                     chrono::Utc::now(),
                     error.to_string(),
-                    OUTBOUND_RETRY_BASE,
-                    OUTBOUND_RETRY_CEILING,
+                    base_delay,
+                    max_delay,
                 )
                 .await
         }
@@ -1636,6 +1645,7 @@ pub(crate) async fn channel_outbox_loop(
     channels.register(email_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
@@ -1653,6 +1663,7 @@ pub(crate) async fn channel_outbox_loop(
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -1674,6 +1685,7 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(email_channel),
         outbox::OutboxPolicy::Email {
@@ -1684,6 +1696,7 @@ async fn channel_outbox_once(
         runtime,
         namespace,
         cancellation,
+        &mut pause_until,
     )
     .await
 }
@@ -1984,6 +1997,7 @@ pub(crate) async fn telegram_outbox_loop(
     channels.register(telegram_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
@@ -1997,6 +2011,7 @@ pub(crate) async fn telegram_outbox_loop(
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -2010,12 +2025,14 @@ async fn telegram_outbox_once(
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(telegram_channel),
         outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
         runtime,
         namespace,
         cancellation,
+        &mut pause_until,
     )
     .await
 }
@@ -2807,6 +2824,16 @@ struct PreparedStorageTopology {
     shared_hydrator: Option<Arc<BlobHydrator>>,
 }
 
+fn declared_backend_db_paths(config: &KhiveConfig) -> Arc<[PathBuf]> {
+    config
+        .backends
+        .iter()
+        .filter(|backend| backend.kind == BackendKind::Sqlite)
+        .filter_map(|backend| backend.path.as_deref().map(khive_runtime::expand_tilde))
+        .collect::<Vec<_>>()
+        .into()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageTopologyPurpose {
     Serving,
@@ -3076,6 +3103,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     )
     .await?;
 
+    // Every pack sees the whole serving topology, including stores assigned
+    // to other packs, before handlers can accept a code.ingest target.
+    let declared_backend_db_paths = declared_backend_db_paths(khive_cfg);
+
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
     // main's models even when the pack itself is `no_embed`.
@@ -3083,7 +3114,8 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         let mut cfg = base_config.clone();
         cfg.backend_id = BackendId::main();
         cfg
-    });
+    })
+    .with_declared_backend_db_paths(declared_backend_db_paths.clone());
 
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
@@ -3115,6 +3147,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
                 rt_config,
                 &main_backend,
                 &default_runtime,
+                declared_backend_db_paths.clone(),
             ),
         );
     }
@@ -3998,7 +4031,8 @@ async fn build_single_backend_runtime_with_max_readers(
     )
     .await?;
 
-    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?;
+    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?
+        .with_declared_backend_db_paths(declared_backend_db_paths(khive_cfg));
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
     }
@@ -4101,11 +4135,14 @@ fn build_pack_runtime(
     rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
+    declared_backend_db_paths: Arc<[PathBuf]>,
 ) -> KhiveRuntime {
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
-    let rt = KhiveRuntime::from_backend(backend, rt_config).with_core_embedders_from(main_runtime);
+    let rt = KhiveRuntime::from_backend(backend, rt_config)
+        .with_declared_backend_db_paths(declared_backend_db_paths)
+        .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -6477,6 +6514,22 @@ id = "lambda:project-actor"
             .dispatch("stats", serde_json::json!({}))
             .await
             .expect("kg.stats dispatch succeeds");
+        let after_irrelevant = multi
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch after irrelevant stats");
+        assert_eq!(after_irrelevant["balanced_recall"]["total_events"], 0);
+
+        // Search is a relevant BrainSignal even when the corpus is empty.
+        multi
+            .registry
+            .dispatch(
+                "search",
+                serde_json::json!({"kind": "entity", "query": "hook-wiring-regression"}),
+            )
+            .await
+            .expect("kg.search dispatch succeeds");
 
         let state = multi
             .registry
@@ -6486,8 +6539,8 @@ id = "lambda:project-actor"
         let total_events = state["balanced_recall"]["total_events"]
             .as_u64()
             .unwrap_or(0);
-        assert!(
-            total_events > 0,
+        assert_eq!(
+            total_events, 1,
             "multi-backend dispatch hook must update the same BrainPack instance \
              the registry dispatches brain.* verbs to; got snapshot {state:?}"
         );
@@ -7716,6 +7769,47 @@ region = "us-east-1"
             },
             ..KhiveConfig::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_path = temp.path().join("main.db");
+        let secondary_path = temp.path().join("secondary.db");
+        let mut config = sqlite_multi_backend_config(main_path.clone(), secondary_path.clone());
+        config.packs.clear();
+        config.packs.insert(
+            "code".to_string(),
+            khive_runtime::PackConfig {
+                backend: "secondary".to_string(),
+                no_embed: false,
+            },
+        );
+        config.backends.push(BackendConfig {
+            name: "volatile".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: None,
+            read_only: false,
+        });
+        let mut base = base_runtime_config_for_multi_backend();
+        base.packs = vec!["kg".into(), "code".into()];
+
+        let multi = build_registry_for_multi_backend(base, &config, None)
+            .await
+            .expect("multi-backend code pack boots");
+        let expected = [main_path, secondary_path];
+        assert_eq!(
+            multi.default_runtime.declared_backend_db_paths(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            multi.per_pack_runtimes["code"].declared_backend_db_paths(),
+            expected.as_slice()
+        );
     }
 
     #[tokio::test]
@@ -13658,6 +13752,10 @@ backend = "kg-backend"
             );
             assert_eq!(quarantined["properties"]["external_id"], EXTERNAL_ID);
             assert_eq!(
+                quarantined["properties"]["channel_slug"], "email",
+                "the fixture adapter uses Channel::slug's default kind identity"
+            );
+            assert_eq!(
                 quarantined["properties"]["quarantine_classification"],
                 "permanent"
             );
@@ -13722,7 +13820,7 @@ backend = "kg-backend"
                 &registry,
                 "test-ns",
                 "email",
-                "mailbox@example.com",
+                "email",
                 Some("actor:test"),
                 &replay_envelope,
                 khive_runtime::ChannelIngestFailureClass::Permanent {
@@ -13873,6 +13971,286 @@ backend = "kg-backend"
                 .await
                 .unwrap();
             assert!(blob_attachment_refs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn channel_replay_leaves_slugless_legacy_quarantine_unclaimed() {
+            let (_blob_dir, runtime, registry, note_id, content_ref) =
+                retained_quarantine_fixture().await;
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            let notes = runtime.notes(&token).unwrap();
+            // Main's old shape had channel_kind and content_ref, but no
+            // channel_slug, expires_at, or attachment owner.
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.unwrap();
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_remove(properties, '$.channel_slug'), \
+                              expires_at = NULL WHERE id = ?1"
+                            .into(),
+                        params: vec![SqlValue::Text(note_id.to_string())],
+                        label: Some("main_shaped_quarantine_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            drop(writer);
+            let attachments = runtime.attachments().unwrap();
+            assert!(attachments
+                .delete_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap());
+            let legacy = notes.get_note(note_id).await.unwrap().unwrap();
+            assert_eq!(legacy.properties.as_ref().unwrap()["channel_kind"], "email");
+            assert!(legacy
+                .properties
+                .as_ref()
+                .unwrap()
+                .get("channel_slug")
+                .is_none());
+            assert_eq!(legacy.expires_at, None);
+
+            let replay = |slug: &str| {
+                json!({
+                    "namespace": "retention-ns",
+                    "from": "email:quarantine",
+                    "to": "email:maintainer@example.com",
+                    "content": "Inbound message quarantined",
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "external_id": "imap:retention:1:1",
+                    "metadata": {
+                        "quarantined": "true",
+                        "quarantine_content_ref": content_ref,
+                    }
+                })
+            };
+            let mut wrong_kind = replay("mailbox@example.com");
+            wrong_kind["channel_kind"] = json!("telegram");
+            // ADR-056/V42 scopes the external ID by channel identity. This
+            // retry may create its own quarantine, but must not repair or
+            // acknowledge the legacy email row.
+            let other_kind = registry
+                .dispatch("comm.ingest", wrong_kind)
+                .await
+                .expect("another channel kind owns a separate dedup key");
+            assert_eq!(other_kind["deduplicated"], false);
+            let other_id: uuid::Uuid = other_kind["full_id"].as_str().unwrap().parse().unwrap();
+            assert_ne!(other_id, note_id);
+            let other = notes.get_note(other_id).await.unwrap().unwrap();
+            assert_eq!(
+                other.properties.as_ref().unwrap()["channel_kind"],
+                "telegram"
+            );
+            let other_deadline = other.expires_at.expect("new quarantine has a deadline");
+            assert_eq!(
+                attachments
+                    .get_attachment(other_id, "quarantine-original")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content_ref
+                    .as_str(),
+                content_ref
+            );
+            let legacy = notes.get_note(note_id).await.unwrap().unwrap();
+            assert!(legacy
+                .properties
+                .as_ref()
+                .unwrap()
+                .get("channel_slug")
+                .is_none());
+            assert_eq!(legacy.expires_at, None);
+            assert!(attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_none());
+            let other_cleanup = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "telegram",
+                        "channel_slug": "mailbox@example.com",
+                        "as_of_micros": other_deadline,
+                    }),
+                )
+                .await
+                .expect("other channel cleanup removes only its own quarantine");
+            assert_eq!(other_cleanup["deleted"], 1);
+            assert!(notes.get_note(other_id).await.unwrap().is_none());
+            assert!(notes.get_note(note_id).await.unwrap().is_some());
+
+            let replay_start = Utc::now().timestamp_micros();
+            let acknowledged = registry
+                .dispatch("comm.ingest", replay("mailbox@example.com"))
+                .await
+                .expect("channel-scoped replay creates its own quarantine");
+            let replay_end = Utc::now().timestamp_micros();
+            assert_eq!(acknowledged["deduplicated"], false);
+            let scoped_id: uuid::Uuid = acknowledged["full_id"].as_str().unwrap().parse().unwrap();
+            assert_ne!(scoped_id, note_id);
+            let scoped = notes.get_note(scoped_id).await.unwrap().unwrap();
+            assert_eq!(
+                scoped.properties.as_ref().unwrap()["channel_slug"],
+                "mailbox@example.com",
+                "new quarantine must be selectable by the exact channel"
+            );
+            let expires_at = scoped
+                .expires_at
+                .expect("new quarantine must have a retention deadline");
+            let grace_us = 14 * 24 * 60 * 60 * 1_000_000;
+            assert!(
+                (replay_start + grace_us..=replay_end + grace_us).contains(&expires_at),
+                "deadline must derive from replay time and configured grace"
+            );
+            assert_eq!(
+                attachments
+                    .get_attachment(scoped_id, "quarantine-original")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content_ref
+                    .as_str(),
+                content_ref
+            );
+            let legacy = notes.get_note(note_id).await.unwrap().unwrap();
+            assert!(legacy
+                .properties
+                .as_ref()
+                .unwrap()
+                .get("channel_slug")
+                .is_none());
+            assert_eq!(legacy.expires_at, None);
+            assert!(attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_none());
+            let mismatch = registry
+                .dispatch("comm.ingest", replay("other@example.com"))
+                .await
+                .expect("a different slug owns a separate dedup key");
+            assert_eq!(mismatch["deduplicated"], false);
+            let mismatch_id: uuid::Uuid = mismatch["full_id"].as_str().unwrap().parse().unwrap();
+            assert_ne!(mismatch_id, scoped_id);
+            assert_ne!(mismatch_id, note_id);
+            let mismatch_deadline = notes
+                .get_note(mismatch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at
+                .expect("other channel quarantine has a deadline");
+            assert_eq!(
+                notes.get_note(scoped_id).await.unwrap().unwrap().expires_at,
+                Some(expires_at),
+                "a different channel must not renew this deadline"
+            );
+
+            let deleted = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "mailbox@example.com",
+                        "as_of_micros": expires_at,
+                    }),
+                )
+                .await
+                .expect("channel cleanup deletes only its scoped row");
+            assert_eq!(deleted["deleted"], 1);
+            assert!(notes.get_note(scoped_id).await.unwrap().is_none());
+            assert!(notes.get_note(note_id).await.unwrap().is_some());
+            assert!(notes.get_note(mismatch_id).await.unwrap().is_some());
+            assert!(attachments
+                .get_attachment(scoped_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_none());
+            let other_deleted = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "other@example.com",
+                        "as_of_micros": mismatch_deadline,
+                    }),
+                )
+                .await
+                .expect("other channel cleanup deletes its scoped row");
+            assert_eq!(other_deleted["deleted"], 1);
+            assert!(notes.get_note(mismatch_id).await.unwrap().is_none());
+            assert!(notes.get_note(note_id).await.unwrap().is_some());
+            let mut reader = sql.reader().await.unwrap();
+            let owners = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT record_uuid FROM attachments WHERE content_ref = ?1".into(),
+                    params: vec![SqlValue::Text(content_ref)],
+                    label: Some("main_shaped_quarantine_owner_refs".into()),
+                })
+                .await
+                .unwrap();
+            assert!(owners.is_empty(), "cleanup must unown the original blob");
+        }
+
+        #[tokio::test]
+        async fn duplicate_quarantine_replay_preserves_later_deadline() {
+            let (_blob_dir, runtime, registry, note_id, content_ref) =
+                retained_quarantine_fixture().await;
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            let notes = runtime.notes(&token).unwrap();
+            let later = Utc::now().timestamp_micros() + 30 * 24 * 60 * 60 * 1_000_000;
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.unwrap();
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET expires_at = ?1 WHERE id = ?2".into(),
+                        params: vec![
+                            SqlValue::Integer(later),
+                            SqlValue::Text(note_id.to_string()),
+                        ],
+                        label: Some("later_quarantine_deadline_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            drop(writer);
+            let replayed = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "retention-ns",
+                        "from": "email:quarantine",
+                        "to": "email:maintainer@example.com",
+                        "content": "Inbound message quarantined",
+                        "channel_kind": "email",
+                        "channel_slug": "mailbox@example.com",
+                        "external_id": "imap:retention:1:1",
+                        "metadata": {
+                            "quarantined": "true",
+                            "quarantine_content_ref": content_ref,
+                        }
+                    }),
+                )
+                .await
+                .expect("same-channel duplicate replay");
+            assert_eq!(replayed["deduplicated"], true);
+            assert_eq!(
+                notes.get_note(note_id).await.unwrap().unwrap().expires_at,
+                Some(later)
+            );
         }
 
         #[tokio::test]

@@ -464,7 +464,25 @@ impl Fixture {
         json!({"number":n,"method":"merge","subject":"Fixture merge","body":"","expected_head":self.head})
     }
     async fn open(&self) -> u64 {
-        self.call(&self.actor,"git.pr_open",json!({"head":"work","base":"main","title":"Fixture","body":"","expected_head":self.head})).await.unwrap()["number"].as_u64().unwrap()
+        let reply = self
+            .call(
+                &self.actor,
+                "git.pr_open",
+                json!({"head":"work","base":"main","title":"Fixture","body":"","expected_head":self.head}),
+            )
+            .await;
+        if let Err(error) = &reply {
+            let receipt = self.last(&self.actor).await;
+            eprintln!(
+                "remote fixture refusal: {error}; receipt_actor={:?} reason={:?} table={:?} key={:?} cause={:?}",
+                receipt.actor,
+                receipt.reason,
+                receipt.result["refusal"]["table"],
+                receipt.result["refusal"]["key"],
+                receipt.result["refusal"]["cause"],
+            );
+        }
+        reply.unwrap()["number"].as_u64().unwrap()
     }
     async fn review(&self, actor: &str, n: u64) -> Result<Value, RuntimeError> {
         self.call(
@@ -1026,6 +1044,57 @@ async fn remote_lost_ack_without_marker_stays_unknown_and_never_retries() {
     assert_eq!(f.remote.state.lock().unwrap().push_calls, 1);
     f.refusal(&f.actor, "git.push", f.push(), "expected_remote_mismatch")
         .await;
+}
+
+#[tokio::test]
+async fn pr_open_and_review_reconcile_return_unknown_without_platform_evidence() {
+    let f = Fixture::new(true, None).await;
+    for (actor, verb, inputs) in [
+        (
+            &f.actor,
+            "git.pr_open",
+            json!({"head":"work","base":"main","expected_head":f.head}),
+        ),
+        (
+            &f.reviewer,
+            "git.pr_review",
+            json!({"number":1,"verdict":"approve","expected_head":f.head}),
+        ),
+    ] {
+        let mut prior = Receipt::new(
+            "local",
+            actor,
+            verb,
+            f.repo.to_str().unwrap(),
+            inputs,
+            json!({"decision":"allow","source":"git_write.allowed","id":0}),
+            Value::Null,
+        );
+        prior.result = json!({"slug":SLUG,"remote":REMOTE});
+        receipts::insert(&f.rt, &prior).await.unwrap();
+        let calls = f.remote.state.lock().unwrap().calls.clone();
+        let writes = f.remote.writes();
+
+        let result = f
+            .call(actor, "git.reconcile", json!({"receipt":prior.id}))
+            .await
+            .unwrap();
+        assert_eq!(result["receipt"]["id"], prior.id);
+        assert_eq!(result["receipt"]["disposition"], "unknown");
+        assert_eq!(result["receipt"]["result"], prior.result);
+        let stored = receipts::load_owned(&f.rt, "local", actor, &prior.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.disposition, Disposition::Unknown);
+        assert_eq!(stored.finished_at, None);
+        assert_eq!(stored.result, prior.result);
+        assert_eq!(f.remote.state.lock().unwrap().calls, calls);
+        assert_eq!(f.remote.writes(), writes);
+    }
+    assert!(
+        !f.dir.path().join("reads").exists(),
+        "reconcile must not resolve either actor's platform credential"
+    );
 }
 
 /// Every push case in this crate reaches `push_marker_support`, so on a host whose `git` does not

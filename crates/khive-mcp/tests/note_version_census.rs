@@ -16,6 +16,7 @@ const CREATE: &str = "khive-runtime/src/note_create.rs";
 const OPERATIONS: &str = "khive-runtime/src/operations.rs";
 const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
+const COMM: &str = "khive-pack-comm/src/handlers.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 
 fn words(sql: &str) -> Vec<String> {
@@ -445,6 +446,9 @@ fn census() -> BTreeMap<(String, String), String> {
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
         (MESSAGE, "create_keyed_message_pair"),
+        // A matching quarantine replay repairs legacy retention metadata in
+        // one UPDATE. The note version trigger, not this writer, advances it.
+        (COMM, "handle_ingest"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -566,6 +570,12 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.
         (MESSAGE, "create_keyed_message_pair", "message", "{}"),
+        (
+            COMM,
+            "handle_ingest",
+            "message",
+            r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
+        ),
         (FAULT, "injected_failure_statement", "memory", "{}"),
     ];
     assert_eq!(
@@ -624,6 +634,18 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                 params!["active", 200_i64, ID, "local", "memory"],
             ),
             MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
+            COMM => conn.execute(
+                sql,
+                params![
+                    ID,
+                    "local",
+                    "census-ref",
+                    "email",
+                    "census@example.com",
+                    300_i64,
+                    200_i64
+                ],
+            ),
             FAULT => conn.execute(sql, []),
             _ => unreachable!(),
         }

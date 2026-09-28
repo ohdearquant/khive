@@ -169,21 +169,29 @@ async fn refresh_moves_body_once_and_roots_the_same_reference() {
                 body
             );
             let receipt = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
-            for record in [final_id, receipt] {
-                let roots = runtime
+            assert!(
+                runtime
                     .attachments()
                     .unwrap()
-                    .list_attachments(record)
+                    .list_attachments(receipt)
                     .await
-                    .unwrap();
-                assert_eq!(roots.len(), 1);
-                assert_eq!(roots[0].content_ref, reference);
-                assert_eq!(
-                    roots[0].size_bytes,
-                    Some(body.len() as u64),
-                    "received length survives moving body"
-                );
-            }
+                    .unwrap()
+                    .is_empty(),
+                "refresh receipts never own fetched bodies"
+            );
+            let roots = runtime
+                .attachments()
+                .unwrap()
+                .list_attachments(final_id)
+                .await
+                .unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].content_ref, reference);
+            assert_eq!(
+                roots[0].size_bytes,
+                Some(body.len() as u64),
+                "received length survives moving body"
+            );
         }
     }
 }
@@ -301,7 +309,7 @@ async fn not_modified_refresh_never_puts_cached_bytes_again() {
             vec![]
         };
         store.puts.store(0, Ordering::SeqCst);
-        let reply = settle_refresh(
+        let result = settle_refresh(
             &runtime,
             &token,
             source.id,
@@ -316,9 +324,17 @@ async fn not_modified_refresh_never_puts_cached_bytes_again() {
             },
             &hops,
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+        if redirected {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("redirected_not_modified"),
+                "{error}"
+            );
+            continue;
+        }
+        let reply = result.unwrap();
         let final_id = Uuid::parse_str(reply["final_id"].as_str().unwrap()).unwrap();
         let final_entity = runtime
             .entities(&token)

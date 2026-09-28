@@ -377,3 +377,67 @@ wraps.
 - [ADR-032](ADR-032-brain-profile-orchestration.md) — brain profiles consume ranked candidates from this port
 - Internal source ported from: internal `platform/retrieval/`
 - SIMD / quantization foundation: `lattice/crates/embed/`
+
+## Amendment 1 (2026-09-25): the formal proofs are not in this repository
+
+**Status**: Accepted (2026-09-25)
+
+**Context.** The "Formal proofs" section says proof files "relocate from the internal
+implementation to `khive/proofs/Retrieval/` and `khive/proofs/Scoring/`", that
+"`proofs/README.md` indexes all 146 theorems to their Rust modules", and that "`lake build` is
+wired into CI so proofs do not drift from code". Phase 2 lists the same steps, and the "Crate
+layout after the port" block includes a `khive/proofs/` tree. Other sections state the result
+as shipped: the closing paragraph of "Formal proofs" and item 2 of "Why the
+formal proofs matter" ("khive does"), the Consequences bullet "146 formal Lean4 proofs ship
+with the release", the Negative bullet about a Lean4 CI dependency, and the "(verified)" labels
+in the capability table under "RuVector — opt-in adapter packs only".
+
+The repository history shows what was built and what was removed:
+
+- Commit ba4b35f1b added `proofs/README.md`, and commit a7777e277 added eleven `.lean` files
+  under `proofs/Retrieval/` and `proofs/Scoring/`, all on 2026-05-24.
+- Those files contained 24 `theorem` declarations. Every one was stated as `: True := trivial`
+  under a "Placeholder" comment, and each file opened with a TODO to port the proof from the
+  internal implementation as part of Phase 2. The README's "Proof Status" section said all
+  files were "planned for port".
+- Commit 1cbab6293 (2026-05-24, "Remove obsolete proof files and scripts related to khive
+  formal proofs and migration") deleted the whole `proofs/` directory together with
+  `scripts/check-proof-references.sh`.
+- The repository now contains no `.lean` file, and no `lake build` step appears in
+  `.github/`, `scripts/` or the `Makefile`. One proof-correspondence comment survives:
+  `crates/khive-retrieval/src/lib.rs` carries
+  `// Formal proof: khive.Retrieval.HNSW.checkpoint_correctness`, which names one of the
+  deleted placeholders.
+
+**Decision (accepted).** The formal-proof part of this ADR is unimplemented in this
+repository and deferred. The "Formal proofs" section and Phase 2 describe a target with no
+artifact here. The sentences that say khive ships formal proofs, and the "(verified)" labels
+in the capability table, do not describe the current release and are not to be cited as
+properties of it. A `// Formal proof:` comment in Rust source is not evidence that a proof
+exists. If proofs are added later, they arrive with the build gate the section already
+describes (theorem statements that state the property, and `lake build` in CI), and a further
+amendment records that. This amendment makes no statement about proofs held outside this
+repository, and it does not change the rest of the decision: the port, the crate boundaries,
+`lattice-embed` as the SIMD and quantization foundation, the deferred sqlite-vec retirement,
+and RuVector as opt-in adapters.
+
+**Alternatives considered.**
+
+- Restore the deleted `proofs/` tree. The deleted files proved `True` and nothing else, so
+  restoring them would re-add placeholders that assert no property of the code, contrary to
+  the "No stubs" principle in the [ADR index](README.md) cross-cutting principles.
+- Withdraw the proof section and drop the target. The history records the removal but gives no
+  decision against formal proofs, so declaring the target abandoned would state an intent that
+  the record does not show.
+- Leave the text unchanged. Accepted text would keep asserting shipped proofs and a CI gate
+  that do not exist.
+
+**Consequences.** Proof claims in this ADR read as an unimplemented target. The comment at
+`crates/khive-retrieval/src/lib.rs` is inconsistent with this record; rewording or removing it
+is a code change outside this amendment. Several rationale entries cite the proofs beside
+other reasons, for example "Why port rather than adopt RuVector as backend", "Why the ported
+HNSW is the preferred path over sqlite-vec", "Why a standalone crate now" and the Alternatives
+table. This amendment removes only the proofs from what those entries can claim about this
+repository; their other reasons are unchanged.
+
+**Refs.** Commits ba4b35f1b, a7777e277, 1cbab6293.

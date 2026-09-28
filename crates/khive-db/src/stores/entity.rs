@@ -27,7 +27,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Entities, op, e)
+    e.into_storage_error(StorageCapability::Entities, op)
 }
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
