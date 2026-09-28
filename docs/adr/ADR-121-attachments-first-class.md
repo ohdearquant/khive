@@ -494,11 +494,14 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    owning main database. The migration that adds binding state and the attachment cutover do not
    mint a store ID, bind a root or write its marker. On any daemon boot while the main database holds
    no completed binding, the daemon may bind its configured canonical root only when attachment
-   cutover is complete, the main database has no pending or completed binding, and it proves the
-   root empty: no blob objects
-   and no root ownership marker of any owner. It checks this under database GC ownership and the
-   root write lock. This is the only automatic fresh-root bind. It first records a pending store ID
-   in main, then durably writes and verifies the matching anchored marker in the canonical root,
+   cutover is complete, the main database has no pending or completed binding and holds no live blob
+   reference (no attachment rows and no registered pack-owned refs), and it proves the root empty:
+   no blob objects and no root ownership marker of any owner. It checks this under database GC ownership and the
+   root write lock. This is the only automatic fresh-root bind. The absence of live refs in main is
+   a precondition for this automatic bind, not ownership proof for a sweep. The daemon records the
+   pending store ID with a conditional write in one main-database transaction that fails if any
+   pending or completed binding row exists; a failed write ends that boot's attempt without touching
+   the root. It then durably writes and verifies the matching anchored marker in the canonical root,
    then uses one main-database transaction to mark binding complete with that same ID. The completed
    cutover state is unchanged by that transaction. A populated root, even with one object, or a
    root with a preexisting marker cannot enter this fresh path; neither boot nor sweep claims it
@@ -615,8 +618,13 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   copied database UUID. A completed cutover with no binding and a configured root containing no
   objects and no marker binds on a daemon boot while no binding is completed: the test observes the
   pending ID, verified marker and one completing main-database transaction. After the completing
-  transaction, a sweep in either mode is admitted on that root. A root with exactly one object
-  refuses that automatic path, leaving the object untouched, and sweeps stay refused; a foreign
+  transaction, a sweep in either mode is admitted on that root. A pre-rule database with one live
+  attachment row and an empty configured root refuses the automatic path, binds nothing, and leaves
+  the object and row untouched; a mutant that removes the main live-reference check fails this arm.
+  Two boots of one database through different path spellings, both with empty roots, race to bind:
+  exactly one pending ID lands and the other boot refuses without a second marker; a mutant that
+  removes the conditional pending-ID write fails this arm. A root with exactly one object refuses
+  that automatic path, leaving the object untouched, and sweeps stay refused; a foreign
   marker likewise refuses and remains untouched, and sweeps stay refused. A mutant that removes
   the emptiness check fails the one-object control. Crashes before the first-boot marker, after that
   marker but before binding completion, and after completion are
