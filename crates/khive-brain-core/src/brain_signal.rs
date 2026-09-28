@@ -96,6 +96,9 @@ pub enum BrainSignal {
         // Retained for replay/backtest completeness per ADR-032 §3.
         #[allow(dead_code)]
         served_by_profile_id: Option<String>,
+        /// Section judgments are independent of the scalar signal vocabulary.
+        /// Preserve them for live folds and deterministic event replay.
+        section_signals: Option<HashMap<SectionType, FeedbackSignal>>,
         /// The weight actually folded into posteriors for this event.
         ///
         /// Normally `event_kind.update_weight()`, but the ADR-081 §2 fold gate can

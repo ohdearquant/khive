@@ -1861,3 +1861,42 @@ Acceptance:
    target-database VFS fence.
 
 Refs: #3299, #3292, #3449, #1855.
+
+## Amendment 11 (2026-09-28): State the Code-Map Database Fence That Ships
+
+**Status**: Accepted (2026-09-28)\
+**Amends**: ADR-085 Amendment 4 E7 and Amendment 9 A9\
+**Tracking**: #1855; opened-handle proof #3552
+
+## Context
+
+E7 describes a thin VFS wrapper that rejects a target from the identity of the file handle SQLite actually opens, including the main database and its journal, WAL, and shared-memory companions. A9 expands the protected set to the production anchor, runtime database, all declared backends, the events database beside each, and their companions. The current `code.ingest` route implements a narrower, useful fence: it rejects the known production paths and compares existing files' path-level identities before constructing the target runtime. The three read-only analysis verbs named in E7 are not shipped; only `code.ingest` is dispatched today.
+
+A delegating wrapper around SQLite's default VFS cannot by itself deliver E7's opened-handle proof. The default VFS opens `-shm` within the main file's `xShmMap`, outside wrapper `xOpen`; its Unix file handle is opaque through the public VFS API, and the Windows native path can follow a reparse point before the wrapper sees the handle. The prior “thin VFS wrapper” design is therefore not an implemented cross-platform boundary.
+
+## Decision
+
+1. **Current production fence.** On the shipped `code.ingest` path, explicit `db` syntax is restricted to plain absolute filesystem paths and an existing regular file; only the omitted-`db` default is create-capable. The target is compared against A9's complete known-production set by normalized path and, for existing files, by path-level file identity (`dev`/`ino` on Unix and the platform file-identity comparison on Windows). This is a **courtesy preflight**, before ordinary SQLite open, and remains useful for a direct production path or hard link. It is not proof about the descriptor SQLite ultimately uses. SQLite's `SQLITE_OPEN_NOFOLLOW` behavior, where the selected native VFS and platform honor it, and native no-follow handling on Unix are additional symlink hardening only; neither substitutes for identity checks on the opened main and companion handles. This amendment makes no claim that the code-pack constructor already requests `SQLITE_OPEN_NOFOLLOW` on every SQLite open.
+
+2. **Final-component symlink refusal in the preflight.** The courtesy preflight rejects a target whose final path component is a symlink, checked with `lstat`/`symlink_metadata` before any target runtime is constructed, rather than following it to a regular file. An explicit existing-file check uses that non-following metadata. The default target is checked when its final component exists; a missing default remains create-capable. A symlinked target refuses even when it points to an otherwise valid dedicated map. An independent byte copy of a protected database, at a new file identity, remains admissible under A9. Parent-directory aliases still use the existing normalization rule. This is a preflight rule, not a claim that a path cannot change afterward.
+
+3. **Residual threat.** A local writer can swap the target between the courtesy preflight and SQLite's actual open, so the currently shipped fence does not establish E7's opened-handle exclusion.
+
+4. **Deferred handle-level proof.** Issue #3552 owns the full guarded native VFS design for code-pack target opens. It must cover main, journal, WAL, and SHM, including the `xShmMap` path and native locking semantics, and prove no-follow traversal plus the identity of each actual retained OS handle before first use. On Unix this means handle-relative no-follow traversal and `fstat` identity; on Windows it means reparse-safe opens and identity from the retained handle. The design must specify refresh or snapshot semantics for protected companions that appear or change during an attempted open. A path re-probe after delegating a native open is not an opened-handle proof.
+
+The #3552 acceptance suite must place a deterministic barrier after courtesy preflight and before SQLite open, then swap the target main and each companion to a production hard link and to a symlink or reparse point. Each arm must refuse before migration or companion writes. It must also refuse an unrelated hard-linked writable companion with link count above one, admit an independent byte copy and an ordinary dedicated map, and test identity refresh after a refused open. For every refusal, compare the protected main/WAL/SHM presence, bytes, size, and modification time before and after. Exercise pooled writers, pooled and standalone readers, and any other code-pack-created connection on Unix and Windows; one unguarded open invalidates the proof.
+
+This amendment narrows E7's present-tense implementation claim. It does not remove E7's target opened-handle security objective or A9's production deny set. The three analysis verbs remain unshipped, and their read-only constructor and migration-free requirements remain target design rather than a claim about current runtime behavior.
+
+## Acceptance for this amendment
+
+- A `code.ingest` explicit target that is a final-component symlink to a dedicated map is refused before runtime construction; a symlink to a protected file is refused as well.
+- A separate byte copy of a protected database at a new inode/file identity remains admissible, subject to the existing map-target rules.
+- The source and public documentation describe the current check as a path-level courtesy preflight and name the local swap race. No test or documentation claims that #3552's handle-level guarantee is already shipped.
+
+## References
+
+- ADR-085 Amendment 4 E7 and Amendment 9 A9
+- `crates/khive-pack-code/src/db_target.rs` and `crates/khive-pack-code/src/pack.rs`
+- `crates/khive-db/src/pool.rs` SQLite connection opens
+- #1855 and #3552
