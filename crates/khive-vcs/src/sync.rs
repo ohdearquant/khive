@@ -345,6 +345,7 @@ pub async fn run_sync_remote(
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishFailAt {
+    AfterGitignoreTempCreate,
     AfterEntities,
     AfterEdges,
     AfterMeta,
@@ -364,30 +365,106 @@ const REMOTE_BACKUP_MARKER: &str = ".replaced~";
 const REMOTE_BACKUP_OWNER_FILE: &str = ".khive-backup-owner";
 const REMOTE_BACKUP_OWNER_HEADER: &str = "khive-vcs remote cache backup v1\n";
 const REMOTES_GITIGNORE: &[u8] = b"*\n";
+const REMOTES_GITIGNORE_PENDING_PREFIX: &str = ".khive-gitignore-pending-";
 
-fn ensure_remote_cache_gitignore(remotes_root: &Path) -> Result<()> {
-    let path = remotes_root.join(".gitignore");
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(REMOTES_GITIGNORE)
-                .with_context(|| format!("writing {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("syncing {}", path.display()))?;
-            fsync_dir_best_effort(remotes_root);
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("inspecting {}", path.display()))?;
-            if !metadata.is_file() || fs::read(&path)?.as_slice() != REMOTES_GITIGNORE {
+fn tool_owned_remote_cache_gitignore_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || fs::read(path)?.as_slice() != REMOTES_GITIGNORE {
                 bail!(
                     "remote cache ignore file {} is not the tool-owned `*` rule",
                     path.display()
                 );
             }
+            Ok(true)
         }
-        Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
     }
-    Ok(())
+}
+
+/// A completed marker ignores these names. Sweep only after validating or
+/// publishing that marker: a concurrent creator can then safely revalidate it
+/// if its own pending file was removed before `persist_noclobber`.
+fn sweep_remote_cache_gitignore_pending(remotes_root: &Path) {
+    let Ok(entries) = fs::read_dir(remotes_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| name.starts_with(REMOTES_GITIGNORE_PENDING_PREFIX))
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        // Only remove an empty or partially written tool marker. The bounded
+        // read avoids consuming a contributor file with a similar name.
+        let Ok(file) = File::open(entry.path()) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(REMOTES_GITIGNORE.len() as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_ok()
+            && REMOTES_GITIGNORE.starts_with(&bytes)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn ensure_remote_cache_gitignore(
+    remotes_root: &Path,
+    #[cfg(test)] interrupt_after_temp_create: bool,
+) -> Result<()> {
+    let path = remotes_root.join(".gitignore");
+    if tool_owned_remote_cache_gitignore_exists(&path)? {
+        sweep_remote_cache_gitignore_pending(remotes_root);
+        return Ok(());
+    }
+
+    let mut pending = tempfile::Builder::new()
+        .prefix(REMOTES_GITIGNORE_PENDING_PREFIX)
+        .tempfile_in(remotes_root)
+        .with_context(|| format!("creating pending ignore file in {}", remotes_root.display()))?;
+    #[cfg(test)]
+    if interrupt_after_temp_create {
+        // Keep the file to model a process death, which skips TempFile's Drop.
+        let (_file, _path) = pending.keep().context("keeping interrupted ignore file")?;
+        bail!("injected failure after cache ignore temp creation");
+    }
+    pending
+        .write_all(REMOTES_GITIGNORE)
+        .with_context(|| format!("writing pending ignore file in {}", remotes_root.display()))?;
+    pending
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing pending ignore file in {}", remotes_root.display()))?;
+    match pending.persist_noclobber(&path) {
+        Ok(_file) => {
+            fsync_dir_best_effort(remotes_root);
+            sweep_remote_cache_gitignore_pending(remotes_root);
+            Ok(())
+        }
+        Err(error) => {
+            let tempfile::PersistError {
+                error: persist_error,
+                file,
+            } = error;
+            drop(file);
+            // Another creator may have won. Even if its successful sweep
+            // removed our pending file, accept only its complete marker.
+            if tool_owned_remote_cache_gitignore_exists(&path)? {
+                sweep_remote_cache_gitignore_pending(remotes_root);
+                Ok(())
+            } else {
+                Err(persist_error).with_context(|| format!("publishing {}", path.display()))
+            }
+        }
+    }
 }
 
 fn publish_remote_cache(
@@ -400,6 +477,12 @@ fn publish_remote_cache(
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(remotes_root)
         .with_context(|| format!("creating {}", remotes_root.display()))?;
+    #[cfg(test)]
+    ensure_remote_cache_gitignore(
+        remotes_root,
+        fail_at == Some(PublishFailAt::AfterGitignoreTempCreate),
+    )?;
+    #[cfg(not(test))]
     ensure_remote_cache_gitignore(remotes_root)?;
     let cache_dir = remotes_root.join(name);
     // Recovery precedes staging I/O too: an error while constructing the next
@@ -2800,6 +2883,129 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(cache_dir.join("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta["content_hash"], "sha256:old");
+    }
+
+    #[test]
+    fn remote_cache_ignore_marker_recovers_interrupted_creation() {
+        let repo = TempDir::new().unwrap();
+        run_git(repo.path(), &["init", "--quiet"]);
+        let remotes_root = repo.path().join(".khive/kg/remotes");
+        fs::create_dir_all(&remotes_root).unwrap();
+        fs::write(
+            repo.path().join(".khive/.gitignore"),
+            "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\n",
+        )
+        .unwrap();
+
+        let error = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &[],
+            &[],
+            &sample_meta("interrupted"),
+            Some(PublishFailAt::AfterGitignoreTempCreate),
+        )
+        .expect_err("injected interruption must precede marker publication");
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure after cache ignore temp creation"),
+            "{error:#}"
+        );
+        assert!(!remotes_root.join(".gitignore").exists());
+        let pending_names = || {
+            fs::read_dir(&remotes_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(REMOTES_GITIGNORE_PENDING_PREFIX))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pending_names().len(), 1, "seam must leave one orphan");
+        let status = || {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "core.excludesFile=/dev/null",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--",
+                    ".khive/kg/remotes",
+                ])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git status must succeed");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert!(
+            status().contains(REMOTES_GITIGNORE_PENDING_PREFIX),
+            "interrupted marker temp must be trackable before recovery"
+        );
+
+        publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &[],
+            &[],
+            &sample_meta("complete"),
+            None,
+        )
+        .expect("next publish must recover from interrupted marker creation");
+        assert_eq!(
+            fs::read(remotes_root.join(".gitignore")).unwrap(),
+            REMOTES_GITIGNORE
+        );
+        assert!(
+            pending_names().is_empty(),
+            "completed marker sweeps the orphan"
+        );
+        assert!(
+            !status().contains(REMOTES_GITIGNORE_PENDING_PREFIX),
+            "no marker temp remains visible to git status"
+        );
+    }
+
+    #[test]
+    fn remote_cache_ignore_marker_refuses_contributor_content() {
+        let temp = TempDir::new().unwrap();
+        let remotes_root = temp.path().join("remotes");
+        fs::create_dir_all(&remotes_root).unwrap();
+        let marker = remotes_root.join(".gitignore");
+        fs::write(&marker, "contributor rule\n").unwrap();
+        let error = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &[],
+            &[],
+            &sample_meta("candidate"),
+            None,
+        )
+        .expect_err("a contributor marker must not be replaced");
+        assert!(
+            error.to_string().contains("not the tool-owned `*` rule"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "contributor rule\n");
+        assert!(!remotes_root.join("upstream").exists());
+
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+        let error = publish_remote_cache(
+            &remotes_root,
+            "upstream",
+            &[],
+            &[],
+            &sample_meta("candidate"),
+            None,
+        )
+        .expect_err("a non-file marker must not be replaced");
+        assert!(
+            error.to_string().contains("not the tool-owned `*` rule"),
+            "{error:#}"
+        );
+        assert!(marker.is_dir());
+        assert!(!remotes_root.join("upstream").exists());
     }
 
     #[test]
