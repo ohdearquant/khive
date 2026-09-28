@@ -1123,6 +1123,9 @@ pub(crate) fn merge_dependency_kind(
     tgt_kind: &str,
     metadata: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
+    // JSON null has the same meaning as an omitted metadata argument. All
+    // callers validate the object shape before reaching inference.
+    let metadata = metadata.filter(|value| !value.is_null());
     if let Some(ref m) = metadata {
         if m.get("dependency_kind").is_some() {
             return metadata;
@@ -1155,6 +1158,8 @@ pub fn merge_entry_metadata(
     metadata: Option<serde_json::Value>,
     dependency_kind: Option<String>,
 ) -> RuntimeResult<Option<serde_json::Value>> {
+    validate_metadata_shape(metadata.as_ref())?;
+    let metadata = metadata.filter(|value| !value.is_null());
     let Some(dk) = dependency_kind else {
         return Ok(metadata);
     };
@@ -1191,18 +1196,36 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
     Ok(())
 }
 
+fn validate_metadata_shape(metadata: Option<&serde_json::Value>) -> RuntimeResult<()> {
+    if metadata.is_some_and(|value| !value.is_null() && !value.is_object()) {
+        return Err(RuntimeError::InvalidInput(
+            "metadata must be a JSON object".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate governed edge metadata keys.
 ///
-/// Currently enforces:
-/// - `dependency_kind` is only valid on `depends_on` edges.
-/// - `dependency_kind`, when present, must be one of the governed values.
+/// Enforces object shape, the `depends_on` scope and vocabulary of
+/// `dependency_kind`, and the boolean type of `optional`.
 pub(crate) fn validate_edge_metadata(
     relation: EdgeRelation,
     metadata: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
-    let Some(meta) = metadata else {
+    validate_metadata_shape(metadata)?;
+    let Some(meta) = metadata.filter(|value| !value.is_null()) else {
         return Ok(());
     };
+    let object = meta.as_object().expect("validated metadata object");
+    if object
+        .get("optional")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "metadata.optional must be a boolean".into(),
+        ));
+    }
     if let Some(dk) = meta.get("dependency_kind") {
         if relation != EdgeRelation::DependsOn {
             return Err(RuntimeError::InvalidInput(format!(
@@ -2896,6 +2919,7 @@ impl KhiveRuntime {
         resurrect: bool,
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
+        validate_edge_metadata(relation, metadata.as_ref())?;
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
@@ -3875,7 +3899,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, false)
+        self.try_create_note_impl(token, kind, name, content, properties, false, None, None)
             .await
     }
 
@@ -3894,6 +3918,7 @@ impl KhiveRuntime {
     /// exclusively to channel-transport packs. Every other write path uses
     /// `try_create_note`, which rejects those three properties
     /// unconditionally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_create_note_as_trusted_ingest(
         &self,
         _capability: &crate::pack::ChannelIngestCapability,
@@ -3902,9 +3927,47 @@ impl KhiveRuntime {
         name: Option<&str>,
         content: &str,
         properties: Option<serde_json::Value>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, true)
-            .await
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            None,
+            expires_after,
+        )
+        .await
+    }
+
+    /// Publish a trusted inbound message and its original-byte attachment in
+    /// one database transaction. Channel quarantine must not advertise a
+    /// reference in note metadata before GC can see its attachment owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_create_note_as_trusted_ingest_with_attachment(
+        &self,
+        _capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        attachment: NewAttachment,
+        expires_after: Option<std::time::Duration>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            Some(attachment),
+            expires_after,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3916,6 +3979,8 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
         allow_transport_owned_message_properties: bool,
+        attachment: Option<NewAttachment>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3925,6 +3990,23 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json_at(p, "note", "properties")?;
+        }
+        if let Some(ref attachment) = attachment {
+            // The note and its owner row must share the main database. A
+            // secondary pack backend cannot atomically root the reference.
+            drop(self.attachments()?);
+            attachment.validate()?;
+            let blob_store = self.blob_store().ok_or_else(|| {
+                RuntimeError::Unconfigured(
+                    "trusted ingest attachment requires an installed BlobStore".to_string(),
+                )
+            })?;
+            if !blob_store.exists(&attachment.content_ref).await? {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "trusted ingest attachment refers to an unpublished blob: {}",
+                    attachment.content_ref
+                )));
+            }
         }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
@@ -3942,6 +4024,16 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str();
         let mut note = Note::new(ns, kind, content);
+        if let Some(retention) = expires_after {
+            let duration_us = i64::try_from(retention.as_micros()).map_err(|_| {
+                RuntimeError::InvalidInput(
+                    "trusted ingest retention exceeds i64 microseconds".into(),
+                )
+            })?;
+            note.expires_at = Some(note.created_at.checked_add(duration_us).ok_or_else(|| {
+                RuntimeError::InvalidInput("trusted ingest expiry exceeds i64 microseconds".into())
+            })?);
+        }
         if let Some(n) = name {
             note = note.with_name(n);
         }
@@ -3955,7 +4047,21 @@ impl KhiveRuntime {
         // so this reaches storage directly rather than duplicate the check
         // through a wrapper that cannot see the trust decision this function
         // just made.
-        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
+        let inserted = if let Some(attachment) = attachment {
+            self.raw_notes(token)?
+                .try_insert_note_with_attachments(
+                    note.clone(),
+                    vec![Attachment::from_new(
+                        note.id,
+                        AttachmentSubstrate::Note,
+                        attachment,
+                        note.created_at,
+                    )],
+                )
+                .await?
+        } else {
+            self.raw_notes(token)?.try_insert_note(note.clone()).await?
+        };
         if !inserted {
             return Ok(None);
         }
@@ -7084,6 +7190,7 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        validate_edge_metadata(spec.relation, spec.metadata.as_ref())?;
         let ns_str = match &spec.namespace {
             Some(s) => {
                 let spec_ns = crate::Namespace::parse(s)
@@ -7526,6 +7633,39 @@ mod tests {
             Some(metadata)
         );
         assert_eq!(merge_dependency_kind("concept", "concept", None), None);
+    }
+
+    #[test]
+    fn edge_metadata_requires_object_and_boolean_optional() {
+        for invalid in [
+            serde_json::json!(false),
+            serde_json::json!("text"),
+            serde_json::json!([]),
+        ] {
+            let error = validate_edge_metadata(EdgeRelation::DependsOn, Some(&invalid))
+                .expect_err("scalar or array metadata must be refused");
+            assert!(format!("{error}").contains("metadata must be a JSON object"));
+            assert!(merge_entry_metadata(Some(invalid), None).is_err());
+        }
+
+        let invalid_optional = serde_json::json!({"optional": "false"});
+        let error = validate_edge_metadata(EdgeRelation::DependsOn, Some(&invalid_optional))
+            .expect_err("optional must be boolean");
+        assert!(format!("{error}").contains("metadata.optional"));
+        validate_edge_metadata(
+            EdgeRelation::DependsOn,
+            Some(&serde_json::json!({"optional": false})),
+        )
+        .expect("boolean optional is valid");
+
+        assert_eq!(
+            merge_entry_metadata(Some(serde_json::Value::Null), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            merge_dependency_kind("document", "document", Some(serde_json::Value::Null)),
+            Some(serde_json::json!({"dependency_kind": "normative"}))
+        );
     }
 
     #[test]

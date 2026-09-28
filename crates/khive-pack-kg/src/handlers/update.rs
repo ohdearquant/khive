@@ -9,10 +9,11 @@ use khive_storage::Entity;
 use khive_types::pack::pack_registry_tag;
 
 use super::common::{
-    description_patch, deser, immutable_event_error, normalize_entity_timestamps,
-    pack_private_record_error, parse_relation, remap_note_status, resolve_kind_spec,
-    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, string_value, to_json,
-    validate_entity_type, DeleteParams, KindSpec, RestoreParams, UpdateParams,
+    description_patch, deser, ensure_entity_subtype, immutable_event_error,
+    normalize_entity_timestamps, pack_private_record_error, parse_relation, remap_note_status,
+    resolve_kind_spec, resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted,
+    string_value, to_json, validate_entity_type, DeleteParams, KindSpec, RestoreParams,
+    UpdateParams,
 };
 use crate::KgPack;
 
@@ -131,7 +132,10 @@ impl KgPack {
         // PR-A1: by-ID substrate inference must NOT gate on caller namespace.
         // UUID v4 is globally unique — resolve without visible-set or primary-ns check.
         match self.runtime.resolve_by_id(token, id).await? {
-            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
+            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity {
+                specific: None,
+                entity_type: None,
+            }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {
                 if self.runtime.get_edge(token, id).await?.is_some() {
@@ -156,7 +160,10 @@ impl KgPack {
             .resolve_by_id_including_deleted(token, id)
             .await?
         {
-            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
+            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity {
+                specific: None,
+                entity_type: None,
+            }),
             Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
             _ => {
                 if self
@@ -218,7 +225,10 @@ impl KgPack {
         reject_inapplicable_fields(&spec, &p)?;
 
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type: required_entity_type,
+            } => {
                 let entity = self.runtime.get_entity(token, id).await?;
                 refuse_pack_registry_row(&entity, "update")?;
                 if let Some(tag) = p
@@ -240,6 +250,11 @@ impl KgPack {
                         )));
                     }
                 }
+                ensure_entity_subtype(
+                    id,
+                    entity.entity_type.as_deref(),
+                    required_entity_type.as_deref(),
+                )?;
                 // ADR-014 tri-state: `Some(None)` is an explicit clear and
                 // bypasses the vocabulary check (runtime applies it);
                 // `Some(Some(raw))` validates + normalizes; `None` unchanged.
@@ -252,6 +267,16 @@ impl KgPack {
                     )?),
                     None => None,
                 };
+                if let Some(expected) = required_entity_type.as_deref() {
+                    if entity_type
+                        .as_ref()
+                        .is_some_and(|value| value.as_deref() != Some(expected))
+                    {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind={expected:?} contradicts the requested entity_type update"
+                        )));
+                    }
+                }
                 let patch = EntityPatch {
                     name: string_value(p.name, "name")?,
                     description: description_patch(p.description)?,
@@ -424,7 +449,10 @@ impl KgPack {
         let spec = spec.unwrap();
 
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 // Read the row before deciding: a registry row is refused here
                 // whether or not the caller named a kind, so the guard cannot
                 // be stepped around by omitting one.
@@ -462,6 +490,7 @@ impl KgPack {
                         )));
                     }
                 }
+                ensure_entity_subtype(id, entity.entity_type.as_deref(), entity_type.as_deref())?;
                 // Report the kind the row carries, not the one the caller typed. The row
                 // was read a few lines up to enforce the mismatch guard, so this costs
                 // nothing, and a caller who deleted by a bare id or a hex prefix learns
@@ -551,7 +580,10 @@ impl KgPack {
         };
 
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 let existing = self
                     .runtime
                     .get_entity_including_deleted(token, id)
@@ -572,6 +604,7 @@ impl KgPack {
                         )));
                     }
                 }
+                ensure_entity_subtype(id, existing.entity_type.as_deref(), entity_type.as_deref())?;
                 let Some((entity, restored)) = self.runtime.restore_entity(token, id).await? else {
                     return Err(foreign_restore_target(&p.id));
                 };

@@ -9,7 +9,7 @@ use khive_runtime::{
 };
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_storage::Note;
-use khive_types::Pack;
+use khive_types::{Pack, Visibility};
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
@@ -107,12 +107,12 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_fourteen_handlers() {
+fn comm_pack_declares_fifteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        14,
-        "comm pack must declare 14 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
-         thread, ingest, heartbeat, health, probe, cursor_get, cursor_commit \
+        15,
+        "comm pack must declare 15 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
+         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
@@ -139,6 +139,16 @@ fn comm_pack_declares_fourteen_handlers() {
     assert!(
         names.contains(&"comm.ingest"),
         "comm.ingest verb must be registered"
+    );
+    assert!(names.contains(&"comm.cleanup_expired_quarantine"));
+    let cleanup = CommPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "comm.cleanup_expired_quarantine")
+        .unwrap();
+    assert_eq!(cleanup.visibility, Visibility::Subhandler);
+    assert!(
+        !cleanup.params.iter().any(|param| param.name == "namespace"),
+        "namespace is a registry routing key, not a cleanup handler parameter"
     );
     assert!(
         names.contains(&"comm.heartbeat"),
@@ -5653,6 +5663,79 @@ async fn imap_account_keys_keep_accounts_distinct_and_recognize_same_account_leg
         .expect("old row retained");
     assert_eq!(old_note.content, "old account A body");
     assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
+}
+
+#[tokio::test]
+async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
+    use khive_storage::BlobStore as _;
+
+    let (registry, runtime) = build_registry_for_ns("local");
+    let blob_root = tempfile::tempdir().expect("blob root");
+    let blob_store = Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+            .expect("blob store"),
+    );
+    let original_ref = blob_store
+        .put(b"quarantined original".to_vec())
+        .await
+        .expect("publish original");
+    runtime
+        .install_blob_store(blob_store)
+        .expect("install blob store");
+    let old_id = "imap:mail.example.com:17:quarantine";
+    let new_id = "imap:mail.example.com:a@example.com:17:quarantine";
+    let original = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "quarantined message", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": old_id,
+                "metadata": {
+                    "quarantined": true,
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("seed old-key quarantine");
+    let note_id = original["full_id"]
+        .as_str()
+        .expect("note id")
+        .parse()
+        .expect("canonical UUID");
+    let attachments = runtime.core().attachments().expect("attachment store");
+    assert!(attachments
+        .delete_attachment(note_id, "quarantine-original")
+        .await
+        .expect("leave metadata-only legacy row"));
+
+    let error = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "quarantined replay", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": true,
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect_err("a legacy-key ack must not bypass quarantine ownership repair");
+    assert!(matches!(
+        error,
+        khive_runtime::RuntimeError::InvalidInput(message)
+            if message.contains("legacy_external_id cannot be combined with quarantine metadata")
+    ));
+    assert!(attachments
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .is_none());
 }
 
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).

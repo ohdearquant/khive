@@ -11,6 +11,7 @@ pub mod imports;
 pub mod ingest;
 pub mod manifest;
 mod pack;
+mod safe_source;
 pub(crate) mod scanner_rust;
 pub mod source_ingest;
 pub(crate) mod vocab;

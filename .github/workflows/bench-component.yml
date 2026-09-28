@@ -129,7 +129,9 @@ jobs:
       # PR runs record and report only the selected components, but do not
       # add ephemeral merge commits to the durable main/release trend ledger.
       - name: Publish ledger to perf-data branch
+        id: publish
         if: ${{ !cancelled() && github.event_name == 'push' }}
+        continue-on-error: true
         run: bash scripts/perf/publish_ledger.sh bench-data/components.jsonl
 
       - name: Write step summary
@@ -150,6 +152,27 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
+      - name: Warn if trend ledger publish failed (advisory, never fails)
+        if: ${{ !cancelled() && github.event_name == 'push' && (steps.publish.outputs.publish_status == 'failed' || steps.publish.outcome == 'failure') }}
+        env:
+          COMPONENT: ${{ inputs.component }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          MSG="perf-data publish failed for component=${COMPONENT}; its ledger record is retained in the run artifact. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "::warning::${MSG}"
+          {
+            echo "## Trend ledger publish failed (advisory)"
+            echo ""
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          TRACKING_ISSUE=863
+          gh issue reopen "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          if ! gh issue comment "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"; then
+            echo "::warning::tracking-issue comment failed (non-fatal)"
+          fi
+          exit 0
+
       # Advisory-lane semantics: publishing happens before this warning on
       # main/release runs, and a data-collection error never paints CI red.
       - name: Warn if trend ledger record errored (advisory, never fails)
@@ -157,11 +180,17 @@ jobs:
         env:
           COMPONENT: ${{ inputs.component }}
           RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
+          PUBLISH_STATUS: ${{ steps.publish.outputs.publish_status }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            LEDGER_NOTE="Its status=error record was still published to perf-data."
+            if [ "$PUBLISH_STATUS" = failed ] || [ "$PUBLISH_OUTCOME" = failure ]; then
+              LEDGER_NOTE="Its status=error record is retained in the run artifact; perf-data publish failed."
+            else
+              LEDGER_NOTE="Its status=error record was still published to perf-data."
+            fi
           else
             LEDGER_NOTE="Its status=error record is retained in the run artifact only."
           fi

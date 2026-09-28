@@ -26,6 +26,9 @@ struct ObservedBlobStore {
     reads: AtomicUsize,
     puts: AtomicUsize,
     fail_next_read: Mutex<Option<ReadFailure>>,
+    block_next_read: AtomicBool,
+    read_started: Notify,
+    read_release: Semaphore,
     block_next_put: AtomicBool,
     put_started: Notify,
     put_release: Semaphore,
@@ -48,6 +51,10 @@ impl BlobStore for ObservedBlobStore {
         max_bytes: u64,
     ) -> StorageResult<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.block_next_read.swap(false, Ordering::SeqCst) {
+            self.read_started.notify_one();
+            self.read_release.acquire().await.unwrap().forget();
+        }
         assert_eq!(
             max_bytes, MAX_BLOB_WHOLE_BYTES,
             "preserve the whole-body bound"
@@ -97,6 +104,9 @@ fn fixture() -> (
         reads: AtomicUsize::new(0),
         puts: AtomicUsize::new(0),
         fail_next_read: Mutex::new(None),
+        block_next_read: AtomicBool::new(false),
+        read_started: Notify::new(),
+        read_release: Semaphore::new(0),
         block_next_put: AtomicBool::new(false),
         put_started: Notify::new(),
         put_release: Semaphore::new(0),
@@ -310,6 +320,60 @@ async fn extract_hydration_errors_preserve_refusals_and_release_admission_withou
         assert!(reply["result"]["text"]["id"].is_string());
         assert_eq!(store.reads.load(Ordering::SeqCst), 2);
     }
+}
+
+#[tokio::test]
+async fn extraction_refuses_a_body_replaced_during_hydration_before_derived_writes() {
+    let (runtime, registry, store, _dir) = fixture();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let page_id = seed_page(
+        &runtime,
+        &token,
+        "https://hydration.example.test/race",
+        "text/html",
+        b"<a href='/old'>Old</a><p>Old text</p>",
+    )
+    .await;
+    let before = domain_counts(&runtime).await;
+    store.block_next_read.store(true, Ordering::SeqCst);
+    let extraction = registry.dispatch("web.extract", json!({ "id": page_id }));
+    tokio::pin!(extraction);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut extraction => panic!("extraction skipped the read barrier: {result:?}"),
+            _ = store.read_started.notified() => {},
+        }
+    })
+    .await
+    .expect("extraction reaches hydration read");
+
+    let replacement = b"<a href='/new'>New</a><p>New text</p>";
+    let new_ref = store.put(replacement.to_vec()).await.unwrap();
+    crate::entities::patch(
+        &runtime,
+        &token,
+        page_id,
+        None,
+        json!({ "blob_ref": new_ref.to_string() }),
+    )
+    .await
+    .unwrap();
+    crate::fetch::root_body(
+        &runtime,
+        page_id,
+        khive_storage::AttachmentSubstrate::Entity,
+        &new_ref,
+        Some("text/html"),
+        replacement.len() as u64,
+    )
+    .await
+    .unwrap();
+    store.read_release.add_permits(1);
+    let error = extraction.await.unwrap_err();
+    assert!(
+        matches!(error, RuntimeError::InvalidInput(ref reason) if reason.starts_with("capture_changed:"))
+    );
+    assert_eq!(domain_counts(&runtime).await, before);
 }
 
 #[tokio::test]

@@ -22,7 +22,9 @@
 # are not already present verbatim are appended. JSONL records are
 # canonicalized with sort_keys=True (bench_track.py), so an identical record
 # always serializes to an identical line, which makes plain line-set dedup
-# safe and also makes a retry of this same invocation idempotent.
+# safe and also makes a retry of this same invocation idempotent. The
+# components ledger is additionally migrated into bounded numbered shards;
+# its historical flat file is removed from the remote branch on first publish.
 
 set -euo pipefail
 
@@ -36,6 +38,13 @@ BOT_NAME="${BENCH_BOT_NAME:-khive-bench-bot}"
 BOT_EMAIL="${BENCH_BOT_EMAIL:-khive-bench-bot@users.noreply.github.com}"
 SHA="$(git rev-parse HEAD)"
 WORKTREE_DIR=".perf-data-worktree"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+report_status() {
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'publish_status=%s\n' "$1" >> "$GITHUB_OUTPUT" || true
+  fi
+}
 
 cleanup() {
   git worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 || true
@@ -58,24 +67,31 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   fi
 
   for f in "$@"; do
-    mkdir -p "$WORKTREE_DIR/$(dirname "$f")"
-    if [ -f "$WORKTREE_DIR/$f" ]; then
-      # History already present (checked out from origin/perf-data) - union
-      # it with this run's local lines, deduping exact-duplicate lines, so
-      # every prior run's record survives alongside the new one.
-      cat "$WORKTREE_DIR/$f" "$f" | awk '!seen[$0]++' > "$WORKTREE_DIR/$f.merged"
-      mv "$WORKTREE_DIR/$f.merged" "$WORKTREE_DIR/$f"
+    if [ "$f" = "bench-data/components.jsonl" ] || [ "$f" = "./bench-data/components.jsonl" ]; then
+      python3 "$SCRIPT_DIR/ledger_shards.py" "$f" "$WORKTREE_DIR/bench-data"
     else
-      cp "$f" "$WORKTREE_DIR/$f"
+      mkdir -p "$WORKTREE_DIR/$(dirname "$f")"
+      if [ -f "$WORKTREE_DIR/$f" ]; then
+        # History already present (checked out from origin/perf-data) - union
+        # it with this run's local lines, deduping exact-duplicate lines, so
+        # every prior run's record survives alongside the new one.
+        cat "$WORKTREE_DIR/$f" "$f" | awk '!seen[$0]++' > "$WORKTREE_DIR/$f.merged"
+        mv "$WORKTREE_DIR/$f.merged" "$WORKTREE_DIR/$f"
+      else
+        cp "$f" "$WORKTREE_DIR/$f"
+      fi
     fi
   done
 
   git -C "$WORKTREE_DIR" config user.name "$BOT_NAME"
   git -C "$WORKTREE_DIR" config user.email "$BOT_EMAIL"
-  git -C "$WORKTREE_DIR" add -- "$@"
+  # Components migration removes the flat file and adds numbered paths; the
+  # input filename alone would miss both changes.
+  git -C "$WORKTREE_DIR" add -A -- bench-data
 
   if git -C "$WORKTREE_DIR" diff --cached --quiet; then
     echo "[publish_ledger] no changes to commit (attempt $attempt) - already up to date"
+    report_status current
     exit 0
   fi
 
@@ -88,12 +104,17 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
 
   if git -C "$WORKTREE_DIR" push origin "HEAD:$BRANCH"; then
     echo "[publish_ledger] pushed on attempt $attempt"
+    report_status published
     exit 0
   fi
 
-  echo "[publish_ledger] push rejected on attempt $attempt, retrying..." >&2
-  sleep $((attempt * 3))
+  if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+    delay=$((attempt * 3 + RANDOM % 4))
+    echo "[publish_ledger] push rejected on attempt $attempt; retrying in ${delay}s..." >&2
+    sleep "$delay"
+  fi
 done
 
-echo "[publish_ledger] FATAL: failed to push after $MAX_ATTEMPTS attempts" >&2
-exit 1
+echo "[publish_ledger] WARNING: failed to push after $MAX_ATTEMPTS attempts; benchmark publication is advisory" >&2
+report_status failed
+exit 0

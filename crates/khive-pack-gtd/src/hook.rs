@@ -933,4 +933,66 @@ mod tests {
             Some("concurrent body")
         );
     }
+
+    #[tokio::test]
+    async fn note_update_refuses_a_same_timestamp_newer_version() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let mut task = Note::new("local", "task", "original body");
+        task.properties = Some(json!({"status": "inbox"}));
+        let task_id = task.id;
+        runtime
+            .notes(&token)
+            .expect("note store")
+            .upsert_note(task)
+            .await
+            .expect("seed task");
+
+        let snapshot = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        let mut concurrent = snapshot.clone();
+        concurrent.properties = Some(json!({"status": "inbox", "gtd_repair": {"observed": true}}));
+        runtime
+            .notes(&token)
+            .expect("note store")
+            .upsert_note(concurrent)
+            .await
+            .expect("same-timestamp concurrent write");
+        let persisted = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(persisted.updated_at, snapshot.updated_at);
+        assert!(persisted.version > snapshot.version);
+
+        for patch in [
+            NotePatch::new(None, Some("stale body".into()), None, None, None),
+            NotePatch::new(None, None, None, None, None),
+        ] {
+            runtime
+                .update_note_from_snapshot_with_embedding_report(&token, snapshot.clone(), patch)
+                .await
+                .expect_err("a stale snapshot must not replace or affirm the newer row");
+        }
+        let after = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(after.content, "original body");
+        assert_eq!(after.properties, persisted.properties);
+        assert_eq!(after.version, persisted.version);
+    }
 }

@@ -8,6 +8,8 @@
 //! `--log` and `KHIVE_LOG` affect the client process, while the daemon's level
 //! is fixed at startup. The response protocol does not report a daemon PID
 //! or stderr destination, so this disclosure includes neither.
+//! A forwarded lexical-timeout response is also reported as a client-side
+//! WARN: the daemon's detailed event cannot reach the caller's stderr.
 //!
 //! ## Modes
 //!
@@ -319,7 +321,7 @@ pub(crate) fn acquire_local_construction_guard(
 /// cold-boot FTS race #667 closes on unix, just without a daemon on the
 /// other end of it.
 ///
-/// Uses `std::fs::File::lock()` (stabilized 1.89, workspace MSRV 1.93) on the
+/// Uses `std::fs::File::lock()` (stabilized 1.89, workspace MSRV 1.95) on the
 /// SAME lock file path the unix guard uses
 /// ([`khive_runtime::daemon::lock_path`]) — a blocking exclusive advisory
 /// lock, released when the returned `File` is dropped. On unix this API is

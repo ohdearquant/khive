@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use khive_runtime::engine_config::ExecSectionConfig;
+use khive_runtime::engine_config::{ExecSectionConfig, DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S};
 
 use crate::tree::digest_hex;
 
@@ -72,6 +72,7 @@ pub struct Resolved {
     pub max_output_bytes: u64,
     pub timeout_default_s: f64,
     pub timeout_max_s: f64,
+    pub binary_digest_timeout_s: u64,
     pub keep: bool,
     pub limits: Limits,
 }
@@ -134,6 +135,9 @@ pub fn resolve(cfg: &ExecSectionConfig) -> Resolved {
         max_output_bytes: cfg.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
         timeout_default_s: cfg.timeout_default_s.unwrap_or(DEFAULT_TIMEOUT_S),
         timeout_max_s: cfg.timeout_max_s.unwrap_or(DEFAULT_TIMEOUT_MAX_S),
+        binary_digest_timeout_s: cfg
+            .binary_digest_timeout_s
+            .unwrap_or(DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S),
         keep: cfg.keep,
         limits: Limits {
             cpu_seconds: cfg.limits.cpu_seconds,

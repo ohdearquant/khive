@@ -1083,7 +1083,7 @@ impl KnowledgeHandlers {
         // approximate ANN recall over new vectors lags until the next kkernel reindex.
         // Missing embedder: embed_sections returns zero counters and an empty
         // truncation report immediately, so edit succeeds.
-        let (_, _, _, section_truncation) =
+        let (_, _, _, _, section_truncation) =
             embed_sections(runtime, token, false, 32, None, Some(&atom_id)).await?;
 
         // Refresh this atom's vector-store entry (knowledge.atom field) so atom-granularity

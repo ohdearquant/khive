@@ -19,7 +19,7 @@ fn fixture() -> TempDir {
         .expect("short isolated socket directory")
 }
 
-fn exec_command(root: &TempDir) -> Command {
+fn exec_command(root: &TempDir, ops: &str) -> Command {
     let config = root.path().join("khive.toml");
     std::fs::write(&config, "[packs.kg]\nbackend = \"main\"\nno_embed = true\n").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kkernel"));
@@ -29,7 +29,7 @@ fn exec_command(root: &TempDir) -> Command {
         }
     }
     command
-        .args(["exec", "whoami()", "--actor", "actor:exec-log"])
+        .args(["exec", ops, "--actor", "actor:exec-log"])
         .arg("--config")
         .arg(config)
         .arg("--db")
@@ -47,56 +47,88 @@ fn exec_command(root: &TempDir) -> Command {
 
 #[tokio::test]
 async fn forwarded_exec_discloses_daemon_logging_scope() {
-    let root = fixture();
-    let listener = UnixListener::bind(root.path().join("s")).unwrap();
-    let daemon = async {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let bytes = read_frame(&mut stream).await.unwrap();
-        let frame: DaemonRequestFrame = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(frame.ops, "whoami()");
-        assert_eq!(frame.actor_id.as_deref(), Some("actor:exec-log"));
-        let response = DaemonResponseFrame {
-            ok: true,
-            result: Some(json!({"daemon_disclosure_fixture": true}).to_string()),
-            error: None,
-            error_detail: None,
-            namespace_mismatch: false,
-            config_mismatch: false,
-            served_config_id: Some(frame.config_id),
-            version_mismatch: false,
-            daemon_protocol_version: PROTOCOL_VERSION,
-            metrics: None,
-            request_id: frame.request_id,
+    for (requested, configured) in [
+        (None, None),
+        (Some("auto"), None),
+        (Some("table"), None),
+        (None, Some("auto")),
+        (None, Some("table")),
+    ] {
+        let root = fixture();
+        let listener = UnixListener::bind(root.path().join("s")).unwrap();
+        let rendered = requested.or(configured).is_some();
+        let result = if rendered {
+            json!("| name |\n|---|\n| first |\n| second |\n")
+        } else {
+            json!({"degraded": {"lexical_timeout": true}, "items": [
+                {"name": "first"}, {"name": "second"}
+            ]})
         };
-        write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
-            .await
-            .unwrap();
-    };
-    let mut command = exec_command(&root);
-    let (served, output) = tokio::join!(tokio::time::timeout(WATCHDOG, daemon), async {
-        let output = tokio::time::timeout(WATCHDOG, command.output())
-            .await
-            .expect("exec must finish")
-            .expect("run exec");
+        let public = json!({
+            "results": [{"ok": true, "tool": "knowledge.search", "result": result}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0}
+        });
+        let daemon = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let bytes = read_frame(&mut stream).await.unwrap();
+            let frame: DaemonRequestFrame = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(frame.ops, "knowledge.search(query=\"test\")");
+            assert_eq!(frame.actor_id.as_deref(), Some("actor:exec-log"));
+            assert_eq!(frame.format.as_deref(), requested);
+            let response = DaemonResponseFrame {
+                ok: true,
+                result: Some(public.to_string()),
+                error: None,
+                error_detail: Some(json!({"lexical_timeout": true})),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id: Some(frame.config_id),
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: frame.request_id,
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
+                .await
+                .unwrap();
+        };
+        let mut command = exec_command(&root, "knowledge.search(query=\"test\")");
+        if let Some(format) = requested {
+            command.args(["--output-format", format]);
+        }
+        if let Some(format) = configured {
+            command.env("KHIVE_OUTPUT_FORMAT", format);
+        }
+        let (served, output) = tokio::join!(tokio::time::timeout(WATCHDOG, daemon), async {
+            let output = tokio::time::timeout(WATCHDOG, command.output())
+                .await
+                .expect("exec must finish")
+                .expect("run exec");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            output
+        },);
+        served.expect("client must reach the fake daemon");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{stderr}");
-        output
-    },);
-    served.expect("client must reach the fake daemon");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({"daemon_disclosure_fixture": true}),
-        "disclosure must not replace or decorate the daemon's stdout payload"
-    );
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.starts_with("execution:"))
-            .collect::<Vec<_>>(),
-        vec![DISCLOSURE],
-        "stderr={stderr}"
-    );
+        assert_eq!(
+            output.stdout.as_slice(),
+            format!("{public}\n").as_bytes(),
+            "requested={requested:?}, configured={configured:?}: stdout changed"
+        );
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| line.starts_with("execution:"))
+                .collect::<Vec<_>>(),
+            vec![DISCLOSURE],
+            "stderr={stderr}"
+        );
+        assert_eq!(
+            stderr.matches("lexical read timed out").count(),
+            1,
+            "requested={requested:?}, configured={configured:?}: {stderr}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -104,7 +136,9 @@ async fn in_process_exec_omits_daemon_logging_disclosure() {
     let root = fixture();
     let output = tokio::time::timeout(
         WATCHDOG,
-        exec_command(&root).env("KHIVE_NO_DAEMON", "1").output(),
+        exec_command(&root, "whoami()")
+            .env("KHIVE_NO_DAEMON", "1")
+            .output(),
     )
     .await
     .expect("local exec must finish")
@@ -121,5 +155,23 @@ async fn in_process_exec_omits_daemon_logging_disclosure() {
     assert!(
         !stderr.contains("client process log level only"),
         "{stderr}"
+    );
+    assert!(!stderr.contains("kkernel logging initialized"), "{stderr}");
+
+    let debug = tokio::time::timeout(
+        WATCHDOG,
+        exec_command(&root, "whoami()")
+            .args(["--log", "debug"])
+            .env("KHIVE_NO_DAEMON", "1")
+            .output(),
+    )
+    .await
+    .expect("debug exec must finish")
+    .expect("run debug exec");
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert!(debug.status.success(), "{debug_stderr}");
+    assert!(
+        debug_stderr.contains("kkernel logging initialized"),
+        "--log debug must enable a client-owned diagnostic: {debug_stderr}"
     );
 }

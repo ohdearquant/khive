@@ -67,6 +67,21 @@ pub fn attachment_upsert_statement(attachment: &Attachment) -> Result<SqlStateme
     })
 }
 
+/// Build an insert that leaves an existing role untouched. The single SQL
+/// statement is the race boundary for replay repair.
+fn attachment_insert_if_absent_statement(
+    attachment: &Attachment,
+) -> Result<SqlStatement, StorageError> {
+    let mut statement = attachment_upsert_statement(attachment)?;
+    statement.sql = "INSERT INTO attachments \
+                     (record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(record_uuid, role) DO NOTHING"
+        .to_string();
+    statement.label = Some("attachment-insert-if-absent".to_string());
+    Ok(statement)
+}
+
 /// Build deletion of one role from one record.
 pub fn delete_attachment_statement(record_uuid: Uuid, role: &str) -> SqlStatement {
     SqlStatement {
@@ -218,6 +233,16 @@ impl AttachmentStore for SqlAttachmentStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn try_insert_attachment(&self, attachment: Attachment) -> Result<bool, StorageError> {
+        let statement = attachment_insert_if_absent_statement(&attachment)?;
+        self.with_writer("try_insert_attachment", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

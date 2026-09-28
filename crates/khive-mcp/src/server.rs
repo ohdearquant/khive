@@ -36,6 +36,7 @@ use khive_request::{
     parse_request, parse_typed_json_batch, unit_write_key_conflicts, ArgValue, DslError,
     ExecutionMode, ParsedOp, ParsedRequest, PrevFailure, TypedJsonOp,
 };
+use khive_runtime::daemon::DAEMON_LEXICAL_TIMEOUT_MARKER;
 use khive_runtime::presentation::{
     prepare_format_value_with_note_content, render_format_with_note_content, NoteContentScope,
 };
@@ -1365,6 +1366,7 @@ pub struct KhiveMcpServer {
 /// Failure reason inside a [`PackRegError`].
 pub enum PackRegFailure {
     UnknownPack(String),
+    DuplicatePack(String),
     MissingDependency { pack: String, dep: String },
     NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
@@ -1383,6 +1385,7 @@ impl std::fmt::Debug for PackRegError {
         let mut dbg = f.debug_struct("PackRegError");
         match &self.failure {
             PackRegFailure::UnknownPack(unknown) => dbg.field("unknown", unknown),
+            PackRegFailure::DuplicatePack(pack) => dbg.field("duplicate_pack", pack),
             PackRegFailure::MissingDependency { pack, dep } => {
                 dbg.field("pack", pack).field("missing_dep", dep)
             }
@@ -1403,6 +1406,7 @@ impl std::fmt::Display for PackRegError {
                 unknown,
                 builtin_pack_names().join(", ")
             ),
+            PackRegFailure::DuplicatePack(pack) => write!(f, "duplicate pack {pack:?}"),
             PackRegFailure::MissingDependency { pack, dep } => write!(
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
@@ -1679,6 +1683,7 @@ impl KhiveMcpServer {
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {
                 PackLoadError::UnknownPack(name) => PackRegFailure::UnknownPack(name),
+                PackLoadError::DuplicatePack(name) => PackRegFailure::DuplicatePack(name),
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }
@@ -4867,6 +4872,10 @@ impl KhiveMcpServer {
                 .map_err(|e| request_internal_error(format!("serialize manifest: {e}")));
         }
 
+        if origin == DispatchOrigin::Daemon {
+            mark_daemon_lexical_timeout(&mut result);
+        }
+
         // Apply per-op format rendering (ADR-078 §8.4 and §9).
         Ok(render_result(
             result,
@@ -5121,6 +5130,32 @@ fn validate_request_overrides(p: &RequestParams, op_count: usize) -> Result<(), 
 struct RenderContext<'a> {
     registry: &'a VerbRegistry,
     content_scopes: &'a [NoteContentScope],
+}
+
+/// Preserve a daemon-only signal before auto/table rendering turns a result
+/// into display text. The daemon moves it into response-frame metadata.
+fn mark_daemon_lexical_timeout(response: &mut Value) {
+    let timed_out = response
+        .get("results")
+        .and_then(Value::as_array)
+        .is_some_and(|results| {
+            results.iter().any(|entry| {
+                entry.get("ok").and_then(Value::as_bool) == Some(true)
+                    && matches!(
+                        entry.get("tool").and_then(Value::as_str),
+                        Some("knowledge.search" | "knowledge.suggest")
+                    )
+                    && entry
+                        .get("result")
+                        .and_then(|result| result.get("degraded"))
+                        .and_then(|degraded| degraded.get("lexical_timeout"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        });
+    if timed_out {
+        response[DAEMON_LEXICAL_TIMEOUT_MARKER] = Value::Bool(true);
+    }
 }
 
 /// Render the `run_parsed` result envelope using per-op format dispatch (ADR-078 §8.4).
@@ -5946,6 +5981,28 @@ mod tests {
     include!("server/search_ranking_tests.rs");
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[test]
+    fn daemon_timeout_marker_requires_successful_knowledge_result_flag() {
+        let mut response = json!({
+            "results": [
+                {"ok": false, "tool": "knowledge.search", "result": {
+                    "degraded": {"lexical_timeout": true}
+                }},
+                {"ok": true, "tool": "stats", "result": {
+                    "degraded": {"lexical_timeout": true}
+                }},
+                {"ok": true, "tool": "knowledge.search", "result": {
+                    "content": "lexical_timeout: true", "degraded": {"lexical_timeout": false}
+                }}
+            ]
+        });
+        super::mark_daemon_lexical_timeout(&mut response);
+        assert!(response.get(super::DAEMON_LEXICAL_TIMEOUT_MARKER).is_none());
+        response["results"][2]["result"]["degraded"]["lexical_timeout"] = json!(true);
+        super::mark_daemon_lexical_timeout(&mut response);
+        assert_eq!(response[super::DAEMON_LEXICAL_TIMEOUT_MARKER], true);
+    }
 
     #[test]
     fn per_op_overrides_are_bounded_and_validated_before_forwarding() {
@@ -7810,6 +7867,147 @@ mod tests {
     }
 
     struct LargeResultPack;
+
+    struct LexicalTimeoutResultPack;
+
+    impl khive_types::Pack for LexicalTimeoutResultPack {
+        const NAME: &'static str = "lexical-timeout-result-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "knowledge.search",
+                description: "returns a deterministic lexical timeout result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "knowledge.suggest",
+                description: "returns a deterministic lexical timeout result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for LexicalTimeoutResultPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "degraded": {"lexical_timeout": true},
+                "items": [{"name": "first"}, {"name": "second"}],
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_timeout_marker_survives_explicit_and_configured_auto_table_rendering() {
+        use khive_runtime::daemon::{DaemonDispatch, DaemonResponseFrame, PROTOCOL_VERSION};
+
+        for (requested, configured) in [
+            (Some("auto"), OutputFormat::Json),
+            (Some("table"), OutputFormat::Json),
+            (None, OutputFormat::Auto),
+            (None, OutputFormat::Table),
+        ] {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(LexicalTimeoutResultPack);
+            let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"))
+                .with_default_output_format(configured);
+            let ops = "[knowledge.search(), knowledge.suggest()]";
+            let raw = server
+                .dispatch(
+                    ops.to_string(),
+                    None,
+                    None,
+                    requested.map(str::to_string),
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .expect("daemon dispatch");
+            let mut expected: Value = serde_json::from_str(&raw).expect("daemon envelope");
+            assert_eq!(
+                expected[super::DAEMON_LEXICAL_TIMEOUT_MARKER],
+                json!(true),
+                "requested={requested:?}, configured={configured:?}: {expected}"
+            );
+            for entry in expected["results"].as_array().expect("results") {
+                assert_eq!(entry["ok"], true);
+                assert!(
+                    entry["result"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("| name |")),
+                    "auto/table must hide the structured timeout: {entry}"
+                );
+            }
+            expected
+                .as_object_mut()
+                .expect("envelope")
+                .remove(super::DAEMON_LEXICAL_TIMEOUT_MARKER);
+            let public_result = expected.to_string();
+            let frame = DaemonResponseFrame {
+                ok: true,
+                result: Some(public_result.clone()),
+                error: None,
+                error_detail: Some(json!({"lexical_timeout": true})),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id: Some(server.config_id().to_string()),
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: None,
+            };
+            let public = crate::daemon::map_response_for_test(
+                frame,
+                server.config_id(),
+                server.default_namespace(),
+            )
+            .expect("accepted daemon response")
+            .expect("successful daemon response");
+            assert_eq!(public, public_result);
+            assert!(!public.contains(super::DAEMON_LEXICAL_TIMEOUT_MARKER));
+
+            let local = server
+                .dispatch_request_local(RequestParams {
+                    ops: ops.to_string(),
+                    format: requested.map(str::to_string),
+                    ..Default::default()
+                })
+                .await
+                .expect("local dispatch");
+            let local: Value = serde_json::from_str(&local).expect("local envelope");
+            assert!(local.get(super::DAEMON_LEXICAL_TIMEOUT_MARKER).is_none());
+        }
+    }
 
     impl khive_types::Pack for LargeResultPack {
         const NAME: &'static str = "large-result-test";

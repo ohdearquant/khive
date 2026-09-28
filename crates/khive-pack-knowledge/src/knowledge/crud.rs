@@ -59,6 +59,28 @@ const DOMAIN_LIST_FIELDS: &[&str] = &[
 const LIST_CURSOR_ORDER: &str = "created_at_asc_id_asc";
 const LIST_OFFSET_ORDER: &str = "created_at_desc_id_desc";
 
+fn invalidate_section_vectors_for_atom_rename(
+    id: &str,
+    namespace: &str,
+    new_name: &str,
+    now: i64,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE knowledge_sections SET embedding=NULL, updated_at=?1 \
+              WHERE atom_id=?2 AND namespace=?3 AND embedding IS NOT NULL \
+              AND EXISTS (SELECT 1 FROM knowledge_atoms a \
+                          WHERE a.id=?2 AND a.namespace=?3 AND a.name<>?4)"
+            .into(),
+        params: vec![
+            SqlValue::Integer(now),
+            SqlValue::Text(id.to_string()),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(new_name.to_string()),
+        ],
+        label: None,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum KnowledgeListKind {
     Atom,
@@ -482,6 +504,12 @@ impl KnowledgeHandlers {
                     });
                 created += 1;
             } else {
+                statements.push(invalidate_section_vectors_for_atom_rename(
+                    &id,
+                    &ns,
+                    &atom_in.name,
+                    now,
+                ));
                 statements.push(SqlStatement {
                     // Presence/value pairs distinguish omission from explicit JSON
                     // null. Finalized is non-nullable, so its null value is bound as
@@ -500,7 +528,7 @@ impl KnowledgeHandlers {
                         SqlValue::Integer(finalized_present as i64),
                         SqlValue::Integer(finalized as i64),
                         SqlValue::Integer(now),
-                        SqlValue::Text(id),
+                        SqlValue::Text(id.clone()),
                         SqlValue::Text(ns.clone()),
                     ],
                     label: None,
@@ -517,7 +545,6 @@ impl KnowledgeHandlers {
             .execute_batch(statements)
             .await
             .map_err(|e| sql_err("upsert_atoms batch", e))?;
-
         Ok(json!({
             "created": created,
             "updated": updated,
@@ -693,7 +720,11 @@ impl KnowledgeHandlers {
                 // logical record; a mirror-write failure must roll back the domain
                 // update too.
                 writer
-                    .execute_batch(vec![domain_stmt, mirror_stmt])
+                    .execute_batch(vec![
+                        domain_stmt,
+                        invalidate_section_vectors_for_atom_rename(&id, &ns, &name, now),
+                        mirror_stmt,
+                    ])
                     .await
                     .map_err(|e| sql_err("upsert_domains update batch", e))?;
                 updated += 1;
@@ -716,7 +747,11 @@ impl KnowledgeHandlers {
                 // Atomic: a mirror-insert failure must roll back the domain insert
                 // too, so no domain row is ever left committed without its mirror.
                 writer
-                    .execute_batch(vec![domain_stmt, mirror_stmt])
+                    .execute_batch(vec![
+                        domain_stmt,
+                        invalidate_section_vectors_for_atom_rename(&id, &ns, &name, now),
+                        mirror_stmt,
+                    ])
                     .await
                     .map_err(|e| sql_err("upsert_domains insert batch", e))?;
                 created += 1;

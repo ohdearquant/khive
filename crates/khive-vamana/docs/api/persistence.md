@@ -19,6 +19,15 @@ names under the same publication lock as `load` and `save_atomic`. A previously
 loaded mmap reader keeps its old `vectors.bin` inode. The v1 data layout remains
 three segments without a checksum-bearing cross-file commit record; use
 `save_atomic` when crash-consistent generations are required.
+`load` creates `.checkpoint.lock` before reading a historical directory that
+does not yet have one, then holds a shared lock through all segment reads.
+This prevents the first concurrent `save` or `save_atomic` from publishing a
+mixed generation during that load. If lock creation is refused solely because
+the directory is read-only, `load` reads without a lock but compares the file
+identities, lengths and modification times of every segment and the lock file
+before and after; any observed change refuses the load. This guards against
+the rename-based publications used by `save` and `save_atomic`. Other lock-creation errors still
+fail. Subsequent loads open the existing lock file for reading.
 If a platform refuses replacement of a mapped destination, `save` returns the
 I/O error; it never falls back to truncating the canonical file.
 
