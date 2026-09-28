@@ -2,6 +2,7 @@
 
 mod aggregate;
 mod export;
+pub mod git_safety;
 mod join;
 mod model;
 mod read;
