@@ -2,6 +2,9 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+/// Shared L1 manifest, L1.5 source, and L2 Rust source admission ceiling.
+pub(crate) const MAX_INGEST_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SourceReadError {
     #[error("{0}")]
@@ -64,10 +67,29 @@ pub(crate) fn read_contained_to_string(
     canonical_root: &Path,
     source_path: &Path,
 ) -> Result<String, SourceReadError> {
-    let mut source = open_contained_file(canonical_root, source_path)?;
-    let mut text = String::new();
-    source.read_to_string(&mut text)?;
-    Ok(text)
+    let source = open_contained_file(canonical_root, source_path)?;
+    // Inspect the opened descriptor, then cap the read on that same handle.
+    // A file growing after metadata inspection cannot allocate unboundedly.
+    if source.metadata()?.len() > MAX_INGEST_FILE_BYTES {
+        return Err(SourceReadError::Refused(format!(
+            "file {} exceeds the {}-byte code ingest ceiling",
+            source_path.display(),
+            MAX_INGEST_FILE_BYTES
+        )));
+    }
+    let mut bytes = Vec::new();
+    source
+        .take(MAX_INGEST_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INGEST_FILE_BYTES {
+        return Err(SourceReadError::Refused(format!(
+            "file {} exceeds the {}-byte code ingest ceiling",
+            source_path.display(),
+            MAX_INGEST_FILE_BYTES
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| SourceReadError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -216,6 +238,29 @@ mod tests {
         assert!(matches!(
             read_contained_to_string(&canonical_root, &path),
             Err(SourceReadError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn bounded_reader_accepts_two_mib_and_refuses_one_byte_more() {
+        let fixture = TempDir::new().expect("fixture");
+        let root = fixture.path().canonicalize().expect("canonical root");
+        let path = root.join("app.py");
+        let declared_limit = 2 * 1024 * 1024;
+        fs::write(&path, vec![b'x'; declared_limit]).expect("at-limit source");
+        assert_eq!(
+            read_contained_to_string(&root, &path)
+                .expect("at-limit source is admitted")
+                .len(),
+            declared_limit
+        );
+        fs::File::create(&path)
+            .expect("source")
+            .set_len(declared_limit as u64 + 1)
+            .expect("one byte over");
+        assert!(matches!(
+            read_contained_to_string(&root, &path),
+            Err(SourceReadError::Refused(reason)) if reason.contains("2097152-byte")
         ));
     }
 
