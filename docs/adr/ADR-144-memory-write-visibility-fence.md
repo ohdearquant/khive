@@ -139,7 +139,11 @@ weaken Arm A.
 `memory.remember` returns `visibility_token` as a strict JSON object:
 
 ```json
-{"version":1,"namespace":"local","fences":[{"model":"example-model","ann_write_log_seq":123}]}
+{
+  "version": 1,
+  "namespace": "local",
+  "fences": [{ "model": "example-model", "ann_write_log_seq": 123 }]
+}
 ```
 
 The namespace is the actual write namespace. There is exactly one fence per
