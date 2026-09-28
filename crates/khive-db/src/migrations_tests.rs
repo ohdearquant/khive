@@ -1845,6 +1845,173 @@ fn migration_versions_advance_by_exactly_one() {
 }
 
 #[test]
+fn v43_vector_provenance_sidecar_starts_empty() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("apply core migrations");
+    assert!(table_exists(&conn, "vector_provenance"));
+    for column in [
+        "model_key",
+        "subject_id",
+        "namespace",
+        "embedding_digest",
+        "text_fingerprint",
+        "updated_at",
+    ] {
+        assert!(column_exists(&conn, "vector_provenance", column));
+    }
+    let row_count: i64 = conn
+        .query_row("SELECT count(*) FROM vector_provenance", [], |row| {
+            row.get(0)
+        })
+        .expect("count provenance rows");
+    assert_eq!(row_count, 0);
+
+    let canonical = "a".repeat(64);
+    let nul_suffix = format!("{canonical}\0suffix");
+    assert!(
+        conn.execute(
+            "INSERT INTO vector_provenance \
+             (model_key, subject_id, namespace, embedding_digest, text_fingerprint) \
+             VALUES ('model', 'fingerprint-nul', 'ns:test', ?1, ?2)",
+            rusqlite::params![&canonical, &nul_suffix],
+        )
+        .is_err(),
+        "NUL after 64 hex characters must not pass the fingerprint CHECK"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO vector_provenance \
+             (model_key, subject_id, namespace, embedding_digest) \
+             VALUES ('model', 'embedding-nul', 'ns:test', ?1)",
+            [&nul_suffix],
+        )
+        .is_err(),
+        "NUL after 64 hex characters must not pass the embedding CHECK"
+    );
+}
+
+#[cfg(feature = "vectors")]
+#[tokio::test]
+async fn v43_upgrade_preserves_v42_vector_as_unknown_provenance() {
+    use std::sync::Arc;
+
+    use khive_storage::types::VectorRecord;
+    use khive_storage::VectorStore;
+    use khive_types::SubstrateKind;
+    use uuid::Uuid;
+
+    use crate::pool::{ConnectionPool, PoolConfig};
+    use crate::stores::vectors::SqliteVecStore;
+
+    crate::extension::ensure_extensions_loaded();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vector-v42.db");
+    let subject_id = Uuid::new_v4();
+    {
+        let mut conn = Connection::open(&path).expect("open historical database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage V21 attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize V21 attachment cutover");
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| (22..=42).contains(&migration.version))
+        {
+            let tx = conn.transaction().expect("begin historical migration");
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .expect("record historical migration");
+            tx.commit().expect("commit historical migration");
+        }
+        assert_eq!(read_schema_version(&conn).unwrap(), 42);
+        assert!(!table_exists(&conn, "vector_provenance"));
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_upgrade_test USING vec0(\
+             subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, embedding float[2] distance_metric=cosine)",
+        )
+        .expect("create legacy model table");
+        let embedding = [0.1_f32, 0.2_f32]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        conn.execute(
+            "INSERT INTO vec_upgrade_test \
+             (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES (?1, 'ns:test', 'entity', 'entity.body', 'model/a', ?2)",
+            rusqlite::params![subject_id.to_string(), embedding],
+        )
+        .expect("write historical vector");
+        assert_eq!(run_migrations(&mut conn).expect("upgrade to V43"), 43);
+        assert!(table_exists(&conn, "vector_provenance"));
+        let sidecars: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vector_provenance", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            sidecars, 0,
+            "migration must not infer historical provenance"
+        );
+    }
+
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open migrated database"),
+    );
+    let store = SqliteVecStore::new(
+        pool,
+        true,
+        "upgrade_test".into(),
+        "model/a".into(),
+        2,
+        "ns:test".into(),
+    )
+    .expect("open migrated vector store");
+    let legacy = store
+        .provenance(subject_id)
+        .await
+        .expect("read migrated vector")
+        .expect("legacy vector remains present");
+    assert_eq!(legacy.embedding_model, "model/a");
+    assert_eq!(legacy.field, "entity.body");
+    assert_eq!(legacy.text_fingerprint, None);
+    assert_eq!(legacy.updated_at, None);
+
+    let updated_at = chrono::DateTime::parse_from_rfc3339("2026-09-26T10:11:12.123456789Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let fingerprint = VectorRecord::fingerprint_text("attributed replacement");
+    let replacement = VectorRecord {
+        subject_id,
+        kind: SubstrateKind::Entity,
+        namespace: "ns:test".into(),
+        field: "entity.body".into(),
+        embedding_model: Some("model/a".into()),
+        vectors: vec![vec![0.1, 0.2]],
+        text_fingerprint: Some(fingerprint.clone()),
+        updated_at,
+    };
+    let summary = store
+        .insert_batch(vec![replacement])
+        .await
+        .expect("replace historical vector");
+    assert_eq!(summary.failed, 0);
+    let attributed = store.provenance(subject_id).await.unwrap().unwrap();
+    assert_eq!(attributed.text_fingerprint, Some(fingerprint));
+    assert_eq!(attributed.updated_at, Some(updated_at));
+}
+
+#[test]
 fn v23_backfills_indexed_record_kinds_and_preserves_unmatched_fts_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("pre-record-kind.db");

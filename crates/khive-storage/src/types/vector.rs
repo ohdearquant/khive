@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use khive_types::SubstrateKind;
 
+use crate::blob::ContentRef;
+
 /// Discriminant for the ANN index algorithm used by a vector backend.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -93,7 +95,29 @@ pub struct VectorRecord {
     pub embedding_model: Option<String>,
     /// One or many dense vectors; sqlite-vec backends enforce `vectors.len() == 1`.
     pub vectors: Vec<Vec<f32>>,
+    /// BLAKE3 digest of the runtime-prepared document bytes (after bounding
+    /// and passage prefix). `None` means unknown.
+    #[serde(default)]
+    pub text_fingerprint: Option<ContentRef>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl VectorRecord {
+    /// Hash one exact UTF-8 input; producers supply their prepared document text.
+    pub fn fingerprint_text(text: &str) -> ContentRef {
+        ContentRef::from_digest_bytes(blake3::hash(text.as_bytes()).as_bytes())
+    }
+}
+
+/// Provenance read from a stored vector row. `None` fields mean the vector's
+/// source or write time is unknown, as with pre-sidecar rows or a sidecar whose
+/// binding digest does not match the live embedding BLOB.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorProvenance {
+    pub embedding_model: String,
+    pub field: String,
+    pub text_fingerprint: Option<ContentRef>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// Parameters for a nearest-neighbor similarity search.
