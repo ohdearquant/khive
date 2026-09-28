@@ -138,7 +138,7 @@ async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     );
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr-CA"]})
+        json!({"accept-language": ["fr-CA"], "accept-encoding": ["gzip"]})
     );
 
     let mut headers = response_headers();
@@ -152,7 +152,7 @@ async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     );
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr-CA"]})
+        json!({"accept-language": ["fr-CA"], "accept-encoding": ["gzip"]})
     );
     assert_eq!(properties["etag"], "refreshed-etag");
     assert_eq!(reply["changed"], false);
@@ -397,7 +397,7 @@ async fn redirected_refresh_updates_terminal_metadata_and_negotiation() {
             );
             assert_eq!(
                 properties["request_headers"],
-                json!({"accept": ["application/json"], "accept-language": ["fr"]}),
+                json!({"accept": ["application/json"], "accept-language": ["fr"], "accept-encoding": ["gzip"]}),
                 "terminal refresh must retain the sent negotiation"
             );
             assert_eq!(properties["status"], 200);
@@ -533,7 +533,10 @@ async fn capture_requests() -> (
             }
             requests.push(headers);
             let body = if status == 200 { BODY } else { &[] };
-            let mut response = format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n", body.len());
+            let mut response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
+                body.len()
+            );
             if let Some(etag) = etag {
                 response.push_str(&format!("ETag: {etag}\r\n"));
             }
@@ -556,6 +559,7 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
+        .gzip(true)
         .build()
         .unwrap();
     let headers = effective_request_headers(
@@ -588,7 +592,7 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
     .await
     .unwrap();
     let id = Uuid::parse_str(fetched["id"].as_str().unwrap()).unwrap();
-    let expected = json!({"accept": ["application/json"], "accept-language": ["fr-CA,fr;q=0.8"]});
+    let expected = json!({"accept": ["application/json"], "accept-language": ["fr-CA,fr;q=0.8"], "accept-encoding": ["gzip"]});
     assert_eq!(
         receipt(&runtime, &token, &fetched).await["request_headers"],
         expected,
@@ -638,6 +642,11 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
             headers.get("accept-language"),
             Some(&vec!["fr-CA,fr;q=0.8".to_string()]),
             "refresh must resend fetched Accept-Language"
+        );
+        assert_eq!(
+            headers.get("accept-encoding"),
+            Some(&vec!["gzip".to_string()]),
+            "the built client must send its fixed encoding on fetch and refresh"
         );
     }
     for (request, expected) in requests.iter().zip([
@@ -697,11 +706,12 @@ async fn fetch_and_refresh_receipts_allowlist_metadata() {
     let stored = crate::fetch::stored_negotiation_headers(&properties).unwrap();
     assert_eq!(
         stored.len(),
-        3,
+        4,
         "only negotiation header values are durable"
     );
-    let expected =
-        json!({"accept": ["application/json", "text/plain;q=0.5"], "accept-language": ["en"]});
+    let expected = json!({"accept": ["application/json", "text/plain;q=0.5"], "accept-language": ["en"], "accept-encoding": ["gzip"]});
+    let mut conditional_sent = sent.clone();
+    conditional_sent.push(("If-None-Match".into(), "old-etag".into()));
     let refreshed = settle_refresh_with_request_headers(
         &runtime,
         &token,
@@ -716,7 +726,7 @@ async fn fetch_and_refresh_receipts_allowlist_metadata() {
             body: None,
         },
         &[],
-        &sent,
+        &conditional_sent,
     )
     .await
     .unwrap();
@@ -763,20 +773,19 @@ async fn head_preserves_cached_get_negotiation_and_unnegotiated_get_clears_it() 
     let properties = entity(&runtime, &token, id).await.properties.unwrap();
     assert_eq!(
         crate::fetch::negotiation_headers(&refresh_request_headers(&properties).unwrap()),
-        crate::fetch::negotiation_headers(&original),
+        crate::fetch::recorded_negotiation_headers(&original),
         "HEAD must not replace cached GET negotiation"
     );
     assert_eq!(
         receipt(&runtime, &token, &reply).await["request_headers"],
-        json!({"accept": ["text/html"]})
+        json!({"accept": ["text/html"], "accept-encoding": ["gzip"]})
     );
     seed(&runtime, &token, &url, &[]).await;
     let properties = entity(&runtime, &token, id).await.properties.unwrap();
-    assert!(
-        crate::fetch::stored_negotiation_headers(&properties)
-            .unwrap()
-            .is_empty(),
-        "a later unnegotiated GET must clear stale negotiation"
+    assert_eq!(
+        crate::fetch::stored_negotiation_headers(&properties).unwrap(),
+        vec![("accept-encoding".to_string(), "gzip".to_string())],
+        "a later unnegotiated GET clears caller fields but retains fixed gzip"
     );
 }
 
@@ -903,6 +912,233 @@ async fn overlapping_refresh_keeps_validators_with_the_settled_body() {
     assert_eq!(second_reply["lost_race"], false);
 }
 
+#[tokio::test]
+async fn redirected_refresh_keeps_a_get_written_after_the_terminal_request() {
+    let (runtime, token, _dir) = fixture();
+    let source_url = Url::parse("https://metadata.example/redirect-source").unwrap();
+    let terminal_url = Url::parse("https://metadata.example/redirect-target").unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = seed(&runtime, &token, &terminal_url, &[]).await;
+    let source_before = entity(&runtime, &token, source_id).await;
+    let source_properties = source_before.properties.as_ref().unwrap();
+    let source_ref = source_properties["blob_ref"].as_str().unwrap().to_owned();
+    let request_headers = refresh_request_headers(source_properties).unwrap();
+    let redirect_hops = [crate::fetch::RedirectHop {
+        from: source_url.clone(),
+        to: terminal_url.clone(),
+        status: 302,
+    }];
+
+    let mut older_refresh_headers = response_headers();
+    older_refresh_headers.insert("etag", "older-refresh".parse().unwrap());
+    older_refresh_headers.insert("vary", "Accept".parse().unwrap());
+    older_refresh_headers.insert("content-language", "en".parse().unwrap());
+    let reply = settle_refresh_with_request_headers_before_settlement(
+        &runtime,
+        &token,
+        source_id,
+        source_url.as_str(),
+        &source_ref,
+        HopOutcome {
+            status: 200,
+            final_url: terminal_url.clone(),
+            headers: older_refresh_headers,
+            redirect_to: None,
+            body: Some((BODY.to_vec(), false)),
+        },
+        &redirect_hops,
+        &request_headers,
+        async {
+            let mut newer_get_headers = response_headers();
+            newer_get_headers.insert("etag", "newer-get".parse().unwrap());
+            newer_get_headers.insert("vary", "Accept-Language".parse().unwrap());
+            newer_get_headers.insert("content-language", "fr".parse().unwrap());
+            let fetched = settle_with_request_headers(
+                &runtime,
+                &token,
+                "GET",
+                &terminal_url,
+                200,
+                &newer_get_headers,
+                Some((BODY.to_vec(), false)),
+                &[],
+                true,
+                &[("Accept-Language".to_owned(), "fr".to_owned())],
+            )
+            .await
+            .unwrap();
+            assert_eq!(fetched["id"], terminal_id.to_string());
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reply["lost_race"], true);
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newer-get");
+    assert_eq!(properties["vary"], json!(["Accept-Language"]));
+    assert_eq!(properties["content_language"], "fr");
+    assert_eq!(
+        properties["request_headers"],
+        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+    );
+}
+
+#[tokio::test]
+async fn redirected_refresh_keeps_a_newer_get_body_after_the_terminal_request() {
+    let (runtime, token, _dir) = fixture();
+    let source_url = Url::parse("https://metadata.example/body-race-source").unwrap();
+    let terminal_url = Url::parse("https://metadata.example/body-race-target").unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = seed(&runtime, &token, &terminal_url, &[]).await;
+    let source_before = entity(&runtime, &token, source_id).await;
+    let source_properties = source_before.properties.as_ref().unwrap();
+    let source_ref = source_properties["blob_ref"].as_str().unwrap().to_owned();
+    let request_headers = refresh_request_headers(source_properties).unwrap();
+    let redirect_hops = [crate::fetch::RedirectHop {
+        from: source_url.clone(),
+        to: terminal_url.clone(),
+        status: 302,
+    }];
+
+    let mut older_refresh_headers = response_headers();
+    older_refresh_headers.insert("etag", "older-refresh-body".parse().unwrap());
+    let reply = settle_refresh_with_request_headers_before_settlement(
+        &runtime,
+        &token,
+        source_id,
+        source_url.as_str(),
+        &source_ref,
+        HopOutcome {
+            status: 200,
+            final_url: terminal_url.clone(),
+            headers: older_refresh_headers,
+            redirect_to: None,
+            body: Some((b"older refresh body".to_vec(), false)),
+        },
+        &redirect_hops,
+        &request_headers,
+        async {
+            let mut newer_get_headers = response_headers();
+            newer_get_headers.insert("etag", "newer-get-body".parse().unwrap());
+            let fetched = settle_with_request_headers(
+                &runtime,
+                &token,
+                "GET",
+                &terminal_url,
+                200,
+                &newer_get_headers,
+                Some((b"newer GET body".to_vec(), false)),
+                &[],
+                true,
+                &[("Accept-Language".to_owned(), "fr".to_owned())],
+            )
+            .await
+            .unwrap();
+            assert_eq!(fetched["id"], terminal_id.to_string());
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reply["lost_race"], true);
+    assert_eq!(reply["changed"], false);
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newer-get-body");
+    assert_eq!(
+        properties["request_headers"],
+        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+    );
+    let body_ref =
+        khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
+    let stored_body = crate::blob_store(&runtime)
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(stored_body, b"newer GET body");
+    let audit = receipt(&runtime, &token, &reply).await;
+    assert_eq!(audit["content_ref"], Value::Null);
+}
+
+#[tokio::test]
+async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_request() {
+    let (runtime, token, _dir) = fixture();
+    let source_url = Url::parse("https://metadata.example/new-target-source").unwrap();
+    let terminal_url = Url::parse("https://metadata.example/new-target").unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = document_id_for_url(&terminal_url);
+    assert!(runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(terminal_id)
+        .await
+        .unwrap()
+        .is_none());
+    let source_before = entity(&runtime, &token, source_id).await;
+    let source_properties = source_before.properties.as_ref().unwrap();
+    let source_ref = source_properties["blob_ref"].as_str().unwrap().to_owned();
+    let request_headers = refresh_request_headers(source_properties).unwrap();
+    let redirect_hops = [crate::fetch::RedirectHop {
+        from: source_url.clone(),
+        to: terminal_url.clone(),
+        status: 302,
+    }];
+
+    let reply = settle_refresh_with_request_headers_before_settlement(
+        &runtime,
+        &token,
+        source_id,
+        source_url.as_str(),
+        &source_ref,
+        HopOutcome {
+            status: 200,
+            final_url: terminal_url.clone(),
+            headers: response_headers(),
+            redirect_to: None,
+            body: Some((b"older refresh body".to_vec(), false)),
+        },
+        &redirect_hops,
+        &request_headers,
+        async {
+            let mut newer_get_headers = response_headers();
+            newer_get_headers.insert("etag", "newly-created-get".parse().unwrap());
+            settle_with_request_headers(
+                &runtime,
+                &token,
+                "GET",
+                &terminal_url,
+                200,
+                &newer_get_headers,
+                Some((b"newly-created GET body".to_vec(), false)),
+                &[],
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reply["lost_race"], true);
+    assert_eq!(reply["changed"], false);
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newly-created-get");
+    let body_ref =
+        khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
+    let stored_body = crate::blob_store(&runtime)
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(stored_body, b"newly-created GET body");
+}
+
 // Simulate a fetch paused between its body settlement and negotiation write.
 #[tokio::test]
 async fn overlapping_fetch_keeps_negotiation_with_the_stored_body() {
@@ -938,9 +1174,15 @@ async fn overlapping_fetch_keeps_negotiation_with_the_stored_body() {
     )
     .await
     .unwrap();
-    let stale = crate::fetch::persist_negotiation_headers(&runtime, &token, &first, &first_headers)
-        .await
-        .expect_err("a stale fetch must not write negotiation onto a newer body");
+    let stale = crate::fetch::persist_get_context(
+        &runtime,
+        &token,
+        &first,
+        &first_headers,
+        &response_headers(),
+    )
+    .await
+    .expect_err("a stale fetch must not write context onto a newer body");
     assert_eq!(
         khive_runtime::runtime_error_value(stale, khive_runtime::DomainDisposition::Unknown)
             ["kind"],
@@ -953,7 +1195,855 @@ async fn overlapping_fetch_keeps_negotiation_with_the_stored_body() {
     let sent = refresh_request_headers(&properties).unwrap();
     assert_eq!(
         crate::fetch::negotiation_headers(&sent),
-        crate::fetch::negotiation_headers(&second_headers),
+        crate::fetch::recorded_negotiation_headers(&second_headers),
         "stored negotiation must describe the stored body, not the last metadata-only writer"
     );
+}
+
+#[tokio::test]
+async fn fetch_records_repeated_vary_and_language_while_head_preserves_get_context() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/vary-fetch").unwrap();
+    let sent = vec![
+        ("Accept".to_owned(), "text/plain".to_owned()),
+        ("Accept-Language".to_owned(), "fr-CA".to_owned()),
+    ];
+    let mut headers = response_headers();
+    headers.append("vary", "Accept".parse().unwrap());
+    headers.append("vary", "Accept-Language".parse().unwrap());
+    headers.insert("content-language", "fr-CA".parse().unwrap());
+    let get = settle_with_request_headers(
+        &runtime,
+        &token,
+        "GET",
+        &url,
+        200,
+        &headers,
+        Some((BODY.to_vec(), false)),
+        &[],
+        true,
+        &sent,
+    )
+    .await
+    .unwrap();
+    let id = Uuid::parse_str(get["id"].as_str().unwrap()).unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    assert_eq!(properties["vary"], json!(["Accept", "Accept-Language"]));
+    assert_eq!(properties["content_language"], "fr-CA");
+    let get_receipt = receipt(&runtime, &token, &get).await;
+    assert_eq!(get_receipt["headers"]["vary"], properties["vary"]);
+    assert_eq!(get_receipt["headers"]["content-language"], "fr-CA");
+    assert_eq!(refresh_request_headers(properties).unwrap().len(), 5);
+
+    let mut head_headers = HeaderMap::new();
+    head_headers.insert("vary", "*".parse().unwrap());
+    head_headers.insert("content-language", "en".parse().unwrap());
+    let head = settle_with_request_headers(
+        &runtime,
+        &token,
+        "HEAD",
+        &url,
+        200,
+        &head_headers,
+        None,
+        &[],
+        true,
+        &[("Accept-Language".to_owned(), "en".to_owned())],
+    )
+    .await
+    .unwrap();
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.as_ref().unwrap();
+    assert_eq!(properties["vary"], json!(["Accept", "Accept-Language"]));
+    assert_eq!(properties["content_language"], "fr-CA");
+    assert_eq!(
+        properties["request_headers"],
+        before.properties.unwrap()["request_headers"]
+    );
+    let head_receipt = receipt(&runtime, &token, &head).await;
+    assert_eq!(head_receipt["headers"]["vary"], json!(["*"]));
+    assert_eq!(head_receipt["headers"]["content-language"], "en");
+}
+
+#[test]
+fn vary_gate_requires_every_stored_selector_and_value() {
+    let url = Url::parse("https://metadata.example/vary-gate").unwrap();
+    let base = json!({
+        "url": url.as_str(),
+        "etag": "old-etag",
+        "truncated": false,
+        "request_headers": {
+            "accept": ["text/plain"],
+            "accept-language": ["fr-CA"],
+            "accept-encoding": ["gzip"]
+        }
+    });
+    for (vary, replayable) in [
+        (json!([]), true),
+        (json!(["Accept, Accept-Language"]), true),
+        (json!(["Accept", "Accept-Language"]), true),
+        (json!(["*"]), false),
+        (json!(["Accept-Encoding"]), true),
+        (json!(["Accept,"]), false),
+        (json!([null]), false),
+    ] {
+        let mut properties = base.clone();
+        properties["vary"] = vary;
+        assert_eq!(
+            !conditional_headers_for_hop(&properties, &url, &url, true).is_empty(),
+            replayable,
+            "vary={}",
+            properties["vary"]
+        );
+    }
+    let mut legacy = base.clone();
+    legacy.as_object_mut().unwrap().remove("vary");
+    assert!(conditional_headers_for_hop(&legacy, &url, &url, true).is_empty());
+    let mut missing_map = base.clone();
+    missing_map["vary"] = json!([]);
+    missing_map
+        .as_object_mut()
+        .unwrap()
+        .remove("request_headers");
+    assert!(conditional_headers_for_hop(&missing_map, &url, &url, true).is_empty());
+    let mut malformed_map = base.clone();
+    malformed_map["vary"] = json!([]);
+    malformed_map["request_headers"] = json!("not an object");
+    assert!(conditional_headers_for_hop(&malformed_map, &url, &url, true).is_empty());
+    let mut unknown_map_key = base.clone();
+    unknown_map_key["vary"] = json!([]);
+    unknown_map_key["request_headers"]["user-agent"] = json!(["khive"]);
+    assert!(conditional_headers_for_hop(&unknown_map_key, &url, &url, true).is_empty());
+    let mut invalid_value = base.clone();
+    invalid_value["vary"] = json!(["Accept"]);
+    invalid_value["request_headers"]["accept"] = json!(["text/plain\r\ninvalid"]);
+    assert!(conditional_headers_for_hop(&invalid_value, &url, &url, true).is_empty());
+    let mut missing_encoding = base.clone();
+    missing_encoding["vary"] = json!(["Accept-Encoding"]);
+    missing_encoding["request_headers"]
+        .as_object_mut()
+        .unwrap()
+        .remove("accept-encoding");
+    assert!(conditional_headers_for_hop(&missing_encoding, &url, &url, true).is_empty());
+    let mut wrong_encoding = base.clone();
+    wrong_encoding["vary"] = json!(["Accept-Encoding"]);
+    wrong_encoding["request_headers"]["accept-encoding"] = json!(["identity"]);
+    assert!(conditional_headers_for_hop(&wrong_encoding, &url, &url, true).is_empty());
+    let mut missing = base;
+    missing["vary"] = json!(["Accept-Language"]);
+    missing["request_headers"]["accept-language"] = json!([]);
+    assert!(conditional_headers_for_hop(&missing, &url, &url, true).is_empty());
+}
+
+#[test]
+fn vary_accept_encoding_with_fixed_record_sends_validator() {
+    let url = Url::parse("https://metadata.example/encoding-validator").unwrap();
+    let properties = json!({
+        "url": url.as_str(),
+        "etag": "encoded-etag",
+        "truncated": false,
+        "vary": ["Accept-Encoding"],
+        "request_headers": {"accept-encoding": ["gzip"]}
+    });
+    let sent = refresh_request_headers(&properties).unwrap();
+    assert!(sent
+        .iter()
+        .any(|(name, value)| { name.eq_ignore_ascii_case("accept-encoding") && value == "gzip" }));
+    assert!(sent.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("if-none-match") && value == "encoded-etag"
+    }));
+}
+
+#[tokio::test]
+async fn represented_accept_encoding_on_304_updates_vary() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/encoding-304").unwrap();
+    let id = seed(&runtime, &token, &url, &[]).await;
+    let mut headers = HeaderMap::new();
+    headers.insert("vary", "Accept-Encoding".parse().unwrap());
+    let reply = refresh(&runtime, &token, id, &url, 304, headers, &[]).await;
+    assert_eq!(reply["changed"], false);
+    let after = entity(&runtime, &token, id).await;
+    assert_eq!(
+        after.properties.unwrap()["vary"],
+        json!(["Accept-Encoding"])
+    );
+}
+
+#[tokio::test]
+async fn legacy_map_304_represents_wire_gzip_but_next_refresh_is_unconditional() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/legacy-encoding-304").unwrap();
+    let id = seed(&runtime, &token, &url, &[]).await;
+    crate::entities::patch(
+        &runtime,
+        &token,
+        id,
+        None,
+        json!({"request_headers": {}, "vary": []}),
+    )
+    .await
+    .unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let sent = refresh_request_headers(before.properties.as_ref().unwrap()).unwrap();
+    assert!(sent.iter().any(|(name, _)| name == "If-None-Match"));
+    assert!(!sent
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding")));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("vary", "Accept-Encoding".parse().unwrap());
+    let reply = refresh(&runtime, &token, id, &url, 304, headers, &[]).await;
+    assert_eq!(reply["changed"], false);
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.unwrap();
+    assert_eq!(properties["request_headers"], json!({}));
+    assert_eq!(properties["vary"], json!(["Accept-Encoding"]));
+    assert!(refresh_request_headers(&properties)
+        .unwrap()
+        .iter()
+        .all(|(name, _)| name != "If-None-Match"));
+}
+
+#[test]
+fn response_header_projection_keeps_repeats_and_invalid_vary_visible() {
+    let mut headers = HeaderMap::new();
+    headers.append("vary", "Accept".parse().unwrap());
+    headers.append(
+        "vary",
+        reqwest::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+    headers.append("content-language", "fr".parse().unwrap());
+    headers.append("content-language", "en".parse().unwrap());
+    let projected = crate::fetch::extract_allowed_headers(&headers);
+    assert_eq!(projected["vary"], json!(["Accept", null]));
+    assert_eq!(projected["content-language"], "fr, en");
+    assert!(!vary_is_replayable(
+        &projected["vary"],
+        &[("Accept".to_owned(), "text/plain".to_owned())]
+    ));
+    headers.append(
+        "content-language",
+        reqwest::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+    assert!(crate::fetch::extract_allowed_headers(&headers)["content-language"].is_null());
+}
+
+#[tokio::test]
+async fn malformed_cached_negotiation_stays_unconditional_across_body_refreshes() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/malformed-negotiation").unwrap();
+    let id = seed(
+        &runtime,
+        &token,
+        &url,
+        &[("Accept-Language".to_owned(), "fr".to_owned())],
+    )
+    .await;
+    crate::entities::patch(
+        &runtime,
+        &token,
+        id,
+        None,
+        json!({ "vary": ["Accept-Language"], "request_headers": {"accept-language": "fr"} }),
+    )
+    .await
+    .unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    let sent = refresh_request_headers(properties).unwrap();
+    assert!(
+        sent.is_empty(),
+        "invalid cached negotiation cannot be replayed"
+    );
+    let reply = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        url.as_str(),
+        properties["blob_ref"].as_str().unwrap(),
+        HopOutcome {
+            status: 200,
+            final_url: url.clone(),
+            headers: response_headers(),
+            redirect_to: None,
+            body: Some((BODY.to_vec(), false)),
+        },
+        &[],
+        &sent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["changed"], false);
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.unwrap();
+    assert_eq!(
+        properties["request_headers"],
+        json!({"accept-language": "fr"})
+    );
+    assert_eq!(properties["vary"], json!([]));
+    assert!(refresh_request_headers(&properties).unwrap().is_empty());
+
+    let second = refresh(&runtime, &token, id, &url, 200, response_headers(), &[]).await;
+    assert_eq!(second["changed"], false);
+    let after_second = entity(&runtime, &token, id).await;
+    let properties = after_second.properties.unwrap();
+    assert_eq!(
+        properties["request_headers"],
+        json!({"accept-language": "fr"})
+    );
+    assert_eq!(properties["vary"], json!([]));
+    assert!(refresh_request_headers(&properties).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn same_identity_redirect_does_not_replace_source_negotiation() {
+    let (runtime, token, _dir) = fixture();
+    let source = Url::parse("https://metadata.example/same?z=1&a=2").unwrap();
+    let terminal = Url::parse("https://metadata.example/same?a=2&z=1").unwrap();
+    let id = seed(
+        &runtime,
+        &token,
+        &source,
+        &[("Accept-Language".to_owned(), "fr".to_owned())],
+    )
+    .await;
+    crate::entities::patch(
+        &runtime,
+        &token,
+        id,
+        None,
+        json!({"request_headers": {"accept-language": "fr"}}),
+    )
+    .await
+    .unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    let sent = refresh_request_headers(properties).unwrap();
+    assert!(sent.is_empty(), "malformed source map cannot be replayed");
+
+    let reply = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        source.as_str(),
+        properties["blob_ref"].as_str().unwrap(),
+        HopOutcome {
+            status: 200,
+            final_url: terminal.clone(),
+            headers: response_headers(),
+            redirect_to: None,
+            body: Some((BODY.to_vec(), false)),
+        },
+        &[crate::fetch::RedirectHop {
+            from: source.clone(),
+            to: terminal,
+            status: 302,
+        }],
+        &sent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["final_id"], id.to_string());
+    let after = entity(&runtime, &token, id).await;
+    assert_eq!(
+        after.properties.as_ref().unwrap()["request_headers"],
+        json!({"accept-language": "fr"}),
+        "a same-identity redirect still addresses the source row"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_get_keeps_its_negotiation_after_same_body_refresh() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/refresh-get-overlap").unwrap();
+    let id = seed(
+        &runtime,
+        &token,
+        &url,
+        &[("Accept-Language".to_owned(), "fr".to_owned())],
+    )
+    .await;
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    let original_ref = properties["blob_ref"].as_str().unwrap().to_owned();
+    let sent = refresh_request_headers(properties).unwrap();
+
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let refresh_runtime = runtime.clone();
+    let refresh_token = token.clone();
+    let refresh_url = url.clone();
+    let paused = tokio::spawn(async move {
+        settle_refresh_with_request_headers_after_body_settlement(
+            &refresh_runtime,
+            &refresh_token,
+            id,
+            refresh_url.as_str(),
+            &original_ref,
+            HopOutcome {
+                status: 200,
+                final_url: refresh_url.clone(),
+                headers: response_headers(),
+                redirect_to: None,
+                body: Some((BODY.to_vec(), false)),
+            },
+            &[],
+            &sent,
+            async move {
+                settled_tx
+                    .send(())
+                    .expect("GET waits for refresh settlement");
+                resume_rx.await.expect("resume paused refresh");
+            },
+        )
+        .await
+    });
+    settled_rx.await.expect("refresh body settled");
+
+    settle_with_request_headers(
+        &runtime,
+        &token,
+        "GET",
+        &url,
+        200,
+        &response_headers(),
+        Some((BODY.to_vec(), false)),
+        &[],
+        true,
+        &[("Accept-Language".to_owned(), "en".to_owned())],
+    )
+    .await
+    .expect("later caller GET");
+    let after_get = entity(&runtime, &token, id).await;
+    assert_eq!(
+        after_get.properties.as_ref().unwrap()["request_headers"],
+        json!({"accept-language": ["en"], "accept-encoding": ["gzip"]})
+    );
+    assert_eq!(
+        after_get.properties.as_ref().unwrap()["blob_ref"],
+        properties["blob_ref"],
+        "the GET has the same body so the refresh metadata guard still matches"
+    );
+
+    resume_tx.send(()).expect("release refresh");
+    paused.await.unwrap().unwrap();
+    let final_entity = entity(&runtime, &token, id).await;
+    assert_eq!(
+        final_entity.properties.unwrap()["request_headers"],
+        json!({"accept-language": ["en"], "accept-encoding": ["gzip"]}),
+        "A5 allows only the caller's GET to replace stored negotiation"
+    );
+}
+
+#[tokio::test]
+async fn refresh_replaces_vary_and_language_on_200_but_304_updates_only_supplied() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/vary-refresh").unwrap();
+    let sent = vec![("Accept-Language".to_owned(), "fr-CA".to_owned())];
+    let mut initial = response_headers();
+    initial.insert("vary", "Accept-Language".parse().unwrap());
+    initial.insert("content-language", "fr-CA".parse().unwrap());
+    let get = settle_with_request_headers(
+        &runtime,
+        &token,
+        "GET",
+        &url,
+        200,
+        &initial,
+        Some((BODY.to_vec(), false)),
+        &[],
+        true,
+        &sent,
+    )
+    .await
+    .unwrap();
+    let id = Uuid::parse_str(get["id"].as_str().unwrap()).unwrap();
+    let full = refresh(&runtime, &token, id, &url, 200, response_headers(), &[]).await;
+    let after_full = entity(&runtime, &token, id).await;
+    let properties = after_full.properties.as_ref().unwrap();
+    assert_eq!(properties["vary"], json!([]));
+    assert!(properties["content_language"].is_null());
+    assert!(receipt(&runtime, &token, &full).await["headers"]
+        .get("vary")
+        .is_none());
+
+    let mut validation = HeaderMap::new();
+    validation.insert("vary", "Accept-Language".parse().unwrap());
+    validation.insert("content-language", "de".parse().unwrap());
+    let fresh = refresh(&runtime, &token, id, &url, 304, validation, &[]).await;
+    let after_fresh = entity(&runtime, &token, id).await;
+    let properties = after_fresh.properties.as_ref().unwrap();
+    assert_eq!(properties["vary"], json!(["Accept-Language"]));
+    assert_eq!(properties["content_language"], "de");
+    assert_eq!(fresh["changed"], false);
+    let unchanged = refresh(&runtime, &token, id, &url, 304, HeaderMap::new(), &[]).await;
+    let after_unchanged = entity(&runtime, &token, id).await;
+    let properties = after_unchanged.properties.unwrap();
+    assert_eq!(properties["vary"], json!(["Accept-Language"]));
+    assert_eq!(properties["content_language"], "de");
+    assert_eq!(receipt(&runtime, &token, &unchanged).await["status"], 304);
+}
+
+#[tokio::test]
+async fn changed_body_refresh_rebinds_response_selection_context() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/changed-vary").unwrap();
+    let sent = vec![("Accept-Language".to_owned(), "fr".to_owned())];
+    let mut initial = response_headers();
+    initial.insert("vary", "Accept-Language".parse().unwrap());
+    initial.insert("content-language", "fr".parse().unwrap());
+    let get = settle_with_request_headers(
+        &runtime,
+        &token,
+        "GET",
+        &url,
+        200,
+        &initial,
+        Some((BODY.to_vec(), false)),
+        &[],
+        true,
+        &sent,
+    )
+    .await
+    .unwrap();
+    let id = Uuid::parse_str(get["id"].as_str().unwrap()).unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let request_headers = refresh_request_headers(before.properties.as_ref().unwrap()).unwrap();
+    let reply = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        url.as_str(),
+        before.properties.as_ref().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap(),
+        HopOutcome {
+            status: 200,
+            final_url: url.clone(),
+            headers: response_headers(),
+            redirect_to: None,
+            body: Some((b"different representation".to_vec(), false)),
+        },
+        &[],
+        &request_headers,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["changed"], true);
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.as_ref().unwrap();
+    assert_ne!(
+        properties["blob_ref"],
+        before.properties.as_ref().unwrap()["blob_ref"]
+    );
+    assert_eq!(properties["vary"], json!([]));
+    assert!(properties["content_language"].is_null());
+    assert_eq!(
+        properties["request_headers"],
+        before.properties.unwrap()["request_headers"]
+    );
+}
+
+#[tokio::test]
+async fn unsolicited_or_unrepresented_304_refuses_before_any_write() {
+    for case in [
+        "no-validator",
+        "unknown-vary",
+        "repeated-vary",
+        "invalid-utf8",
+    ] {
+        let (runtime, token, _dir) = fixture();
+        let url = Url::parse("https://metadata.example/vary-304-refusal").unwrap();
+        let sent = vec![("Accept-Language".to_owned(), "fr".to_owned())];
+        let mut initial = response_headers();
+        initial.insert("vary", "Accept-Language".parse().unwrap());
+        let get = settle_with_request_headers(
+            &runtime,
+            &token,
+            "GET",
+            &url,
+            200,
+            &initial,
+            Some((BODY.to_vec(), false)),
+            &[],
+            true,
+            &sent,
+        )
+        .await
+        .unwrap();
+        let id = Uuid::parse_str(get["id"].as_str().unwrap()).unwrap();
+        let before = entity(&runtime, &token, id).await;
+        let before_notes = runtime
+            .notes(&token)
+            .unwrap()
+            .count_notes(token.namespace().as_str(), None)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        match case {
+            "unknown-vary" => {
+                headers.insert("vary", "X-Variant".parse().unwrap());
+            }
+            "repeated-vary" => {
+                headers.append("vary", "Accept-Language".parse().unwrap());
+                headers.append("vary", "User-Agent".parse().unwrap());
+            }
+            "invalid-utf8" => {
+                headers.insert(
+                    "vary",
+                    reqwest::header::HeaderValue::from_bytes(b"Accept-Language,\xff").unwrap(),
+                );
+            }
+            _ => {}
+        }
+        let request_headers = if case == "no-validator" {
+            sent.clone()
+        } else {
+            refresh_request_headers(before.properties.as_ref().unwrap()).unwrap()
+        };
+        let error = settle_refresh_with_request_headers(
+            &runtime,
+            &token,
+            id,
+            url.as_str(),
+            before.properties.as_ref().unwrap()["blob_ref"]
+                .as_str()
+                .unwrap(),
+            HopOutcome {
+                status: 304,
+                final_url: url.clone(),
+                headers,
+                redirect_to: None,
+                body: None,
+            },
+            &[],
+            &request_headers,
+        )
+        .await
+        .expect_err("an unvalidated representation must not accept 304 metadata");
+        assert!(
+            error.to_string().contains(if case == "no-validator" {
+                "unsolicited_not_modified"
+            } else {
+                "unrepresented_vary"
+            }),
+            "case={case}: {error}"
+        );
+        assert_eq!(
+            serde_json::to_value(entity(&runtime, &token, id).await).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "case={case}"
+        );
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .count_notes(token.namespace().as_str(), None)
+                .await
+                .unwrap(),
+            before_notes,
+            "case={case}"
+        );
+    }
+}
+
+mod refresh_revision_tests {
+    use super::*;
+
+    const NEUTRAL_BODY: &[u8] = br#"{"message":"neutral"}"#;
+
+    async fn put_variant(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        url: &Url,
+        language: &str,
+        etag: &str,
+        body: &[u8],
+    ) -> Value {
+        let mut response = HeaderMap::new();
+        response.insert("content-type", "application/json".parse().unwrap());
+        response.insert("etag", etag.parse().unwrap());
+        let sent = vec![("Accept-Language".to_owned(), language.to_owned())];
+        settle_with_request_headers(
+            runtime,
+            token,
+            "GET",
+            url,
+            200,
+            &response,
+            Some((body.to_vec(), false)),
+            &[],
+            true,
+            &sent,
+        )
+        .await
+        .expect("synthetic persisted GET must settle")
+    }
+
+    fn assert_winner(row: &Entity, language: &str, expected_ref: &str) {
+        let properties = row.properties.as_ref().unwrap();
+        assert_eq!(properties["blob_ref"], expected_ref);
+        assert_eq!(row.content_ref.as_deref(), Some(expected_ref));
+        assert_eq!(
+            properties["request_headers"],
+            json!({"accept-language": [language], "accept-encoding": ["gzip"]}),
+            "a refresh must not replace the later caller-issued GET negotiation"
+        );
+        assert_eq!(
+            properties["etag"], "\"get-b\"",
+            "an old validation response must not replace the winner's validator"
+        );
+        assert_eq!(properties["content_type"], "application/json");
+        assert_eq!(properties["truncated"], false);
+        assert_eq!(properties["status"], 200);
+    }
+
+    async fn late_response_case(
+        status: u16,
+        supplies_metadata: bool,
+        publish_b_after_body_phase: bool,
+        winner_language: &str,
+    ) {
+        let (runtime, token, _dir) = fixture();
+        let url = Url::parse("https://review.example/same-bytes").unwrap();
+        let first = put_variant(&runtime, &token, &url, "fr", "\"get-a\"", NEUTRAL_BODY).await;
+        let id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+        let before = entity(&runtime, &token, id).await;
+        let old = before.properties.as_ref().unwrap();
+        let expected_ref = old["blob_ref"].as_str().unwrap().to_owned();
+        let captured_request = refresh_request_headers(old).unwrap();
+
+        if !publish_b_after_body_phase {
+            let second = put_variant(
+                &runtime,
+                &token,
+                &url,
+                winner_language,
+                "\"get-b\"",
+                NEUTRAL_BODY,
+            )
+            .await;
+            assert_eq!(
+                second["content_ref"], expected_ref,
+                "identical byte precondition"
+            );
+            assert_winner(
+                &entity(&runtime, &token, id).await,
+                winner_language,
+                &expected_ref,
+            );
+        }
+
+        let mut response = HeaderMap::new();
+        if supplies_metadata {
+            // A normal old response: its entity tag matches A's request,
+            // not the later GET's validator. It need not describe new bytes.
+            response.insert("etag", "\"get-a\"".parse().unwrap());
+            if status != 304 {
+                response.insert("content-type", "text/plain".parse().unwrap());
+            }
+        }
+        let outcome = HopOutcome {
+            status,
+            final_url: url.clone(),
+            headers: response,
+            redirect_to: None,
+            body: if status == 304 {
+                None
+            } else {
+                Some((NEUTRAL_BODY.to_vec(), false))
+            },
+        };
+        let result = settle_refresh_from_snapshot(
+            &runtime,
+            &token,
+            &before,
+            None,
+            id,
+            url.as_str(),
+            &expected_ref,
+            outcome,
+            &[],
+            &captured_request,
+            async {
+                if publish_b_after_body_phase {
+                    let second = put_variant(
+                        &runtime,
+                        &token,
+                        &url,
+                        winner_language,
+                        "\"get-b\"",
+                        NEUTRAL_BODY,
+                    )
+                    .await;
+                    assert_eq!(second["content_ref"], expected_ref);
+                    assert_winner(
+                        &entity(&runtime, &token, id).await,
+                        winner_language,
+                        &expected_ref,
+                    );
+                }
+            },
+        )
+        .await;
+
+        // Check state even when an implementation chooses a typed refusal.
+        assert_winner(
+            &entity(&runtime, &token, id).await,
+            winner_language,
+            &expected_ref,
+        );
+        match result {
+            Ok(reply) => {
+                assert_eq!(reply["lost_race"], true);
+                let audit = receipt(&runtime, &token, &reply).await;
+                assert_eq!(audit["lost_race"], true);
+                assert_eq!(
+                    audit["request_headers"],
+                    json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]}),
+                    "receipt must report A's actual request, not B's saved context"
+                );
+            }
+            Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
+            }
+            Err(error) => {
+                // A repair may choose a named pre-settlement refusal instead.
+                let text = error.to_string();
+                assert!(
+                    text.contains("cached_representation_changed")
+                        || text.contains("cached_body_changed"),
+                    "unrelated setup/storage errors are not a successful refusal: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_304_cannot_restore_old_get_context_for_equal_bytes() {
+        late_response_case(304, true, false, "en").await;
+    }
+
+    #[tokio::test]
+    async fn headerless_304_cannot_rewrite_get_owned_negotiation() {
+        // No replacement headers still cannot validate against a stale row.
+        late_response_case(304, false, false, "en").await;
+    }
+
+    #[tokio::test]
+    async fn stale_same_body_200_cannot_restore_old_get_context() {
+        late_response_case(200, true, false, "en").await;
+    }
+
+    #[tokio::test]
+    async fn same_body_get_between_settlement_and_metadata_is_detected() {
+        late_response_case(304, true, true, "en").await;
+    }
+
+    #[tokio::test]
+    async fn same_negotiation_but_new_validator_still_needs_a_revision_fence() {
+        // Identical negotiation does not make the old validator current.
+        late_response_case(304, true, false, "fr").await;
+    }
 }

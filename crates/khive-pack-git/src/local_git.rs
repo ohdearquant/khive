@@ -57,7 +57,11 @@ fn filter_overrides(program: &Path, repo: &Path) -> Vec<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(output) = command.output() else {
+    let Ok(output) = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .and_then(|child| child.wait_with_output()) else {
         return Vec::new();
     };
     let mut drivers: Vec<String> = Vec::new();
@@ -300,9 +304,11 @@ fn run_git_output(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|_| LocalGitError::new("git_spawn", format!("could not start git {operation}")))?;
+    let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .map_err(|_| LocalGitError::new("git_spawn", format!("could not start git {operation}")))?;
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
     let stdin = child.stdin.take();

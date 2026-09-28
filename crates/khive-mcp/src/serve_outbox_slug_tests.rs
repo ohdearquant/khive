@@ -4,10 +4,12 @@ use khive_channel::ChannelRegistry;
 
 async fn pass(runtime: &KhiveRuntime, registry: &ChannelRegistry, kind: &str, slug: &str) {
     let allowlist = vec!["recipient@example.com".to_string()];
+    let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(slug, "")
+        .expect("fixture mailbox domain");
     let policy = if kind == "email" {
         outbox::OutboxPolicy::Email {
             mailbox: slug,
-            domain: "example.com",
+            domains: &domains,
             allowlist: &allowlist,
         }
     } else {
@@ -77,6 +79,14 @@ async fn exact_slug_isolates_both_kinds() {
         );
         assert_eq!(props(&runtime, &token, id_b).await["delivery"], "delivered");
         if kind == "email" {
+            assert_eq!(
+                props(&runtime, &token, id_a).await["external_id"],
+                format!("<{id_a}@example.com>")
+            );
+            assert_eq!(
+                props(&runtime, &token, id_b).await["external_id"],
+                format!("<{id_b}@example.com>")
+            );
             assert_eq!(a.sent.lock().unwrap()[0]["from"], "email:a@example.com");
             assert_eq!(b.sent.lock().unwrap()[0]["from"], "email:b@example.com");
         }

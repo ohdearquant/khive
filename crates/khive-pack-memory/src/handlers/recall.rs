@@ -5665,6 +5665,7 @@ mod tests {
     const NS733_ANN_MODEL: &str = "ns733-ann-namespace-model";
     const NS733_QUERY: &str = "ns733 ann overfetch query";
     const NS733_TARGET_CONTENT: &str = "ns733 ann overfetch bench target";
+    const NS733_INCREMENTAL_CONTENT: &str = "ns733 ann overfetch incremental local filler";
     const NS733_FILLER_COUNT: usize = 35;
 
     /// Fixed vectors place the bench-a target deterministically behind all local fillers.
@@ -5684,7 +5685,17 @@ mod tests {
             NS733_TARGET_CONTENT.to_string(),
             vec![0.5, 0.8660254, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
+        m.insert(
+            NS733_INCREMENTAL_CONTENT.to_string(),
+            vec![0.9, 0.4358899, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
         m
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Ns733NamespaceMetadata {
+        Exact,
+        ConservativelyEmpty,
     }
 
     /// Widening finds only the bench-a target; disabling widening leaves it unreachable.
@@ -5693,6 +5704,18 @@ mod tests {
     #[serial(background_tasks)]
     #[serial_test::serial(config_ledger)]
     async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
+        assert_ns733_overfetch_with_namespace_metadata(Ns733NamespaceMetadata::Exact).await;
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn ns733_recall_ann_overfetch_retries_with_current_empty_namespace_metadata() {
+        assert_ns733_overfetch_with_namespace_metadata(Ns733NamespaceMetadata::ConservativelyEmpty)
+            .await;
+    }
+
+    async fn assert_ns733_overfetch_with_namespace_metadata(metadata: Ns733NamespaceMetadata) {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733_ANN_MODEL.to_string(),
@@ -5703,6 +5726,11 @@ mod tests {
         builder.register(KgPack::new(rt.clone()));
         let memory_pack = MemoryPack::new(rt.clone());
         let ann = memory_pack.ann_for_test();
+        let ann_key = crate::ann::AnnKey::from_token(NS733_ANN_MODEL);
+        // Remember queues background warms. Keep them behind the model lock
+        // until every seed has landed, so the first build scans one complete
+        // corpus and can prove the exact namespace metadata it learned.
+        let seed_warm_guard = crate::ann::hold_model_warm_lock_for_test(&ann, &ann_key).await;
         builder.register(memory_pack);
         let registry = builder.build().expect("registry");
 
@@ -5735,6 +5763,7 @@ mod tests {
             .expect("id")
             .parse::<Uuid>()
             .expect("valid uuid");
+        drop(seed_warm_guard);
 
         // Establish readiness from this test's own ANN state rather than inferring it
         // from a successful recall. The fresh-tail leg can surface the newest target
@@ -5742,7 +5771,6 @@ mod tests {
         // one-round assertion observe a different engine state under load. The
         // single-flight ensure installs the complete seeded generation, and the idle
         // barrier drains any fire-and-forget warm started by `memory.remember`.
-        let ann_key = crate::ann::AnnKey::from_token(NS733_ANN_MODEL);
         let local_token = rt
             .authorize(Namespace::local())
             .expect("authorize local for deterministic ANN warm");
@@ -5757,7 +5785,47 @@ mod tests {
         assert_eq!(
             crate::ann::index_namespace_set(&ann, &ann_key).await,
             Some(HashSet::from(["local".to_string(), "bench-a".to_string()])),
-            "the installed graph must contain both namespaces before overfetch assertions"
+            "the full corpus warm must record both namespaces exactly"
+        );
+
+        // The exact branch keeps that full-build metadata. The other branch
+        // adds one later note and forces incremental maintenance, which clears
+        // namespace metadata while keeping the bridge current. Both branches
+        // must then exercise the same overfetch assertions below.
+        let expected_namespace_set = match metadata {
+            Ns733NamespaceMetadata::Exact => {
+                Some(HashSet::from(["local".to_string(), "bench-a".to_string()]))
+            }
+            Ns733NamespaceMetadata::ConservativelyEmpty => {
+                let incremental_guard =
+                    crate::ann::hold_model_warm_lock_for_test(&ann, &ann_key).await;
+                registry
+                    .dispatch(
+                        "memory.remember",
+                        serde_json::json!({
+                            "content": NS733_INCREMENTAL_CONTENT,
+                            "memory_type": "semantic",
+                            "namespace": "local",
+                        }),
+                    )
+                    .await
+                    .expect("remember one incremental local filler");
+                drop(incremental_guard);
+                crate::ann::ensure_ann_for_model(&rt, &local_token, &ann, NS733_ANN_MODEL)
+                    .await
+                    .expect("apply the one-note incremental ANN tail");
+                crate::ann::wait_until_warm_idle(&ann, &ann_key).await;
+                Some(HashSet::new())
+            }
+        };
+        assert!(
+            crate::ann::is_current(&ann, &ann_key).await,
+            "{metadata:?} branch must cover its final write"
+        );
+        assert_eq!(
+            crate::ann::index_namespace_set(&ann, &ann_key).await,
+            expected_namespace_set,
+            "{metadata:?} branch must retain its expected namespace metadata"
         );
 
         let base_params = serde_json::json!({
@@ -5765,20 +5833,20 @@ mod tests {
             "namespace": "bench-a",
             "fusion_strategy": "vector_only",
             "embedding_model": NS733_ANN_MODEL,
-            "config": { "candidate_limit": 1 },
+            "config": { "candidate_limit": 1, "ann_overfetch_max_rounds": 2 },
             "limit": 1,
         });
 
-        // Case 1: default widening — the target must be found, and only the target.
+        // Case 1: two rounds of widening — the target must be found, and only the target.
         let widened_result = registry
             .dispatch("memory.recall", base_params.clone())
             .await
-            .expect("memory.recall with default widening");
+            .expect("memory.recall with two widening rounds");
         let widened_hits = widened_result.as_array().expect("bare array result");
         assert_eq!(
             widened_hits.len(),
             1,
-            "default widening must surface exactly the bench-a target, got: {widened_hits:?}"
+            "two widening rounds must surface exactly the bench-a target, got: {widened_hits:?}"
         );
         assert_eq!(
             widened_hits[0]["id"]
