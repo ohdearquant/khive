@@ -36,8 +36,9 @@ fn min_max_normalize_source<Id>(
 
 /// Fuse per-source min-max-normalized scores with lossy normalized weights.
 ///
-/// Negative/non-finite weights become zero and all-zero input becomes equal weights. Results sort
-/// by descending score, breaking ties by ascending ID. See
+/// Negative/non-finite weights become zero; a zero or overflowing effective sum gives equal
+/// weight to covered source positions, or to all sources when no weights are provided. Results
+/// sort by descending score, breaking ties by ascending ID. See
 /// `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
@@ -57,8 +58,15 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     let active_count = sources.len().min(sanitized.len());
     let weight_sum: f64 = sanitized[..active_count].iter().sum();
 
-    let normalized: Vec<f64> = if weight_sum <= 0.0 {
-        vec![1.0 / sources.len() as f64; sources.len()]
+    let normalized: Vec<f64> = if !weight_sum.is_finite() || weight_sum <= 0.0 {
+        let fallback_count = if active_count == 0 {
+            sources.len()
+        } else {
+            active_count
+        };
+        let mut equal_weights = vec![0.0; sources.len()];
+        equal_weights[..fallback_count].fill(1.0 / fallback_count as f64);
+        equal_weights
     } else {
         (0..sources.len())
             .map(|i| sanitized.get(i).map(|&w| w / weight_sum).unwrap_or(0.0))
@@ -203,6 +211,73 @@ mod tests {
         let fused = weighted_fusion(vec![source1, source2], &[0.0, 0.0]);
 
         assert!((fused[0].1.to_f64() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_weighted_fusion_overflow_sum_falls_back_to_equal_weights() {
+        let source1 = make_results(vec![("doc_a", 1.0)]);
+        let source2 = make_results(vec![("doc_b", 1.0)]);
+
+        let fused = weighted_fusion(vec![source1, source2], &[f64::MAX, f64::MAX]);
+
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].0, "doc_a");
+        assert_eq!(fused[1].0, "doc_b");
+        assert!((fused[0].1.to_f64() - 0.5).abs() < 1e-10);
+        assert_eq!(fused[0].1, fused[1].1);
+    }
+
+    #[test]
+    fn test_weighted_fusion_overflow_fallback_excludes_unweighted_source() {
+        let sources = vec![
+            make_results(vec![("doc_a", 1.0)]),
+            make_results(vec![("doc_b", 1.0)]),
+            make_results(vec![("doc_c", 1.0)]),
+        ];
+
+        let fused = weighted_fusion(sources, &[f64::MAX, f64::MAX]);
+
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].0, "doc_a");
+        assert_eq!(fused[1].0, "doc_b");
+        assert!((fused[0].1.to_f64() - 0.5).abs() < 1e-10);
+        assert_eq!(fused[0].1, fused[1].1);
+    }
+
+    #[test]
+    fn test_weighted_fusion_zero_fallback_excludes_unweighted_source() {
+        let sources = vec![
+            make_results(vec![("doc_a", 1.0)]),
+            make_results(vec![("doc_b", 1.0)]),
+            make_results(vec![("doc_c", 1.0)]),
+        ];
+
+        let fused = weighted_fusion(sources, &[0.0, 0.0]);
+
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].0, "doc_a");
+        assert_eq!(fused[1].0, "doc_b");
+        assert!((fused[0].1.to_f64() - 0.5).abs() < 1e-10);
+        assert_eq!(fused[0].1, fused[1].1);
+    }
+
+    #[test]
+    fn test_weighted_fusion_empty_weights_fallback_includes_all_sources() {
+        let sources = vec![
+            make_results(vec![("doc_a", 1.0)]),
+            make_results(vec![("doc_b", 1.0)]),
+            make_results(vec![("doc_c", 1.0)]),
+        ];
+
+        let fused = weighted_fusion(sources, &[]);
+
+        assert_eq!(fused.len(), 3);
+        assert_eq!(fused[0].0, "doc_a");
+        assert_eq!(fused[1].0, "doc_b");
+        assert_eq!(fused[2].0, "doc_c");
+        assert!((fused[0].1.to_f64() - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(fused[0].1, fused[1].1);
+        assert_eq!(fused[1].1, fused[2].1);
     }
 
     #[test]

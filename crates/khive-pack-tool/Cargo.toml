@@ -12,9 +12,9 @@ categories.workspace = true
 description = "Tool registry pack - discover tools, skills, plugins and verbs; request and grant tool-use approval; tooling policy"
 
 [dependencies]
-khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
+khive-storage = { version = "0.9.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -26,6 +26,6 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["fault-injection"] }
-khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
-khive-db = { version = "0.8.0", path = "../khive-db" }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["fault-injection"] }
+khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-db = { version = "0.9.0", path = "../khive-db" }

@@ -14,7 +14,52 @@ use khive_storage::{
 };
 use khive_types::{EventKind, Namespace};
 use serde_json::json;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+// The backend-routing suite exhausts the measured 256-fd test host only when fixtures overlap.
+#[cfg(unix)]
+const LOW_NOFILE_CEILING: u64 = 256;
+const HIGH_NOFILE_FIXTURES: usize = 16;
+static FIXTURE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[cfg(unix)]
+fn fixture_budget(soft_nofile: u64) -> usize {
+    if soft_nofile <= LOW_NOFILE_CEILING {
+        1
+    } else {
+        HIGH_NOFILE_FIXTURES
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_budget_serializes_at_the_measured_nofile_limit() {
+    assert_eq!(fixture_budget(256), 1);
+    assert_eq!(fixture_budget(257), HIGH_NOFILE_FIXTURES);
+}
+
+fn fixture_limit() -> usize {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return 1;
+        }
+        fixture_budget(limit.rlim_cur)
+    }
+    #[cfg(not(unix))]
+    {
+        HIGH_NOFILE_FIXTURES
+    }
+}
 
 fn config(root: &Path, backend: &str) -> RuntimeConfig {
     RuntimeConfig {
@@ -30,7 +75,8 @@ fn config(root: &Path, backend: &str) -> RuntimeConfig {
 }
 
 fn migrated_backend(path: &Path) -> Arc<StorageBackend> {
-    let backend = StorageBackend::sqlite(path).unwrap();
+    let backend = StorageBackend::sqlite_with_max_readers(path, Some(2)).unwrap();
+    assert_eq!(backend.pool().max_readers(), 2);
     {
         let mut writer = backend.pool().try_writer().unwrap();
         khive_db::run_migrations(writer.conn_mut()).unwrap();
@@ -62,10 +108,16 @@ struct Fixture {
     main: KhiveRuntime,
     routed: KhiveRuntime,
     registry: VerbRegistry,
+    // Rust drops fields in declaration order; release this after the file-backed stores.
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    async fn new() -> Self {
+        let permits = FIXTURE_PERMITS
+            .get_or_init(|| Arc::new(Semaphore::new(fixture_limit())))
+            .clone();
+        let permit = permits.acquire_owned().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let tree = dir.path().canonicalize().unwrap().join("served");
         std::fs::create_dir(&tree).unwrap();
@@ -94,6 +146,7 @@ impl Fixture {
             main,
             routed,
             registry,
+            _permit: permit,
         }
     }
 
@@ -146,7 +199,7 @@ async fn fetched_entities(runtime: &KhiveRuntime) -> Vec<Entity> {
 // Must fail if the core pointer is absent, roots move to web, or records move to main.
 #[tokio::test]
 async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     assert_ne!(fixture.main.backend_id(), fixture.routed.backend_id());
     assert_eq!(
@@ -245,7 +298,7 @@ async fn a9_web_pack_scoped_backend_routes_records_and_attachments() {
 // routed database, or creates a second root when extraction is retried.
 #[tokio::test]
 async fn routed_extract_roots_derived_text_in_main_backend_once() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let page = fetched_entities(&fixture.routed)
         .await
@@ -310,7 +363,7 @@ async fn routed_extract_roots_derived_text_in_main_backend_once() {
 
 #[tokio::test]
 async fn a9_control_web_pack_without_binding_writes_to_default_backend() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     let shared = &fixture.main;
     let registry = registry(shared, shared);
     registry
@@ -355,7 +408,7 @@ async fn a9_control_web_pack_without_binding_writes_to_default_backend() {
 // Must fail if cleanup is omitted, soft deletion unroots the body, or routing stays on main.
 #[tokio::test]
 async fn routed_hard_delete_removes_main_attachments_after_record_commit() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let token = fixture.main.authorize(Namespace::local()).unwrap();
     let documents = fetched_entities(&fixture.routed).await;
@@ -409,7 +462,7 @@ async fn routed_hard_delete_removes_main_attachments_after_record_commit() {
 #[tokio::test]
 async fn routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments() {
     for fail_core in [false, true] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         fixture.ingest().await;
         let entity = fetched_entities(&fixture.routed)
             .await
@@ -517,7 +570,7 @@ async fn routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments()
 
 #[tokio::test]
 async fn routed_delete_cleanup_retry_keeps_indexes_and_event_consistent() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let entity = fetched_entities(&fixture.routed)
         .await
@@ -672,7 +725,7 @@ async fn entity_deleted_event_count(
 #[tokio::test]
 async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
     for explicit_kind in [false, true] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         fixture.ingest().await;
         let entity = fetched_entities(&fixture.routed)
             .await
@@ -769,7 +822,7 @@ async fn routed_delete_retry_does_not_claim_failed_event_append_completed() {
 // Deletion must retain kind guards and attribute the caller without filtering record ownership.
 #[tokio::test]
 async fn routed_delete_preserves_kind_guards_and_namespace_agnostic_lookup() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let entity = fetched_entities(&fixture.routed)
         .await
@@ -850,7 +903,7 @@ async fn routed_delete_preserves_kind_guards_and_namespace_agnostic_lookup() {
 
 #[tokio::test]
 async fn routed_delete_refuses_duplicate_entity_ids_without_removing_body_roots() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let entity = fetched_entities(&fixture.routed)
         .await
@@ -895,7 +948,7 @@ async fn routed_delete_refuses_duplicate_entity_ids_without_removing_body_roots(
 
 #[tokio::test]
 async fn routed_delete_refuses_live_entity_with_duplicate_tombstone() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let entity = fetched_entities(&fixture.routed)
         .await
@@ -963,7 +1016,7 @@ async fn routed_delete_refuses_live_entity_with_duplicate_tombstone() {
 
 #[tokio::test]
 async fn direct_routed_delete_preserves_root_of_other_live_owner() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().await;
     fixture.ingest().await;
     let entity = fetched_entities(&fixture.routed)
         .await

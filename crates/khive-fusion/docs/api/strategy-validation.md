@@ -10,9 +10,11 @@ bypass the public builders through JSON.
 
 ## Weighted fusion
 
-`try_weighted(weights)` rejects NaN and infinity, distinguishing the two error variants and naming
-the offending index. It preserves finite negative values for the execution layer, which treats them
-as zero. `weighted` panics on non-finite input and is intended for trusted literals.
+`try_weighted(weights)` rejects NaN and infinity with distinct error variants. It preserves finite
+negative values for the execution layer, which treats them as zero. Finite individual weights are
+accepted even when their positive sum would overflow; execution then gives equal weight only to
+source positions covered by the supplied weights. An empty weight list covers all sources for this
+fallback. `weighted` panics on non-finite input and is intended for trusted literals.
 
 ## Union and custom strategies
 

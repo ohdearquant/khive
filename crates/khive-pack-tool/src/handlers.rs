@@ -10,7 +10,7 @@ use khive_runtime::{
     VerbRegistry,
 };
 use khive_storage::types::Direction;
-use khive_storage::{Entity, EntityFilter};
+use khive_storage::{Entity, EntityFilter, StorageCapability, StorageError};
 use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
@@ -154,17 +154,20 @@ fn side_effect_of(e: &Entity) -> Option<String> {
 async fn registry_entities(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
+    kind: Option<&str>,
     limit: u32,
     offset: u32,
 ) -> Result<Vec<Entity>, RuntimeError> {
-    rt.list_entities_tagged(
-        token,
-        Some(REGISTRY_ENTITY_KIND),
-        Some(REGISTRY_TAG),
-        limit,
-        offset,
-    )
-    .await
+    let filter = EntityFilter {
+        kinds: vec![REGISTRY_ENTITY_KIND.into()],
+        entity_types: kind
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+        tags_any: vec![REGISTRY_TAG.into()],
+        ..Default::default()
+    };
+    rt.list_entities_filtered(token, filter, limit, offset)
+        .await
 }
 
 async fn find_by_name(
@@ -291,6 +294,17 @@ fn derived_registry_id(seed: &str, namespace: &str, name: &str) -> Uuid {
     Uuid::new_v5(&pack_seed, &key)
 }
 
+fn is_duplicate_implements_error(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Storage(StorageError::AlreadyExists {
+            capability: StorageCapability::Graph,
+            resource: "edge",
+            ..
+        })
+    )
+}
+
 async fn link_implements(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -309,14 +323,8 @@ async fn link_implements(
         .await
     {
         Ok(_) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("exist") || msg.contains("duplicate") {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
+        Err(e) if is_duplicate_implements_error(&e) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -736,15 +744,8 @@ pub(crate) async fn list(
                 RuntimeError::InvalidInput("offset must be a non-negative integer".into())
             })?,
     };
-    let entities = registry_entities(rt, token, limit, offset).await?;
-    let tools: Vec<Value> = entities
-        .iter()
-        .filter(|e| match &kind {
-            Some(k) => e.entity_type.as_deref() == Some(k.as_str()),
-            None => true,
-        })
-        .map(summary)
-        .collect();
+    let entities = registry_entities(rt, token, kind.as_deref(), limit, offset).await?;
+    let tools: Vec<Value> = entities.iter().map(summary).collect();
     Ok(json!({
         "ok": true,
         "count": tools.len(),
@@ -999,3 +1000,32 @@ pub(crate) async fn policies(
 #[cfg(test)]
 #[path = "claim_tests.rs"]
 mod claim_tests;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_runtime::GuardedWriteFailure;
+
+    #[test]
+    fn missing_endpoint_refusal_is_not_a_duplicate_implements_edge() {
+        let missing = RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
+            entry_index: None,
+            missing_source: None,
+            missing_target: Some(Uuid::new_v4()),
+        });
+        assert!(missing.to_string().contains("exist"));
+        assert!(!is_duplicate_implements_error(&missing));
+
+        let duplicate = RuntimeError::Storage(StorageError::AlreadyExists {
+            capability: StorageCapability::Graph,
+            resource: "edge",
+            key: "same implements triple".into(),
+        });
+        assert!(is_duplicate_implements_error(&duplicate));
+        let unrelated = RuntimeError::Storage(StorageError::AlreadyExists {
+            capability: StorageCapability::Entities,
+            resource: "entity",
+            key: "unrelated".into(),
+        });
+        assert!(!is_duplicate_implements_error(&unrelated));
+    }
+}

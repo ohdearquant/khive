@@ -50,6 +50,26 @@ async fn digest_resume_diamond_max_one_reopens_database_and_finishes() {
     let repo = dir.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     let shas = diamond(&repo);
+    let real_git = resolve_real_git();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let path_log = dir.path().join("name-only.log");
+    std::fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" --name-only \"*) printf '%s\\n' \"$*\" >> \"{log}\" ;;\nesac\nexec \"{real_git}\" \"$@\"\n",
+            log = path_log.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(bin.join("git")).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(bin.join("git"), perms).unwrap();
+    }
+    let _path_guard = PathGuard::install(&bin);
     let db = dir.path().join("mirror.db");
     let (rt, token, registry) = file_fixture(&db).await;
     let project = create(&registry, json!({"kind":"project","name":"diamond"})).await;
@@ -105,6 +125,26 @@ async fn digest_resume_diamond_max_one_reopens_database_and_finishes() {
         assert_eq!(progress["base_cursor"], Value::Null);
         let cursor = read_git_cursor(&rt, project, "commits").await.unwrap();
         assert_eq!(progress["last_completed_sha"], cursor);
+        let path_calls = std::fs::read_to_string(&path_log).unwrap();
+        let path_calls: Vec<&str> = path_calls.lines().collect();
+        assert_eq!(
+            path_calls.len(),
+            (pass + 1).min(4),
+            "only passes with a fresh commit request changed paths"
+        );
+        if pass < 4 {
+            let args: Vec<&str> = path_calls[pass].split_whitespace().collect();
+            assert!(args.contains(&"--no-walk=unsorted"), "{args:?}");
+            let requested_shas: Vec<&str> = args
+                .into_iter()
+                .filter(|arg| arg.len() == 40 && arg.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .collect();
+            assert_eq!(
+                requested_shas,
+                vec![cursor.as_str()],
+                "pass {pass} must request only its unacknowledged SHA"
+            );
+        }
         if pass < 4 {
             assert!(positions.insert(cursor), "no cursor cycle");
         }

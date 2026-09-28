@@ -1,4 +1,4 @@
-//! Append-only NDJSON event sink for writer-timeout diagnostics.
+//! Append-only NDJSON event sink for writer diagnostics.
 //!
 //! Exists so "zero writer-admission timeouts over the last 24h" is a claim
 //! that can be checked from a running daemon instead of grepped out of
@@ -320,11 +320,12 @@ impl Site {
 /// bounded channel — this is the only thing a database caller path ever
 /// does. `error` is already truncated to [`MAX_ERROR_BYTES`] where present.
 ///
-/// `kind` distinguishes the five durable row shapes this sink emits:
+/// `kind` distinguishes the durable row shapes this sink emits:
 /// `"timeout"` (a writer-admission or busy/locked timeout, carries `site` +
 /// `error`), `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
 /// `timeout_ms`), `"writer_task_retirement"` (a `WriterTask` terminal
 /// retirement, carries `error` as the retirement reason),
+/// `"sqlite_full"` (SQLite exhausted the volume during a write),
 /// `"direct_route_violation"` (a direct writer acquisition bypassing an
 /// enabled queue, carries `site`), and `"slow_write"` (a queued write whose
 /// send-to-reply span met [`SLOW_WRITE_THRESHOLD`], carries `elapsed_ms` +
@@ -362,6 +363,15 @@ struct SinkHandle {
 }
 
 static SINK: OnceLock<SinkHandle> = OnceLock::new();
+
+#[cfg(test)]
+static SQLITE_FULL_CAPTURE: std::sync::Mutex<Option<mpsc::Sender<String>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn capture_sqlite_full_for_test(sender: Option<mpsc::Sender<String>>) {
+    *SQLITE_FULL_CAPTURE.lock().unwrap() = sender;
+}
 
 /// One JSON line: `{ts_utc, kind, db, site, error, timeout_ms?}`.
 /// `site`/`error`/`timeout_ms`/`pid`/`version` are omitted (not null) when
@@ -1017,6 +1027,54 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
+fn is_sqlite_full(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            current.downcast_ref::<rusqlite::Error>()
+        {
+            if code.code == rusqlite::ErrorCode::DiskFull {
+                return true;
+            }
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// An actual SQLite out-of-space error means the reserve was bypassed or an
+/// admitted transaction exceeded it. Keep that escalation separate from
+/// contention timeouts; the sink itself remains nonblocking and best effort.
+pub(crate) fn maybe_emit_sqlite_full(db: &str, error: &(dyn std::error::Error + 'static)) {
+    if !is_sqlite_full(error) {
+        return;
+    }
+    #[cfg(test)]
+    if let Some(sender) = SQLITE_FULL_CAPTURE.lock().unwrap().as_ref() {
+        let _ = sender.send(db.to_string());
+    }
+    tracing::error!(db, error = %error, "SQLite ran out of disk space during a write");
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = sqlite_full_event(db, error);
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> QueuedEvent {
+    QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "sqlite_full",
+        db: db.to_string(),
+        site: None,
+        error: Some(truncate_error(&error.to_string(), MAX_ERROR_BYTES)),
+        timeout_ms: None,
+        elapsed_ms: None,
+        queue_depth: None,
+        writer_stages: None,
+    }
+}
+
 /// Record a `queue_saturation` event: a caller-visible
 /// `StorageError::WriteQueueFull` — the bounded `WriterTask` channel was
 /// full for the caller's whole `send_with_timeout` deadline and the request
@@ -1160,13 +1218,14 @@ pub(crate) fn is_busy_or_locked(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// Emit a `timeout` event for `err` if (and only if) it classifies as
-/// busy/locked; otherwise a no-op. Convenience for the standalone-writer
-/// call sites in `stores::graph` and `stores::event`, which see the raw
-/// `rusqlite::Error` before it is mapped to `StorageError`.
+/// Emit a `timeout` event for busy/locked, or a separate `sqlite_full`
+/// escalation for out-of-space. Standalone-writer call sites see the raw
+/// driver error here before mapping it to `StorageError`.
 pub(crate) fn maybe_emit_busy(db: &str, site: Site, err: &rusqlite::Error) {
     if is_busy_or_locked(err) {
         emit_timeout(db, site, &err.to_string(), None);
+    } else {
+        maybe_emit_sqlite_full(db, err);
     }
 }
 
@@ -1592,5 +1651,30 @@ mod tests {
         assert!(!is_busy_or_locked(&other));
 
         assert!(!is_busy_or_locked(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn sqlite_full_escalation_has_its_own_event_kind() {
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("disk I/O write stopped".to_string()),
+        );
+        let wrapped = khive_storage::StorageError::driver(
+            khive_storage::StorageCapability::Sql,
+            "test_write",
+            full,
+        );
+        assert!(is_sqlite_full(&wrapped));
+        let event = sqlite_full_event("test.db", &wrapped);
+        assert_eq!(event.kind, "sqlite_full");
+        assert_eq!(event.site, None);
+        assert_eq!(event.timeout_ms, None);
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(!is_sqlite_full(&busy));
+        assert!(is_busy_or_locked(&busy));
     }
 }
