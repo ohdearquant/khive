@@ -190,11 +190,21 @@ def closing_backtick_run(line: str, start: int, ticks: str) -> re.Match[str] | N
     return None
 
 
-def paragraph_last_backticks(lines: list[str]) -> list[dict[int, tuple[int, int]]]:
-    """Last run position by length in each non-blank paragraph.
+def fence_opener(line: str) -> re.Match[str] | None:
+    """A CommonMark fence opener, including its backtick info-string rule."""
+    opener = FENCE_OPEN.match(line)
+    if opener and opener.group("chars")[0] == "`" and "`" in opener.group("info"):
+        return None
+    return opener
 
-    Every line in a paragraph shares one dictionary. Building it once keeps
-    unmatched-run lookups bounded on an ADR full of stray backticks.
+
+def paragraph_last_backticks(lines: list[str]) -> list[dict[int, tuple[int, int]]]:
+    """Last run position by length before a blank or fence boundary.
+
+    A fence can interrupt prose without a blank line. Its delimiter run cannot
+    close a code span opened in that prose, so lookahead stops before the
+    fence. Each segment shares one dictionary, keeping unmatched-run lookups
+    bounded on an ADR full of stray backticks.
     """
     last_by_line: list[dict[int, tuple[int, int]]] = [{} for _ in lines]
     first = 0
@@ -206,6 +216,11 @@ def paragraph_last_backticks(lines: list[str]) -> list[dict[int, tuple[int, int]
             first = line_no + 1
             last = {}
             continue
+        if fence_opener(line):
+            for paragraph_line in range(first, line_no):
+                last_by_line[paragraph_line] = last
+            first = line_no
+            last = {}
         for run in BACKTICK_RUN.finditer(line):
             last[len(run.group())] = (line_no, run.start())
     for paragraph_line in range(first, len(lines)):
@@ -340,10 +355,8 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
             prev_blank = line.strip() == ""
             continue
         if not in_comment and code_open is None:
-            opener = FENCE_OPEN.match(line)
-            if opener and not (
-                opener.group("chars")[0] == "`" and "`" in opener.group("info")
-            ):
+            opener = fence_opener(line)
+            if opener:
                 chars = opener.group("chars")
                 fence_close = re.compile(
                     rf"^ {{0,3}}{re.escape(chars[0])}{{{len(chars)},}}[ \t]*$"
@@ -696,6 +709,33 @@ MUST_FAIL = {
         "`<!--`\n"
         "\n"
         "**Status**: Proposed\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A fence interrupts prose without a blank line. Its delimiter cannot
+    # close the stray run above it and hide the fenced-only status.
+    "ADR-996-prose-run-before-fence.md": (
+        "# ADR-996: Probe2\n"
+        "\n"
+        "Some prose with a stray ``` run here.\n"
+        "```text\n"
+        "Status: Proposed\n"
+        "```\n"
+        "\n"
+        "## Context\n"
+        "\n"
+        "Text.\n"
+    ),
+    # The same boundary still holds when another prose line separates the
+    # unmatched run from the fence opener.
+    "ADR-995-prose-run-two-lines-before-fence.md": (
+        "# ADR-995: Probe3\n"
+        "\n"
+        "Prose ``` stray\n"
+        "more prose\n"
+        "```text\n"
+        "Status: Proposed\n"
+        "```\n"
         "\n"
         "## Context\n"
     ),
