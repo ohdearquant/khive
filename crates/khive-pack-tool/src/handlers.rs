@@ -5,9 +5,15 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    micros_to_iso, operations::EntityClaimSpec, KhiveRuntime, NamespaceToken, RuntimeError,
+    VerbRegistry,
+};
 use khive_storage::types::Direction;
-use khive_storage::{Entity, EntityFilter, StorageCapability, StorageError};
+use khive_storage::{
+    Entity, EntityFilter, SqlStatement, SqlValue, StorageCapability, StorageError,
+};
+use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
 use crate::policy::{self, actor_label, now_micros, Decision};
@@ -16,6 +22,18 @@ use crate::vocab::{
     TRUST_ORIGINS,
 };
 use crate::RegistryPin;
+
+#[cfg(test)]
+tokio::task_local! {
+    static BEFORE_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+}
+
+#[cfg(test)]
+async fn pause_before_claim() {
+    if let Ok(barrier) = BEFORE_CLAIM.try_with(std::sync::Arc::clone) {
+        barrier.wait().await;
+    }
+}
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -39,9 +57,12 @@ fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
 fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(default),
-        Some(v) => v.as_u64().map(|n| (n as u32).clamp(1, max)).ok_or_else(|| {
-            RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
-        }),
+        Some(v) => v
+            .as_u64()
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
+            }),
     }
 }
 
@@ -160,6 +181,46 @@ async fn find_by_name(
     find_visible_by_name(rt, &own_namespace, name).await
 }
 
+async fn same_name_tombstone(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+    kind: &str,
+    entity_type: Option<&str>,
+    identity_tag: &str,
+) -> Result<Option<Uuid>, RuntimeError> {
+    let mut reader = rt.sql().reader().await?;
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT id FROM entities \
+                  WHERE namespace = ?1 AND kind = ?2 \
+                    AND (?3 IS NULL OR entity_type = ?3) AND deleted_at IS NOT NULL \
+                    AND CAST(lower(name) AS BLOB) = ?4 \
+                    AND EXISTS (SELECT 1 FROM json_each(entities.tags) \
+                                WHERE lower(json_each.value) = ?5) \
+                  ORDER BY created_at DESC, id ASC LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(kind.into()),
+                entity_type.map_or(SqlValue::Null, |value| SqlValue::Text(value.into())),
+                SqlValue::Blob(name.to_ascii_lowercase().into_bytes()),
+                SqlValue::Text(identity_tag.into()),
+            ],
+            label: Some("tool_same_name_tombstone".into()),
+        })
+        .await?;
+    match row.as_ref().and_then(|row| row.get("id")) {
+        None => Ok(None),
+        Some(SqlValue::Text(id)) => Uuid::parse_str(id)
+            .map(Some)
+            .map_err(|_| RuntimeError::Internal("invalid registry tombstone UUID".into())),
+        Some(_) => Err(RuntimeError::Internal(
+            "invalid registry tombstone identity".into(),
+        )),
+    }
+}
+
 async fn find_visible_by_name(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -178,19 +239,34 @@ async fn resolve_tool(
 ) -> Result<Entity, RuntimeError> {
     if let Ok(id) = Uuid::parse_str(reference) {
         if let Ok(e) = rt.get_entity(token, id).await {
-            return Ok(e);
+            return require_registry_row(e, reference);
         }
     }
     if reference.len() >= 8 && reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         if let Ok(Some(id)) = rt.resolve_prefix(token, reference).await {
             if let Ok(e) = rt.get_entity(token, id).await {
-                return Ok(e);
+                return require_registry_row(e, reference);
             }
         }
     }
     find_visible_by_name(rt, token, reference)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("tool {reference:?} is not registered")))
+}
+
+fn require_registry_row(entity: Entity, reference: &str) -> Result<Entity, RuntimeError> {
+    if entity.kind == REGISTRY_ENTITY_KIND
+        && entity
+            .tags
+            .iter()
+            .any(|tag| pack_registry_tag(tag) == Some(REGISTRY_TAG))
+    {
+        Ok(entity)
+    } else {
+        Err(RuntimeError::NotFound(format!(
+            "tool {reference:?} is not registered"
+        )))
+    }
 }
 
 /// Resolve a registry object by uuid, id prefix or name for another pack
@@ -209,29 +285,70 @@ async fn ensure_capability(
     name: &str,
 ) -> Result<Entity, RuntimeError> {
     let own_namespace = token.with_namespace(token.namespace().clone());
-    let filter = EntityFilter {
-        kinds: vec!["concept".into()],
-        entity_types: vec!["capability".into()],
-        names_ci: vec![name.to_string()],
-        tags_any: vec![CAPABILITY_TAG.into()],
-        ..Default::default()
-    };
     let existing = rt
-        .list_entities_filtered(&own_namespace, filter, 1, 0)
+        .list_entities_filtered(
+            &own_namespace,
+            EntityFilter {
+                kinds: vec!["concept".into()],
+                entity_types: vec!["capability".into()],
+                tags_any: vec![CAPABILITY_TAG.into()],
+                names_ci: vec![name.into()],
+                ..Default::default()
+            },
+            1,
+            0,
+        )
         .await?;
     if let Some(e) = existing.into_iter().next() {
+        rt.ensure_claimed_entity_create_event(token, &e).await?;
+        rt.reindex_claimed_entity(token, &e).await?;
         return Ok(e);
     }
-    rt.create_entity(
-        &own_namespace,
+    if let Some(id) = same_name_tombstone(
+        rt,
+        token,
+        name,
         "concept",
         Some("capability"),
-        name,
-        None,
-        None,
-        vec![CAPABILITY_TAG.to_string()],
+        CAPABILITY_TAG,
     )
-    .await
+    .await?
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "capability name {name:?} is soft-deleted at entity {id}; restore it explicitly"
+        )));
+    }
+    #[cfg(test)]
+    pause_before_claim().await;
+    let id = derived_registry_id("capability", token.namespace().as_str(), name);
+    let (entity, _) = rt
+        .claim_entity_if_absent(
+            token,
+            EntityClaimSpec {
+                id,
+                kind: "concept".into(),
+                entity_type: Some("capability".into()),
+                name: name.into(),
+                description: None,
+                properties: None,
+                tags: vec![CAPABILITY_TAG.into()],
+                identity_tag: CAPABILITY_TAG.into(),
+            },
+        )
+        .await?;
+    Ok(entity)
+}
+
+fn derived_registry_id(seed: &str, namespace: &str, name: &str) -> Uuid {
+    let pack_seed = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("khive:tool-registry:{seed}:v1").as_bytes(),
+    );
+    let mut key = Vec::with_capacity(8 + namespace.len() + name.len());
+    key.extend_from_slice(&(namespace.len() as u64).to_be_bytes());
+    key.extend_from_slice(namespace.as_bytes());
+    key.extend_from_slice(name.to_ascii_lowercase().as_bytes());
+    Uuid::new_v5(&pack_seed, &key)
 }
 
 fn is_duplicate_implements_error(error: &RuntimeError) -> bool {
@@ -312,8 +429,30 @@ async fn register_one(
     one_of(&spec.trust, TRUST_ORIGINS, "trust")?;
 
     let (entity, created) = match find_by_name(rt, token, &spec.name).await? {
-        Some(existing) => (existing, false),
+        Some(existing) => {
+            rt.ensure_claimed_entity_create_event(token, &existing)
+                .await?;
+            rt.reindex_claimed_entity(token, &existing).await?;
+            (existing, false)
+        }
         None => {
+            if let Some(id) = same_name_tombstone(
+                rt,
+                token,
+                &spec.name,
+                REGISTRY_ENTITY_KIND,
+                None,
+                REGISTRY_TAG,
+            )
+            .await?
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "registry name {:?} is soft-deleted at entity {id}; restore it explicitly",
+                    spec.name
+                )));
+            }
+            #[cfg(test)]
+            pause_before_claim().await;
             let mut props = serde_json::Map::new();
             props.insert("side_effect".into(), json!(spec.side_effect));
             props.insert("trust".into(), json!(spec.trust));
@@ -330,18 +469,23 @@ async fn register_one(
                     tags.push(t.clone());
                 }
             }
-            let e = rt
-                .create_entity(
+            let id = derived_registry_id("object", token.namespace().as_str(), &spec.name);
+            let (entity, created) = rt
+                .claim_entity_if_absent(
                     token,
-                    REGISTRY_ENTITY_KIND,
-                    Some(&spec.kind),
-                    &spec.name,
-                    spec.description.as_deref(),
-                    Some(Value::Object(props)),
-                    tags,
+                    EntityClaimSpec {
+                        id,
+                        kind: REGISTRY_ENTITY_KIND.into(),
+                        entity_type: Some(spec.kind.clone()),
+                        name: spec.name.clone(),
+                        description: spec.description.clone(),
+                        properties: Some(Value::Object(props)),
+                        tags,
+                        identity_tag: REGISTRY_TAG.into(),
+                    },
                 )
                 .await?;
-            (e, true)
+            (entity, created)
         }
     };
 
@@ -810,7 +954,16 @@ pub(crate) async fn decide_request(
     let decider = actor_label(token);
     policy::validate_transition(&current, status, &decider)?;
     let expires_at = if status == "granted" {
-        opt_i64(&params, "expires_in_s")?.map(|s| now_micros() + s.max(0) * 1_000_000)
+        opt_i64(&params, "expires_in_s")?
+            .map(|seconds| {
+                let duration = seconds.max(0).checked_mul(1_000_000).ok_or_else(|| {
+                    RuntimeError::InvalidInput("expires_in_s is too large".to_string())
+                })?;
+                now_micros().checked_add(duration).ok_or_else(|| {
+                    RuntimeError::InvalidInput("expires_in_s is too large".to_string())
+                })
+            })
+            .transpose()?
     } else {
         None
     };
@@ -918,6 +1071,9 @@ pub(crate) async fn policies(
     }))
 }
 
+#[cfg(test)]
+#[path = "claim_tests.rs"]
+mod claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

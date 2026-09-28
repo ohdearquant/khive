@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
 use khive_storage::{AttachmentSubstrate, EdgeRelation, EdgeUpsertDisposition, SqlStatement};
+use khive_types::pack::pack_registry_tag;
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -63,6 +64,15 @@ use khive_db::stores::text::{delete_document_statements, insert_document_stateme
 fn obj(args: &Value) -> RuntimeResult<&serde_json::Map<String, Value>> {
     args.as_object()
         .ok_or_else(|| RuntimeError::InvalidInput("op args must be a JSON object".into()))
+}
+
+fn refuse_pack_registry_tags(tags: &[String], verb: &str) -> RuntimeResult<()> {
+    let Some(tag) = tags.iter().find_map(|tag| pack_registry_tag(tag)) else {
+        return Ok(());
+    };
+    Err(RuntimeError::InvalidInput(format!(
+        "{verb} refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+    )))
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> RuntimeResult<&'a str> {
@@ -276,6 +286,31 @@ fn purge_index_row_statement(
     }
 }
 
+fn purge_vector_provenance_statement(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label: &str,
+) -> PlanStatement {
+    let model_key = table
+        .strip_prefix("vec_")
+        .expect("runtime vector tables use the vec_ prefix");
+    PlanStatement {
+        statement: SqlStatement {
+            sql: "DELETE FROM vector_provenance \
+                  WHERE model_key = ?1 AND subject_id = ?2 AND namespace = ?3"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(model_key.to_string()),
+                SqlValue::Text(subject_id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some(label.to_string()),
+        },
+        guard: None,
+    }
+}
+
 /// The FTS-document half of an index purge: `fts_table`'s row for `subject_id`
 /// (looked up via `khive_db::stores::text::rowid_map_table`, not a
 /// `namespace`/`subject_id` scan — those columns are `UNINDEXED` in every
@@ -390,6 +425,12 @@ async fn push_index_purge_statements(
                 namespace,
                 subject_id,
                 &format!("{label_prefix}-purge-vec-{vec_table}"),
+            ));
+            statements.push(purge_vector_provenance_statement(
+                &vec_table,
+                namespace,
+                subject_id,
+                &format!("{label_prefix}-purge-vec-provenance-{vec_table}"),
             ));
         }
     }
@@ -1088,6 +1129,7 @@ pub async fn prepare_update(
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
             }
+            refuse_pack_registry_tags(&entity.tags, "update")?;
             // Decide step lives in curation.rs's `prepare_update_entity` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
@@ -1100,6 +1142,9 @@ pub async fn prepare_update(
             let description = optional_string_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
+            if let Some(ref tags) = tags {
+                refuse_pack_registry_tags(tags, "update")?;
+            }
             let entity_type = optional_entity_type_patch(args, "entity_type")?;
 
             let expected_version = obj(args)?
@@ -1565,6 +1610,7 @@ pub async fn prepare_delete(
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
             }
+            refuse_pack_registry_tags(&entity.tags, "delete")?;
             let namespace = entity.namespace.clone();
             // Storage parity: `entity_soft_delete_statement`/
             // `entity_hard_delete_statement` are the SAME khive-db builders
@@ -2030,14 +2076,16 @@ async fn prepare_merge(
     }
 
     let entities = runtime.entities(token)?;
-    entities
+    let into_entity = entities
         .get_entity(into_id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("entity {into_id}")))?;
-    entities
+    let from_entity = entities
         .get_entity(from_id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("entity {from_id}")))?;
+    refuse_pack_registry_tags(&into_entity.tags, "merge")?;
+    refuse_pack_registry_tags(&from_entity.tags, "merge")?;
 
     let now = chrono::Utc::now().timestamp_micros();
     let rewires = vec![
@@ -2235,6 +2283,7 @@ mod tests {
     }
 
     const STUB_MODEL: &str = "stub-adr099-b3";
+    const SECOND_STUB_MODEL: &str = "stub-adr044-a4-second";
     const STUB_DIMS: usize = 4;
 
     struct StubService;
@@ -2259,6 +2308,23 @@ mod tests {
     }
 
     struct StubProvider;
+
+    struct SecondStubProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for SecondStubProvider {
+        fn name(&self) -> &str {
+            SECOND_STUB_MODEL
+        }
+
+        fn dimensions(&self) -> usize {
+            STUB_DIMS
+        }
+
+        async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(StubService))
+        }
+    }
 
     #[async_trait]
     impl EmbedderProvider for StubProvider {
@@ -2288,6 +2354,99 @@ mod tests {
         TestRuntime {
             runtime,
             _temp_dir: dir,
+        }
+    }
+
+    /// The CLI's atomic update/delete path prepares plans in this module,
+    /// bypassing the ordinary KG handlers. Registry ownership must survive
+    /// both existing-row mutation and an attempted tag assignment.
+    #[tokio::test]
+    async fn atomic_entity_writes_refuse_pack_registry_tags() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut registry = khive_storage::Entity::new("local", "project", "registry-target");
+        registry.tags = vec!["ToOl-ReGiStRy".into()];
+        let registry_id = registry.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(registry)
+            .await
+            .expect("seed registry row");
+
+        let update = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": registry_id.to_string(), "name": "hijacked"}),
+            None,
+        )
+        .await
+        .expect_err("atomic update must reject current registry row");
+        assert!(
+            matches!(update, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+        );
+
+        for hard in [false, true] {
+            let deletion = prepare_delete(
+                &runtime,
+                &token,
+                &json!({"id": registry_id.to_string(), "hard": hard}),
+                None,
+            )
+            .await
+            .expect_err("atomic delete must reject current registry row");
+            assert!(
+                matches!(deletion, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+            );
+        }
+        let unchanged = runtime
+            .get_entity(&token, registry_id)
+            .await
+            .expect("registry row remains");
+        assert_eq!(unchanged.name, "registry-target");
+        assert_eq!(unchanged.tags, vec!["ToOl-ReGiStRy".to_string()]);
+
+        let plain = khive_storage::Entity::new("local", "project", "plain-target");
+        let plain_id = plain.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(plain)
+            .await
+            .expect("seed ordinary row");
+        let tagging = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": plain_id.to_string(), "tags": ["TOOL-REGISTRY"]}),
+            None,
+        )
+        .await
+        .expect_err("atomic update must not mint a registry row");
+        assert!(
+            matches!(tagging, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+        );
+        assert!(runtime
+            .get_entity(&token, plain_id)
+            .await
+            .expect("ordinary row remains")
+            .tags
+            .is_empty());
+
+        // Atomic merge is currently rejected at the CLI, but the public
+        // prepare dispatch retains a direct merge arm. Keep it guarded too.
+        for (into_id, from_id) in [(registry_id, plain_id), (plain_id, registry_id)] {
+            let merge = prepare_merge(
+                &runtime,
+                &token,
+                &json!({"into_id": into_id.to_string(), "from_id": from_id.to_string()}),
+            )
+            .await
+            .expect_err("atomic merge must reject either protected operand");
+            assert!(
+                matches!(merge, RuntimeError::InvalidInput(ref msg) if msg.contains("tool-registry"))
+            );
         }
     }
 
@@ -3010,6 +3169,8 @@ mod tests {
     /// index-cleanup contract.
     #[tokio::test]
     async fn atomic_delete_note_purges_fts_and_vector_indexes_soft_and_hard() {
+        use khive_storage::types::VectorRecord;
+
         let runtime = scratch_runtime();
         runtime.register_embedder(StubProvider);
         let token = runtime
@@ -3035,6 +3196,26 @@ mod tests {
             let vec_store = runtime
                 .vectors_for_model(&token, STUB_MODEL)
                 .expect("vec store");
+            vec_store
+                .insert_batch(vec![VectorRecord {
+                    subject_id: note_id,
+                    kind: SubstrateKind::Note,
+                    namespace: "local".into(),
+                    field: "note.content".into(),
+                    embedding_model: Some(STUB_MODEL.into()),
+                    vectors: vec![vec![0.5_f32; STUB_DIMS]],
+                    text_fingerprint: Some(VectorRecord::fingerprint_text("purge-target content")),
+                    updated_at: chrono::Utc::now(),
+                }])
+                .await
+                .expect("seed attributed vector");
+            assert!(vec_store
+                .provenance(note_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text_fingerprint
+                .is_some());
             assert_eq!(
                 vec_store.count().await.expect("count before"),
                 1,
@@ -3085,7 +3266,386 @@ mod tests {
                 0,
                 "vector row must be purged after atomic delete (hard={hard})"
             );
+            let mut reader = runtime.sql().reader().await.expect("sql reader");
+            let sidecar_count = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM vector_provenance WHERE subject_id = ?1".into(),
+                    params: vec![SqlValue::Text(note_id.to_string())],
+                    label: Some("test-atomic-delete-sidecar-clear".into()),
+                })
+                .await
+                .expect("count sidecar rows");
+            assert!(matches!(sidecar_count, Some(SqlValue::Integer(0))));
         }
+    }
+
+    /// An explicit embed=false note update uses NoteVectors::apply inside the
+    /// writer transaction. It must physically remove that note's sidecar row
+    /// along with its vec0 row while retaining another note's provenance.
+    #[tokio::test]
+    async fn note_vectors_embed_false_purge_clears_provenance_across_models() {
+        use khive_storage::types::VectorRecord;
+
+        const FOREIGN_MODEL: &str = "stub-adr044-a4-foreign";
+        struct ForeignStubProvider;
+        #[async_trait]
+        impl EmbedderProvider for ForeignStubProvider {
+            fn name(&self) -> &str {
+                FOREIGN_MODEL
+            }
+
+            fn dimensions(&self) -> usize {
+                STUB_DIMS
+            }
+
+            async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+                Ok(std::sync::Arc::new(StubService))
+            }
+        }
+
+        async fn provenance_count(runtime: &KhiveRuntime, subject_id: Uuid, model: &str) -> i64 {
+            let mut reader = runtime.sql().reader().await.expect("sql reader");
+            let count = reader
+                .query_scalar(crate::note_write::statement(
+                    "SELECT COUNT(*) FROM vector_provenance \
+                     WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
+                    vec![
+                        SqlValue::Text(crate::config::sanitize_key(model)),
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text(subject_id.to_string()),
+                    ],
+                ))
+                .await
+                .expect("read physical provenance row count");
+            let Some(SqlValue::Integer(count)) = count else {
+                panic!("expected physical provenance count, got {count:?}");
+            };
+            count
+        }
+
+        async fn ann_delete_count(runtime: &KhiveRuntime, subject_id: Uuid, model: &str) -> i64 {
+            let mut reader = runtime.sql().reader().await.expect("sql reader");
+            let count = reader
+                .query_scalar(crate::note_write::statement(
+                    "SELECT COUNT(*) FROM ann_write_log \
+                     WHERE namespace=?1 AND embedding_model=?2 AND subject_id=?3 AND op='delete'",
+                    vec![
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text(model.into()),
+                        SqlValue::Text(subject_id.to_string()),
+                    ],
+                ))
+                .await
+                .expect("read ANN delete log");
+            let Some(SqlValue::Integer(count)) = count else {
+                panic!("expected ANN delete count, got {count:?}");
+            };
+            count
+        }
+
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        runtime.register_embedder(SecondStubProvider);
+        runtime.register_embedder(ForeignStubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut ids = Vec::new();
+        for content in ["purge provenance", "keep provenance"] {
+            let note = khive_storage::note::Note::new("local", "observation", content);
+            ids.push(note.id);
+            runtime
+                .notes(&token)
+                .expect("notes store")
+                .upsert_note(note.clone())
+                .await
+                .expect("seed note");
+            runtime
+                .reindex_note(&token, &note)
+                .await
+                .expect("seed note vector");
+            // Custom providers correctly produce no attested fingerprint. Seed
+            // a known historical attribution for both live vectors so this
+            // test can observe whether the raw purge physically clears it.
+            for model in [STUB_MODEL, SECOND_STUB_MODEL] {
+                runtime
+                    .vectors_for_model(&token, model)
+                    .expect("vec store")
+                    .insert_batch(vec![VectorRecord {
+                        subject_id: note.id,
+                        kind: khive_types::SubstrateKind::Note,
+                        namespace: note.namespace.clone(),
+                        field: "note.content".into(),
+                        embedding_model: Some(model.into()),
+                        vectors: vec![vec![0.5; STUB_DIMS]],
+                        text_fingerprint: Some(VectorRecord::fingerprint_text(&note.content)),
+                        updated_at: chrono::Utc::now(),
+                    }])
+                    .await
+                    .expect("seed known historical attribution");
+            }
+        }
+        let [purged_id, retained_id] = [ids[0], ids[1]];
+        runtime
+            .vectors_for_model(&token, FOREIGN_MODEL)
+            .expect("foreign-model vec store")
+            .insert_batch(vec![VectorRecord {
+                subject_id: purged_id,
+                kind: khive_types::SubstrateKind::Note,
+                namespace: "foreign".into(),
+                field: "note.content".into(),
+                embedding_model: Some(FOREIGN_MODEL.into()),
+                vectors: vec![vec![0.5; STUB_DIMS]],
+                text_fingerprint: Some(VectorRecord::fingerprint_text("foreign source")),
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .expect("seed same-subject foreign vec0 and sidecar");
+        let foreign_count = |runtime: &KhiveRuntime| {
+            let writer = runtime
+                .backend()
+                .pool()
+                .try_writer()
+                .expect("fixture writer");
+            let conn = writer.conn();
+            let model_key = crate::config::sanitize_key(FOREIGN_MODEL);
+            let sidecar: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM vector_provenance WHERE model_key=?1 AND namespace='foreign' AND subject_id=?2",
+                    rusqlite::params![model_key, purged_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let vector: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM vec_{model_key} WHERE namespace='foreign' AND subject_id=?1"),
+                    [purged_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (sidecar, vector)
+        };
+        assert_eq!(foreign_count(&runtime), (1, 1));
+        for model in [STUB_MODEL, SECOND_STUB_MODEL] {
+            assert_eq!(provenance_count(&runtime, purged_id, model).await, 1);
+            assert_eq!(provenance_count(&runtime, retained_id, model).await, 1);
+        }
+        // Replacing the foreign model's local seed row logs a delete before
+        // this purge. Check the purge's delta rather than the lifetime total.
+        let delete_logs_before = [
+            ann_delete_count(&runtime, purged_id, STUB_MODEL).await,
+            ann_delete_count(&runtime, purged_id, SECOND_STUB_MODEL).await,
+        ];
+        let foreign_delete_logs_before = ann_delete_count(&runtime, purged_id, FOREIGN_MODEL).await;
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": purged_id.to_string(), "embed": false}),
+            None,
+        )
+        .await
+        .expect("prepare explicit vector purge");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("run atomic update");
+        assert!(
+            matches!(
+                &outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "expected committed update, got {outcome:?}"
+        );
+
+        for model in [STUB_MODEL, SECOND_STUB_MODEL] {
+            assert_eq!(provenance_count(&runtime, purged_id, model).await, 0);
+            assert_eq!(provenance_count(&runtime, retained_id, model).await, 1);
+            assert_eq!(
+                runtime
+                    .vectors_for_model(&token, model)
+                    .expect("vec store")
+                    .count()
+                    .await
+                    .expect("vector row count"),
+                1,
+                "only the retained note's vector row remains for {model}"
+            );
+        }
+        assert_eq!(foreign_count(&runtime), (1, 1));
+        for (model, before) in [STUB_MODEL, SECOND_STUB_MODEL]
+            .into_iter()
+            .zip(delete_logs_before)
+        {
+            assert_eq!(
+                ann_delete_count(&runtime, purged_id, model).await,
+                before + 1,
+                "purge must log exactly one delete for {model}"
+            );
+        }
+        assert_eq!(
+            ann_delete_count(&runtime, purged_id, FOREIGN_MODEL).await,
+            foreign_delete_logs_before,
+            "purge must not log a delete for the foreign namespace"
+        );
+    }
+
+    /// A failure while purging the second model must roll back the first
+    /// model's vec0 DELETE, sidecar DELETE, and ANN-log insert as one unit.
+    #[tokio::test]
+    async fn note_vectors_second_model_sidecar_failure_rolls_back_all_models() {
+        use khive_storage::types::VectorRecord;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct PersistedVector {
+            embedding_hex: String,
+            digest: String,
+            fingerprint: Option<String>,
+            updated_at: Option<String>,
+            ann_delete_count: i64,
+        }
+
+        fn persisted(runtime: &KhiveRuntime, model: &str, subject_id: Uuid) -> PersistedVector {
+            let key = crate::config::sanitize_key(model);
+            let writer = runtime.backend().pool().try_writer().expect("pool writer");
+            let conn = writer.conn();
+            let embedding_hex = conn
+                .query_row(
+                    &format!(
+                        "SELECT hex(embedding) FROM vec_{key} \
+                         WHERE namespace=?1 AND subject_id=?2"
+                    ),
+                    rusqlite::params!["local", subject_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("read persisted vec0 embedding");
+            let (digest, fingerprint, updated_at) = conn
+                .query_row(
+                    "SELECT embedding_digest, text_fingerprint, updated_at \
+                     FROM vector_provenance \
+                     WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
+                    rusqlite::params![key, "local", subject_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read persisted model sidecar");
+            let ann_delete_count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ann_write_log \
+                     WHERE namespace=?1 AND embedding_model=?2 \
+                     AND subject_id=?3 AND op='delete'",
+                    rusqlite::params!["local", model, subject_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("read persisted ANN delete count");
+            PersistedVector {
+                embedding_hex,
+                digest,
+                fingerprint,
+                updated_at,
+                ann_delete_count,
+            }
+        }
+
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        runtime.register_embedder(SecondStubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let note = khive_storage::note::Note::new("local", "observation", "rollback provenance");
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+        runtime
+            .reindex_note(&token, &note)
+            .await
+            .expect("seed note vectors");
+        for model in [STUB_MODEL, SECOND_STUB_MODEL] {
+            runtime
+                .vectors_for_model(&token, model)
+                .expect("vec store")
+                .insert_batch(vec![VectorRecord {
+                    subject_id: note.id,
+                    kind: khive_types::SubstrateKind::Note,
+                    namespace: note.namespace.clone(),
+                    field: "note.content".into(),
+                    embedding_model: Some(model.into()),
+                    vectors: vec![vec![0.5; STUB_DIMS]],
+                    text_fingerprint: Some(VectorRecord::fingerprint_text(&note.content)),
+                    updated_at: chrono::Utc::now(),
+                }])
+                .await
+                .expect("seed known historical attribution");
+        }
+        let before = [
+            persisted(&runtime, STUB_MODEL, note.id),
+            persisted(&runtime, SECOND_STUB_MODEL, note.id),
+        ];
+
+        // NoteVectors::tables orders the vec_* catalog by name. Abort only
+        // the second model's sidecar DELETE, after the first model has already
+        // logged and deleted its vector and sidecar inside this transaction.
+        let mut keys = [
+            crate::config::sanitize_key(STUB_MODEL),
+            crate::config::sanitize_key(SECOND_STUB_MODEL),
+        ];
+        keys.sort();
+        {
+            let writer = runtime.backend().pool().try_writer().expect("pool writer");
+            writer
+                .conn()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_second_note_vector_sidecar_delete \
+                     BEFORE DELETE ON vector_provenance \
+                     WHEN OLD.model_key='{}' AND OLD.namespace='local' \
+                      AND OLD.subject_id='{}' \
+                     BEGIN SELECT RAISE(ABORT, 'injected second-model sidecar delete failure'); END;",
+                    keys[1], note.id
+                ))
+                .expect("install second-model sidecar fault");
+        }
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": note.id.to_string(), "embed": false}),
+            None,
+        )
+        .await
+        .expect("prepare explicit vector purge");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("atomic seam should report an op rollback");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index: 0,
+                failure:
+                    crate::atomic_runner::AtomicOpFailure::SqlError {
+                        statement_label,
+                        message,
+                    },
+            } => {
+                assert_eq!(statement_label.as_deref(), Some("note-vector-purge"));
+                assert!(
+                    message.contains("injected second-model sidecar delete failure"),
+                    "unexpected rollback cause: {message}"
+                );
+            }
+            other => panic!("expected the second-model purge to roll back, got {other:?}"),
+        }
+
+        assert_eq!(persisted(&runtime, STUB_MODEL, note.id), before[0]);
+        assert_eq!(persisted(&runtime, SECOND_STUB_MODEL, note.id), before[1]);
+        let stored = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(note.id)
+            .await
+            .expect("read note")
+            .expect("note remains");
+        assert_eq!(stored.version, note.version, "note update also rolled back");
     }
 
     /// Atomic delete must purge the entity's FTS row and vector row for

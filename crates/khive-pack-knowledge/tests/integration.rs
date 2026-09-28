@@ -2670,6 +2670,221 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
         "re-embed paging sweep must embed every atom exactly once in \
          created_at ASC, id ASC order"
     );
+
+    // The recording provider is pack-supplied, even though it replaces a
+    // built-in model name. Its input preparation is not attested, so live
+    // vectors must exist without a claimed exact-input fingerprint.
+    let live_vectors = {
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("provenance reader");
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT a.name, p.text_fingerprint \
+                      FROM knowledge_atoms AS a \
+                      JOIN vec_all_minilm_l6_v2 AS v \
+                        ON v.subject_id = a.id AND v.namespace = a.namespace \
+                       AND v.field = 'knowledge.atom' \
+                      LEFT JOIN vector_provenance AS p \
+                        ON p.model_key = 'all_minilm_l6_v2' \
+                       AND p.subject_id = v.subject_id AND p.namespace = v.namespace \
+                      WHERE a.deleted_at IS NULL"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("read live vectors and optional provenance")
+    };
+    let mut indexed_names = std::collections::HashSet::new();
+    for row in live_vectors {
+        let name = match row.get("name") {
+            Some(SqlValue::Text(value)) => value.clone(),
+            other => panic!("unexpected atom name {other:?}"),
+        };
+        assert!(
+            indexed_names.insert(name.clone()),
+            "each atom must have exactly one live vector: {name}"
+        );
+        assert!(
+            matches!(row.get("text_fingerprint"), Some(SqlValue::Null)),
+            "custom provider must not claim exact-input provenance for {name}"
+        );
+    }
+    assert_eq!(indexed_names.len(), expected_names.len());
+    assert!(
+        expected_names
+            .iter()
+            .all(|name| indexed_names.contains(name)),
+        "all recorded atoms must retain a live vector"
+    );
+}
+
+// ── delete_atoms ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn knowledge_index_persists_audited_bounded_prefixed_fingerprint() {
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    const MODEL: EmbeddingModel = EmbeddingModel::MultilingualE5Small;
+    const PREFIX: &str = "passage: ";
+
+    struct RecordingService(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl EmbeddingService for RecordingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.0
+                .lock()
+                .expect("recorded input lock")
+                .extend_from_slice(texts);
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.25; MODEL.dimensions()])
+                .collect())
+        }
+
+        fn supports_model(&self, model: EmbeddingModel) -> bool {
+            model == MODEL
+        }
+
+        fn name(&self) -> &'static str {
+            "knowledge-audited-test-service"
+        }
+    }
+    struct RecordingProvider(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl EmbedderProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "multilingual-e5-small"
+        }
+
+        fn dimensions(&self) -> usize {
+            MODEL.dimensions()
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(RecordingService(Arc::clone(&self.0))))
+        }
+    }
+
+    let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(MODEL),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+        exec: Default::default(),
+    })
+    .expect("runtime");
+    rt.register_test_audited_embedder(MODEL, RecordingProvider(Arc::clone(&recorded)));
+    let f = pack(rt.clone());
+    let name = "Audited E5 atom";
+    let content = format!("{}海", "海 ".repeat(11_999));
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({"atoms": [{"slug": "audited-e5-atom", "name": name, "content": content.clone()}]}),
+    )
+    .await
+    .expect("upsert atom");
+    let indexed = f
+        .dispatch("knowledge.index", json!({"ids": ["audited-e5-atom"]}))
+        .await
+        .expect("index atom");
+    assert_eq!(indexed["indexed"].as_u64(), Some(1), "{indexed:?}");
+
+    let source = format!("{name}\n\n{content}");
+    let budget = lattice_embed::MAX_TEXT_BYTES - PREFIX.len();
+    let end = source
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= budget)
+        .last()
+        .expect("nonempty input");
+    let prepared = format!("{PREFIX}{}", &source[..end]);
+    assert_eq!(
+        recorded.lock().unwrap().as_slice(),
+        std::slice::from_ref(&prepared)
+    );
+    assert!(prepared.len() <= lattice_embed::MAX_TEXT_BYTES);
+    assert!(
+        source.len() > budget,
+        "fixture must exercise UTF-8 truncation"
+    );
+    let expected = blake3::hash(prepared.as_bytes()).to_hex().to_string();
+
+    async fn stored_fingerprint(rt: &KhiveRuntime) -> String {
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("provenance reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT p.text_fingerprint FROM vector_provenance AS p \
+                      JOIN vec_multilingual_e5_small AS v \
+                        ON p.subject_id = v.subject_id AND p.namespace = v.namespace \
+                      JOIN knowledge_atoms AS a \
+                        ON a.id = v.subject_id AND a.namespace = v.namespace \
+                      WHERE p.model_key = 'multilingual_e5_small' \
+                        AND v.field = 'knowledge.atom' AND a.slug = 'audited-e5-atom'"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("read stored fingerprint")
+            .expect("attributed atom vector");
+        match row.get("text_fingerprint") {
+            Some(SqlValue::Text(value)) => value.clone(),
+            other => panic!("expected exact-input fingerprint, got {other:?}"),
+        }
+    }
+    assert_eq!(stored_fingerprint(&rt).await, expected);
+
+    f.dispatch("knowledge.index", json!({"ids": ["audited-e5-atom"]}))
+        .await
+        .expect("repeat same-source index");
+    assert_eq!(stored_fingerprint(&rt).await, expected);
+    assert_eq!(
+        recorded.lock().unwrap().as_slice(),
+        &[prepared.clone(), prepared.clone()]
+    );
+
+    let changed_content = content.replacen('海', "河", 1);
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({"atoms": [{"slug": "audited-e5-atom", "name": name, "content": changed_content}]}),
+    )
+    .await
+    .expect("change bounded source byte");
+    f.dispatch("knowledge.index", json!({"ids": ["audited-e5-atom"]}))
+        .await
+        .expect("index changed atom");
+    let changed_prepared = prepared.replacen('海', "河", 1);
+    assert_eq!(recorded.lock().unwrap()[2], changed_prepared);
+    let changed = blake3::hash(changed_prepared.as_bytes())
+        .to_hex()
+        .to_string();
+    assert_ne!(changed, expected);
+    assert_eq!(stored_fingerprint(&rt).await, changed);
 }
 
 // ── delete_atoms ──────────────────────────────────────────────────────────────

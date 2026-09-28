@@ -289,6 +289,9 @@ pub trait EmbedderProvider: Send + Sync {
 pub(crate) struct EmbedderEntry {
     provider: Arc<dyn EmbedderProvider>,
     cell: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
+    /// Only the runtime's built-in lattice provider has an audited document
+    /// preparation path. Pack replacements, even under a built-in name, do not.
+    audited_document_preparation: bool,
 }
 
 impl Clone for EmbedderEntry {
@@ -296,6 +299,7 @@ impl Clone for EmbedderEntry {
         Self {
             provider: Arc::clone(&self.provider),
             cell: Arc::clone(&self.cell),
+            audited_document_preparation: self.audited_document_preparation,
         }
     }
 }
@@ -328,12 +332,39 @@ impl EmbedderRegistry {
     /// Callers needing strict collision detection should check
     /// [`names`](Self::names) before registering.
     pub fn register<P: EmbedderProvider + 'static>(&mut self, provider: P) {
+        self.insert(provider, false);
+    }
+
+    /// Register the runtime-owned lattice adapter whose passage preparation is
+    /// audited. This is deliberately not available to pack providers.
+    pub(crate) fn register_builtin(&mut self, provider: LatticeEmbedderProvider) {
+        self.insert(provider, true);
+    }
+
+    /// Test-only attested provider. The wrapper below owns passage preparation,
+    /// so a fake backend cannot change the bytes whose digest is recorded.
+    #[cfg(feature = "test-internals")]
+    pub fn register_test_audited<P: EmbedderProvider + 'static>(
+        &mut self,
+        model: EmbeddingModel,
+        provider: P,
+    ) {
+        assert_eq!(provider.name(), model.to_string());
+        self.insert(TestAuditedProvider { provider }, true);
+    }
+
+    fn insert<P: EmbedderProvider + 'static>(
+        &mut self,
+        provider: P,
+        audited_document_preparation: bool,
+    ) {
         let name = provider.name().to_owned();
         self.entries.insert(
             name,
             EmbedderEntry {
                 provider: Arc::new(provider),
                 cell: Arc::new(OnceCell::new()),
+                audited_document_preparation,
             },
         );
     }
@@ -381,7 +412,58 @@ impl EmbedderRegistry {
     }
 }
 
+#[cfg(feature = "test-internals")]
+struct TestAuditedProvider<P> {
+    provider: P,
+}
+
+#[cfg(feature = "test-internals")]
+#[async_trait]
+impl<P: EmbedderProvider> EmbedderProvider for TestAuditedProvider<P> {
+    fn name(&self) -> &str {
+        self.provider.name()
+    }
+
+    fn dimensions(&self) -> usize {
+        self.provider.dimensions()
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(Arc::new(TestAuditedService(self.provider.build().await?)))
+    }
+}
+
+/// Deliberately does not delegate `embed_passage`: the lattice trait default
+/// applies the model's document instruction before calling `embed`, exactly
+/// as the audited built-in path does. Test providers supply only fake vectors.
+#[cfg(feature = "test-internals")]
+struct TestAuditedService(Arc<dyn EmbeddingService>);
+
+#[cfg(feature = "test-internals")]
+#[async_trait]
+impl EmbeddingService for TestAuditedService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        self.0.embed(texts, model).await
+    }
+
+    fn supports_model(&self, model: EmbeddingModel) -> bool {
+        self.0.supports_model(model)
+    }
+
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+
 impl EmbedderEntry {
+    pub(crate) fn has_audited_document_preparation(&self) -> bool {
+        self.audited_document_preparation
+    }
+
     /// Lazily initialise and return the embedding service for this entry.
     ///
     /// `OnceCell::get_or_try_init` single-flights concurrent cold callers: only
@@ -521,6 +603,21 @@ mod tests {
             self.build_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(ConstVecService { dims: self.dims }))
         }
+    }
+
+    #[test]
+    fn builtin_input_attestation_stays_with_cloned_entry_after_canonical_name_override() {
+        let model = EmbeddingModel::MultilingualE5Small;
+        let name = model.to_string();
+        let mut registry = EmbedderRegistry::new();
+        registry.register_builtin(LatticeEmbedderProvider::new(model));
+        let builtin_entry = registry.get_entry(&name).expect("builtin entry");
+        assert!(builtin_entry.has_audited_document_preparation());
+
+        registry.register(ConstVecProvider::new(&name, model.dimensions()));
+        let replacement_entry = registry.get_entry(&name).expect("replacement entry");
+        assert!(builtin_entry.has_audited_document_preparation());
+        assert!(!replacement_entry.has_audited_document_preparation());
     }
 
     struct FirstLoadBlockingService {

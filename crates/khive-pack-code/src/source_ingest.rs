@@ -48,7 +48,7 @@ use crate::manifest;
 use crate::safe_source::{self, SourceReadError};
 
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
-const RUST_L2_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const RUST_L2_MAX_SOURCE_BYTES: usize = safe_source::MAX_INGEST_FILE_BYTES as usize;
 const RUST_L2_MAX_DELIMITER_DEPTH: usize = 64;
 const RUST_L2_MAX_ANGLE_DEPTH: usize = 64;
 const RUST_L2_MAX_SEGMENT_TOKENS: usize = 2048;
@@ -171,11 +171,11 @@ pub struct CodeSourceIngestReport {
     /// could be derived — counted instead of silently skipping them.
     #[serde(default)]
     pub files_skipped_without_module_path: u64,
-    /// Source file opens refused because the candidate disappeared, was not
-    /// regular, or could not be verified inside the ingest root.
+    /// L1.5 source reads refused because the candidate disappeared, was not
+    /// regular, escaped the ingest root, or exceeded the 2 MiB ceiling.
     #[serde(skip_serializing_if = "count_is_zero")]
     pub source_files_refused: u64,
-    /// Manifest opens refused for the same file and containment checks.
+    /// Manifest reads refused for the same file, containment, and size checks.
     #[serde(skip_serializing_if = "count_is_zero")]
     pub manifest_files_refused: u64,
     /// Entity documents successfully written to the map database's FTS index.
@@ -274,6 +274,16 @@ pub struct CodeSourceIngestOptions<'a> {
     pub enable_l2: bool,
 }
 
+async fn blocking_io<T, F>(work: F) -> Result<T, CodeSourceIngestError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        CodeSourceIngestError::Storage(format!("code ingest worker failed: {error}"))
+    })
+}
+
 fn record_observed_language(report: &mut CodeSourceIngestReport, language: &str) {
     if !report.languages.iter().any(|observed| observed == language) {
         report.languages.push(language.to_string());
@@ -301,11 +311,12 @@ struct ModuleScan {
 type ManifestScopeIndex = BTreeMap<(String, String, String), BTreeSet<String>>;
 
 async fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
-    let fallback_root = ingest_root
-        .canonicalize()
-        .unwrap_or_else(|_| ingest_root.to_path_buf());
+    let fallback_ingest_root = ingest_root.to_path_buf();
     let ingest_root = ingest_root.to_path_buf();
     let git_result = tokio::task::spawn_blocking(move || {
+        let fallback_root = ingest_root
+            .canonicalize()
+            .unwrap_or_else(|_| ingest_root.clone());
         let git_output = |args: &[&str]| {
             Command::new("git")
                 .arg("-C")
@@ -327,12 +338,13 @@ async fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
             .map(PathBuf::from);
         let revision =
             git_output(&["rev-parse", "--verify", "HEAD"]).filter(|revision| !revision.is_empty());
-        (root, revision)
+        (root, revision, fallback_root)
     })
     .await
     .ok();
 
-    let (git_root, git_revision) = git_result.unwrap_or((None, None));
+    let (git_root, git_revision, fallback_root) =
+        git_result.unwrap_or((None, None, fallback_ingest_root));
     let git_metadata_available = git_root.is_some() && git_revision.is_some();
     SourceSnapshot {
         root: git_root.unwrap_or(fallback_root),
@@ -1842,6 +1854,61 @@ fn collect_source_files(
     Ok(())
 }
 
+struct SourceWalkResult {
+    canonical_root: PathBuf,
+    files: Vec<PathBuf>,
+    skipped_outside_root: Vec<PathBuf>,
+    skipped_non_regular: Vec<PathBuf>,
+    skipped_non_source: Vec<PathBuf>,
+}
+
+async fn walk_source_files_on_worker(
+    ingest_root: &Path,
+    ext: &'static str,
+) -> Result<io::Result<SourceWalkResult>, CodeSourceIngestError> {
+    let root = ingest_root.to_path_buf();
+    blocking_io(move || {
+        let canonical_root = fs::canonicalize(root)?;
+        let mut walk = SourceWalkResult {
+            canonical_root,
+            files: Vec::new(),
+            skipped_outside_root: Vec::new(),
+            skipped_non_regular: Vec::new(),
+            skipped_non_source: Vec::new(),
+        };
+        collect_source_files(
+            &walk.canonical_root,
+            ext,
+            &mut walk.files,
+            &mut walk.skipped_outside_root,
+            &mut walk.skipped_non_regular,
+            &mut walk.skipped_non_source,
+        )?;
+        Ok(walk)
+    })
+    .await
+}
+
+async fn derive_source_path_on_worker(
+    file: &Path,
+    ingest_root: &Path,
+    snapshot_root: &Path,
+) -> Result<(Option<String>, Vec<String>, u64), CodeSourceIngestError> {
+    let file = file.to_path_buf();
+    let ingest_root = ingest_root.to_path_buf();
+    let snapshot_root = snapshot_root.to_path_buf();
+    blocking_io(move || {
+        let mut path_report = CodeSourceIngestReport::default();
+        let path = derive_source_path(&file, &ingest_root, &snapshot_root, &mut path_report);
+        (
+            path,
+            path_report.warnings,
+            path_report.files_dropped_without_source_path,
+        )
+    })
+    .await
+}
+
 fn content_hash(content: &str) -> String {
     // FNV-1a: fast, dependency-free, sufficient for change-detection (not a
     // security boundary).
@@ -1851,6 +1918,18 @@ fn content_hash(content: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn scan_import_source(
+    canonical_root: &Path,
+    path: &Path,
+    language: &str,
+) -> Result<(String, Vec<String>), SourceReadError> {
+    let content = safe_source::read_contained_to_string(canonical_root, path)?;
+    Ok((
+        content_hash(&content),
+        imports::extract_raw_imports(language, &content),
+    ))
 }
 
 /// Read at most the L2 scanner's byte limit plus one. A refused file keeps
@@ -2168,7 +2247,8 @@ pub async fn run_code_ingest(
     token: &NamespaceToken,
     opts: CodeSourceIngestOptions<'_>,
 ) -> Result<CodeSourceIngestReport, CodeSourceIngestError> {
-    if !opts.path.is_dir() {
+    let path_for_check = opts.path.to_path_buf();
+    if !blocking_io(move || path_for_check.is_dir()).await? {
         return Err(CodeSourceIngestError::InvalidPath(opts.path.to_path_buf()));
     }
 
@@ -2198,16 +2278,22 @@ pub async fn run_code_ingest(
     // to L1.5 without implying L1 output. No selected L1/L1.5 tier means no
     // manifest walk, preserving the zero-write and L2-only boundaries.
     let manifests = if opts.enable_l1 || opts.enable_l1_5 {
-        let canonical_ingest_root = fs::canonicalize(opts.path)
-            .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
-        let (manifests, failures) =
-            manifest::discover_manifests(&canonical_ingest_root, &opts.languages)
-                .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+        let root = opts.path.to_path_buf();
+        let languages = opts.languages.clone();
+        let discovery = blocking_io(move || {
+            let canonical_root = fs::canonicalize(root)?;
+            manifest::discover_manifests(&canonical_root, &languages)
+        })
+        .await?;
+        let (manifests, failures) = discovery.map_err(|error| {
+            CodeSourceIngestError::InvalidPath(opts.path.join(error.to_string()))
+        })?;
         record_manifest_failures(&mut report, failures);
         manifests
     } else {
         Vec::new()
     };
+    let manifest_index = manifest::ManifestIndex::new(&manifests);
     for manifest in &manifests {
         record_observed_language(&mut report, manifest.language);
         for (dependency, _kind, scope) in &manifest.dependencies {
@@ -2310,6 +2396,7 @@ pub async fn run_code_ingest(
                 &snapshot,
                 &manifest_scopes,
                 &project_renames,
+                &manifest_index,
                 opts.enable_l2,
                 opts.sweep_time,
                 &mut project_ids,
@@ -2401,6 +2488,7 @@ async fn run_import_scan(
     snapshot: &SourceSnapshot,
     manifest_scopes: &ManifestScopeIndex,
     project_renames: &ProjectRenames,
+    manifest_index: &manifest::ManifestIndex,
     per_language_project_stamps: bool,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<(String, String), Uuid>,
@@ -2412,33 +2500,22 @@ async fn run_import_scan(
     let Some(ext) = imports::extension_for_language(language) else {
         return Ok(());
     };
-    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
-        Ok(path) => path,
+    let walk = match walk_source_files_on_worker(ingest_root, ext).await? {
+        Ok(walk) => walk,
         Err(error) => {
-            report.warnings.push(format!(
-                "canonicalizing L1.5 ingest root {}: {error}",
-                ingest_root.display()
-            ));
+            report
+                .warnings
+                .push(format!("walking {}: {error}", ingest_root.display()));
             return Ok(());
         }
     };
-    let mut files = Vec::new();
-    let mut skipped_outside_root = Vec::new();
-    let mut skipped_non_regular = Vec::new();
-    let mut skipped_non_source = Vec::new();
-    if let Err(e) = collect_source_files(
-        &canonical_ingest_root,
-        ext,
-        &mut files,
-        &mut skipped_outside_root,
-        &mut skipped_non_regular,
-        &mut skipped_non_source,
-    ) {
-        report
-            .warnings
-            .push(format!("walking {}: {e}", ingest_root.display()));
-        return Ok(());
-    }
+    let SourceWalkResult {
+        canonical_root: canonical_ingest_root,
+        files,
+        skipped_outside_root,
+        skipped_non_regular,
+        skipped_non_source,
+    } = walk;
     for skipped in skipped_outside_root {
         report.warnings.push(format!(
             "L1.5 skipped source outside the canonical ingest root: {}",
@@ -2470,14 +2547,7 @@ async fn run_import_scan(
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let mut manifest_failures = Vec::new();
-        let governing = manifest::find_governing_manifest(
-            file_dir,
-            &canonical_ingest_root,
-            language,
-            &mut manifest_failures,
-        );
-        record_manifest_failures(report, manifest_failures);
+        let governing = manifest_index.governing(file_dir, &canonical_ingest_root, language);
         let (proj_root, proj_name) = governing.unwrap_or_else(|| {
             (
                 canonical_ingest_root.clone(),
@@ -2488,9 +2558,11 @@ async fn run_import_scan(
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) =
-            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
-        else {
+        let (source_path, warnings, dropped) =
+            derive_source_path_on_worker(&file, &canonical_ingest_root, &snapshot.root).await?;
+        report.warnings.extend(warnings);
+        report.files_dropped_without_source_path += dropped;
+        let Some(source_path) = source_path else {
             continue;
         };
 
@@ -2515,14 +2587,18 @@ async fn run_import_scan(
             continue;
         };
 
-        let content = match safe_source::read_contained_to_string(&canonical_ingest_root, &file) {
-            Ok(c) => c,
-            Err(e) => {
-                record_source_read_failure(report, "L1.5", &file, e);
-                continue;
-            }
-        };
-        let hash = content_hash(&content);
+        let file_for_read = file.clone();
+        let root_for_read = canonical_ingest_root.clone();
+        let (hash, raw_imports) =
+            match blocking_io(move || scan_import_source(&root_for_read, &file_for_read, language))
+                .await?
+            {
+                Ok(scan) => scan,
+                Err(error) => {
+                    record_source_read_failure(report, "L1.5", &file, error);
+                    continue;
+                }
+            };
         let Some(module_id) = upsert_module(
             rt,
             token,
@@ -2564,7 +2640,7 @@ async fn run_import_scan(
 
         let mut scan_imports = Vec::new();
         let is_package = file.file_name().is_some_and(|name| name == "__init__.py");
-        for raw in imports::extract_raw_imports(language, &content) {
+        for raw in raw_imports {
             let resolved = if language == "typescript" && raw.starts_with('.') {
                 let rel_dir = file_dir.strip_prefix(&proj_root).unwrap_or(Path::new(""));
                 Resolved::IntraModule(imports::resolve_relative_ts_module(rel_dir, &raw))
@@ -3835,33 +3911,22 @@ async fn run_l2_sweep(
     let Some(ext) = imports::extension_for_language(LANGUAGE) else {
         return Ok(state);
     };
-    let canonical_ingest_root = match fs::canonicalize(ingest_root) {
-        Ok(path) => path,
+    let walk = match walk_source_files_on_worker(ingest_root, ext).await? {
+        Ok(walk) => walk,
         Err(error) => {
-            report.warnings.push(format!(
-                "canonicalizing L2 ingest root {}: {error}",
-                ingest_root.display()
-            ));
+            report
+                .warnings
+                .push(format!("walking {}: {error}", ingest_root.display()));
             return Ok(state);
         }
     };
-    let mut files = Vec::new();
-    let mut skipped_outside_root = Vec::new();
-    let mut skipped_non_regular = Vec::new();
-    let mut skipped_non_source = Vec::new();
-    if let Err(e) = collect_source_files(
-        &canonical_ingest_root,
-        ext,
-        &mut files,
-        &mut skipped_outside_root,
-        &mut skipped_non_regular,
-        &mut skipped_non_source,
-    ) {
-        report
-            .warnings
-            .push(format!("walking {}: {e}", ingest_root.display()));
-        return Ok(state);
-    }
+    let SourceWalkResult {
+        canonical_root: canonical_ingest_root,
+        files,
+        skipped_outside_root,
+        skipped_non_regular,
+        skipped_non_source,
+    } = walk;
     for skipped in skipped_outside_root {
         report.warnings.push(format!(
             "L2 skipped source outside the canonical ingest root: {}",
@@ -3886,18 +3951,22 @@ async fn run_l2_sweep(
         record_observed_language(report, LANGUAGE);
     }
 
+    // L2-only never requests the L1 manifest walk. Read only ancestors of
+    // canonical source paths and reuse that parsed snapshot for every file.
+    let files_for_manifests = files.clone();
+    let root_for_manifests = canonical_ingest_root.clone();
+    let (manifests, failures) = blocking_io(move || {
+        manifest::discover_rust_manifests_for_sources(&files_for_manifests, &root_for_manifests)
+    })
+    .await?;
+    record_manifest_failures(report, failures);
+    let manifest_index = manifest::ManifestIndex::new(&manifests);
+
     for file in files {
         let Some(file_dir) = file.parent() else {
             continue;
         };
-        let mut manifest_failures = Vec::new();
-        let governing = manifest::find_governing_manifest(
-            file_dir,
-            &canonical_ingest_root,
-            LANGUAGE,
-            &mut manifest_failures,
-        );
-        record_manifest_failures(report, manifest_failures);
+        let governing = manifest_index.governing(file_dir, &canonical_ingest_root, LANGUAGE);
         let (proj_root, proj_name) = governing.unwrap_or_else(|| {
             (
                 canonical_ingest_root.clone(),
@@ -3908,9 +3977,11 @@ async fn run_l2_sweep(
             report.files_skipped_without_module_path += 1;
             continue;
         };
-        let Some(source_path) =
-            derive_source_path(&file, &canonical_ingest_root, &snapshot.root, report)
-        else {
+        let (source_path, warnings, dropped) =
+            derive_source_path_on_worker(&file, &canonical_ingest_root, &snapshot.root).await?;
+        report.warnings.extend(warnings);
+        report.files_dropped_without_source_path += dropped;
+        let Some(source_path) = source_path else {
             continue;
         };
         let file_label = file.display().to_string();
@@ -3932,13 +4003,16 @@ async fn run_l2_sweep(
             continue;
         };
 
-        let source = match read_l2_source(&canonical_ingest_root, &file) {
-            Ok(source) => source,
-            Err(e) => {
-                record_source_read_failure(report, "L2", &file, e);
-                continue;
-            }
-        };
+        let file_for_read = file.clone();
+        let root_for_read = canonical_ingest_root.clone();
+        let source =
+            match blocking_io(move || read_l2_source(&root_for_read, &file_for_read)).await? {
+                Ok(source) => source,
+                Err(error) => {
+                    record_source_read_failure(report, "L2", &file, error);
+                    continue;
+                }
+            };
         let hash = source.hash().to_string();
         let refused = matches!(&source, L2Source::Refused { .. });
 
@@ -4538,6 +4612,18 @@ mod tests {
     use khive_runtime::{Namespace, RuntimeConfig};
     use tempfile::TempDir;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_worker_yields_the_async_executor() {
+        let worker = blocking_io(|| std::thread::sleep(std::time::Duration::from_millis(200)));
+        tokio::pin!(worker);
+        tokio::select! {
+            biased;
+            _ = &mut worker => panic!("blocking work completed before the executor timer"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        worker.await.expect("blocking worker completed");
+    }
+
     fn runtime_on(db_path: &Path) -> (KhiveRuntime, NamespaceToken) {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: Some(db_path.to_path_buf()),
@@ -4597,6 +4683,40 @@ mod tests {
         };
         assert_eq!(hash, format!("refused:size:{}", source.len()));
         assert!(reason.contains("scanner safety limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_scan_reader_refuses_opened_source_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("ingest root");
+        let outside = TempDir::new().expect("outside root");
+        let source = outside.path().join("outside.py");
+        fs::write(&source, "import must_not_ingest\n").expect("outside source");
+        let link = root.path().join("source.py");
+        symlink(&source, &link).expect("outside link");
+        assert!(matches!(
+            scan_import_source(&root.path().canonicalize().expect("canonical root"), &link, "python"),
+            Err(SourceReadError::Refused(reason)) if reason.contains("escapes the canonical ingest root")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_l2_reader_refuses_opened_source_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("ingest root");
+        let outside = TempDir::new().expect("outside root");
+        let source = outside.path().join("outside.rs");
+        fs::write(&source, "pub fn must_not_ingest() {}\n").expect("outside source");
+        let link = root.path().join("source.rs");
+        symlink(&source, &link).expect("outside link");
+        assert!(matches!(
+            read_l2_source(&root.path().canonicalize().expect("canonical root"), &link),
+            Err(SourceReadError::Refused(reason)) if reason.contains("escapes the canonical ingest root")
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

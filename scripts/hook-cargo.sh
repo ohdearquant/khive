@@ -42,6 +42,65 @@ case "${1:-}" in
   *) echo "hook-cargo.sh: expected fmt or clippy, got '${1:-}'" >&2; exit 2 ;;
 esac
 
+manifest="$(dirname "$0")/../crates/Cargo.toml"
+toolchain=$(
+  python3 - "$manifest" <<'PY'
+import re
+import sys
+
+manifest = sys.argv[1]
+try:
+    with open(manifest, encoding="utf-8") as source:
+        lines = source.readlines()
+except OSError as error:
+    sys.exit(f"cannot read {manifest}: {error}")
+
+in_workspace_package = False
+versions = []
+for line in lines:
+    value = line.strip()
+    if value.startswith("["):
+        in_workspace_package = value == "[workspace.package]"
+    elif in_workspace_package and value.startswith("rust-version"):
+        match = re.fullmatch(
+            r"rust-version\s*=\s*(['\"])(\d+\.\d+(?:\.\d+)?)\1(?:\s*#.*)?",
+            value,
+        )
+        if match is None:
+            sys.exit(f"invalid [workspace.package].rust-version in {manifest}")
+        versions.append(match.group(2))
+
+if len(versions) != 1:
+    sys.exit(f"expected exactly one [workspace.package].rust-version in {manifest}")
+print(versions[0])
+PY
+) || {
+  echo "hook-cargo.sh: cannot select the workspace Rust toolchain; fix $manifest before committing" >&2
+  exit 3
+}
+
+if ! command -v rustup >/dev/null 2>&1; then
+  echo "hook-cargo.sh: rustup is unavailable; install the declared toolchain with: rustup toolchain install $toolchain" >&2
+  exit 3
+fi
+if ! installed=$(rustup toolchain list --quiet); then
+  echo "hook-cargo.sh: cannot list installed Rust toolchains; install $toolchain with: rustup toolchain install $toolchain" >&2
+  exit 3
+fi
+found=0
+while IFS= read -r entry; do
+  case "$entry" in
+    "$toolchain"|"$toolchain"-*) found=1; break ;;
+  esac
+done <<< "$installed"
+if [ "$found" -ne 1 ]; then
+  echo "hook-cargo.sh: Rust toolchain $toolchain is not installed; run: rustup toolchain install $toolchain" >&2
+  exit 3
+fi
+# Cargo is the rustup proxy on supported hosts. Pin its selection for both
+# commands and carry the same selection through any configured flock wrapper.
+export RUSTUP_TOOLCHAIN="$toolchain"
+
 # Space-separated pids from this process up to init; used to recognise a lock
 # held by the script that issued the commit.
 ancestors=""

@@ -12,7 +12,7 @@ use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, StorageResult,
-    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorMetadataFilter, VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest,
     VectorStoreCapabilities, VectorStoreInfo,
 };
 
@@ -53,6 +53,17 @@ pub trait VectorStore: Send + Sync + 'static {
     }
     /// Insert a batch of pre-assembled vector records in one call.
     async fn insert_batch(&self, records: Vec<VectorRecord>) -> StorageResult<BatchWriteSummary>;
+    /// Read one persisted vector's provenance. `None` means no vector row;
+    /// present rows can still have unknown fingerprint and write time when
+    /// sidecar data is absent or does not match the live embedding.
+    async fn provenance(&self, subject_id: Uuid) -> StorageResult<Option<VectorProvenance>> {
+        let _ = subject_id;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "provenance".into(),
+            message: "backend has no vector provenance read seam".into(),
+        })
+    }
     /// Delete all vectors associated with the given subject ID.
     async fn delete(&self, subject_id: Uuid) -> StorageResult<bool>;
     /// Return the total number of vector entries in this store.

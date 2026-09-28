@@ -22,9 +22,14 @@ fn fixture(orphans: usize) -> (Connection, Arc<AtomicUsize>) {
            SELECT count_live_id(id) AS id, deleted_at FROM fixture_live_entities;
          CREATE TABLE notes(id TEXT PRIMARY KEY NOT NULL, deleted_at TEXT);
          CREATE TABLE knowledge_atoms(id TEXT PRIMARY KEY NOT NULL, deleted_at TEXT);
-         CREATE TABLE fixture_vectors(
+         CREATE TABLE vec_fixture(
            subject_id TEXT PRIMARY KEY NOT NULL, namespace TEXT NOT NULL,
            kind TEXT NOT NULL, field TEXT NOT NULL, embedding_model TEXT NOT NULL);
+         CREATE TABLE vector_provenance(
+           model_key TEXT NOT NULL, subject_id TEXT NOT NULL,
+           namespace TEXT NOT NULL, embedding_digest TEXT NOT NULL,
+           text_fingerprint TEXT, updated_at TEXT,
+           PRIMARY KEY(model_key, subject_id));
          CREATE TABLE ann_write_log(
            seq INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL,
            embedding_model TEXT NOT NULL, kind TEXT NOT NULL, field TEXT NOT NULL,
@@ -46,7 +51,14 @@ fn fixture(orphans: usize) -> (Connection, Arc<AtomicUsize>) {
 }
 fn insert_vector(conn: &Connection, id: &str, namespace: &str) {
     conn.execute(
-        "INSERT INTO fixture_vectors VALUES (?1, ?2, 'entity', 'body', 'fixture_model')",
+        "INSERT INTO vec_fixture VALUES (?1, ?2, 'entity', 'body', 'fixture_model')",
+        [id, namespace],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO vector_provenance \
+         (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
+         VALUES ('fixture', ?1, ?2, 'digest', 'fingerprint', 'write-time')",
         [id, namespace],
     )
     .unwrap();
@@ -59,7 +71,7 @@ fn measured_sweep(orphans: usize) -> usize {
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let report = super::orphan_sweep_dml(
         &conn,
-        "fixture_vectors",
+        "vec_fixture",
         None,
         None,
         None,
@@ -69,7 +81,8 @@ fn measured_sweep(orphans: usize) -> usize {
     .expect("production DML on diagnostic schema");
     assert_eq!(report.deleted, orphans as u64);
     tx.commit().unwrap();
-    assert_eq!(scalar(&conn, "SELECT count(*) FROM fixture_vectors"), 0);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vec_fixture"), 0);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 0);
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM ann_write_log"),
         orphans as i64
@@ -98,10 +111,11 @@ fn full_and_partial_batches_log_each_deleted_subject_exactly_once() {
     let (conn, _visits) = fixture(405);
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let report =
-        super::orphan_sweep_dml(&conn, "fixture_vectors", None, None, None, 403, false).unwrap();
+        super::orphan_sweep_dml(&conn, "vec_fixture", None, None, None, 403, false).unwrap();
     tx.commit().unwrap();
     assert_eq!(report.deleted, 403);
-    assert_eq!(scalar(&conn, "SELECT count(*) FROM fixture_vectors"), 2);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vec_fixture"), 2);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 2);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM ann_write_log"), 403);
     assert_eq!(
         scalar(
@@ -114,7 +128,7 @@ fn full_and_partial_batches_log_each_deleted_subject_exactly_once() {
     assert_eq!(
         scalar(
             &conn,
-            "SELECT count(*) FROM ann_write_log l JOIN fixture_vectors v \
+            "SELECT count(*) FROM ann_write_log l JOIN vec_fixture v \
                        ON v.subject_id = l.subject_id"
         ),
         0
@@ -133,13 +147,15 @@ fn late_log_failure_rolls_back_prior_batch_deletes_and_logs() {
     .unwrap();
     {
         let _tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let error = super::orphan_sweep_dml(&conn, "fixture_vectors", None, None, None, 403, false)
+        let error = super::orphan_sweep_dml(&conn, "vec_fixture", None, None, None, 403, false)
             .expect_err("second batch must reach the injected failure");
         assert!(error.to_string().contains("late_log_failure"));
-        assert_eq!(scalar(&conn, "SELECT count(*) FROM fixture_vectors"), 5);
+        assert_eq!(scalar(&conn, "SELECT count(*) FROM vec_fixture"), 5);
+        assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 5);
         assert_eq!(scalar(&conn, "SELECT count(*) FROM ann_write_log"), 400);
     }
-    assert_eq!(scalar(&conn, "SELECT count(*) FROM fixture_vectors"), 405);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vec_fixture"), 405);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 405);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM ann_write_log"), 0);
 }
 #[test]
@@ -147,11 +163,12 @@ fn dry_run_does_not_delete_or_append_logs() {
     let (conn, _visits) = fixture(405);
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let report =
-        super::orphan_sweep_dml(&conn, "fixture_vectors", None, None, None, 403, true).unwrap();
+        super::orphan_sweep_dml(&conn, "vec_fixture", None, None, None, 403, true).unwrap();
     tx.commit().unwrap();
     assert_eq!(report.would_delete, 405);
     assert_eq!(report.deleted, 0);
-    assert_eq!(scalar(&conn, "SELECT count(*) FROM fixture_vectors"), 405);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vec_fixture"), 405);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 405);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM ann_write_log"), 0);
 }
 #[test]
@@ -160,10 +177,11 @@ fn required_live_table_absence_refuses_before_deletion() {
     conn.execute_batch("DROP TABLE knowledge_atoms").unwrap();
     {
         let _tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        super::orphan_sweep_dml(&conn, "fixture_vectors", None, None, None, 5, false)
+        super::orphan_sweep_dml(&conn, "vec_fixture", None, None, None, 5, false)
             .expect_err("missing live-subject table must fail closed");
     }
-    assert_eq!(scalar(&conn, "SELECT count(*) FROM fixture_vectors"), 5);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vec_fixture"), 5);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 5);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM ann_write_log"), 0);
 }
 #[test]
@@ -180,7 +198,7 @@ fn namespace_filter_and_live_records_remain_protected() {
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let report = super::orphan_sweep_dml(
         &conn,
-        "fixture_vectors",
+        "vec_fixture",
         Some(r#"["ns:fixture"]"#),
         None,
         None,
@@ -192,14 +210,23 @@ fn namespace_filter_and_live_records_remain_protected() {
     assert_eq!(report.scanned, 408);
     assert_eq!(report.would_delete, 405);
     assert_eq!(report.deleted, 403);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM vector_provenance"), 6);
     for id in ["live-000000", "live-note", "live-atom", "outside-orphan"] {
         let present: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM fixture_vectors WHERE subject_id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM vec_fixture WHERE subject_id=?1)",
                 [id],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(present, "protected subject {id} disappeared");
+        let sidecar: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM vector_provenance WHERE model_key='fixture' AND subject_id=?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sidecar, "protected subject {id} lost provenance");
     }
 }
