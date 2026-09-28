@@ -278,6 +278,10 @@ struct ReindexReport {
     knowledge_atoms_indexed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_sections_indexed: Option<u64>,
+    /// Sections whose embedding input changed before a conditional vector
+    /// write. A later keep-existing pass can fill their NULL vectors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knowledge_sections_superseded: Option<u64>,
     /// Present only when `--rebuild-fts` actually ran the global FTS rebuild.
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_fts_rebuild: Option<KnowledgeFtsRebuildReport>,
@@ -810,6 +814,7 @@ async fn run_reindex_with_setup(
     // handler over the full corpus), not the verb-DSL shell.
     let mut knowledge_atoms_indexed: Option<u64> = None;
     let mut knowledge_sections_indexed: Option<u64> = None;
+    let mut knowledge_sections_superseded: Option<u64> = None;
     let mut knowledge_atoms_failed: u64 = 0;
     let mut knowledge_pass_errored = false;
     let mut knowledge_ann_failed = false;
@@ -865,6 +870,11 @@ async fn run_reindex_with_setup(
                             .and_then(|n| n.as_u64())
                             .unwrap_or(0),
                     );
+                    let superseded = v
+                        .get("sections_superseded")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                    knowledge_sections_superseded = (superseded > 0).then_some(superseded);
                     knowledge_sections_failed = v
                         .get("sections_failed")
                         .and_then(|n| n.as_u64())
@@ -908,6 +918,7 @@ async fn run_reindex_with_setup(
         notes_processed,
         knowledge_atoms_indexed,
         knowledge_sections_indexed,
+        knowledge_sections_superseded,
         knowledge_fts_rebuild,
         knowledge_atoms_failed,
         knowledge_pass_errored,
@@ -1375,6 +1386,11 @@ fn render_human_report(report: &ReindexReport) -> String {
         output.push_str(&format!(
             "Knowledge sections: {} section embed/write failures\n",
             report.knowledge_sections_failed
+        ));
+    }
+    if let Some(superseded) = report.knowledge_sections_superseded {
+        output.push_str(&format!(
+            "Knowledge sections: {superseded} changed during embedding; run a keep-existing reindex to fill remaining NULL vectors\n"
         ));
     }
     if report.vamana_snapshot_invalidation_failed {
@@ -2059,6 +2075,7 @@ read_only = true
             notes_processed: 0,
             knowledge_atoms_indexed: Some(0),
             knowledge_sections_indexed: None,
+            knowledge_sections_superseded: None,
             knowledge_fts_rebuild: None,
             knowledge_atoms_failed: k_failed,
             knowledge_pass_errored: k_errored,
@@ -2149,6 +2166,7 @@ read_only = true
             notes_processed: 0,
             knowledge_atoms_indexed: Some(10),
             knowledge_sections_indexed: None,
+            knowledge_sections_superseded: None,
             knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
@@ -2184,6 +2202,7 @@ read_only = true
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: Some(0),
+            knowledge_sections_superseded: None,
             knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
@@ -2210,6 +2229,19 @@ read_only = true
             decide_result(report.has_failures(), true).is_ok(),
             "best-effort downgrades knowledge_sections_failed to exit 0"
         );
+    }
+
+    #[test]
+    fn superseded_knowledge_sections_are_reported_without_a_failure_exit() {
+        let mut report = report_with(0, 0, false);
+        report.knowledge_sections_indexed = Some(0);
+        report.knowledge_sections_superseded = Some(2);
+        assert!(!report.has_failures());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["knowledge_sections_superseded"],
+            2
+        );
+        assert!(render_human_report(&report).contains("2 changed during embedding"));
     }
 
     #[test]
@@ -2819,6 +2851,7 @@ read_only = true
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: None,
+            knowledge_sections_superseded: None,
             knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
@@ -3630,6 +3663,7 @@ read_only = true
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: None,
+            knowledge_sections_superseded: None,
             knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
