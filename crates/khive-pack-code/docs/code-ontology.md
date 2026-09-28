@@ -66,6 +66,13 @@ unions, type aliases, traits, inline modules, selected type references, and posi
 call-graph floor. Method dispatch, macros, function values, dynamic dispatch, and other semantic
 Rust relationships are outside that floor, so L2 must not be interpreted as a complete call graph.
 
+Before Rust L2 parsing, the scanner refuses non-regular files, source files over 2 MiB, and files
+that exceed its conservative syntax-complexity limits. Each refusal increments
+`symbol_parse_failures`, records a warning, and leaves no current declaration ownership stamp;
+other files in the sweep continue. A size refusal uses a `refused:` module fingerprint rather than
+claiming a full-content hash for bytes it did not read. The L1 and L1.5 tiers keep their existing
+input behavior.
+
 `import_scan_status` distinguishes `scanned`, `partially_resolved`, and `unscanned` modules, with
 `import_specifier_count` and `unresolved_import_count` recording the completed scan's coverage.
 Both the project and module endpoints of `project contains module` carry the same

@@ -8,7 +8,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use khive_pack_code::source_ingest::{
@@ -2787,6 +2788,128 @@ async fn parse_failure_in_one_file_does_not_abort_the_sweep() {
     assert!(
         functions.iter().any(|(n, _)| n == "still_parses"),
         "the syntactically valid sibling file must still be ingested: {functions:?}"
+    );
+}
+
+/// The subprocess keeps the test runner alive if the old scanner aborts on
+/// hostile input. A successful child must record one refused file and keep
+/// processing its sibling; an abnormal child exit is a test failure.
+#[tokio::test]
+async fn crafted_rust_source_cannot_abort_l2_ingest() {
+    const CHILD_ENV: &str = "KHIVE_3292_INGEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "crafted_rust_source_cannot_abort_l2_ingest",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("isolated ingest test starts");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("child status").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop stalled ingest test");
+                child.wait().expect("reap stalled ingest test");
+                panic!("crafted Rust source stalled the isolated L2 ingest");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().expect("isolated ingest output");
+        assert!(
+            output.status.success(),
+            "isolated L2 ingest failed (status {}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = TempDir::new().expect("tempdir");
+    write_manifest(root.path(), "pkg_guarded_scan");
+    let pkg = root.path().join("pkg_guarded_scan");
+    let mut source = String::new();
+    for _ in 0..2_048 {
+        source.push_str("mod nested {\n");
+    }
+    source.push_str("pub fn unreachable_symbol() {}\n");
+    for _ in 0..2_048 {
+        source.push_str("}\n");
+    }
+    std::fs::write(pkg.join("src/hostile.rs"), source).expect("write crafted source");
+    let generic = format!(
+        "type Deep = {}u8{};\n",
+        "Vec<".repeat(2_048),
+        ">".repeat(2_048)
+    );
+    std::fs::write(pkg.join("src/generic.rs"), generic).expect("write nested type source");
+    let unary = format!("pub fn unary() {{ let _ = {}true; }}\n", "!".repeat(2_048));
+    std::fs::write(pkg.join("src/unary.rs"), unary).expect("write unary source");
+    let chain = format!("pub fn chain() {{ let _ = 1{}; }}\n", "+1".repeat(2_048));
+    std::fs::write(pkg.join("src/chain.rs"), chain).expect("write expression source");
+    let block_chain = format!("const X: usize = {{0}}{};\n", "+{0}".repeat(2_048));
+    std::fs::write(pkg.join("src/block_chain.rs"), block_chain)
+        .expect("write block expression source");
+    let function_type_chain = format!("const X: fn() = {{0}}{};\n", "+{0}".repeat(2_048));
+    std::fs::write(pkg.join("src/function_type_chain.rs"), function_type_chain)
+        .expect("write function-typed block expression source");
+    let generic_const = format!(
+        "impl {}u8{} {{}}\n",
+        "A<{0}, ".repeat(2_048),
+        ">".repeat(2_048)
+    );
+    std::fs::write(pkg.join("src/generic_const.rs"), generic_const)
+        .expect("write const-generic source");
+    std::fs::write(
+        pkg.join("src/healthy.rs"),
+        "pub fn still_ingested() -> i32 { 7 }\n",
+    )
+    .expect("write healthy sibling");
+
+    let rt = rt_at(&root.path().join("guarded-scan.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    eprintln!("L2 crafted-source fixture prepared; entering ingest");
+    let report = run_code_ingest(&rt, &token, l2_only_opts(&pkg))
+        .await
+        .expect("ingest returns after refusing a crafted file");
+    let l2 = report.l2.expect("L2 report group");
+    assert_eq!(l2.symbol_parse_failures, 7);
+    for file in [
+        "hostile.rs",
+        "generic.rs",
+        "unary.rs",
+        "chain.rs",
+        "block_chain.rs",
+        "function_type_chain.rs",
+        "generic_const.rs",
+    ] {
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains("L2 parse failed")
+                    && warning.contains(file)
+                    && warning.contains("scanner safety limit")
+            }),
+            "the refused file must be reported as a parse failure: {file}: {:?}",
+            report.warnings
+        );
+    }
+    let functions = concepts_by_type(&rt, "pkg_guarded_scan", "rust", "function").await;
+    assert!(
+        functions.iter().any(|(name, _)| name == "still_ingested"),
+        "a healthy sibling must still be ingested: {functions:?}"
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|(name, _)| name == "unreachable_symbol"),
+        "a refused file must not stamp its declarations"
     );
 }
 
