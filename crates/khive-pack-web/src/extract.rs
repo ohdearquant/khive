@@ -6,24 +6,27 @@
 //! or XML parser crate is a workspace dependency, so every extraction here
 //! uses regex matches and a fixed-capacity text scan rather than a DOM walk.
 //!
-//! - `links`: up to the per-page limit of `<a href="...">` values in an HTML
-//!   body become `page links_to page|resource` edges to a target
-//!   minted, if absent, as an unfetched `resource` (`status: null`) — never
-//!   overwritten if the target already exists and has been fetched.
+//! - `links`: admitted `<a>`, `<link>`, and response `Link` targets become
+//!   live `page links_to page|resource` edges with occurrence evidence. An
+//!   unfetched target is minted as a `resource` (`status: null`), and a
+//!   marked extracted edge is retracted only when its target is absent from
+//!   the full parsed set.
 //! - `sitemap`/`feed`: admitted `<loc>`/`<link>` entries become a `resource`
 //!   under the document's own `site`, linked `site contains resource` (the
 //!   pack's second `EDGE_RULES` row) — a feed/sitemap entry is the site's
 //!   content, not the feed document's.
-//! - `text`: a new `resource` holding the tag-stripped text, linked
-//!   `document derived_from document` (source: the new text resource,
-//!   target: the original) and keyed by [`identity::derived_text_id`] so
-//!   repeated extraction over an unchanged document converges on one row.
+//! - `text`: a `resource` holding the tag-stripped text, linked
+//!   `document derived_from document` and keyed by the source document and
+//!   stored body reference. A new body cannot overwrite an old excerpt.
+//!
+//! Every successful extraction writes an immutable note and roots its input
+//! body there for later reconstruction.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use khive_runtime::{KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
+use khive_runtime::{EdgeListFilter, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -38,6 +41,8 @@ use crate::WebPack;
 const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
 pub(crate) const DEFAULT_LINK_LIMIT: u32 = 100;
 const MAX_LINK_LIMIT: u32 = 1_000;
+const MAX_LINK_OCCURRENCES: usize = 10_000;
+const MAX_LINK_CONTEXT_BYTES: usize = 256;
 // Two fixed text buffers plus at most three UTF-8 bytes per raw byte (U+FFFD).
 // This pack-local aggregate budget is separate from raw blob admission. A
 // request acquires it once, after hydration, and never upgrades its reservation.
@@ -48,9 +53,14 @@ const MAX_DERIVED_BYTES: usize =
 static DERIVED_ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_DERIVED_BYTES)));
 
-static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<a\s[^>]*?href\s*=\s*["']([^"'#][^"']*)["']"#).expect("valid regex")
+static HTML_LINK_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<(a|link)\b([^>]*)>").expect("valid regex"));
+static HTML_ATTRIBUTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\b([a-z][a-z0-9:_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
+        .expect("valid regex")
 });
+static HTML_CLOSE_ANCHOR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)</a\s*>").expect("valid regex"));
 static LOC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?is)<loc>\s*([^<\s][^<]*?)\s*</loc>"#).expect("valid regex"));
 static ATOM_LINK_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -419,24 +429,350 @@ fn resolve_against(base: &Url, href: &str) -> Option<Url> {
     base.join(href).ok()
 }
 
+struct LinkOccurrence {
+    source: &'static str,
+    href: String,
+    rel: Vec<String>,
+    context: String,
+    context_truncated: bool,
+}
+
+struct LinkOccurrenceLimit;
+
+impl LinkOccurrenceLimit {
+    fn refusal(&self) -> Value {
+        json!({
+            "code": "too_many_link_occurrences",
+            "reason": format!(
+                "web.extract: more than {MAX_LINK_OCCURRENCES} link occurrences; narrow the input"
+            ),
+            "limit": MAX_LINK_OCCURRENCES,
+            "observed_at_least": MAX_LINK_OCCURRENCES + 1,
+        })
+    }
+}
+
+fn link_attribute(attributes: &str, name: &str) -> Option<String> {
+    HTML_ATTRIBUTE_RE
+        .captures_iter(attributes)
+        .find_map(|capture| {
+            if !capture[1].eq_ignore_ascii_case(name) {
+                return None;
+            }
+            capture
+                .get(2)
+                .or_else(|| capture.get(3))
+                .or_else(|| capture.get(4))
+                .map(|value| value.as_str().to_string())
+        })
+}
+
+fn relation_tokens(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn link_context(raw: &str) -> (String, bool) {
+    let mut context = String::new();
+    let mut in_tag = false;
+    let mut space = false;
+    for ch in raw.chars() {
+        if ch == '<' {
+            in_tag = true;
+            continue;
+        }
+        if ch == '>' && in_tag {
+            in_tag = false;
+            continue;
+        }
+        if in_tag {
+            continue;
+        }
+        if ch.is_whitespace() {
+            space = !context.is_empty();
+            continue;
+        }
+        if space && context.len() < MAX_LINK_CONTEXT_BYTES {
+            context.push(' ');
+        }
+        space = false;
+        if context.len() + ch.len_utf8() > MAX_LINK_CONTEXT_BYTES {
+            return (context.trim_end().to_string(), true);
+        }
+        context.push(ch);
+    }
+    (context.trim_end().to_string(), false)
+}
+
+fn push_occurrence(
+    occurrences: &mut Vec<LinkOccurrence>,
+    occurrence: LinkOccurrence,
+) -> Result<(), LinkOccurrenceLimit> {
+    if occurrences.len() == MAX_LINK_OCCURRENCES {
+        return Err(LinkOccurrenceLimit);
+    }
+    occurrences.push(occurrence);
+    Ok(())
+}
+
+fn parse_link_occurrences(
+    body: &str,
+    link_headers: &[String],
+) -> Result<Vec<LinkOccurrence>, LinkOccurrenceLimit> {
+    let mut occurrences = Vec::new();
+    for tag in HTML_LINK_TAG_RE.captures_iter(body) {
+        let attributes = &tag[2];
+        let Some(href) = link_attribute(attributes, "href") else {
+            continue;
+        };
+        let source = if tag[1].eq_ignore_ascii_case("a") {
+            "anchor"
+        } else {
+            "link"
+        };
+        let (context, context_truncated) = if source == "anchor" {
+            let after = &body[tag.get(0).expect("whole tag").end()..];
+            let mut end = after.len().min(MAX_LINK_CONTEXT_BYTES * 4);
+            while !after.is_char_boundary(end) {
+                end -= 1;
+            }
+            let candidate = &after[..end];
+            let inner = HTML_CLOSE_ANCHOR_RE
+                .find(candidate)
+                .map_or(candidate, |close| &candidate[..close.start()]);
+            let (text, truncated) = link_context(inner);
+            (text, truncated || inner.len() == end && end < after.len())
+        } else {
+            link_context(&link_attribute(attributes, "title").unwrap_or_default())
+        };
+        push_occurrence(
+            &mut occurrences,
+            LinkOccurrence {
+                source,
+                href,
+                rel: relation_tokens(&link_attribute(attributes, "rel").unwrap_or_default()),
+                context,
+                context_truncated,
+            },
+        )?;
+    }
+    for header in link_headers {
+        let mut start = 0;
+        let mut quoted = false;
+        let mut angled = false;
+        for (index, ch) in header
+            .char_indices()
+            .chain(std::iter::once((header.len(), ',')))
+        {
+            match ch {
+                '"' => quoted = !quoted,
+                '<' if !quoted => angled = true,
+                '>' if !quoted => angled = false,
+                ',' if !quoted && !angled => {
+                    let entry = header[start..index].trim();
+                    if let Some(open) = entry.find('<') {
+                        if let Some(close) = entry[open + 1..].find('>') {
+                            let close = open + 1 + close;
+                            let href = entry[open + 1..close].trim();
+                            let attributes = &entry[close + 1..];
+                            let mut rel = Vec::new();
+                            let mut context = String::new();
+                            let mut context_truncated = false;
+                            for parameter in attributes.split(';').skip(1) {
+                                if let Some((name, value)) = parameter.trim().split_once('=') {
+                                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                                    if name.trim().eq_ignore_ascii_case("rel") {
+                                        rel.extend(relation_tokens(value));
+                                    } else if name.trim().eq_ignore_ascii_case("title") {
+                                        (context, context_truncated) = link_context(value);
+                                    }
+                                }
+                            }
+                            push_occurrence(
+                                &mut occurrences,
+                                LinkOccurrence {
+                                    source: "header",
+                                    href: href.to_string(),
+                                    rel,
+                                    context,
+                                    context_truncated,
+                                },
+                            )?;
+                        }
+                    }
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(occurrences)
+}
+
+struct LinkTarget {
+    request_url: Url,
+    canonical: Url,
+    site: Uuid,
+    id: Uuid,
+    occurrences: Vec<Value>,
+}
+
+struct ExistingLinks {
+    existing_edge_ids: HashMap<Uuid, Uuid>,
+    unmarked_targets: HashSet<Uuid>,
+    legacy_claimed_targets: Vec<Uuid>,
+    legacy_claimed: Vec<Value>,
+    legacy_unclaimed: Vec<Value>,
+    retractions: Vec<Uuid>,
+}
+
+fn is_legacy_extractor_write(edge: &khive_storage::Edge) -> bool {
+    edge.metadata.is_none() && edge.weight == 1.0
+}
+
+async fn inspect_existing_links(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    document_id: Uuid,
+    present: &HashSet<Uuid>,
+    admitted: &HashSet<Uuid>,
+) -> Result<ExistingLinks, RuntimeError> {
+    let filter = EdgeListFilter {
+        source_id: Some(document_id),
+        relations: vec![EdgeRelation::LinksTo],
+        ..Default::default()
+    };
+    let mut existing = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = runtime
+            .list_edges(token, filter.clone(), 1_000, offset)
+            .await?;
+        let count = page.len();
+        existing.extend(page);
+        if count < 1_000 {
+            break;
+        }
+        offset += count as u32;
+    }
+    let mut existing_edge_ids = HashMap::new();
+    let mut unmarked_targets = HashSet::new();
+    let mut legacy_claimed_targets = Vec::new();
+    let mut legacy_claimed = Vec::new();
+    let mut legacy_unclaimed = Vec::new();
+    let mut retractions = Vec::new();
+    for edge in existing {
+        if edge.namespace != token.namespace().as_str() {
+            continue;
+        }
+        let marked = edge
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("web_extract"))
+            == Some(&Value::Bool(true));
+        existing_edge_ids.insert(edge.target_id, Uuid::from(edge.id));
+        if !marked {
+            if present.contains(&edge.target_id) && is_legacy_extractor_write(&edge) {
+                legacy_claimed_targets.push(edge.target_id);
+                legacy_claimed.push(json!({
+                    "edge_id": Uuid::from(edge.id).to_string(),
+                    "target_id": edge.target_id.to_string(),
+                    "admitted": admitted.contains(&edge.target_id),
+                }));
+            } else {
+                unmarked_targets.insert(edge.target_id);
+                legacy_unclaimed.push(json!({
+                    "edge_id": Uuid::from(edge.id).to_string(),
+                    "target_id": edge.target_id.to_string(),
+                    "live": true,
+                    "present_in_extraction": present.contains(&edge.target_id),
+                    "collides_with_admitted_target": admitted.contains(&edge.target_id),
+                }));
+            }
+        } else if !present.contains(&edge.target_id) {
+            retractions.push(edge.id);
+        }
+    }
+    // `list_edges` intentionally omits tombstones. An unmarked soft-deleted
+    // triple is still a caller-owned natural key and must not be resurrected
+    // as extractor-owned merely because its target reappears.
+    for target_id in admitted {
+        if existing_edge_ids.contains_key(target_id) {
+            continue;
+        }
+        let Some(edge) = runtime
+            .get_edge_by_natural_key_including_deleted(
+                token,
+                token.namespace().as_str(),
+                document_id,
+                *target_id,
+                EdgeRelation::LinksTo,
+            )
+            .await?
+        else {
+            continue;
+        };
+        existing_edge_ids.insert(*target_id, Uuid::from(edge.id));
+        let marked = edge
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("web_extract"))
+            == Some(&Value::Bool(true));
+        if !marked {
+            if edge.deleted_at.is_none() && is_legacy_extractor_write(&edge) {
+                legacy_claimed_targets.push(*target_id);
+                legacy_claimed.push(json!({
+                    "edge_id": Uuid::from(edge.id).to_string(),
+                    "target_id": target_id.to_string(),
+                    "admitted": true,
+                }));
+            } else {
+                unmarked_targets.insert(*target_id);
+                legacy_unclaimed.push(json!({
+                    "edge_id": Uuid::from(edge.id).to_string(),
+                    "target_id": target_id.to_string(),
+                    "live": edge.deleted_at.is_none(),
+                    "present_in_extraction": true,
+                    "collides_with_admitted_target": true,
+                }));
+            }
+        }
+    }
+    Ok(ExistingLinks {
+        existing_edge_ids,
+        unmarked_targets,
+        legacy_claimed_targets,
+        legacy_claimed,
+        legacy_unclaimed,
+        retractions: retractions.into_iter().map(Uuid::from).collect(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn extract_links(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     document_id: Uuid,
     base_url: &Url,
-    body: &str,
+    occurrences: Vec<LinkOccurrence>,
     link_limit: u32,
-) -> Result<(u32, u32), RuntimeError> {
-    let mut seen = std::collections::HashSet::new();
-    let mut targets = Vec::new();
+    source_content_ref: &str,
+    capture_receipt_id: Option<Uuid>,
+) -> Result<(u32, u32, u32, Vec<Value>, Vec<Value>, Vec<Value>), RuntimeError> {
+    let mut positions: HashMap<Uuid, usize> = HashMap::new();
+    let mut unadmitted_positions: HashMap<Uuid, usize> = HashMap::new();
+    let mut present = HashSet::new();
+    let mut targets: Vec<LinkTarget> = Vec::new();
+    let mut unadmitted: Vec<LinkTarget> = Vec::new();
     let mut skipped = 0u32;
-    for capture in HREF_RE.captures_iter(body) {
-        if targets.len() >= link_limit as usize {
-            skipped += 1;
-            continue;
-        }
-        let href = capture[1].trim();
-        if href.is_empty() || href.starts_with("javascript:") || href.starts_with("mailto:") {
+    for occurrence in occurrences {
+        let href = occurrence.href.trim();
+        let disallowed_scheme = ["javascript:", "mailto:"].into_iter().any(|prefix| {
+            href.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        });
+        if href.is_empty() || href.starts_with('#') || disallowed_scheme {
             continue;
         }
         let Some(target_url) = resolve_against(base_url, href) else {
@@ -447,62 +783,170 @@ async fn extract_links(
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
         let site = identity::site_id(&canonical);
         let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
-        targets.push((request_url, canonical, site, target_id));
+        present.insert(target_id);
+        let evidence = json!({
+            "source": occurrence.source,
+            "href": occurrence.href,
+            "rel": occurrence.rel,
+            "context": occurrence.context,
+            "context_truncated": occurrence.context_truncated,
+        });
+        if let Some(index) = positions.get(&target_id).copied() {
+            targets[index].occurrences.push(evidence);
+        } else if targets.len() < link_limit as usize {
+            positions.insert(target_id, targets.len());
+            targets.push(LinkTarget {
+                request_url,
+                canonical,
+                site,
+                id: target_id,
+                occurrences: vec![evidence],
+            });
+        } else {
+            if let Some(index) = unadmitted_positions.get(&target_id).copied() {
+                unadmitted[index].occurrences.push(evidence);
+            } else {
+                skipped = skipped.saturating_add(1);
+                unadmitted_positions.insert(target_id, unadmitted.len());
+                unadmitted.push(LinkTarget {
+                    request_url,
+                    canonical,
+                    site,
+                    id: target_id,
+                    occurrences: vec![evidence],
+                });
+            }
+        }
     }
 
     let processed = targets.len() as u32;
+    let admitted: HashSet<Uuid> = targets.iter().map(|target| target.id).collect();
+    // Inspect before link_many: its natural-key upsert would overwrite an
+    // unmarked caller edge and make its ownership impossible to recover.
+    let existing = inspect_existing_links(runtime, token, document_id, &present, &admitted).await?;
     let mut link_specs = Vec::with_capacity(targets.len() * 2);
-    for (request_url, canonical, site, target_id) in targets {
+    let mut owned_positions = HashMap::new();
+    for target in &targets {
         crate::entities::get_or_create(
             runtime,
             token,
-            site,
+            target.site,
             "service",
             "site",
-            &identity::site_key(&canonical),
+            &identity::site_key(&target.canonical),
             json!({
-                "scheme": canonical.scheme(),
-                "host": canonical.host_str(),
-                "port": canonical.port_or_known_default(),
+                "scheme": target.canonical.scheme(),
+                "host": target.canonical.host_str(),
+                "port": target.canonical.port_or_known_default(),
             }),
         )
         .await?;
         crate::entities::get_or_create(
             runtime,
             token,
-            target_id,
+            target.id,
             "document",
             "resource",
-            canonical.as_ref(),
-            json!({ "url": request_url.to_string(), "status": Value::Null }),
+            target.canonical.as_ref(),
+            json!({ "url": target.request_url.to_string(), "status": Value::Null }),
         )
         .await?;
         link_specs.push(LinkSpec {
             namespace: None,
-            source_id: site,
-            target_id,
+            source_id: target.site,
+            target_id: target.id,
             relation: EdgeRelation::Contains,
             weight: 1.0,
             metadata: None,
             resurrect: false,
         });
+        if !existing.unmarked_targets.contains(&target.id) {
+            owned_positions.insert(target.id, link_specs.len());
+            link_specs.push(LinkSpec {
+                namespace: None,
+                source_id: document_id,
+                target_id: target.id,
+                relation: EdgeRelation::LinksTo,
+                weight: 1.0,
+                metadata: Some(json!({
+                    "web_extract": true,
+                    "source_content_ref": source_content_ref,
+                    "capture_receipt_id": capture_receipt_id.map(|id| id.to_string()),
+                    "occurrence_count": target.occurrences.len(),
+                    "occurrences": target.occurrences,
+                })),
+                resurrect: true,
+            });
+        }
+    }
+    // A present default-shaped legacy edge beyond the admission budget was
+    // still observed in this capture. Mark ownership with claim provenance
+    // only; the immutable note carries this run's occurrence detail.
+    for target_id in &existing.legacy_claimed_targets {
+        if admitted.contains(target_id) {
+            continue;
+        }
         link_specs.push(LinkSpec {
             namespace: None,
             source_id: document_id,
-            target_id,
+            target_id: *target_id,
             relation: EdgeRelation::LinksTo,
             weight: 1.0,
-            metadata: None,
+            metadata: Some(json!({
+                "web_extract": true,
+                "claimed_source_content_ref": source_content_ref,
+                "capture_receipt_id": capture_receipt_id.map(|id| id.to_string()),
+            })),
             resurrect: false,
         });
     }
-    runtime.link_many(token, link_specs).await?;
-    Ok((processed, skipped))
+    let edges = runtime.link_many(token, link_specs).await?;
+    for edge_id in &existing.retractions {
+        runtime.delete_edge(token, *edge_id, false).await?;
+    }
+    let collisions = targets
+        .iter()
+        .filter(|target| existing.unmarked_targets.contains(&target.id))
+        .count() as u32;
+    let mut evidence: Vec<Value> = targets
+        .iter()
+        .map(|target| {
+            let edge_id = owned_positions
+                .get(&target.id)
+                .map(|index| Uuid::from(edges[*index].id))
+                .or_else(|| existing.existing_edge_ids.get(&target.id).copied());
+            json!({
+                "target_id": target.id.to_string(),
+                "edge_id": edge_id.map(|id| id.to_string()),
+                "url": target.canonical.to_string(),
+                "occurrence_count": target.occurrences.len(),
+                "occurrences": target.occurrences,
+                "admitted": true,
+                "ownership_collision": existing.unmarked_targets.contains(&target.id),
+            })
+        })
+        .collect();
+    evidence.extend(unadmitted.iter().map(|target| {
+        json!({
+            "target_id": target.id.to_string(),
+            "edge_id": existing.existing_edge_ids.get(&target.id).map(Uuid::to_string),
+            "url": target.canonical.to_string(),
+            "occurrence_count": target.occurrences.len(),
+            "occurrences": target.occurrences,
+            "admitted": false,
+            "ownership_collision": existing.unmarked_targets.contains(&target.id),
+        })
+    }));
+    Ok((
+        processed,
+        skipped,
+        collisions,
+        evidence,
+        existing.legacy_claimed,
+        existing.legacy_unclaimed,
+    ))
 }
 
 async fn extract_entries(
@@ -605,11 +1049,14 @@ async fn extract_entries(
     Ok((count, skipped))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn extract_text(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     original_id: Uuid,
     original_url: &str,
+    source_content_ref: &str,
+    capture_receipt_id: Option<Uuid>,
     body: &[u8],
     derived_admission: &Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Uuid, RuntimeError> {
@@ -619,7 +1066,7 @@ async fn extract_text(
     let store = crate::blob_store(runtime)?;
     let content_ref = put_excerpt(store, excerpt, Arc::clone(derived_admission)).await?;
 
-    let text_id = identity::derived_text_id(original_id);
+    let text_id = identity::derived_text_id(original_id, source_content_ref);
     crate::entities::get_or_create(
         runtime,
         token,
@@ -627,7 +1074,11 @@ async fn extract_text(
         "document",
         "resource",
         &format!("{original_url} (extracted text)"),
-        json!({ "derived_from": original_id.to_string() }),
+        json!({
+            "derived_from": original_id.to_string(),
+            "source_content_ref": source_content_ref,
+            "capture_receipt_id": capture_receipt_id.map(|id| id.to_string()),
+        }),
     )
     .await?;
     crate::entities::patch(
@@ -637,6 +1088,7 @@ async fn extract_text(
         Some("resource"),
         json!({
             "derived_from": original_id.to_string(),
+            "source_content_ref": source_content_ref,
             "content_type": "text/plain",
             "blob_ref": content_ref.to_string(),
             "size": excerpt_bytes as u64,
@@ -685,6 +1137,45 @@ async fn put_excerpt(
         .map_err(RuntimeError::from)
 }
 
+async fn verify_source_body(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    document_id: Uuid,
+    source_content_ref: &str,
+) -> Result<(), RuntimeError> {
+    let current = runtime.entities(token)?.get_entity(document_id).await?;
+    if let Some(entity) = &current {
+        crate::entities::require_entity_namespace(token, entity)?;
+    }
+    // Web graph rows may live on a routed backend, while all body roots live
+    // on canonical main (ADR-191 A1). The graph backend's content_ref
+    // projection therefore cannot establish attachment concordance.
+    let attachment = runtime
+        .core()
+        .attachments()?
+        .get_attachment(document_id, "content")
+        .await?;
+    if attachment
+        .as_ref()
+        .filter(|attachment| attachment.substrate == khive_storage::AttachmentSubstrate::Entity)
+        .map(|attachment| attachment.content_ref.as_str())
+        != Some(source_content_ref)
+        || current
+            .as_ref()
+            .and_then(|entity| entity.properties.as_ref())
+            .and_then(|properties| properties.get("blob_ref"))
+            .and_then(Value::as_str)
+            != Some(source_content_ref)
+    {
+        return Err(Refusal::new(
+            "capture_changed",
+            "the stored body or its content attachment changed while web.extract read it; retry",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 async fn run_extract_with_link_selection(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -710,12 +1201,28 @@ async fn run_extract_with_link_selection(
         })?;
     let content_ref = khive_storage::ContentRef::from_hex(content_ref)
         .map_err(|error| RuntimeError::Internal(format!("stored blob_ref is invalid: {error}")))?;
+    let source_content_ref = content_ref.to_string();
+    let capture =
+        crate::receipt::capture_for_body(runtime, token, &entity, &source_content_ref).await?;
+    let capture_receipt_id = capture.as_ref().map(|(id, _)| *id);
+    let link_headers: Vec<String> = capture
+        .as_ref()
+        .and_then(|(_, request)| request["headers"]["link"].as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let hydrator = runtime.blob_hydrator().ok_or_else(|| {
         RuntimeError::Unconfigured(
             "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
                 .to_string(),
         )
     })?;
+    verify_source_body(runtime, token, target_id, &source_content_ref).await?;
     let verified = hydrator
         .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
         .await?;
@@ -774,26 +1281,65 @@ async fn run_extract_with_link_selection(
         None => Cow::Owned(decode_body(verified.bytes(), decoded_bytes)),
     };
 
+    // Parse before any kind writes. A link occurrence refusal degrades only
+    // the links kind; the final extraction note still roots this source body.
+    let mut parsed_links = kinds
+        .iter()
+        .any(|kind| kind == "links")
+        .then(|| parse_link_occurrences(&body, &link_headers));
+    // The second check closes the hydration and parse window before any
+    // derived row, link, or extraction note is written. Later interleavings
+    // still require an atomic graph replacement primitive to serialize fully.
+    verify_source_body(runtime, token, target_id, &source_content_ref).await?;
     let mut result = serde_json::Map::new();
     let mut targets_remaining = link_limit;
+    let mut link_evidence = Vec::new();
+    let mut legacy_claimed = Vec::new();
+    let mut legacy_unclaimed = Vec::new();
+    let mut link_skipped = 0;
+    let mut link_collisions = 0;
+    let mut derived_ids = Vec::new();
+    let mut refusal = None;
     for kind in &kinds {
         match kind.as_str() {
-            "links" => {
-                let (count, skipped) = extract_links(
-                    runtime,
-                    token,
-                    target_id,
-                    &base_url,
-                    &body,
-                    targets_remaining,
-                )
-                .await?;
-                targets_remaining = targets_remaining.saturating_sub(count);
-                result.insert(
-                    "links".to_string(),
-                    json!({ "edges_created": count, "skipped": skipped }),
-                );
-            }
+            "links" => match parsed_links.take().expect("selected links were pre-parsed") {
+                Ok(occurrences) => {
+                    let (count, skipped, collisions, evidence, claimed, unclaimed) = extract_links(
+                        runtime,
+                        token,
+                        target_id,
+                        &base_url,
+                        occurrences,
+                        targets_remaining,
+                        &source_content_ref,
+                        capture_receipt_id,
+                    )
+                    .await?;
+                    targets_remaining = targets_remaining.saturating_sub(count);
+                    link_evidence = evidence;
+                    legacy_claimed = claimed;
+                    legacy_unclaimed = unclaimed;
+                    link_skipped = skipped;
+                    link_collisions = collisions;
+                    result.insert(
+                        "links".to_string(),
+                        json!({
+                            "edges_created": count - collisions,
+                            "admitted_targets": count,
+                            "skipped": skipped,
+                            "ownership_collisions": collisions,
+                        }),
+                    );
+                }
+                Err(limit) => {
+                    let reason = limit.refusal();
+                    result.insert(
+                        "links".to_string(),
+                        json!({ "refused": true, "refusal": reason }),
+                    );
+                    refusal = Some(reason);
+                }
+            },
             "sitemap" => {
                 let (count, skipped) =
                     extract_entries(runtime, token, site_id, &body, "sitemap", targets_remaining)
@@ -820,20 +1366,50 @@ async fn run_extract_with_link_selection(
                     token,
                     target_id,
                     &url_str,
+                    &source_content_ref,
+                    capture_receipt_id,
                     verified.bytes(),
                     &derived,
                 )
                 .await?;
+                derived_ids.push(text_id);
                 result.insert("text".to_string(), json!({ "id": text_id.to_string() }));
             }
             _ => unreachable!("validated above"),
         }
     }
 
+    let extraction_receipt_id = crate::receipt::write_extraction_receipt(
+        runtime,
+        token,
+        target_id,
+        json!({
+            "verb": "web.extract",
+            "source_content_ref": source_content_ref,
+            "capture_receipt_id": capture_receipt_id.map(|id| id.to_string()),
+            "kinds": kinds,
+            "result": result,
+            "links": link_evidence,
+            "legacy_claimed": if refusal.is_some() { Value::Null } else { json!(legacy_claimed) },
+            "legacy_unclaimed": if refusal.is_some() { Value::Null } else { json!(legacy_unclaimed) },
+            "links_complete": refusal.is_none() && link_skipped == 0 && link_collisions == 0,
+            "status": if refusal.is_some() { "degraded" } else { "complete" },
+            "refusal": refusal,
+        }),
+        derived_ids,
+        &content_ref,
+        verified.bytes().len() as u64,
+        content_type,
+    )
+    .await?;
+
     Ok(json!({
         "id": target_id.to_string(),
         "kinds": kinds,
         "result": Value::Object(result),
+        "status": if refusal.is_some() { "degraded" } else { "complete" },
+        "refusal": refusal,
+        "receipt_id": extraction_receipt_id.to_string(),
     }))
 }
 
@@ -1260,7 +1836,72 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::fetch::root_body(
+            runtime,
+            id,
+            khive_storage::AttachmentSubstrate::Entity,
+            &content_ref,
+            Some(content_type),
+            body.len() as u64,
+        )
+        .await
+        .unwrap();
         id
+    }
+
+    async fn capture_page(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: Uuid,
+        body: &[u8],
+        link_headers: &[&str],
+    ) -> (String, Uuid) {
+        let store = crate::blob_store(runtime).unwrap();
+        let content_ref = store.put(body.to_vec()).await.unwrap();
+        let reference = content_ref.to_string();
+        crate::entities::patch(
+            runtime,
+            token,
+            id,
+            None,
+            json!({ "blob_ref": reference, "content_type": "text/html" }),
+        )
+        .await
+        .unwrap();
+        crate::fetch::root_body(
+            runtime,
+            id,
+            khive_storage::AttachmentSubstrate::Entity,
+            &content_ref,
+            Some("text/html"),
+            body.len() as u64,
+        )
+        .await
+        .unwrap();
+        let receipt_id = crate::receipt::write_receipt(
+            runtime,
+            token,
+            "web.fetch GET test capture",
+            json!({
+                "verb": "web.fetch",
+                "content_ref": reference,
+                "body_entity_id": id.to_string(),
+                "headers": { "link": link_headers },
+            }),
+            vec![id],
+        )
+        .await
+        .unwrap();
+        crate::entities::patch(
+            runtime,
+            token,
+            id,
+            None,
+            json!({ "capture_receipt_id": receipt_id.to_string() }),
+        )
+        .await
+        .unwrap();
+        (reference, receipt_id)
     }
 
     // A2: extract(links) on a page with N distinct hrefs yields N links_to
@@ -1549,6 +2190,1061 @@ mod tests {
         assert_eq!(neighbors[0].node_id, page_id);
     }
 
+    #[tokio::test]
+    async fn two_captures_keep_distinct_excerpts_and_retract_missing_live_links() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let first = b"<p>Same words</p><a href='/old' rel='next'>Link</a>";
+        let second = b"<section>Same words</section><a href='/new' rel='next'>Link</a>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://capture.example.test/page",
+            "text/html",
+            first,
+        )
+        .await;
+        let (first_ref, first_capture) = capture_page(&runtime, &token, page_id, first, &[]).await;
+        crate::receipt::write_receipt(
+            &runtime,
+            &token,
+            "web.fetch HEAD after test capture",
+            json!({ "verb": "web.fetch", "method": "HEAD", "content_ref": null }),
+            vec![page_id],
+        )
+        .await
+        .unwrap();
+        let params = || ExtractParams {
+            id: Some(page_id),
+            url: None,
+            kinds: Some(vec!["text".into(), "links".into()]),
+            link_limit: None,
+            namespace: None,
+        };
+        let first_reply = run_extract(&runtime, &token, params()).await.unwrap();
+        let first_text =
+            Uuid::parse_str(first_reply["result"]["text"]["id"].as_str().unwrap()).unwrap();
+        let first_extraction =
+            Uuid::parse_str(first_reply["receipt_id"].as_str().unwrap()).unwrap();
+
+        let (second_ref, second_capture) =
+            capture_page(&runtime, &token, page_id, second, &[]).await;
+        let second_reply = run_extract(&runtime, &token, params()).await.unwrap();
+        let second_text =
+            Uuid::parse_str(second_reply["result"]["text"]["id"].as_str().unwrap()).unwrap();
+        let second_extraction =
+            Uuid::parse_str(second_reply["receipt_id"].as_str().unwrap()).unwrap();
+
+        assert_ne!(first_ref, second_ref);
+        assert_ne!(
+            first_text, second_text,
+            "body identity must not be excerpt identity"
+        );
+        let notes = runtime.notes(&token).unwrap();
+        for (id, expected_ref, expected_capture, expected_target) in [
+            (first_extraction, &first_ref, first_capture, "/old"),
+            (second_extraction, &second_ref, second_capture, "/new"),
+        ] {
+            let note = notes.get_note(id).await.unwrap().unwrap();
+            let properties = note.properties.unwrap();
+            let request = &properties["request"];
+            assert_eq!(request["source_content_ref"], expected_ref.as_str());
+            assert_eq!(request["capture_receipt_id"], expected_capture.to_string());
+            assert!(request["links"][0]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with(expected_target));
+            let source = runtime
+                .core()
+                .attachments()
+                .unwrap()
+                .get_attachment(id, "source")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.content_ref.to_string(), expected_ref.as_str());
+        }
+        let entities = runtime.entities(&token).unwrap();
+        let old_text = entities.get_entity(first_text).await.unwrap().unwrap();
+        let new_text = entities.get_entity(second_text).await.unwrap().unwrap();
+        assert_eq!(
+            old_text.properties.as_ref().unwrap()["source_content_ref"],
+            first_ref
+        );
+        assert_eq!(
+            new_text.properties.as_ref().unwrap()["source_content_ref"],
+            second_ref
+        );
+        assert_eq!(
+            old_text.properties.as_ref().unwrap()["blob_ref"],
+            new_text.properties.as_ref().unwrap()["blob_ref"],
+            "two different HTML bodies can produce the same excerpt bytes"
+        );
+        let neighbors = runtime
+            .neighbors(
+                &token,
+                page_id,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::LinksTo]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        let current = entities
+            .get_entity(neighbors[0].node_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.name.ends_with("/new"));
+
+        capture_page(&runtime, &token, page_id, first, &[]).await;
+        run_extract(&runtime, &token, params()).await.unwrap();
+        let restored = runtime
+            .neighbors(
+                &token,
+                page_id,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::LinksTo]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        let restored_target = entities
+            .get_entity(restored[0].node_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(restored_target.name.ends_with("/old"));
+    }
+
+    #[tokio::test]
+    async fn link_rel_context_occurrences_and_header_survive_on_edges_and_receipt() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = br#"<a href="/same" rel="next prev">Continue</a>
+            <a href="/same" rel="license">Terms</a>
+            <link href="/style.css" rel="stylesheet" title="Main style">"#;
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://links.example.test/page",
+            "text/html",
+            body,
+        )
+        .await;
+        capture_page(
+            &runtime,
+            &token,
+            page_id,
+            body,
+            &["<https://links.example.test/legal>; rel=license; title=Legal"],
+        )
+        .await;
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: None,
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["links"]["edges_created"], 3);
+        let edges = runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 3);
+        let same = identity::canonicalize(Url::parse("https://links.example.test/same").unwrap());
+        let same_id =
+            identity::document_id(identity::site_id(&same), &identity::path_and_query(&same));
+        let same_edge = edges.iter().find(|edge| edge.target_id == same_id).unwrap();
+        let metadata = same_edge.metadata.as_ref().unwrap();
+        assert_eq!(metadata["occurrence_count"], 2);
+        assert_eq!(metadata["occurrences"][0]["rel"], json!(["next", "prev"]));
+        assert_eq!(metadata["occurrences"][0]["context"], "Continue");
+        assert_eq!(metadata["occurrences"][1]["rel"], json!(["license"]));
+        assert_eq!(metadata["occurrences"][1]["context"], "Terms");
+        assert!(edges.iter().any(
+            |edge| edge.metadata.as_ref().unwrap()["occurrences"][0]["rel"]
+                == json!(["stylesheet"])
+        ));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.metadata.as_ref().unwrap()["occurrences"][0]["source"] == "header"));
+
+        let receipt_id = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+        let receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let properties = receipt.properties.unwrap();
+        let request = &properties["request"];
+        assert_eq!(request["links"].as_array().unwrap().len(), 3);
+        assert_eq!(request["links_complete"], true);
+
+        let limited = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: Some(1),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let live = runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 3, "budget-skipped present links stay live");
+        assert!(live.iter().any(|edge| edge.target_id == same_id));
+        let limited_receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(limited["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let limited_properties = limited_receipt.properties.unwrap();
+        let limited_request = &limited_properties["request"];
+        assert_eq!(limited_request["links_complete"], false);
+        assert_eq!(limited_request["links"].as_array().unwrap().len(), 3);
+        assert_eq!(limited_request["links"][1]["admitted"], false);
+        assert!(limited_request["links"][1]["edge_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn legacy_links_are_preserved_with_present_collision_and_absence_evidence() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let first_body = b"<a href='/present'>Present</a><a href='/deleted'>Deleted</a>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://legacy.example.test/page",
+            "text/html",
+            first_body,
+        )
+        .await;
+        let present_id = seed_page(
+            &runtime,
+            &token,
+            "https://legacy.example.test/present",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        let absent_id = seed_page(
+            &runtime,
+            &token,
+            "https://legacy.example.test/absent",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        let deleted_id = seed_page(
+            &runtime,
+            &token,
+            "https://legacy.example.test/deleted",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        runtime
+            .link(
+                &token,
+                page_id,
+                present_id,
+                EdgeRelation::LinksTo,
+                0.7,
+                Some(json!({ "legacy_label": "kept" })),
+            )
+            .await
+            .unwrap();
+        runtime
+            .link(&token, page_id, absent_id, EdgeRelation::LinksTo, 1.0, None)
+            .await
+            .unwrap();
+        let deleted_edge = runtime
+            .link(
+                &token,
+                page_id,
+                deleted_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .delete_edge(&token, Uuid::from(deleted_edge.id), false)
+            .await
+            .unwrap();
+        capture_page(&runtime, &token, page_id, first_body, &[]).await;
+        let params = || ExtractParams {
+            id: Some(page_id),
+            url: None,
+            kinds: Some(vec!["links".into()]),
+            link_limit: Some(2),
+            namespace: None,
+        };
+        let first = run_extract(&runtime, &token, params()).await.unwrap();
+        assert_eq!(first["result"]["links"]["edges_created"], 0);
+        assert_eq!(first["result"]["links"]["admitted_targets"], 2);
+        assert_eq!(first["result"]["links"]["ownership_collisions"], 2);
+        let filter = EdgeListFilter {
+            source_id: Some(page_id),
+            relations: vec![EdgeRelation::LinksTo],
+            ..Default::default()
+        };
+        let edges = runtime
+            .list_edges(&token, filter.clone(), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+        let present_edge = edges
+            .iter()
+            .find(|edge| edge.target_id == present_id)
+            .unwrap();
+        assert_eq!(
+            present_edge.metadata.as_ref().unwrap(),
+            &json!({ "legacy_label": "kept" })
+        );
+        assert_eq!(present_edge.weight, 0.7);
+        let absent_edge = edges
+            .iter()
+            .find(|edge| edge.target_id == absent_id)
+            .unwrap();
+        assert!(absent_edge.metadata.is_none());
+        let first_receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let first_properties = first_receipt.properties.unwrap();
+        let first_request = &first_properties["request"];
+        assert_eq!(first_request["links"][0]["admitted"], true);
+        assert_eq!(first_request["links"][0]["ownership_collision"], true);
+        assert_eq!(first_request["links"][1]["ownership_collision"], true);
+        assert_eq!(first_request["links_complete"], false);
+        assert!(first_request["legacy_claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let unclaimed = first_request["legacy_unclaimed"].as_array().unwrap();
+        assert_eq!(unclaimed.len(), 3);
+        assert!(unclaimed.iter().any(|edge| {
+            edge["target_id"] == present_id.to_string()
+                && edge["present_in_extraction"] == true
+                && edge["collides_with_admitted_target"] == true
+        }));
+        assert!(unclaimed.iter().any(|edge| {
+            edge["target_id"] == absent_id.to_string() && edge["present_in_extraction"] == false
+        }));
+        assert!(unclaimed.iter().any(|edge| {
+            edge["target_id"] == deleted_id.to_string()
+                && edge["live"] == false
+                && edge["collides_with_admitted_target"] == true
+        }));
+        let tombstone = runtime
+            .get_edge_by_natural_key_including_deleted(
+                &token,
+                token.namespace().as_str(),
+                page_id,
+                deleted_id,
+                EdgeRelation::LinksTo,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tombstone.deleted_at.is_some());
+
+        capture_page(&runtime, &token, page_id, b"<p>No links</p>", &[]).await;
+        let second = run_extract(&runtime, &token, params()).await.unwrap();
+        let edges = runtime.list_edges(&token, filter, 100, 0).await.unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            edge.target_id == present_id
+                && edge.metadata.as_ref() == Some(&json!({ "legacy_label": "kept" }))
+                && edge.weight == 0.7
+        }));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.target_id == absent_id && edge.metadata.is_none()));
+        let second_receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(second["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_properties = second_receipt.properties.unwrap();
+        assert_eq!(
+            second_properties["request"]["legacy_unclaimed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_default_present_is_claimed_caller_metadata_collides_and_absent_survives() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let first_body = b"<a href='/default'>Default</a><a href='/caller'>Caller</a>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/page",
+            "text/html",
+            first_body,
+        )
+        .await;
+        let default_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/default",
+            "text/html",
+            b"<p>Default</p>",
+        )
+        .await;
+        let caller_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/caller",
+            "text/html",
+            b"<p>Caller</p>",
+        )
+        .await;
+        let absent_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/absent",
+            "text/html",
+            b"<p>Absent</p>",
+        )
+        .await;
+        let original_default = runtime
+            .link(
+                &token,
+                page_id,
+                default_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .link(
+                &token,
+                page_id,
+                caller_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                Some(json!({ "caller_label": "keep" })),
+            )
+            .await
+            .unwrap();
+        runtime
+            .link(&token, page_id, absent_id, EdgeRelation::LinksTo, 1.0, None)
+            .await
+            .unwrap();
+        capture_page(&runtime, &token, page_id, first_body, &[]).await;
+        let params = || ExtractParams {
+            id: Some(page_id),
+            url: None,
+            kinds: Some(vec!["links".into()]),
+            link_limit: Some(2),
+            namespace: None,
+        };
+        let first = run_extract(&runtime, &token, params()).await.unwrap();
+        assert_eq!(first["result"]["links"]["edges_created"], 1);
+        assert_eq!(first["result"]["links"]["admitted_targets"], 2);
+        assert_eq!(first["result"]["links"]["ownership_collisions"], 1);
+        let filter = EdgeListFilter {
+            source_id: Some(page_id),
+            relations: vec![EdgeRelation::LinksTo],
+            ..Default::default()
+        };
+        let edges = runtime
+            .list_edges(&token, filter.clone(), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 3);
+        let default = edges
+            .iter()
+            .find(|edge| edge.target_id == default_id)
+            .unwrap();
+        assert_eq!(default.id, original_default.id);
+        assert_eq!(default.metadata.as_ref().unwrap()["web_extract"], true);
+        let caller = edges
+            .iter()
+            .find(|edge| edge.target_id == caller_id)
+            .unwrap();
+        assert_eq!(
+            caller.metadata.as_ref().unwrap(),
+            &json!({ "caller_label": "keep" })
+        );
+        let absent = edges
+            .iter()
+            .find(|edge| edge.target_id == absent_id)
+            .unwrap();
+        assert!(absent.metadata.is_none());
+        let receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt_properties = receipt.properties.unwrap();
+        let request = &receipt_properties["request"];
+        assert_eq!(request["links_complete"], false);
+        let claimed = request["legacy_claimed"].as_array().unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0]["edge_id"],
+            Uuid::from(original_default.id).to_string()
+        );
+        assert_eq!(claimed[0]["target_id"], default_id.to_string());
+        assert_eq!(claimed[0]["admitted"], true);
+        let unclaimed = request["legacy_unclaimed"].as_array().unwrap();
+        assert_eq!(unclaimed.len(), 2);
+        assert!(unclaimed.iter().any(|edge| {
+            edge["target_id"] == caller_id.to_string()
+                && edge["present_in_extraction"] == true
+                && edge["collides_with_admitted_target"] == true
+        }));
+        assert!(unclaimed.iter().any(|edge| {
+            edge["target_id"] == absent_id.to_string() && edge["present_in_extraction"] == false
+        }));
+
+        capture_page(&runtime, &token, page_id, b"<p>No links</p>", &[]).await;
+        run_extract(&runtime, &token, params()).await.unwrap();
+        let edges = runtime.list_edges(&token, filter, 100, 0).await.unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| edge.target_id != default_id));
+        assert!(edges.iter().any(|edge| {
+            edge.target_id == caller_id
+                && edge.metadata.as_ref() == Some(&json!({ "caller_label": "keep" }))
+        }));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.target_id == absent_id && edge.metadata.is_none()));
+    }
+
+    #[tokio::test]
+    async fn legacy_default_present_is_claimed_even_when_budget_skips_target() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let first_body = b"<a href='/target'>Target</a>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/limited",
+            "text/html",
+            first_body,
+        )
+        .await;
+        let target_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/target",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        runtime
+            .link(&token, page_id, target_id, EdgeRelation::LinksTo, 1.0, None)
+            .await
+            .unwrap();
+        capture_page(&runtime, &token, page_id, first_body, &[]).await;
+        let params = || ExtractParams {
+            id: Some(page_id),
+            url: None,
+            kinds: Some(vec!["links".into()]),
+            link_limit: Some(0),
+            namespace: None,
+        };
+        let first = run_extract(&runtime, &token, params()).await.unwrap();
+        assert_eq!(first["result"]["links"]["admitted_targets"], 0);
+        assert_eq!(first["result"]["links"]["skipped"], 1);
+        let receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt_properties = receipt.properties.unwrap();
+        let request = &receipt_properties["request"];
+        assert_eq!(
+            request["legacy_claimed"][0]["target_id"],
+            target_id.to_string()
+        );
+        assert_eq!(request["legacy_claimed"][0]["admitted"], false);
+        let edge = runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    target_id: Some(target_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(edge.metadata.as_ref().unwrap()["web_extract"], true);
+        capture_page(&runtime, &token, page_id, b"<p>No links</p>", &[]).await;
+        run_extract(&runtime, &token, params()).await.unwrap();
+        assert!(runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    target_id: Some(target_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_nondefault_weight_present_remains_unclaimed() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"<a href='/weighted-target'>Target</a>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/weighted",
+            "text/html",
+            body,
+        )
+        .await;
+        let target_id = seed_page(
+            &runtime,
+            &token,
+            "https://claim.example.test/weighted-target",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        runtime
+            .link(&token, page_id, target_id, EdgeRelation::LinksTo, 0.7, None)
+            .await
+            .unwrap();
+        capture_page(&runtime, &token, page_id, body, &[]).await;
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: Some(1),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["links"]["ownership_collisions"], 1);
+        let edges = runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].weight, 0.7);
+        assert!(edges[0].metadata.is_none());
+        capture_page(&runtime, &token, page_id, b"<p>No links</p>", &[]).await;
+        run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: Some(1),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let edges = runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].weight, 0.7);
+        assert!(edges[0].metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_selection_requires_the_body_owner_even_when_digest_and_annotation_match() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"<p>Shared bytes</p>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://owner.example.test/page",
+            "text/html",
+            body,
+        )
+        .await;
+        let (reference, source_capture) = capture_page(&runtime, &token, page_id, body, &[]).await;
+        let other_id = seed_page(
+            &runtime,
+            &token,
+            "https://owner.example.test/other",
+            "text/html",
+            body,
+        )
+        .await;
+        let other_capture = crate::receipt::write_receipt(
+            &runtime,
+            &token,
+            "redirect participant with identical body digest",
+            json!({
+                "verb": "web.fetch",
+                "content_ref": reference,
+                "body_entity_id": other_id.to_string(),
+                "headers": { "link": ["<https://owner.example.test/wrong>; rel=next"] },
+            }),
+            vec![page_id, other_id],
+        )
+        .await
+        .unwrap();
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let selected = crate::receipt::capture_for_body(&runtime, &token, &page, &reference)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.0, source_capture);
+
+        // The pointer is only a hint. If it too names the wrong owner, the
+        // capture is unknown rather than misattributed to this document.
+        crate::entities::patch(
+            &runtime,
+            &token,
+            page_id,
+            None,
+            json!({ "capture_receipt_id": other_capture.to_string() }),
+        )
+        .await
+        .unwrap();
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::receipt::capture_for_body(&runtime, &token, &page, &reference)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: Some(10),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["links"]["edges_created"], 0);
+        let receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(receipt.properties.unwrap()["request"]["capture_receipt_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn extraction_refuses_property_and_content_attachment_mismatch_before_writes() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://owner.example.test/mismatch",
+            "text/html",
+            b"<a href='/old'>Old</a>",
+        )
+        .await;
+        let store = crate::blob_store(&runtime).unwrap();
+        let second = store.put(b"<a href='/new'>New</a>".to_vec()).await.unwrap();
+        crate::entities::patch(
+            &runtime,
+            &token,
+            page_id,
+            None,
+            json!({ "blob_ref": second.to_string() }),
+        )
+        .await
+        .unwrap();
+        assert!(!crate::receipt::bind_capture_receipt(
+            &runtime,
+            &token,
+            page_id,
+            second.as_ref(),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap());
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(page
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("capture_receipt_id"))
+            .is_none());
+        let error = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into(), "text".into()]),
+                link_limit: None,
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref reason) if reason.starts_with("capture_changed:"))
+        );
+        assert!(runtime
+            .latest_annotating_note(
+                &token,
+                page_id,
+                "observation",
+                crate::receipt::EXTRACTION_RECEIPT_TAG
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn occurrence_limit_writes_degraded_receipt_without_link_mutation() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = "<a href='/same'>Same</a>".repeat(MAX_LINK_OCCURRENCES + 1);
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://limit.example.test/page",
+            "text/html",
+            body.as_bytes(),
+        )
+        .await;
+        let marked_id = seed_page(
+            &runtime,
+            &token,
+            "https://limit.example.test/marked",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        let unmarked_id = seed_page(
+            &runtime,
+            &token,
+            "https://limit.example.test/unmarked",
+            "text/html",
+            b"<p>Target</p>",
+        )
+        .await;
+        runtime
+            .link(
+                &token,
+                page_id,
+                marked_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                Some(json!({ "web_extract": true })),
+            )
+            .await
+            .unwrap();
+        runtime
+            .link(
+                &token,
+                page_id,
+                unmarked_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let (source_ref, _) = capture_page(&runtime, &token, page_id, body.as_bytes(), &[]).await;
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into(), "text".into()]),
+                link_limit: Some(1),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["status"], "degraded");
+        assert_eq!(reply["result"]["links"]["refused"], true);
+        assert!(reply["result"]["text"]["id"].is_string());
+        assert_eq!(reply["refusal"]["code"], "too_many_link_occurrences");
+        let edges = runtime
+            .list_edges(
+                &token,
+                EdgeListFilter {
+                    source_id: Some(page_id),
+                    relations: vec![EdgeRelation::LinksTo],
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edges.len(),
+            2,
+            "the refused links kind does not reconcile edges"
+        );
+        assert_eq!(
+            edges
+                .iter()
+                .find(|edge| edge.target_id == marked_id)
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()["web_extract"],
+            true
+        );
+        assert!(edges
+            .iter()
+            .find(|edge| edge.target_id == unmarked_id)
+            .unwrap()
+            .metadata
+            .is_none());
+        let receipt_id = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+        let note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let properties = note.properties.unwrap();
+        let request = &properties["request"];
+        assert_eq!(request["status"], "degraded");
+        assert_eq!(request["refusal"]["code"], "too_many_link_occurrences");
+        assert_eq!(request["links_complete"], false);
+        assert!(request["legacy_claimed"].is_null());
+        assert!(request["legacy_unclaimed"].is_null());
+        let source = runtime
+            .core()
+            .attachments()
+            .unwrap()
+            .get_attachment(receipt_id, "source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.content_ref.to_string(), source_ref);
+    }
+
     // extract(text)'s excerpt cap is a BYTE bound, and the cut never
     // splits a multi-byte character even when the raw byte offset lands
     // mid-character.
@@ -1583,6 +3279,8 @@ mod tests {
             &token,
             page_id,
             "https://origin.example.test/big-multibyte",
+            blake3::hash(html.as_bytes()).to_hex().as_ref(),
+            None,
             html.as_bytes(),
             &derived,
         )

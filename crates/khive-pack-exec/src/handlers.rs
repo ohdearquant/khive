@@ -5,12 +5,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
+use std::future::Future;
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -23,6 +30,9 @@ use crate::capture::{drain, walk, CaptureRead, Tail};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
+
+const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOOL_BINARY_BYTES: u64 = MAX_RUN_INPUT_BYTES;
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -48,7 +58,7 @@ fn opt_limit(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, R
         None | Some(Value::Null) => Ok(default),
         Some(v) => v
             .as_u64()
-            .map(|n| (n as u32).clamp(1, max))
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
             .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a positive integer"))),
     }
 }
@@ -322,6 +332,7 @@ pub fn identity(cfg: &Resolved) -> Value {
         "max_output_bytes": cfg.max_output_bytes,
         "timeout_default_s": cfg.timeout_default_s,
         "timeout_max_s": cfg.timeout_max_s,
+        "binary_digest_timeout_s": cfg.binary_digest_timeout_s,
         "keep": cfg.keep,
         "limits": cfg.limits.to_json(),
         "digest": "blake3-hex",
@@ -345,6 +356,8 @@ struct Receipt {
     denied: bool,
     success: bool,
     reason: Option<String>,
+    refusal_code: &'static str,
+    refusal_detail: Value,
     decision: Option<Value>,
     stdout_ref: Option<String>,
     stderr_ref: Option<String>,
@@ -376,7 +389,7 @@ struct Receipt {
 
 impl Receipt {
     fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "actor": self.actor,
             "tool": self.tool,
@@ -417,7 +430,14 @@ impl Receipt {
                 (Some(s), Some(f)) => Some((f - s) / 1000),
                 _ => None,
             },
-        })
+        });
+        if self.refusal_code != "exec_refused" {
+            value["refusal"] = json!({
+                "code": self.refusal_code,
+                "detail": self.refusal_detail,
+            });
+        }
+        value
     }
 }
 
@@ -474,6 +494,14 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
             cfg.timeout_max_s
         )));
     }
+    let timeout = Duration::try_from_secs_f64(timeout_s)
+        .ok()
+        .filter(|duration| !duration.is_zero() && Instant::now().checked_add(*duration).is_some())
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "timeout_s must be positive, finite, and representable as a deadline".into(),
+            )
+        })?;
     let session_id = opt_str(params, "session_id")?.filter(|s| !s.is_empty());
     let declared = opt_str_list(params, "declared_write_paths")?;
     if let Some(list) = &declared {
@@ -488,7 +516,7 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
         actor,
         cwd,
         env,
-        timeout: Duration::from_secs_f64(timeout_s),
+        timeout,
         session_id,
         declared,
     })
@@ -516,17 +544,262 @@ fn tool_binary(entity: &khive_storage::Entity) -> Result<String, RuntimeError> {
     }
 }
 
-fn refusal_error(reason: &str, id: &str, effective_max_output_bytes: u64) -> RuntimeError {
+#[derive(Clone, Copy)]
+struct BinaryDigestBudget {
+    started: Instant,
+    timeout: Duration,
+    max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryDigestErrorKind {
+    Read,
+    ByteLimit,
+    TimeLimit,
+    Worker,
+}
+
+impl BinaryDigestErrorKind {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Read => "binary_digest_read",
+            Self::ByteLimit => "binary_digest_byte_limit",
+            Self::TimeLimit => "binary_digest_time_limit",
+            Self::Worker => "binary_digest_worker",
+        }
+    }
+}
+
+#[derive(Default)]
+struct BinaryDigestProgress {
+    bytes_read: AtomicU64,
+    path_class: Mutex<Option<&'static str>>,
+}
+
+#[derive(Debug)]
+struct BinaryDigestError {
+    kind: BinaryDigestErrorKind,
+    elapsed_ms: u64,
+    bytes_read: u64,
+    byte_cap: u64,
+    time_cap_ms: u64,
+    path_class: Option<&'static str>,
+    cause: Option<String>,
+}
+
+impl BinaryDigestError {
+    fn new(
+        kind: BinaryDigestErrorKind,
+        budget: BinaryDigestBudget,
+        progress: &BinaryDigestProgress,
+        cause: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            elapsed_ms: u64::try_from(budget.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bytes_read: progress.bytes_read.load(Ordering::Relaxed),
+            byte_cap: budget.max_bytes,
+            time_cap_ms: u64::try_from(budget.timeout.as_millis()).unwrap_or(u64::MAX),
+            path_class: *progress.path_class.lock().unwrap(),
+            cause,
+        }
+    }
+
+    fn detail(&self) -> Value {
+        json!({
+            "elapsed_ms": self.elapsed_ms,
+            "bytes_read": self.bytes_read,
+            "byte_cap": self.byte_cap,
+            "time_cap_ms": self.time_cap_ms,
+            "path_class": self.path_class,
+            "cause": self.cause,
+        })
+    }
+}
+
+impl std::fmt::Display for BinaryDigestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            BinaryDigestErrorKind::Read | BinaryDigestErrorKind::Worker => write!(
+                f,
+                "{}: {}",
+                self.kind.code(),
+                self.cause
+                    .as_deref()
+                    .unwrap_or("registered tool could not be read")
+            ),
+            BinaryDigestErrorKind::ByteLimit => write!(
+                f,
+                "{}: registered tool exceeds {} bytes",
+                self.kind.code(),
+                self.byte_cap
+            ),
+            BinaryDigestErrorKind::TimeLimit => write!(
+                f,
+                "{}: registered tool digest exceeded {} ms",
+                self.kind.code(),
+                self.time_cap_ms
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+static HASH_PROBE: std::sync::Mutex<
+    Option<(PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+type DigestStall = (
+    PathBuf,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<(Mutex<bool>, std::sync::Condvar)>,
+);
+
+#[cfg(test)]
+static DIGEST_STALL: Mutex<Option<DigestStall>> = Mutex::new(None);
+
+#[cfg(test)]
+struct TestStalledReader<R> {
+    inner: R,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl<R: Read> Read for TestStalledReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let stall = DIGEST_STALL.lock().unwrap().clone();
+        if let Some((target, entered, release)) = stall {
+            if target == self.path {
+                entered.store(true, Ordering::SeqCst);
+                let (lock, signal) = &*release;
+                let held = lock.lock().unwrap();
+                let _held = signal
+                    .wait_timeout_while(held, Duration::from_secs(4), |released| !*released)
+                    .unwrap();
+            }
+        }
+        self.inner.read(buffer)
+    }
+}
+
+fn hash_tool_binary(
+    path: &Path,
+    budget: BinaryDigestBudget,
+    progress: &BinaryDigestProgress,
+) -> Result<String, BinaryDigestError> {
+    #[cfg(test)]
+    if let Some((target, count)) = HASH_PROBE.lock().unwrap().as_ref() {
+        if target == path {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let failure = |kind, cause| BinaryDigestError::new(kind, budget, progress, cause);
+    if budget.started.elapsed() >= budget.timeout {
+        return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)
+        .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
+    let class = if metadata.is_file() {
+        "regular_file"
+    } else if metadata.is_dir() {
+        "directory"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+    *progress.path_class.lock().unwrap() = Some(class);
+    if !metadata.is_file() {
+        return Err(failure(
+            BinaryDigestErrorKind::Read,
+            Some("registered tool is not a regular file".into()),
+        ));
+    }
+    #[cfg(test)]
+    {
+        let mut reader = TestStalledReader {
+            inner: file,
+            path: path.to_path_buf(),
+        };
+        hash_tool_binary_reader(&mut reader, budget, progress)
+    }
+    #[cfg(not(test))]
+    {
+        let mut file = file;
+        hash_tool_binary_reader(&mut file, budget, progress)
+    }
+}
+
+fn hash_tool_binary_reader(
+    reader: &mut impl Read,
+    budget: BinaryDigestBudget,
+    progress: &BinaryDigestProgress,
+) -> Result<String, BinaryDigestError> {
+    let failure = |kind, cause| BinaryDigestError::new(kind, budget, progress, cause);
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        if budget.started.elapsed() >= budget.timeout {
+            return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
+        }
+        let remaining = budget.max_bytes.saturating_sub(total).saturating_add(1);
+        let read_len = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(chunk.len()));
+        let read = reader
+            .read(&mut chunk[..read_len])
+            .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
+        total += read as u64;
+        progress.bytes_read.store(total, Ordering::Relaxed);
+        if budget.started.elapsed() >= budget.timeout {
+            return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
+        }
+        if read == 0 {
+            break;
+        }
+        if total > budget.max_bytes {
+            return Err(failure(BinaryDigestErrorKind::ByteLimit, None));
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn refusal_error(reason: &str, receipt: &Receipt) -> RuntimeError {
+    let mut detail = receipt
+        .refusal_detail
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    detail.insert(
+        "effective_max_output_bytes".into(),
+        json!(receipt.effective_max_output_bytes),
+    );
     RuntimeError::RefusedWithReceipt(Box::new(khive_runtime::ReceiptRefusal {
-        code: "exec_refused",
+        code: receipt.refusal_code,
         // Unchanged wording: the id stays inside the sentence for readers that
         // already parse it, and rides beside it as `receipt_id` for readers that
         // should not have to. `reason` and the resolved cap ride the same way,
         // so the envelope carries what the denied receipt records.
-        message: format!("exec.run refused: {reason} (receipt_id={id})"),
-        receipt_id: id.to_string(),
+        message: format!("exec.run refused: {reason} (receipt_id={})", receipt.id),
+        receipt_id: receipt.id.clone(),
         reason: reason.to_string(),
-        detail: json!({ "effective_max_output_bytes": effective_max_output_bytes }),
+        detail: Value::Object(detail),
     }))
 }
 
@@ -555,6 +828,8 @@ pub async fn run(
         denied: false,
         success: false,
         reason: None,
+        refusal_code: "exec_refused",
+        refusal_detail: Value::Null,
         decision: None,
         stdout_ref: None,
         stderr_ref: None,
@@ -619,21 +894,59 @@ pub async fn run(
             receipt.reason = Some(reason.clone());
             let value = receipt.to_json();
             receipts::insert(rt, &ns, &value).await?;
-            Err(refusal_error(
-                &reason,
-                &id,
-                receipt.effective_max_output_bytes,
-            ))
+            Err(refusal_error(&reason, &receipt))
         }
     }
 }
 
 /// What preflight hands to execution once every refusal rule passed.
 struct Ready {
-    binary: PathBuf,
+    binary_digest: String,
     registered: String,
     registry_id: Uuid,
     entries: Vec<TreeEntry>,
+    input_sizes: BTreeMap<String, u64>,
+}
+
+fn checked_input_total(total: u64, next: u64, ceiling: u64) -> Result<u64, String> {
+    total
+        .checked_add(next)
+        .filter(|sum| *sum <= ceiling)
+        .ok_or_else(|| format!("input tree exceeds {ceiling} bytes"))
+}
+
+async fn preflight_input_sizes(
+    rt: &KhiveRuntime,
+    entries: &[TreeEntry],
+) -> Result<BTreeMap<String, u64>, String> {
+    let store = tree::blob_store(rt).map_err(|error| error.to_string())?;
+    let mut sizes = BTreeMap::new();
+    let mut total = 0_u64;
+    for entry in entries {
+        let size = if let Some(size) = sizes.get(&entry.content_ref) {
+            *size
+        } else {
+            let reference = ContentRef::from_hex(&entry.content_ref)
+                .map_err(|error| format!("entry {:?} ref: {error}", entry.path))?;
+            let size = store
+                .size(&reference)
+                .await
+                .map_err(|error| format!("input blob {}: {error}", entry.content_ref))?
+                .ok_or_else(|| format!("entry {:?} references a missing blob", entry.path))?;
+            if size > khive_storage::MAX_BLOB_WHOLE_BYTES {
+                return Err(format!(
+                    "entry {:?} exceeds the per-blob hydration limit",
+                    entry.path
+                ));
+            }
+            sizes.insert(entry.content_ref.clone(), size);
+            size
+        };
+        // Count materialized entries, not just distinct references: two
+        // paths sharing a blob still occupy bytes twice in the run tree.
+        total = checked_input_total(total, size, MAX_RUN_INPUT_BYTES)?;
+    }
+    Ok(sizes)
 }
 
 fn preflight_registry_pin(entity: &khive_storage::Entity) -> Result<RegistryPin, RuntimeError> {
@@ -712,13 +1025,52 @@ async fn preflight(
             req.actor, entity.name, decision.decision, decision.source
         ));
     }
+    let maximum_digest_timeout = khive_runtime::engine_config::MAX_EXEC_BINARY_DIGEST_TIMEOUT_S;
+    if !(1..=maximum_digest_timeout).contains(&cfg.binary_digest_timeout_s) {
+        return Err(format!(
+            "binary_digest_timeout_s is outside the configured 1..={maximum_digest_timeout} second range"
+        ));
+    }
+    let budget = BinaryDigestBudget {
+        started: Instant::now(),
+        timeout: Duration::from_secs(cfg.binary_digest_timeout_s),
+        max_bytes: MAX_TOOL_BINARY_BYTES,
+    };
+    let progress = Arc::new(BinaryDigestProgress::default());
+    let worker_progress = Arc::clone(&progress);
+    let digest_result = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(budget.started + budget.timeout),
+        tokio::task::spawn_blocking(move || hash_tool_binary(&binary, budget, &worker_progress)),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(BinaryDigestError::new(
+            BinaryDigestErrorKind::Worker,
+            budget,
+            &progress,
+            Some(error.to_string()),
+        )),
+        Err(_) => Err(BinaryDigestError::new(
+            BinaryDigestErrorKind::TimeLimit,
+            budget,
+            &progress,
+            None,
+        )),
+    };
+    let binary_digest = match digest_result {
+        Ok(digest) => digest,
+        Err(error) => {
+            receipt.refusal_code = error.kind.code();
+            receipt.refusal_detail = error.detail();
+            return Err(error.to_string());
+        }
+    };
     // Tree and cwd.
     let entries = tree::load(rt, &req.tree_in)
         .await
         .map_err(|e| format!("tree: {e}"))?;
-    tree::verify_blobs(rt, &entries)
-        .await
-        .map_err(|e| format!("tree: {e}"))?;
+    let input_sizes = preflight_input_sizes(rt, &entries).await?;
     let cwd = tree::resolve_cwd(rt, &entries, &req.cwd)
         .await
         .map_err(|e| e.to_string())?;
@@ -728,13 +1080,119 @@ async fn preflight(
     // materializing a tree that could only ever fail at spawn.
     sandbox::check_backend(sandbox::SANDBOX_EXEC)?;
     Ok(Ready {
-        binary,
+        binary_digest,
         registered,
         registry_id: entity.id,
         entries,
+        input_sizes,
     })
 }
 
+#[cfg(unix)]
+struct PartialRunDir<'a> {
+    path: &'a Path,
+    complete: bool,
+}
+
+#[cfg(unix)]
+impl Drop for PartialRunDir<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = std::fs::remove_dir_all(self.path);
+        }
+    }
+}
+
+/// Hydrate only the entry being written. Its admission lease stays held
+/// through the write, then drops before the next blob is requested.
+#[cfg(unix)]
+async fn materialize_hydrated(
+    rt: &KhiveRuntime,
+    run_dir: &Path,
+    entries: &[TreeEntry],
+    input_sizes: &BTreeMap<String, u64>,
+) -> Result<(), RuntimeError> {
+    let hydrator = rt
+        .blob_hydrator()
+        .ok_or_else(|| RuntimeError::Unconfigured("exec blob hydrator is not installed".into()))?;
+    std::fs::create_dir(run_dir).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "creating run directory {}: {error}",
+            run_dir.display()
+        ))
+    })?;
+    let mut partial = PartialRunDir {
+        path: run_dir,
+        complete: false,
+    };
+
+    // A manifest cannot name a file as another entry's parent. Create all
+    // regular files before links so filesystem aliases cannot redirect a
+    // later materialization write.
+    for entry in entries.iter().filter(|entry| entry.mode != 120000) {
+        let target = run_dir.join(&entry.path);
+        let reference = ContentRef::from_hex(&entry.content_ref).map_err(|error| {
+            RuntimeError::InvalidInput(format!("entry {:?} ref: {error}", entry.path))
+        })?;
+        let size = *input_sizes.get(&entry.content_ref).ok_or_else(|| {
+            RuntimeError::Internal(format!("input size missing for entry {:?}", entry.path))
+        })?;
+        let blob = hydrator.hydrate_verified(&reference, size).await?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                RuntimeError::Unconfigured(format!(
+                    "creating input directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .await
+            .map_err(|error| {
+                RuntimeError::Unconfigured(format!("creating input {:?}: {error}", entry.path))
+            })?;
+        file.write_all(blob.bytes()).await.map_err(|error| {
+            RuntimeError::Unconfigured(format!("writing input {:?}: {error}", entry.path))
+        })?;
+        let mode = if entry.mode == 755 { 0o755 } else { 0o644 };
+        tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|error| {
+                RuntimeError::Unconfigured(format!("setting input mode {:?}: {error}", entry.path))
+            })?;
+    }
+    for entry in entries.iter().filter(|entry| entry.mode == 120000) {
+        let target = run_dir.join(&entry.path);
+        let reference = ContentRef::from_hex(&entry.content_ref).map_err(|error| {
+            RuntimeError::InvalidInput(format!("entry {:?} ref: {error}", entry.path))
+        })?;
+        let size = *input_sizes.get(&entry.content_ref).ok_or_else(|| {
+            RuntimeError::Internal(format!("input size missing for entry {:?}", entry.path))
+        })?;
+        let blob = hydrator.hydrate_verified(&reference, size).await?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                RuntimeError::Unconfigured(format!(
+                    "creating input directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(blob.bytes()), &target).map_err(
+            |error| {
+                RuntimeError::Unconfigured(format!("creating input link {:?}: {error}", entry.path))
+            },
+        )?;
+    }
+    partial.complete = true;
+    Ok(())
+}
+
+#[cfg(test)]
 fn materialize(
     run_dir: &Path,
     entries: &[TreeEntry],
@@ -759,6 +1217,7 @@ fn materialize(
     Ok(())
 }
 
+#[cfg(test)]
 fn materialize_entries(
     run_dir: &Path,
     entries: &[TreeEntry],
@@ -940,21 +1399,6 @@ async fn execute(
     receipt: &mut Receipt,
 ) -> Result<(), RuntimeError> {
     let store = tree::blob_store(rt)?;
-    // Hydrate every input blob before creating the run directory so a store
-    // failure leaves no directory behind.
-    let mut bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for entry in &ready.entries {
-        if bytes.contains_key(&entry.content_ref) {
-            continue;
-        }
-        let content_ref = ContentRef::from_hex(&entry.content_ref)
-            .map_err(|e| RuntimeError::InvalidInput(format!("entry {:?} ref: {e}", entry.path)))?;
-        let data = store
-            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
-            .await?;
-        bytes.insert(entry.content_ref.clone(), data);
-    }
-
     std::fs::create_dir_all(&cfg.root).map_err(|e| {
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
@@ -962,11 +1406,13 @@ async fn execute(
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
     let run_dir = root.join(&receipt.id);
-    if let Err(error) = materialize(&run_dir, &ready.entries, &bytes) {
-        return Err(RuntimeError::Unconfigured(format!(
-            "materialize {}: {error}",
-            run_dir.display()
-        )));
+    if let Err(error) = materialize_hydrated(rt, &run_dir, &ready.entries, &ready.input_sizes).await
+    {
+        receipt.success = false;
+        receipt.reason = Some(format!("materialize {}: {error}", run_dir.display()));
+        receipt.finished_at = Some(receipts::now_micros());
+        // No profile or child exists yet. Return through run's receipt insertion.
+        return Ok(());
     }
     receipt.owned_run_dir = Some(run_dir.clone());
     if let Err(error) = receipts::event(
@@ -989,10 +1435,9 @@ async fn execute(
     std::fs::write(&profile_path, &profile).map_err(|e| {
         RuntimeError::Unconfigured(format!("profile {}: {e}", profile_path.display()))
     })?;
-    let binary_bytes = std::fs::read(&ready.binary).unwrap_or_default();
     receipt.sandbox = Some(json!({
         "profile_digest": profile_ref.as_str(),
-        "tool_binary_digest": digest_hex(&binary_bytes),
+        "tool_binary_digest": ready.binary_digest,
         "tool_source": format!("exec:{}", ready.registered),
         "tool_registry_id": ready.registry_id.to_string(),
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
@@ -1054,6 +1499,7 @@ async fn execute(
     }
 
     let started = Instant::now();
+    let wall_started = tokio::time::Instant::now();
     receipt.started_at = Some(receipts::now_micros());
     let spawn = command.spawn();
     // Parent side of the pipe: close the writer, read the child's report.
@@ -1072,8 +1518,7 @@ async fn execute(
             )));
         }
     };
-    let enforced = read_limit_report(limit_reader);
-    receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
+    let report_wait = req.timeout.min(Duration::from_secs(1));
     let pid = child.id().unwrap_or_default() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
@@ -1094,7 +1539,15 @@ async fn execute(
     let out_task = tokio::spawn(async move { drain(stdout, cap).await });
     let err_task = tokio::spawn(async move { drain(stderr, cap).await });
 
-    let status = match tokio::time::timeout(req.timeout, child.wait()).await {
+    let (enforced, waited) = collect_report_and_wait(
+        wall_started,
+        req.timeout,
+        collect_limit_report(limit_reader, report_wait),
+        child.wait(),
+    )
+    .await;
+    receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
+    let status = match waited {
         Ok(Ok(status)) => {
             use std::os::unix::process::ExitStatusExt;
             // Only the delivered signal for a configured limit is observable
@@ -1334,8 +1787,26 @@ fn kill_group(pid: i32) {
 #[cfg(unix)]
 fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: plain pipe creation; both ends are marked close-on-exec so the
-    // writer closes in the child at exec and the reader never leaks.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    ))]
+    unsafe {
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return Err(RuntimeError::Unconfigured(format!(
+                "pipe2: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) != 0 {
             return Err(RuntimeError::Unconfigured(format!(
@@ -1345,23 +1816,81 @@ fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
         }
         for fd in fds {
             let flags = libc::fcntl(fd, libc::F_GETFD);
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                let error = std::io::Error::last_os_error();
+                for fd in fds {
+                    libc::close(fd);
+                }
+                return Err(RuntimeError::Unconfigured(format!(
+                    "pipe close-on-exec: {error}"
+                )));
+            }
         }
     }
     Ok((fds[0], fds[1]))
 }
 
 #[cfg(unix)]
-fn read_limit_report(reader: libc::c_int) -> Value {
-    use std::io::Read;
+async fn collect_report_and_wait<R, W, T>(
+    started: tokio::time::Instant,
+    timeout: Duration,
+    report: R,
+    wait: W,
+) -> (Value, Result<T, tokio::time::error::Elapsed>)
+where
+    R: Future<Output = Value>,
+    W: Future<Output = T>,
+{
+    let deadline = started + timeout;
+    let enforced = tokio::time::timeout_at(deadline, report)
+        .await
+        .unwrap_or_else(|_| json!({}));
+    (enforced, tokio::time::timeout_at(deadline, wait).await)
+}
+
+#[cfg(unix)]
+async fn collect_limit_report(reader: libc::c_int, wait: Duration) -> Value {
+    let task = tokio::task::spawn_blocking(move || read_limit_report(reader, wait));
+    match tokio::time::timeout(wait, task).await {
+        Ok(Ok(report)) => report,
+        _ => json!({}),
+    }
+}
+
+#[cfg(unix)]
+fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     use std::os::unix::io::FromRawFd;
     // SAFETY: we own the descriptor and close it exactly once through File.
     let mut file = unsafe { std::fs::File::from_raw_fd(reader) };
-    let mut report = [0u8; LIMIT_REPORT_LEN];
-    if file.read_exact(&mut report).is_err() {
-        return json!({});
+    let deadline = Instant::now() + wait;
+    let mut poll_fd = libc::pollfd {
+        fd: reader,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return json!({});
+        }
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: poll_fd is valid for one descriptor owned by file.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready > 0 {
+            break;
+        }
+        if ready == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return json!({});
+        }
     }
-    decode_limit_report(&report)
+    // The child writes one fixed-size report below POSIX PIPE_BUF. Read once
+    // after poll so an inherited writer cannot keep this worker waiting for
+    // more bytes or EOF. A short report cannot certify any enforced limit.
+    let mut report = [0u8; LIMIT_REPORT_LEN];
+    match file.read(&mut report) {
+        Ok(LIMIT_REPORT_LEN) => decode_limit_report(&report),
+        _ => json!({}),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1372,6 +1901,255 @@ mod grant_pin_tests;
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn limit_pipe_descriptors_are_close_on_exec() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let reader = unsafe { std::fs::File::from_raw_fd(reader) };
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        for fd in [
+            std::os::fd::AsRawFd::as_raw_fd(&reader),
+            std::os::fd::AsRawFd::as_raw_fd(&writer),
+        ] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_report_arrives_without_waiting_for_writer_eof() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let bytes = encode_limit_report(
+            PreparedLimits::new(&sandbox::Limits {
+                cpu_seconds: Some(1),
+                ..Default::default()
+            }),
+            |_, value| Ok(value),
+        )
+        .unwrap();
+        let written = unsafe {
+            libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&writer),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        assert_eq!(written, bytes.len() as isize);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(750),
+            collect_limit_report(reader, Duration::from_secs(1)),
+        )
+        .await;
+        // Close the held writer before asserting the deadline. A broken
+        // EOF-dependent reader must be released before this test's Tokio
+        // runtime shuts down, so the failure stays bounded.
+        drop(writer);
+        let report = outcome.expect("report read waited for writer EOF");
+        assert_eq!(report, json!({"cpu_seconds": 1}));
+    }
+
+    #[tokio::test]
+    async fn silent_limit_report_writer_releases_blocking_worker() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let task = tokio::task::spawn_blocking(move || {
+            read_limit_report(reader, Duration::from_millis(30))
+        });
+        let outcome = tokio::time::timeout(Duration::from_millis(750), task).await;
+        drop(writer);
+        let report = outcome
+            .expect("blocking report reader did not reach its deadline")
+            .unwrap();
+        assert_eq!(report, json!({}));
+    }
+
+    #[test]
+    fn pending_limit_report_does_not_hold_async_executor() {
+        let (reader, writer) = limit_pipe().unwrap();
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let report = runtime.block_on(async move {
+                let report_task =
+                    tokio::spawn(collect_limit_report(reader, Duration::from_millis(800)));
+                tokio::task::yield_now().await;
+                let _ = progress_tx.send(());
+                report_task.await.unwrap()
+            });
+            let _ = done_tx.send(report);
+        });
+        // A synchronous pipe read on the current-thread executor prevents its
+        // own Tokio timer from firing. Observe progress from this independent
+        // test thread, then release the held writer before any assertion.
+        let progress = progress_rx.recv_timeout(Duration::from_millis(500));
+        drop(writer);
+        let report = done_rx.recv_timeout(Duration::from_secs(2));
+        if report.is_ok() {
+            worker.join().unwrap();
+        }
+        assert!(
+            progress.is_ok(),
+            "pending report blocked the async executor"
+        );
+        assert_eq!(
+            report.expect("pending report exceeded its deadline"),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn wide_list_limit_saturates_before_clamping() {
+        let params = json!({"limit": u64::from(u32::MAX) + 1});
+        assert_eq!(opt_limit(&params, "limit", 20, 500).unwrap(), 500);
+        let params = json!({"limit": u64::MAX});
+        assert_eq!(opt_limit(&params, "limit", 20, 500).unwrap(), 500);
+    }
+
+    #[test]
+    fn input_budget_counts_repeated_materialization_and_cannot_wrap() {
+        assert_eq!(checked_input_total(3, 2, 5).unwrap(), 5);
+        assert!(checked_input_total(3, 3, 5).is_err());
+        assert!(checked_input_total(u64::MAX, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn binary_digest_is_streamed_and_a_failed_read_is_not_a_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        let bytes = vec![0x5a; 128 * 1024];
+        std::fs::write(&binary, &bytes).unwrap();
+        let budget = BinaryDigestBudget {
+            started: Instant::now(),
+            timeout: Duration::from_secs(5),
+            max_bytes: MAX_TOOL_BINARY_BYTES,
+        };
+        let progress = BinaryDigestProgress::default();
+        assert_eq!(
+            hash_tool_binary(&binary, budget, &progress).unwrap(),
+            digest_hex(&bytes)
+        );
+        std::fs::remove_file(&binary).unwrap();
+        let missing_budget = BinaryDigestBudget {
+            started: Instant::now(),
+            ..budget
+        };
+        let missing = hash_tool_binary(&binary, missing_budget, &BinaryDigestProgress::default());
+        assert!(matches!(
+            missing,
+            Err(BinaryDigestError {
+                kind: BinaryDigestErrorKind::Read,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn binary_digest_refuses_over_cap_without_returning_a_partial_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("oversize-tool");
+        std::fs::write(&binary, vec![0x5a; 2 * 1024]).unwrap();
+        let budget = BinaryDigestBudget {
+            started: Instant::now(),
+            timeout: Duration::from_secs(5),
+            max_bytes: 1024,
+        };
+        let progress = BinaryDigestProgress::default();
+        let error = hash_tool_binary(&binary, budget, &progress).unwrap_err();
+        assert_eq!(error.kind, BinaryDigestErrorKind::ByteLimit);
+        assert_eq!(error.kind.code(), "binary_digest_byte_limit");
+        assert_eq!(error.detail()["bytes_read"], 1025);
+        assert_eq!(error.detail()["byte_cap"], 1024);
+        assert_eq!(error.detail()["path_class"], "regular_file");
+    }
+
+    #[test]
+    fn binary_digest_refuses_expired_deadline_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, b"tool").unwrap();
+        let budget = BinaryDigestBudget {
+            started: Instant::now() - Duration::from_secs(2),
+            timeout: Duration::from_secs(1),
+            max_bytes: MAX_TOOL_BINARY_BYTES,
+        };
+        let error =
+            hash_tool_binary(&binary, budget, &BinaryDigestProgress::default()).unwrap_err();
+        assert_eq!(error.kind, BinaryDigestErrorKind::TimeLimit);
+        assert_eq!(error.kind.code(), "binary_digest_time_limit");
+        assert_eq!(error.detail()["bytes_read"], 0);
+        assert_eq!(error.detail()["time_cap_ms"], 1000);
+    }
+
+    #[test]
+    fn binary_digest_refuses_reader_that_stalls_past_its_deadline() {
+        struct SlowEof {
+            read_called: bool,
+        }
+        impl Read for SlowEof {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.read_called = true;
+                std::thread::sleep(Duration::from_millis(75));
+                Ok(0)
+            }
+        }
+
+        let budget = BinaryDigestBudget {
+            started: Instant::now(),
+            timeout: Duration::from_millis(50),
+            max_bytes: MAX_TOOL_BINARY_BYTES,
+        };
+        let mut reader = SlowEof { read_called: false };
+        let error = hash_tool_binary_reader(&mut reader, budget, &BinaryDigestProgress::default())
+            .unwrap_err();
+        assert!(
+            reader.read_called,
+            "the reader did not consume the deadline"
+        );
+        assert_eq!(error.kind.code(), "binary_digest_time_limit");
+        assert!(error.elapsed_ms >= error.time_cap_ms);
+        assert_eq!(error.bytes_read, 0);
+        assert_eq!(error.time_cap_ms, 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn report_collection_spends_the_same_wall_budget_as_child_wait() {
+        let started = tokio::time::Instant::now();
+        let (report, status) = collect_report_and_wait(
+            started,
+            Duration::from_secs(1),
+            async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                json!({"delayed": true})
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                "exited"
+            },
+        )
+        .await;
+        assert_eq!(report, json!({"delayed": true}));
+        assert!(status.is_err(), "child outlived the shared wall deadline");
+    }
+
+    #[test]
+    fn invalid_resolved_timeout_cannot_reach_duration_conversion() {
+        let mut config = sandbox::resolve(&Default::default());
+        config.timeout_default_s = f64::NAN;
+        assert!(parse_request(
+            &json!({"tree": "tree", "tool": "tool", "actor": "local"}),
+            &config,
+        )
+        .is_err());
+    }
 
     #[test]
     fn limit_report_uses_values_prepared_before_spawn() {

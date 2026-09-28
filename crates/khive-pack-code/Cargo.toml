@@ -34,5 +34,9 @@ khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 same-file = "1.0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

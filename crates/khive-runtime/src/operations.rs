@@ -3645,7 +3645,7 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, false)
+        self.try_create_note_impl(token, kind, name, content, properties, false, None, None)
             .await
     }
 
@@ -3664,6 +3664,7 @@ impl KhiveRuntime {
     /// exclusively to channel-transport packs. Every other write path uses
     /// `try_create_note`, which rejects those three properties
     /// unconditionally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_create_note_as_trusted_ingest(
         &self,
         _capability: &crate::pack::ChannelIngestCapability,
@@ -3672,9 +3673,47 @@ impl KhiveRuntime {
         name: Option<&str>,
         content: &str,
         properties: Option<serde_json::Value>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(token, kind, name, content, properties, true)
-            .await
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            None,
+            expires_after,
+        )
+        .await
+    }
+
+    /// Publish a trusted inbound message and its original-byte attachment in
+    /// one database transaction. Channel quarantine must not advertise a
+    /// reference in note metadata before GC can see its attachment owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_create_note_as_trusted_ingest_with_attachment(
+        &self,
+        _capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        attachment: NewAttachment,
+        expires_after: Option<std::time::Duration>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(
+            token,
+            kind,
+            name,
+            content,
+            properties,
+            true,
+            Some(attachment),
+            expires_after,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3686,6 +3725,8 @@ impl KhiveRuntime {
         content: &str,
         properties: Option<serde_json::Value>,
         allow_transport_owned_message_properties: bool,
+        attachment: Option<NewAttachment>,
+        expires_after: Option<std::time::Duration>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3695,6 +3736,23 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json_at(p, "note", "properties")?;
+        }
+        if let Some(ref attachment) = attachment {
+            // The note and its owner row must share the main database. A
+            // secondary pack backend cannot atomically root the reference.
+            drop(self.attachments()?);
+            attachment.validate()?;
+            let blob_store = self.blob_store().ok_or_else(|| {
+                RuntimeError::Unconfigured(
+                    "trusted ingest attachment requires an installed BlobStore".to_string(),
+                )
+            })?;
+            if !blob_store.exists(&attachment.content_ref).await? {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "trusted ingest attachment refers to an unpublished blob: {}",
+                    attachment.content_ref
+                )));
+            }
         }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
@@ -3712,6 +3770,16 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str();
         let mut note = Note::new(ns, kind, content);
+        if let Some(retention) = expires_after {
+            let duration_us = i64::try_from(retention.as_micros()).map_err(|_| {
+                RuntimeError::InvalidInput(
+                    "trusted ingest retention exceeds i64 microseconds".into(),
+                )
+            })?;
+            note.expires_at = Some(note.created_at.checked_add(duration_us).ok_or_else(|| {
+                RuntimeError::InvalidInput("trusted ingest expiry exceeds i64 microseconds".into())
+            })?);
+        }
         if let Some(n) = name {
             note = note.with_name(n);
         }
@@ -3725,7 +3793,21 @@ impl KhiveRuntime {
         // so this reaches storage directly rather than duplicate the check
         // through a wrapper that cannot see the trust decision this function
         // just made.
-        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
+        let inserted = if let Some(attachment) = attachment {
+            self.raw_notes(token)?
+                .try_insert_note_with_attachments(
+                    note.clone(),
+                    vec![Attachment::from_new(
+                        note.id,
+                        AttachmentSubstrate::Note,
+                        attachment,
+                        note.created_at,
+                    )],
+                )
+                .await?
+        } else {
+            self.raw_notes(token)?.try_insert_note(note.clone()).await?
+        };
         if !inserted {
             return Ok(None);
         }

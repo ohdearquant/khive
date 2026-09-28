@@ -244,14 +244,14 @@ pub fn recoverer_lock_path() -> PathBuf {
     khive_dir().join("khived.recoverer.lock")
 }
 
-/// Marker file a process supervisor (launchd, systemd, or any equivalent)
-/// writes beside the socket path before it starts a supervised `khived`, and
-/// removes on a clean stop. Its presence tells a client that this rendezvous
-/// is not the "any client may spawn on demand" case: a supervisor already
-/// owns the daemon's lifecycle for this socket, and a client racing it to
-/// bind the socket would only produce a second, unsupervised daemon that the
-/// supervisor's own instance then refuses to replace. Reading and acting on
-/// this file is entirely the client's decision (`khive-mcp`); this module
+/// Marker file the supervisor's launcher publishes before it execs `khived`.
+/// It records the job label, launcher/daemon PID, restart interval in seconds,
+/// and the launcher's incarnation claim. The launcher or deliberate-stop procedure
+/// removes its own claim; the daemon never writes or removes it. A client
+/// waits up to three restart intervals before a logged degraded bootstrap,
+/// bounded by its caller deadline, rather than racing normal supervisor
+/// startup. Reading and acting on this file is the client's decision
+/// (`khive-mcp`); this module
 /// only resolves where it lives, matching the [`lock_path`] /
 /// [`recoverer_lock_path`] pattern.
 ///
@@ -264,6 +264,55 @@ pub fn supervisor_marker_path() -> PathBuf {
         }
     }
     khive_dir().join("khived.supervisor")
+}
+
+#[cfg(unix)]
+pub const SUPERVISOR_CLAIM_ENV: &str = "KHIVE_SUPERVISOR_CLAIM";
+
+#[cfg(unix)]
+fn read_supervisor_marker_claim() -> Option<(u32, String)> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(supervisor_marker_path())
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut marker = String::new();
+    file.take(4097).read_to_string(&mut marker).ok()?;
+    if marker.len() > 4096 {
+        return None;
+    }
+    let mut lines = marker.lines();
+    if lines.next()?.is_empty() {
+        return None;
+    }
+    let pid = lines.next()?.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+    lines
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)?;
+    let claim = lines.next()?.to_string();
+    if lines.next().is_some() {
+        return None;
+    }
+    let parsed = uuid::Uuid::parse_str(&claim).ok()?;
+    if parsed.get_version() != Some(uuid::Version::Random) || parsed.to_string() != claim {
+        return None;
+    }
+    Some((pid, claim))
+}
+
+#[cfg(unix)]
+fn current_supervisor_claim() -> Option<String> {
+    let claim = std::env::var(SUPERVISOR_CLAIM_ENV).ok()?;
+    let (pid, published_claim) = read_supervisor_marker_claim()?;
+    (pid == std::process::id() && claim == published_claim).then_some(claim)
 }
 
 #[cfg(unix)]
@@ -1760,6 +1809,13 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     initial_frame_deadline: tokio::time::Instant,
 ) {
+    let production_shutdown = shutdown.is_some();
+    // A handover is delivered over the probed connection. The production
+    // listener enforces same-uid admission, and direct handler tests cannot
+    // self-signal because they do not supply the daemon shutdown receiver.
+    let handover_peer_allowed = peer_uid(&stream)
+        .ok()
+        .is_some_and(|uid| uid == unsafe { libc::geteuid() } as u32);
     let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown = shutdown.unwrap_or(local_shutdown_rx);
     // Keeps the fallback receiver open in direct/test calls. Production owns
@@ -1772,8 +1828,15 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             return;
         }
     };
-    let decoded: Result<DaemonRequestFrame, _> = serde_json::from_slice(&raw);
-    if decoded.as_ref().ok().is_none_or(|frame| frame.plan) {
+    #[derive(Deserialize)]
+    struct SupervisorRequestEnvelope {
+        #[serde(flatten)]
+        frame: DaemonRequestFrame,
+        #[serde(default)]
+        supervisor_handover: bool,
+    }
+    let decoded: Result<SupervisorRequestEnvelope, _> = serde_json::from_slice(&raw);
+    if decoded.as_ref().ok().is_none_or(|item| item.frame.plan) {
         if let Some(field) = plan_frame_companion(&raw) {
             let response = DaemonResponseFrame {
                 ok: false,
@@ -1803,13 +1866,23 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             return;
         }
     }
-    let frame: DaemonRequestFrame = match decoded {
-        Ok(f) => f,
+    let (frame, handover_requested) = match decoded {
+        Ok(item) => (item.frame, item.supervisor_handover),
         Err(e) => {
             tracing::debug!(error = %e, "failed to decode daemon request frame");
             return;
         }
     };
+    let supervisor_probe = frame.probe_only;
+    let handover_accepted = handover_requested
+        && supervisor_probe
+        && production_shutdown
+        && handover_peer_allowed
+        && frame.protocol_version == PROTOCOL_VERSION
+        && !frame.plan
+        && !frame.metrics_only
+        && frame.ops.is_empty()
+        && read_supervisor_marker_claim().is_some_and(|(pid, _)| pid != std::process::id());
     let (mut peer_read, mut peer_write) = stream.into_split();
 
     let served_config_id = Some(dispatcher.config_id().to_string());
@@ -1855,6 +1928,41 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
             request_id: frame.request_id,
+        }
+    } else if handover_requested {
+        if handover_accepted {
+            DaemonResponseFrame {
+                ok: true,
+                result: None,
+                error: None,
+                error_detail: None,
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id,
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: frame.request_id,
+            }
+        } else {
+            DaemonResponseFrame {
+                ok: false,
+                result: None,
+                error: Some("supervisor handover refused".to_string()),
+                error_detail: Some(serde_json::json!({
+                    "kind": "protocol",
+                    "code": "supervisor_handover_refused",
+                    "message": "supervisor handover refused",
+                    "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                })),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id,
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: frame.request_id,
+            }
         }
     } else if frame.metrics_only && !frame.plan {
         // Process-global gauge read: namespace/config-agnostic, so this is
@@ -2030,7 +2138,21 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         }
     };
 
-    match serde_json::to_vec(&resp) {
+    let payload = if supervisor_probe {
+        serde_json::to_value(&resp).and_then(|mut value| {
+            if let Some(claim) = current_supervisor_claim() {
+                value["supervisor_claim"] = serde_json::Value::String(claim);
+            }
+            if handover_accepted {
+                value["supervisor_handover_accepted"] = serde_json::Value::Bool(true);
+            }
+            serde_json::to_vec(&value)
+        })
+    } else {
+        serde_json::to_vec(&resp)
+    };
+    let mut handover_ack_written = false;
+    match payload {
         Ok(payload) => {
             if payload.len() > MAX_FRAME_BYTES {
                 // The serialized response exceeds the IPC frame cap.  Send a
@@ -2073,11 +2195,21 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                         tracing::debug!(error = %e, "failed to write oversized-response error frame");
                     }
                 }
-            } else if let Err(e) = write_frame(&mut peer_write, &payload).await {
-                tracing::debug!(error = %e, "failed to write daemon response frame");
+            } else {
+                match write_frame(&mut peer_write, &payload).await {
+                    Ok(()) => handover_ack_written = true,
+                    Err(e) => tracing::debug!(error = %e, "failed to write daemon response frame"),
+                }
             }
         }
         Err(e) => tracing::warn!(error = %e, "failed to serialize daemon response frame"),
+    }
+    if handover_accepted && handover_ack_written {
+        // Signal this process, not a PID observed earlier over a socket.
+        // Production installed its SIGTERM handler before binding the socket.
+        if unsafe { libc::raise(libc::SIGTERM) } != 0 {
+            tracing::error!(error = %std::io::Error::last_os_error(), "self-directed handover signal failed");
+        }
     }
 }
 
@@ -2594,6 +2726,13 @@ where
         Incumbent::Stale => {}
     }
 
+    // Install signal streams before publishing either rendezvous file. A
+    // supervisor may stop us as soon as connect/pid checks succeed, before
+    // the accept loop or shutdown future has been polled. Keep these streams
+    // alive so a signal during the rest of startup reaches normal cleanup.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     let pid_file_guard = match write_pid_file_exclusive(&pid_file) {
         Ok(guard) => guard,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2709,13 +2848,6 @@ where
     let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
-        // REASON: signal handler registration can only fail if the global Tokio runtime
-        // is not running or the OS rejects the signal number — both are unrecoverable
-        // at this point in startup, so panic is the correct response.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("install SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("received SIGTERM"),
             _ = sigint.recv() => tracing::info!("received SIGINT"),

@@ -942,6 +942,31 @@ async fn existing_expected_reference_returns_stored_size_without_staging() {
 }
 
 #[tokio::test]
+async fn existing_expected_reference_restarts_publish_grace() {
+    let f = fixture();
+    let reference = f.store.put(b"existing".to_vec()).await.unwrap();
+    let path = f
+        .root
+        .join(&reference.as_str()[..2])
+        .join(&reference.as_str()[2..4])
+        .join(reference.as_str());
+    age_file(&path);
+    let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let result = f
+        .manager
+        .begin(1, Some(reference.clone()), "uploader:a".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        json!({"content_ref": reference.to_string(), "size": 8})
+    );
+    assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > old);
+    assert!(!f.root.join(".uploads").exists());
+}
+
+#[tokio::test]
 async fn abort_removes_staging_and_consumes_capability() {
     let f = fixture();
     let id = begin(&f.manager, 3).await;

@@ -410,6 +410,7 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    change to core or pack-owned liveness schema, producer code or manifest format repeats that review
    and updates the gate and tests in the same change.
    ADR-160's exact-V21 rule remains the historical Phase-4a rollout contract.
+   Amendment 4 supersedes the historical epoch value with the reviewed V22–V42 snapshot.
 7. **Use registered ownership as the complete liveness authority.** Choose option (a): every
    production path in any crate linked into `kkernel` that writes to the shared runtime blob store
    and persists or returns a ref as durable must register each such root in the canonical main
@@ -490,32 +491,51 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
    (or stronger serialization) with the sweep, including writes from a pack routed to a secondary.
    This item extends ADR-111 §8 and ADR-160 Phase 4's attachment-only liveness rule for these pack
    objects while keeping the canonical main backend as the sole SQL authority.
-8. **Bind the root to its main database at cutover.** A filesystem blob root has one durable owning
-   main database. For a provably new empty root, a new attachment cutover first records a pending
-   store ID in the main database, then durably writes and verifies the matching anchored marker in
-   the canonical root. A populated root instead requires a separately invoked verified adoption
-   that establishes this same pending ID and marker before cutover can complete; daemon boot never
-   claims it automatically. Only then does one database transaction mark both the binding and
-   cutover complete with that same ID.
-   A crash before this final transaction leaves the cutover incomplete and sweeps refuse. Recovery
-   reuses and verifies the pending ID and any existing matching root marker; it never mints a new ID
-   for that attempt or overwrites a different owner's marker. A cutover completed under this rule implies a durable
-   verified root marker. A database already cut over before this rule obtains its store ID only
-   through the separate verified adoption action below; the
-   old V21 completion marker alone cannot mint one. The database binding and root marker identify
-   the same `store_id`, root and owner, including a durable database identity and canonical
-   database file identity; a copied database at another path cannot inherit ownership by copying
-   its rows. A completed attachment cutover, empty `attachments`, a database path supplied by
-   `--db`, or the path-derived GC claim key is not binding proof. `FsBlobStore` checks the binding
+8. **Bind the root to its main database after cutover.** A filesystem blob root has one durable
+   owning main database. The migration that adds binding state and the attachment cutover do not
+   mint a store ID, bind a root or write its marker. On any daemon boot while the main database holds
+   no completed binding, the daemon may bind its configured canonical root only when attachment
+   cutover is complete, the main database has no pending or completed binding and holds no live blob
+   reference (no attachment rows and no registered pack-owned refs), and it proves the root empty:
+   no blob objects and no root ownership marker of any owner. It checks this under database GC ownership and the
+   root write lock. This is the only automatic fresh-root bind. The absence of live refs in main is
+   a precondition for this automatic bind, not ownership proof for a sweep. The daemon records the
+   pending store ID with a conditional write in one main-database transaction that fails if any
+   pending or completed binding row exists; a failed write ends that boot's attempt without touching
+   the root. It then durably writes and verifies the matching anchored marker in the canonical root,
+   then uses one main-database transaction to mark binding complete with that same ID. The completed
+   cutover state is unchanged by that transaction. A populated root, even with one object, or a
+   root with a preexisting marker cannot enter this fresh path; neither boot nor sweep claims it
+   automatically.
+
+   A boot that dies before the pending ID is recorded leaves no state, so the next boot is a fresh
+   attempt. A crash after recording the pending ID but before the completing transaction leaves
+   binding pending and both sweep modes refuse. Recovery reuses the pending ID, rechecks that no
+   blob objects appeared and verifies its own matching root marker if one was already written. It
+   never mints a replacement ID, overwrites a foreign or mismatched marker, or completes an
+   automatic bind for a populated root. A marker without a matching pending ID is not a recoverable
+   fresh-root attempt. A completed
+   binding implies a durable verified root marker. A database cut over before this rule may take
+   the fresh-root path only for a provably empty configured root; a pre-rule completed root with
+   objects, and every populated root, requires separately invoked verified adoption. The old V21
+   completion marker alone cannot mint a store ID or change ADR-160's historical exact-V21
+   predicate. The database binding and root marker identify the same `store_id`, root and owner,
+   including a durable database identity and canonical database file identity; a copied database at
+   another path cannot inherit ownership by copying its rows. A completed attachment cutover, empty
+   `attachments`, a database path supplied by `--db`, or the path-derived GC claim key is not
+   binding proof. `FsBlobStore` checks the binding
    against the supplied `SqlAccess` for _both_ sweep modes before any database/root ownership lock
    or filesystem walk, then rechecks after holding both the database GC owner and root write lock,
    immediately before walking or deleting. A reviewed epoch with a missing or different `store_id`
    is `Unsupported` just like an unreviewed epoch. Missing, corrupt, stale or mismatched evidence
-   returns a typed refusal with no fallback. An in-memory database cannot own a
-   durable filesystem root under this rule. Binding or rebinding a populated root is a separate
-   verified adoption action, never an automatic side effect of a sweep or boot. Adoption records a
-   pending database store ID, durably writes and verifies the root marker under the same owner/root
-   locks, and records binding completion only after they match. Recovery reuses that pending ID;
+   returns a typed refusal with no fallback. An in-memory database cannot own a durable filesystem
+   root under this rule. A live sweep also requires daemon/GC exclusion keyed by the opened main
+   database file identity across different `HOME` values or path spellings, as in
+   #3069 or an equivalent fix; a socket or path-derived lock alone does not satisfy that gate.
+   Binding or rebinding a populated root is a separate verified adoption action, never an automatic
+   side effect of a sweep or boot. Adoption records a pending database store ID, durably writes and
+   verifies the root marker under the same owner/root locks, and records binding completion only
+   after they match. Recovery reuses that pending ID;
    adoption cannot infer an ID from a path or silently overwrite another owner's marker.
    Provisioning proves the selected database is the effective topology's canonical main (`KhiveRuntime::core()` in a
    daemon); with no declared `[[backends]]`, a selected `--db` becomes main only through an existing
@@ -596,12 +616,25 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   secondary's empty-attachment SQL refuses in both modes before a lock or walk. A second migrated
   database sharing that root, once through the default same-directory root and once through
   `KHIVE_BLOB_ROOT`, refuses through `--db` and the direct API in both modes, even when it has a
-  copied database UUID. Crashes before the root marker, after that marker but before database
-  completion, and after completion are replayed: both sweep modes refuse before any lock or walk
-  until the final state has matching durable IDs, and replay preserves the pending `store_id`
-  without overwriting another owner's marker. A populated-root cutover without explicit adoption
-  also refuses; an already-completed cutover never silently mints or replaces an ID. The same
-  reviewed epoch with an absent or mismatched cutover `store_id`
+  copied database UUID. A completed cutover with no binding and a configured root containing no
+  objects and no marker binds on a daemon boot while no binding is completed: the test observes the
+  pending ID, verified marker and one completing main-database transaction. After the completing
+  transaction, a sweep in either mode is admitted on that root. A pre-rule database with one live
+  attachment row and an empty configured root refuses the automatic path, binds nothing, and leaves
+  the attachment row and the object it references, in its original root, untouched; a mutant that removes the main live-reference check fails this arm.
+  Two boots of one database through different path spellings, both with empty roots, race to bind:
+  exactly one pending ID lands and the other boot refuses without a second marker; a mutant that
+  removes the conditional pending-ID write fails this arm. A root with exactly one object refuses
+  that automatic path, leaving the object untouched, and sweeps stay refused; a foreign
+  marker likewise refuses and remains untouched, and sweeps stay refused. A mutant that removes
+  the emptiness check fails the one-object control. Crashes before the first-boot marker, after that
+  marker but before binding completion, and after completion are
+  replayed: both sweep modes refuse before any lock or walk until the final state has matching
+  durable IDs, and replay preserves the pending `store_id` without overwriting another owner's
+  marker or claiming a root that gained an object. A populated-root cutover without explicit
+  adoption also refuses; a pre-rule completed root with objects never silently mints or replaces
+  an ID. A second daemon under a different `HOME` cannot serve the same opened main database while
+  live sweeps are enabled. The same reviewed epoch with an absent or mismatched cutover `store_id`
   refuses before a lock or walk. Missing, corrupt and stale binding markers, root relocation and an unbound
   database/store pair refuse likewise. No command treats an arbitrary `--db` as proof of ownership.
 - `kkernel blob sweep --live` started while a scheduled run in the daemon holds ownership either
@@ -955,3 +988,70 @@ documented maintenance window makes a removal safe at this commit.
 - Rows of soft-deleted records keep their blobs until the record is hard-deleted or restored, as §6 intends.
 - The removal command and its acceptance, retiring a roster member, removing rows while writers run, and restoring one
   backend independently of main.
+
+## Amendment 4 (2026-09-28): reviewed core-schema epoch for blob GC
+
+**Status: Accepted (2026-09-28).** This amendment supplies the core migration review required by Amendment 1 item 6.
+It supersedes that item's historical `REVIEWED_SCHEMA_EPOCH = 41` value for this reviewed snapshot;
+it does not remove the ownership, store-binding, or pack-schema review obligations in items 6–8.
+
+The reviewed core migration chain is V22–V42 at snapshot
+`e6b34cb5e255d2e6572d20a979f45746484356c2`. The terminal version is V42 because the
+final entry of `MIGRATIONS` is version 42 (`crates/khive-db/src/migrations.rs:444-448`).
+“Tables touched” includes schema and index changes and data rewrites; views and virtual tables
+are named explicitly. A read-only backing table is identified as such. “None” means the
+migration neither adds a durable `BlobStore` producer nor changes the shape or authority of a
+blob reference.
+
+| Migration                                         | Tables touched                                                                                                                                  | Blob-liveness effect | Source                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| V22 `notes_unread_probe_recipient`                | `notes` index                                                                                                                                   | None                 | `crates/khive-db/sql/022-notes-unread-probe-recipient.sql:7-15`                                                                                                                                                                                                                                                       |
+| V23 `fts_record_kind`                             | Rebuilds `fts_entities`, `fts_notes`; reads `entities`, `notes`                                                                                 | None                 | `crates/khive-db/sql/023-fts-record-kind.sql:6-88`                                                                                                                                                                                                                                                                    |
+| V24 `fts_rowid_map`                               | `fts_entities`, `fts_notes`; their rowid maps and state tables; reads `entities`, `notes`                                                       | None                 | `crates/khive-db/sql/024-fts-rowid-map.sql:41-134`                                                                                                                                                                                                                                                                    |
+| V25 `notes_unread_probe_recipient_direction`      | `notes` index                                                                                                                                   | None                 | `crates/khive-db/sql/025-notes-unread-probe-recipient-direction.sql:24-33`                                                                                                                                                                                                                                            |
+| V26 `knowledge_fts_repair`                        | `fts_knowledge`, `fts_sections`, `knowledge_atoms_fts_content` view; reads `knowledge_atoms`, `knowledge_sections`                              | None                 | `crates/khive-db/sql/026-knowledge-fts-repair.sql:14-63`; `crates/khive-db/sql/schema.sql:197-205`                                                                                                                                                                                                                    |
+| V27 `notes_hot_property_indexes`                  | `notes` indexes                                                                                                                                 | None                 | `crates/khive-db/sql/027-notes-hot-property-indexes.sql:45-55`                                                                                                                                                                                                                                                        |
+| V28 `notes_key`                                   | `notes` column and index                                                                                                                        | None                 | `crates/khive-db/sql/028-notes-key.sql:2-6`                                                                                                                                                                                                                                                                           |
+| V29 `note_streams`                                | `note_streams` table; `notes` delete/update guards                                                                                              | None                 | `crates/khive-db/sql/029-note-streams.sql:2-52`                                                                                                                                                                                                                                                                       |
+| V30 `tool_source_mounts`                          | `tool_source_mounts` table                                                                                                                      | None                 | `crates/khive-db/sql/030-tool-source-mounts.sql:1-5`                                                                                                                                                                                                                                                                  |
+| V31 `note_versions`                               | `notes` column and update trigger                                                                                                               | None                 | `crates/khive-db/sql/031-note-versions.sql:1-8`                                                                                                                                                                                                                                                                       |
+| V32 `knowledge_count_indexes`                     | `events`, `knowledge_atoms` indexes                                                                                                             | None                 | `crates/khive-db/sql/032-knowledge-count-indexes.sql:3-8`                                                                                                                                                                                                                                                             |
+| V33 `notes_message_recipient_direction`           | `notes` indexes                                                                                                                                 | None                 | `crates/khive-db/sql/033-notes-message-recipient-direction.sql:4-22`                                                                                                                                                                                                                                                  |
+| V34 `notes_namespace_created`                     | `notes` index                                                                                                                                   | None                 | `crates/khive-db/sql/034-notes-namespace-created.sql:2-4`                                                                                                                                                                                                                                                             |
+| V35 `notes_unread_probe_recipient_type_direction` | `notes` index                                                                                                                                   | None                 | `crates/khive-db/sql/035-notes-unread-probe-recipient-type-direction.sql:8-16`                                                                                                                                                                                                                                        |
+| V36 `events_operation_attribution`                | `events` columns                                                                                                                                | None                 | `crates/khive-db/sql/036-events-operation-attribution.sql:2-7`                                                                                                                                                                                                                                                        |
+| V37 `entity_versions`                             | `entities` column and triggers                                                                                                                  | None                 | `crates/khive-db/sql/037-entity-versions.sql:1-18`                                                                                                                                                                                                                                                                    |
+| V38 `entities_legacy_type_index`                  | `entities` index                                                                                                                                | None                 | `crates/khive-db/sql/038-entities-legacy-type-index.sql:1-3`                                                                                                                                                                                                                                                          |
+| V39 `knowledge_cursor_indexes`                    | `knowledge_atoms`, `knowledge_domains` indexes                                                                                                  | None                 | `crates/khive-db/sql/039-knowledge-cursor-indexes.sql:1-6`                                                                                                                                                                                                                                                            |
+| V40 `session_source_scoped_identity`              | `session_mirror_migration_audit`, `sessions`, `session_messages`, `session_messages_fts`, staging tables; conditionally `session_mirror_cursor` | None                 | `crates/khive-db/sql/040-session-source-scope.sql:4-11`; `crates/khive-db/sql/040a-session-source-scope-stage.sql:4-34`; `crates/khive-db/sql/040b-session-source-scope-swap.sql:3-6`; `crates/khive-db/sql/040c-session-source-scope-finalize.sql:3-59`; `crates/khive-db/src/session_identity_migration.rs:231-232` |
+| V41 `sender_transport`                            | `comm_sender_transport` table and index                                                                                                         | None                 | `crates/khive-db/sql/041-sender-transport.sql:1-45`                                                                                                                                                                                                                                                                   |
+| V42 `comm_external_id_channel_scope`              | `notes` index                                                                                                                                   | None                 | `crates/khive-db/sql/042-comm-external-id-channel-scope.sql:5-16`                                                                                                                                                                                                                                                     |
+
+V29 can prevent deletion of a stream member note, but it does not introduce a new blob owner
+or alter the `attachments` reference. V40 keeps session mirror content inline; V41 keeps its
+encrypted envelope inline in `comm_sender_transport`, and `credential_ref` names an external
+credential, not a `ContentRef`. No migration in the table adds a producer or changes the blob
+reference shape. The separate pack-owned schema and blob-writer census required by Amendment 1
+remain independent proof obligations; the core migration ledger cannot prove them.
+
+For this reviewed snapshot, `REVIEWED_SCHEMA_EPOCH = 42`. The implementation of
+`blob_gc_fencing_complete` replaces its historical exact-V21 admission with **exactly** that
+named epoch, never `>=` that value. The compiled `latest_schema_version()` must equal the same
+named epoch before either sweep mode can run. The persisted ledger must be contiguous and
+canonically named through that exact terminal version, and retain the completed V21 cutover
+marker and functional attachment fences. Unknown and newer versions refuse before root locking,
+walking, or claim cleanup. The ownership and store-binding checks required by Amendment 1
+items 7 and 8 remain mandatory in addition to this schema predicate.
+
+Before the collector is admitted on a database past V21, pre-existing slugless channel
+quarantine notes must be repaired as #3497 requires. Each still-published original referenced
+only by `quarantine_content_ref` must gain a `quarantine-original` attachment row, or its
+note must expire under the normal quarantine rule. The repair must report counts and be
+idempotent. The schema epoch alone does not establish that those originals have a live owner.
+
+A migration added after this table was reviewed invalidates the review, even if it appears
+unrelated to blob liveness. Re-read the complete chain from V22 through the new `MIGRATIONS` tip,
+add a row for every new version, advance `REVIEWED_SCHEMA_EPOCH` to that tip, and record the new
+snapshot SHA before the collector accepts that epoch. Changes to pack-owned liveness schema,
+blob producers, or manifests independently repeat the review and gate updates required by
+Amendment 1 item 6.

@@ -1307,6 +1307,24 @@ mod windows_impl {
         OPEN_DIR_HANDLE_CALLS.with(std::cell::Cell::get)
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Runs after the target has been inspected but before its replacing
+        /// rename, so a test can observe the old name at the exact seam.
+        static BEFORE_TARGET_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_before_target_rename_hook(hook: impl FnOnce() + 'static) {
+        BEFORE_TARGET_RENAME_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn take_before_target_rename_hook() -> Option<Box<dyn FnOnce()>> {
+        BEFORE_TARGET_RENAME_HOOK.with(|cell| cell.borrow_mut().take())
+    }
+
     fn to_wide_nul(path: &Path) -> io::Result<Vec<u16>> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         if wide.contains(&0) {
@@ -1802,6 +1820,16 @@ mod windows_impl {
         delete_via_handle(&file)
     }
 
+    fn inspect_relative_if_exists(dir: &fs::File, name: &str) -> io::Result<Option<fs::File>> {
+        let file = match open_relative(dir, name, FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        verify_handle_kind(&file, false)?;
+        Ok(Some(file))
+    }
+
     fn delete_via_handle(file: &fs::File) -> io::Result<()> {
         let info = FileDispositionInfo { delete_pending: 1 };
         // SAFETY: `file`'s handle is live and was opened with `DELETE`
@@ -1895,8 +1923,18 @@ mod windows_impl {
         verify_handle_kind(&tmp_file, false)?;
         tmp_file.write_all(body)?;
         tmp_file.sync_all()?;
-        remove_relative_if_exists(&dir_handle, target_name)?;
-        rename_via_handle(&tmp_file, &dir.join(target_name))
+        let target_handle = inspect_relative_if_exists(&dir_handle, target_name)?;
+        #[cfg(test)]
+        if let Some(hook) = take_before_target_rename_hook() {
+            hook();
+        }
+        // The inspected handle stays open through the replacing rename. Its
+        // FILE_SHARE_DELETE permission still lets another writer move the
+        // inspected leaf and install a different one before this path-based
+        // rename; the handle does not bind the destination name to its identity.
+        let result = rename_via_handle(&tmp_file, &dir.join(target_name));
+        drop(target_handle);
+        result
     }
 
     pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
@@ -5823,6 +5861,71 @@ mod tests {
 
             remove_heartbeat(&dir, pid).expect("remove must succeed");
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn replacing_heartbeat_keeps_old_target_until_rename() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let path = dir.join(format!("{pid}.json"));
+            let first = heartbeat(pid);
+            write_heartbeat(&dir, &first).unwrap();
+            let old_body = fs::read(&path).unwrap();
+
+            let mut second = heartbeat(pid);
+            second.oldest_tx_label = Some("replacement".to_string());
+            let hook_ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_ran_inside = std::rc::Rc::clone(&hook_ran);
+            super::super::windows_impl::set_before_target_rename_hook(move || {
+                assert_eq!(
+                    fs::read(&path).expect("old target must still exist before rename"),
+                    old_body,
+                    "the old heartbeat must remain at the target until replacement"
+                );
+                hook_ran_inside.set(true);
+            });
+            write_heartbeat(&dir, &second).expect("replacement write must succeed");
+            assert!(hook_ran.get(), "the inspection-to-rename hook must run");
+            assert_eq!(
+                fs::read(dir.join(format!("{pid}.json"))).unwrap(),
+                serde_json::to_vec(&second).unwrap()
+            );
+        }
+
+        #[test]
+        fn write_heartbeat_refuses_directory_target_without_removing_it() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).unwrap();
+            let hb = heartbeat(std::process::id());
+            let target = dir.join(format!("{}.json", hb.pid));
+            fs::create_dir(&target).unwrap();
+
+            write_heartbeat(&dir, &hb).expect_err("directory target must be refused");
+            assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        }
+
+        #[test]
+        fn write_heartbeat_refuses_reparse_target_without_removing_it() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).unwrap();
+            let outside = root.path().join("outside.txt");
+            fs::write(&outside, b"untouched").unwrap();
+            let hb = heartbeat(std::process::id());
+            let target = dir.join(format!("{}.json", hb.pid));
+            std::os::windows::fs::symlink_file(&outside, &target).expect(
+                "creating a file symlink requires Developer Mode or an elevated \
+                 process on the Windows CI runner",
+            );
+
+            write_heartbeat(&dir, &hb).expect_err("reparse target must be refused");
+            assert!(fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&outside).unwrap(), b"untouched");
         }
 
         #[test]

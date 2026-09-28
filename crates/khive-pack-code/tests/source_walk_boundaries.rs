@@ -185,3 +185,29 @@ async fn outside_prefix_sibling_and_socket_stay_excluded() {
         .iter()
         .any(|warning| { warning.contains("s.rs") && warning.contains("non-regular source") }));
 }
+
+#[tokio::test]
+async fn outside_manifest_symlink_is_counted_without_importing_its_project() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TempDir::new().expect("source fixture");
+    let root = fixture.path().join("source");
+    write_root(&root);
+    let outside = fixture.path().join("outside.toml");
+    std::fs::write(&outside, "[package]\nname = \"outside\"\n").expect("outside manifest");
+    std::fs::remove_file(root.join("Cargo.toml")).expect("remove checked manifest");
+    symlink(&outside, root.join("Cargo.toml")).expect("outside manifest symlink");
+
+    let (report, paths) = scan(&root, ["rust"].into_iter().collect()).await;
+    assert_eq!(paths, vec!["src/lib.rs"]);
+    assert_eq!(report.manifest_files_refused, 1);
+    assert_eq!(report.source_files_refused, 0);
+    assert_eq!(report.modules_created, 1);
+    let wire = serde_json::to_value(&report).expect("report JSON");
+    assert_eq!(wire["manifest_files_refused"].as_u64(), Some(1));
+    assert!(wire.get("source_files_refused").is_none());
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| { warning.contains("refused manifest") && warning.contains("Cargo.toml") }));
+}

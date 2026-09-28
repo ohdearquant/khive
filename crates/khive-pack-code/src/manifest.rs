@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value as JsonValue;
 use toml::Value as TomlValue;
 
+use crate::safe_source::{self, SourceReadError};
+
 /// One of the three languages this PR's L1/L1.5 tiers cover. Lean is deferred
 /// to the Scanner/Extractor pipeline (B2) and has no manifest tier.
 pub(crate) const LANGUAGES: &[&str] = &["rust", "python", "typescript"];
@@ -51,50 +53,84 @@ pub(crate) struct ManifestProject {
     pub renames: Vec<(String, String)>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ManifestReadFailure {
+    pub path: PathBuf,
+    pub error: SourceReadError,
+}
+
+fn read_manifest_if_present(
+    ingest_root: &Path,
+    path: &Path,
+    failures: &mut Vec<ManifestReadFailure>,
+) -> Option<String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            failures.push(ManifestReadFailure {
+                path: path.to_path_buf(),
+                error: SourceReadError::Refused(format!(
+                    "cannot inspect candidate manifest {}: {error}",
+                    path.display()
+                )),
+            });
+            return None;
+        }
+    }
+    match safe_source::read_contained_to_string(ingest_root, path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            failures.push(ManifestReadFailure {
+                path: path.to_path_buf(),
+                error,
+            });
+            None
+        }
+    }
+}
+
 /// Walk `path` recursively and parse every governing manifest found
 /// (B4: a workspace-only `Cargo.toml`/`pyproject.toml` with no package name
 /// is not governing and is skipped).
 pub(crate) fn discover_manifests(
     path: &Path,
     languages: &BTreeSet<&'static str>,
-) -> std::io::Result<Vec<ManifestProject>> {
+) -> std::io::Result<(Vec<ManifestProject>, Vec<ManifestReadFailure>)> {
     let mut out = Vec::new();
-    walk_dir(path, languages, &mut out)?;
-    Ok(out)
+    let mut failures = Vec::new();
+    walk_dir(path, path, languages, &mut out, &mut failures)?;
+    Ok((out, failures))
 }
 
 fn walk_dir(
     dir: &Path,
+    ingest_root: &Path,
     languages: &BTreeSet<&'static str>,
     out: &mut Vec<ManifestProject>,
+    failures: &mut Vec<ManifestReadFailure>,
 ) -> std::io::Result<()> {
     if languages.contains("rust") {
         let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.is_file() {
-            if let Ok(text) = fs::read_to_string(&cargo_toml) {
-                if let Some(project) = parse_cargo_toml(dir, &text) {
-                    out.push(project);
-                }
+        if let Some(text) = read_manifest_if_present(ingest_root, &cargo_toml, failures) {
+            if let Some(project) = parse_cargo_toml(dir, &text) {
+                out.push(project);
             }
         }
     }
     if languages.contains("python") {
         let pyproject = dir.join("pyproject.toml");
-        if pyproject.is_file() {
-            if let Ok(text) = fs::read_to_string(&pyproject) {
-                if let Some(project) = parse_pyproject_toml(dir, &text) {
-                    out.push(project);
-                }
+        if let Some(text) = read_manifest_if_present(ingest_root, &pyproject, failures) {
+            if let Some(project) = parse_pyproject_toml(dir, &text) {
+                out.push(project);
             }
         }
     }
     if languages.contains("typescript") {
         let package_json = dir.join("package.json");
-        if package_json.is_file() {
-            if let Ok(text) = fs::read_to_string(&package_json) {
-                if let Some(project) = parse_package_json(dir, &text) {
-                    out.push(project);
-                }
+        if let Some(text) = read_manifest_if_present(ingest_root, &package_json, failures) {
+            if let Some(project) = parse_package_json(dir, &text) {
+                out.push(project);
             }
         }
     }
@@ -110,7 +146,7 @@ fn walk_dir(
         if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
             continue;
         }
-        walk_dir(&entry.path(), languages, out)?;
+        walk_dir(&entry.path(), ingest_root, languages, out, failures)?;
     }
     Ok(())
 }
@@ -283,19 +319,19 @@ pub(crate) fn find_governing_manifest(
     file_dir: &Path,
     ingest_root: &Path,
     language: &str,
+    failures: &mut Vec<ManifestReadFailure>,
 ) -> Option<(PathBuf, String)> {
     let mut dir = Some(file_dir);
     while let Some(d) = dir {
         let found = match language {
-            "rust" => fs::read_to_string(d.join("Cargo.toml"))
-                .ok()
-                .and_then(|t| parse_cargo_toml(d, &t)),
-            "python" => fs::read_to_string(d.join("pyproject.toml"))
-                .ok()
-                .and_then(|t| parse_pyproject_toml(d, &t)),
-            "typescript" => fs::read_to_string(d.join("package.json"))
-                .ok()
-                .and_then(|t| parse_package_json(d, &t)),
+            "rust" => read_manifest_if_present(ingest_root, &d.join("Cargo.toml"), failures)
+                .and_then(|text| parse_cargo_toml(d, &text)),
+            "python" => read_manifest_if_present(ingest_root, &d.join("pyproject.toml"), failures)
+                .and_then(|text| parse_pyproject_toml(d, &text)),
+            "typescript" => {
+                read_manifest_if_present(ingest_root, &d.join("package.json"), failures)
+                    .and_then(|text| parse_package_json(d, &text))
+            }
             _ => None,
         };
         if let Some(project) = found {
@@ -312,6 +348,38 @@ pub(crate) fn find_governing_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_manifest_symlink_outside_root_is_refused() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let fixture = TempDir::new().expect("fixture");
+        let root = fixture.path().join("root");
+        fs::create_dir(&root).expect("root");
+        let manifest = root.join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname = \"inside\"\n").expect("manifest");
+        let outside = fixture.path().join("outside.toml");
+        fs::write(&outside, "[package]\nname = \"outside\"\n").expect("outside manifest");
+
+        let canonical_root = root.canonicalize().expect("canonical root");
+        assert!(manifest
+            .canonicalize()
+            .expect("checked manifest")
+            .starts_with(&canonical_root));
+        fs::remove_file(&manifest).expect("remove checked manifest");
+        symlink(&outside, &manifest).expect("swap to outside symlink");
+
+        let (projects, failures) =
+            discover_manifests(&canonical_root, &["rust"].into_iter().collect())
+                .expect("manifest walk");
+        assert!(projects.is_empty());
+        assert!(failures.iter().any(|failure| {
+            failure.path == canonical_root.join("Cargo.toml")
+                && matches!(&failure.error, SourceReadError::Refused(_))
+        }));
+    }
 
     #[test]
     fn cargo_toml_without_package_is_not_governing() {
