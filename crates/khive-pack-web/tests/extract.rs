@@ -7,7 +7,9 @@ use std::sync::Arc;
 use khive_pack_kg::KgPack;
 use khive_pack_web::WebPack;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
-use khive_storage::{BlobStore, ContentRef, Entity};
+use khive_storage::{
+    Attachment, AttachmentSubstrate, BlobStore, ContentRef, Entity, NewAttachment,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -93,6 +95,7 @@ fn fixture() -> (
 }
 
 async fn seed_page(runtime: &KhiveRuntime, store: &dyn BlobStore, body: Vec<u8>) -> Uuid {
+    let body_len = body.len() as u64;
     let content_ref = store.put(body).await.unwrap();
     let token = runtime.authorize(Namespace::local()).unwrap();
     let mut entity =
@@ -109,6 +112,23 @@ async fn seed_page(runtime: &KhiveRuntime, store: &dyn BlobStore, body: Vec<u8>)
         .insert_entity_if_absent(entity)
         .await
         .unwrap());
+    runtime
+        .core()
+        .attachments()
+        .unwrap()
+        .upsert_attachment(Attachment::from_new(
+            id,
+            AttachmentSubstrate::Entity,
+            NewAttachment {
+                role: "content".to_string(),
+                content_ref,
+                media_type: Some("text/html".to_string()),
+                size_bytes: Some(body_len),
+            },
+            chrono::Utc::now().timestamp_micros(),
+        ))
+        .await
+        .unwrap();
     id
 }
 
