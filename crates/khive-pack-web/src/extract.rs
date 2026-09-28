@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use khive_runtime::{EdgeListFilter, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, StorageCapability, StorageError};
 use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
@@ -1223,9 +1223,24 @@ async fn run_extract_with_link_selection(
         )
     })?;
     verify_source_body(runtime, token, target_id, &source_content_ref).await?;
-    let verified = hydrator
-        .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
-        .await?;
+    let size = match crate::blob_store(runtime)?.size(&content_ref).await {
+        Ok(Some(size)) => size,
+        Ok(None)
+        | Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            ..
+        }) => khive_storage::MAX_BLOB_WHOLE_BYTES,
+        Err(error) => return Err(error.into()),
+    };
+    if size > khive_storage::MAX_BLOB_WHOLE_BYTES {
+        return Err(StorageError::BlobTooLarge {
+            content_ref,
+            max_bytes: khive_storage::MAX_BLOB_WHOLE_BYTES,
+            observed_at_least: size,
+        }
+        .into());
+    }
+    let verified = hydrator.hydrate_verified(&content_ref, size).await?;
     let url_str = properties
         .get("url")
         .and_then(Value::as_str)
