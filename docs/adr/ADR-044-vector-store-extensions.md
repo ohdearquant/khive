@@ -1125,7 +1125,7 @@ to the original §1-5 trait extensions, not this A4 schema addition.
 | Sidecar keyed only by model and subject                 | Rejected. A bypass writer can replace vec0 without touching that row and leave false provenance. Binding the chosen sidecar to the live embedding BLOB reports unknown when the bytes change; identical-byte replacements still require known writers to clear or maintain the sidecar.                                                                                                                                  |
 | Return `None` for unsupported backends                  | Rejected. It would conflate an unsupported read with a proven absent vector.                                                                                                                                                                                                                                                                                                                                             |
 
-## Amendment A5: rerank from stored vectors (#2378, proposed 2026-09-28)
+## Amendment A5: rerank from stored vectors (#2378, accepted 2026-09-28)
 
 **Status**: Accepted (2026-09-28; #2378). Builds on A4 (persisted vector text provenance).
 
