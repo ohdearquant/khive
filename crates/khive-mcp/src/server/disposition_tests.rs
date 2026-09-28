@@ -495,14 +495,18 @@ async fn a3_committed_noncomm_create_preserves_exact_entity_id() {
 async fn a3_predispatch_refusals_leave_real_stats_unchanged() {
     let fixture = Fixture::new();
     let before = fixture.stats().await;
-    for ops in [
-        "a3_missing_verb()",
-        "stats(namespace=42)",
-        "a3fixture.hidden()",
-    ] {
+    for ops in ["a3_missing_verb()", "stats(namespace=42)", "hidden()"] {
         let response = fixture.request(ops).await;
         let entry = &response["results"][0];
         assert_eq!(entry["ok"], false, "{ops}: {response}");
+        if ops == "hidden()" {
+            assert_eq!(
+                entry["error"]["message"],
+                "permission denied for verb \"hidden\": verb 'hidden' is an internal \
+                 subhandler and cannot be invoked via the MCP request surface",
+                "{ops}: {response}"
+            );
+        }
         assert_eq!(
             entry["error"]["domain_disposition"], "not_committed",
             "{ops}: {response}"
