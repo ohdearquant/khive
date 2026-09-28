@@ -84,6 +84,7 @@ impl Drop for Process {
 struct Fixture {
     // Processes must drop before their socket, database and log directory.
     daemons: Vec<Process>,
+    writer_count: usize,
     root: TempDir,
     database: PathBuf,
     config: PathBuf,
@@ -92,8 +93,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(daemon_count: usize) -> Self {
-        assert!((1..=2).contains(&daemon_count));
+    fn new(writer_count: usize) -> Self {
+        assert!((1..=2).contains(&writer_count));
         let root = tempfile::Builder::new()
             .prefix("memory-keys-")
             .tempdir_in("/tmp")
@@ -118,13 +119,17 @@ impl Fixture {
         .unwrap();
         let mut fixture = Self {
             daemons: Vec::new(),
+            writer_count,
             root,
             database,
             config,
             sequence: 0,
             completed: 0,
         };
-        for index in 0..daemon_count {
+        // One daemon owns the store. A second process, when requested, writes
+        // through the explicit local-dispatch path instead of booting a
+        // competing daemon on the same SQLite file.
+        for index in 0..1 {
             let stdout = fixture.root.path().join(format!("daemon-{index}.stdout"));
             let stderr = fixture.root.path().join(format!("daemon-{index}.stderr"));
             let child = fixture
@@ -159,11 +164,9 @@ impl Fixture {
             }
             fixture.ok(index, ACTOR, operation("stats", json!({})));
         }
-        if daemon_count == 2 {
-            assert_ne!(fixture.daemons[0].child.id(), fixture.daemons[1].child.id());
-            assert_ne!(fixture.socket(0), fixture.socket(1));
-        }
-        eprintln!("started {daemon_count} daemons on one scratch store; events split disabled");
+        eprintln!(
+            "started one daemon for {writer_count} writer process(es) on one scratch store; events split disabled"
+        );
         fixture
     }
 
@@ -196,6 +199,9 @@ impl Fixture {
                 self.root.path().join(format!("recover-{index}.lock")),
             )
             .current_dir(self.root.path());
+        if index == 1 {
+            command.env("KHIVE_NO_DAEMON", "1");
+        }
         command
     }
 
@@ -306,7 +312,10 @@ impl Fixture {
     }
 
     fn race(&mut self, first: Value, second: Value, actor: &str) -> [Value; 2] {
-        assert_eq!(self.daemons.len(), 2, "race needs two distinct daemons");
+        assert_eq!(
+            self.writer_count, 2,
+            "race needs two distinct writer processes"
+        );
         let (mut left, left_ready) = self.start(0, actor, first, true);
         let (mut right, right_ready) = self.start(1, actor, second, true);
         assert_ne!(left.child.id(), right.child.id(), "two OS clients required");
@@ -329,11 +338,10 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(10));
         }
         eprintln!(
-            "release clients {} and {} to daemons {} and {}",
+            "release clients {} and {} to daemon {} and local dispatch",
             left.child.id(),
             right.child.id(),
-            self.daemons[0].child.id(),
-            self.daemons[1].child.id()
+            self.daemons[0].child.id()
         );
         left.child.stdin.take().unwrap().write_all(&[1]).unwrap();
         right.child.stdin.take().unwrap().write_all(&[1]).unwrap();
@@ -369,6 +377,31 @@ impl Fixture {
                 |row| row.get(0),
             )
             .expect("count physical keyed history")
+    }
+
+    fn assert_key_uniqueness_index(&mut self) {
+        // Force the direct-store notes DDL path as well as the migration path
+        // before inspecting the live schema.
+        assert!(self.memories("keys:index-check").is_empty());
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(self.database.clone()),
+            ..PoolConfig::default()
+        })
+        .expect("observer pool for keyed-memory schema");
+        let reader = pool.reader().expect("schema reader");
+        let count: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_notes_namespace_kind_key' \
+                 AND sql LIKE 'CREATE UNIQUE INDEX%WHERE key IS NOT NULL AND deleted_at IS NULL%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect the keyed-memory uniqueness constraint");
+        assert_eq!(
+            count, 1,
+            "keyed-memory concurrency requires the live partial unique index"
+        );
     }
 
     fn assert_executed(&self, minimum: usize) {
@@ -513,8 +546,9 @@ fn memory_keys_cli_replay_decoy_and_unkeyed_control() {
 }
 
 #[test]
-fn memory_keys_two_processes_two_daemons_share_one_holder() {
+fn memory_keys_two_processes_one_daemon_share_one_holder() {
     let mut fixture = Fixture::new(2);
+    fixture.assert_key_uniqueness_index();
     const ROUNDS: usize = 4;
     for round in 0..ROUNDS {
         let namespace = format!("keys:concurrent:{round}");
@@ -556,8 +590,41 @@ fn memory_keys_two_processes_two_daemons_share_one_holder() {
             "partial unique index must reject the competing insert"
         );
         assert_eq!(id(&notes[0]), winner);
+
+        let conflict_namespace = format!("keys:concurrent-conflict:{round}");
+        let first = remember(Some("same-key"), Some(&conflict_namespace), None);
+        let mut different = first.clone();
+        different["args"]["content"] = json!("different keyed-memory payload");
+        let conflict_results = fixture.race(first, different, ACTOR);
+        let created: Vec<_> = conflict_results
+            .iter()
+            .filter(|result| result["ok"] == true)
+            .collect();
+        let refused: Vec<_> = conflict_results
+            .iter()
+            .filter(|result| result["ok"] == false)
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "one payload creates: {conflict_results:?}"
+        );
+        assert_eq!(
+            refused.len(),
+            1,
+            "the competing payload refuses: {conflict_results:?}"
+        );
+        let holder = id(&created[0]["result"]);
+        assert_conflict(refused[0], "same-key", holder);
+        let conflict_notes = fixture.memories(&conflict_namespace);
+        assert_eq!(
+            conflict_notes.len(),
+            1,
+            "the index retains one keyed holder"
+        );
+        assert_eq!(id(&conflict_notes[0]), holder);
     }
-    fixture.assert_executed(2 + 3 * ROUNDS);
+    fixture.assert_executed(2 + 6 * ROUNDS);
 }
 
 #[test]
@@ -636,6 +703,7 @@ fn memory_keys_soft_and_hard_delete_release_the_key() {
 #[test]
 fn memory_keys_actor_scope_and_explicit_namespace_pin() {
     let mut fixture = Fixture::new(2);
+    fixture.assert_key_uniqueness_index();
     let other = "test:recovering-writer";
     let op = remember(Some("unpinned-operation"), None, None);
     let first = fixture.ok(0, ACTOR, op.clone());
@@ -659,6 +727,7 @@ fn memory_keys_actor_scope_and_explicit_namespace_pin() {
 #[test]
 fn memory_keys_prune_replay_race_bounds_retained_history() {
     let mut fixture = Fixture::new(2);
+    fixture.assert_key_uniqueness_index();
     const ROUNDS: usize = 12;
     let mut outcomes = [0usize; 2];
     for round in 0..ROUNDS {

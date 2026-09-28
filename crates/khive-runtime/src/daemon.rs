@@ -219,6 +219,211 @@ pub fn lock_path() -> PathBuf {
     khive_dir().join("khived.recovery.lock")
 }
 
+/// One daemon-lifetime path-sidecar claim and its bound database-file identity.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DaemonStoreGuard {
+    _sidecar: std::fs::File,
+    database: PathBuf,
+    claimed_identity: Option<(u64, u64)>,
+    _bound_database: Option<std::fs::File>,
+}
+
+/// Placeholder for platforms where serving daemons and store claims are unavailable.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct DaemonStoreGuard;
+
+#[cfg(unix)]
+fn regular_store_identity(database: &std::path::Path) -> anyhow::Result<Option<(u64, u64)>> {
+    let metadata = match std::fs::symlink_metadata(database) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            anyhow::bail!(
+                "cannot inspect claimed database {}: {error}",
+                database.display()
+            )
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "claimed database {} is not a regular file",
+        database.display()
+    );
+    Ok(Some((metadata.dev(), metadata.ino())))
+}
+
+/// Open each claimed canonical database pathname under its held sidecar lock.
+/// A missing writable database is created here, after the claim; a missing
+/// read-only database fails without creating it. The descriptor pins the
+/// identity to compare against the later SQLite open at the same path.
+#[cfg(unix)]
+pub fn bind_daemon_store_files(
+    guards: &mut [DaemonStoreGuard],
+    read_only_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for guard in guards {
+        let read_only = read_only_paths.contains(&guard.database);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .create(!read_only)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&guard.database)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot open claimed database {}: {error}",
+                    guard.database.display()
+                )
+            })?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "claimed database {} is not a regular file",
+            guard.database.display()
+        );
+        let opened_identity = (metadata.dev(), metadata.ino());
+        if let Some(claimed_identity) = guard.claimed_identity {
+            anyhow::ensure!(
+                claimed_identity == opened_identity,
+                "claimed database {} changed inode between claim and open",
+                guard.database.display()
+            );
+        }
+        guard.claimed_identity = Some(opened_identity);
+        guard._bound_database = Some(file);
+        anyhow::ensure!(
+            regular_store_identity(&guard.database)? == Some(opened_identity),
+            "claimed database {} changed inode while binding its open file",
+            guard.database.display()
+        );
+    }
+    Ok(())
+}
+
+/// Fail boot if the canonical pathname no longer names the file opened under
+/// its held claim. Call after SQLite has opened the database and before serving.
+#[cfg(unix)]
+pub fn assert_daemon_store_identities(guards: &[DaemonStoreGuard]) -> anyhow::Result<()> {
+    for guard in guards {
+        let observed = regular_store_identity(&guard.database)?;
+        anyhow::ensure!(
+            observed.is_some() && observed == guard.claimed_identity,
+            "claimed database {} changed inode after open (claimed {:?}, now {:?}); refusing daemon boot",
+            guard.database.display(),
+            guard.claimed_identity,
+            observed
+        );
+    }
+    Ok(())
+}
+
+/// Non-Unix hosts cannot run the daemon and have no store claims to verify.
+#[cfg(not(unix))]
+pub fn assert_daemon_store_identities(_guards: &[DaemonStoreGuard]) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Hold one exclusive daemon-lifetime lock for each resolved SQLite file.
+/// Unlike the HOME-bound boot/recovery lock, these locks follow the storage
+/// topology. Callers acquire them before SQLite opens any store and retain
+/// them until daemon shutdown. Never unlink a lock file: unlinking a held
+/// inode would let a second boot lock a new one.
+///
+/// `database_paths` must contain canonical absolute paths. This function
+/// sorts and deduplicates them so overlapping multi-backend topologies acquire
+/// in one order and aliases of one path use one lock.
+#[cfg(unix)]
+pub fn acquire_daemon_store_guards(
+    database_paths: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<Vec<DaemonStoreGuard>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut database_paths: Vec<PathBuf> = database_paths.into_iter().collect();
+    database_paths.sort();
+    database_paths.dedup();
+    let mut guards = Vec::with_capacity(database_paths.len());
+
+    for database in database_paths {
+        let filename = database.file_name().ok_or_else(|| {
+            anyhow::anyhow!("database path {} has no file name", database.display())
+        })?;
+        let mut lock_name = std::ffi::OsString::from(".");
+        lock_name.push(filename);
+        lock_name.push(".khived.lock");
+        let lock_path = database.with_file_name(lock_name);
+        let parent = lock_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("store lock {} has no parent", lock_path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot create store lock directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot open daemon store lock {} for {}: {error}",
+                    lock_path.display(),
+                    database.display()
+                )
+            })?;
+        if !file.metadata()?.is_file() {
+            anyhow::bail!(
+                "daemon store lock {} is not a regular file",
+                lock_path.display()
+            );
+        }
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // The winning process writes its pid immediately after locking.
+                // A contender can race that write, so an empty/unreadable pid
+                // is an unknown holder, never permission to proceed.
+                let holder = std::fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .map(|pid| format!("pid {pid}"))
+                    .unwrap_or_else(|| "an unknown pid".to_string());
+                anyhow::bail!(
+                    "refusing to start: khived is already running as {holder} for database {}; \
+                     daemon store lock {} is held",
+                    database.display(),
+                    lock_path.display()
+                );
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                anyhow::bail!(
+                    "cannot acquire daemon store lock {} for {}: {error}",
+                    lock_path.display(),
+                    database.display()
+                );
+            }
+        }
+        file.set_len(0)?;
+        file.write_all(std::process::id().to_string().as_bytes())?;
+        file.sync_data()?;
+        let claimed_identity = regular_store_identity(&database)?;
+        guards.push(DaemonStoreGuard {
+            _sidecar: file,
+            database,
+            claimed_identity,
+            _bound_database: None,
+        });
+    }
+    Ok(guards)
+}
+
 /// Advisory lock file used to serialize RECOVERY (kill+respawn) attempts
 /// across concurrent clients only — the daemon's own boot sequence never
 /// acquires this file ([`lock_path`] / [`acquire_daemon_boot_guard`] is the
@@ -6251,6 +6456,133 @@ mod tests {
             std::fs::read_dir(home).unwrap().next().is_none(),
             "both daemon lock producers must leave the child HOME empty"
         );
+    }
+
+    #[test]
+    fn store_guard_refuses_a_second_claim_and_names_the_holder() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("fixture");
+        let database = dir.path().join("stores/khive.db");
+        let first = acquire_daemon_store_guards([database.clone()]).expect("first daemon claim");
+        let lock = dir.path().join("stores/.khive.db.khived.lock");
+        assert!(lock.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            std::process::id().to_string()
+        );
+
+        let error = acquire_daemon_store_guards([database.clone()])
+            .expect_err("a second daemon claim must not own the same store");
+        let message = error.to_string();
+        assert!(message.contains("already running"), "{message}");
+        assert!(
+            message.contains(&format!("pid {}", std::process::id())),
+            "{message}"
+        );
+        assert_eq!(
+            lock.parent(),
+            database.parent(),
+            "the guard must be anchored beside the database, independent of the HOME rendezvous"
+        );
+
+        drop(first);
+        let replacement = acquire_daemon_store_guards([database]).expect("guard released");
+        drop(replacement);
+        assert!(
+            lock.is_file(),
+            "the stable lock inode must never be unlinked"
+        );
+    }
+
+    #[test]
+    fn store_guard_deduplicates_and_releases_partial_claims() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let first_path = dir.path().join("a.db");
+        let second_path = dir.path().join("b.db");
+        let first = acquire_daemon_store_guards([second_path.clone()]).unwrap();
+        let error = acquire_daemon_store_guards([
+            second_path.clone(),
+            first_path.clone(),
+            first_path.clone(),
+        ])
+        .expect_err("overlap on the second lock must refuse the full topology");
+        assert!(error.to_string().contains("b.db"), "{error}");
+        let independent = acquire_daemon_store_guards([first_path.clone(), first_path])
+            .expect("the failed candidate released its earlier lock and deduplicated aliases");
+        drop(independent);
+        drop(first);
+        acquire_daemon_store_guards([second_path]).expect("second store released");
+    }
+
+    #[test]
+    fn store_guard_missing_database_binds_created_inode_under_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("new.db");
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        assert!(
+            !database.exists(),
+            "claiming the sidecar must not create SQLite data"
+        );
+        bind_daemon_store_files(&mut guards, &[]).unwrap();
+        assert!(database.is_file());
+        assert_daemon_store_identities(&guards).unwrap();
+    }
+
+    #[test]
+    fn store_guard_missing_read_only_database_refuses_without_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("missing-snapshot.db");
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        let error = bind_daemon_store_files(&mut guards, std::slice::from_ref(&database))
+            .expect_err("read-only database must already exist");
+        assert!(
+            error.to_string().contains("cannot open claimed database"),
+            "{error}"
+        );
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn store_guard_replaced_canonical_inode_refuses_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("database.db");
+        std::fs::write(&database, b"original").unwrap();
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        bind_daemon_store_files(&mut guards, &[]).unwrap();
+
+        let replacement = dir.path().join("replacement.db");
+        std::fs::write(&replacement, b"replacement").unwrap();
+        std::fs::rename(&replacement, &database).unwrap();
+        let error = assert_daemon_store_identities(&guards)
+            .expect_err("a replaced canonical inode must refuse daemon boot");
+        assert!(
+            error.to_string().contains("changed inode after open"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn store_guard_hardlink_names_remain_independent_unsupported_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let database = first_dir.join("database.db");
+        let hardlink = second_dir.join("alias.db");
+        std::fs::write(&database, b"same inode").unwrap();
+        std::fs::hard_link(&database, &hardlink).unwrap();
+        let original = regular_store_identity(&database).unwrap();
+        assert_eq!(original, regular_store_identity(&hardlink).unwrap());
+
+        let first = acquire_daemon_store_guards([database]).unwrap();
+        let second = acquire_daemon_store_guards([hardlink]).expect(
+            "distinct hardlink names have distinct path sidecars and are unsupported aliases",
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
     }
 
     // ── the recovery lock actually serializes two boot sequences ─────────────

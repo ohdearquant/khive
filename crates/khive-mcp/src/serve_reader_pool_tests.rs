@@ -120,10 +120,11 @@ async fn forwarding_runtime_uses_one_reader_on_every_store() {
         Some(1),
         "forwarding default must be selected before store construction"
     );
-    let multi =
-        build_registry_for_multi_backend_inner_with_max_readers(config, &khive_cfg, None, readers)
-            .await
-            .expect("forwarding registry");
+    let multi = build_registry_for_multi_backend_inner_with_max_readers(
+        config, &khive_cfg, None, readers, None,
+    )
+    .await
+    .expect("forwarding registry");
     assert_store_readers(&multi, 1);
 }
 
@@ -145,7 +146,7 @@ async fn direct_hosts_keep_default_readers() {
             "direct hosts must retain the default reader policy"
         );
         let multi = build_registry_for_multi_backend_inner_with_max_readers(
-            config, &khive_cfg, None, readers,
+            config, &khive_cfg, None, readers, None,
         )
         .await
         .expect("direct registry");
@@ -195,7 +196,7 @@ async fn memory_runtime_keeps_single_connection_mode() {
     khive_cfg.packs.clear();
     let readers = mcp_max_readers(&args, &config, &khive_cfg.backends, None);
     assert_eq!(readers, None);
-    let runtime = build_single_backend_runtime_with_max_readers(config, &khive_cfg, readers)
+    let runtime = build_single_backend_runtime_with_max_readers(config, &khive_cfg, readers, None)
         .await
         .expect("in-memory runtime");
     assert!(!runtime.backend().is_file_backed());
@@ -278,10 +279,11 @@ async fn forwarding_runtime_retains_pool_for_local_dispatch_and_save_to() {
     let dir = tempfile::tempdir().unwrap();
     let (args, config, khive_cfg) = fixture(dir.path());
     let readers = mcp_max_readers(&args, &config, &khive_cfg.backends, None);
-    let multi =
-        build_registry_for_multi_backend_inner_with_max_readers(config, &khive_cfg, None, readers)
-            .await
-            .expect("forwarding registry");
+    let multi = build_registry_for_multi_backend_inner_with_max_readers(
+        config, &khive_cfg, None, readers, None,
+    )
+    .await
+    .expect("forwarding registry");
     let pool = multi.main_backend.pool_arc();
     let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
     let sink = dir.path().join("stats.jsonl");
