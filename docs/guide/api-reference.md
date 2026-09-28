@@ -1117,8 +1117,10 @@ reconstructed. Additional handles to the same pool and secondary-pool constructi
 advance it. The root reader and writer counters belong to main; compare
 `(pid, started_at, pool_generation)` to identify its counter window. Within `databases`, reader
 and writer counters belong to the entry's pool. A secondary pool can be reconstructed without
-advancing the main `pool_generation`, so compare its canonical `path` and process identity and
-treat a secondary-pool restart as a new counter window. Checkpoint counters and audit failure
+advancing the main `pool_generation`; its canonical `path` and process identity also stay the
+same. The report has no per-secondary generation field, so it cannot identify that
+reconstruction directly. A decrease in a cumulative secondary-pool counter indicates a new
+observation window. Checkpoint counters and audit failure
 counters remain process-global. Point-in-time gauges and
 consecutive-failure counts can also decrease during normal operation.
 
