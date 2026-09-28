@@ -51,9 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching `KHIVE_EMAIL_INGEST_NAMESPACE` and the adjacent startup resolver,
   instead of a hard-coded identity with no meaning outside the deployment it
   was named for. Behaviour with the variable explicitly set is unchanged.
-- Uncorrelated Telegram messages now default to the `local` inbox. Deployments
-  that currently read from `telegram:bot` can set
-  `KHIVE_TELEGRAM_DEFAULT_ACTOR=telegram:bot` to keep receiving messages there.
+- Uncorrelated Telegram messages can be routed with
+  `KHIVE_TELEGRAM_DEFAULT_ACTOR`; the unset or blank default remains the isolated
+  `telegram:bot` inbox. Routing them to `local` requires an access policy that
+  protects the local inbox from anonymous readers.
 
 ### Fixed
 
