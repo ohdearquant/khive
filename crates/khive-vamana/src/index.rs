@@ -1498,6 +1498,19 @@ impl VamanaIndex {
             let mut index = Self::load(path)?;
             // Release the mmap before save_atomic overwrites the same files.
             index.ensure_owned()?;
+            let mut stored_config = index.config().clone();
+            let dimension = index.dimensions();
+            let stored_bytes: &[u8] = cast_slice(index.vectors()?);
+            let corpus_bytes: &[u8] = cast_slice(corpus_vectors);
+            let corpus_matches = dimension == fallback_config.dimensions
+                && dimension != 0
+                && corpus_vectors.len().is_multiple_of(dimension)
+                && index.num_vectors() == corpus_vectors.len() / dimension
+                && stored_bytes == corpus_bytes;
+            if !corpus_matches {
+                stored_config.dimensions = fallback_config.dimensions;
+                return rebuild_and_persist(&mut publication_guard, stored_config);
+            }
             index.set_last_applied_seq(rebuild_last_applied_seq);
             // Same reason as in `rebuild_and_persist`: this branch publishes, so the
             // shared read lock must be gone before `save_atomic` asks for it exclusively.
