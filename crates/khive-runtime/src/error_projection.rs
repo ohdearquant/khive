@@ -26,6 +26,7 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         // refused: the receipt exists precisely to record that nothing ran.
         RuntimeError::RefusedWithReceipt(_) => Some("not_committed"),
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
+            (khive_types::ErrorKind::Internal, Some("post_commit_degraded")) => Some("committed"),
             (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
                 Some("not_committed")
             }
