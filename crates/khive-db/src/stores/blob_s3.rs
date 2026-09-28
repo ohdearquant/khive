@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
@@ -400,6 +401,7 @@ impl BlobStore for S3BlobStore {
         let digest = blake3::hash(&bytes);
         let content_ref = ContentRef::from_digest_bytes(digest.as_bytes());
         let key = self.shard_key(&content_ref);
+        let payload_bytes = Bytes::from(bytes);
 
         // HEAD fast path: content-addressed dedup means an existing object
         // makes this put a no-op, same contract as FsBlobStore. A single
@@ -410,11 +412,7 @@ impl BlobStore for S3BlobStore {
             Ok(Ok(_)) => return Ok(content_ref),
             Ok(Err(ObjectStoreError::NotFound { .. })) => {}
             Ok(Err(e)) => return Err(map_object_store_err(e, "put_head")),
-            Err(_elapsed) => {
-                return Err(StorageError::Timeout {
-                    operation: "put_head".into(),
-                });
-            }
+            Err(_elapsed) => {}
         }
 
         // Bounded outer retry around the conditional create (ADR-111
@@ -428,10 +426,9 @@ impl BlobStore for S3BlobStore {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            // Rebuild the payload each attempt: `PutPayload` is consumed by
-            // `put_opts`, and `Bytes::clone()` is a cheap refcount bump, not
-            // a copy, so re-deriving it from `bytes` costs nothing material.
-            let payload = PutPayload::from(bytes.clone());
+            // `PutPayload` is consumed by `put_opts`; cloning `Bytes`
+            // shares the same allocation across bounded retry attempts.
+            let payload = PutPayload::from(payload_bytes.clone());
             let put_fut = self.client.put_opts(&key, payload, PutMode::Create.into());
             match tokio::time::timeout(self.request_timeout, put_fut).await {
                 Ok(Ok(_)) => return Ok(content_ref),
@@ -1013,6 +1010,7 @@ mod tests {
         #[derive(Debug)]
         pub struct FakeObjectStore {
             put_script: Mutex<Vec<Outcome>>,
+            pub(super) put_payloads: Mutex<Vec<Bytes>>,
             get_script: Mutex<Vec<Outcome>>,
             list_script: Arc<Mutex<Vec<ListOutcome>>>,
             delete_script: Arc<Mutex<Vec<Outcome>>>,
@@ -1061,6 +1059,7 @@ mod tests {
             pub fn new(put_script: Vec<Outcome>, get_script: Vec<Outcome>) -> Self {
                 Self {
                     put_script: Mutex::new(put_script),
+                    put_payloads: Mutex::new(Vec::new()),
                     get_script: Mutex::new(get_script),
                     list_script: Arc::new(Mutex::new(Vec::new())),
                     delete_script: Arc::new(Mutex::new(vec![Outcome::Ok])),
@@ -1139,9 +1138,13 @@ mod tests {
             async fn put_opts(
                 &self,
                 _location: &ObjectPath,
-                _payload: PutPayload,
+                payload: PutPayload,
                 _opts: PutOptions,
             ) -> Result<PutResult> {
+                self.put_payloads
+                    .lock()
+                    .unwrap()
+                    .push(payload.iter().next().cloned().unwrap_or_default());
                 let outcome = Self::next_outcome(&self.put_script, &self.put_calls);
                 if matches!(outcome, Outcome::Hang) {
                     tokio::time::sleep(self.hang_delay).await;
@@ -1321,6 +1324,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_head_timeout_then_already_exists_is_dedup_success() {
+        let (fake, store) = fake_store(vec![Outcome::AlreadyExists], vec![Outcome::Hang]);
+        assert!(store.put(b"head timeout dedup".to_vec()).await.is_ok());
+        assert_eq!(fake.head_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn put_head_timeout_then_create_succeeds() {
+        let (fake, store) = fake_store(vec![Outcome::Ok], vec![Outcome::Hang]);
+        assert!(store.put(b"head timeout create".to_vec()).await.is_ok());
+        assert_eq!(fake.head_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn put_head_permission_denied_still_fails_before_create() {
+        let (fake, store) = fake_store(vec![Outcome::Ok], vec![Outcome::PermissionDenied]);
+        let error = store
+            .put(b"head permission denied".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Driver { .. }), "{error:?}");
+        assert_eq!(fake.head_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.put_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn put_permission_denied_maps_to_driver_without_retry() {
         let (fake, store) = fake_store(vec![Outcome::PermissionDenied], vec![Outcome::NotFound]);
         let err = store.put(b"hello".to_vec()).await.unwrap_err();
@@ -1351,6 +1382,15 @@ mod tests {
         let result = store.put(b"hello".to_vec()).await;
         assert!(result.is_ok());
         assert_eq!(fake.put_calls.load(Ordering::SeqCst), 2);
+        let payloads = fake.put_payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0], Bytes::from_static(b"hello"));
+        assert_eq!(payloads[1], payloads[0]);
+        assert_eq!(
+            payloads[0].as_ptr(),
+            payloads[1].as_ptr(),
+            "retry payloads must share the same backing buffer"
+        );
     }
 
     #[tokio::test]
