@@ -895,7 +895,7 @@ fn build_note_filter_where(
                 let expr = json_extract_expr(&pf.json_path);
                 conditions.push(format!("khive_rfc3339_key({expr}) IS NOT NULL"));
             }
-            FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte => {
+            FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte | FilterOp::Rfc3339LteOrInvalid => {
                 let instant = match &pf.value {
                     SqlValue::Timestamp(instant) => *instant,
                     SqlValue::Text(text) => {
@@ -917,7 +917,19 @@ fn build_note_filter_where(
                     "<="
                 };
                 params.push(Box::new(crate::pool::rfc3339_instant_key(instant)));
-                conditions.push(format!("khive_rfc3339_key({expr}) {op} ?{}", params.len()));
+                let key_expr = if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
+                    format!("khive_rfc3339_strict_key({expr})")
+                } else {
+                    format!("khive_rfc3339_key({expr})")
+                };
+                if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
+                    conditions.push(format!(
+                        "({key_expr} IS NULL OR {key_expr} <= ?{})",
+                        params.len()
+                    ));
+                } else {
+                    conditions.push(format!("{key_expr} {op} ?{}", params.len()));
+                }
             }
             FilterOp::EqOrMissing => {
                 let expr = json_extract_expr(&pf.json_path);
@@ -1076,7 +1088,10 @@ fn build_note_filter_where(
                     | FilterOp::TextStartsWithIndexed => {
                         unreachable!()
                     }
-                    FilterOp::Rfc3339Valid | FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte => {
+                    FilterOp::Rfc3339Valid
+                    | FilterOp::Rfc3339Gte
+                    | FilterOp::Rfc3339Lte
+                    | FilterOp::Rfc3339LteOrInvalid => {
                         unreachable!()
                     }
                 };
