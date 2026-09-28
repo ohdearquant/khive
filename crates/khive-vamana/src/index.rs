@@ -70,7 +70,7 @@ fn is_read_only_lock_create_error(error: &std::io::Error) -> bool {
 }
 
 #[cfg(all(feature = "mmap", unix))]
-fn publication_file_identity(metadata: &fs::Metadata) -> Result<PublicationFileIdentity> {
+fn publication_file_identity(_: &Path, metadata: &fs::Metadata) -> Result<PublicationFileIdentity> {
     use std::os::unix::fs::MetadataExt as _;
     Ok(PublicationFileIdentity {
         volume: metadata.dev(),
@@ -81,24 +81,31 @@ fn publication_file_identity(metadata: &fs::Metadata) -> Result<PublicationFileI
 }
 
 #[cfg(all(feature = "mmap", windows))]
-fn publication_file_identity(metadata: &fs::Metadata) -> Result<PublicationFileIdentity> {
-    use std::os::windows::fs::MetadataExt as _;
-    let volume = metadata.volume_serial_number().ok_or_else(|| {
-        VamanaError::invalid_format("volume identity unavailable for unlocked load".into())
-    })?;
-    let file_index = metadata.file_index().ok_or_else(|| {
-        VamanaError::invalid_format("file identity unavailable for unlocked load".into())
-    })?;
+fn publication_file_identity(path: &Path, _: &fs::Metadata) -> Result<PublicationFileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file = File::open(path)?;
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `file` owns a live handle and `info` points to writable storage
+    // for the documented output structure. Only a successful call initializes it.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let info = unsafe { info.assume_init() };
+    let metadata = file.metadata()?;
     Ok(PublicationFileIdentity {
-        volume: u64::from(volume),
-        file_index,
+        volume: u64::from(info.dwVolumeSerialNumber),
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         len: metadata.len(),
         modified: metadata.modified().ok(),
     })
 }
 
 #[cfg(all(feature = "mmap", not(any(unix, windows))))]
-fn publication_file_identity(_: &fs::Metadata) -> Result<PublicationFileIdentity> {
+fn publication_file_identity(_: &Path, _: &fs::Metadata) -> Result<PublicationFileIdentity> {
     Err(VamanaError::invalid_format(
         "file identity unavailable for unlocked load on this platform".into(),
     ))
@@ -115,10 +122,13 @@ fn publication_file_snapshot(path: &Path) -> Result<Vec<Option<PublicationFileId
         ".checkpoint.lock",
     ]
     .iter()
-    .map(|name| match fs::metadata(path.join(name)) {
-        Ok(metadata) => publication_file_identity(&metadata).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    .map(|name| {
+        let file_path = path.join(name);
+        match fs::metadata(&file_path) {
+            Ok(metadata) => publication_file_identity(&file_path, &metadata).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     })
     .collect()
 }
@@ -6117,6 +6127,28 @@ mod tests {
             !lock_path.exists(),
             "read-only fallback must not create a lock"
         );
+    }
+
+    #[cfg(all(feature = "mmap", windows))]
+    #[test]
+    fn windows_unlocked_load_identity_uses_stable_handle_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.bin");
+        fs::write(&path, b"first").unwrap();
+        let first = publication_file_identity(&path, &fs::metadata(&path).unwrap()).unwrap();
+        fs::write(&path, b"longer-second-value").unwrap();
+        let second = publication_file_identity(&path, &fs::metadata(&path).unwrap()).unwrap();
+        assert_eq!(
+            (first.volume, first.file_index),
+            (second.volume, second.file_index)
+        );
+        assert_ne!(first.len, second.len);
+        let replacement = dir.path().join("replacement.bin");
+        fs::write(&replacement, b"longer-second-value").unwrap();
+        let distinct =
+            publication_file_identity(&replacement, &fs::metadata(&replacement).unwrap()).unwrap();
+        assert_eq!(second.volume, distinct.volume);
+        assert_ne!(second.file_index, distinct.file_index);
     }
 
     #[cfg(all(feature = "mmap", unix))]
