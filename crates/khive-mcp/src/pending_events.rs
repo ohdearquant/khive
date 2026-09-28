@@ -43,7 +43,7 @@
 //! means for creation and for this executor:
 //! - `"daily"`   → `trigger_at + 1 day`
 //! - `"weekly"`  → `trigger_at + 7 days`
-//! - `"monthly"` → `trigger_at + 1 calendar month`
+//! - `"monthly"` → `repeat_anchor` plus n calendar months, clamped per month
 //! - `"every:<N><s|m|h|d>"` → `trigger_at + N units`
 //! - a five-field cron expression → the next match after `trigger_at`, in UTC
 //!
@@ -962,8 +962,17 @@ async fn run_pending_events_on_with_lease(
                         continue;
                     };
                     props["missed_at"] = json!(now.timestamp_micros());
-                    match advance_repeat_past_missed(&repeat, trigger_at, now) {
-                        Some(next_at) => {
+                    let repeat_for_finalize = props
+                        .get("repeat")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    match advance_repeat_past_missed_for_event(
+                        &mut props,
+                        &repeat_for_finalize,
+                        trigger_at,
+                        now,
+                    ) {
+                        Ok(Some(next_at)) => {
                             // Repeating event: skip this occurrence, re-arm
                             // pending at the next future one, rendered at the
                             // original offset, not UTC.
@@ -971,11 +980,18 @@ async fn run_pending_events_on_with_lease(
                                 json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                             props["status"] = json!("pending");
                         }
-                        None => {
+                        Ok(None) => {
                             // Non-repeating: terminal "missed". Unsupported
                             // recurrence was rejected before this path.
                             // `fired_at` stays null/untouched.
                             props["status"] = json!("missed");
+                        }
+                        Err(error) => {
+                            props["status"] = json!("failed");
+                            let (error_key, error_at_key) = dispatch_error_property_keys(&props);
+                            props[error_key] = json!(error);
+                            props[error_at_key] = json!(Utc::now().to_rfc3339());
+                            summary.failed += 1;
                         }
                     }
                     let updated_at = Utc::now().timestamp_micros();
@@ -1924,30 +1940,36 @@ fn final_properties_after_dispatch(
                 object.remove(error_at_key);
             }
             properties["fired_at"] = json!(completed_at_rfc);
-            match next_trigger_at(repeat, trigger_at) {
-                Some(next_at) => {
+            match next_trigger_at_for_event(&mut properties, repeat, trigger_at) {
+                Ok(Some(next_at)) => {
                     properties["trigger_at"] =
                         json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                     properties["status"] = json!("pending");
                     (properties, FinalDisposition::Advanced)
                 }
-                None => {
+                Ok(None) => {
                     properties["status"] = json!("fired");
                     (properties, FinalDisposition::Fired)
+                }
+                Err(error) => {
+                    properties["status"] = json!("failed");
+                    properties[error_key] = json!(error);
+                    properties[error_at_key] = json!(completed_at_rfc);
+                    (properties, FinalDisposition::Failed)
                 }
             }
         }
         DispatchCompletion::Failed(error) => {
             properties[error_key] = json!(error.as_str());
             properties[error_at_key] = json!(completed_at_rfc);
-            match next_trigger_at(repeat, trigger_at) {
-                Some(next_at) => {
+            match next_trigger_at_for_event(&mut properties, repeat, trigger_at) {
+                Ok(Some(next_at)) => {
                     properties["trigger_at"] =
                         json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                     properties["status"] = json!("pending");
                     (properties, FinalDisposition::Advanced)
                 }
-                None => {
+                Ok(None) => {
                     if properties
                         .pointer("/dispatch_receipt/error_payload")
                         .is_some_and(action_error_disposition_may_have_committed)
@@ -1964,6 +1986,11 @@ fn final_properties_after_dispatch(
                         properties["status"] = json!("pending");
                         (properties, FinalDisposition::RetryPending)
                     }
+                }
+                Err(anchor_error) => {
+                    properties["status"] = json!("failed");
+                    properties[error_key] = json!(anchor_error);
+                    (properties, FinalDisposition::Failed)
                 }
             }
         }
@@ -2764,6 +2791,62 @@ fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<Da
     repeat.next_after(current)
 }
 
+const INVALID_MONTHLY_ANCHOR: &str =
+    "monthly repeat_anchor must be a valid timestamp no later than trigger_at";
+
+fn is_monthly_repeat(repeat: &Option<String>) -> bool {
+    repeat
+        .as_deref()
+        .is_some_and(|value| value.trim() == "monthly")
+}
+
+/// Each monthly candidate is computed from the original anchor, never from
+/// the preceding (possibly clamped) trigger. A legacy row adopts its current
+/// trigger in the same finalization that first advances it.
+fn monthly_next_after(
+    properties: &mut Value,
+    current: DateTime<Utc>,
+    bound: DateTime<Utc>,
+) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    let (anchor_text, legacy) = match properties.get("repeat_anchor") {
+        Some(value) => (
+            value.as_str().ok_or(INVALID_MONTHLY_ANCHOR)?.to_string(),
+            false,
+        ),
+        None => (
+            properties
+                .get("trigger_at")
+                .and_then(Value::as_str)
+                .ok_or(INVALID_MONTHLY_ANCHOR)?
+                .to_string(),
+            true,
+        ),
+    };
+    let anchor = anchor_text
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| INVALID_MONTHLY_ANCHOR)?;
+    if anchor > current || (legacy && anchor != current) {
+        return Err(INVALID_MONTHLY_ANCHOR);
+    }
+    let next = khive_pack_schedule::repeat::Repeat::Monthly.first_after(anchor, bound);
+    if next.is_some() && legacy {
+        properties["repeat_anchor"] = json!(anchor_text);
+    }
+    Ok(next)
+}
+
+fn next_trigger_at_for_event(
+    properties: &mut Value,
+    repeat: &Option<String>,
+    current: DateTime<Utc>,
+) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    if is_monthly_repeat(repeat) {
+        monthly_next_after(properties, current, current)
+    } else {
+        Ok(next_trigger_at(repeat, current))
+    }
+}
+
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
 /// or before `now`, landing on the first occurrence strictly after `now`
 /// (ADR-106 missed-event amendment) — avoids firing a catch-up burst.
@@ -2778,6 +2861,19 @@ fn advance_repeat_past_missed(
 ) -> Option<DateTime<Utc>> {
     let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
     repeat.first_after(current, now)
+}
+
+fn advance_repeat_past_missed_for_event(
+    properties: &mut Value,
+    repeat: &Option<String>,
+    current: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    if is_monthly_repeat(repeat) {
+        monthly_next_after(properties, current, now)
+    } else {
+        Ok(advance_repeat_past_missed(repeat, current, now))
+    }
 }
 
 fn reminder_delivery_action(actor: &str, content: &str) -> String {
@@ -7664,6 +7760,133 @@ mod tests {
         assert_eq!(next, expected);
     }
 
+    fn complete_repeating_occurrence(properties: Value, current: &str, repeat: &str) -> Value {
+        let trigger_at: DateTime<Utc> = current.parse().expect("fixture trigger");
+        let (properties, disposition) = final_properties_after_dispatch(
+            properties,
+            json!({"completed_at": trigger_at.timestamp_micros()}),
+            &DispatchCompletion::Succeeded,
+            trigger_at,
+            FixedOffset::east_opt(0).expect("UTC offset"),
+            &Some(repeat.to_string()),
+        );
+        assert_eq!(disposition, FinalDisposition::Advanced);
+        assert_eq!(properties["status"], "pending");
+        properties
+    }
+
+    #[test]
+    fn monthly_anchor_restores_day_after_nonleap_february_and_april() {
+        let anchor = "2027-01-31T09:30:00Z";
+        let mut properties = json!({
+            "event_type": "schedule",
+            "trigger_at": anchor,
+            "repeat": "monthly",
+            "repeat_anchor": anchor,
+        });
+        let mut current = anchor;
+        for expected in [
+            "2027-02-28T09:30:00+00:00",
+            "2027-03-31T09:30:00+00:00",
+            "2027-04-30T09:30:00+00:00",
+        ] {
+            properties = complete_repeating_occurrence(properties, current, "monthly");
+            assert_eq!(properties["trigger_at"], expected);
+            assert_eq!(properties["repeat_anchor"], anchor);
+            current = expected;
+        }
+    }
+
+    #[test]
+    fn monthly_anchor_restores_day_after_leap_february() {
+        let anchor = "2028-01-31T09:30:00Z";
+        let mut properties = json!({
+            "event_type": "schedule",
+            "trigger_at": anchor,
+            "repeat": "monthly",
+            "repeat_anchor": anchor,
+        });
+        let mut current = anchor;
+        for expected in ["2028-02-29T09:30:00+00:00", "2028-03-31T09:30:00+00:00"] {
+            properties = complete_repeating_occurrence(properties, current, "monthly");
+            assert_eq!(properties["trigger_at"], expected);
+            assert_eq!(properties["repeat_anchor"], anchor);
+            current = expected;
+        }
+    }
+
+    #[test]
+    fn failed_monthly_attempt_rearms_from_anchor_after_february() {
+        let anchor = "2027-01-31T09:30:00Z";
+        let february: DateTime<Utc> = "2027-02-28T09:30:00Z".parse().unwrap();
+        let (properties, disposition) = final_properties_after_dispatch(
+            json!({
+                "event_type": "schedule",
+                "trigger_at": "2027-02-28T09:30:00Z",
+                "repeat": "monthly",
+                "repeat_anchor": anchor,
+            }),
+            json!({"completed_at": february.timestamp_micros()}),
+            &DispatchCompletion::Failed(DispatchFailure::plain("test failure")),
+            february,
+            FixedOffset::east_opt(0).expect("UTC offset"),
+            &Some("monthly".to_string()),
+        );
+        assert_eq!(disposition, FinalDisposition::Advanced);
+        assert_eq!(properties["trigger_at"], "2027-03-31T09:30:00+00:00");
+        assert_eq!(properties["repeat_anchor"], anchor);
+    }
+
+    #[test]
+    fn legacy_monthly_row_adopts_current_trigger_once_and_stops_drifting() {
+        let jan_anchor = "2027-01-31T09:30:00Z";
+        let first = complete_repeating_occurrence(
+            json!({"event_type": "schedule", "trigger_at": jan_anchor, "repeat": "monthly"}),
+            jan_anchor,
+            "monthly",
+        );
+        assert_eq!(first["trigger_at"], "2027-02-28T09:30:00+00:00");
+        assert_eq!(first["repeat_anchor"], jan_anchor);
+        let second = complete_repeating_occurrence(first, "2027-02-28T09:30:00+00:00", "monthly");
+        assert_eq!(second["trigger_at"], "2027-03-31T09:30:00+00:00");
+        assert_eq!(second["repeat_anchor"], jan_anchor);
+
+        let clamped_legacy = "2027-02-28T09:30:00Z";
+        let advanced = complete_repeating_occurrence(
+            json!({
+                "event_type": "schedule",
+                "trigger_at": clamped_legacy,
+                "repeat": "monthly"
+            }),
+            clamped_legacy,
+            "monthly",
+        );
+        assert_eq!(advanced["trigger_at"], "2027-03-28T09:30:00+00:00");
+        assert_eq!(advanced["repeat_anchor"], clamped_legacy);
+    }
+
+    #[test]
+    fn nonmonthly_forms_advance_without_creating_repeat_anchor() {
+        let current = "2026-06-01T09:00:00Z";
+        for (repeat, expected) in [
+            ("daily", "2026-06-02T09:00:00+00:00"),
+            ("weekly", "2026-06-08T09:00:00+00:00"),
+            ("every:15m", "2026-06-01T09:15:00+00:00"),
+            ("0 9 * * 1", "2026-06-08T09:00:00+00:00"),
+        ] {
+            let advanced = complete_repeating_occurrence(
+                json!({"event_type": "schedule", "trigger_at": current, "repeat": repeat}),
+                current,
+                repeat,
+            );
+            assert_eq!(advanced["trigger_at"], expected, "{repeat}");
+            assert!(
+                advanced.get("repeat_anchor").is_none(),
+                "{repeat} must not write a monthly anchor"
+            );
+        }
+    }
+
     #[test]
     fn next_trigger_at_none_repeat_returns_none() {
         let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
@@ -7718,6 +7941,54 @@ mod tests {
             original + Duration::days(15),
             "must be exactly the first daily occurrence after now (single advance, no burst)"
         );
+    }
+
+    #[test]
+    fn missed_january_monthly_occurrence_rearms_on_march_anchor_day() {
+        let jan_31: DateTime<Utc> = "2027-01-31T09:30:00Z".parse().unwrap();
+        let mid_march: DateTime<Utc> = "2027-03-15T12:00:00Z".parse().unwrap();
+        let next = advance_repeat_past_missed(&Some("monthly".to_string()), jan_31, mid_march);
+        assert_eq!(
+            next,
+            Some("2027-03-31T09:30:00Z".parse().unwrap()),
+            "tick time is only a bound; February's clamp must not become the base"
+        );
+    }
+
+    #[test]
+    fn missed_february_monthly_occurrence_reads_stored_january_anchor() {
+        let february: DateTime<Utc> = "2027-02-28T09:30:00Z".parse().unwrap();
+        let mid_march: DateTime<Utc> = "2027-03-15T12:00:00Z".parse().unwrap();
+        let mut properties = json!({
+            "event_type": "schedule",
+            "trigger_at": "2027-02-28T09:30:00Z",
+            "repeat": "monthly",
+            "repeat_anchor": "2027-01-31T09:30:00Z",
+        });
+        let next = advance_repeat_past_missed_for_event(
+            &mut properties,
+            &Some("monthly".to_string()),
+            february,
+            mid_march,
+        )
+        .expect("stored monthly anchor");
+        assert_eq!(next, Some("2027-03-31T09:30:00Z".parse().unwrap()));
+        assert_eq!(properties["repeat_anchor"], "2027-01-31T09:30:00Z");
+    }
+
+    #[test]
+    fn malformed_stored_monthly_anchor_does_not_advance() {
+        let current: DateTime<Utc> = "2027-02-28T09:30:00Z".parse().unwrap();
+        let mut properties = json!({
+            "trigger_at": "2027-02-28T09:30:00Z",
+            "repeat_anchor": "not-a-timestamp",
+        });
+        assert!(
+            next_trigger_at_for_event(&mut properties, &Some("monthly".to_string()), current,)
+                .is_err()
+        );
+        assert_eq!(properties["trigger_at"], "2027-02-28T09:30:00Z");
+        assert_eq!(properties["repeat_anchor"], "not-a-timestamp");
     }
 
     #[test]
@@ -7993,6 +8264,68 @@ mod tests {
             new_trigger <= now + Duration::days(1),
             "re-armed trigger_at must be the very next occurrence, not skip further \
              (no catch-up burst), got {new_trigger} (now={now})"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn missed_monthly_drain_records_miss_and_rearms_on_anchor_calendar() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let anchor_text = "2025-01-31T09:30:00Z";
+        let anchor: DateTime<Utc> = anchor_text.parse().expect("anchor timestamp");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            anchor_text,
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+
+        let before = Utc::now();
+        let summary = drain_for_test(&db_path)
+            .await
+            .expect("missed monthly drain");
+        let after = Utc::now();
+        assert_eq!(summary.invoked, 0, "missed occurrence must not dispatch");
+        assert!(
+            summary.missed.contains(&id),
+            "original occurrence recorded as missed"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "pending", "monthly row re-armed");
+        assert!(
+            props["missed_at"].as_i64().is_some(),
+            "missed instant recorded"
+        );
+        assert_eq!(props["dispatch_receipt"]["state"], "missed");
+        assert_eq!(
+            props["dispatch_receipt"]["occurrence_id"],
+            dispatch_occurrence_id(id, anchor).to_string(),
+            "receipt must identify the original missed occurrence"
+        );
+        assert_eq!(props["repeat_anchor"], anchor_text, "legacy anchor adopted");
+
+        let next: DateTime<Utc> = props["trigger_at"]
+            .as_str()
+            .expect("next trigger")
+            .parse()
+            .expect("parse next trigger");
+        let first_anchored_after = |bound| {
+            (1..=1200)
+                .find_map(|months| {
+                    anchor
+                        .checked_add_months(chrono::Months::new(months))
+                        .filter(|candidate| *candidate > bound)
+                })
+                .expect("next monthly occurrence within a century")
+        };
+        assert!(
+            next == first_anchored_after(before) || next == first_anchored_after(after),
+            "re-armed occurrence must be the first anchored date after the drain tick; got {next}"
         );
     }
 
