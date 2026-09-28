@@ -13,6 +13,93 @@ use tempfile::TempDir;
 
 const LABEL: &str = "test:supervisor-lifecycle";
 const START_LIMIT: Duration = Duration::from_secs(30);
+const REAP_LIMIT: Duration = Duration::from_secs(2);
+
+fn is_fixture_daemon_command(command: &str, config: &Path) -> bool {
+    command.contains(&format!(
+        "kkernel mcp --daemon --config {}",
+        config.display()
+    ))
+}
+
+fn fixture_daemon_command(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn fixture_daemon_alive(pid: u32, config: &Path) -> bool {
+    fixture_daemon_command(pid).is_some_and(|command| is_fixture_daemon_command(&command, config))
+}
+
+fn socket_peer_pid(socket: &Path) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: fd is a connected fixture socket and cred is a live output buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0 && len as usize == std::mem::size_of::<libc::ucred>())
+            .then(|| u32::try_from(cred.pid).ok())
+            .flatten()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: fd is a connected fixture socket and pid is a live output buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0 && len as usize == std::mem::size_of::<libc::pid_t>())
+            .then(|| u32::try_from(pid).ok())
+            .flatten()
+    }
+}
+
+fn fixture_daemon_pids(config: &Path) -> Vec<u32> {
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-axo", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| is_fixture_daemon_command(line, config))
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
+        .collect()
+}
 
 struct Fixture {
     root: TempDir,
@@ -26,6 +113,12 @@ struct Fixture {
 
 struct OwnedChild(Child);
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop_fixture_daemon();
+    }
+}
+
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         // Only the exact child we spawned; never enumerate or kill host daemons.
@@ -37,6 +130,50 @@ impl Drop for OwnedChild {
 }
 
 impl Fixture {
+    fn stop_fixture_daemon(&self) {
+        // A client can spawn a daemon that is not an OwnedChild. Prefer this
+        // fixture's PID file, then check the peer of its own socket. Never
+        // enumerate host processes or signal a PID whose command is not rooted
+        // at this fixture's unique config path (including the PID-file decoy).
+        let file_pid = std::fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|pid| fixture_daemon_alive(*pid, &self.config));
+        let mut pids = Vec::new();
+        if let Some(pid) = file_pid {
+            pids.push(pid);
+        }
+        if let Some(pid) = socket_peer_pid(&self.socket) {
+            if !pids.contains(&pid) && fixture_daemon_alive(pid, &self.config) {
+                pids.push(pid);
+            }
+        }
+        for pid in pids {
+            let Ok(pid) = i32::try_from(pid) else {
+                continue;
+            };
+            if pid <= 1 || !fixture_daemon_alive(pid as u32, &self.config) {
+                continue;
+            }
+            // SAFETY: the PID was read from this fixture's PID file or socket
+            // peer credentials, then revalidated against the fixture argv.
+            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+            let deadline = Instant::now() + REAP_LIMIT;
+            while fixture_daemon_alive(pid as u32, &self.config) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if fixture_daemon_alive(pid as u32, &self.config) {
+                // SAFETY: recheck the same fixture-specific argv immediately
+                // before escalating; a reused PID cannot select a host daemon.
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                let deadline = Instant::now() + REAP_LIMIT;
+                while fixture_daemon_alive(pid as u32, &self.config) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
     fn new() -> Self {
         // Keep Unix socket names below the platform path-length limit.
         let root = tempfile::Builder::new()
@@ -662,6 +799,31 @@ fn wait_stub_socket(fixture: &Fixture, stub: &mut OwnedChild, log_path: &Path) {
         assert!(Instant::now() < deadline, "stub did not bind");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// MUST-FAIL: removing Fixture::drop's reap leaves the auto-spawned daemon
+// alive after the client process and its temporary rendezvous are gone.
+#[tokio::test]
+async fn fixture_drop_reaps_client_spawned_daemon() {
+    let fixture = Fixture::new();
+    let (status, log) = fixture.completed(&mut fixture.exec_command(), "reap-client.log");
+    assert!(status.success(), "client auto-spawn failed: {log}");
+    let pid = wait_for_holder(&fixture, None).await;
+    let config = fixture.config.clone();
+    let while_alive = fixture_daemon_pids(&config);
+    assert_eq!(while_alive, vec![pid], "ps missed the live fixture daemon");
+
+    drop(fixture);
+    let after_drop = fixture_daemon_pids(&config);
+    println!(
+        "fixture daemon ps count: while_alive={} after_drop={}",
+        while_alive.len(),
+        after_drop.len()
+    );
+    assert!(
+        after_drop.is_empty(),
+        "fixture drop left a client-spawned daemon alive: {after_drop:?}"
+    );
 }
 
 // MUST-FAIL: removing the post-publish handover leaves the client-started
