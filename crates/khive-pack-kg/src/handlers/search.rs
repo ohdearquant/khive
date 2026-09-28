@@ -21,7 +21,7 @@ use khive_storage::EntityFilter;
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, missing_kind_error, props_match,
-    reconcile_specific, resolve_kind_spec, tags_match_any, to_json, validate_entity_type_filter,
+    reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any, to_json,
     validate_graph_read_kind, KindSpec, SearchParams,
 };
 use crate::KgPack;
@@ -205,7 +205,10 @@ impl ValidatedSearchRequest {
         };
 
         match resolve_kind_spec(kind_raw, registry)? {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 reject_search_field_for_substrate(
                     p.note_kind.as_ref(),
                     "note_kind",
@@ -225,8 +228,9 @@ impl ValidatedSearchRequest {
                     },
                     "entity_kind",
                 )?;
-                let entity_type = validate_entity_type_filter(
+                let entity_type = reconcile_entity_type(
                     kind_filter.as_deref(),
+                    entity_type.as_deref(),
                     p.entity_type.as_deref(),
                     registry,
                 )?;

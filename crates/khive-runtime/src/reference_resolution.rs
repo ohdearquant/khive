@@ -131,6 +131,22 @@ pub async fn resolve_reference(
     limit: u32,
     entity_kind: Option<&str>,
 ) -> RuntimeResult<ReferenceResolution> {
+    resolve_reference_with_entity_type(runtime, ring, token, nl_ref, limit, entity_kind, None).await
+}
+
+/// Resolve with an optional canonical entity subtype in the exact-name and
+/// search stages. ID and ring matches retain their existing kind-agnostic
+/// behavior, so a subtype filter cannot turn an explicit ID into a fuzzy hit.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_reference_with_entity_type(
+    runtime: &KhiveRuntime,
+    ring: &ReferenceRing,
+    token: &NamespaceToken,
+    nl_ref: &str,
+    limit: u32,
+    entity_kind: Option<&str>,
+    entity_type: Option<&str>,
+) -> RuntimeResult<ReferenceResolution> {
     let trimmed = nl_ref.trim();
     if trimmed.is_empty() {
         return Ok(ReferenceResolution::NotFound);
@@ -242,7 +258,9 @@ pub async fn resolve_reference(
     // this actor's session ever referenced the entity (the ring's blind
     // spot). Single match resolves; multiple exact matches are `Ambiguous`;
     // none falls through to hybrid search unchanged.
-    if let Some(resolution) = exact_name_match(runtime, token, trimmed, entity_kind).await? {
+    if let Some(resolution) =
+        exact_name_match(runtime, token, trimmed, entity_kind, entity_type).await?
+    {
         return Ok(resolution);
     }
 
@@ -260,7 +278,7 @@ pub async fn resolve_reference(
             None,
             search_limit,
             entity_kind,
-            None,
+            entity_type,
             &[],
             None,
             SEARCH_VECTOR_SIMILARITY_FLOOR,
@@ -347,12 +365,18 @@ async fn exact_name_match(
     token: &NamespaceToken,
     name: &str,
     entity_kind: Option<&str>,
+    entity_type: Option<&str>,
 ) -> RuntimeResult<Option<ReferenceResolution>> {
-    let filter = EntityFilter {
+    let mut filter = EntityFilter {
         name_exact: Some(name.to_string()),
         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
         ..EntityFilter::default()
     };
+    if let (Some(kind), Some(entity_type)) = (entity_kind, entity_type) {
+        filter
+            .entity_types_by_kind
+            .insert(kind.to_string(), vec![entity_type.to_string()]);
+    }
     // A storage-level `name = ?` predicate (not `name_prefix` + in-memory
     // filter) so a namespace with many newer case variants of `name` can
     // never page the exact target out from under a `created_at DESC` sort
