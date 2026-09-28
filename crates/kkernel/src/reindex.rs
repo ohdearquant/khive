@@ -231,6 +231,7 @@ pub(crate) fn validate_declared_reindex_target(
         .map(|(config, _)| config.backends.as_slice())
         .unwrap_or_default();
 
+    khive_mcp::serve::validate_effective_backend_alias_modes(backends)?;
     khive_mcp::serve::validate_reindex_db_target_with_source(db, backends, config_source)
 }
 
@@ -2368,6 +2369,73 @@ read_only = true
         let wrong = dir.path().join("typo.db");
         validate_declared_reindex_target(wrong.to_str(), Some(&config))
             .expect_err("an undeclared target must never be reindexed");
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_refuses_conflicting_alias_modes_in_either_declaration_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shared = dir.path().join("shared.db");
+        let config = dir.path().join("khive.toml");
+        for declarations in [
+            [("main", false), ("archive", true)],
+            [("archive", true), ("main", false)],
+        ] {
+            let body = declarations
+                .iter()
+                .map(|(name, read_only)| {
+                    format!(
+                        "[[backends]]\nname = \"{name}\"\nkind = \"sqlite\"\npath = \"{}\"\nread_only = {read_only}\n",
+                        shared.display()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&config, body).expect("write alias config");
+            let loaded = KhiveConfig::load_with_home_fallback_and_source(Some(&config), None)
+                .expect("parse alias config")
+                .expect("explicit config exists");
+            let expected =
+                khive_mcp::serve::validate_effective_backend_alias_modes(&loaded.0.backends)
+                    .expect_err("boot rejects conflicting alias modes")
+                    .to_string();
+            let actual = validate_declared_reindex_target(shared.to_str(), Some(&config))
+                .expect_err("reindex must reject conflicting alias modes before opening")
+                .to_string();
+            assert_eq!(actual, expected, "declaration order: {declarations:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_preserves_consistent_aliases_and_distinct_writable_secondary() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shared = dir.path().join("shared.db");
+        let distinct = dir.path().join("secondary.db");
+        let config = dir.path().join("khive.toml");
+        for (main_read_only, archive_read_only, archive_path, admitted) in [
+            (false, false, &shared, true),
+            (true, true, &shared, false),
+            (true, false, &distinct, true),
+        ] {
+            std::fs::write(
+                &config,
+                format!(
+                    "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\nread_only = {main_read_only}\n\
+                     \n[[backends]]\nname = \"archive\"\nkind = \"sqlite\"\npath = \"{}\"\nread_only = {archive_read_only}\n",
+                    shared.display(),
+                    archive_path.display(),
+                ),
+            )
+            .expect("write consistent alias config");
+            let result = validate_declared_reindex_target(archive_path.to_str(), Some(&config));
+            if admitted {
+                assert!(result.unwrap().is_some(), "writable target must be bound");
+            } else {
+                let error = result.expect_err("read-only alias cannot be reindexed");
+                assert!(error.to_string().contains("read_only"), "{error}");
+            }
+        }
     }
 
     #[test]

@@ -475,6 +475,32 @@ mod tests {
     }
 
     #[test]
+    fn section_fold_semantic_feedback_uses_effective_weight() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let initial = fold.init(&ctx);
+        let alpha_before = initial.posteriors[&ST::Overview].alpha();
+        let mut event = make_event(
+            "brain.feedback",
+            EventOutcome::Success,
+            Some(Uuid::new_v4()),
+        );
+        event.payload = serde_json::json!({
+            "signal": "implicit_positive",
+            "gate": {"effective_weight": 0.1},
+            "section_signals": {"overview": "useful"}
+        });
+        let after_one = fold.reduce(initial, &event, &ctx);
+        assert!((after_one.posteriors[&ST::Overview].alpha() - alpha_before - 0.1).abs() < 1e-12);
+        assert_eq!(after_one.total_events, 1);
+
+        event.payload["gate"]["effective_weight"] = serde_json::json!(0.0);
+        let after_clamp = fold.reduce(after_one, &event, &ctx);
+        assert!((after_clamp.posteriors[&ST::Overview].alpha() - alpha_before - 0.1).abs() < 1e-12);
+        assert_eq!(after_clamp.total_events, 1);
+    }
+
+    #[test]
     fn section_fold_not_useful_increments_beta() {
         let fold = SectionPosteriorFold::new();
         let ctx = FoldContext::new();

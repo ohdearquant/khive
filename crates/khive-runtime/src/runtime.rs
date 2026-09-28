@@ -8,7 +8,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use khive_db::StorageBackend;
+use khive_db::{ConnectionPool, StorageBackend};
 #[cfg(test)]
 use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
@@ -259,6 +259,15 @@ struct CoreEmbedderState {
     additional_embedding_models: Vec<EmbeddingModel>,
 }
 
+/// An already-open serving backend eligible for operator diagnostics.
+/// Aliases of the same canonical database file share one entry.
+#[derive(Clone)]
+pub struct OpenedDiagnosticBackend {
+    pub backend_names: Vec<String>,
+    pub canonical_path: Option<PathBuf>,
+    pub pool: Arc<ConnectionPool>,
+}
+
 /// for each storage capability, plus a lazily-loaded embedder.
 #[derive(Clone)]
 pub struct KhiveRuntime {
@@ -278,6 +287,8 @@ pub struct KhiveRuntime {
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
+    /// Pools opened by the serving host, grouped by canonical database file.
+    diagnostic_backends: Arc<[OpenedDiagnosticBackend]>,
     /// ADR-118 exact-leg policy, sampled once at runtime construction.
     /// Request-time memory/knowledge serving must never re-read the process
     /// environment because tests and embedded runtimes share one process.
@@ -523,6 +534,7 @@ impl KhiveRuntime {
             core_backend: None,
             config,
             declared_backend_db_paths: Vec::new().into(),
+            diagnostic_backends: Vec::new().into(),
             ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
@@ -668,6 +680,7 @@ impl KhiveRuntime {
                     core_backend: None,
                     config: core_config,
                     declared_backend_db_paths: self.declared_backend_db_paths.clone(),
+                    diagnostic_backends: self.diagnostic_backends.clone(),
                     ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
                     embedder_registry,
                     default_embedder_name,
@@ -730,6 +743,27 @@ impl KhiveRuntime {
     /// All declared SQLite backend paths known to this runtime's host.
     pub fn declared_backend_db_paths(&self) -> &[PathBuf] {
         &self.declared_backend_db_paths
+    }
+
+    /// Install only pools the host actually opened. A bare runtime defaults
+    /// to its already-open main pool without opening or creating another file.
+    pub fn with_diagnostic_backends(mut self, backends: Arc<[OpenedDiagnosticBackend]>) -> Self {
+        self.diagnostic_backends = backends;
+        self
+    }
+
+    pub fn diagnostic_backends(&self) -> Arc<[OpenedDiagnosticBackend]> {
+        if self.diagnostic_backends.is_empty() {
+            let main = self.core().backend.pool_arc();
+            vec![OpenedDiagnosticBackend {
+                backend_names: vec![BackendId::MAIN.to_string()],
+                canonical_path: main.canonical_path().map(PathBuf::from),
+                pool: main,
+            }]
+            .into()
+        } else {
+            self.diagnostic_backends.clone()
+        }
     }
 
     /// Whether this runtime selects the vector arm for a hybrid search —
@@ -843,6 +877,42 @@ impl KhiveRuntime {
         )
         .await
         .map_err(RuntimeError::from)?;
+        report.writer_contention.audit_obligation_append_failures =
+            Some(crate::pack::audit_obligation_append_failure_count());
+        report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason = None;
+        Ok(report)
+    }
+
+    /// Collect the same per-file report as the primary diagnostic surface for
+    /// one opened backend. The process identity comes from main; invoking
+    /// `ProcessIdentity::current` on a secondary would miscount main generations.
+    pub async fn db_diagnostics_for_opened_backend_with_audit_metrics(
+        &self,
+        backend: &OpenedDiagnosticBackend,
+        runtime_audit_batch_metrics: Option<khive_db::diagnostics::RuntimeAuditBatchMetrics>,
+    ) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
+        let main_pool = self.core().backend.pool_arc();
+        let process = khive_db::diagnostics::ProcessIdentity::current(&main_pool);
+        let build_hash = crate::build_info::BUILD_INFO
+            .is_stamped()
+            .then_some(crate::build_info::BUILD_INFO.source_revision);
+        let build = khive_db::diagnostics::BuildIdentity::from_env(
+            crate::build_info::PACKAGE_VERSION,
+            build_hash,
+        );
+        let mut report =
+            khive_db::diagnostics::collect_with_runtime_audit_metrics_for_process_interruptibly(
+                Arc::clone(&backend.pool),
+                build,
+                process,
+                khive_db::SessionSweepConfig::default().interval,
+                crate::pack::audit_append_failure_count(),
+                runtime_audit_batch_metrics,
+            )
+            .await
+            .map_err(RuntimeError::from)?;
         report.writer_contention.audit_obligation_append_failures =
             Some(crate::pack::audit_obligation_append_failure_count());
         report
