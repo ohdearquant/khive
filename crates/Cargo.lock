@@ -2241,6 +2241,7 @@ dependencies = [
  "khive-types",
  "quote",
  "regex",
+ "same-file",
  "serde",
  "serde_json",
  "syn",
