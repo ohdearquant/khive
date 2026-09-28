@@ -90,6 +90,12 @@ aggregate multiple operations.
 `entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
 (ignoring `; charset=...` and case) is `page`, everything else is `resource`.
 
+Fetch and refresh receipts include allow-listed response `headers` and negotiation `request_headers`.
+The document stores `request_headers` for its cached GET body: lowercase `accept`/`accept-language`
+keys map to arrays retaining repeated values in their sent order. Credentials, conditional validators
+and other request headers are excluded. A later GET replaces this negotiation, including clearing it
+when absent; HEAD records its own request in the receipt and preserves cached GET negotiation.
+
 ### `web.extract(id | url, kinds?, namespace?, link_limit?)`
 
 Parse an already-fetched body — never fetches one itself. `kinds` is a subset of
@@ -156,13 +162,19 @@ BLAKE3 digest over it. `persist` defaults to `false`; `true` mints each hit's UR
 
 ### `web.refresh(id)`
 
-Conditionally re-fetch an already-fetched complete document using its stored `etag`/`last_modified` as
-`If-None-Match`/`If-Modified-Since`. A partial (`truncated`) body is re-fetched without validators,
-and source validators are dropped when a redirect changes the address. A redirected `304` is
-refused rather than copying the source body onto the target. The reply and receipt report `truncated`.
-A `304`, or a `200` whose body content-addresses to the
-_same_ reference already stored with unchanged completeness, writes a receipt only — no entity or
-blob change. A changed body or completeness flag patches the entity in place. Every refresh's receipt
+Conditionally re-fetch an already-fetched document using its stored `etag`/`last_modified` as
+`If-None-Match`/`If-Modified-Since`, together with the fetched body's `Accept`/`Accept-Language`.
+A partial (`truncated`) body is re-fetched without validators. Validators are sent only to the
+stored address on the first hop; negotiation may be replayed on each hop. A redirected `304` is
+refused before graph mutation, so the caller must fetch the target. The reply and receipt report
+`truncated` and `lost_race`; `lost_race` indicates that a concurrent row change prevented the
+response metadata from being applied.
+
+Same-byte responses with unchanged completeness update changed Content-Type, status and validators
+while retaining the blob and content attachment. A same-body 200 clears stale validators omitted by
+the response. A 304 applies only supplied headers and retains the cached representation status;
+with no metadata change it writes only a receipt. `changed` reports body/reference changes. A
+changed body or completeness flag patches the entity in place. Every refresh's receipt
 supersedes the immediately prior receipt for the same document, so the note history is the
 resource's refresh timeline. Follows the same bounded redirect chain `fetch` does, through the
 same egress checks on every hop: identity is by address, so the terminal address's own row

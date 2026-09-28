@@ -200,9 +200,10 @@ web_verbs! {
                               authorized token namespace, never elevates capability.", NotApplicable);
     }
     RefreshParams("web.refresh", "Conditionally re-fetch a previously fetched document using its stored \
-                      etag/last_modified. An unchanged body writes a receipt only; a changed \
-                      body updates the stored blob and properties. Every refresh's receipt \
-                      supersedes the previous one for the same document.") {
+                      etag/last_modified and Accept/Accept-Language. An unchanged body keeps \
+                      its blob and attachment while changed response metadata updates the document. \
+                      A redirected 304 is refused. A changed body updates the stored blob and \
+                      properties. Every refresh's receipt supersedes the previous one for the same document.") {
         id: Uuid => (0, "The document entity to refresh.", UnscopedById);
         #[serde(default)]
         max_bytes: Option<u64> => (1, "Caller-supplied byte ceiling; may only lower the operator's \

@@ -3,14 +3,12 @@
 //! A conditional re-fetch of an already-fetched document: `If-None-Match`/
 //! `If-Modified-Since` are sent from the entity's own stored `etag`/
 //! `last_modified` (both already on `egress::ALLOWED_REQUEST_HEADERS`, so no
-//! policy change was needed to send them). A `304` response, or a `200`
-//! whose body content-addresses to the SAME `ContentRef` already stored and
-//! has the same completeness flag (some origins ignore conditional headers),
-//! writes a receipt only — no
-//! entity patch, no new blob (the blob store's own `put` is idempotent, so
-//! "no blob change" falls out of that rather than needing separate logic).
-//! Conditional headers are confined to their original resource. A redirected
-//! 304 is refused rather than treating one address's body as another's.
+//! policy change was needed to send them), alongside the cached body's
+//! Accept/Accept-Language negotiation. An unchanged body and completeness
+//! keep their reference and attachment while changed response metadata
+//! updates the entity. A `304` with unchanged metadata writes only a receipt.
+//! Validators are confined to the original address's first request; a
+//! redirected 304 is refused before any graph mutation.
 //! A genuinely changed body puts the new blob and patches the entity in
 //! place, same as `fetch`. Every refresh receipt chains to the immediately
 //! prior one for the same entity via `note supersedes note` (D4's "receipt
@@ -57,6 +55,88 @@ async fn latest_receipt(
         .await
 }
 
+fn refresh_request_headers(properties: &Value) -> Result<Vec<(String, String)>, RuntimeError> {
+    let url = stored_request_url(properties)?;
+    refresh_headers_for_hop(properties, &url, &url, true)
+}
+
+/// A 304 only supplies replacement fields; its status describes validation,
+/// not the cached representation. A body response replaces its validators,
+/// including clearing stale validators the origin no longer serves.
+async fn apply_refresh_metadata(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    expected_content_ref: &str,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    request_headers: &[(String, String)],
+) -> Result<bool, RuntimeError> {
+    let entity = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let properties = entity.properties.clone().unwrap_or(Value::Null);
+    if properties.get("blob_ref").and_then(Value::as_str) != Some(expected_content_ref) {
+        return Ok(false);
+    }
+    let mut patch = serde_json::Map::new();
+    let mut entity_type = None;
+    for (header, property) in [
+        ("content-type", "content_type"),
+        ("etag", "etag"),
+        ("last-modified", "last_modified"),
+    ] {
+        let value = headers.get(header).and_then(|value| value.to_str().ok());
+        if value.is_some() || (status != 304 && header != "content-type") {
+            let value = json!(value);
+            if properties.get(property).unwrap_or(&Value::Null) != &value {
+                patch.insert(property.to_string(), value);
+            }
+        }
+        if header == "content-type" {
+            if let Some(value) = value {
+                let classified = crate::fetch::classify_entity_type(Some(value));
+                if entity.entity_type.as_deref() != Some(classified) {
+                    entity_type = Some(classified);
+                }
+            }
+        }
+    }
+    if status != 304 && properties.get("status") != Some(&json!(status)) {
+        patch.insert("status".to_string(), json!(status));
+    }
+    let negotiation = crate::fetch::negotiation_headers(request_headers);
+    if crate::fetch::negotiation_headers(&crate::fetch::stored_negotiation_headers(&properties)?)
+        != negotiation
+    {
+        patch.insert("request_headers".to_string(), json!(negotiation));
+    }
+    if !patch.is_empty() || entity_type.is_some() {
+        match runtime
+            .update_entity_if_unchanged(
+                token,
+                &entity,
+                khive_runtime::EntityPatch {
+                    entity_type: entity_type.map(|entity_type| Some(entity_type.to_string())),
+                    properties: Some(Value::Object(patch)),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
 fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
     let url = properties
         .get("url")
@@ -87,6 +167,22 @@ fn conditional_headers_for_hop(
         headers.push(("If-Modified-Since".to_string(), last_modified.to_string()));
     }
     headers
+}
+
+fn refresh_headers_for_hop(
+    properties: &Value,
+    original_url: &Url,
+    current_url: &Url,
+    first_hop: bool,
+) -> Result<Vec<(String, String)>, RuntimeError> {
+    let mut headers = crate::fetch::stored_negotiation_headers(properties)?;
+    headers.extend(conditional_headers_for_hop(
+        properties,
+        original_url,
+        current_url,
+        first_hop,
+    ));
+    Ok(headers)
 }
 
 async fn run_refresh(
@@ -136,6 +232,7 @@ async fn run_refresh(
     )?;
     let deadline = egress::request_deadline(timeout_s)?;
 
+    let headers = refresh_request_headers(&properties)?;
     // Same bounded chain, same per-hop egress checks as `web.fetch`
     // (`crate::fetch::run_hop_chain`) — a refresh that hits a moved resource
     // follows the redirect rather than conditional-GETing the old address
@@ -152,17 +249,12 @@ async fn run_refresh(
         deadline,
         |current_url| {
             let initial = std::mem::take(&mut first_hop);
-            Ok(conditional_headers_for_hop(
-                &properties,
-                &original_url,
-                current_url,
-                initial,
-            ))
+            refresh_headers_for_hop(&properties, &original_url, current_url, initial)
         },
     )
     .await?;
 
-    settle_refresh(
+    settle_refresh_with_request_headers(
         runtime,
         token,
         params.id,
@@ -170,6 +262,7 @@ async fn run_refresh(
         &stored_content_ref,
         outcome,
         &redirect_hops,
+        &headers,
     )
     .await
 }
@@ -189,7 +282,33 @@ async fn run_refresh(
 /// when there was no redirect; on a redirect the terminal address's own row
 /// receives the body instead (identity is by address), `id` keeps its own
 /// recorded `url`, and the reply's `final_id` names the terminal row.
-async fn settle_refresh(
+#[allow(clippy::too_many_arguments)]
+async fn settle_refresh_with_request_headers(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    url_str: &str,
+    stored_content_ref: &str,
+    outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
+    request_headers: &[(String, String)],
+) -> Result<Value, RuntimeError> {
+    settle_refresh_with_request_headers_after_body_settlement(
+        runtime,
+        token,
+        id,
+        url_str,
+        stored_content_ref,
+        outcome,
+        redirect_hops,
+        request_headers,
+        std::future::ready(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_refresh_with_request_headers_after_body_settlement(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
@@ -197,6 +316,8 @@ async fn settle_refresh(
     stored_content_ref: &str,
     mut outcome: HopOutcome,
     redirect_hops: &[crate::fetch::RedirectHop],
+    request_headers: &[(String, String)],
+    after_body_settlement: impl std::future::Future<Output = ()>,
 ) -> Result<Value, RuntimeError> {
     let previous_receipt = latest_receipt(runtime, token, id).await?;
 
@@ -258,6 +379,9 @@ async fn settle_refresh(
             }
         }
     }
+    let mut response_content_ref = final_stored_content_ref
+        .clone()
+        .unwrap_or_else(|| stored_content_ref.to_owned());
 
     let mut entities_touched: Vec<Uuid> = vec![id];
     for touched in crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await? {
@@ -282,6 +406,7 @@ async fn settle_refresh(
             let store = crate::blob_store(runtime)?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
+            response_content_ref = content_ref_str.clone();
             let body_changed =
                 Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref();
             let completeness_changed = prior_truncated != Some(truncated);
@@ -353,6 +478,19 @@ async fn settle_refresh(
         }
     }
 
+    after_body_settlement.await;
+    let metadata_applied = apply_refresh_metadata(
+        runtime,
+        token,
+        final_id,
+        &response_content_ref,
+        outcome.status,
+        &outcome.headers,
+        request_headers,
+    )
+    .await?;
+    let lost_race = !metadata_applied;
+
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()
         .map(|hop| {
@@ -365,7 +503,10 @@ async fn settle_refresh(
         "url": url_str,
         "final_url": final_url_str,
         "status": outcome.status,
+        "headers": crate::fetch::extract_allowed_headers(&outcome.headers),
+        "request_headers": crate::fetch::negotiation_headers(request_headers),
         "changed": changed,
+        "lost_race": lost_race,
         "content_ref": new_content_ref,
         "truncated": was_truncated,
         "redirects": redirect_hops.len() as u32,
@@ -400,10 +541,40 @@ async fn settle_refresh(
         "status": outcome.status,
         "changed": changed,
         "truncated": was_truncated,
+        "lost_race": lost_race,
         "receipt_id": receipt_id.to_string(),
         "redirects": redirect_hops.len() as u32,
         "final_id": final_id.to_string(),
     }))
+}
+
+#[cfg(test)]
+async fn settle_refresh(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    url_str: &str,
+    stored_content_ref: &str,
+    outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
+) -> Result<Value, RuntimeError> {
+    let entity = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let headers = refresh_request_headers(&entity.properties.unwrap_or(Value::Null))?;
+    settle_refresh_with_request_headers(
+        runtime,
+        token,
+        id,
+        url_str,
+        stored_content_ref,
+        outcome,
+        redirect_hops,
+        &headers,
+    )
+    .await
 }
 
 impl WebPack {
@@ -699,6 +870,25 @@ mod tests {
         assert!(conditional_headers_for_hop(&complete, &original, &original, false).is_empty());
         let partial = json!({ "etag": "\"v1\"", "truncated": true });
         assert!(conditional_headers_for_hop(&partial, &original, &original, true).is_empty());
+
+        let negotiated = json!({
+            "url": original.as_str(),
+            "etag": "\"v1\"",
+            "truncated": false,
+            "request_headers": {
+                "accept": ["application/json"],
+                "accept-language": ["fr"]
+            }
+        });
+        let first = refresh_headers_for_hop(&negotiated, &original, &original, true).unwrap();
+        let next = refresh_headers_for_hop(&negotiated, &original, &redirected, false).unwrap();
+        assert!(first.iter().any(|(name, _)| name == "If-None-Match"));
+        assert!(next.iter().all(|(name, _)| !name.starts_with("If-")));
+        assert_eq!(
+            crate::fetch::negotiation_headers(&first),
+            crate::fetch::negotiation_headers(&next),
+            "negotiation may follow the redirect while source validators do not"
+        );
     }
 
     #[tokio::test]
@@ -876,6 +1066,9 @@ mod tests {
         let body = b"stable body".to_vec();
         let (port, hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
         let id = seed(&runtime, &token, port, &body).await;
+        crate::entities::patch(&runtime, &token, id, None, json!({"status": 200}))
+            .await
+            .unwrap();
         let before = runtime
             .entities(&token)
             .unwrap()
@@ -1292,6 +1485,9 @@ mod tests {
                     .unwrap();
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("content-type", "text/html".parse().unwrap());
+                if terminal_body == Some(b"same body".as_slice()) {
+                    headers.insert("etag", "terminal-etag".parse().unwrap());
+                }
                 let reply = settle_refresh(
                     &runtime,
                     &token,
@@ -1391,3 +1587,7 @@ mod receipt_tests;
 #[cfg(test)]
 #[path = "refresh_query_tests.rs"]
 mod query_tests;
+
+#[cfg(test)]
+#[path = "refresh_metadata_tests.rs"]
+mod metadata_tests;

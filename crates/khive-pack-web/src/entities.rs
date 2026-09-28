@@ -111,8 +111,8 @@ pub(crate) async fn get_or_create(
 
 /// Patch an already-existing web entity's properties (deep-merged, per
 /// `EntityPatch`'s documented semantics) and/or re-type it in place. Used by
-/// `refresh` (unchanged body: still a no-op — callers only invoke this when
-/// something actually changed) and by `fetch`'s re-typing of an unfetched
+/// `refresh` (callers invoke this when the body or representation metadata
+/// changes) and by `fetch`'s re-typing of an unfetched
 /// `resource` to `page` once the body is known to be HTML (D3).
 pub(crate) async fn patch(
     runtime: &KhiveRuntime,
