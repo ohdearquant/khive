@@ -133,6 +133,19 @@ pub(crate) struct AnnState {
     /// Releases the armed pathless incremental checkpoint pause.
     #[cfg(test)]
     pub(crate) pathless_checkpoint_release: tokio::sync::Notify,
+    /// Signals that a pathless checkpoint is about to request its SQL writer.
+    #[cfg(test)]
+    pub(crate) pathless_watermark_attempt_notify: tokio::sync::Notify,
+    /// Pauses after the pathless SQL watermark rises but before bridge publication.
+    #[cfg(test)]
+    pub(crate) pathless_post_watermark_barrier: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) pathless_post_watermark_notify: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) pathless_post_watermark_release: tokio::sync::Notify,
+    /// Signals that mismatch recovery released its SQL snapshot before waiting.
+    #[cfg(test)]
+    pub(crate) pathless_reresolve_wait_notify: tokio::sync::Notify,
     /// Test barrier after the single-statement incremental-tail read returns.
     #[cfg(test)]
     pub(crate) protected_tail_barrier: std::sync::atomic::AtomicBool,
@@ -200,6 +213,16 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         pathless_checkpoint_notify: tokio::sync::Notify::new(),
         #[cfg(test)]
         pathless_checkpoint_release: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_watermark_attempt_notify: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_post_watermark_barrier: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        pathless_post_watermark_notify: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_post_watermark_release: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_reresolve_wait_notify: tokio::sync::Notify::new(),
         #[cfg(test)]
         protected_tail_barrier: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -2189,16 +2212,18 @@ async fn fetch_final_tail_on(
     parse_final_tail_rows(&rows, model, s)
 }
 
-/// Read registry protection, raw delta size, and final vector state in one
-/// statement. Pathless SQLite readers share the writer connection, so keeping
-/// an explicit read transaction across several async reads would retain the
-/// only pooled connection while the task is suspended.
+/// Read registry protection, capped raw delta size, and final vector state in
+/// one statement. The count is exact when it is within `max_delta`; above the
+/// cap, `max_delta + 1` rows suffice to require a rebuild without materializing
+/// the remaining suffix. Pathless SQLite readers share the writer connection,
+/// so keeping an explicit read transaction across several async reads would
+/// retain the only pooled connection while the task is suspended.
 async fn fetch_protected_tail_on(
     reader: &mut dyn khive_storage::SqlReader,
     model: &str,
     s: u64,
     max_delta: u64,
-) -> Result<Option<(Vec<(Uuid, Option<Vec<f32>>)>, u64, u64)>, String> {
+) -> Result<(Option<(Vec<(Uuid, Option<Vec<f32>>)>, u64, u64)>, u64), String> {
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let rows = reader
         .query_all(SqlStatement {
@@ -2206,7 +2231,8 @@ async fn fetch_protected_tail_on(
                 "WITH tail AS MATERIALIZED (\
                    SELECT seq, subject_id, op FROM ann_write_log \
                    WHERE embedding_model = ?1 \
-                     AND kind = 'note' AND field = 'note.content' AND seq > ?2\
+                     AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
+                   ORDER BY seq LIMIT ?5\
                  ), summary AS MATERIALIZED (\
                    SELECT COUNT(*) AS raw_count, \
                           (SELECT MIN(watermark) FROM ann_consumer_watermark \
@@ -2241,6 +2267,7 @@ async fn fetch_protected_tail_on(
                 SqlValue::Integer(s as i64),
                 SqlValue::Text(ANN_WILDCARD_NS.to_owned()),
                 SqlValue::Integer(max_delta.min(i64::MAX as u64) as i64),
+                SqlValue::Integer(max_delta.saturating_add(1).min(i64::MAX as u64) as i64),
             ],
             label: Some("memory_ann_incremental_protected_tail".into()),
         })
@@ -2263,12 +2290,12 @@ async fn fetch_protected_tail_on(
         return Err("incremental tail registry minimum is invalid".into());
     }
     if raw_count > max_delta {
-        return Ok(None);
+        return Ok((None, raw_count));
     }
 
     let tail_rows = &rows[1..];
     let (ops, end) = parse_final_tail_rows(tail_rows, model, s)?;
-    Ok(Some((ops, end, raw_count)))
+    Ok((Some((ops, end, raw_count)), raw_count))
 }
 
 /// Final op per subject, in sequence order, plus the last applied sequence.
@@ -2750,51 +2777,13 @@ async fn fresh_tail_serving(
     if let Some(m) = registry_min.and_then(|value| u64::try_from(value).ok()) {
         if m > s {
             if ann_segment_dir(rt, model).is_none() {
-                // Pathless mismatch (docs/ann.md): re-resolve against the
-                // currently installed bridge under this snapshot's pinned
-                // registry/log state, then replace (never merge) the stale
-                // candidates the caller captured.
-                let resolved = search_loaded_with_seq(ann, key, query, k).await;
-                let outcome = match resolved {
-                    Ok(Some((candidates, resolved_s))) if resolved_s >= m => {
-                        match fetch_final_tail_on(reader.as_mut(), model, resolved_s, None).await {
-                            Ok((ops, _)) => FreshTailOutcome::Replace(
-                                merge_fresh_tail(candidates, query, ops),
-                                None,
-                            ),
-                            Err(e) => {
-                                tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved tail fetch failed; serving re-resolved candidates");
-                                FreshTailOutcome::Replace(
-                                    candidates,
-                                    Some("fresh-tail: pathless re-resolved tail fetch failed; served re-resolved candidates without fresh-tail merge"),
-                                )
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            model,
-                            floor = m,
-                            "fresh-tail: pathless mismatch has no bridge at the registry floor; \
-                             dropping stale ANN candidates"
-                        );
-                        bump_generation(ann, key).await;
-                        FreshTailOutcome::Replace(
-                            Vec::new(),
-                            Some("fresh-tail: pathless mismatch has no bridge at the registry floor; dropped stale candidates"),
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolution search failed; dropping stale ANN candidates");
-                        bump_generation(ann, key).await;
-                        FreshTailOutcome::Replace(
-                            Vec::new(),
-                            Some("fresh-tail: pathless re-resolution search failed; dropped stale candidates"),
-                        )
-                    }
-                };
+                // A checkpoint may have raised the registry floor but not yet
+                // marked its dirty bridge published. Never wait for that
+                // checkpoint's model lock while pinning the pathless SQL
+                // connection it needs to finish.
                 end_read_snapshot(reader.as_mut()).await;
-                return outcome;
+                drop(reader);
+                return fresh_tail_pathless_reresolve(rt, ann, key, model, query, k).await;
             }
 
             // Mismatch (ADR-118 §1): the log may no longer retain every row
@@ -2843,6 +2832,99 @@ async fn fresh_tail_serving(
             FreshTailOutcome::Skipped(SkipReason::with_error("fresh-tail: tail fetch failed", e))
         }
     }
+}
+
+/// Resolve a pathless checkpoint mismatch without holding a SQL read snapshot
+/// while waiting for the checkpoint's per-model lock. Once that checkpoint
+/// finishes, the bridge search and a new registry/tail snapshot form one
+/// coherent pair; this checkpoint's compaction cannot race the model lock.
+async fn fresh_tail_pathless_reresolve(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    model: &str,
+    query: &[f32],
+    k: usize,
+) -> FreshTailOutcome {
+    let lock = model_warm_lock(ann, key).await;
+    #[cfg(test)]
+    ann.pathless_reresolve_wait_notify.notify_one();
+    let _publication_guard = lock.lock().await;
+    let (candidates, resolved_s) = match search_loaded_with_seq(ann, key, query, k).await {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            bump_generation(ann, key).await;
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: pathless mismatch has no installed bridge; dropped stale candidates"),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolution search failed; dropping stale ANN candidates");
+            bump_generation(ann, key).await;
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: pathless re-resolution search failed; dropped stale candidates"),
+            );
+        }
+    };
+
+    let mut reader = match rt.sql().reader().await {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved reader open failed");
+            return FreshTailOutcome::Replace(
+                candidates,
+                Some("fresh-tail: pathless re-resolved reader open failed; served re-resolved candidates without fresh-tail merge"),
+            );
+        }
+    };
+    if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
+        tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved snapshot begin failed");
+        return FreshTailOutcome::Replace(
+            candidates,
+            Some("fresh-tail: pathless re-resolved snapshot begin failed; served re-resolved candidates without fresh-tail merge"),
+        );
+    }
+    let floor = registry_min_watermark_on(reader.as_mut(), model).await;
+    let outcome = match floor {
+        Ok(Some(floor)) if u64::try_from(floor).is_ok_and(|floor| floor <= resolved_s) => {
+            match fetch_final_tail_on(reader.as_mut(), model, resolved_s, None).await {
+                Ok((ops, _)) => {
+                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved tail fetch failed; serving re-resolved candidates");
+                    FreshTailOutcome::Replace(
+                        candidates,
+                        Some("fresh-tail: pathless re-resolved tail fetch failed; served re-resolved candidates without fresh-tail merge"),
+                    )
+                }
+            }
+        }
+        Ok(floor) => {
+            tracing::warn!(
+                ?floor,
+                resolved_s,
+                model,
+                "fresh-tail: pathless re-resolved bridge is below the registry floor"
+            );
+            bump_generation(ann, key).await;
+            FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: pathless mismatch has no bridge at the registry floor; dropped stale candidates"),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved registry read failed");
+            FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: pathless re-resolved registry read failed; dropped stale candidates"),
+            )
+        }
+    };
+    end_read_snapshot(reader.as_mut()).await;
+    outcome
 }
 
 /// Bound on the re-resolution convergence loop below; three back-to-back peer

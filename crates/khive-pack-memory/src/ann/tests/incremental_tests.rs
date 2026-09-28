@@ -13,6 +13,38 @@ fn threshold_policy(ann: &SharedAnn) {
     };
 }
 
+#[tokio::test]
+async fn protected_tail_materializes_only_one_row_beyond_replay_cap() {
+    const MODEL: &str = "ann-bounded-incremental-tail-model";
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(crate::test_support::HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    for index in 0..12 {
+        write_note(&rt, &token, &format!("bounded tail note {index}")).await;
+    }
+
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let (rebuild, observed) = fetch_protected_tail_on(reader.as_mut(), MODEL, 0, 2)
+        .await
+        .expect("bounded protected tail");
+    assert!(rebuild.is_none(), "the raw suffix exceeds the replay cap");
+    assert_eq!(
+        observed, 3,
+        "the materialized CTE needs only cap + 1 rows to require a rebuild"
+    );
+
+    let (within_cap, observed) = fetch_protected_tail_on(reader.as_mut(), MODEL, 0, 12)
+        .await
+        .expect("within-cap protected tail");
+    let (ops, _end, raw_count) = within_cap.expect("all twelve rows fit the replay cap");
+    assert_eq!(observed, 12);
+    assert_eq!(raw_count, 12);
+    assert_eq!(ops.len(), 12);
+}
+
 async fn write_note(rt: &KhiveRuntime, token: &NamespaceToken, text: &str) -> Uuid {
     rt.create_note_with_decay_for_embedding_model(
         token,
@@ -359,6 +391,196 @@ async fn pathless_incremental_checkpoint_keeps_committed_rows_visible_during_pub
             .await
             .expect("read published watermark"),
         Some((baseline + committed_ids.len() as u64) as i64)
+    );
+}
+
+#[tokio::test]
+#[serial(pathless_fresh_tail)]
+async fn pathless_checkpoint_writer_wait_leaves_index_available_to_snapshot_reader() {
+    const MODEL: &str = "ann-pathless-checkpoint-lock-order-model";
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(crate::test_support::HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    for index in 0..8 {
+        write_note(&rt, &token, &format!("lock order seed {index}")).await;
+    }
+    let ann = new_shared();
+    *ann.checkpoint_policy.write().expect("checkpoint policy") = CheckpointPolicy {
+        max_dirty_ops: 1,
+        interval: Duration::ZERO,
+        consolidate_tau: 40_000,
+        rebuild_fraction: 0.20,
+    };
+    let key = AnnKey::new(MODEL);
+    ensure_ann_for_model(&rt, &token, &ann, MODEL)
+        .await
+        .expect("initial pathless warm");
+    assert!(ann_segment_dir(&rt, MODEL).is_none());
+
+    let fresh_text = "lock order committed note";
+    let fresh_id = write_note(&rt, &token, fresh_text).await;
+    bump_generation(&ann, &key).await;
+    ann.pathless_checkpoint_barrier
+        .store(true, Ordering::SeqCst);
+    let task_rt = rt.clone();
+    let task_token = token.clone();
+    let task_ann = ann.clone();
+    let checkpoint =
+        tokio::spawn(
+            async move { ensure_ann_for_model(&task_rt, &task_token, &task_ann, MODEL).await },
+        );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ann.pathless_checkpoint_notify.notified(),
+    )
+    .await
+    .expect("checkpoint must pause before watermark publication");
+
+    let mut reader = rt.sql().reader().await.expect("pathless reader");
+    begin_read_snapshot(reader.as_mut())
+        .await
+        .expect("pin pathless read snapshot");
+    registry_min_watermark_on(reader.as_mut(), MODEL)
+        .await
+        .expect("read pinned registry floor");
+    ann.pathless_checkpoint_release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ann.pathless_watermark_attempt_notify.notified(),
+    )
+    .await
+    .expect("checkpoint must reach its SQL writer attempt");
+
+    let indexes = tokio::time::timeout(Duration::from_secs(1), ann.indexes.read())
+        .await
+        .expect("snapshot reader must acquire index lock while SQL writer waits");
+    assert!(
+        indexes.contains_key(&key),
+        "the warm bridge stays installed"
+    );
+    drop(indexes);
+    end_read_snapshot(reader.as_mut()).await;
+    drop(reader);
+
+    let status = tokio::time::timeout(Duration::from_secs(10), checkpoint)
+        .await
+        .expect("checkpoint completes after the read snapshot closes")
+        .expect("checkpoint task")
+        .expect("pathless checkpoint succeeds without evicting the bridge");
+    assert!(matches!(status, AnnEnsureStatus::AlreadyLoaded));
+    let query = fnv_to_vec(fresh_text, DIMS);
+    let (raw, seq) = search_loaded_with_seq(&ann, &key, &query, 20)
+        .await
+        .expect("search retained bridge")
+        .expect("warm bridge remains installed");
+    let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 20, Some(seq)).await;
+    let (merged, _) = outcome_into_candidates(outcome, raw, &query);
+    assert!(
+        merged.iter().any(|(id, _)| *id == fresh_id),
+        "committed memory remains in ANN candidates after checkpoint contention"
+    );
+}
+
+#[tokio::test]
+#[serial(pathless_fresh_tail)]
+async fn pathless_mismatch_waits_for_checkpoint_without_dropping_committed_candidate() {
+    const MODEL: &str = "ann-pathless-post-watermark-mismatch-model";
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(crate::test_support::HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    for index in 0..8 {
+        write_note(&rt, &token, &format!("post-watermark seed {index}")).await;
+    }
+    let ann = new_shared();
+    *ann.checkpoint_policy.write().expect("checkpoint policy") = CheckpointPolicy {
+        max_dirty_ops: 1,
+        interval: Duration::ZERO,
+        consolidate_tau: 40_000,
+        rebuild_fraction: 0.20,
+    };
+    let key = AnnKey::new(MODEL);
+    ensure_ann_for_model(&rt, &token, &ann, MODEL)
+        .await
+        .expect("initial pathless warm");
+    assert!(ann_segment_dir(&rt, MODEL).is_none());
+
+    let fresh_text = "post-watermark committed note";
+    let fresh_id = write_note(&rt, &token, fresh_text).await;
+    bump_generation(&ann, &key).await;
+    let query = fnv_to_vec(fresh_text, DIMS);
+    let (stale_raw, stale_s) = search_loaded_with_seq(&ann, &key, &query, 20)
+        .await
+        .expect("search incumbent bridge")
+        .expect("incumbent bridge remains installed");
+    ann.pathless_post_watermark_barrier
+        .store(true, Ordering::SeqCst);
+    let task_rt = rt.clone();
+    let task_token = token.clone();
+    let task_ann = ann.clone();
+    let checkpoint =
+        tokio::spawn(
+            async move { ensure_ann_for_model(&task_rt, &task_token, &task_ann, MODEL).await },
+        );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ann.pathless_post_watermark_notify.notified(),
+    )
+    .await
+    .expect("checkpoint must pause after SQL watermark publication");
+    let raised_floor = read_own_watermark(&rt, MODEL)
+        .await
+        .expect("read raised watermark")
+        .expect("active watermark");
+    assert!(raised_floor > stale_s as i64);
+    let (_, still_old_s) = search_loaded_with_seq(&ann, &key, &query, 20)
+        .await
+        .expect("search dirty bridge")
+        .expect("bridge remains installed");
+    assert_eq!(still_old_s, stale_s, "bridge publication is still pending");
+
+    let recall_rt = rt.clone();
+    let recall_ann = ann.clone();
+    let recall_key = key.clone();
+    let recall_query = query.clone();
+    let recall = tokio::spawn(async move {
+        fresh_tail_leg(
+            &recall_rt,
+            &recall_ann,
+            &recall_key,
+            MODEL,
+            &recall_query,
+            20,
+            Some(stale_s),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ann.pathless_reresolve_wait_notify.notified(),
+    )
+    .await
+    .expect("mismatch recovery must release its SQL snapshot before waiting");
+    ann.pathless_post_watermark_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), checkpoint)
+        .await
+        .expect("checkpoint must finish without a pinned reader")
+        .expect("checkpoint task")
+        .expect("pathless checkpoint succeeds");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), recall)
+        .await
+        .expect("mismatch recovery finishes after checkpoint publication")
+        .expect("recall task");
+    let (merged, reason) = outcome_into_candidates(outcome, stale_raw, &query);
+    assert_eq!(reason, None, "re-resolved exact leg remains healthy");
+    assert!(
+        merged.iter().any(|(id, _)| *id == fresh_id),
+        "the committed note survives the transient floor/bridge mismatch"
     );
 }
 

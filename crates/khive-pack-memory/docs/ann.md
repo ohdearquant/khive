@@ -217,9 +217,13 @@ minimum `m` exceeds the bridge's watermark `s`, the log may no longer retain eve
 - **Pathless mismatch.** There is no filesystem commit record to re-resolve against by
   reading a file. A pathless checkpoint installs its replacement bridge before raising and
   compacting, so a recall may have captured the old bridge immediately before that swap.
-  The leg re-resolves by re-searching the *currently installed* bridge under the same SQL
-  snapshot's pinned registry/log state, then returns those candidates as a `Replace` — never
-  merged with the stale set the caller originally captured.
+  The leg closes its initial SQL snapshot before waiting on the per-model checkpoint lock;
+  otherwise that snapshot can hold the pathless connection needed by a checkpoint which
+  is waiting for the index lock. After the checkpoint completes, it searches the currently
+  installed bridge and validates its watermark against the registry in a new snapshot that
+  also supplies the exact tail. The resulting candidates are a `Replace` — never merged
+  with the stale set the caller originally captured. This wait also covers the brief interval
+  after the registry floor rises but before a dirty bridge marks its new sequence published.
 - **File-backed mismatch.** A cheap filesystem commit-record read (no DB access) checks
   whether a newer persisted segment (watermark `>= m`) exists before deciding whether the
   snapshot's floor fallback is even needed. If one exists, `fresh_tail_reresolve` handles it

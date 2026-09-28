@@ -131,7 +131,7 @@ pub(super) async fn protected_tail(
     let result = fetch_protected_tail_on(reader.as_mut(), model, applied, max_delta).await;
     #[cfg(test)]
     ann.pause_protected_tail_for_test().await;
-    result.map(|tail| {
+    result.map(|(tail, _observed_rows)| {
         tail.map(|(ops, applied, raw_count)| IncrementalTail {
             ops,
             applied,
@@ -242,17 +242,30 @@ pub(super) async fn maintain_installed(
     } else {
         #[cfg(test)]
         ann.pause_pathless_checkpoint_for_test().await;
-        // Keep the bridge's old exact-tail floor visible until the registry
-        // protects the applied sequence. Hold the write lock across both state
-        // changes so a reader cannot pair the raised floor with the old registry.
-        let mut indexes = ann.indexes.write().await;
+        // Publish the registry protection before raising the bridge's
+        // exact-tail floor. The intermediate old-floor/new-registry state is
+        // resolved by fresh_tail_serving's pathless mismatch branch. Do not
+        // hold the index write lock while waiting for the SQL writer: a
+        // pathless fresh-tail snapshot can hold that connection while it
+        // needs the index read lock. The mismatch path drops its snapshot
+        // before waiting for this checkpoint's model lock.
+        #[cfg(test)]
+        ann.pathless_watermark_attempt_notify.notify_one();
         if let Err(error) =
             raise_watermark_with_authority(rt, model, new_s, WatermarkAuthority::Active).await
         {
-            drop(indexes);
             evict_unprotected_index(ann, key).await;
             return Err(RuntimeError::Internal(error));
         }
+        #[cfg(test)]
+        if ann
+            .pathless_post_watermark_barrier
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            ann.pathless_post_watermark_notify.notify_one();
+            ann.pathless_post_watermark_release.notified().await;
+        }
+        let mut indexes = ann.indexes.write().await;
         if let Some(bridge) = indexes.get_mut(key) {
             bridge.mark_checkpointed();
         }
