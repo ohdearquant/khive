@@ -2325,6 +2325,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "encoding_rs",
  "inventory",
  "khive-db",
  "khive-pack-blob",
