@@ -291,7 +291,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             name: "profile_id",
             param_type: "string",
             required: false,
-            description: "Profile ID to reset (must exist and be active). Defaults to \"balanced-recall-v1\". Use brain.profiles() to list profiles.",
+            description: "Profile ID to reset (must exist and be non-archived). Defaults to \"balanced-recall-v1\". Use brain.profiles() to list profiles.",
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
@@ -1961,8 +1961,8 @@ impl BrainPack {
 
         // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
         // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
-        // the fold gate's mass check-and-write, the public event, the private
-        // brain event, and the posterior snapshot — the `resolve`
+        // the fold gate's mass check-and-write, the public event, the serve
+        // grade, the private brain event, and the posterior snapshot — the `resolve`
         // check above is a non-atomic fast path only (it still handles the
         // common sequential case and the NotFound / forced-zero-weight
         // determination); this is the authoritative correctness mechanism
@@ -2037,6 +2037,7 @@ impl BrainPack {
                 target_id: target.to_string(),
                 gate_mode,
                 gate_now_us: now_us,
+                grade: dedup_key.as_ref().map(|_| signal.to_owned()),
                 dedup_key,
             }
         } else {
@@ -2165,6 +2166,7 @@ impl BrainPack {
                 gate_mode,
                 gate_now_us,
                 dedup_key,
+                grade,
             } = event_write
             else {
                 unreachable!(
@@ -2188,6 +2190,7 @@ impl BrainPack {
                 gate_mode,
                 gate_now_us,
                 dedup_ref,
+                grade.as_deref(),
                 move |fold_outcome, forced_zero| {
                     let mut event = event;
                     let (effective_weight, mass_before, mass_after) = match fold_outcome {
@@ -2231,26 +2234,6 @@ impl BrainPack {
                 }
             }
         };
-
-        // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
-        // the fold itself so a ledger-write failure never blocks the feedback
-        // event from landing — intentionally non-fatal, unlike the fail-closed
-        // brain-state persistence above (#458).
-        if let (Some(scorer_run_id), Some(serve_ledger_id)) =
-            (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
-        {
-            if let Err(e) = crate::serve_ledger::backfill_grade(
-                sql.as_ref(),
-                serve_ledger_id,
-                signal,
-                now_us,
-                scorer_run_id,
-            )
-            .await
-            {
-                eprintln!("[brain] serve ledger grade backfill failed (non-fatal): {e}");
-            }
-        }
 
         Ok(json!({
             "emitted": true,
