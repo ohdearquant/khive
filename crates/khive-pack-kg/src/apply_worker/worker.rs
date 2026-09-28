@@ -14,6 +14,7 @@ use khive_runtime::{
 };
 use khive_storage::types::PageRequest;
 use khive_storage::{EdgeRelation, EventFilter};
+use khive_types::pack::pack_registry_tag;
 use khive_types::{
     ApplyResult, EventKind, Id128, ProposalAppliedPayload, ProposalChangeset,
     ProposalCreatedPayload, Timestamp,
@@ -23,6 +24,20 @@ use super::budget::{
     check_note_proposal_admission, count_new_entries, has_multi_step_compound, WriteBudget,
 };
 use crate::projection_worker::ProposalsProjectionWorker;
+
+/// Proposal apply bypasses the generic create/update/merge handlers. Enforce
+/// their registry-row boundary before building a write plan or calling merge.
+fn refuse_registry_tags(tags: &[String], verb: &str) -> Result<(), RuntimeError> {
+    let Some(tag) = tags
+        .iter()
+        .find_map(|candidate| pack_registry_tag(candidate))
+    else {
+        return Ok(());
+    };
+    Err(RuntimeError::InvalidInput(format!(
+        "{verb} refuses registry tag {tag:?}: registry rows are written only by the owning pack"
+    )))
+}
 
 pub(super) enum PreparedApply {
     Atomic {
@@ -369,6 +384,7 @@ impl ProposalApplyWorker {
                 ProposalChangeset::AddEntity { entity } => {
                     let kind =
                         crate::handlers::canonical_entity_kind(entity.kind.as_str(), registry)?;
+                    refuse_registry_tags(&entity.tags, "create")?;
                     budget.consume_new_entry()?;
                     if let Some(hook) = registry.find_kind_hook(&kind) {
                         let mut draft = entity.clone();
@@ -394,13 +410,15 @@ impl ProposalApplyWorker {
                 }
                 ProposalChangeset::UpdateEntity { id, patch } => {
                     let entity_id = Uuid::from_u128(id.to_u128());
+                    let entity = self.runtime.get_entity(token, entity_id).await?;
+                    refuse_registry_tags(&entity.tags, "update")?;
+                    refuse_registry_tags(patch.tags.as_deref().unwrap_or_default(), "update")?;
                     // ADR-014 parity with the direct update surface: a set
                     // validates + normalizes against the registered
                     // vocabulary for the entity's kind; a clear passes
                     // through untouched.
                     let entity_type = match &patch.entity_type {
                         Some(Some(raw)) => {
-                            let entity = self.runtime.get_entity(token, entity_id).await?;
                             Some(crate::handlers::validate_entity_type(
                                 &entity.kind,
                                 Some(raw.as_str()),
@@ -478,9 +496,15 @@ impl ProposalApplyWorker {
                     })
                 }
                 ProposalChangeset::MergeEntities { into, from } => {
+                    let into_id = Uuid::from_u128(into.to_u128());
+                    let from_id = Uuid::from_u128(from.to_u128());
+                    let into_entity = self.runtime.get_entity(token, into_id).await?;
+                    let from_entity = self.runtime.get_entity(token, from_id).await?;
+                    refuse_registry_tags(&into_entity.tags, "merge")?;
+                    refuse_registry_tags(&from_entity.tags, "merge")?;
                     Ok(PreparedApply::CanonicalMerge {
-                        into_id: Uuid::from_u128(into.to_u128()),
-                        from_id: Uuid::from_u128(from.to_u128()),
+                        into_id,
+                        from_id,
                     })
                 }
                 ProposalChangeset::SupersedeEntity { old, new } => {
