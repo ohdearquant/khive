@@ -2489,6 +2489,103 @@ async fn configured_kg_pack() -> (
     (rt, token, pack, registry)
 }
 
+#[tokio::test]
+async fn create_and_delete_return_post_commit_degradations_with_committed_ids() {
+    use uuid::Uuid;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let mut writer = rt.sql().writer().await.unwrap();
+    writer
+        .execute_script(
+            "CREATE TRIGGER reject_note_created_event BEFORE INSERT ON events \
+             WHEN NEW.kind = 'note_created' \
+             BEGIN SELECT RAISE(ABORT, 'injected created-event failure'); END;"
+                .into(),
+        )
+        .await
+        .unwrap();
+    drop(writer);
+
+    let created = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "observation",
+                "content": "committed note with degraded telemetry",
+                "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("create response must retain the committed id");
+    let id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        created["post_commit_degradations"][0]["stage"],
+        "event_append"
+    );
+    assert!(rt
+        .notes(&token)
+        .unwrap()
+        .get_note(id)
+        .await
+        .unwrap()
+        .is_some());
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept",
+                "name": "entity to delete with failed index cleanup",
+                "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .unwrap();
+    let entity_id = Uuid::parse_str(entity["id"].as_str().unwrap()).unwrap();
+
+    // Backend text acquisition recreates dropped FTS tables. Abort the actual
+    // per-document cleanup instead, after its row/index write.
+    let mut writer = rt.sql().writer().await.unwrap();
+    writer
+        .execute_script(
+            "CREATE TRIGGER reject_note_fts_cleanup BEFORE DELETE ON fts_notes_rowids \
+             BEGIN SELECT RAISE(ABORT, 'injected fts_notes cleanup failure'); END; \
+             CREATE TRIGGER reject_entity_fts_cleanup BEFORE DELETE ON fts_entities_rowids \
+             BEGIN SELECT RAISE(ABORT, 'injected fts_entities cleanup failure'); END;"
+                .into(),
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let deleted = pack
+        .handle_delete(&token, json!({"id": id.to_string()}), &registry)
+        .await
+        .expect("delete response must retain the committed result");
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["id"], id.to_string());
+    assert_eq!(
+        deleted["post_commit_degradations"][0]["stage"],
+        "fts_cleanup"
+    );
+    assert!(deleted["post_commit_degradations"][0]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("injected fts_notes cleanup failure")));
+    let deleted_entity = pack
+        .handle_delete(&token, json!({"id": entity_id.to_string()}), &registry)
+        .await
+        .expect("entity delete response must retain the committed result");
+    assert_eq!(deleted_entity["deleted"], true);
+    assert_eq!(deleted_entity["id"], entity_id.to_string());
+    assert_eq!(
+        deleted_entity["post_commit_degradations"][0]["stage"],
+        "fts_cleanup"
+    );
+    assert!(deleted_entity["post_commit_degradations"][0]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("injected fts_entities cleanup failure")));
+}
+
 // khive#2087: `link` is an observable upsert. A live natural-key conflict is
 // an explicit replacement, while a tombstone requires caller opt-in before it
 // can be resurrected. Typed lifecycle events must project the affected edge id

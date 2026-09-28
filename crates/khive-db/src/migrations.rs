@@ -180,8 +180,9 @@ const SESSION_IDENTITY_UP: &str = include_str!("../sql/040-session-source-scope.
 const SESSION_IDENTITY_MIGRATION_NAME: &str = "session_source_scoped_identity";
 const V41_UP: &str = include_str!("../sql/041-sender-transport.sql");
 const V42_UP: &str = include_str!("../sql/042-comm-external-id-channel-scope.sql");
-const RECIPIENT_TRANSPORT_VERSION: u32 = 43;
-const V43_UP: &str = include_str!("../sql/043-recipient-transport.sql");
+const V43_UP: &str = include_str!("../sql/043-vector-provenance.sql");
+const RECIPIENT_TRANSPORT_VERSION: u32 = 44;
+const V44_UP: &str = include_str!("../sql/044-recipient-transport.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -220,6 +221,10 @@ pub const ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL: &str = V12_UP;
 /// paths may execute it repeatedly and must never demote a valid active
 /// checkpoint at sequence zero back to pending.
 pub const ANN_CONSUMER_PENDING_DDL: &str = include_str!("../sql/ann-consumer-pending-ddl.sql");
+
+/// Sidecar DDL registered in the migration ledger. Direct vector-store
+/// construction leaves this schema to the versioned migration.
+pub const VECTOR_PROVENANCE_DDL: &str = V43_UP;
 
 /// DDL for the `_embedding_models` registry table.
 ///
@@ -449,9 +454,14 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         up: V42_UP,
     },
     VersionedMigration {
+        version: 43,
+        name: "vector_provenance",
+        up: V43_UP,
+    },
+    VersionedMigration {
         version: RECIPIENT_TRANSPORT_VERSION,
         name: "recipient_transport",
-        up: V43_UP,
+        up: V44_UP,
     },
 ];
 

@@ -1830,6 +1830,9 @@ impl KhiveRuntime {
         vector: &[f32],
     ) -> Vec<SqlStatement> {
         let subject = entity.id.to_string();
+        let model_key = table
+            .strip_prefix("vec_")
+            .expect("runtime vector tables use the vec_ prefix");
         let kind = SubstrateKind::Entity.to_string();
         let field = "entity.body";
         let blob = vector
@@ -1858,6 +1861,19 @@ impl KhiveRuntime {
                 sql: format!("DELETE FROM {table} WHERE subject_id=?1"),
                 params: vec![SqlValue::Text(subject.clone())],
                 label: Some("entity-reindex-vector-delete".into()),
+            },
+            // This raw replacement cannot attest the embedded input. Clear the old
+            // sidecar in the same atomic index revision even when the new BLOB is
+            // byte-identical to the old one.
+            SqlStatement {
+                sql: "DELETE FROM vector_provenance \
+                      WHERE model_key = ?1 AND subject_id = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key.to_string()),
+                    SqlValue::Text(subject.clone()),
+                ],
+                label: Some("entity-reindex-provenance-clear".into()),
             },
             SqlStatement {
                 sql: format!(
@@ -2031,22 +2047,6 @@ impl KhiveRuntime {
         }
 
         Ok(report)
-    }
-
-    /// Remove an entity from FTS5 and vector indexes across all registered models.
-    pub(crate) async fn remove_from_indexes(
-        &self,
-        token: &NamespaceToken,
-        id: Uuid,
-    ) -> RuntimeResult<()> {
-        let ns = token.namespace().as_str().to_owned();
-        self.text(token)?.delete_document(&ns, id).await?;
-        for model_name in self.registered_embedding_model_names() {
-            self.vectors_for_model(token, &model_name)?
-                .delete(id)
-                .await?;
-        }
-        Ok(())
     }
 
     /// Re-upsert FTS5 document and vector(s) for the note across all registered models.
@@ -5270,7 +5270,9 @@ mod tests {
 
     use super::*;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
-    use khive_storage::types::{Direction, TextFilter, TextQueryMode, TextSearchRequest};
+    use khive_storage::types::{
+        Direction, TextFilter, TextQueryMode, TextSearchRequest, VectorRecord,
+    };
     use khive_types::EndpointKind;
 
     fn rt() -> KhiveRuntime {
@@ -10592,6 +10594,7 @@ mod tests {
                 None,
                 "quarantined transport content",
                 Some(serde_json::json!({"quarantined": true})),
+                None,
             )
             .await
             .unwrap()
@@ -10652,6 +10655,7 @@ mod tests {
                 None,
                 "string-marked quarantined content",
                 Some(serde_json::json!({"quarantined": "true"})),
+                None,
             )
             .await
             .unwrap()
@@ -12828,6 +12832,300 @@ mod tests {
         {
             Ok(std::sync::Arc::new(MergeTestVecService { dims: self.dims }))
         }
+    }
+
+    #[tokio::test]
+    async fn entity_reindex_clears_attribution_when_replacement_blob_is_identical() {
+        const MODEL: &str = "entity-provenance-identical";
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "UnchangedEmbeddingInput",
+                Some("entity description"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        rt.register_embedder(MergeTestVecProvider::new(MODEL, 4));
+        let vectors = rt.vectors_for_model(&tok, MODEL).unwrap();
+        let seeded = rt
+            .embed_document_with_model_outcome_for_token(
+                &tok,
+                MODEL,
+                &entity_embedding_text(&entity),
+            )
+            .await
+            .unwrap();
+        // The test provider is custom, so the runtime correctly cannot attest
+        // its prepared input. Seed a known historical sidecar explicitly to
+        // exercise the raw writer's duty to clear it on an identical BLOB.
+        assert!(seeded.prepared_text_fingerprint.is_none());
+        let prepared = format!(
+            "{}{}",
+            lattice_embed::EmbeddingModel::default()
+                .document_instruction()
+                .unwrap_or_default(),
+            entity_embedding_text(&entity)
+        );
+        let fingerprint = VectorRecord::fingerprint_text(&prepared);
+        vectors
+            .insert_batch(vec![VectorRecord {
+                subject_id: entity.id,
+                kind: SubstrateKind::Entity,
+                namespace: entity.namespace.clone(),
+                field: "entity.body".into(),
+                embedding_model: Some(MODEL.into()),
+                vectors: vec![seeded.vector],
+                text_fingerprint: Some(fingerprint.clone()),
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            vectors
+                .provenance(entity.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text_fingerprint,
+            Some(fingerprint)
+        );
+
+        async fn live_blob(rt: &KhiveRuntime, model: &str, subject: Uuid) -> Vec<u8> {
+            let table = format!("vec_{}", crate::config::sanitize_key(model));
+            let mut reader = rt.sql().reader().await.unwrap();
+            let blob = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT embedding FROM {table} WHERE subject_id = ?1"),
+                    params: vec![SqlValue::Text(subject.to_string())],
+                    label: Some("test-entity-reindex-live-blob".into()),
+                })
+                .await
+                .unwrap();
+            match blob {
+                Some(SqlValue::Blob(blob)) => blob,
+                other => panic!("expected live vec0 BLOB, got {other:?}"),
+            }
+        }
+
+        let before = live_blob(&rt, MODEL, entity.id).await;
+        // Property/tag-only updates do not automatically reindex. Explicitly
+        // reindex the changed entity to exercise the curation raw writer with
+        // the same prepared input and the constant provider's same BLOB.
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    tags: Some(vec!["new-tag".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_embedding_text(&updated),
+            entity_embedding_text(&entity)
+        );
+        assert!(vectors
+            .provenance(entity.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .text_fingerprint
+            .is_some());
+        rt.reindex_entity(&tok, &updated).await.unwrap();
+        assert_eq!(live_blob(&rt, MODEL, entity.id).await, before);
+        let after = vectors.provenance(entity.id).await.unwrap().unwrap();
+        assert_eq!(after.text_fingerprint, None);
+        assert_eq!(after.updated_at, None);
+
+        let mut reader = rt.sql().reader().await.unwrap();
+        let sidecar_count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance \
+                      WHERE model_key = ?1 AND subject_id = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                    SqlValue::Text(entity.id.to_string()),
+                ],
+                label: Some("test-entity-reindex-sidecar-clear".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(sidecar_count, Some(SqlValue::Integer(0))));
+    }
+
+    #[tokio::test]
+    async fn entity_type_update_same_blob_reindex_clears_provenance() {
+        const MODEL: &str = "entity-type-provenance-identical";
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.install_entity_type_validator(Arc::new(|kind, entity_type| match (kind, entity_type) {
+            ("concept", Some("algorithm")) => Ok(Some("algorithm".into())),
+            (_, None) => Ok(None),
+            _ => Err(RuntimeError::InvalidInput("invalid entity type".into())),
+        }));
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "StableEmbeddingInput",
+                Some("stable description"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        rt.register_embedder(MergeTestVecProvider::new(MODEL, 4));
+        let vectors = rt.vectors_for_model(&tok, MODEL).unwrap();
+        vectors
+            .insert_batch(vec![VectorRecord {
+                subject_id: entity.id,
+                kind: SubstrateKind::Entity,
+                namespace: entity.namespace.clone(),
+                field: "entity.body".into(),
+                embedding_model: Some(MODEL.into()),
+                vectors: vec![vec![1.0; 4]],
+                text_fingerprint: Some(VectorRecord::fingerprint_text("seeded prior text")),
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .unwrap();
+        let table = format!("vec_{}", crate::config::sanitize_key(MODEL));
+        let live_sql = SqlStatement {
+            sql: format!("SELECT embedding FROM {table} WHERE subject_id = ?1"),
+            params: vec![SqlValue::Text(entity.id.to_string())],
+            label: Some("test-entity-type-live-blob".into()),
+        };
+        let before = {
+            let mut reader = rt.sql().reader().await.unwrap();
+            reader.query_scalar(live_sql.clone()).await.unwrap()
+        };
+        let Some(SqlValue::Blob(before_blob)) = before else {
+            panic!("the original vector BLOB is missing")
+        };
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    entity_type: Some(Some("algorithm".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.entity_type.as_deref(), Some("algorithm"));
+        assert_eq!(
+            entity_embedding_text(&updated),
+            entity_embedding_text(&entity)
+        );
+        let after = {
+            let mut reader = rt.sql().reader().await.unwrap();
+            reader.query_scalar(live_sql).await.unwrap()
+        };
+        let Some(SqlValue::Blob(after_blob)) = after else {
+            panic!("the reindexed vector BLOB is missing")
+        };
+        assert_eq!(
+            after_blob, before_blob,
+            "the automatic reindex must use the same BLOB"
+        );
+        let observed = vectors.provenance(entity.id).await.unwrap().unwrap();
+        assert_eq!(observed.text_fingerprint, None);
+        assert_eq!(observed.updated_at, None);
+
+        let sidecar_count = {
+            let mut reader = rt.sql().reader().await.unwrap();
+            reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM vector_provenance \
+                      WHERE model_key = ?1 AND subject_id = ?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                        SqlValue::Text(entity.id.to_string()),
+                    ],
+                    label: Some("test-entity-type-sidecar-clear".into()),
+                })
+                .await
+                .unwrap()
+        };
+        assert!(matches!(sidecar_count, Some(SqlValue::Integer(0))));
+    }
+
+    #[tokio::test]
+    async fn entity_raw_subject_only_move_clears_old_namespace_provenance() {
+        const MODEL: &str = "entity-raw-move-model";
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "RawMove", None, None, vec![])
+            .await
+            .unwrap();
+        rt.register_embedder(MergeTestVecProvider::new(MODEL, 4));
+        let vectors = rt.vectors_for_model(&tok, MODEL).unwrap();
+        vectors
+            .insert_batch(vec![VectorRecord {
+                subject_id: entity.id,
+                kind: SubstrateKind::Entity,
+                namespace: entity.namespace.clone(),
+                field: "entity.body".into(),
+                embedding_model: Some(MODEL.into()),
+                vectors: vec![vec![1.0; 4]],
+                text_fingerprint: Some(VectorRecord::fingerprint_text("old namespace")),
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .unwrap();
+        let mut moved = entity.clone();
+        moved.namespace = "other".into();
+        let table = format!("vec_{}", crate::config::sanitize_key(MODEL));
+        rt.sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute_batch(KhiveRuntime::entity_vector_insert_statements(
+                &table, &moved, MODEL, &[1.0; 4],
+            ))
+            .await
+            .unwrap();
+
+        let mut reader = rt.sql().reader().await.unwrap();
+        let old_sidecar = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance WHERE model_key=?1 AND namespace=?2 AND subject_id=?3".into(),
+                params: vec![
+                    SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                    SqlValue::Text(entity.namespace.clone()),
+                    SqlValue::Text(entity.id.to_string()),
+                ],
+                label: Some("test-entity-raw-move-old-sidecar".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(old_sidecar, Some(SqlValue::Integer(0))));
+        let new_vector = reader
+            .query_scalar(SqlStatement {
+                sql: format!("SELECT COUNT(*) FROM {table} WHERE namespace=?1 AND subject_id=?2"),
+                params: vec![
+                    SqlValue::Text("other".into()),
+                    SqlValue::Text(entity.id.to_string()),
+                ],
+                label: Some("test-entity-raw-move-new-vector".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(new_vector, Some(SqlValue::Integer(1))));
     }
 
     async fn assert_delete_during_entity_reindex_does_not_restore_indexes(pause_vector: bool) {

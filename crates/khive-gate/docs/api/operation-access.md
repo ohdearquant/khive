@@ -25,6 +25,10 @@ Revision `domain-effects-v6` explicitly classifies `git.update_ref` as
 `Write`. Adding this classification changes that identity even though unknown
 operations were already denied. Empty restrictions retain their enrollment-only
 fingerprint.
+Revision `domain-effects-v7` classifies the internal
+`comm.cleanup_expired_quarantine` subhandler as `Write`: a caller-requested
+maintenance tick hard-deletes due quarantine notes and their attachment rows.
+Its bounded scope and internal-only visibility do not make that deletion a read.
 
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
@@ -62,6 +66,7 @@ fingerprint.
 | `brain.state`                | Read   | Subhandler | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L41)     |
 | `brain.unbind`               | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L538)    |
 | `code.ingest`                | Write  | Verb       | [khive-pack-code/src/vocab.rs](../../../khive-pack-code/src/vocab.rs#L11)             |
+| `comm.cleanup_expired_quarantine` | Write | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L523) |
 | `comm.cursor_commit`         | Write  | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L675)            |
 | `comm.cursor_get`            | Read   | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L651)            |
 | `comm.delivered`             | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L104)            |

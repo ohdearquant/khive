@@ -123,6 +123,7 @@ fn fixture_with_optional_blob_fault(
             max_output_bytes: Some(max_output_bytes),
             timeout_default_s: Some(5.0),
             timeout_max_s: Some(10.0),
+            binary_digest_timeout_s: None,
             keep,
             limits,
         },
@@ -830,6 +831,30 @@ async fn refusals_write_receipts_and_touch_no_disk() {
     let events = f.call("exec.events", json!({})).await;
     assert_eq!(events["count"], 0, "refusals write no execution events");
     assert!(root_is_empty(&f));
+}
+
+#[tokio::test]
+async fn run_refuses_an_ordinary_entity_id_as_a_tool() {
+    let f = fixture();
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "not-registered"}),
+        )
+        .await;
+    let id = ordinary["id"].as_str().expect("created id");
+    let tree = f.tree(&[]).await;
+    let err = f
+        .call_err(
+            "exec.run",
+            json!({"tree": tree, "tool": id, "args": [], "actor": "local"}),
+        )
+        .await;
+    assert!(err.contains("not registered"), "{err}");
+    assert!(
+        root_is_empty(&f),
+        "an unregistered id must not launch a process"
+    );
 }
 
 /// A consumer of a refused `exec.run` must be able to reach the durable receipt

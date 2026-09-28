@@ -20,6 +20,7 @@ use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 pub struct CommPack {
     runtime: KhiveRuntime,
     inbox_signal: InboxSignal,
+    quarantine_retention: std::time::Duration,
     /// Instance-bound trusted channel-ingest grant (khive #1839 round 3).
     ///
     /// Previously a process-global `OnceLock` shared by every `CommPack`
@@ -53,6 +54,7 @@ impl CommPack {
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
+            quarantine_retention: std::time::Duration::from_secs(14 * 24 * 60 * 60),
             channel_ingest: std::sync::OnceLock::new(),
         }
     }
@@ -67,6 +69,13 @@ impl CommPack {
         let pack = Self::new(runtime);
         let _ = pack.channel_ingest.set(capability);
         pack
+    }
+
+    /// Set how long a quarantined message and its original-byte attachment
+    /// remain live before the channel poller's expiry pass removes them.
+    pub fn with_quarantine_retention(mut self, retention: std::time::Duration) -> Self {
+        self.quarantine_retention = retention;
+        self
     }
 
     pub(crate) fn runtime(&self) -> &KhiveRuntime {
@@ -369,8 +378,12 @@ impl PackRuntime for CommPack {
                     self.channel_ingest_capability(),
                     token,
                     params,
+                    self.quarantine_retention,
                 )
                 .await
+            }
+            "comm.cleanup_expired_quarantine" => {
+                handlers::handle_cleanup_expired_quarantine(self.runtime(), token, params).await
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,

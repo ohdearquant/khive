@@ -66,6 +66,7 @@ const KHIVE_GITIGNORE = `\
 # Remote cache and derived working state are never committed.
 kg/.remote-cache/
 kg/.remote-cache/**
+kg/remotes/
 `;
 
 // ---------------------------------------------------------------------------
@@ -194,7 +195,7 @@ export async function kgInit(): Promise<void> {
   // 3. Create .khive/kg/ structure.
   await Deno.mkdir(kgDirPath, { recursive: true });
   await Deno.mkdir(join(repoRoot, MIGRATIONS_DIR), { recursive: true });
-  // .remote-cache is gitignored (ADR-048 §Implementation).
+  // The remote fetch cache is gitignored even though KG exports are tracked.
   await Deno.mkdir(join(repoRoot, REMOTE_CACHE_DIR), { recursive: true });
 
   await Deno.writeTextFile(join(repoRoot, ENTITIES_FILE), "");

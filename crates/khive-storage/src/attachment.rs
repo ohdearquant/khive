@@ -143,6 +143,15 @@ fn validate_attachment_size(size_bytes: Option<u64>) -> StorageResult<()> {
 pub trait AttachmentStore: Send + Sync + 'static {
     /// Insert or replace one attachment role.
     async fn upsert_attachment(&self, attachment: Attachment) -> StorageResult<()>;
+    /// Insert one role only if it is still absent, without replacing a concurrent writer.
+    /// Returns `true` when inserted and `false` when the role already exists.
+    async fn try_insert_attachment(&self, _attachment: Attachment) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Attachments,
+            operation: "try_insert_attachment".into(),
+            message: "the attachment backend does not support conditional insert".to_string(),
+        })
+    }
     /// Fetch one attachment role for a record.
     async fn get_attachment(
         &self,

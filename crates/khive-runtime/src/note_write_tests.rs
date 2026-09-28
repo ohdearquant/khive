@@ -513,6 +513,170 @@ async fn ann_deletes(runtime: &KhiveRuntime, id: uuid::Uuid) -> i64 {
     count
 }
 
+async fn seed_attributed_note_vector(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    note: &Note,
+) -> khive_storage::ContentRef {
+    use khive_storage::types::VectorRecord;
+
+    let fingerprint = VectorRecord::fingerprint_text("known note vector input");
+    runtime
+        .vectors_for_model(token, MODEL)
+        .unwrap()
+        .insert_batch(vec![VectorRecord {
+            subject_id: note.id,
+            kind: khive_types::SubstrateKind::Note,
+            namespace: note.namespace.clone(),
+            field: "note.content".into(),
+            embedding_model: Some(MODEL.into()),
+            vectors: vec![vec![0.5; 4]],
+            text_fingerprint: Some(fingerprint.clone()),
+            updated_at: chrono::Utc::now(),
+        }])
+        .await
+        .unwrap();
+    fingerprint
+}
+
+async fn note_sidecar_count(runtime: &KhiveRuntime, note: &Note) -> i64 {
+    let result = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_scalar(crate::note_write::statement(
+            "SELECT COUNT(*) FROM vector_provenance \
+             WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
+            vec![
+                khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                khive_storage::SqlValue::Text(note.namespace.clone()),
+                khive_storage::SqlValue::Text(note.id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    let Some(khive_storage::SqlValue::Integer(count)) = result else {
+        panic!("expected sidecar count, got {result:?}");
+    };
+    count
+}
+
+async fn note_sidecar_snapshot(runtime: &KhiveRuntime, note: &Note) -> serde_json::Value {
+    let rows = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_all(crate::note_write::statement(
+            "SELECT model_key, subject_id, namespace, embedding_digest, \
+                    text_fingerprint, updated_at \
+             FROM vector_provenance WHERE model_key=?1 AND subject_id=?2",
+            vec![
+                khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                khive_storage::SqlValue::Text(note.id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    serde_json::to_value(rows).unwrap()
+}
+
+async fn note_vector_blob_hex(runtime: &KhiveRuntime, note: &Note) -> String {
+    let result = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_scalar(crate::note_write::statement(
+            "SELECT hex(embedding) FROM vec_note_version_test \
+             WHERE namespace=?1 AND subject_id=?2",
+            vec![
+                khive_storage::SqlValue::Text(note.namespace.clone()),
+                khive_storage::SqlValue::Text(note.id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    let Some(khive_storage::SqlValue::Text(blob)) = result else {
+        panic!("expected live vector BLOB, got {result:?}");
+    };
+    blob
+}
+
+#[tokio::test]
+async fn atomic_message_same_blob_note_reindex_clears_provenance() {
+    let (runtime, token, service) = fixture();
+    let note = create(&runtime, &token, "version/same-blob-reindex", Some(false)).await;
+    let fingerprint = seed_attributed_note_vector(&runtime, &token, &note).await;
+    let vectors = runtime.vectors_for_model(&token, MODEL).unwrap();
+    let before_blob = note_vector_blob_hex(&runtime, &note).await;
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 1);
+    let before = vectors.provenance(note.id).await.unwrap().unwrap();
+    assert_eq!(before.text_fingerprint, Some(fingerprint));
+    assert!(before.updated_at.is_some());
+
+    let updated = runtime
+        .update_note(
+            &token,
+            note.id,
+            patch("{\"reindexed\":true}", 1, Some(true)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.version, 2);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(vectors.count().await.unwrap(), 1);
+    assert_eq!(note_vector_blob_hex(&runtime, &updated).await, before_blob);
+    assert_eq!(note_sidecar_count(&runtime, &updated).await, 0);
+    let after = vectors.provenance(note.id).await.unwrap().unwrap();
+    assert_eq!(after.text_fingerprint, None);
+    assert_eq!(after.updated_at, None);
+}
+
+#[tokio::test]
+async fn atomic_message_subject_only_move_clears_old_namespace_provenance() {
+    let (runtime, token, _service) = fixture();
+    let note = create(&runtime, &token, "version/raw-note-move", Some(false)).await;
+    seed_attributed_note_vector(&runtime, &token, &note).await;
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 1);
+
+    let table = format!("vec_{}", crate::config::sanitize_key(MODEL));
+    let statements = crate::atomic_message::vector_insert_statements(
+        &table,
+        "other",
+        note.id,
+        "note.content",
+        MODEL,
+        &[0.5; 4],
+        "test-raw-note-move",
+    );
+    runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute_batch(statements.into_iter().map(|step| step.statement).collect())
+        .await
+        .unwrap();
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 0);
+    let moved = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_scalar(crate::note_write::statement(
+            format!("SELECT COUNT(*) FROM {table} WHERE namespace=?1 AND subject_id=?2"),
+            vec![
+                khive_storage::SqlValue::Text("other".into()),
+                khive_storage::SqlValue::Text(note.id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(moved, Some(khive_storage::SqlValue::Integer(1))));
+}
+
 #[tokio::test]
 async fn version_guarded_vector_publication_canonicalizes_builtin_aliases() {
     let (runtime, token, service) = fixture();
@@ -629,6 +793,134 @@ async fn version_creation_compensation_preserves_or_removes_attachments_with_rev
             matches!(retained, Some(khive_storage::SqlValue::Integer(count)) if count == i64::from(newer))
         );
     }
+}
+
+#[tokio::test]
+async fn note_creation_compensation_clears_provenance() {
+    let (runtime, token, _) = fixture();
+    let note = create(
+        &runtime,
+        &token,
+        "version/compensate-provenance",
+        Some(false),
+    )
+    .await;
+    let fingerprint = seed_attributed_note_vector(&runtime, &token, &note).await;
+    let vectors = runtime.vectors_for_model(&token, MODEL).unwrap();
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 1);
+    assert_eq!(
+        vectors
+            .provenance(note.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .text_fingerprint,
+        Some(fingerprint)
+    );
+
+    assert!(runtime.compensate_note_creation(&note).await);
+    assert!(runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(note.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 0);
+    assert!(vectors.provenance(note.id).await.unwrap().is_none());
+
+    // A stale compensation must not purge either the live vector or its
+    // sidecar. Seed after the note revision so post-commit reindex is irrelevant.
+    let stale = create(
+        &runtime,
+        &token,
+        "version/stale-compensate-provenance",
+        Some(false),
+    )
+    .await;
+    runtime
+        .update_note(&token, stale.id, patch("{\"newer\":true}", 1, None))
+        .await
+        .unwrap();
+    let stale_fingerprint = seed_attributed_note_vector(&runtime, &token, &stale).await;
+    assert!(!runtime.compensate_note_creation(&stale).await);
+    assert_eq!(note_sidecar_count(&runtime, &stale).await, 1);
+    assert_eq!(
+        vectors
+            .provenance(stale.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .text_fingerprint,
+        Some(stale_fingerprint)
+    );
+}
+
+#[tokio::test]
+async fn note_vector_purge_scopes_sidecar_to_model_and_namespace() {
+    let (runtime, token, _) = fixture();
+    let note = create(&runtime, &token, "version/purge-scope", Some(false)).await;
+    seed_attributed_note_vector(&runtime, &token, &note).await;
+
+    // Deliberately stage two adversarial sidecar rows. A foreign namespace
+    // row for this model and a same-subject row for a model with no vec0 table
+    // are outside the local purge's authority.
+    let mut writer = runtime.sql().writer().await.unwrap();
+    writer
+        .execute(crate::note_write::statement(
+            "UPDATE vector_provenance SET namespace='foreign' \
+             WHERE model_key=?1 AND subject_id=?2",
+            vec![
+                khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                khive_storage::SqlValue::Text(note.id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    writer
+        .execute(crate::note_write::statement(
+            "INSERT INTO vector_provenance \
+             (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
+             VALUES ('unrelated_model', ?1, 'local', ?2, NULL, NULL)",
+            vec![
+                khive_storage::SqlValue::Text(note.id.to_string()),
+                khive_storage::SqlValue::Text("0".repeat(64)),
+            ],
+        ))
+        .await
+        .unwrap();
+    drop(writer);
+
+    runtime
+        .update_note(&token, note.id, patch("{\"off\":true}", 1, Some(false)))
+        .await
+        .unwrap();
+    assert_eq!(vectors(&runtime, &token).await, 0);
+    let remaining = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_all(crate::note_write::statement(
+            "SELECT model_key, namespace FROM vector_provenance WHERE subject_id=?1 \
+             ORDER BY model_key",
+            vec![khive_storage::SqlValue::Text(note.id.to_string())],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(matches!(
+        remaining[0].get("model_key"),
+        Some(khive_storage::SqlValue::Text(key)) if key == &crate::config::sanitize_key(MODEL)
+    ));
+    assert!(matches!(
+        remaining[0].get("namespace"),
+        Some(khive_storage::SqlValue::Text(namespace)) if namespace == "foreign"
+    ));
+    assert!(matches!(
+        remaining[1].get("model_key"),
+        Some(khive_storage::SqlValue::Text(key)) if key == "unrelated_model"
+    ));
 }
 
 #[tokio::test]
@@ -981,6 +1273,59 @@ async fn version_embedding_inheritance_includes_retired_model_rows() {
 #[tokio::test]
 async fn version_embedding_inheritance_sees_publication_after_prepare() {
     assert_writer_time_embedding_inheritance(false).await;
+}
+
+#[tokio::test]
+async fn note_embedding_inheritance_preserves_provenance_without_delete() {
+    let (runtime, token, _) = fixture();
+    let note = create(&runtime, &token, "version/inherit-provenance", Some(false)).await;
+    let fingerprint = seed_attributed_note_vector(&runtime, &token, &note).await;
+    let vectors = runtime.vectors_for_model(&token, MODEL).unwrap();
+    let before_blob = note_vector_blob_hex(&runtime, &note).await;
+    let before_sidecar = note_sidecar_snapshot(&runtime, &note).await;
+    let (_, plan) = runtime
+        .prepare_versioned_note_update(&token, note.clone(), patch("{\"new\":true}", 1, None))
+        .await
+        .unwrap();
+    let AtomicRunOutcome::Committed { post_commit } = run_atomic_unit(
+        runtime.sql().as_ref(),
+        vec![AtomicOpPlan::Update(Box::new(plan))],
+    )
+    .await
+    .unwrap() else {
+        panic!("commit");
+    };
+    assert_eq!(
+        post_commit.as_slice(),
+        &[crate::PostCommitEffect::ReindexNote {
+            note_id: note.id,
+            version: 2
+        }]
+    );
+    // This assertion is before the post-commit reindex. The inheritance
+    // check itself only reads membership and must not clear attribution.
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 1);
+    assert_eq!(note_vector_blob_hex(&runtime, &note).await, before_blob);
+    assert_eq!(note_sidecar_snapshot(&runtime, &note).await, before_sidecar);
+    assert_eq!(
+        vectors
+            .provenance(note.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .text_fingerprint,
+        Some(fingerprint)
+    );
+
+    let applied = apply_post_commit_effects_with_report(&runtime, &token, post_commit)
+        .await
+        .unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(note_sidecar_count(&runtime, &note).await, 0);
+    assert_eq!(note_vector_blob_hex(&runtime, &note).await, before_blob);
+    let replaced = vectors.provenance(note.id).await.unwrap().unwrap();
+    assert_eq!(replaced.text_fingerprint, None);
+    assert_eq!(replaced.updated_at, None);
 }
 
 async fn assert_writer_time_embedding_inheritance(retired: bool) {

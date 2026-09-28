@@ -1057,6 +1057,29 @@ fn default_report_serialization_preserves_the_pre_l2_key_sequence() {
     );
 }
 
+#[tokio::test]
+async fn l2_only_reports_oversized_source_and_keeps_small_sibling() {
+    let root = TempDir::new().expect("tempdir");
+    write_manifest(root.path(), "pkg");
+    let source_dir = root.path().join("pkg/src");
+    std::fs::write(source_dir.join("lib.rs"), "pub fn small() {}\n").expect("small source");
+    std::fs::File::create(source_dir.join("huge.rs"))
+        .expect("huge source")
+        .set_len(2 * 1024 * 1024 + 1)
+        .expect("sparse oversized source");
+    let rt = rt_at(&root.path().join("map.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(&rt, &token, l2_only_opts(root.path()))
+        .await
+        .expect("L2 ingest");
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("huge.rs") && warning.contains("scanner safety limit")
+    }));
+    let l2 = report.l2.expect("L2 counters");
+    assert_eq!(l2.symbol_parse_failures, 1);
+    assert!(l2.symbols_created >= 1, "small sibling must still parse");
+}
+
 /// L2-only creates project/file-module ownership anchors, but no L1 manifest
 /// dependency edges and no L1.5 import-scan facts.
 #[tokio::test]

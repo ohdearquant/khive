@@ -11,9 +11,10 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
-    PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
-    VectorSearchRequest,
+    PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorRecord,
+    VectorSearchHit, VectorSearchRequest,
 };
+use khive_storage::ContentRef;
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
@@ -132,11 +133,14 @@ const CANDIDATE_MULTIPLIER: u32 = 4;
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
     "embedding input was truncated to the embedder maximum; full content was stored unchanged";
 
-/// What the embedding service actually received for one document.
+/// Outcome for one document embedding. The exact-input fingerprint is present
+/// only when the resolved provider has the runtime-audited preparation path.
 #[derive(Clone, Debug)]
 pub struct DocumentEmbeddingOutcome {
     pub model_name: String,
     pub vector: Vec<f32>,
+    /// Digest of the exact prepared input, or `None` for an unaudited provider.
+    pub prepared_text_fingerprint: Option<ContentRef>,
     pub source_bytes: usize,
     pub embedded_bytes: usize,
     pub truncated: bool,
@@ -192,6 +196,13 @@ pub fn bounded_embedding_input(text: &str, max_bytes: usize) -> (&str, bool) {
         .last()
         .unwrap_or(0);
     (&text[..end], true)
+}
+
+fn prepared_document_fingerprint(text: &str, model: EmbeddingModel) -> ContentRef {
+    match model.document_instruction() {
+        Some(prefix) => VectorRecord::fingerprint_text(&format!("{prefix}{text}")),
+        None => VectorRecord::fingerprint_text(text),
+    }
 }
 
 impl KhiveRuntime {
@@ -289,10 +300,9 @@ impl KhiveRuntime {
         text: &str,
     ) -> RuntimeResult<DocumentEmbeddingOutcome> {
         let model = parse_embedding_model_alias(model_name);
-        let service = match token {
-            Some(token) => self.embedder_with_token(token, model_name).await?,
-            None => self.embedder(model_name).await?,
-        };
+        let (service, audited_document_preparation) = self
+            .embedder_with_input_attestation(model_name, token)
+            .await?;
         let emb_model = model.unwrap_or_default();
         let source_bytes = text.len();
         let (text, truncated) =
@@ -312,6 +322,8 @@ impl KhiveRuntime {
         Ok(DocumentEmbeddingOutcome {
             model_name: model_name.to_owned(),
             vector: out,
+            prepared_text_fingerprint: audited_document_preparation
+                .then(|| prepared_document_fingerprint(text, emb_model)),
             source_bytes,
             embedded_bytes,
             truncated,
@@ -511,10 +523,9 @@ impl KhiveRuntime {
             return Ok(vec![]);
         }
         let model = parse_embedding_model_alias(model_name);
-        let service = match token {
-            Some(token) => self.embedder_with_token(token, model_name).await?,
-            None => self.embedder(model_name).await?,
-        };
+        let (service, audited_document_preparation) = self
+            .embedder_with_input_attestation(model_name, token)
+            .await?;
         let emb_model = model.unwrap_or_default();
         let budget = document_embedding_budget(model_name);
         if token.is_some() {
@@ -549,6 +560,8 @@ impl KhiveRuntime {
                 DocumentEmbeddingOutcome {
                     model_name: model_name.to_owned(),
                     vector,
+                    prepared_text_fingerprint: audited_document_preparation
+                        .then(|| prepared_document_fingerprint(bounded, emb_model)),
                     source_bytes: text.len(),
                     embedded_bytes: bounded.len(),
                     truncated,
@@ -2561,6 +2574,61 @@ mod tests {
         captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     }
 
+    struct RewritingPassageService {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for RewritingPassageService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.captured.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+
+        async fn embed_passage(
+            &self,
+            texts: &[String],
+            model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            let prepared: Vec<String> = texts.iter().map(|text| format!("custom:{text}")).collect();
+            self.embed(&prepared, model).await
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "rewriting-passage-service"
+        }
+    }
+
+    struct RewritingPassageProvider {
+        name: String,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for RewritingPassageProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(RewritingPassageService {
+                captured: std::sync::Arc::clone(&self.captured),
+            }))
+        }
+    }
+
     struct WrongCardinalityEmbeddingService;
 
     #[async_trait::async_trait]
@@ -2776,6 +2844,75 @@ mod tests {
                 "x".repeat(MAX_TEXT_BYTES),
                 texts[2].clone(),
             ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_name_override_has_no_exact_input_fingerprint() {
+        let model = EmbeddingModel::MultilingualE5Small;
+        let model_name = model.to_string();
+        let (runtime, captured) = runtime_with_capturing_embedder(model);
+        let input = "x".repeat(document_embedding_budget(&model_name) + 3);
+        let outcomes = runtime
+            .embed_document_batch_with_model_outcomes(&model_name, std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        let calls = captured.lock().unwrap();
+        let actual_input = &calls[0][0];
+        assert!(actual_input.starts_with("passage: "));
+        assert_eq!(actual_input.len(), MAX_TEXT_BYTES);
+        assert!(outcomes[0].truncated);
+        assert_eq!(outcomes[0].prepared_text_fingerprint, None);
+        assert_eq!(
+            prepared_document_fingerprint(
+                bounded_embedding_input(&input, document_embedding_budget(&model_name)).0,
+                model,
+            ),
+            VectorRecord::fingerprint_text(actual_input),
+            "the audited lattice path hashes the bounded text plus passage prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_custom_document_provider_has_no_exact_input_fingerprint() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.register_embedder(CapturingEmbedderProvider {
+            name: "custom-document-provider".to_string(),
+            captured: std::sync::Arc::clone(&captured),
+        });
+
+        let outcome = runtime
+            .embed_document_with_model_outcome("custom-document-provider", "document")
+            .await
+            .expect("custom provider must embed");
+        assert_eq!(outcome.prepared_text_fingerprint, None);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_passage_override_under_builtin_name_cannot_claim_exact_input() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = EmbeddingModel::MultilingualE5Small;
+        let model_name = model.to_string();
+        runtime.register_embedder(RewritingPassageProvider {
+            name: model_name.clone(),
+            captured: std::sync::Arc::clone(&captured),
+        });
+
+        let outcome = runtime
+            .embed_document_with_model_outcome(&model_name, "document")
+            .await
+            .expect("custom override must embed");
+        assert_eq!(outcome.prepared_text_fingerprint, None);
+        assert_eq!(
+            captured.lock().unwrap()[0],
+            vec!["custom:document".to_string()]
+        );
+        assert_ne!(
+            prepared_document_fingerprint("document", model),
+            VectorRecord::fingerprint_text("custom:document")
         );
     }
 

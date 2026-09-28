@@ -236,8 +236,13 @@ pub(crate) fn describe_entity_type_normalization(
 /// See `docs/api/entity-kind-validation.md#adr-099-b3-pub-widening-rationale` for why this is `pub` rather than `pub(crate)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KindSpec {
-    Entity { specific: Option<String> },
-    Note { specific: Option<String> },
+    Entity {
+        specific: Option<String>,
+        entity_type: Option<String>,
+    },
+    Note {
+        specific: Option<String>,
+    },
     Edge,
     Event,
     Proposal,
@@ -268,6 +273,12 @@ fn all_valid_kind_names(registry: &VerbRegistry) -> Vec<String> {
         "proposal".into(),
     ];
     all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
+    all.extend(
+        EntityTypeRegistry::with_extra(registry.all_entity_types())
+            .definitions()
+            .iter()
+            .map(|definition| definition.type_name.to_string()),
+    );
     all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
     all.sort();
     all.dedup();
@@ -296,7 +307,12 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
     let normalized = raw.trim().to_ascii_lowercase();
 
     match normalized.as_str() {
-        "entity" => return Ok(KindSpec::Entity { specific: None }),
+        "entity" => {
+            return Ok(KindSpec::Entity {
+                specific: None,
+                entity_type: None,
+            })
+        }
         "note" => return Ok(KindSpec::Note { specific: None }),
         "edge" => return Ok(KindSpec::Edge),
         "event" => return Ok(KindSpec::Event),
@@ -304,14 +320,55 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
         _ => {}
     }
 
-    if let Ok(k) = EntityKind::from_str(raw) {
+    // Canonical base-kind names remain base kinds even when a pack registers
+    // the same word as a subtype of another kind (for example Document's
+    // `resource` subtype versus the KG pack's Resource kind).
+    if EntityKind::ALL
+        .iter()
+        .any(|kind| kind.name() == normalized.as_str())
+        || (normalized == "resource" && registry.all_entity_kinds().contains(&"resource"))
+    {
         return Ok(KindSpec::Entity {
-            specific: Some(k.name().to_string()),
+            specific: Some(normalized),
+            entity_type: None,
         });
     }
-    if let Ok(k) = crate::vocab::EntityKind::from_str(raw) {
+
+    // A registered subtype can also be a legacy base-kind alias (notably
+    // `paper`, `benchmark`, and `library`). Preserve the subtype only when its
+    // base agrees with that legacy parser. In particular, the KG Resource
+    // aliases `tool` and `skill` must not turn into Project rows merely
+    // because their names are registered as Project subtypes.
+    let legacy_base = EntityKind::from_str(raw)
+        .ok()
+        .map(EntityKind::name)
+        .or_else(|| {
+            crate::vocab::EntityKind::from_str(raw)
+                .ok()
+                .map(|kind| kind.name())
+        });
+    let token = khive_types::to_snake_case(raw.trim());
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let mut matches = composed.definitions().iter().filter(|definition| {
+        definition.type_name == token.as_str()
+            && legacy_base.is_none_or(|base| base == definition.kind.name())
+    });
+    if let Some(first) = matches.next() {
+        if matches.any(|definition| definition.kind != first.kind) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "ambiguous kind {raw:?}; specify a base kind and entity_type"
+            )));
+        }
         return Ok(KindSpec::Entity {
-            specific: Some(k.name().to_string()),
+            specific: Some(first.kind.name().to_string()),
+            entity_type: Some(first.type_name.to_string()),
+        });
+    }
+
+    if let Some(base) = legacy_base {
+        return Ok(KindSpec::Entity {
+            specific: Some(base.to_string()),
+            entity_type: None,
         });
     }
     if let Ok(k) = NoteKind::from_str(raw) {
@@ -323,6 +380,7 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
     if registry.all_entity_kinds().contains(&normalized.as_str()) {
         return Ok(KindSpec::Entity {
             specific: Some(normalized),
+            entity_type: None,
         });
     }
     if registry.all_note_kinds().contains(&normalized.as_str()) {
@@ -335,6 +393,40 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
         "unknown kind {raw:?}; valid: {}",
         all_valid_kind_names(registry).join(" | ")
     )))
+}
+
+pub(crate) fn reconcile_entity_type(
+    kind: Option<&str>,
+    from_kind: Option<&str>,
+    explicit: Option<&str>,
+    registry: &VerbRegistry,
+) -> Result<Option<String>, RuntimeError> {
+    let resolved = validate_entity_type_filter(kind, explicit, registry)?;
+    match (from_kind, resolved) {
+        (Some(expected), Some(actual)) if expected != actual => Err(RuntimeError::InvalidInput(
+            format!("kind={expected:?} contradicts entity_type={actual:?}; pick one"),
+        )),
+        (Some(expected), _) => Ok(Some(expected.to_string())),
+        (None, resolved) => Ok(resolved),
+    }
+}
+
+/// A by-ID kind hint rejects a conflicting stored subtype. Legacy rows with
+/// NULL `entity_type` retain only their separately checked base-kind identity;
+/// list and search continue to apply their narrower subtype filters.
+pub(crate) fn ensure_entity_subtype(
+    id: Uuid,
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), RuntimeError> {
+    if let (Some(actual), Some(expected)) = (actual, expected) {
+        if actual != expected {
+            return Err(RuntimeError::InvalidInput(format!(
+                "kind mismatch: {id} exists with entity_type {actual:?}, not {expected:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile a granular `kind` with a legacy `entity_kind`/`note_kind` subfield.

@@ -293,6 +293,11 @@ rollback returns no successful item receipts at all: the call itself becomes an 
 request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary position embedding\")")
 ```
 
+A singleton entity or note create can return `post_commit_degradations` alongside its
+committed `id`, with entries such as `{"stage":"event_append","error":"..."}`. This
+means the record exists but the later telemetry write failed. Reconcile the returned id;
+retrying `create` would make a duplicate.
+
 ### `get` — Assertive
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
@@ -530,6 +535,12 @@ Soft or hard delete a record.
 ```
 request(ops="delete(id=\"<uuid>\")")
 ```
+
+Entity and note deletes return `deleted: true` and the `id` after the row change commits,
+even if a later index cleanup or event append fails. In that case the response also
+contains `post_commit_degradations` entries with `stage` (`fts_cleanup`,
+`vector_cleanup`, or `event_append`) and `error`. A failed index cleanup can leave a
+stale search entry; use the returned id to reconcile it instead of repeating the delete.
 
 ### `merge` — Declaration
 

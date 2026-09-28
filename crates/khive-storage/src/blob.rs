@@ -210,6 +210,14 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// once returns the same `ContentRef` and does not re-write the object.
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef>;
 
+    /// Restart the publish grace period for an existing object and return its
+    /// size, or `None` if absent. Backends with a live orphan sweep must make
+    /// the existence check and refresh atomic with that sweep's root lock.
+    /// The default is sufficient for backends without a live orphan sweep.
+    async fn refresh_publish_grace(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        self.size(content_ref).await
+    }
+
     /// Create an empty staging object. The pack keeps the declared size,
     /// incremental hash, sequence and idle clock. Backends enforce their
     /// capacity policy on each append. Unsupported backends refuse explicitly.
