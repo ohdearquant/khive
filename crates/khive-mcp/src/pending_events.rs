@@ -308,7 +308,8 @@ enum FinalDisposition {
     Fired,
     Advanced,
     RetryPending,
-    Failed,
+    Indeterminate,
+    RecurrenceFailed,
 }
 
 #[derive(Debug, Default)]
@@ -966,6 +967,7 @@ async fn run_pending_events_on_with_lease(
                         .get("repeat")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    let mut recurrence_error = None;
                     match advance_repeat_past_missed_for_event(
                         &mut props,
                         &repeat_for_finalize,
@@ -987,11 +989,13 @@ async fn run_pending_events_on_with_lease(
                             props["status"] = json!("missed");
                         }
                         Err(error) => {
-                            props["status"] = json!("failed");
-                            let (error_key, error_at_key) = dispatch_error_property_keys(&props);
-                            props[error_key] = json!(error);
-                            props[error_at_key] = json!(Utc::now().to_rfc3339());
-                            summary.failed += 1;
+                            mark_recurrence_failure(&mut props, error, &Utc::now().to_rfc3339());
+                            recurrence_error = Some(error);
+                            tracing::error!(
+                                scheduled_event_id = %id,
+                                error = %error,
+                                "pending-events: missed recurrence could not advance"
+                            );
                         }
                     }
                     let updated_at = Utc::now().timestamp_micros();
@@ -1013,8 +1017,12 @@ async fn run_pending_events_on_with_lease(
                     .await
                     {
                         Ok(true) => {
-                            summary.missed.push(id);
                             summary.finalized += 1;
+                            if recurrence_error.is_some() {
+                                summary.failed += 1;
+                            } else {
+                                summary.missed.push(id);
+                            }
                         }
                         Ok(false) => {
                             if verbose {
@@ -1180,7 +1188,6 @@ async fn run_pending_events_on_with_lease(
                             ),
                             "pending-events: scheduled event delivery failed"
                         );
-                        summary.failed += 1;
                         Some(error.as_str().to_string())
                     }
                 };
@@ -1344,6 +1351,13 @@ async fn run_pending_events_on_with_lease(
                     trigger_offset,
                     &repeat,
                 );
+                if disposition == FinalDisposition::RecurrenceFailed {
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        error = %final_props["recurrence_error"].as_str().unwrap_or(UNADVANCEABLE_REPEAT),
+                        "pending-events: recurrence advancement failed after dispatch"
+                    );
+                }
                 match finalize_fired_event(
                     rt,
                     ns_str,
@@ -1355,7 +1369,14 @@ async fn run_pending_events_on_with_lease(
                 )
                 .await
                 {
-                    Ok(true) => apply_final_disposition(&mut summary, disposition),
+                    Ok(true) => {
+                        apply_final_disposition(&mut summary, disposition);
+                        if !matches!(completion, DispatchCompletion::Succeeded)
+                            && disposition != FinalDisposition::RecurrenceFailed
+                        {
+                            summary.failed += 1;
+                        }
+                    }
                     Ok(false) => summary.failed += 1,
                     Err(error) => {
                         tracing::error!(
@@ -1894,6 +1915,12 @@ fn dispatch_error_property_keys(properties: &Value) -> (&'static str, &'static s
     }
 }
 
+fn mark_recurrence_failure(properties: &mut Value, error: &str, failed_at: &str) {
+    properties["status"] = json!("failed");
+    properties["recurrence_error"] = json!(error);
+    properties["recurrence_failed_at"] = json!(failed_at);
+}
+
 fn mark_dispatch_receipt_indeterminate(
     properties: &mut Value,
     invalid_receipt: Value,
@@ -1952,10 +1979,8 @@ fn final_properties_after_dispatch(
                     (properties, FinalDisposition::Fired)
                 }
                 Err(error) => {
-                    properties["status"] = json!("failed");
-                    properties[error_key] = json!(error);
-                    properties[error_at_key] = json!(completed_at_rfc);
-                    (properties, FinalDisposition::Failed)
+                    mark_recurrence_failure(&mut properties, error, &completed_at_rfc);
+                    (properties, FinalDisposition::RecurrenceFailed)
                 }
             }
         }
@@ -1981,16 +2006,15 @@ fn final_properties_after_dispatch(
                         properties["dispatch_receipt"]["state"] =
                             json!(DispatchReceiptState::Indeterminate.as_str());
                         properties["status"] = json!("failed");
-                        (properties, FinalDisposition::Failed)
+                        (properties, FinalDisposition::Indeterminate)
                     } else {
                         properties["status"] = json!("pending");
                         (properties, FinalDisposition::RetryPending)
                     }
                 }
-                Err(anchor_error) => {
-                    properties["status"] = json!("failed");
-                    properties[error_key] = json!(anchor_error);
-                    (properties, FinalDisposition::Failed)
+                Err(error) => {
+                    mark_recurrence_failure(&mut properties, error, &completed_at_rfc);
+                    (properties, FinalDisposition::RecurrenceFailed)
                 }
             }
         }
@@ -1998,7 +2022,7 @@ fn final_properties_after_dispatch(
             properties[error_key] = json!(error.as_str());
             properties[error_at_key] = json!(completed_at_rfc);
             properties["status"] = json!("failed");
-            (properties, FinalDisposition::Failed)
+            (properties, FinalDisposition::Indeterminate)
         }
     }
 }
@@ -2009,7 +2033,8 @@ fn apply_final_disposition(summary: &mut DrainSummary, disposition: FinalDisposi
         FinalDisposition::Fired => summary.fired += 1,
         FinalDisposition::Advanced => summary.advanced += 1,
         FinalDisposition::RetryPending => summary.retry_pending += 1,
-        FinalDisposition::Failed => summary.indeterminate += 1,
+        FinalDisposition::Indeterminate => summary.indeterminate += 1,
+        FinalDisposition::RecurrenceFailed => summary.failed += 1,
     }
 }
 
@@ -2398,9 +2423,17 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
                 properties[error_key] =
                     json!("cannot recover dispatch outcome: trigger_at is invalid");
                 properties[error_at_key] = json!(Utc::now().to_rfc3339());
-                (properties, FinalDisposition::Failed)
+                (properties, FinalDisposition::Indeterminate)
             }
         };
+        if disposition == FinalDisposition::RecurrenceFailed {
+            tracing::error!(
+                scheduled_event_id = %id,
+                namespace,
+                error = %final_properties["recurrence_error"].as_str().unwrap_or(UNADVANCEABLE_REPEAT),
+                "pending-events: recurrence advancement failed during expired-claim recovery"
+            );
+        }
         match finalize_expired_firing_event(
             rt,
             &namespace,
@@ -2425,9 +2458,12 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
                     FinalDisposition::Fired => summary.fired += 1,
                     FinalDisposition::Advanced => summary.advanced += 1,
                     FinalDisposition::RetryPending => summary.retry_pending += 1,
-                    FinalDisposition::Failed => summary.indeterminate += 1,
+                    FinalDisposition::Indeterminate => summary.indeterminate += 1,
+                    FinalDisposition::RecurrenceFailed => {}
                 }
-                if !matches!(completion, DispatchCompletion::Succeeded) {
+                if disposition == FinalDisposition::RecurrenceFailed
+                    || !matches!(completion, DispatchCompletion::Succeeded)
+                {
                     summary.failed += 1;
                 }
             }
@@ -2783,9 +2819,9 @@ async fn finalize_firing_event(
 /// Compute the next `trigger_at` for a repeating event, given the current
 /// `trigger_at` and the `repeat` spec.
 ///
-/// Returns `Some(next)` for every form `khive_pack_schedule::repeat` parses.
-/// Returns `None` for an absent repeat. Unsupported expressions are rejected
-/// by schedule creation and fail closed before dispatch for legacy rows.
+/// Returns `None` for an absent, malformed, or exhausted repeat. Callers that
+/// finalize a row must use `next_trigger_at_for_event` to distinguish a
+/// one-shot from a stored recurrence that cannot advance.
 fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
     repeat.next_after(current)
@@ -2793,6 +2829,8 @@ fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<Da
 
 const INVALID_MONTHLY_ANCHOR: &str =
     "monthly repeat_anchor must be a valid timestamp no later than trigger_at";
+const INVALID_STORED_REPEAT: &str = "stored repeat must be a string";
+const UNADVANCEABLE_REPEAT: &str = "stored repeat has no representable next occurrence";
 
 fn is_monthly_repeat(repeat: &Option<String>) -> bool {
     repeat
@@ -2840,18 +2878,33 @@ fn next_trigger_at_for_event(
     repeat: &Option<String>,
     current: DateTime<Utc>,
 ) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    if repeat.is_none() {
+        return if properties
+            .get("repeat")
+            .is_some_and(|value| !value.is_null())
+        {
+            Err(INVALID_STORED_REPEAT)
+        } else {
+            Ok(None)
+        };
+    }
     if is_monthly_repeat(repeat) {
-        monthly_next_after(properties, current, current)
+        monthly_next_after(properties, current, current)?
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     } else {
-        Ok(next_trigger_at(repeat, current))
+        next_trigger_at(repeat, current)
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     }
 }
 
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
 /// or before `now`, landing on the first occurrence strictly after `now`
 /// (ADR-106 missed-event amendment) — avoids firing a catch-up burst.
-/// Returns `None` when the event does not repeat; the caller then marks it
-/// terminally `"missed"`.
+/// Returns `None` for an absent, malformed, or exhausted repeat. Callers that
+/// finalize a row must use `advance_repeat_past_missed_for_event` to distinguish
+/// a one-shot from a stored recurrence that cannot advance.
 /// See `crates/khive-mcp/docs/api/pending-events.md` for the termination
 /// argument.
 fn advance_repeat_past_missed(
@@ -2869,10 +2922,24 @@ fn advance_repeat_past_missed_for_event(
     current: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    if repeat.is_none() {
+        return if properties
+            .get("repeat")
+            .is_some_and(|value| !value.is_null())
+        {
+            Err(INVALID_STORED_REPEAT)
+        } else {
+            Ok(None)
+        };
+    }
     if is_monthly_repeat(repeat) {
-        monthly_next_after(properties, current, now)
+        monthly_next_after(properties, current, now)?
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     } else {
-        Ok(advance_repeat_past_missed(repeat, current, now))
+        advance_repeat_past_missed(repeat, current, now)
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     }
 }
 
@@ -4111,6 +4178,18 @@ mod tests {
             .expect("get_note")
             .expect("note exists");
         note.properties.unwrap_or(json!({}))
+    }
+
+    async fn set_repeat_anchor_for_test(rt: &KhiveRuntime, id: uuid::Uuid, anchor: Value) {
+        let mut properties = get_note_props(rt, id).await;
+        properties["repeat_anchor"] = anchor;
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        assert!(rt
+            .notes(&token)
+            .expect("notes")
+            .update_note_properties(id, Some(properties), Utc::now().timestamp_micros())
+            .await
+            .expect("set repeat anchor"));
     }
 
     async fn get_raw_note_properties(rt: &KhiveRuntime, id: uuid::Uuid) -> String {
@@ -6474,7 +6553,7 @@ mod tests {
             FixedOffset::east_opt(0).unwrap(),
             &None,
         );
-        assert_eq!(disposition, FinalDisposition::Failed);
+        assert_eq!(disposition, FinalDisposition::Indeterminate);
         assert_eq!(properties["status"], "failed");
         assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
     }
@@ -7989,6 +8068,223 @@ mod tests {
         );
         assert_eq!(properties["trigger_at"], "2027-02-28T09:30:00Z");
         assert_eq!(properties["repeat_anchor"], "not-a-timestamp");
+    }
+
+    #[test]
+    fn monthly_anchor_rejects_nonstring_and_later_than_trigger() {
+        let current: DateTime<Utc> = "2027-02-28T09:30:00Z".parse().unwrap();
+        for anchor in [json!(42), json!("2027-03-01T09:30:00Z")] {
+            let mut properties = json!({
+                "trigger_at": "2027-02-28T09:30:00Z",
+                "repeat": "monthly",
+                "repeat_anchor": anchor,
+            });
+            assert_eq!(
+                next_trigger_at_for_event(&mut properties, &Some("monthly".to_string()), current),
+                Err(INVALID_MONTHLY_ANCHOR)
+            );
+            assert_eq!(properties["repeat_anchor"], anchor);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stored_unadvanceable_interval_fails_after_success_without_becoming_one_shot() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let trigger = due_rfc3339();
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &trigger,
+            Some("stats()"),
+            Some("every:100000000d"),
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain unadvanceable stored repeat");
+        assert_eq!(summary.invoked, 1, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.indeterminate, 0, "{summary:?}");
+        assert_eq!(summary.fired, 0, "repeat must not become a one-shot");
+        assert_eq!(
+            summary.retry_pending, 0,
+            "repeat must not retry at the same trigger"
+        );
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["trigger_at"], trigger);
+        assert_eq!(properties["recurrence_error"], UNADVANCEABLE_REPEAT);
+        assert_eq!(properties["dispatch_receipt"]["state"], "succeeded");
+        assert!(properties["fired_at"].as_str().is_some());
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("terminal row remains inert");
+        assert_eq!(second.invoked, 0, "{second:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn successful_action_with_invalid_monthly_anchor_is_a_known_failed_row() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!("not-a-timestamp")).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain invalid monthly anchor");
+        assert_eq!(summary.invoked, 1, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.indeterminate, 0, "{summary:?}");
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["dispatch_receipt"]["state"], "succeeded");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert!(properties.get("dispatch_error").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn failed_action_keeps_its_error_when_monthly_anchor_is_invalid() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(OrdinaryHandlerFailurePack {
+            invocations: invocations.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("test.ordinary_handler_failure()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!("not-a-timestamp")).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain invalid monthly anchor");
+        assert_eq!(summary.invoked, 1, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(
+            summary.failed, 1,
+            "action and calendar failure count one row"
+        );
+        assert_eq!(
+            summary.indeterminate, 0,
+            "known action outcome is not indeterminate"
+        );
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["dispatch_receipt"]["state"], "failed");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert_eq!(
+            properties["dispatch_error"], properties["dispatch_receipt"]["error"],
+            "the action's error must not be replaced by the anchor error"
+        );
+        assert_ne!(properties["dispatch_error"], properties["recurrence_error"]);
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("terminal row remains inert");
+        assert_eq!(second.invoked, 0, "{second:?}");
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn recovered_known_success_with_invalid_anchor_counts_failed_not_indeterminate() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let trigger = due_rfc3339();
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &trigger,
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!(42)).await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        let receipt =
+            persist_dispatch_outcome(&rt, "local", id, &claim, &DispatchCompletion::Succeeded)
+                .await
+                .expect("persist outcome")
+                .expect("claim still owned");
+        expire_dispatch_lease_for_test(&rt, id).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("recover invalid monthly anchor");
+        assert_eq!(summary.reclaimed, 1, "{summary:?}");
+        assert_eq!(summary.invoked, 0, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.indeterminate, 0, "{summary:?}");
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert_eq!(properties["dispatch_receipt"], receipt);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn missed_invalid_anchor_counts_once_and_does_not_enter_missed_list() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            "2000-01-01T00:00:00Z",
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!("not-a-timestamp")).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain missed invalid anchor");
+        assert_eq!(summary.invoked, 0, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert!(summary.missed.is_empty(), "failed row is not a missed row");
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert_eq!(properties["dispatch_receipt"]["state"], "missed");
     }
 
     #[test]
