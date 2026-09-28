@@ -3770,7 +3770,16 @@ mod tests {
     use crate::writer_task::WriterTaskHandle;
     use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
+    use std::sync::atomic::AtomicBool;
     use tracing::field::{Field, Visit};
+
+    static LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED: AtomicBool = AtomicBool::new(false);
+
+    fn hold_checkpoint_lock_for_live_busy_probe(_attempt: i32) -> bool {
+        LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(250));
+        false
+    }
 
     fn pr3409_active_interval(pool: &ConnectionPool) -> u64 {
         let key = checkpoint_db_key(pool);
@@ -4058,6 +4067,180 @@ mod tests {
                 .first_observed_at_unix_ms,
             100
         );
+    }
+
+    #[test]
+    #[serial(
+        checkpoint_skip_metrics,
+        khive_walpin_census_budget_env,
+        checkpoint_live_busy
+    )]
+    fn live_concurrent_busy_checkpoints_preserve_a_reader_pin_run() {
+        let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
+        std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live_concurrent_busy_pin.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (0)")
+                .unwrap();
+            assert_eq!(query_truncate_observation(writer.conn()).unwrap().busy, 0);
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (1)", [])
+                .unwrap();
+        }
+
+        // The reader sees a WAL frame before another writer advances the log.
+        // Holding a snapshot of an already-backfilled database would not pin it.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN DEFERRED").unwrap();
+        let visible_rows: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible_rows, 2);
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute("INSERT INTO t VALUES (2)", [])
+                .unwrap();
+        }
+
+        // Use real SQLite PASSIVE rows with the same tracker and diagnostic
+        // path as the periodic checkpoint task. The 500 ms configured interval
+        // gives a one-second neutral-busy bound; observations below are faster.
+        let _run_owner = CheckpointRunTaskGuard::start(&pool, Duration::from_millis(500));
+        let observer = rusqlite::Connection::open(&path).unwrap();
+        let first = query_checkpoint_observation(&observer).unwrap();
+        assert_eq!(first.busy, 0);
+        assert!(first.checkpointed_frames > 0);
+        assert!(first.log_frames > first.checkpointed_frames);
+        let CheckpointRunStatus::Observed(first_run) = record_checkpoint_run_result(
+            &pool,
+            Some((first.busy, first.log_frames, first.checkpointed_frames)),
+        ) else {
+            panic!("the held reader must start a checkpoint run");
+        };
+
+        // SQLite holds the CKPT lock while a TRUNCATE waits on this reader's
+        // read mark. Its bounded busy handler signals when PASSIVE probes can
+        // collide with that lock and return actual busy rows (often -1/-1).
+        LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED.store(false, Ordering::SeqCst);
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(contender_path).unwrap();
+            conn.busy_handler(Some(hold_checkpoint_lock_for_live_busy_probe))
+                .unwrap();
+            query_truncate_observation(&conn).unwrap()
+        });
+        let lock_deadline = Instant::now() + Duration::from_secs(2);
+        while !LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED.load(Ordering::SeqCst)
+            && Instant::now() < lock_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED.load(Ordering::SeqCst),
+            "TRUNCATE must wait on the held reader while holding the CKPT lock"
+        );
+
+        let mut busy_rows = 0;
+        for _ in 0..10 {
+            let sample = query_checkpoint_observation(&observer).unwrap();
+            let status = record_checkpoint_run_result(
+                &pool,
+                Some((sample.busy, sample.log_frames, sample.checkpointed_frames)),
+            );
+            if sample.busy != 0 {
+                busy_rows += 1;
+                assert_eq!(
+                    status,
+                    CheckpointRunStatus::Observed(first_run),
+                    "a real busy PASSIVE row must leave the first run intact"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let contender_result = contender.join().expect("TRUNCATE contender must finish");
+        assert_ne!(contender_result.busy, 0, "the held reader blocks TRUNCATE");
+        assert!(
+            busy_rows > 0,
+            "the test must observe real concurrent busy rows"
+        );
+
+        let resumed = query_checkpoint_observation(&observer).unwrap();
+        assert_eq!(resumed.busy, 0);
+        assert_eq!(resumed.checkpointed_frames, first_run.frame);
+        assert!(resumed.log_frames >= first.log_frames);
+        assert_eq!(
+            record_checkpoint_run_result(
+                &pool,
+                Some((
+                    resumed.busy,
+                    resumed.log_frames,
+                    resumed.checkpointed_frames
+                )),
+            ),
+            CheckpointRunStatus::Observed(first_run),
+            "the first informative row after a bounded busy span resumes the run"
+        );
+
+        let aging_started = Instant::now();
+        while aging_started.elapsed() < Duration::from_millis(1_050) {
+            {
+                let writer = pool.writer().unwrap();
+                writer
+                    .conn()
+                    .execute("INSERT INTO t VALUES (3)", [])
+                    .unwrap();
+            }
+            let sample = query_checkpoint_observation(&observer).unwrap();
+            assert_eq!(sample.busy, 0);
+            assert_eq!(sample.checkpointed_frames, first_run.frame);
+            assert!(sample.log_frames > sample.checkpointed_frames);
+            assert_eq!(
+                record_checkpoint_run_result(
+                    &pool,
+                    Some((sample.busy, sample.log_frames, sample.checkpointed_frames)),
+                ),
+                CheckpointRunStatus::Observed(first_run)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let aged = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let probe = aged
+            .checkpoint_probe
+            .as_ref()
+            .expect("diagnostic probe row");
+        assert_eq!(probe.busy, 0);
+        assert_eq!(
+            aged.checkpoint_pin.oldest_pinned_frame,
+            Some(first_run.frame)
+        );
+        assert_eq!(aged.checkpoint_pin.oldest_pinned_frame_run, Some(first_run));
+        assert_eq!(
+            aged.checkpoint_pin.pin_depth,
+            Some(probe.log_frames - first_run.frame)
+        );
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        let drained = crate::diagnostics::collect(
+            &pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        assert_eq!(drained.checkpoint_pin.oldest_pinned_frame, None);
+        assert_eq!(drained.checkpoint_pin.pin_depth, None);
     }
 
     /// The bundled SQLite reuses the slot at the greatest read mark when all
@@ -4401,6 +4584,101 @@ mod tests {
             !saw_pin_depth,
             "writer-only backfill gaps are not pin depths"
         );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
+    fn live_multi_writer_churn_has_no_pin_at_tight_or_default_cadence() {
+        let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
+        std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+
+        for interval in [Duration::from_millis(10), Duration::from_millis(500)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live_multi_writer_churn.db");
+            let pool = file_pool(&path);
+            {
+                let writer = pool.writer().unwrap();
+                writer
+                    .conn()
+                    .execute_batch("CREATE TABLE t (writer INTEGER)")
+                    .unwrap();
+            }
+            let _run_owner = CheckpointRunTaskGuard::start(&pool, interval);
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer_connections: Vec<_> = (0..3)
+                .map(|_| {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(Duration::from_millis(250)).unwrap();
+                    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+                    conn
+                })
+                .collect();
+            let writers: Vec<_> = writer_connections
+                .into_iter()
+                .enumerate()
+                .map(|(writer_id, conn)| {
+                    let writer_id = i64::try_from(writer_id).unwrap();
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        let mut commits = 0_u64;
+                        while !stop.load(Ordering::SeqCst) {
+                            match conn.execute("INSERT INTO t VALUES (?1)", [writer_id]) {
+                                Ok(_) => commits += 1,
+                                Err(rusqlite::Error::SqliteFailure(code, _))
+                                    if matches!(
+                                        code.code,
+                                        rusqlite::ErrorCode::DatabaseBusy
+                                            | rusqlite::ErrorCode::DatabaseLocked
+                                    ) => {}
+                                Err(error) => panic!("writer {writer_id} failed: {error}"),
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        commits
+                    })
+                })
+                .collect();
+
+            let started = Instant::now();
+            let mut samples = 0;
+            let mut bad_reports = Vec::new();
+            while started.elapsed() < Duration::from_millis(1_600) {
+                let report = crate::diagnostics::collect(
+                    &pool,
+                    crate::diagnostics::BuildIdentity::from_env("test", None),
+                    Duration::from_secs(30),
+                );
+                samples += 1;
+                let (run, age) = checkpoint_run_snapshot(&pool);
+                if report.checkpoint_pin.oldest_pinned_frame.is_some()
+                    || report.checkpoint_pin.pin_depth.is_some()
+                    || age.is_some_and(|age| age >= Duration::from_secs(1))
+                {
+                    bad_reports.push((
+                        report.checkpoint_pin.oldest_pinned_frame,
+                        report.checkpoint_pin.pin_depth,
+                        run,
+                        age,
+                    ));
+                }
+                std::thread::sleep(interval);
+            }
+
+            stop.store(true, Ordering::SeqCst);
+            let commits: Vec<_> = writers
+                .into_iter()
+                .map(|writer| writer.join().expect("writer must finish"))
+                .collect();
+            assert!(
+                commits.iter().all(|commits| *commits > 0),
+                "all three connections must commit at {interval:?}: {commits:?}"
+            );
+            assert!(samples >= 2, "checkpoint probes must run at {interval:?}");
+            assert!(
+                bad_reports.is_empty(),
+                "writer-only churn must not age a run or report a pin at {interval:?}: {bad_reports:?}"
+            );
+        }
     }
 
     #[test]
