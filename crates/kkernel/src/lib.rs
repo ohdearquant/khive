@@ -6,6 +6,7 @@ mod sql;
 mod test_process;
 
 mod atomic_apply;
+pub mod blob;
 pub mod cli;
 pub mod code_audit;
 pub mod code_ingest;
