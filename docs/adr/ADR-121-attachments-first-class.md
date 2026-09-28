@@ -620,7 +620,7 @@ caller of `BlobStore::transactional_orphan_sweep` is a test. So every blob freed
   pending ID, verified marker and one completing main-database transaction. After the completing
   transaction, a sweep in either mode is admitted on that root. A pre-rule database with one live
   attachment row and an empty configured root refuses the automatic path, binds nothing, and leaves
-  the object and row untouched; a mutant that removes the main live-reference check fails this arm.
+  the attachment row and the object it references, in its original root, untouched; a mutant that removes the main live-reference check fails this arm.
   Two boots of one database through different path spellings, both with empty roots, race to bind:
   exactly one pending ID lands and the other boot refuses without a second marker; a mutant that
   removes the conditional pending-ID write fails this arm. A root with exactly one object refuses
