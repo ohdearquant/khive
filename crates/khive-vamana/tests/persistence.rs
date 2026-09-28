@@ -817,6 +817,104 @@ fn v2_upgrades_v1_format_to_v2() {
     assert_eq!(r1, r2, "search results must match after v1→v2 upgrade");
 }
 
+#[cfg(feature = "mmap")]
+#[test]
+fn v1_upgrade_rebuilds_changed_corpus_before_stamping_sequence() {
+    let dimensions = 4;
+    let original = rand_unit_vectors(4, dimensions, 0x3520);
+    let changed: Vec<f32> = original.iter().map(|value| -*value).collect();
+    let config = VamanaConfig::with_dimensions(dimensions)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let dir = tempfile::tempdir().unwrap();
+    VamanaIndex::build(&original, config.clone())
+        .unwrap()
+        .save(dir.path())
+        .unwrap();
+
+    let upgraded =
+        VamanaIndex::load_or_build_with_sequence(dir.path(), &changed, config, Some(41)).unwrap();
+    let changed_bits: Vec<u32> = changed.iter().map(|value| value.to_bits()).collect();
+    let upgraded_bits: Vec<u32> = upgraded
+        .vectors()
+        .unwrap()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    assert_eq!(
+        upgraded_bits, changed_bits,
+        "v1 upgrade returned old vectors"
+    );
+    assert_eq!(upgraded.last_applied_seq(), Some(41));
+
+    let reopened = VamanaIndex::load(dir.path()).unwrap();
+    let reopened_bits: Vec<u32> = reopened
+        .vectors()
+        .unwrap()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    assert_eq!(reopened_bits, changed_bits, "v2 commit kept old vectors");
+    assert_eq!(reopened.last_applied_seq(), Some(41));
+}
+
+#[cfg(feature = "mmap")]
+#[test]
+fn v1_upgrade_rebuilds_when_vector_count_changes() {
+    let dimensions = 4;
+    let original = rand_unit_vectors(4, dimensions, 0x3521);
+    let changed = rand_unit_vectors(5, dimensions, 0x3522);
+    let config = VamanaConfig::with_dimensions(dimensions)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let dir = tempfile::tempdir().unwrap();
+    VamanaIndex::build(&original, config.clone())
+        .unwrap()
+        .save(dir.path())
+        .unwrap();
+
+    let rebuilt =
+        VamanaIndex::load_or_build_with_sequence(dir.path(), &changed, config, Some(42)).unwrap();
+    assert_eq!(rebuilt.num_vectors(), 5);
+    assert_eq!(rebuilt.vectors().unwrap(), changed.as_slice());
+    assert_eq!(rebuilt.last_applied_seq(), Some(42));
+    let reopened = VamanaIndex::load(dir.path()).unwrap();
+    assert_eq!(reopened.vectors().unwrap(), changed.as_slice());
+    assert_eq!(reopened.last_applied_seq(), Some(42));
+}
+
+#[cfg(feature = "mmap")]
+#[test]
+fn v1_upgrade_rebuilds_when_caller_dimensions_change_at_equal_byte_count() {
+    let original = rand_unit_vectors(4, 4, 0x3523);
+    // Keep every byte identical: only the caller's vector shape distinguishes
+    // this corpus from the v1 snapshot.
+    let changed = original.clone();
+    let original_config = VamanaConfig::with_dimensions(4)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let caller_config = VamanaConfig::with_dimensions(2)
+        .with_max_degree(4)
+        .with_search_list_size(8);
+    let dir = tempfile::tempdir().unwrap();
+    VamanaIndex::build(&original, original_config)
+        .unwrap()
+        .save(dir.path())
+        .unwrap();
+
+    let rebuilt =
+        VamanaIndex::load_or_build_with_sequence(dir.path(), &changed, caller_config, Some(43))
+            .unwrap();
+    assert_eq!(rebuilt.dimensions(), 2);
+    assert_eq!(rebuilt.num_vectors(), 8);
+    assert_eq!(rebuilt.vectors().unwrap(), changed.as_slice());
+    assert_eq!(rebuilt.last_applied_seq(), Some(43));
+    let reopened = VamanaIndex::load(dir.path()).unwrap();
+    assert_eq!(reopened.dimensions(), 2);
+    assert_eq!(reopened.vectors().unwrap(), changed.as_slice());
+    assert_eq!(reopened.last_applied_seq(), Some(43));
+}
+
 /// Search correctness: load via v2 → search returns same results as in-memory index.
 #[cfg(feature = "mmap")]
 #[test]
