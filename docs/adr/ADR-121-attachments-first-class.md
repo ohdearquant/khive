@@ -959,7 +959,7 @@ documented maintenance window makes a removal safe at this commit.
 
 ## Amendment 4 (2026-09-28): reviewed core-schema epoch for blob GC
 
-**Status: Proposed.** This amendment supplies the core migration review required by Amendment 1 item 6.
+**Status: Accepted (2026-09-28).** This amendment supplies the core migration review required by Amendment 1 item 6.
 It supersedes that item's historical `REVIEWED_SCHEMA_EPOCH = 41` value for this reviewed snapshot;
 it does not remove the ownership, store-binding, or pack-schema review obligations in items 6–8.
 
