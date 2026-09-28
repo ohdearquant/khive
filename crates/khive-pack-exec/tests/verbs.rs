@@ -123,6 +123,7 @@ fn fixture_with_optional_blob_fault(
             max_output_bytes: Some(max_output_bytes),
             timeout_default_s: Some(5.0),
             timeout_max_s: Some(10.0),
+            binary_digest_timeout_s: None,
             keep,
             limits,
         },
