@@ -63,8 +63,8 @@ mod unix {
     use anyhow::{bail, Context, Result};
     use clap::Parser;
     use khive_mcp::daemon::{
-        probe_supervisor_socket, supervisor_effective_uid, supervisor_pid_is_alive,
-        supervisor_sigterm, SupervisorSocketProbe,
+        probe_supervisor_socket, request_supervisor_handover, supervisor_effective_uid,
+        supervisor_pid_is_alive, SupervisorSocketProbe,
     };
     use khive_mcp::serve::{
         config_discovery_db_anchor, reject_conflicting_db_override_with_source,
@@ -159,8 +159,13 @@ mod unix {
             }
         }
 
-        fn publish(&self, label: &str, interval: u64) -> Result<()> {
+        fn publish(&self, label: &str, interval: u64, claim: &str) -> Result<()> {
             self.require_owner(label)?;
+            if uuid::Uuid::parse_str(claim).ok().is_none_or(|parsed| {
+                parsed.get_version() != Some(uuid::Version::Random) || parsed.to_string() != claim
+            }) {
+                bail!("supervisor incarnation claim must be a canonical UUID");
+            }
             let parent = self
                 .path
                 .parent()
@@ -168,8 +173,12 @@ mod unix {
                 .unwrap_or_else(|| Path::new("."));
             let mut temporary = tempfile::NamedTempFile::new_in(parent)
                 .context("create supervisor marker temporary file")?;
-            write!(temporary, "{label}\n{}\n{interval}\n", std::process::id())
-                .context("write supervisor marker")?;
+            write!(
+                temporary,
+                "{label}\n{}\n{interval}\n{claim}\n",
+                std::process::id()
+            )
+            .context("write supervisor marker")?;
             temporary
                 .persist(&self.path)
                 .context("atomically publish supervisor marker")?;
@@ -182,6 +191,20 @@ mod unix {
             }
             Ok(())
         }
+    }
+
+    fn marker_claim(body: &str) -> Option<&str> {
+        let mut lines = body.lines();
+        lines.next()?;
+        lines.next()?;
+        lines.next()?;
+        let claim = lines.next()?;
+        if lines.next().is_some() {
+            return None;
+        }
+        let parsed = uuid::Uuid::parse_str(claim).ok()?;
+        (parsed.get_version() == Some(uuid::Version::Random) && parsed.to_string() == claim)
+            .then_some(claim)
     }
 
     fn resolve_configuration(args: &khive_mcp::args::Args) -> Result<()> {
@@ -238,19 +261,31 @@ mod unix {
         }
         // A second launch of an already-serving job must leave its declaration
         // byte-identical, even if the second launch supplied bad configuration.
-        // A stale/reused marker PID alone does not prove this: the same PID
-        // must answer on the socket as a daemon.
+        // A stale/reused marker PID alone does not prove this: the daemon on
+        // that socket must also echo the marker's incarnation claim.
         if let Some(prior_pid) = prior_marker
             .as_deref()
             .and_then(|body| body.lines().nth(1))
             .and_then(|pid| pid.parse::<u32>().ok())
             .filter(|pid| *pid > 0)
         {
+            let prior_claim = prior_marker.as_deref().and_then(marker_claim);
             match probe_supervisor_socket(Duration::from_millis(500)).await {
-                SupervisorSocketProbe::Daemon(peer) if peer.pid == Some(prior_pid) => {
+                SupervisorSocketProbe::Daemon(peer)
+                    if peer.pid == Some(prior_pid)
+                        && prior_claim.is_some()
+                        && peer.supervisor_claim.as_deref() == prior_claim =>
+                {
                     bail!(
                         "duplicate supervisor launch for {:?}: job pid {prior_pid} already serves the socket",
                         args.label
+                    );
+                }
+                SupervisorSocketProbe::Daemon(peer)
+                    if peer.pid == Some(prior_pid) && prior_claim.is_none() =>
+                {
+                    bail!(
+                        "legacy supervisor marker cannot prove process incarnation: marker_pid={prior_pid}; preserving marker"
                     );
                 }
                 SupervisorSocketProbe::Unidentified { pid, uid, reason } => {
@@ -286,12 +321,13 @@ mod unix {
             }
         };
         let executable = std::env::current_exe().context("resolve current kkernel executable")?;
-        guard.publish(&args.label, interval)?;
+        let claim = uuid::Uuid::new_v4().to_string();
+        guard.publish(&args.label, interval, &claim)?;
         // The client may have won the marker lock first and started an
         // unmanaged daemon. The launcher owns the lock through this handover
         // and exec, so no new client can race into the old socket afterwards.
         let probe_started = Instant::now();
-        match probe_supervisor_socket(Duration::from_millis(500)).await {
+        match request_supervisor_handover(Duration::from_millis(500)).await {
             SupervisorSocketProbe::Absent => {}
             SupervisorSocketProbe::Unidentified { pid, uid, reason } => {
                 bail!(
@@ -314,9 +350,9 @@ mod unix {
                         probe_started.elapsed()
                     );
                 }
-                if let Err(error) = supervisor_sigterm(incumbent_pid) {
+                if !peer.handover_accepted {
                     bail!(
-                        "incumbent did not yield: pid={pid:?} uid={uid:?} waited={:?}: SIGTERM failed: {error}",
+                        "incumbent did not yield: pid={pid:?} uid={uid:?} waited={:?}: socket-bound handover not acknowledged",
                         probe_started.elapsed()
                     );
                 }
@@ -349,6 +385,7 @@ mod unix {
         let error = Command::new(executable)
             .args(["--log", log, "mcp", "--daemon"])
             .args(&args.mcp_args)
+            .env(khive_runtime::daemon::SUPERVISOR_CLAIM_ENV, &claim)
             .exec();
         // exec never returns on success. Keep serialization through exec so
         // a deliberate release cannot interleave between publication and exec.
@@ -361,21 +398,23 @@ mod unix {
     mod tests {
         use super::*;
 
+        const CLAIM: &str = "00000000-0000-4000-8000-000000000001";
+
         #[test]
-        fn marker_has_three_lines_and_same_label_can_restart() {
+        fn marker_has_four_lines_and_same_label_can_restart() {
             let root = tempfile::tempdir().unwrap();
             let marker = root.path().join("khived.supervisor");
             fs::write(&marker, "job\n123\n").unwrap();
             let guard = MarkerGuard::acquire(&marker).unwrap();
-            guard.publish("job", 7).unwrap();
+            guard.publish("job", 7, CLAIM).unwrap();
             assert_eq!(
                 fs::read_to_string(&marker).unwrap(),
-                format!("job\n{}\n7\n", std::process::id())
+                format!("job\n{}\n7\n{CLAIM}\n", std::process::id())
             );
-            guard.publish("job", 11).unwrap();
+            guard.publish("job", 11, CLAIM).unwrap();
             assert_eq!(
                 fs::read_to_string(&marker).unwrap(),
-                format!("job\n{}\n11\n", std::process::id())
+                format!("job\n{}\n11\n{CLAIM}\n", std::process::id())
             );
             guard.release("job").unwrap();
             assert!(!marker.exists());
@@ -390,7 +429,7 @@ mod unix {
             let foreign = b"other-job\n998\n30\n";
             fs::write(&marker, foreign).unwrap();
             let guard = MarkerGuard::acquire(&marker).unwrap();
-            assert!(guard.publish("job", 10).is_err());
+            assert!(guard.publish("job", 10, CLAIM).is_err());
             assert_eq!(fs::read(&marker).unwrap(), foreign);
             assert!(guard.release("job").is_err());
             assert_eq!(fs::read(&marker).unwrap(), foreign);
@@ -406,7 +445,7 @@ mod unix {
             let mut reader = File::open(&marker).unwrap();
             MarkerGuard::acquire(&marker)
                 .unwrap()
-                .publish("job", 10)
+                .publish("job", 10, CLAIM)
                 .unwrap();
             let mut observed = String::new();
             reader.read_to_string(&mut observed).unwrap();
@@ -416,7 +455,7 @@ mod unix {
             );
             assert_eq!(
                 fs::read_to_string(&marker).unwrap(),
-                format!("job\n{}\n10\n", std::process::id())
+                format!("job\n{}\n10\n{CLAIM}\n", std::process::id())
             );
         }
 
@@ -439,10 +478,12 @@ mod unix {
             let contender = std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
                 let guard = MarkerGuard::acquire(&contender_marker).unwrap();
-                done_tx.send(guard.publish("second", 20).is_err()).unwrap();
+                done_tx
+                    .send(guard.publish("second", 20, CLAIM).is_err())
+                    .unwrap();
             });
             started_rx.recv().unwrap();
-            guard.publish("first", 10).unwrap();
+            guard.publish("first", 10, CLAIM).unwrap();
             drop(guard);
             assert!(done_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -450,7 +491,7 @@ mod unix {
             contender.join().unwrap();
             assert_eq!(
                 fs::read_to_string(&marker).unwrap(),
-                format!("first\n{}\n10\n", std::process::id())
+                format!("first\n{}\n10\n{CLAIM}\n", std::process::id())
             );
         }
 
@@ -462,7 +503,7 @@ mod unix {
             fs::write(&target, "job\n1\n10\n").unwrap();
             std::os::unix::fs::symlink(&target, &marker).unwrap();
             let guard = MarkerGuard::acquire(&marker).unwrap();
-            assert!(guard.publish("job", 10).is_err());
+            assert!(guard.publish("job", 10, CLAIM).is_err());
             assert!(guard.release("job").is_err());
             assert!(fs::symlink_metadata(&marker)
                 .unwrap()

@@ -165,10 +165,16 @@ kkernel kg fetch upstream --url https://github.com/org/kg-data.git --ref main \
   for later pinning).
 - `--repin` accepts the fetched content regardless of the existing pin and returns the new hash so
   the caller can update `schema.yaml`/config with it.
-- Output: `.khive/kg/remotes/<remote>/{entities.ndjson, edges.ndjson, meta.json}`, published via an
-  atomic staging-directory swap (`khive-vcs/src/sync.rs:341-395`); a crash mid-publish never
-  leaves a reader-visible mix of old and new files. `meta.json` records `fetched_at`, the resolved
-  `git_ref`, `commit_sha`, and `content_hash`.
+- Output: `.khive/kg/remotes/<remote>/{entities.ndjson, edges.ndjson, meta.json}`, published via a
+  staged directory replacement (`khive-vcs/src/sync.rs`, `publish_remote_cache` and
+  `atomic_replace_dir`); a crash between the two renames may leave the target briefly absent,
+  with the old directory in a `.replaced~*` sibling recovered by the next publish. Recovery
+  accepts only backups carrying the ownership marker written before the swap. A matching
+  directory without that marker is left untouched and reported on stderr; inspect it before
+  manual recovery. A reader never sees a mix of old and new files within the target.
+  `meta.json` records `fetched_at`, the resolved `git_ref`, `commit_sha`, and `content_hash`.
+  An older `.replaced-<digits>` sibling is also left untouched because it may be a valid
+  remote cache.
 - Git remote URLs and any embedded credentials are redacted from error messages before they reach
   stdout/stderr (`khive-vcs/src/sync.rs:462-523`).
 - Remote validation uses the same full deterministic gate as local sync. Edge properties are part
@@ -752,10 +758,13 @@ cut-over database.
 ### `exec --save-file` / `exec --ops-file`: daemon coexistence
 
 When they execute operations, both file-oriented `exec` modes deliberately build a local runtime
-instead of forwarding through the warm daemon (`--ops-file --dry-run` stops before runtime
-construction). `--save-file` needs a trusted local result sink; `--ops-file` needs bulk execution,
+instead of forwarding through the warm daemon (ordinary `--ops-file --dry-run` stops before
+runtime construction; atomic dry-run builds only the metadata preflight registry and never opens
+the target runtime). `--save-file` needs a trusted local result sink; `--ops-file` needs bulk execution,
 including optional whole-file atomic behavior, that the daemon protocol does not expose. If a live
 daemon has the same database open, the command and daemon are independent SQLite clients.
+An atomic dry-run applies the same op-count, topology, and verb-admissibility preflight as a real
+atomic run, then prints a summary with `"atomic": true` without opening the target database.
 `KHIVE_WRITE_QUEUE=1` does not combine them into one writer because that queue is process-local.
 
 SQLite serializes their writes through the WAL write lock. Each process waits for
@@ -768,8 +777,8 @@ For non-atomic `--ops-file`, a busy op can fail after earlier ops committed. Ins
 failure list and use `--strict` when any failed op must produce a non-zero exit. For
 `--ops-file --atomic`, the whole commit pass holds one bounded write transaction; run large units
 against an idle daemon or in a maintenance window. A plan-level rollback prints
-`atomic.committed=false` but currently exits zero even with `--strict`; inspect that field rather
-than relying on process status. Admissibility, prepare, and atomic-unit seam errors instead exit
+`atomic.committed=false` and exits non-zero with or without `--strict`. Inspect the envelope to
+distinguish a rollback from a post-commit publication error. Admissibility, prepare, and atomic-unit seam errors instead exit
 non-zero before printing an atomic result envelope. A deferred reindex or result-rendering failure
 after commit is different: it exits zero with `atomic.committed=true`,
 `atomic.status="committed_degraded"`, and `atomic.retryable=false`; repair or re-read as directed by

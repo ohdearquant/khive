@@ -12,7 +12,70 @@ use khive_runtime::{
     runtime_error_value, DomainDisposition, KhiveRuntime, RuntimeConfig, VerbRegistry,
     VerbRegistryBuilder,
 };
+use khive_storage::{BlobStore, ContentRef, StorageCapability, StorageError, StorageResult};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct FaultBlobStore {
+    inner: Arc<dyn BlobStore>,
+    fail_next: Arc<AtomicBool>,
+    fail_get_on_call: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for FaultBlobStore {
+    async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Blob,
+                operation: "put".into(),
+                message: "injected profile blob write failure".into(),
+            });
+        }
+        self.inner.put(bytes).await
+    }
+
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        if matches!(
+            self.fail_get_on_call
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    if remaining == 0 {
+                        None
+                    } else {
+                        Some(remaining - 1)
+                    }
+                }),
+            Ok(1)
+        ) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Blob,
+                operation: "get_bounded_verified".into(),
+                message: "injected hydration blob read failure".into(),
+            });
+        }
+        self.inner
+            .get_bounded_verified(content_ref, max_bytes)
+            .await
+    }
+
+    async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
+        self.inner.exists(content_ref).await
+    }
+
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        self.inner.size(content_ref).await
+    }
+
+    async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool> {
+        self.inner.delete(content_ref).await
+    }
+}
 
 struct Fixture {
     registry: VerbRegistry,
@@ -37,6 +100,15 @@ fn fixture_with_limits_and_output_cap(
     keep: bool,
     limits: ExecLimitsConfig,
     max_output_bytes: u64,
+) -> Fixture {
+    fixture_with_optional_blob_fault(keep, limits, max_output_bytes, None)
+}
+
+fn fixture_with_optional_blob_fault(
+    keep: bool,
+    limits: ExecLimitsConfig,
+    max_output_bytes: u64,
+    fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
 ) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
@@ -64,7 +136,16 @@ fn fixture_with_limits_and_output_cap(
     let blob_root = dir.path().join("blobs");
     let blobs =
         khive_db::stores::blob::FsBlobStore::new(blob_root.clone(), 0).expect("fs blob store");
-    rt.install_blob_store(std::sync::Arc::new(blobs))
+    let inner: Arc<dyn BlobStore> = Arc::new(blobs);
+    let installed: Arc<dyn BlobStore> = match fault {
+        Some((fail_next, fail_get_on_call)) => Arc::new(FaultBlobStore {
+            inner,
+            fail_next,
+            fail_get_on_call,
+        }),
+        None => inner,
+    };
+    rt.install_blob_store(installed)
         .expect("install blob store");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
@@ -1229,6 +1310,146 @@ async fn run_materialize_symlink_failure_persists_receipt_and_cleans_up() {
             "partial trees must be removed even when keep={keep}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn profile_blob_failure_after_materialization_persists_receipt_and_removes_run_dir() {
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let f = fixture_with_optional_blob_fault(
+        false,
+        ExecLimitsConfig::default(),
+        128,
+        Some((fail_next.clone(), Arc::new(AtomicUsize::new(0)))),
+    );
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"data", 644)]).await;
+    fail_next.store(true, Ordering::SeqCst);
+    let out = f
+        .call(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","actor":"local",
+                "args":["-c","printf launched > child-output"]}),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert!(receipt["reason"]
+        .as_str()
+        .unwrap()
+        .contains("injected profile blob write failure"));
+    assert!(receipt["tree_out"].is_null());
+    assert!(receipt["started_at"].is_null());
+    assert!(receipt["finished_at"].is_string());
+    let stored = f.call("exec.receipt", json!({"id": receipt["id"]})).await;
+    assert_eq!(
+        &stored, receipt,
+        "the post-materialization error is durable"
+    );
+    let events = f
+        .call("exec.events", json!({"run_id": receipt["id"]}))
+        .await;
+    assert_eq!(events["count"], 1, "materialization still has an event");
+    assert!(root_is_empty(&f), "the materialized input must be removed");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn input_hydration_failure_after_preflight_still_persists_a_receipt() {
+    let fail_get_on_call = Arc::new(AtomicUsize::new(0));
+    let f = fixture_with_optional_blob_fault(
+        false,
+        ExecLimitsConfig::default(),
+        128,
+        Some((Arc::new(AtomicBool::new(false)), fail_get_on_call.clone())),
+    );
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"data", 644)]).await;
+    // The first read loads the manifest during preflight. The second is the
+    // input blob hydration after policy has allowed execution.
+    fail_get_on_call.store(2, Ordering::SeqCst);
+    let out = f
+        .call(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","actor":"local",
+                "args":["-c","printf should-not-launch"]}),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert!(receipt["reason"]
+        .as_str()
+        .unwrap()
+        .contains("injected hydration blob read failure"));
+    assert!(receipt["started_at"].is_null());
+    assert!(receipt["tree_out"].is_null());
+    let stored = f.call("exec.receipt", json!({"id": receipt["id"]})).await;
+    assert_eq!(&stored, receipt);
+    assert!(root_is_empty(&f), "hydration cannot create a run directory");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn invalid_output_filename_is_skipped_and_published_tree_loads() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[]).await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","actor":"local",
+                "args":["-c",r"printf invalid > 'bad\name'"]}),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert_eq!(receipt["skipped"], json!([r"bad\name"]));
+    assert!(receipt["reason"]
+        .as_str()
+        .unwrap()
+        .contains("forbidden character"));
+    let output = f
+        .call("exec.tree_get", json!({"tree": receipt["tree_out"]}))
+        .await;
+    assert_eq!(output["entries"], json!([]), "a minted tree must load");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn unreadable_output_directory_never_becomes_a_deletion_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_ne!(unsafe { libc::geteuid() }, 0, "run as a non-root user");
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("sealed/input", b"still present", 644)]).await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","actor":"local",
+                "args":["-c","chmod 000 sealed"]}),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    let run_dir = f.root.join(receipt["id"].as_str().unwrap());
+    let sealed = run_dir.join("sealed");
+    if sealed.exists() {
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert!(receipt["tree_out"].is_null(), "{receipt}");
+    assert_eq!(
+        receipt["changed"],
+        json!([]),
+        "no false deletion: {receipt}"
+    );
+    let reason = receipt["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("read capture directory") && reason.contains("sealed"),
+        "{reason}"
+    );
+    assert!(reason.contains("exec cleanup failed"), "{reason}");
 }
 
 #[cfg(target_os = "macos")]

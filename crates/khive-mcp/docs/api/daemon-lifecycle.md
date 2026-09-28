@@ -6,12 +6,14 @@ stale/dead one, and forwards request frames over the daemon socket. This
 document is the extended rationale for the concurrency and safety properties
 that the inline doc comments summarize.
 
-## Supervised startup (ADR-185 Amendment 1)
+## Supervised startup (ADR-185 Amendments 1–3)
 
 A supervisor launches the daemon through `kkernel supervisor launch`. The
 launcher publishes `~/.khive/khived.supervisor` before replacing itself with
-the daemon. Its three lines contain the supervisor job label, the launcher's
-PID, and the restart interval in whole seconds. Unix exec preserves that PID.
+the daemon. Its four lines contain the supervisor job label, the launcher's
+PID, the restart interval in whole seconds, and a fresh UUID v4 incarnation
+claim. Unix exec preserves that PID. A client may ignore the fourth line;
+the launcher uses it to distinguish a live job from a daemon whose PID was reused.
 The interval must match the supervisor's restart policy. A legacy two-line
 marker has a ten-second interval. `KHIVE_SUPERVISOR_MARKER` overrides the path
 for isolated tests; it is not a second ownership declaration.
@@ -38,9 +40,11 @@ mutation. No permanent “not yours to start” refusal remains on this path. An
 unreadable marker is still a claim; it is not treated as absent.
 
 The launcher probes the socket while holding the lock. If a same-uid
-client-started khive daemon answers, the launcher sends it SIGTERM, waits up
-to one restart interval for it to leave, and then execs the supervised daemon.
-It never signals an unidentified or foreign-uid socket holder.
+client-started khive daemon answers, the launcher asks for handover on the same
+credential-bound socket connection. The daemon acknowledges and sends SIGTERM
+to itself, then the launcher waits up to one restart interval for it to leave
+before exec. Missing acknowledgement refuses the launch. The launcher never
+signals a captured numeric PID or an unidentified or foreign-uid socket holder.
 
 Only a launcher with the marker's own label can replace or release it. A
 foreign label causes refusal without modifying the marker. Publication uses

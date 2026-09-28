@@ -38,7 +38,10 @@ pub struct KnowledgeReindexOptions {
 ///
 /// Knowledge is single-model: atom indexing, section indexing, and search all
 /// use the default embedder. Returns `{atoms_indexed, sections_indexed, failed,
-/// ann_failed, sections_failed, truncation_by_model}`.
+/// ann_failed, sections_failed, sections_superseded, truncation_by_model}`.
+/// `sections_superseded` counts conditional vector writes rejected because the
+/// section or its atom changed while embedding was in flight; these are not
+/// storage failures.
 ///
 /// Optional progress callbacks receive `(processed, total)` after each batch.
 pub async fn reindex_knowledge(
@@ -83,12 +86,13 @@ pub async fn reindex_knowledge(
 
     let mut sections_indexed = 0u64;
     let mut sections_failed = 0u64;
+    let mut sections_superseded = 0u64;
     if opts.sections {
         let batch = opts
             .batch_size
             .map(|b| b as usize)
             .unwrap_or(knowledge::util::DEFAULT_EMBED_BATCH);
-        let (indexed, _skipped, sec_failed, section_truncation) =
+        let (indexed, _skipped, superseded, sec_failed, section_truncation) =
             knowledge::sections_index::embed_sections(
                 runtime,
                 token,
@@ -100,6 +104,7 @@ pub async fn reindex_knowledge(
             .await?;
         sections_indexed = indexed as u64;
         sections_failed = sec_failed as u64;
+        sections_superseded = superseded as u64;
         if section_truncation.any_truncated() {
             let model = runtime.default_embedder_name().to_string();
             let existing = truncation_by_model
@@ -127,6 +132,7 @@ pub async fn reindex_knowledge(
         "failed": failed,
         "ann_failed": ann_failed,
         "sections_failed": sections_failed,
+        "sections_superseded": sections_superseded,
         "truncation_by_model": truncation_by_model,
     }))
 }

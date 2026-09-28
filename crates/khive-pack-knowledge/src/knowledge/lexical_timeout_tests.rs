@@ -102,8 +102,9 @@ impl Subscriber for TimeoutEvents {
     fn event(&self, event: &Event<'_>) {
         let mut fields = Fields::default();
         event.record(&mut fields);
-        if fields.0.contains_key("stage_elapsed_ms") {
-            fields.0.remove("message");
+        if event.metadata().level() == &tracing::Level::WARN
+            && fields.0.contains_key("stage_elapsed_ms")
+        {
             self.0
                 .lock()
                 .expect("events lock")
@@ -173,6 +174,11 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
         let mut logged = events.0.lock().unwrap().clone();
         assert_eq!(logged.len(), 1, "{label}");
         let mut logged = logged.remove(0);
+        let message = logged
+            .as_object_mut()
+            .expect("event is an object")
+            .remove("message");
+        assert_eq!(message, Some(json!("lexical read timed out")), "{label}");
         let completed = logged
             .as_object_mut()
             .expect("event is an object")
@@ -276,13 +282,18 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
             .expect("missing public lexical_timeout_details");
         assert_eq!(details.len(), passes.len(), "one record per executed pass");
         for (detail, pass) in details.iter().zip(passes) {
+            // Six expanded query words receive 7.5 s; each three-word
+            // decomposed pass receives 4.5 s. The probe still has its own
+            // unchanged 500 ms bound.
+            let stage_budget_ms = if pass == "full" { 7_500 } else { 4_500 };
             assert_eq!(
                 *detail,
                 json!({
                     "pass": pass, "phase": "term_frequency",
                     "bound": "ordering_probe",
                     "stage_elapsed_ms": 9, "operation_elapsed_ms": 9,
-                    "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "configured_budget_ms": stage_budget_ms,
+                    "effective_budget_ms": stage_budget_ms,
                     "read_budget_ms": 500,
                 })
             );
@@ -314,6 +325,41 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
         };
         assert_eq!(response, expected, "empty-timeout response: {verb}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn flagged_lexical_timeout_emits_one_log_record_from_the_same_dispatch() {
+    let runtime = fixture(false).await;
+    let registry = registry(&runtime);
+    let args = json!({"query": "unrelated", "rerank": false});
+
+    let healthy_events = TimeoutEvents::default();
+    let healthy = registry
+        .dispatch("knowledge.search", args.clone())
+        .with_subscriber(healthy_events.clone())
+        .await
+        .expect("healthy public dispatch");
+    assert!(healthy["degraded"]["lexical_timeout"].is_null());
+    assert!(healthy_events.0.lock().unwrap().is_empty());
+
+    let timeout_events = TimeoutEvents::default();
+    let response = with_timeout(
+        vec![LexicalPhase::PhaseBHydration],
+        Duration::from_millis(11),
+        registry.dispatch("knowledge.search", args),
+    )
+    .with_subscriber(timeout_events.clone())
+    .await
+    .expect("timed-out public dispatch");
+    assert_eq!(response["degraded"]["lexical_timeout"], true);
+    assert!(response["degraded"]
+        .get("lexical_timeout_details")
+        .is_none());
+
+    let events = timeout_events.0.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["message"], "lexical read timed out");
+    assert_eq!(events[0]["phase"], "phase_b_hydration");
 }
 
 #[tokio::test(start_paused = true)]
@@ -432,8 +478,8 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
                     "pass": "full", "phase": phase.label(),
                     "bound": if probe_site { "ordering_probe" } else { "stage" },
                     "stage_elapsed_ms": 11,
-                    "operation_elapsed_ms": 11, "configured_budget_ms": 2000, "effective_budget_ms": 2000,
-                    "read_budget_ms": if probe_site { 500 } else { 2000 },
+                    "operation_elapsed_ms": 11, "configured_budget_ms": 2500, "effective_budget_ms": 2500,
+                    "read_budget_ms": if probe_site { 500 } else { 2500 },
                 }]
             }});
             if probe_site {
@@ -542,7 +588,7 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
                     "pass": "full", "phase": "term_frequency",
                     "bound": "ordering_probe",
                     "stage_elapsed_ms": 11, "operation_elapsed_ms": 11,
-                    "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "configured_budget_ms": 5500, "effective_budget_ms": 5500,
                     "read_budget_ms": 500,
                 }]
             }}),
@@ -725,7 +771,11 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
     for query in ["term1 term18", "term18 term1"] {
         let outcome = with_fts_deadline_advance_after_term(
             1,
-            Duration::from_millis(2000),
+            // Both query words have a plural expansion, so this pass admits
+            // four terms and has a 3.5 s stage budget. Advance past that
+            // bound after the first completed term to preserve the partial
+            // candidate fixture under the scaled allowance.
+            Duration::from_millis(3600),
             search_core(&ctx, query, LexicalPass::Full),
         )
         .await
@@ -788,11 +838,11 @@ async fn configured_budget_uses_the_stage_override() {
     );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["configured_budget_ms"],
-        137
+        171
     );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["effective_budget_ms"],
-        137
+        171
     );
 }
 

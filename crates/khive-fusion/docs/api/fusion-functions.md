@@ -14,9 +14,10 @@ by fused score; it does not apply top-k truncation.
 
 Each source is independently min-max normalized to `[0, 1]`; an equal-valued or single-item source
 maps every member to `1.0`. Non-finite and negative weights become zero. Positive weights for
-actual sources are normalized to sum to one; if all effective weights are zero, sources receive
-equal weight. Extra weights do not steal mass, and extra sources beyond the weight list receive zero
-weight and inject no IDs.
+actual sources are normalized to sum to one. With a nonempty weight list, a zero or overflowing
+effective sum gives equal weight only to source positions covered by that list; later sources
+receive zero weight and inject no IDs. An empty weight list gives every source equal weight. Extra
+weights do not steal mass from real sources.
 
 Within a source, duplicate IDs keep their maximum normalized value. Fixed-point weighted products
 then accumulate deterministically. The full unique result set is returned in ranking order.

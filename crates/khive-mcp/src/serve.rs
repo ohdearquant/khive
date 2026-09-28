@@ -1082,6 +1082,7 @@ async fn channel_poll_loop(
                             "channel_kind": kind,
                             "channel_slug": slug,
                             "external_id": env.external_id.clone(),
+                            "legacy_external_id": env.legacy_external_id.clone(),
                             "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id.clone(),
                             "default_inbound_actor": default_inbound_actor,
@@ -1280,6 +1281,7 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
             "auth"
         }
         khive_channel::ChannelError::Transport(_)
+        | khive_channel::ChannelError::RateLimited { .. }
         | khive_channel::ChannelError::PermanentTransport(_) => "transport",
         khive_channel::ChannelError::Config(_)
         | khive_channel::ChannelError::UnauthorizedSender(_)
@@ -1476,14 +1478,21 @@ async fn record_outbound_send_failure(
 
     match error.delivery_failure_class() {
         DeliveryFailureClass::Transient => {
+            let (base_delay, max_delay) = match error {
+                khive_channel::ChannelError::RateLimited { retry_after, .. } => (
+                    OUTBOUND_RETRY_BASE.max(*retry_after),
+                    OUTBOUND_RETRY_CEILING.max(*retry_after),
+                ),
+                _ => (OUTBOUND_RETRY_BASE, OUTBOUND_RETRY_CEILING),
+            };
             runtime
                 .mark_outbound_message_transient_failure(
                     token,
                     note_id,
                     chrono::Utc::now(),
                     error.to_string(),
-                    OUTBOUND_RETRY_BASE,
-                    OUTBOUND_RETRY_CEILING,
+                    base_delay,
+                    max_delay,
                 )
                 .await
         }
@@ -1585,6 +1594,7 @@ pub(crate) async fn channel_outbox_loop(
     channels.register(email_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
@@ -1602,6 +1612,7 @@ pub(crate) async fn channel_outbox_loop(
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -1623,6 +1634,7 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(email_channel),
         outbox::OutboxPolicy::Email {
@@ -1633,6 +1645,7 @@ async fn channel_outbox_once(
         runtime,
         namespace,
         cancellation,
+        &mut pause_until,
     )
     .await
 }
@@ -1923,6 +1936,7 @@ pub(crate) async fn telegram_outbox_loop(
     channels.register(telegram_channel);
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
+    let mut pause_until = None;
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, ctx.cancellation()).await {
             return Ok(());
@@ -1936,6 +1950,7 @@ pub(crate) async fn telegram_outbox_loop(
             &runtime,
             &namespace,
             ctx.cancellation(),
+            &mut pause_until,
         )
         .await?;
         ctx.heartbeat();
@@ -1949,12 +1964,14 @@ async fn telegram_outbox_once(
     namespace: &khive_runtime::Namespace,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(telegram_channel),
         outbox::OutboxPolicy::Telegram(std::marker::PhantomData),
         runtime,
         namespace,
         cancellation,
+        &mut pause_until,
     )
     .await
 }
@@ -2746,6 +2763,16 @@ struct PreparedStorageTopology {
     shared_hydrator: Option<Arc<BlobHydrator>>,
 }
 
+fn declared_backend_db_paths(config: &KhiveConfig) -> Arc<[PathBuf]> {
+    config
+        .backends
+        .iter()
+        .filter(|backend| backend.kind == BackendKind::Sqlite)
+        .filter_map(|backend| backend.path.as_deref().map(khive_runtime::expand_tilde))
+        .collect::<Vec<_>>()
+        .into()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageTopologyPurpose {
     Serving,
@@ -3015,6 +3042,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     )
     .await?;
 
+    // Every pack sees the whole serving topology, including stores assigned
+    // to other packs, before handlers can accept a code.ingest target.
+    let declared_backend_db_paths = declared_backend_db_paths(khive_cfg);
+
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
     // main's models even when the pack itself is `no_embed`.
@@ -3022,7 +3053,8 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         let mut cfg = base_config.clone();
         cfg.backend_id = BackendId::main();
         cfg
-    });
+    })
+    .with_declared_backend_db_paths(declared_backend_db_paths.clone());
 
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
@@ -3054,6 +3086,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
                 rt_config,
                 &main_backend,
                 &default_runtime,
+                declared_backend_db_paths.clone(),
             ),
         );
     }
@@ -3937,7 +3970,8 @@ async fn build_single_backend_runtime_with_max_readers(
     )
     .await?;
 
-    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?;
+    let runtime = KhiveRuntime::from_prepared_backend(backend, config)?
+        .with_declared_backend_db_paths(declared_backend_db_paths(khive_cfg));
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
     }
@@ -4040,11 +4074,14 @@ fn build_pack_runtime(
     rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
+    declared_backend_db_paths: Arc<[PathBuf]>,
 ) -> KhiveRuntime {
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
-    let rt = KhiveRuntime::from_backend(backend, rt_config).with_core_embedders_from(main_runtime);
+    let rt = KhiveRuntime::from_backend(backend, rt_config)
+        .with_declared_backend_db_paths(declared_backend_db_paths)
+        .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -6416,6 +6453,22 @@ id = "lambda:project-actor"
             .dispatch("stats", serde_json::json!({}))
             .await
             .expect("kg.stats dispatch succeeds");
+        let after_irrelevant = multi
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch after irrelevant stats");
+        assert_eq!(after_irrelevant["balanced_recall"]["total_events"], 0);
+
+        // Search is a relevant BrainSignal even when the corpus is empty.
+        multi
+            .registry
+            .dispatch(
+                "search",
+                serde_json::json!({"kind": "entity", "query": "hook-wiring-regression"}),
+            )
+            .await
+            .expect("kg.search dispatch succeeds");
 
         let state = multi
             .registry
@@ -6425,8 +6478,8 @@ id = "lambda:project-actor"
         let total_events = state["balanced_recall"]["total_events"]
             .as_u64()
             .unwrap_or(0);
-        assert!(
-            total_events > 0,
+        assert_eq!(
+            total_events, 1,
             "multi-backend dispatch hook must update the same BrainPack instance \
              the registry dispatches brain.* verbs to; got snapshot {state:?}"
         );
@@ -7655,6 +7708,47 @@ region = "us-east-1"
             },
             ..KhiveConfig::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_path = temp.path().join("main.db");
+        let secondary_path = temp.path().join("secondary.db");
+        let mut config = sqlite_multi_backend_config(main_path.clone(), secondary_path.clone());
+        config.packs.clear();
+        config.packs.insert(
+            "code".to_string(),
+            khive_runtime::PackConfig {
+                backend: "secondary".to_string(),
+                no_embed: false,
+            },
+        );
+        config.backends.push(BackendConfig {
+            name: "volatile".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: None,
+            read_only: false,
+        });
+        let mut base = base_runtime_config_for_multi_backend();
+        base.packs = vec!["kg".into(), "code".into()];
+
+        let multi = build_registry_for_multi_backend(base, &config, None)
+            .await
+            .expect("multi-backend code pack boots");
+        let expected = [main_path, secondary_path];
+        assert_eq!(
+            multi.default_runtime.declared_backend_db_paths(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            multi.per_pack_runtimes["code"].declared_backend_db_paths(),
+            expected.as_slice()
+        );
     }
 
     #[tokio::test]

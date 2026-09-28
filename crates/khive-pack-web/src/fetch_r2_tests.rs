@@ -263,7 +263,7 @@ async fn transient_head_still_records_standalone_metadata_receipt() {
     assert_eq!(request["method"], "HEAD");
     assert_eq!(request["final_url"], url.as_str());
     assert_eq!(request["bytes"], 0);
-    assert_eq!(request["size"], 0);
+    assert!(request["size"].is_null());
     assert!(request["content_digest"].is_null());
     chrono::DateTime::parse_from_rfc3339(request["fetched_at"].as_str().unwrap()).unwrap();
     assert!(reply["body"].is_null());

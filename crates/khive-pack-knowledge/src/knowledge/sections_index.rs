@@ -27,13 +27,22 @@ fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
+struct SectionEmbeddingInput {
+    id: String,
+    atom_name: String,
+    heading: String,
+    content: String,
+    text: String,
+}
+
 /// Embed sections in `token`'s namespace into `knowledge_sections.embedding`.
 ///
 /// With `drop_existing`, every section is re-embedded; otherwise only sections
 /// whose `embedding` is currently NULL are filled. When `atom_id` is `Some`, only
 /// sections belonging to that atom are processed (used by `knowledge.edit` for
-/// inline re-embed after a write). Returns `(indexed, skipped, failed, truncation)`. Genuine
-/// skips (blank section text) go to `skipped`; embed errors and vector-count
+/// inline re-embed after a write). Returns `(indexed, skipped, superseded, failed,
+/// truncation)`. Blank section text goes to `skipped`; a row changed while its
+/// embedding was computed goes to `superseded`; embed errors and vector-count
 /// mismatches go to `failed` (fail-closed contract).
 pub(crate) async fn embed_sections(
     runtime: &KhiveRuntime,
@@ -47,12 +56,13 @@ pub(crate) async fn embed_sections(
         usize,
         usize,
         usize,
+        usize,
         khive_runtime::retrieval::EmbeddingTruncationReport,
     ),
     RuntimeError,
 > {
     if runtime.default_embedder_name().is_empty() {
-        return Ok((0, 0, 0, Default::default()));
+        return Ok((0, 0, 0, 0, Default::default()));
     }
     let ns = token.namespace().as_str().to_owned();
     let sql = runtime.sql();
@@ -60,7 +70,7 @@ pub(crate) async fn embed_sections(
 
     // Build the atom-scope fragment and its bind parameter once.
     let atom_filter = if atom_id.is_some() {
-        " AND atom_id = ?2"
+        " AND s.atom_id = ?2"
     } else {
         ""
     };
@@ -69,7 +79,7 @@ pub(crate) async fn embed_sections(
         let null_filter = if drop_existing {
             ""
         } else {
-            " AND embedding IS NULL"
+            " AND s.embedding IS NULL"
         };
         let mut params = vec![SqlValue::Text(ns.clone())];
         if let Some(id) = atom_id {
@@ -82,8 +92,10 @@ pub(crate) async fn embed_sections(
         let row = reader
             .query_row(SqlStatement {
                 sql: format!(
-                    "SELECT count(*) AS cnt FROM knowledge_sections \
-                     WHERE namespace = ?1{atom_filter}{null_filter}"
+                    "SELECT count(*) AS cnt FROM knowledge_sections s \
+                     JOIN knowledge_atoms a ON a.id = s.atom_id \
+                     AND a.namespace = s.namespace AND a.deleted_at IS NULL \
+                     WHERE s.namespace = ?1{atom_filter}{null_filter}"
                 ),
                 params,
                 label: None,
@@ -105,6 +117,7 @@ pub(crate) async fn embed_sections(
 
     let mut indexed = 0usize;
     let mut skipped = 0usize;
+    let mut superseded = 0usize;
     let mut failed = 0usize;
     let mut truncation_report = khive_runtime::retrieval::EmbeddingTruncationReport::default();
     let mut last_id: Option<String> = None;
@@ -143,6 +156,7 @@ pub(crate) async fn embed_sections(
                     a.name AS atom_name \
              FROM knowledge_sections s \
              JOIN knowledge_atoms a ON a.id = s.atom_id \
+             AND a.namespace = s.namespace AND a.deleted_at IS NULL \
              WHERE s.namespace = ?1{atom_clause}{null_filter}{keyset_clause} \
              ORDER BY s.id LIMIT ?{limit_pos}"
         );
@@ -163,7 +177,7 @@ pub(crate) async fn embed_sections(
             break;
         }
 
-        let mut staged: Vec<(String, String)> = Vec::with_capacity(n);
+        let mut staged: Vec<SectionEmbeddingInput> = Vec::with_capacity(n);
         for r in &rows {
             let Some(id) = row_str(r, "id") else {
                 continue;
@@ -176,14 +190,20 @@ pub(crate) async fn embed_sections(
                 skipped += 1;
                 continue;
             }
-            staged.push((id, text));
+            staged.push(SectionEmbeddingInput {
+                id,
+                atom_name,
+                heading,
+                content,
+                text,
+            });
         }
 
         // One embed call per page: the page (LIMIT = batch_size) IS the embed
         // batch, so there is no inner re-chunk. `staged` holds the non-empty rows
         // of this page (≤ batch_size).
         if !staged.is_empty() {
-            let texts: Vec<String> = staged.iter().map(|(_, text)| text.clone()).collect();
+            let texts: Vec<String> = staged.iter().map(|input| input.text.clone()).collect();
             match runtime.embed_document_batch_outcomes(&texts).await {
                 Ok(outcomes) if outcomes.len() == staged.len() => {
                     let mut truncation =
@@ -204,28 +224,39 @@ pub(crate) async fn embed_sections(
                         .await
                         .map_err(|e| sql_err("section index writer", e))?;
                     let now = now_us();
-                    for ((id, _), outcome) in staged.iter().zip(outcomes) {
+                    for (input, outcome) in staged.iter().zip(outcomes) {
                         let mut emb = outcome.vector;
                         unit_normalize(&mut emb);
-                        if let Err(e) = writer
+                        match writer
                             .execute(SqlStatement {
                                 sql:
                                     "UPDATE knowledge_sections SET embedding = ?1, updated_at = ?2 \
-                                      WHERE id = ?3"
+                                      WHERE id = ?3 AND heading = ?4 AND content = ?5 \
+                                      AND EXISTS (SELECT 1 FROM knowledge_atoms a \
+                                                  WHERE a.id = knowledge_sections.atom_id \
+                                                  AND a.name = ?6 AND a.deleted_at IS NULL)"
                                         .into(),
                                 params: vec![
                                     SqlValue::Blob(f32_to_le_bytes(&emb)),
                                     SqlValue::Integer(now),
-                                    SqlValue::Text(id.clone()),
+                                    SqlValue::Text(input.id.clone()),
+                                    SqlValue::Text(input.heading.clone()),
+                                    SqlValue::Text(input.content.clone()),
+                                    SqlValue::Text(input.atom_name.clone()),
                                 ],
                                 label: None,
                             })
                             .await
                         {
-                            tracing::warn!(id = %id, error = %e, "section embedding UPDATE failed; counting as failed");
-                            failed += 1;
-                        } else {
-                            indexed += 1;
+                            Ok(0) => {
+                                superseded += 1;
+                                tracing::debug!(id = %input.id, "section embedding input changed before write");
+                            }
+                            Ok(_) => indexed += 1,
+                            Err(e) => {
+                                tracing::warn!(id = %input.id, error = %e, "section embedding UPDATE failed; counting as failed");
+                                failed += 1;
+                            }
                         }
                     }
                 }
@@ -259,5 +290,5 @@ pub(crate) async fn embed_sections(
         }
     }
 
-    Ok((indexed, skipped, failed, truncation_report))
+    Ok((indexed, skipped, superseded, failed, truncation_report))
 }

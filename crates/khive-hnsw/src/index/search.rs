@@ -367,16 +367,16 @@ impl HnswIndex {
         while i < n {
             if !self.is_tombstoned(i) {
                 let dot = dot1(query, &self.nodes[i].vector);
-                let dist = if query_is_unit && cached_norm_is_unit(self.nodes[i].norm) {
-                    1.0 - dot.clamp(-1.0, 1.0)
-                } else {
-                    match metric {
-                        DistanceMetric::Cosine => {
+                let dist = match metric {
+                    DistanceMetric::Cosine => {
+                        if query_is_unit && cached_norm_is_unit(self.nodes[i].norm) {
+                            1.0 - dot.clamp(-1.0, 1.0)
+                        } else {
                             cosine_distance_from_parts(dot, query_norm, self.nodes[i].norm)
                         }
-                        DistanceMetric::Dot => -dot,
-                        _ => unreachable!(),
                     }
+                    DistanceMetric::Dot => -dot,
+                    _ => unreachable!(),
                 };
                 scored.push((i, score_from_distance(dist, metric)));
             }

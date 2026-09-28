@@ -128,6 +128,8 @@ allow-list, and a receipt written after the body's blob is stored.
 | `web.search(query, provider?, limit?, persist?)` | an operator-configured search provider; `persist` defaults false                                                                                                                                                         | hits; a receipt note; with `persist`, each hit's URL as an unfetched `resource` under its site                                                                |
 | `web.refresh(id)`                                | conditional re-fetch using `etag` / `last_modified`; unchanged digest writes a receipt only                                                                                                                              | receipt; new blob and updated properties when the body changed                                                                                                |
 
+The `web.refresh` row is amended by Amendment 5.
+
 An unfetched target is minted as `resource` with `status` null. When `fetch` (directly, or through
 `ingest` or `refresh`) later retrieves it and the body is HTML, `fetch` updates the row's `entity_type`
 to `page` in place; the id does not change because identity is by address. A2's control covers the
@@ -151,7 +153,7 @@ timing, egress classification, and the stored reference when `persist` is true, 
 digest and size (amended by A1.2: a request that stores no body, `persist` false or a HEAD, writes a
 receipt with no blob reference and records the content digest, size, final URL and fetch time). Receipts chain by `supersedes`,
 so the fetch history of a resource is a note chain, and content that did not change produces a receipt
-and nothing else.
+and nothing else (amended by Amendment 5 for changed representation metadata).
 
 ### D5. Deletions against the superseded revision
 
@@ -198,7 +200,7 @@ Controls are stated before the arms run; an arm without its control is not evide
   resources under their own sites; control: a page with no hrefs yields none.
 - A3 a 301 chain yields `new supersedes old`; a 302 yields no edge and a receipt naming the hop.
 - A4 `refresh` on an unchanged `etag` writes no entity or blob change; control: changed body updates
-  `blob_ref` and `content_digest`.
+  `blob_ref` and `content_digest` (amended by Amendment 5).
 - A5 `ingest` of a served tree on disk under a declared `origin` produces the same graph as live
   ingest of the same tree served under that origin over HTTP: the arm asserts id equality row by row
   and edge-set equality.
@@ -483,3 +485,71 @@ deduplicate across namespaces in the content-addressed blob store.
   namespace.
 
 **Refs.** #3037.
+
+## Amendment 5 (2026-09-27): refresh metadata and redirected 304
+
+**Status**: Accepted (2026-09-27)
+
+**Context.** D3 and A4 say an unchanged body writes only a receipt. A response can keep the body
+bytes while changing `Content-Type`, status, `ETag` or `Last-Modified`; ignoring those fields leaves
+the stored representation stale and sends an obsolete validator on the next refresh (#3093). D3
+also does not retain the fetched body's `Accept` and `Accept-Language`, so refresh can ask for a
+different representation from the one whose body it holds. Identity is by address under D2 and D3:
+a redirect target is a different row, and a 304 from it supplies no body for that address. The
+redirected-304 ruling of 2026-09-27 selects refusal over copying the source body to the target.
+
+**Decision.**
+
+1. A persisted GET stores the representation negotiation sent with the request: lowercase
+   `accept` and `accept-language` keys, each an array retaining repeated values in sent order.
+   Only a later caller-issued persisted GET replaces this map, including clearing values absent
+   from its request. `web.refresh` replays the stored negotiation and never replaces the map.
+   HEAD records its own request in its receipt but does not replace the cached GET body's
+   negotiation. Credentials, conditional validators and all other request headers are excluded
+   from this stored map.
+2. `web.refresh` replays the stored `Accept` and `Accept-Language` on each redirect hop. It sends
+   the source row's `If-None-Match` and `If-Modified-Since` only on the first request to the stored
+   address, and only when the cached body is known complete. A partial body is fetched without
+   validators. A 304 after any redirect is refused as `redirected_not_modified` before source or
+   target graph rows, attachments, or receipts change; the caller fetches the target instead.
+3. A body response with the same content reference and completeness can still patch changed
+   representation metadata. It applies supplied `Content-Type` and the representation status;
+   a 200 response replaces `ETag` and `Last-Modified`, clearing either validator when absent.
+   A 304 patches only header fields it supplies, retains the cached representation status, and
+   records its actual 304 status in the receipt. A 304 with no metadata change writes only the
+   receipt. Metadata-only patches retain the blob reference and content attachment; the reply's
+   `changed` flag continues to describe a body/reference change.
+4. Refresh settles any response body before patching metadata. The metadata patch is conditional
+   on the terminal row still carrying that response's content reference and on the entity snapshot
+   read for the patch remaining unchanged. A mismatch skips the metadata write and sets
+   `lost_race: true` in the reply and receipt. This prevents a late metadata write from a response
+   whose body lost to a concurrent, different-body refresh.
+5. Fetch and refresh receipts carry the allow-listed response headers and the request's
+   allow-listed negotiation. They do not record credential headers.
+
+**Alternatives considered.**
+
+- Keep D3's receipt-only rule whenever body bytes match. This strands a new validator and
+  content type until a future changed-body response and repeats the stale conditional request.
+- Replay the source validators on redirect hops and accept a target 304. A target has its own
+  address identity; its 304 cannot establish that it served the source row's cached bytes. A
+  cached target's own validators could support a separate target-specific validation rule, but
+  this amendment does not define or implement that rule.
+- Copy the source body to an uncached redirect target after its 304. That would mint a fetched
+  target representation without receiving a body from the target.
+- Retain negotiation only in the receipt chain. Refresh would have to reconstruct the cached
+  body's request context from mutable history rather than read it beside the body reference.
+
+**Consequences and acceptance.** A same-body 200 changing type, status or validators updates
+only representation metadata; the attachment and blob reference remain unchanged. A 304 with a
+new ETag updates that field but preserves cached status; a bodyless 304 with no new metadata writes
+only a receipt. The next refresh sends the updated validator and the cached GET negotiation.
+HEAD leaves that negotiation intact, while a later unnegotiated persisted GET clears it. For every
+301, 302, 307 and 308 hop, a terminal 200 updates the target's representation and leaves the
+source's representation fields alone; a terminal 304 refuses with both rows and the receipt chain
+unchanged. A control that resends source validators after a redirect must fail the first-hop
+header test; a control that removes the 304 refusal must fail the no-mutation test; a control that
+skips same-body metadata must fail the metadata test; a control that drops the body/metadata
+revision guard must fail the overlapping-fetch test.
+
+**Refs.** #3093, PR #3165, ADR-191 D2-D4 and A4, the 2026-09-27 redirected-304 ruling.

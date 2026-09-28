@@ -204,6 +204,18 @@ impl Fixture {
     }
 }
 
+fn assert_supervisor_marker(path: &Path, pid: u32, interval: u64) -> String {
+    let marker = std::fs::read_to_string(path).unwrap();
+    let mut lines = marker.lines();
+    assert_eq!(lines.next(), Some(LABEL));
+    assert_eq!(lines.next().unwrap().parse::<u32>().unwrap(), pid);
+    assert_eq!(lines.next().unwrap().parse::<u64>().unwrap(), interval);
+    let claim = lines.next().expect("marker incarnation claim");
+    assert_eq!(uuid::Uuid::parse_str(claim).unwrap().to_string(), claim);
+    assert_eq!(lines.next(), None);
+    marker
+}
+
 // MUST-FAIL: publishing a helper/parent PID instead of the exec'd process cannot
 // satisfy the peer-credential equality, even if a socket happens to exist.
 #[tokio::test]
@@ -235,8 +247,7 @@ async fn supervisor_launcher_marker_pid_is_the_actual_socket_owner() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let marker = std::fs::read_to_string(&fixture.marker).unwrap();
-    assert_eq!(marker, format!("{LABEL}\n{pid}\n10\n"));
+    let marker = assert_supervisor_marker(&fixture.marker, pid, 10);
     assert_eq!(
         stream.peer_cred().unwrap().pid(),
         Some(i32::try_from(pid).unwrap())
@@ -538,9 +549,9 @@ fn supervisor_socket_stub_child() {
         return;
     };
     let socket = PathBuf::from(std::env::var_os("KHIVE_SUPERVISOR_STUB_SOCKET").unwrap());
-    if mode == "ignore-term" {
+    if mode == "ack-no-exit" {
         // SAFETY: this subprocess is the isolated test stub and intentionally
-        // ignores TERM to exercise the launcher's bounded refusal.
+        // stays alive after claiming to accept handover.
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
     }
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -560,7 +571,16 @@ fn supervisor_socket_stub_child() {
             if stream.read_exact(&mut frame).is_err() {
                 return;
             }
-            let response = serde_json::json!({
+            let request: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            if request["supervisor_handover"] == true {
+                if mode == "exit-before-ack" {
+                    std::process::exit(0);
+                }
+                if mode == "disconnect-before-ack" {
+                    return;
+                }
+            }
+            let mut response = serde_json::json!({
                 "ok": false,
                 "result": null,
                 "error": "stub configuration mismatch",
@@ -570,6 +590,9 @@ fn supervisor_socket_stub_child() {
                 "version_mismatch": false,
                 "daemon_protocol_version": khive_runtime::daemon::PROTOCOL_VERSION
             });
+            if mode == "ack-no-exit" && request["supervisor_handover"] == true {
+                response["supervisor_handover_accepted"] = true.into();
+            }
             let response = serde_json::to_vec(&response).unwrap();
             stream
                 .write_all(&(response.len() as u32).to_be_bytes())
@@ -657,10 +680,7 @@ async fn supervisor_client_first_handover_and_legacy_control() {
     assert_ne!(old_pid, job_pid);
     assert_eq!(wait_for_holder(&fixture, Some(job_pid)).await, job_pid);
     wait_pid_gone(old_pid).await;
-    assert_eq!(
-        std::fs::read_to_string(&fixture.marker).unwrap(),
-        format!("{LABEL}\n{job_pid}\n10\n")
-    );
+    assert_supervisor_marker(&fixture.marker, job_pid, 10);
     let (status, log) = fixture.completed(&mut fixture.exec_command(), "client-again.log");
     assert!(
         status.success(),
@@ -774,8 +794,8 @@ async fn supervisor_started_together_twenty_offsets() {
     }
 }
 
-// MUST-FAIL: removing the own-job guard overwrites the marker and sends TERM
-// to the daemon already serving this same supervisor job.
+// MUST-FAIL: removing the own-job guard overwrites the marker and asks the
+// daemon already serving this same supervisor job to shut itself down.
 #[tokio::test]
 async fn supervisor_second_launch_leaves_own_job_and_marker_unchanged() {
     let fixture = Fixture::new();
@@ -815,6 +835,91 @@ async fn supervisor_second_launch_leaves_own_job_and_marker_unchanged() {
         "wrong own-job refusal: {log}"
     );
     assert_eq!(std::fs::read(&fixture.marker).unwrap(), marker);
+}
+
+// Simulate PID reuse without depending on the host allocator: the socket
+// holder's real PID equals the stale marker PID, but it lacks that launcher's
+// incarnation claim. A numeric-only duplicate guard would refuse handover.
+#[tokio::test]
+async fn supervisor_reused_marker_pid_does_not_adopt_client_daemon() {
+    let fixture = Fixture::new();
+    let stale_claim = uuid::Uuid::new_v4();
+    let (status, log) = fixture.completed(&mut fixture.exec_command(), "reused-client.log");
+    assert!(status.success(), "client auto-spawn failed: {log}");
+    let client_pid = wait_for_holder(&fixture, None).await;
+    std::fs::write(
+        &fixture.marker,
+        format!("{LABEL}\n{client_pid}\n10\n{stale_claim}\n"),
+    )
+    .unwrap();
+    let (mut launcher, launcher_log) = fixture.spawn(
+        &mut fixture.launch_command(&fixture.config),
+        "reused-launch.log",
+    );
+    let job_pid = launcher.0.id();
+    assert_eq!(wait_for_holder(&fixture, Some(job_pid)).await, job_pid);
+    wait_pid_gone(client_pid).await;
+    let marker = assert_supervisor_marker(&fixture.marker, job_pid, 10);
+    assert!(!marker.contains(&stale_claim.to_string()));
+    assert!(
+        launcher.0.try_wait().unwrap().is_none(),
+        "launcher failed to hand over reused PID: {}",
+        std::fs::read_to_string(launcher_log).unwrap_or_default()
+    );
+}
+
+#[tokio::test]
+async fn supervisor_pid_equal_legacy_marker_refuses_without_claim() {
+    let fixture = Fixture::new();
+    let (status, log) = fixture.completed(&mut fixture.exec_command(), "legacy-client.log");
+    assert!(status.success(), "client auto-spawn failed: {log}");
+    let client_pid = wait_for_holder(&fixture, None).await;
+    let legacy = format!("{LABEL}\n{client_pid}\n10\n");
+    std::fs::write(&fixture.marker, &legacy).unwrap();
+
+    let (status, log) = fixture.completed(
+        &mut fixture.launch_command(&fixture.config),
+        "legacy-ambiguous-launch.log",
+    );
+    assert!(!status.success(), "legacy identity must fail closed: {log}");
+    assert!(
+        log.contains("legacy supervisor marker cannot prove"),
+        "{log}"
+    );
+    assert_eq!(std::fs::read_to_string(&fixture.marker).unwrap(), legacy);
+    assert_eq!(socket_holder_pid(&fixture).await, Some(client_pid));
+}
+
+#[tokio::test]
+async fn supervisor_client_spawn_discards_inherited_claim() {
+    let fixture = Fixture::new();
+    let stale_claim = uuid::Uuid::new_v4();
+    let mut client = fixture.exec_command();
+    client.env(
+        khive_runtime::daemon::SUPERVISOR_CLAIM_ENV,
+        stale_claim.to_string(),
+    );
+    let (status, log) = fixture.completed(&mut client, "inherited-client.log");
+    assert!(status.success(), "client auto-spawn failed: {log}");
+    let client_pid = wait_for_holder(&fixture, None).await;
+    std::fs::write(
+        &fixture.marker,
+        format!("{LABEL}\n{client_pid}\n10\n{stale_claim}\n"),
+    )
+    .unwrap();
+
+    let (mut launcher, launcher_log) = fixture.spawn(
+        &mut fixture.launch_command(&fixture.config),
+        "inherited-launch.log",
+    );
+    let job_pid = launcher.0.id();
+    assert_eq!(wait_for_holder(&fixture, Some(job_pid)).await, job_pid);
+    wait_pid_gone(client_pid).await;
+    assert!(
+        launcher.0.try_wait().unwrap().is_none(),
+        "client daemon inherited the claim: {}",
+        std::fs::read_to_string(launcher_log).unwrap_or_default()
+    );
 }
 
 // MUST-FAIL: an accepted but silent socket does not grant permission to
@@ -875,8 +980,8 @@ fn supervisor_silent_same_uid_stub_is_not_signalled() {
     );
 }
 
-// MUST-FAIL: replacing the peer PID with the PID-file PID in the handover
-// branch would signal the unrelated locked decoy, not the answering socket holder.
+// MUST-FAIL: the PID-file owner is not the socket holder and cannot authorize
+// handover of, or signalling to, that unrelated locked decoy.
 #[test]
 fn supervisor_pid_file_decoy_never_selects_signal_target() {
     let fixture = Fixture::new();
@@ -918,11 +1023,11 @@ fn supervisor_pid_file_decoy_never_selects_signal_target() {
     );
     assert!(
         !status.success(),
-        "runtime must refuse decoy PID-file owner: {log}"
+        "unacknowledged holder must block exec: {log}"
     );
     assert!(
-        log.contains("live process owns the PID file"),
-        "holder was not handed over before daemon exec: {log}"
+        log.contains("socket-bound handover not acknowledged"),
+        "holder did not refuse handover before daemon exec: {log}"
     );
     assert!(
         decoy.0.try_wait().unwrap().is_none(),
@@ -932,35 +1037,27 @@ fn supervisor_pid_file_decoy_never_selects_signal_target() {
         std::fs::read_to_string(&poison.pid_file).unwrap(),
         format!("{}\n", decoy.0.id())
     );
-    let deadline = Instant::now() + START_LIMIT;
-    while holder.0.try_wait().unwrap().is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "socket holder did not receive SIGTERM: {log}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert!(holder.0.try_wait().unwrap().is_none(), "stub was signalled");
 }
 
-// MUST-FAIL: SIGTERM is bounded to one interval and never escalates to KILL.
+// MUST-FAIL: a daemon-like socket response without the handover ack cannot
+// authorize signalling the captured numeric PID.
 #[tokio::test]
-async fn supervisor_probe_answering_sigterm_ignoring_holder_stays_alive() {
+async fn supervisor_unacknowledged_holder_is_never_signalled() {
     let fixture = Fixture::new();
     let (mut holder, holder_log) =
-        fixture.spawn(&mut fixture.stub_command("ignore-term"), "ignore-stub.log");
+        fixture.spawn(&mut fixture.stub_command("answer"), "answer-stub.log");
     wait_stub_socket(&fixture, &mut holder, &holder_log);
-    let start = Instant::now();
     let (status, log) = fixture.completed(
         &mut fixture.launch_command_options(&fixture.config, &["kg"], "1", true),
-        "ignore-launch.log",
-    );
-    assert!(!status.success(), "ignoring holder must block exec: {log}");
-    assert!(
-        start.elapsed() >= Duration::from_secs(1),
-        "launcher did not wait one interval: {log}"
+        "no-ack-launch.log",
     );
     assert!(
-        log.contains("incumbent did not yield"),
+        !status.success(),
+        "unacknowledged holder must block exec: {log}"
+    );
+    assert!(
+        log.contains("socket-bound handover not acknowledged"),
         "wrong refusal: {log}"
     );
     assert!(
@@ -971,6 +1068,81 @@ async fn supervisor_probe_answering_sigterm_ignoring_holder_stays_alive() {
         fixture.marker.exists(),
         "failed handover must retain marker"
     );
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "holder was signalled"
+    );
+    assert_eq!(socket_holder_pid(&fixture).await, Some(holder.0.id()));
+}
+
+#[test]
+fn supervisor_exit_between_probe_and_ack_never_signals_captured_pid() {
+    // Test the live disconnect first: the numeric-signal mutant fails before
+    // reaching the case whose PID has already been released by the kernel.
+    // A disconnecting peer stays alive so an unsafe numeric-PID signal on
+    // the same failed-ACK path has an observable, deterministic target.
+    let disconnected = Fixture::new();
+    let (mut holder, holder_log) = disconnected.spawn(
+        &mut disconnected.stub_command("disconnect-before-ack"),
+        "disconnect-before-ack-stub.log",
+    );
+    wait_stub_socket(&disconnected, &mut holder, &holder_log);
+    let (status, log) = disconnected.completed(
+        &mut disconnected.launch_command_options(&disconnected.config, &["kg"], "1", true),
+        "disconnect-before-ack-launch.log",
+    );
+    assert!(!status.success(), "lost ACK must block exec: {log}");
+    assert!(
+        log.contains("incumbent is not a khive daemon"),
+        "lost ACK should refuse as an unidentified holder: {log}"
+    );
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "a failed ACK signalled the captured peer PID"
+    );
+
+    let exited = Fixture::new();
+    let (mut exiting_holder, exiting_log) = exited.spawn(
+        &mut exited.stub_command("exit-before-ack"),
+        "exit-before-ack-stub.log",
+    );
+    wait_stub_socket(&exited, &mut exiting_holder, &exiting_log);
+    let (status, log) = exited.completed(
+        &mut exited.launch_command_options(&exited.config, &["kg"], "1", true),
+        "exit-before-ack-launch.log",
+    );
+    assert!(!status.success(), "lost ACK must block exec: {log}");
+    assert!(
+        log.contains("incumbent is not a khive daemon"),
+        "lost ACK should refuse as an unidentified holder: {log}"
+    );
+    assert!(exited.marker.exists(), "failed handover retains its marker");
+    assert!(
+        exiting_holder.0.try_wait().unwrap().is_some(),
+        "fixture holder did not exit before ACK"
+    );
+}
+
+#[tokio::test]
+async fn supervisor_acknowledged_handover_still_bounds_nonexiting_holder() {
+    let fixture = Fixture::new();
+    let (mut holder, holder_log) =
+        fixture.spawn(&mut fixture.stub_command("ack-no-exit"), "ack-stub.log");
+    wait_stub_socket(&fixture, &mut holder, &holder_log);
+    let started = Instant::now();
+    let (status, log) = fixture.completed(
+        &mut fixture.launch_command_options(&fixture.config, &["kg"], "1", true),
+        "ack-launch.log",
+    );
+    assert!(
+        !status.success(),
+        "nonexiting holder must block exec: {log}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "wait was not bounded: {log}"
+    );
+    assert!(log.contains("incumbent did not yield"), "{log}");
     assert!(holder.0.try_wait().unwrap().is_none(), "holder was killed");
     assert_eq!(socket_holder_pid(&fixture).await, Some(holder.0.id()));
 }

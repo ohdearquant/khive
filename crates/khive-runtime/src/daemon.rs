@@ -46,7 +46,26 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 8;
 
+/// Internal signal carried in a dispatch result until the daemon moves it to
+/// response-frame metadata. It must never be sent in `result`: older v8
+/// clients publish that string without inspecting its contents.
+#[doc(hidden)]
+pub const DAEMON_LEXICAL_TIMEOUT_MARKER: &str = "__khive_daemon_lexical_timeout";
+
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// An accepted local socket must finish its first frame within this window.
+/// Dispatch deadlines start only after decoding, so they cannot reap peers
+/// that connect and then stop sending request bytes.
+#[cfg(unix)]
+const INITIAL_FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(unix)]
+fn next_accept_error_backoff(previous: Option<std::time::Duration>) -> std::time::Duration {
+    previous
+        .map(|delay| delay.saturating_mul(2))
+        .unwrap_or_else(|| std::time::Duration::from_millis(10))
+        .min(std::time::Duration::from_secs(1))
+}
 
 // ── paths ─────────────────────────────────────────────────────────────────────
 
@@ -226,8 +245,8 @@ pub fn recoverer_lock_path() -> PathBuf {
 }
 
 /// Marker file the supervisor's launcher publishes before it execs `khived`.
-/// It records the job label, launcher/daemon PID, and restart interval in
-/// seconds (ADR-185 Amendment 1). The launcher or deliberate-stop procedure
+/// It records the job label, launcher/daemon PID, restart interval in seconds,
+/// and the launcher's incarnation claim. The launcher or deliberate-stop procedure
 /// removes its own claim; the daemon never writes or removes it. A client
 /// waits up to three restart intervals before a logged degraded bootstrap,
 /// bounded by its caller deadline, rather than racing normal supervisor
@@ -245,6 +264,55 @@ pub fn supervisor_marker_path() -> PathBuf {
         }
     }
     khive_dir().join("khived.supervisor")
+}
+
+#[cfg(unix)]
+pub const SUPERVISOR_CLAIM_ENV: &str = "KHIVE_SUPERVISOR_CLAIM";
+
+#[cfg(unix)]
+fn read_supervisor_marker_claim() -> Option<(u32, String)> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(supervisor_marker_path())
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut marker = String::new();
+    file.take(4097).read_to_string(&mut marker).ok()?;
+    if marker.len() > 4096 {
+        return None;
+    }
+    let mut lines = marker.lines();
+    if lines.next()?.is_empty() {
+        return None;
+    }
+    let pid = lines.next()?.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+    lines
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)?;
+    let claim = lines.next()?.to_string();
+    if lines.next().is_some() {
+        return None;
+    }
+    let parsed = uuid::Uuid::parse_str(&claim).ok()?;
+    if parsed.get_version() != Some(uuid::Version::Random) || parsed.to_string() != claim {
+        return None;
+    }
+    Some((pid, claim))
+}
+
+#[cfg(unix)]
+fn current_supervisor_claim() -> Option<String> {
+    let claim = std::env::var(SUPERVISOR_CLAIM_ENV).ok()?;
+    let (pid, published_claim) = read_supervisor_marker_claim()?;
+    (pid == std::process::id() && claim == published_claim).then_some(claim)
 }
 
 #[cfg(unix)]
@@ -889,7 +957,9 @@ pub struct DaemonResponseFrame {
     pub ok: bool,
     pub result: Option<String>,
     pub error: Option<String>,
-    /// Additive error metadata; legacy protocol-v4 peers still read `error` as text.
+    /// Additive failure metadata; legacy protocol-v4 peers still read `error` as text.
+    /// On a successful response, `{"lexical_timeout":true}` is a daemon-only
+    /// diagnostic that old clients ignore and new clients log locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<serde_json::Value>,
     pub namespace_mismatch: bool,
@@ -932,6 +1002,40 @@ pub struct DaemonResponseFrame {
     /// rather than a parse error.
     #[serde(default)]
     pub request_id: Option<u64>,
+}
+
+/// Move the private dispatch signal out of the result before any client can
+/// observe it. Unmarked results retain their exact bytes. The marked result
+/// was serialized from a JSON Value by the MCP server, so reserializing after
+/// removal reproduces its public envelope. The marker's escaped frame cost
+/// equals `error_detail:{"lexical_timeout":true}`, keeping the server's exact
+/// frame-fit calculation valid after this move.
+#[cfg(unix)]
+fn take_daemon_lexical_timeout_marker(raw: String) -> (String, Option<serde_json::Value>) {
+    if !raw.contains(DAEMON_LEXICAL_TIMEOUT_MARKER) {
+        return (raw, None);
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (raw, None);
+    };
+    let Some(fields) = value.as_object_mut() else {
+        return (raw, None);
+    };
+    if !fields
+        .get("results")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return (raw, None);
+    }
+    let Some(marker) = fields.remove(DAEMON_LEXICAL_TIMEOUT_MARKER) else {
+        return (raw, None);
+    };
+    let detail =
+        (marker.as_bool() == Some(true)).then(|| serde_json::json!({"lexical_timeout": true}));
+    (
+        serde_json::to_string(&value).expect("serde_json::Value is serializable"),
+        detail,
+    )
 }
 
 /// One checkpoint store in this daemon's fixed topology. IDs are process-local:
@@ -1066,6 +1170,37 @@ where
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+#[cfg(unix)]
+fn initial_frame_timeout_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "daemon initial request frame read timed out",
+    )
+}
+
+#[cfg(unix)]
+async fn read_initial_frame<R>(
+    stream: &mut R,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // Tokio polls the inner future before checking its timer. A frame already
+    // buffered when a delayed connection task first runs would otherwise pass
+    // even though its acceptance-time deadline has expired.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(initial_frame_timeout_error());
+    }
+    let raw = tokio::time::timeout_at(deadline, read_frame(stream))
+        .await
+        .map_err(|_| initial_frame_timeout_error())??;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(initial_frame_timeout_error());
+    }
+    Ok(raw)
 }
 
 /// Write one length-prefixed frame.
@@ -1624,13 +1759,25 @@ async fn wait_for_peer_disconnect(read: &mut tokio::net::unix::OwnedReadHalf) {
 
 #[cfg(all(unix, test))]
 async fn handle_conn<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
-    handle_conn_with_shutdown(stream, dispatcher, None).await;
+    handle_conn_with_shutdown(
+        stream,
+        dispatcher,
+        None,
+        tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+    )
+    .await;
 }
 
 #[cfg(all(unix, feature = "fault-injection"))]
 #[doc(hidden)]
 pub async fn handle_conn_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
-    handle_conn_with_shutdown(stream, dispatcher, None).await;
+    handle_conn_with_shutdown(
+        stream,
+        dispatcher,
+        None,
+        tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+    )
+    .await;
 }
 
 #[cfg(unix)]
@@ -1660,21 +1807,36 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     mut stream: UnixStream,
     dispatcher: D,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    initial_frame_deadline: tokio::time::Instant,
 ) {
+    let production_shutdown = shutdown.is_some();
+    // A handover is delivered over the probed connection. The production
+    // listener enforces same-uid admission, and direct handler tests cannot
+    // self-signal because they do not supply the daemon shutdown receiver.
+    let handover_peer_allowed = peer_uid(&stream)
+        .ok()
+        .is_some_and(|uid| uid == unsafe { libc::geteuid() } as u32);
     let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown = shutdown.unwrap_or(local_shutdown_rx);
     // Keeps the fallback receiver open in direct/test calls. Production owns
     // a sender at the daemon-run scope and passes its receiver above.
     let _local_shutdown_tx = local_shutdown_tx;
-    let raw = match read_frame(&mut stream).await {
+    let raw = match read_initial_frame(&mut stream, initial_frame_deadline).await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "failed to read daemon request frame");
             return;
         }
     };
-    let decoded: Result<DaemonRequestFrame, _> = serde_json::from_slice(&raw);
-    if decoded.as_ref().ok().is_none_or(|frame| frame.plan) {
+    #[derive(Deserialize)]
+    struct SupervisorRequestEnvelope {
+        #[serde(flatten)]
+        frame: DaemonRequestFrame,
+        #[serde(default)]
+        supervisor_handover: bool,
+    }
+    let decoded: Result<SupervisorRequestEnvelope, _> = serde_json::from_slice(&raw);
+    if decoded.as_ref().ok().is_none_or(|item| item.frame.plan) {
         if let Some(field) = plan_frame_companion(&raw) {
             let response = DaemonResponseFrame {
                 ok: false,
@@ -1704,13 +1866,23 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             return;
         }
     }
-    let frame: DaemonRequestFrame = match decoded {
-        Ok(f) => f,
+    let (frame, handover_requested) = match decoded {
+        Ok(item) => (item.frame, item.supervisor_handover),
         Err(e) => {
             tracing::debug!(error = %e, "failed to decode daemon request frame");
             return;
         }
     };
+    let supervisor_probe = frame.probe_only;
+    let handover_accepted = handover_requested
+        && supervisor_probe
+        && production_shutdown
+        && handover_peer_allowed
+        && frame.protocol_version == PROTOCOL_VERSION
+        && !frame.plan
+        && !frame.metrics_only
+        && frame.ops.is_empty()
+        && read_supervisor_marker_claim().is_some_and(|(pid, _)| pid != std::process::id());
     let (mut peer_read, mut peer_write) = stream.into_split();
 
     let served_config_id = Some(dispatcher.config_id().to_string());
@@ -1756,6 +1928,41 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
             request_id: frame.request_id,
+        }
+    } else if handover_requested {
+        if handover_accepted {
+            DaemonResponseFrame {
+                ok: true,
+                result: None,
+                error: None,
+                error_detail: None,
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id,
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: frame.request_id,
+            }
+        } else {
+            DaemonResponseFrame {
+                ok: false,
+                result: None,
+                error: Some("supervisor handover refused".to_string()),
+                error_detail: Some(serde_json::json!({
+                    "kind": "protocol",
+                    "code": "supervisor_handover_refused",
+                    "message": "supervisor handover refused",
+                    "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                })),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id,
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: frame.request_id,
+            }
         }
     } else if frame.metrics_only && !frame.plan {
         // Process-global gauge read: namespace/config-agnostic, so this is
@@ -1896,19 +2103,22 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             }
         };
         match dispatch_result {
-            Ok(result) => DaemonResponseFrame {
-                ok: true,
-                result: Some(result),
-                error: None,
-                error_detail: None,
-                namespace_mismatch: false,
-                config_mismatch: false,
-                served_config_id,
-                version_mismatch: false,
-                daemon_protocol_version: PROTOCOL_VERSION,
-                metrics: None,
-                request_id: frame.request_id,
-            },
+            Ok(result) => {
+                let (result, detail) = take_daemon_lexical_timeout_marker(result);
+                DaemonResponseFrame {
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                    error_detail: detail,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id,
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: frame.request_id,
+                }
+            }
             Err(error) => {
                 let error = DaemonDispatchError::new(error.message, Some(error.error_detail));
                 DaemonResponseFrame {
@@ -1928,7 +2138,21 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         }
     };
 
-    match serde_json::to_vec(&resp) {
+    let payload = if supervisor_probe {
+        serde_json::to_value(&resp).and_then(|mut value| {
+            if let Some(claim) = current_supervisor_claim() {
+                value["supervisor_claim"] = serde_json::Value::String(claim);
+            }
+            if handover_accepted {
+                value["supervisor_handover_accepted"] = serde_json::Value::Bool(true);
+            }
+            serde_json::to_vec(&value)
+        })
+    } else {
+        serde_json::to_vec(&resp)
+    };
+    let mut handover_ack_written = false;
+    match payload {
         Ok(payload) => {
             if payload.len() > MAX_FRAME_BYTES {
                 // The serialized response exceeds the IPC frame cap.  Send a
@@ -1971,11 +2195,21 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                         tracing::debug!(error = %e, "failed to write oversized-response error frame");
                     }
                 }
-            } else if let Err(e) = write_frame(&mut peer_write, &payload).await {
-                tracing::debug!(error = %e, "failed to write daemon response frame");
+            } else {
+                match write_frame(&mut peer_write, &payload).await {
+                    Ok(()) => handover_ack_written = true,
+                    Err(e) => tracing::debug!(error = %e, "failed to write daemon response frame"),
+                }
             }
         }
         Err(e) => tracing::warn!(error = %e, "failed to serialize daemon response frame"),
+    }
+    if handover_accepted && handover_ack_written {
+        // Signal this process, not a PID observed earlier over a socket.
+        // Production installed its SIGTERM handler before binding the socket.
+        if unsafe { libc::raise(libc::SIGTERM) } != 0 {
+            tracing::error!(error = %std::io::Error::last_os_error(), "self-directed handover signal failed");
+        }
     }
 }
 
@@ -2636,9 +2870,15 @@ where
 
     tokio::select! {
         _ = async {
+            let mut accept_error_backoff = None;
+            let mut last_accept_error_log: Option<std::time::Instant> = None;
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let initial_frame_deadline =
+                            tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT;
+                        accept_error_backoff = None;
+                        last_accept_error_log = None;
                         // Refuse a foreign uid before any frame is read.
                         // Fails CLOSED: an error reading peer credentials is
                         // "cannot prove same-uid", which is the same answer as
@@ -2674,10 +2914,18 @@ where
                                 continue;
                             }
                         }
+                        // Keep the acceptance-time deadline across the
+                        // credential check and connection-task scheduling.
                         let d = dispatcher.clone();
                         let shutdown = request_shutdown_rx.clone();
                         let handle = spawn_connection_task(Arc::clone(&active), async move {
-                            handle_conn_with_shutdown(stream, d, Some(shutdown)).await;
+                            handle_conn_with_shutdown(
+                                stream,
+                                d,
+                                Some(shutdown),
+                                initial_frame_deadline,
+                            )
+                            .await;
                         });
                         let mut tasks = connection_tasks
                             .lock()
@@ -2685,7 +2933,26 @@ where
                         tasks.retain(|task| !task.is_finished());
                         tasks.push(handle);
                     }
-                    Err(e) => tracing::error!(error = %e, "accept failed"),
+                    Err(e) => {
+                        let delay = next_accept_error_backoff(accept_error_backoff);
+                        accept_error_backoff = Some(delay);
+                        let capacity_exhausted = matches!(
+                            e.raw_os_error(),
+                            Some(libc::EMFILE) | Some(libc::ENFILE)
+                        );
+                        if last_accept_error_log.is_none_or(|last| {
+                            last.elapsed() >= std::time::Duration::from_secs(30)
+                        }) {
+                            tracing::error!(
+                                error = %e,
+                                capacity_exhausted,
+                                retry_ms = delay.as_millis(),
+                                "daemon accept failed; retrying with bounded backoff"
+                            );
+                            last_accept_error_log = Some(std::time::Instant::now());
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
         } => {}
@@ -3215,7 +3482,13 @@ mod khive_root_tests {
 #[cfg(all(unix, any(test, feature = "test-internals")))]
 #[doc(hidden)]
 pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
-    handle_conn_with_shutdown(stream, dispatcher, None).await;
+    handle_conn_with_shutdown(
+        stream,
+        dispatcher,
+        None,
+        tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+    )
+    .await;
 }
 
 #[cfg(all(test, unix))]
@@ -3226,6 +3499,88 @@ mod tests {
     }
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn lexical_timeout_detail_hides_marker_from_old_clients_without_changing_frame_fit() {
+        let public = serde_json::json!({
+            "results": [{"ok": true, "tool": "knowledge.search", "result": "| name |\n|---|\n| first |\n"}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0}
+        });
+        let public_raw = public.to_string();
+        let mut marked = public;
+        marked[DAEMON_LEXICAL_TIMEOUT_MARKER] = serde_json::json!(true);
+        let marked_raw = marked.to_string();
+        let (result, detail) = take_daemon_lexical_timeout_marker(marked_raw.clone());
+        assert_eq!(result, public_raw);
+        assert_eq!(detail, Some(serde_json::json!({"lexical_timeout": true})));
+
+        let frame = |result, error_detail| DaemonResponseFrame {
+            ok: true,
+            result: Some(result),
+            error: None,
+            error_detail,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some("test".to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: Some(u64::MAX),
+        };
+        let internal_len = serde_json::to_vec(&frame(marked_raw, None)).unwrap().len();
+        let sent = frame(result, detail);
+        assert_eq!(sent.result.as_deref(), Some(public_raw.as_str()));
+        assert!(!sent
+            .result
+            .as_deref()
+            .unwrap()
+            .contains(DAEMON_LEXICAL_TIMEOUT_MARKER));
+        assert_eq!(serde_json::to_vec(&sent).unwrap().len(), internal_len);
+
+        let untouched = " {\"results\":[],\"summary\":{}} ".to_string();
+        assert_eq!(
+            take_daemon_lexical_timeout_marker(untouched.clone()),
+            (untouched, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_initial_frames_release_the_connection_deadline() {
+        for prefix in [&[][..], &[0, 0][..], &[0, 0, 0, 5][..]] {
+            let (mut peer, mut server) = tokio::io::duplex(64);
+            peer.write_all(prefix).await.expect("send partial frame");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+            let error = read_initial_frame(&mut server, deadline)
+                .await
+                .expect_err("an idle peer cannot hold a daemon connection indefinitely");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+
+        let (mut peer, mut server) = tokio::io::duplex(64);
+        write_frame(&mut peer, b"{}")
+            .await
+            .expect("send full frame");
+        assert_eq!(
+            read_initial_frame(
+                &mut server,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("complete frame remains readable"),
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn repeated_accept_failures_back_off_and_cap_at_one_second() {
+        let mut previous = None;
+        for expected_ms in [10, 20, 40, 80, 160, 320, 640, 1000, 1000] {
+            let next = next_accept_error_backoff(previous);
+            assert_eq!(next.as_millis(), expected_ms);
+            previous = Some(next);
+        }
+        assert_eq!(next_accept_error_backoff(None).as_millis(), 10);
+    }
 
     #[derive(Debug)]
     struct DrainBlockingBlobStore {
@@ -3532,6 +3887,17 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cleanup_preserves_live_incumbent_without_reachable_socket() {
+        // No other test in this process may fork while this fixture briefly
+        // owns a listener: a child that inherits it can keep the socket
+        // reachable after this test drops its own descriptor.
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        assert_eq!(
+            std::env::var("KHIVE_RUNTIME_ISOLATED_TEST").ok().as_deref(),
+            Some("daemon::tests::stale_cleanup_preserves_live_incumbent_without_reachable_socket"),
+            "the stale-listener fixture must run alone in its child process"
+        );
         for socket_exists in [false, true] {
             let dir = tempfile::tempdir().expect("tempdir");
             let sock = dir.path().join("khived.sock");
@@ -4428,6 +4794,80 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    #[tokio::test]
+    async fn expired_accepted_deadline_refuses_even_buffered_complete_frame() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".into(),
+            config_id: "expired-accept-test".into(),
+            dispatch_calls: Arc::clone(&calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        let frame = base_request_frame("expired-accept-test");
+        write_frame(&mut client, &serde_json::to_vec(&frame).unwrap())
+            .await
+            .expect("buffer complete frame before handler starts");
+        // Model a task first polled after its acceptance-time deadline. Tokio
+        // polls a ready frame before its timer, so timeout_at alone would
+        // wrongly dispatch this already-buffered request.
+        let accepted_deadline = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_conn_with_shutdown(server, dispatcher, None, accepted_deadline),
+        )
+        .await
+        .expect("expired accepted deadline must not start a fresh read window");
+        let mut byte = [0u8; 1];
+        match client.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected closed socket, got {other:?}"),
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Supplies the entire frame without registering readiness or yielding.
+    /// `timeout_at` must not be allowed to accept this ready first poll after
+    /// the connection's acceptance-time deadline has already passed.
+    struct ReadyFrameReader {
+        frame: Vec<u8>,
+        offset: usize,
+        polls: usize,
+    }
+
+    impl tokio::io::AsyncRead for ReadyFrameReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let reader = self.get_mut();
+            reader.polls += 1;
+            let remaining = &reader.frame[reader.offset..];
+            let count = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..count]);
+            reader.offset += count;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_accepted_deadline_refuses_a_frame_ready_on_first_poll() {
+        let mut reader = ReadyFrameReader {
+            frame: [2_u32.to_be_bytes().as_slice(), b"{}"].concat(),
+            offset: 0,
+            polls: 0,
+        };
+        let accepted_deadline = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+        let error = read_initial_frame(&mut reader, accepted_deadline)
+            .await
+            .expect_err("a fully ready frame must not outlive its acceptance deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(reader.polls, 0, "an expired frame must not be polled");
     }
 
     /// #2230 review (Medium): duplicate-daemon detection must not treat any

@@ -596,10 +596,21 @@ note's own UUID becomes the canonical root per ADR-040.
 back to the sending actor), (2) caller-supplied `default_inbound_actor` (fresh
 email landing actor), (3) `p.to.trim()` (back-compat: raw recipient address).
 
-Deduplication: when `external_id` is supplied, `try_create_note` uses a
-verify-after-insert check on the durable unique index on `external_id`. A
-confirmed duplicate returns `Ok(None)` without error; only an external_id
-collision is treated as dedup, other constraint violations surface as errors.
+Deduplication: when `external_id` is supplied, the trusted ingest insert uses a
+verify-after-insert check on the durable unique index over the external ID
+and exact `(channel_kind, channel_slug)` provenance. Missing channel fields
+occupy the empty index partition. A confirmed duplicate returns `Ok(None)`
+without error; other constraint violations surface as errors.
+For the #3228 IMAP account-key migration, an email poll also supplies its
+pre-account `legacy_external_id`. During one release window, `comm.ingest`
+reads that key before writing, restricted to an existing inbound email row
+with the same `channel_slug`. This prevents another account on the same host
+from claiming the UID, while recognizing a replay from the original account.
+The old row is not rewritten, and new rows store only the account-scoped key
+`imap:{host}:{account}:{uidvalidity}:{uid}`. The compatibility window ends by
+a later release change, not by a timer. Historical rows without channel-slug
+provenance cannot be safely attributed to one account and are not matched by
+this compatibility lookup.
 The acknowledgement returns the `thread_id` read from the existing row — the
 canonical 36-character hyphenated UUID for v1 rows — never the new root
 proposed by the duplicate delivery. Exception: a pre-v1 row may store a
@@ -714,6 +725,8 @@ value, and direction; its partial predicate matches the unread filter. The type
 key excludes malformed object/array recipients before the cap-limited scan, even
 when their JSON text equals an allowed actor label.
 
-The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
-created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
-is the sole durable authority for that index.
+The `idx_comm_message_external_id` UNIQUE index is NOT listed here; V5
+introduced it, and the V42 schema migration
+(`042-comm-external-id-channel-scope.sql`) replaces it with exact channel
+provenance in the key. Versioned migrations are the durable authority for
+that index.
