@@ -19,6 +19,7 @@
 //! `page`/`resource` row.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -608,14 +609,79 @@ pub(crate) async fn run_hop_chain_with_clients<F>(
     clients: &egress::PinnedClients,
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
+    url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    headers_for_hop: F,
+) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+{
+    let (outcome, redirect_hops, ()) = run_hop_chain_with_clients_observed(
+        clients,
+        resolver,
+        cfg,
+        url,
+        method,
+        max_bytes,
+        deadline,
+        headers_for_hop,
+        |_| async { Ok(()) },
+    )
+    .await?;
+    Ok((outcome, redirect_hops))
+}
+
+/// Observe each hop immediately before sending it. The returned observation
+/// belongs to the terminal request, including when that request followed a
+/// redirect; callers can use it as an optimistic-write guard at settlement.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_hop_chain_observed<F, O, Fut, T>(
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
+    url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    headers_for_hop: F,
+    before_request: O,
+) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+    O: FnMut(Url) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
+{
+    run_hop_chain_with_clients_observed(
+        &egress::PinnedClients::default(),
+        resolver,
+        cfg,
+        url,
+        method,
+        max_bytes,
+        deadline,
+        headers_for_hop,
+        before_request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
+    clients: &egress::PinnedClients,
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
     mut url: Url,
     method: reqwest::Method,
     max_bytes: u64,
     deadline: Instant,
     mut headers_for_hop: F,
-) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+    mut before_request: O,
+) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
 where
     F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+    O: FnMut(Url) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
 {
     let mut redirects = 0u32;
     let mut redirect_hops: Vec<RedirectHop> = Vec::new();
@@ -630,6 +696,7 @@ where
             .to_string();
         let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
         let client = clients.for_checked_address(&url, addr)?;
+        let request_observation = before_request(url.clone()).await?;
 
         let outcome = run_one_hop(
             &client,
@@ -653,7 +720,7 @@ where
                 url = next.clone();
                 continue;
             }
-            None => return Ok((outcome, redirect_hops)),
+            None => return Ok((outcome, redirect_hops, request_observation)),
         }
     }
 }
@@ -837,15 +904,6 @@ pub(crate) struct SettledContent {
     pub(crate) entity: Entity,
 }
 
-pub(crate) enum ContentBody {
-    Received(Vec<u8>, bool),
-    Stored {
-        content_ref: ContentRef,
-        bytes: u64,
-        truncated: bool,
-    },
-}
-
 pub(crate) fn representation_patch(
     url: &str,
     content_type: Option<&str>,
@@ -882,30 +940,6 @@ pub(crate) async fn settle_content(
     etag: Option<&str>,
     last_modified: Option<&str>,
     body: Option<(Vec<u8>, bool)>,
-) -> Result<SettledContent, RuntimeError> {
-    settle_content_body(
-        runtime,
-        token,
-        url,
-        content_type,
-        status,
-        etag,
-        last_modified,
-        body.map(|(bytes, truncated)| ContentBody::Received(bytes, truncated)),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn settle_content_body(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    url: &Url,
-    content_type: Option<&str>,
-    status: u16,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
-    body: Option<ContentBody>,
 ) -> Result<SettledContent, RuntimeError> {
     let request_url = identity::request_url(url.clone());
     let canonical = identity::canonicalize(request_url.clone());
@@ -951,17 +985,12 @@ pub(crate) async fn settle_content_body(
     let no_body = body.is_none();
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
-        Some(ContentBody::Received(buffer, truncated)) => {
+        Some((buffer, truncated)) => {
             let store = crate::blob_store(runtime)?;
             let len = buffer.len() as u64;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             (Some(content_ref), len, truncated)
         }
-        Some(ContentBody::Stored {
-            content_ref,
-            bytes,
-            truncated,
-        }) => (Some(content_ref), bytes, truncated),
     };
     let content_ref = typed_ref.as_ref().map(ToString::to_string);
 

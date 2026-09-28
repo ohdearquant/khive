@@ -55,6 +55,14 @@ async fn latest_receipt(
         .await
 }
 
+fn document_id_for_url(url: &Url) -> Uuid {
+    let canonical = crate::identity::canonicalize(url.clone());
+    crate::identity::document_id(
+        crate::identity::site_id(&canonical),
+        &crate::identity::path_and_query(&canonical),
+    )
+}
+
 fn refresh_request_headers(properties: &Value) -> Result<Vec<(String, String)>, RuntimeError> {
     let url = stored_request_url(properties)?;
     refresh_headers_for_hop(properties, &url, &url, true)
@@ -308,7 +316,8 @@ async fn run_refresh(
     // forwarded to another address after a redirect.
     let original_url = url.clone();
     let mut first_hop = true;
-    let (outcome, redirect_hops) = crate::fetch::run_hop_chain(
+    let mut first_observed_hop = true;
+    let (outcome, redirect_hops, terminal_request_snapshot) = crate::fetch::run_hop_chain_observed(
         resolver,
         cfg,
         url,
@@ -319,6 +328,22 @@ async fn run_refresh(
             let initial = std::mem::take(&mut first_hop);
             refresh_headers_for_hop(&properties, &original_url, current_url, initial)
         },
+        |current_url| {
+            let initial = std::mem::take(&mut first_observed_hop);
+            async move {
+                // The original row was already read before the first request.
+                // Only redirected hops need a separate terminal-row snapshot.
+                if initial {
+                    return Ok(None);
+                }
+                let document_id = document_id_for_url(&current_url);
+                let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
+                if let Some(entity) = &snapshot {
+                    crate::entities::require_entity_namespace(token, entity)?;
+                }
+                Ok(snapshot)
+            }
+        },
     )
     .await?;
 
@@ -326,6 +351,7 @@ async fn run_refresh(
         runtime,
         token,
         &entity,
+        terminal_request_snapshot.as_ref(),
         params.id,
         &url_str,
         &stored_content_ref,
@@ -369,10 +395,15 @@ async fn settle_refresh_with_request_headers(
         .get_entity(id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let terminal_request_snapshot = runtime
+        .entities(token)?
+        .get_entity(document_id_for_url(&outcome.final_url))
+        .await?;
     settle_refresh_from_snapshot(
         runtime,
         token,
         &expected,
+        terminal_request_snapshot.as_ref(),
         id,
         url_str,
         stored_content_ref,
@@ -402,10 +433,15 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
         .get_entity(id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    let terminal_request_snapshot = runtime
+        .entities(token)?
+        .get_entity(document_id_for_url(&outcome.final_url))
+        .await?;
     settle_refresh_from_snapshot(
         runtime,
         token,
         &expected,
+        terminal_request_snapshot.as_ref(),
         id,
         url_str,
         stored_content_ref,
@@ -417,11 +453,53 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
     .await
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn settle_refresh_with_request_headers_before_settlement(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    url_str: &str,
+    stored_content_ref: &str,
+    outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
+    request_headers: &[(String, String)],
+    before_settlement: impl std::future::Future<Output = ()>,
+) -> Result<Value, RuntimeError> {
+    let entities = runtime.entities(token)?;
+    let source_snapshot = entities
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+    // The terminal URL is known before its request is sent. This test seam
+    // pauses after that request but before settlement, while retaining the
+    // snapshot that production captures immediately before the send.
+    let terminal_request_snapshot = entities
+        .get_entity(document_id_for_url(&outcome.final_url))
+        .await?;
+    before_settlement.await;
+    settle_refresh_from_snapshot(
+        runtime,
+        token,
+        &source_snapshot,
+        terminal_request_snapshot.as_ref(),
+        id,
+        url_str,
+        stored_content_ref,
+        outcome,
+        redirect_hops,
+        request_headers,
+        std::future::ready(()),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn settle_refresh_from_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     source_snapshot: &Entity,
+    terminal_request_snapshot: Option<&Entity>,
     id: Uuid,
     url_str: &str,
     stored_content_ref: &str,
@@ -437,11 +515,7 @@ async fn settle_refresh_from_snapshot(
     let final_id = if redirect_hops.is_empty() {
         id
     } else {
-        let canonical = crate::identity::canonicalize(outcome.final_url.clone());
-        crate::identity::document_id(
-            crate::identity::site_id(&canonical),
-            &crate::identity::path_and_query(&canonical),
-        )
+        document_id_for_url(&outcome.final_url)
     };
     if outcome.status == 304 && !redirect_hops.is_empty() {
         return Err(Refusal::new(
@@ -454,10 +528,10 @@ async fn settle_refresh_from_snapshot(
     if let Some(entity) = &final_entity {
         crate::entities::require_entity_namespace(token, entity)?;
     }
-    let mut metadata_snapshot = if final_id == id {
+    let mut metadata_snapshot = if redirect_hops.is_empty() {
         Some(source_snapshot.clone())
     } else {
-        final_entity.clone()
+        terminal_request_snapshot.cloned()
     };
     let final_properties = final_entity
         .as_ref()
@@ -521,6 +595,47 @@ async fn settle_refresh_from_snapshot(
         .clone()
         .unwrap_or_else(|| stored_content_ref.to_owned());
 
+    // A redirected body settlement must use the same pre-request guard as
+    // the metadata-only path. If the terminal row did not exist before the
+    // request, claim its deterministic ID before redirect-hop settlement can
+    // mint it; a concurrent creator is a lost race, not our own empty row.
+    let terminal_body_guard = if redirect_hops.is_empty() {
+        None
+    } else if let Some(snapshot) = terminal_request_snapshot {
+        Some(snapshot.clone())
+    } else if final_entity.is_none() && outcome.status != 304 && outcome.body.is_some() {
+        let request_url = crate::identity::request_url(outcome.final_url.clone());
+        let canonical = crate::identity::canonicalize(request_url.clone());
+        let site = crate::fetch::canonical_site(runtime, token, &canonical).await?;
+        let (candidate, created) = crate::entities::get_or_create(
+            runtime,
+            token,
+            final_id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": request_url.to_string(), "status": Value::Null }),
+        )
+        .await?;
+        if created {
+            runtime
+                .link(
+                    token,
+                    site,
+                    final_id,
+                    khive_storage::EdgeRelation::Contains,
+                    1.0,
+                    None,
+                )
+                .await?;
+            Some(candidate)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut entities_touched: Vec<Uuid> = vec![id];
     for touched in crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await? {
         if !entities_touched.contains(&touched) {
@@ -539,6 +654,7 @@ async fn settle_refresh_from_snapshot(
         .as_ref()
         .map_or(0, |(bytes, _)| bytes.len() as u64);
     let mut new_content_ref: Option<String> = None;
+    let mut body_settled = true;
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
             was_truncated = Some(truncated);
@@ -609,14 +725,14 @@ async fn settle_refresh_from_snapshot(
                     metadata_snapshot = Some(settled);
                 } else {
                     // Identity is by address: the body served at the terminal
-                    // hop belongs to that address's own row. Permanent hops
-                    // have already minted it; temporary hops leave that job
-                    // entirely to this terminal content settlement.
-                    // The caller-named row keeps its own url.
-                    let settled = crate::fetch::settle_content_body(
-                        runtime,
-                        token,
-                        &outcome.final_url,
+                    // hop belongs to that address's own row. The guard was
+                    // captured before its request; a GET that won meanwhile
+                    // must not be replaced even when the old response has
+                    // different bytes.
+                    let request_url = crate::identity::request_url(outcome.final_url.clone());
+                    let entity_type = crate::fetch::classify_entity_type(content_type.as_deref());
+                    let mut properties = crate::fetch::representation_patch(
+                        request_url.as_ref(),
                         content_type.as_deref(),
                         outcome.status,
                         outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
@@ -624,18 +740,72 @@ async fn settle_refresh_from_snapshot(
                             .headers
                             .get("last-modified")
                             .and_then(|v| v.to_str().ok()),
-                        Some(crate::fetch::ContentBody::Stored {
-                            content_ref,
-                            bytes: body_bytes,
-                            truncated,
-                        }),
-                    )
-                    .await?;
-                    debug_assert_eq!(settled.id, final_id);
-                    metadata_snapshot = Some(settled.entity);
+                        Some(&content_ref_str),
+                        body_bytes,
+                    );
+                    properties["truncated"] = json!(truncated);
+                    let settled = match terminal_body_guard.as_ref() {
+                        Some(expected) => {
+                            match runtime
+                                .update_entity_if_unchanged(
+                                    token,
+                                    expected,
+                                    khive_runtime::EntityPatch {
+                                        entity_type: Some(Some(entity_type.to_string())),
+                                        properties: Some(properties),
+                                        ..Default::default()
+                                    },
+                                    &[],
+                                )
+                                .await
+                            {
+                                Ok(entity) => Some(entity),
+                                Err(RuntimeError::Khive(error))
+                                    if error.kind() == khive_types::ErrorKind::Conflict =>
+                                {
+                                    None
+                                }
+                                Err(RuntimeError::NotFound(_)) => None,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        None => None,
+                    };
+                    if let Some(mut settled) = settled {
+                        if body_changed {
+                            crate::fetch::root_body(
+                                runtime,
+                                final_id,
+                                khive_storage::AttachmentSubstrate::Entity,
+                                &content_ref,
+                                content_type.as_deref(),
+                                body_bytes,
+                            )
+                            .await?;
+                            settled = crate::fetch::entity_after_body_root(
+                                runtime,
+                                token,
+                                &settled,
+                                &content_ref_str,
+                            )
+                            .await?;
+                        }
+                        metadata_snapshot = Some(settled);
+                    } else {
+                        body_settled = false;
+                        metadata_snapshot = None;
+                    }
                 }
             }
-            new_content_ref = Some(content_ref_str);
+            if body_settled {
+                new_content_ref = Some(content_ref_str);
+            } else {
+                changed = false;
+                was_truncated = prior_truncated;
+                response_content_ref = final_stored_content_ref
+                    .clone()
+                    .unwrap_or_else(|| stored_content_ref.to_owned());
+            }
         }
     }
 
@@ -657,6 +827,11 @@ async fn settle_refresh_from_snapshot(
         None => false,
     };
     let lost_race = !metadata_applied;
+    if lost_race && !redirect_hops.is_empty() {
+        // The response's bytes were not committed as the terminal row's
+        // current representation. Do not bind a capture receipt to them.
+        new_content_ref = None;
+    }
 
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()

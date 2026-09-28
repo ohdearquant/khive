@@ -912,6 +912,233 @@ async fn overlapping_refresh_keeps_validators_with_the_settled_body() {
     assert_eq!(second_reply["lost_race"], false);
 }
 
+#[tokio::test]
+async fn redirected_refresh_keeps_a_get_written_after_the_terminal_request() {
+    let (runtime, token, _dir) = fixture();
+    let source_url = Url::parse("https://metadata.example/redirect-source").unwrap();
+    let terminal_url = Url::parse("https://metadata.example/redirect-target").unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = seed(&runtime, &token, &terminal_url, &[]).await;
+    let source_before = entity(&runtime, &token, source_id).await;
+    let source_properties = source_before.properties.as_ref().unwrap();
+    let source_ref = source_properties["blob_ref"].as_str().unwrap().to_owned();
+    let request_headers = refresh_request_headers(source_properties).unwrap();
+    let redirect_hops = [crate::fetch::RedirectHop {
+        from: source_url.clone(),
+        to: terminal_url.clone(),
+        status: 302,
+    }];
+
+    let mut older_refresh_headers = response_headers();
+    older_refresh_headers.insert("etag", "older-refresh".parse().unwrap());
+    older_refresh_headers.insert("vary", "Accept".parse().unwrap());
+    older_refresh_headers.insert("content-language", "en".parse().unwrap());
+    let reply = settle_refresh_with_request_headers_before_settlement(
+        &runtime,
+        &token,
+        source_id,
+        source_url.as_str(),
+        &source_ref,
+        HopOutcome {
+            status: 200,
+            final_url: terminal_url.clone(),
+            headers: older_refresh_headers,
+            redirect_to: None,
+            body: Some((BODY.to_vec(), false)),
+        },
+        &redirect_hops,
+        &request_headers,
+        async {
+            let mut newer_get_headers = response_headers();
+            newer_get_headers.insert("etag", "newer-get".parse().unwrap());
+            newer_get_headers.insert("vary", "Accept-Language".parse().unwrap());
+            newer_get_headers.insert("content-language", "fr".parse().unwrap());
+            let fetched = settle_with_request_headers(
+                &runtime,
+                &token,
+                "GET",
+                &terminal_url,
+                200,
+                &newer_get_headers,
+                Some((BODY.to_vec(), false)),
+                &[],
+                true,
+                &[("Accept-Language".to_owned(), "fr".to_owned())],
+            )
+            .await
+            .unwrap();
+            assert_eq!(fetched["id"], terminal_id.to_string());
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reply["lost_race"], true);
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newer-get");
+    assert_eq!(properties["vary"], json!(["Accept-Language"]));
+    assert_eq!(properties["content_language"], "fr");
+    assert_eq!(
+        properties["request_headers"],
+        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+    );
+}
+
+#[tokio::test]
+async fn redirected_refresh_keeps_a_newer_get_body_after_the_terminal_request() {
+    let (runtime, token, _dir) = fixture();
+    let source_url = Url::parse("https://metadata.example/body-race-source").unwrap();
+    let terminal_url = Url::parse("https://metadata.example/body-race-target").unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = seed(&runtime, &token, &terminal_url, &[]).await;
+    let source_before = entity(&runtime, &token, source_id).await;
+    let source_properties = source_before.properties.as_ref().unwrap();
+    let source_ref = source_properties["blob_ref"].as_str().unwrap().to_owned();
+    let request_headers = refresh_request_headers(source_properties).unwrap();
+    let redirect_hops = [crate::fetch::RedirectHop {
+        from: source_url.clone(),
+        to: terminal_url.clone(),
+        status: 302,
+    }];
+
+    let mut older_refresh_headers = response_headers();
+    older_refresh_headers.insert("etag", "older-refresh-body".parse().unwrap());
+    let reply = settle_refresh_with_request_headers_before_settlement(
+        &runtime,
+        &token,
+        source_id,
+        source_url.as_str(),
+        &source_ref,
+        HopOutcome {
+            status: 200,
+            final_url: terminal_url.clone(),
+            headers: older_refresh_headers,
+            redirect_to: None,
+            body: Some((b"older refresh body".to_vec(), false)),
+        },
+        &redirect_hops,
+        &request_headers,
+        async {
+            let mut newer_get_headers = response_headers();
+            newer_get_headers.insert("etag", "newer-get-body".parse().unwrap());
+            let fetched = settle_with_request_headers(
+                &runtime,
+                &token,
+                "GET",
+                &terminal_url,
+                200,
+                &newer_get_headers,
+                Some((b"newer GET body".to_vec(), false)),
+                &[],
+                true,
+                &[("Accept-Language".to_owned(), "fr".to_owned())],
+            )
+            .await
+            .unwrap();
+            assert_eq!(fetched["id"], terminal_id.to_string());
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reply["lost_race"], true);
+    assert_eq!(reply["changed"], false);
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newer-get-body");
+    assert_eq!(
+        properties["request_headers"],
+        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+    );
+    let body_ref =
+        khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
+    let stored_body = crate::blob_store(&runtime)
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(stored_body, b"newer GET body");
+    let audit = receipt(&runtime, &token, &reply).await;
+    assert_eq!(audit["content_ref"], Value::Null);
+}
+
+#[tokio::test]
+async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_request() {
+    let (runtime, token, _dir) = fixture();
+    let source_url = Url::parse("https://metadata.example/new-target-source").unwrap();
+    let terminal_url = Url::parse("https://metadata.example/new-target").unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = document_id_for_url(&terminal_url);
+    assert!(runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(terminal_id)
+        .await
+        .unwrap()
+        .is_none());
+    let source_before = entity(&runtime, &token, source_id).await;
+    let source_properties = source_before.properties.as_ref().unwrap();
+    let source_ref = source_properties["blob_ref"].as_str().unwrap().to_owned();
+    let request_headers = refresh_request_headers(source_properties).unwrap();
+    let redirect_hops = [crate::fetch::RedirectHop {
+        from: source_url.clone(),
+        to: terminal_url.clone(),
+        status: 302,
+    }];
+
+    let reply = settle_refresh_with_request_headers_before_settlement(
+        &runtime,
+        &token,
+        source_id,
+        source_url.as_str(),
+        &source_ref,
+        HopOutcome {
+            status: 200,
+            final_url: terminal_url.clone(),
+            headers: response_headers(),
+            redirect_to: None,
+            body: Some((b"older refresh body".to_vec(), false)),
+        },
+        &redirect_hops,
+        &request_headers,
+        async {
+            let mut newer_get_headers = response_headers();
+            newer_get_headers.insert("etag", "newly-created-get".parse().unwrap());
+            settle_with_request_headers(
+                &runtime,
+                &token,
+                "GET",
+                &terminal_url,
+                200,
+                &newer_get_headers,
+                Some((b"newly-created GET body".to_vec(), false)),
+                &[],
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reply["lost_race"], true);
+    assert_eq!(reply["changed"], false);
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newly-created-get");
+    let body_ref =
+        khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
+    let stored_body = crate::blob_store(&runtime)
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(stored_body, b"newly-created GET body");
+}
+
 // Simulate a fetch paused between its body settlement and negotiation write.
 #[tokio::test]
 async fn overlapping_fetch_keeps_negotiation_with_the_stored_body() {
@@ -1733,6 +1960,7 @@ mod refresh_revision_tests {
             &runtime,
             &token,
             &before,
+            None,
             id,
             url.as_str(),
             &expected_ref,
