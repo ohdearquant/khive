@@ -180,6 +180,8 @@ const SESSION_IDENTITY_UP: &str = include_str!("../sql/040-session-source-scope.
 const SESSION_IDENTITY_MIGRATION_NAME: &str = "session_source_scoped_identity";
 const V41_UP: &str = include_str!("../sql/041-sender-transport.sql");
 const V42_UP: &str = include_str!("../sql/042-comm-external-id-channel-scope.sql");
+const RECIPIENT_TRANSPORT_VERSION: u32 = 43;
+const V43_UP: &str = include_str!("../sql/043-recipient-transport.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -445,6 +447,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 42,
         name: "comm_external_id_channel_scope",
         up: V42_UP,
+    },
+    VersionedMigration {
+        version: RECIPIENT_TRANSPORT_VERSION,
+        name: "recipient_transport",
+        up: V43_UP,
     },
 ];
 

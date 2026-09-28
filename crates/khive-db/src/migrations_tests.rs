@@ -5011,3 +5011,36 @@ fn sender_transport_migration_fresh_and_previous_tail() {
         run_migrations(&mut conn).unwrap();
     }
 }
+
+#[test]
+fn recipient_transport_migration_fresh_and_previous_tail() {
+    for previous in [0, 42] {
+        let mut conn = open_memory();
+        if previous != 0 {
+            migrate_through(&mut conn, previous);
+        }
+        assert_eq!(
+            run_migrations(&mut conn).unwrap(),
+            RECIPIENT_TRANSPORT_VERSION
+        );
+        for table in [
+            "comm_recipient_replay",
+            "comm_recipient_quarantine",
+            "comm_ack_work",
+        ] {
+            assert!(table_exists(&conn, table));
+        }
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM _schema_migrations WHERE version = ?1",
+                [RECIPIENT_TRANSPORT_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "recipient_transport");
+        assert_eq!(
+            run_migrations(&mut conn).unwrap(),
+            RECIPIENT_TRANSPORT_VERSION
+        );
+    }
+}
