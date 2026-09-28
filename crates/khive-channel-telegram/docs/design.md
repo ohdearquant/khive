@@ -23,7 +23,10 @@ The adapter requires `KHIVE_TELEGRAM_BOT_TOKEN` and a numeric
 `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`. `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID` identifies the inbound
 Telegram account; it defaults to the chat id only for a positive private-chat id and is required
 for a non-positive group or channel id. `KHIVE_TELEGRAM_MAINTAINER_SLUG` defaults to `maintainer`,
-and `KHIVE_TELEGRAM_INGEST_NAMESPACE` defaults to `local`. No filesystem configuration is read.
+and `KHIVE_TELEGRAM_INGEST_NAMESPACE` defaults to `local`.
+`KHIVE_TELEGRAM_DEFAULT_ACTOR` defaults to the isolated `telegram:bot` recipient.
+Set the latter to `local` only when the runtime access policy protects the local
+inbox from anonymous readers. No filesystem configuration is read.
 
 ## Invariants
 
