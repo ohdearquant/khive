@@ -45,6 +45,84 @@ const PORTABLE_IDS_VERSION: u32 = 1;
 /// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
 const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
 
+#[cfg(feature = "mmap")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublicationFileIdentity {
+    volume: u64,
+    file_index: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(feature = "mmap")]
+fn is_read_only_lock_create_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EROFS)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(all(feature = "mmap", unix))]
+fn publication_file_identity(metadata: &fs::Metadata) -> Result<PublicationFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(PublicationFileIdentity {
+        volume: metadata.dev(),
+        file_index: metadata.ino(),
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+#[cfg(all(feature = "mmap", windows))]
+fn publication_file_identity(metadata: &fs::Metadata) -> Result<PublicationFileIdentity> {
+    use std::os::windows::fs::MetadataExt as _;
+    let volume = metadata.volume_serial_number().ok_or_else(|| {
+        VamanaError::invalid_format("volume identity unavailable for unlocked load".into())
+    })?;
+    let file_index = metadata.file_index().ok_or_else(|| {
+        VamanaError::invalid_format("file identity unavailable for unlocked load".into())
+    })?;
+    Ok(PublicationFileIdentity {
+        volume: u64::from(volume),
+        file_index,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+#[cfg(all(feature = "mmap", not(any(unix, windows))))]
+fn publication_file_identity(_: &fs::Metadata) -> Result<PublicationFileIdentity> {
+    Err(VamanaError::invalid_format(
+        "file identity unavailable for unlocked load on this platform".into(),
+    ))
+}
+
+#[cfg(feature = "mmap")]
+fn publication_file_snapshot(path: &Path) -> Result<Vec<Option<PublicationFileIdentity>>> {
+    [
+        "metadata.bin",
+        "graph.bin",
+        "vectors.bin",
+        "lifecycle.bin",
+        "codes.bin",
+        ".checkpoint.lock",
+    ]
+    .iter()
+    .map(|name| match fs::metadata(path.join(name)) {
+        Ok(metadata) => publication_file_identity(&metadata).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    })
+    .collect()
+}
+
 /// Format identifier string stored in every `VamanaSnapshot`.
 pub const VAMANA_SNAPSHOT_FORMAT: &str = "khive-vamana-index";
 /// Snapshot format version; a mismatch causes `from_snapshot` to return an error.
@@ -922,40 +1000,108 @@ impl VamanaIndex {
     /// amplifier. Taking a shared lock on the same file the writer holds exclusively
     /// puts the whole rename sequence outside anything a reader can observe.
     ///
-    /// A directory with no lock file — a historical v1 layout, or a segment no
-    /// locking writer has ever published — loads unlocked. The lock releases
-    /// when the guard drops at the end of the load; an mmap
-    /// taken during the load holds its own inode open, so a rename landing afterwards
-    /// cannot change what was loaded.
+    /// A writable historical directory joins the publication protocol by
+    /// creating a lock before reading any segment. A read-only directory
+    /// cannot create the file; that narrow fallback revalidates every segment
+    /// identity after loading instead of accepting a mixed generation.
+    /// A mapping keeps its original inode if a later publisher renames the path.
     #[cfg(feature = "mmap")]
     fn load_with_lock_hook(
         path: &Path,
         acquire_lock: impl FnOnce(&File) -> Result<()>,
     ) -> Result<Self> {
-        let _publication_guard = Self::open_publication_lock(path, acquire_lock)?;
-        Self::load_unlocked(path)
+        Self::load_with_lock_hooks(
+            path,
+            acquire_lock,
+            |lock_path| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(lock_path)
+            },
+            || {},
+        )
     }
 
-    /// Open `path`'s `.checkpoint.lock` and hand it to `acquire_lock`. `None` means the
-    /// directory has no lock file, which is not a failure: an older v1 layout,
-    /// or a segment no locking writer has ever published, has no writer using
-    /// this protocol to exclude.
+    #[cfg(feature = "mmap")]
+    fn load_with_lock_hooks(
+        path: &Path,
+        acquire_lock: impl FnOnce(&File) -> Result<()>,
+        create_lock: impl FnOnce(&Path) -> std::io::Result<File>,
+        after_snapshot: impl FnOnce(),
+    ) -> Result<Self> {
+        match Self::open_publication_lock_with_creator(path, acquire_lock, create_lock, true)? {
+            Some(_publication_guard) => Self::load_unlocked(path),
+            None => Self::load_without_publication_lock(path, after_snapshot),
+        }
+    }
+
+    /// Open `path`'s `.checkpoint.lock` and hand it to `acquire_lock`. A first
+    /// reader creates the file atomically; if another reader or writer wins that
+    /// creation race, reopen and lock it. Only `load` allows permission/read-only
+    /// creation failures to fall back to validated lockless loading.
     #[cfg(feature = "mmap")]
     fn open_publication_lock(
         path: &Path,
         acquire_lock: impl FnOnce(&File) -> Result<()>,
     ) -> Result<Option<File>> {
-        match OpenOptions::new()
-            .read(true)
-            .open(path.join(".checkpoint.lock"))
-        {
-            Ok(lock) => {
-                acquire_lock(&lock)?;
-                Ok(Some(lock))
+        Self::open_publication_lock_with_creator(
+            path,
+            acquire_lock,
+            |lock_path| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(lock_path)
+            },
+            false,
+        )
+    }
+
+    #[cfg(feature = "mmap")]
+    fn open_publication_lock_with_creator(
+        path: &Path,
+        acquire_lock: impl FnOnce(&File) -> Result<()>,
+        create_lock: impl FnOnce(&Path) -> std::io::Result<File>,
+        allow_read_only_fallback: bool,
+    ) -> Result<Option<File>> {
+        let lock_path = path.join(".checkpoint.lock");
+        let open_existing = || OpenOptions::new().read(true).open(&lock_path);
+        let lock = match open_existing() {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match create_lock(&lock_path) {
+                    Ok(lock) => lock,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        open_existing()?
+                    }
+                    Err(error)
+                        if allow_read_only_fallback && is_read_only_lock_create_error(&error) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
+        };
+        acquire_lock(&lock)?;
+        Ok(Some(lock))
+    }
+
+    #[cfg(feature = "mmap")]
+    fn load_without_publication_lock(path: &Path, after_snapshot: impl FnOnce()) -> Result<Self> {
+        let before = publication_file_snapshot(path)?;
+        after_snapshot();
+        let loaded = Self::load_unlocked(path)?;
+        if before != publication_file_snapshot(path)? {
+            return Err(VamanaError::invalid_format(
+                "index publication changed during read-only unlocked load".into(),
+            ));
         }
+        Ok(loaded)
     }
 
     #[cfg(feature = "mmap")]
@@ -1153,6 +1299,9 @@ impl VamanaIndex {
         fallback_config: VamanaConfig,
         rebuild_last_applied_seq: Option<u64>,
     ) -> Result<Self> {
+        // This API may publish a rebuilt checkpoint, so establish the directory
+        // before the first lock probe. A clean first run has no directory yet.
+        fs::create_dir_all(path)?;
         let metadata_path = path.join("metadata.bin");
 
         // Every read below — the commit record and all four segments — happens under a
@@ -5836,9 +5985,8 @@ mod tests {
         assert_eq!(second.join().unwrap().unwrap().vectors().unwrap(), vectors);
     }
 
-    /// A directory with no `.checkpoint.lock` has no writer using this protocol, so the
-    /// load proceeds unlocked rather than failing. Covers v1 layouts and any segment
-    /// directory `save_atomic` has never written.
+    /// A historical directory without `.checkpoint.lock` remains loadable, and
+    /// its first reader creates the publication lock before opening segments.
     #[cfg(feature = "mmap")]
     #[test]
     fn load_succeeds_when_no_publication_lock_file_exists() {
@@ -5856,6 +6004,185 @@ mod tests {
 
         let loaded = VamanaIndex::load(dir.path()).unwrap();
         assert_eq!(loaded.vectors().unwrap(), vectors);
+        assert!(lock_path.exists(), "first load must join the lock protocol");
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn load_or_build_creates_directory_before_first_lock() {
+        let vectors = rand_unit_vectors(16, 8, 0x1138_0509);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("new-index");
+        assert!(!path.exists());
+
+        let loaded = VamanaIndex::load_or_build(&path, &vectors, config).unwrap();
+        assert_eq!(loaded.vectors().unwrap(), vectors);
+        assert!(path.join(".checkpoint.lock").exists());
+    }
+
+    /// The first load of a legacy v1 directory must exclude the first publisher,
+    /// just like a load of a directory whose lock file already exists. The hook
+    /// holds the reader before any segment read; the writer probes the actual
+    /// file lock, so the control does not depend on thread scheduling.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn first_legacy_load_excludes_first_publication() {
+        for lock_already_present in [false, true] {
+            let old_vectors = rand_unit_vectors(16, 8, 0x1138_0510);
+            let new_vectors = rand_unit_vectors(16, 8, 0x1138_0511);
+            let config = VamanaConfig::with_dimensions(8)
+                .with_max_degree(8)
+                .with_search_list_size(16);
+            let old = VamanaIndex::build(&old_vectors, config.clone()).unwrap();
+            let mut new = VamanaIndex::build(&new_vectors, config).unwrap();
+            new.set_last_applied_seq(Some(2));
+            let dir = tempfile::tempdir().unwrap();
+            old.save(dir.path()).unwrap();
+            let lock_path = dir.path().join(".checkpoint.lock");
+            if !lock_already_present {
+                fs::remove_file(&lock_path).unwrap();
+            }
+
+            let reader_path = dir.path().to_path_buf();
+            let (reader_locked_tx, reader_locked_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let reader = std::thread::spawn(move || {
+                VamanaIndex::load_with_lock_hook(&reader_path, |lock| {
+                    lock.lock_shared()?;
+                    reader_locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+            reader_locked_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("first reader never acquired a publication lock");
+            assert!(lock_path.exists());
+
+            let writer_path = dir.path().to_path_buf();
+            let (probe_tx, probe_rx) = std::sync::mpsc::sync_channel(0);
+            let writer = std::thread::spawn(move || {
+                new.save_atomic_with_lock_hook(&writer_path, |lock| match lock.try_lock() {
+                    Ok(()) => {
+                        probe_tx.send(false).unwrap();
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        probe_tx.send(true).unwrap();
+                        lock.lock().map_err(Into::into)
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+                })
+            });
+            let contended = probe_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("first publisher never probed the publication lock");
+            release_tx.send(()).unwrap();
+            let loaded = reader.join().unwrap().unwrap();
+            writer.join().unwrap().unwrap();
+            assert!(contended, "first publisher must wait for the first reader");
+            assert_eq!(loaded.vectors().unwrap(), old_vectors);
+            assert_eq!(
+                VamanaIndex::load(dir.path()).unwrap().vectors().unwrap(),
+                new_vectors
+            );
+        }
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn read_only_legacy_load_preserves_missing_lock() {
+        let vectors = rand_unit_vectors(16, 8, 0x1138_0520);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        index.save(dir.path()).unwrap();
+        let lock_path = dir.path().join(".checkpoint.lock");
+        fs::remove_file(&lock_path).unwrap();
+
+        let loaded = VamanaIndex::load_with_lock_hooks(
+            dir.path(),
+            |lock| lock.lock_shared().map_err(Into::into),
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(loaded.vectors().unwrap(), vectors);
+        assert!(
+            !lock_path.exists(),
+            "read-only fallback must not create a lock"
+        );
+    }
+
+    #[cfg(all(feature = "mmap", unix))]
+    #[test]
+    fn actual_read_only_legacy_directory_remains_loadable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root can still create a file in mode 0555, so the injected error
+        // test above is the deterministic fallback arm for that environment.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let vectors = rand_unit_vectors(16, 8, 0x1138_0521);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        index.save(dir.path()).unwrap();
+        let lock_path = dir.path().join(".checkpoint.lock");
+        fs::remove_file(&lock_path).unwrap();
+        let original = fs::metadata(dir.path()).unwrap().permissions();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let loaded = VamanaIndex::load(dir.path());
+        let lock_created = lock_path.exists();
+        fs::set_permissions(dir.path(), original).unwrap();
+        assert!(
+            !lock_created,
+            "read-only load must leave the directory unchanged"
+        );
+        assert_eq!(loaded.unwrap().vectors().unwrap(), vectors);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn read_only_fallback_refuses_a_changed_segment_generation() {
+        let old_vectors = rand_unit_vectors(16, 8, 0x1138_0530);
+        let new_vectors = rand_unit_vectors(16, 8, 0x1138_0531);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let old = VamanaIndex::build(&old_vectors, config.clone()).unwrap();
+        let new = VamanaIndex::build(&new_vectors, config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let next_dir = tempfile::tempdir().unwrap();
+        old.save(dir.path()).unwrap();
+        new.save(next_dir.path()).unwrap();
+        fs::remove_file(dir.path().join(".checkpoint.lock")).unwrap();
+        let replacement_graph = fs::read(next_dir.path().join("graph.bin")).unwrap();
+        let destination = dir.path().to_path_buf();
+
+        let result = VamanaIndex::load_with_lock_hooks(
+            dir.path(),
+            |lock| lock.lock_shared().map_err(Into::into),
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+            move || {
+                let staged = destination.join("graph.bin.next");
+                fs::write(&staged, replacement_graph).unwrap();
+                fs::rename(staged, destination.join("graph.bin")).unwrap();
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(VamanaError::InvalidFormat { reason })
+                if reason.contains("publication changed during read-only unlocked load")
+        ));
     }
 
     #[cfg(feature = "mmap")]
