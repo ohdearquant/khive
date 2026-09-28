@@ -28,6 +28,9 @@ on:
       - "crates/khive-mcp/**"
       - "crates/kkernel/**"
       - "scripts/perf/bench_pipeline_daemon.py"
+      - "scripts/perf/mcp_bench_client.py"
+      - "scripts/perf/test_bench_pipeline_daemon.py"
+      - "scripts/perf/test_mcp_bench_client.py"
       - ".github/workflows/bench-pipeline.yml"
 
 permissions:
@@ -47,6 +50,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Test benchmark response contracts
+        working-directory: scripts/perf
+        run: python3 -m unittest test_mcp_bench_client test_bench_pipeline_daemon -v
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:

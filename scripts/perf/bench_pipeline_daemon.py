@@ -279,7 +279,7 @@ def _ingest(proc, corpus):
 # ── Query ─────────────────────────────────────────────────────────────────────
 
 def _query_once(proc, query_text, fusion_strategy=None):
-    """Issue one memory.recall and return (elapsed_us, contents).
+    """Issue one memory.recall, validate its fixture hits, and return (elapsed_us, contents).
 
     When fusion_strategy is provided (e.g. "vector_only" or "keyword_only"),
     it is passed as-is to the memory.recall verb. The daemon accepts the
@@ -298,11 +298,31 @@ def _query_once(proc, query_text, fusion_strategy=None):
     if isinstance(result, list):
         arr = result
     elif isinstance(result, dict):
-        arr = result.get("results") or result.get("items") or []
+        has_results = "results" in result
+        has_items = "items" in result
+        if has_results == has_items:
+            raise RuntimeError("memory.recall response must contain exactly one of results or items")
+        arr = result["results" if has_results else "items"]
     else:
-        arr = []
+        raise RuntimeError("memory.recall response must be a list or object")
 
-    contents = [r["content"] for r in arr if isinstance(r, dict) and "content" in r]
+    if not isinstance(arr, list):
+        raise RuntimeError("memory.recall results must be a list")
+    if len(arr) > TOP_K:
+        raise RuntimeError(f"memory.recall returned {len(arr)} hits, exceeding limit {TOP_K}")
+
+    contents = []
+    seen = set()
+    for rank, row in enumerate(arr, start=1):
+        if not isinstance(row, dict) or not isinstance(row.get("content"), str):
+            raise RuntimeError(f"memory.recall hit at rank {rank} must be an object with string content")
+        content = row["content"]
+        # Every generated note has distinct content; a repeat here means this fixture's
+        # retrieval gate would otherwise count the same hit more than once.
+        if content in seen:
+            raise RuntimeError(f"memory.recall returned duplicate content at rank {rank}")
+        seen.add(content)
+        contents.append(content)
     return elapsed_us, contents
 
 def _wait_for_ann_convergence(

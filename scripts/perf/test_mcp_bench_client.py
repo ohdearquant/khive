@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import mcp_bench_client as mbc
@@ -189,6 +190,57 @@ class DaemonEngagementTests(unittest.TestCase):
 
 
 # ── Mock raw daemon-socket server ─────────────────────────────────────────────
+
+
+class RecvExactTests(unittest.TestCase):
+    def test_one_byte_fragments_return_exact_bytes(self):
+        payload = b"fragmented response"
+        sock = mock.Mock()
+        sock.recv.side_effect = [bytes([byte]) for byte in payload]
+
+        result = mbc.recv_exact(sock, len(payload))
+        self.assertEqual(result, payload)
+        self.assertIs(type(result), bytes)
+        self.assertEqual(sock.recv.call_count, len(payload))
+        self.assertEqual(sock.recv.call_args_list[0], mock.call(len(payload)))
+        self.assertEqual(sock.recv.call_args_list[-1], mock.call(1))
+
+    def test_irregular_fragments_return_exact_bytes(self):
+        sock = mock.Mock()
+        sock.recv.side_effect = [b"ab", b"c", b"defg", b"hij"]
+
+        result = mbc.recv_exact(sock, 10)
+        self.assertEqual(result, b"abcdefghij")
+        self.assertIs(type(result), bytes)
+        self.assertEqual(sock.recv.call_args_list, [
+            mock.call(10), mock.call(8), mock.call(7), mock.call(3),
+        ])
+
+    def test_deadline_uses_remaining_budget_and_stops_before_next_recv(self):
+        sock = mock.Mock()
+        sock.recv.side_effect = [b"a", b"b"]
+        with mock.patch.object(mbc.time, "monotonic", side_effect=[100.0, 100.4, 101.1]):
+            with self.assertRaises(socketlib.timeout):
+                mbc.recv_exact(sock, 3, deadline=101.0)
+
+        self.assertEqual(sock.recv.call_count, 2)
+        self.assertAlmostEqual(sock.settimeout.call_args_list[0].args[0], 1.0)
+        self.assertAlmostEqual(sock.settimeout.call_args_list[1].args[0], 0.6)
+
+    def test_premature_eof_raises(self):
+        sock = mock.Mock()
+        sock.recv.side_effect = [b"ab", b""]
+
+        with self.assertRaisesRegex(RuntimeError, "closed mid-frame"):
+            mbc.recv_exact(sock, 3)
+
+    def test_zero_bytes_returns_immediately(self):
+        sock = mock.Mock()
+
+        self.assertEqual(mbc.recv_exact(sock, 0, deadline=-1.0), b"")
+        sock.recv.assert_not_called()
+        sock.settimeout.assert_not_called()
+
 
 class _MockDaemonServer:
     """A minimal Unix-socket server speaking the daemon's length-prefixed JSON
