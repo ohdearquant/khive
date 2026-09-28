@@ -1638,7 +1638,19 @@ pub(crate) async fn channel_outbox_loop(
     allowlist: Vec<String>,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
-    let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    let historical = match std::env::var(khive_runtime::HISTORICAL_DOMAINS_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::components::ComponentError::Permanent(format!(
+                "{} must contain valid Unicode text",
+                khive_runtime::HISTORICAL_DOMAINS_ENV
+            )));
+        }
+    };
+    let domains =
+        khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(&mailbox, &historical)
+            .map_err(crate::components::ComponentError::Permanent)?;
     outbox::validate_loop_channel(email_channel.as_ref(), "email")?;
     let slug = email_channel.slug();
     let mut channels = khive_channel::ChannelRegistry::new();
@@ -1657,7 +1669,7 @@ pub(crate) async fn channel_outbox_loop(
             },
             outbox::OutboxPolicy::Email {
                 mailbox: &mailbox,
-                domain: &domain,
+                domains: &domains,
                 allowlist: &allowlist,
             },
             &runtime,
@@ -1685,12 +1697,15 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(mailbox, "")
+        .map_err(crate::components::ComponentError::Permanent)?;
+    debug_assert_eq!(domains.current(), domain);
     let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(email_channel),
         outbox::OutboxPolicy::Email {
             mailbox,
-            domain,
+            domains: &domains,
             allowlist,
         },
         runtime,

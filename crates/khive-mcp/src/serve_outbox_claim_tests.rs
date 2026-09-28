@@ -215,8 +215,9 @@ async fn transient_claim_failure_backs_off_then_claims_and_delivers() {
 #[tokio::test]
 async fn already_claimed_refusal_preserves_winner_and_remains_sendable() {
     let (runtime, token, id) = fixture().await;
+    let winner = format!("<{id}@example.com>");
     let claimed = runtime
-        .claim_outbound_message_external_id(&token, id, "<winner@example.com>".into())
+        .claim_outbound_message_external_id(&token, id, winner.clone())
         .await
         .unwrap();
     let error = runtime
@@ -251,7 +252,7 @@ async fn already_claimed_refusal_preserves_winner_and_remains_sendable() {
     cycle(&runtime, &channel).await;
     assert_eq!(
         channel.sent.lock().unwrap()[0].message_id.as_deref(),
-        Some("<winner@example.com>")
+        Some(winner.as_str())
     );
     let delivered = runtime
         .notes(&token)
@@ -266,6 +267,6 @@ async fn already_claimed_refusal_preserves_winner_and_remains_sendable() {
     );
     assert_eq!(
         delivered.properties.as_ref().unwrap()["external_id"],
-        "<winner@example.com>"
+        winner
     );
 }
