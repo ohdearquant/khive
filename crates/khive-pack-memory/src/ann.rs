@@ -2888,7 +2888,11 @@ async fn fresh_tail_pathless_reresolve(
     }
     let floor = registry_min_watermark_on(reader.as_mut(), model).await;
     let outcome = match floor {
-        Ok(Some(floor)) if u64::try_from(floor).is_ok_and(|floor| floor <= resolved_s) => {
+        Ok(floor)
+            if floor
+                .and_then(|value| u64::try_from(value).ok())
+                .is_none_or(|floor| floor <= resolved_s) =>
+        {
             match fetch_final_tail_on(reader.as_mut(), model, resolved_s, None).await {
                 Ok((ops, _)) => {
                     FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
@@ -6551,6 +6555,87 @@ mod tests {
             ops.iter()
                 .any(|(id, embedding)| *id == fresh.id && embedding.is_some()),
             "the fully retained tail must include the fresh note"
+        );
+    }
+
+    /// A pending peer's negative minimum is coherent with the installed
+    /// pathless bridge; re-resolution must retain its candidates and tail.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_pathless_negative_peer_minimum_merges_candidates_and_tail() {
+        const MODEL: &str = "adr118-pathless-negative-minimum-model";
+        const DIMS: usize = 8;
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("pathless negative minimum baseline note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create baseline note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm pathless bridge");
+        const FRESH_TEXT: &str = "pathless negative minimum distinctive fresh note";
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                FRESH_TEXT,
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create tail note");
+        ann_registry::register_pending(rt.sql().as_ref(), "pending-peer", ANN_WILDCARD_NS, MODEL)
+            .await
+            .expect("register pending peer");
+
+        let query = fnv_to_vec(FRESH_TEXT, DIMS);
+        let (candidates, _) = search_loaded_with_seq(&ann, &key, &query, 10)
+            .await
+            .expect("search installed bridge")
+            .expect("pathless bridge installed");
+        assert!(!candidates.is_empty(), "bridge must supply candidates");
+        assert!(
+            candidates.iter().all(|(id, _)| *id != fresh.id),
+            "fresh note must exist only in the tail"
+        );
+
+        let outcome = fresh_tail_pathless_reresolve(&rt, &ann, &key, MODEL, &query, 10).await;
+        let merged = match outcome {
+            FreshTailOutcome::Replace(hits, _) => hits,
+            _ => panic!("pathless re-resolution must replace stale candidates"),
+        };
+        assert!(
+            candidates
+                .iter()
+                .all(|(id, _)| merged.iter().any(|(served, _)| served == id)),
+            "negative minimum must retain re-resolved bridge candidates: {merged:?}"
+        );
+        assert!(
+            merged.iter().any(|(id, _)| *id == fresh.id),
+            "negative minimum must merge the final fresh tail: {merged:?}"
         );
     }
 

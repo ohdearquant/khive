@@ -822,7 +822,9 @@ async fn pathless_incremental_tail_does_not_hold_shared_writer_after_read() {
             .await
             .expect("protected incremental tail")
     });
-    reached_pause.await;
+    tokio::time::timeout(Duration::from_secs(5), reached_pause)
+        .await
+        .expect("protected tail must reach its pause barrier");
 
     let writer = rt
         .backend()
