@@ -27,8 +27,8 @@ use crate::message::{
 };
 use crate::params::{
     deser, CleanupExpiredQuarantineParams, CursorCommitParams, CursorGetParams, DeliveredParams,
-    HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, ReadParams,
-    ReplyParams, SendParams, ThreadParams, UnreadParams,
+    HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, QuarantineCleanupMode,
+    ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
 fn add_embedding_truncation_warning(
@@ -2918,6 +2918,61 @@ pub(crate) async fn handle_ingest(
     }))
 }
 
+/// Detach only the main-backend original owned by this already hard-deleted
+/// legacy note. The conditional DELETE rejects a competing replacement of the
+/// role after the owner read; it never scans for unrelated ownerless rows.
+async fn detach_deleted_legacy_original(
+    runtime: &KhiveRuntime,
+    id: Uuid,
+    expected_ref: Option<&str>,
+) -> Result<bool, RuntimeError> {
+    let core = runtime.core();
+    let attachments = core.attachments()?;
+    let Some(owner) = attachments
+        .get_attachment(id, "quarantine-original")
+        .await?
+    else {
+        return Ok(false);
+    };
+    let expected = expected_ref.ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} has an original owner but no original ref"
+        ))
+    })?;
+    let expected = ContentRef::from_hex(expected.to_string()).map_err(|error| {
+        RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} has an invalid original ref: {error}"
+        ))
+    })?;
+    if owner.substrate != AttachmentSubstrate::Note || owner.content_ref != expected {
+        return Err(RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} has a mismatched original owner"
+        )));
+    }
+    let detached = core
+        .sql()
+        .writer()
+        .await?
+        .execute(SqlStatement {
+            sql: "DELETE FROM attachments WHERE record_uuid = ?1 \
+                  AND role = 'quarantine-original' AND substrate = 'note' \
+                  AND content_ref = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(expected.as_str().to_string()),
+            ],
+            label: Some("comm_cleanup_legacy_quarantine_original".into()),
+        })
+        .await?;
+    if detached != 1 {
+        return Err(RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} original owner changed during cleanup"
+        )));
+    }
+    Ok(true)
+}
+
 /// Internal channel-poller maintenance. One bounded page per tick ensures an
 /// empty poll still makes progress without monopolizing the writer. The token
 /// carries the ingest namespace explicitly; heartbeat rows use a different
@@ -2926,17 +2981,87 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
+    quarantine_retention: std::time::Duration,
 ) -> Result<Value, RuntimeError> {
     let p: CleanupExpiredQuarantineParams = deser(params)?;
-    if p.channel_kind.trim().is_empty() || p.channel_slug.trim().is_empty() {
+    if p.channel_kind.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
-            "cleanup_expired_quarantine: channel_kind and channel_slug must be nonblank".into(),
+            "cleanup_expired_quarantine: channel_kind must be nonblank".into(),
         ));
+    }
+    match p.mode {
+        QuarantineCleanupMode::Channel if p.channel_slug.trim().is_empty() => {
+            return Err(RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: channel_kind and channel_slug must be nonblank".into(),
+            ));
+        }
+        QuarantineCleanupMode::LegacySlugless if !p.channel_slug.is_empty() => {
+            return Err(RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: legacy_slugless requires an empty channel_slug".into(),
+            ));
+        }
+        _ => {}
     }
     let as_of = p
         .as_of_micros
         .unwrap_or_else(|| Utc::now().timestamp_micros());
+    let legacy_cutoff = if p.mode == QuarantineCleanupMode::LegacySlugless {
+        let retention_us = i64::try_from(quarantine_retention.as_micros()).map_err(|_| {
+            RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: retention exceeds i64 microseconds".into(),
+            )
+        })?;
+        Some(as_of.checked_sub(retention_us).ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: retention cutoff underflow".into(),
+            )
+        })?)
+    } else {
+        None
+    };
     let namespace = token.namespace().as_str();
+    let (sql, sql_params) = if let Some(cutoff) = legacy_cutoff {
+        // Match the #3497 boot-repair selector: missing, JSON null, or a
+        // SQLite-space-only text slug. Existing tombstones stay eligible,
+        // including an operator-soft-deleted historical quarantine.
+        (
+            "SELECT id FROM notes \
+             WHERE namespace = ?1 AND kind = 'message' \
+               AND ((expires_at IS NOT NULL AND expires_at <= ?2) \
+                    OR (expires_at IS NULL AND created_at <= ?3)) \
+               AND json_extract(properties, '$.channel_kind') = ?4 \
+               AND (json_type(properties, '$.channel_slug') IS NULL \
+                    OR json_type(properties, '$.channel_slug') = 'null' \
+                    OR (json_type(properties, '$.channel_slug') = 'text' \
+                        AND trim(json_extract(properties, '$.channel_slug')) = '')) \
+               AND (json_extract(properties, '$.quarantined') = 'true' \
+                    OR json_type(properties, '$.quarantined') = 'true') \
+             ORDER BY COALESCE(expires_at, created_at), id LIMIT 128",
+            vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(as_of),
+                SqlValue::Integer(cutoff),
+                SqlValue::Text(p.channel_kind.clone()),
+            ],
+        )
+    } else {
+        (
+            "SELECT id FROM notes \
+             WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
+               AND expires_at IS NOT NULL AND expires_at <= ?2 \
+               AND json_extract(properties, '$.channel_kind') = ?3 \
+               AND json_extract(properties, '$.channel_slug') = ?4 \
+               AND (json_extract(properties, '$.quarantined') = 'true' \
+                    OR json_type(properties, '$.quarantined') = 'true') \
+             ORDER BY expires_at, id LIMIT 128",
+            vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(as_of),
+                SqlValue::Text(p.channel_kind.clone()),
+                SqlValue::Text(p.channel_slug.clone()),
+            ],
+        )
+    };
     let mut reader = runtime
         .sql()
         .reader()
@@ -2944,21 +3069,8 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         .map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT id FROM notes \
-                  WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
-                    AND expires_at IS NOT NULL AND expires_at <= ?2 \
-                    AND json_extract(properties, '$.channel_kind') = ?3 \
-                    AND json_extract(properties, '$.channel_slug') = ?4 \
-                    AND (json_extract(properties, '$.quarantined') = 'true' \
-                         OR json_type(properties, '$.quarantined') = 'true') \
-                  ORDER BY expires_at, id LIMIT 128"
-                .into(),
-            params: vec![
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(as_of),
-                SqlValue::Text(p.channel_kind.clone()),
-                SqlValue::Text(p.channel_slug.clone()),
-            ],
+            sql: sql.into(),
+            params: sql_params,
             label: Some("comm_cleanup_expired_quarantine".into()),
         })
         .await
@@ -2966,11 +3078,10 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
     drop(reader);
 
     // NoteStore by-ID deletion is not namespace-scoped. Re-read each UUID
-    // through the authorized store and enforce the query's full predicate
-    // before hard deletion. Hard delete removes the note and its attachment
-    // row in one transaction; blob GC reclaims the orphan after its grace.
+    // through the authorized store and enforce the query's full predicate.
     let store = runtime.notes(token)?;
     let mut deleted = 0usize;
+    let mut routed_owner_detached = 0usize;
     for row in rows {
         let id = match row.get("id") {
             Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|error| {
@@ -2984,31 +3095,97 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
                 ));
             }
         };
-        let Some(note) = store.get_note(id).await? else {
+        let note = if legacy_cutoff.is_some() {
+            store.get_note_including_deleted(id).await?
+        } else {
+            store.get_note(id).await?
+        };
+        let Some(note) = note else {
             continue;
         };
         let properties = note.properties.as_ref();
+        let slug = properties.and_then(|props| props.get("channel_slug"));
+        let slug_matches = match p.mode {
+            QuarantineCleanupMode::Channel => {
+                slug.and_then(Value::as_str) == Some(p.channel_slug.as_str())
+            }
+            QuarantineCleanupMode::LegacySlugless => match slug {
+                None | Some(Value::Null) => true,
+                Some(Value::String(value)) => value.trim().is_empty(),
+                _ => false,
+            },
+        };
         let still_due = note.namespace == namespace
             && note.kind == "message"
-            && note.expires_at.is_some_and(|expires| expires <= as_of)
+            && match legacy_cutoff {
+                Some(cutoff) => note
+                    .expires_at
+                    .map_or(note.created_at <= cutoff, |expires| expires <= as_of),
+                None => {
+                    note.deleted_at.is_none()
+                        && note.expires_at.is_some_and(|expires| expires <= as_of)
+                }
+            }
             && properties
                 .and_then(|props| props.get("channel_kind"))
                 .and_then(Value::as_str)
                 == Some(p.channel_kind.as_str())
-            && properties
-                .and_then(|props| props.get("channel_slug"))
-                .and_then(Value::as_str)
-                == Some(p.channel_slug.as_str())
+            && slug_matches
             && (properties.and_then(|props| props.get("quarantined")) == Some(&Value::Bool(true))
                 || properties
                     .and_then(|props| props.get("quarantined"))
                     .and_then(Value::as_str)
                     == Some("true"));
-        if still_due && store.delete_note(id, DeleteMode::Hard).await? {
+        if !still_due {
+            continue;
+        }
+        let routed_legacy = p.mode == QuarantineCleanupMode::LegacySlugless
+            && runtime.backend_id() != runtime.core().backend_id();
+        let expected_ref = properties
+            .and_then(|props| props.get("quarantine_content_ref"))
+            .and_then(Value::as_str);
+        // Hard-delete the note first. Main-backend NoteStore removes its
+        // attachment rows in the same transaction. A routed note's repaired
+        // original lives on canonical main and is detached by exact ID/ref
+        // only after the note deletion commits.
+        if store.delete_note(id, DeleteMode::Hard).await? {
             deleted += 1;
+            if routed_legacy {
+                for attempt in 1..=3 {
+                    match detach_deleted_legacy_original(runtime, id, expected_ref).await {
+                        Ok(detached) => {
+                            routed_owner_detached += usize::from(detached);
+                            break;
+                        }
+                        Err(error) if attempt < 3 => {
+                            tracing::warn!(
+                                note_id = %id,
+                                attempt,
+                                error = %error,
+                                "targeted legacy quarantine owner detach will retry"
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => {
+                            // There is no note left to select on a later tick.
+                            // The possible residue belongs to the operator's
+                            // blob ownerless-row inspection path (#3178).
+                            return Err(RuntimeError::Internal(format!(
+                                "cleanup_expired_quarantine: deleted_notes={deleted}, \
+                                 routed_owners_detached={routed_owner_detached}, \
+                                 possible_owner_residue=1 for note {id} after 3 attempts: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
     }
-    Ok(json!({"ok": true, "deleted": deleted}))
+    Ok(json!({
+        "ok": true,
+        "deleted": deleted,
+        "routed_owners_detached": routed_owner_detached,
+    }))
 }
 
 /// Deterministic UUID identifying the `channel_health` row for one
