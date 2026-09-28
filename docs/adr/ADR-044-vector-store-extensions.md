@@ -1124,3 +1124,156 @@ to the original §1-5 trait extensions, not this A4 schema addition.
 | Add nullable columns to every vec0 table                | Deferred for this change. Dynamic virtual tables need a rebuild to change their declared columns; ADR-043 V17 shows that this is possible. A bypass DELETE+INSERT omitting the nullable columns would leave unknown provenance even with identical embedding bytes. The chosen digest-bound sidecar avoids the rebuild but needs a complete raw-writer inventory to protect write time on an identical-BLOB replacement. |
 | Sidecar keyed only by model and subject                 | Rejected. A bypass writer can replace vec0 without touching that row and leave false provenance. Binding the chosen sidecar to the live embedding BLOB reports unknown when the bytes change; identical-byte replacements still require known writers to clear or maintain the sidecar.                                                                                                                                  |
 | Return `None` for unsupported backends                  | Rejected. It would conflate an unsupported read with a proven absent vector.                                                                                                                                                                                                                                                                                                                                             |
+
+## Amendment A5: rerank from stored vectors (#2378, proposed 2026-09-28)
+
+**Status**: Accepted (2026-09-28; #2378). Builds on A4 (persisted vector text provenance).
+
+### Context
+
+`knowledge.search` reranks its fused lexical and ANN candidates by cosine similarity. Today it does
+so by re-embedding every candidate at query time: `rerank_with_embeddings`
+(`crates/khive-pack-knowledge/src/knowledge/search.rs:1805`) renders each hit as
+`format!("{} {}", name, content)` (`:1817`) and `embed_cosine_scores` (`:1742`) sends those texts,
+plus the query when no query vector is cached yet, through the generic `embed_batch` path. The
+issue records a default `limit=5` search reporting `usage.embed_calls = 37`: one query and 36
+candidate bodies re-embedded on a single call.
+
+Those candidates already have vectors. Atom vectors are written at index time under the field
+`knowledge.atom` (`knowledge/index_handler.rs:359`) through the document-intent embedding path,
+from the text `atom_embed_text` renders (`knowledge/util.rs:313`: name, content and a
+`Tags: ...` line, joined by blank lines). The query-time rendering differs from the indexed one
+(a different separator, and no tags), and the query-time embedding is generic rather than
+document intent. So the rerank signal is neither cheap nor the signal the ANN stage used.
+
+Three facts constrain the change:
+
+1. `VectorStore` (`crates/khive-storage/src/vectors.rs`) has no by-ID vector read. `batch_exists`
+   (`:189`) answers presence and A4's `provenance` (`:59`) answers what produced a row; neither
+   returns the embedding.
+2. The ANN stage cannot supply the similarity instead: `fuse_ann_hits` (`search.rs:236`) fuses
+   by reciprocal rank, so the raw cosine is discarded and a hit keeps only `provenance.ann`.
+3. Lexical candidates can reach the rerank while the warm ANN serving index is unavailable (the
+   warm wait times out, the persisted corpus is non-empty). A design that reads vectors out of
+   the serving index fails in exactly that state.
+
+### Decision
+
+**A5.1: by-ID vector read.** `VectorStore` gains
+
+```rust
+/// Read the stored embeddings of `ids` under `field` in `namespace`, for this
+/// store's embedding model. Absent IDs are absent from the map; the result
+/// has no ordering. Default: StorageError::Unsupported.
+async fn get_vectors(
+    &self,
+    ids: &[Uuid],
+    namespace: &str,
+    field: &str,
+) -> StorageResult<HashMap<Uuid, Vec<f32>>>;
+```
+
+and `VectorStoreCapabilities` gains `supports_vector_read: bool`, default `false` (A2: the
+default must not assume SQLite). The SQLite store implements the read as point lookups on the
+requested IDs, bounded by `ids.len()`, never as a scan, and sets the capability. The read goes to
+the persisted vector store, not to any in-memory serving index, so it works when the ANN index
+is cold, rebuilding or unavailable. It returns the embedding bytes as stored; it does not
+consult A4 provenance.
+
+**A5.2: candidate vectors.** When the rerank runs, each candidate's vector, atom or domain, is
+taken from `get_vectors` under `knowledge.atom`, from the store of the embedding model the request's
+query vector belongs to. `get_vectors` takes one namespace, like `batch_exists`. The rerank issues one
+read per namespace the request searched and merges the results; an ID absent from every read is a
+candidate with no stored vector. Today `knowledge.search` searches exactly one namespace, the
+caller's (`token.namespace()` in `search`, `search.rs:3296`), so this is one read bounded by the
+candidate count; a request that searches several namespaces makes one read per namespace, each
+bounded the same way. Domain candidates follow the same rule. `knowledge.upsert_domains` writes each
+domain's FTS mirror into `knowledge_atoms` under the domain's own UUID, tagged `type:domain`
+(`knowledge/crud.rs:684`). `knowledge.index` embeds every live atom of the namespace, mirrors
+included (`knowledge/index_handler.rs:76`). So a domain's stored `knowledge.atom` vector is its
+mirror's, the vector the ANN stage scored. A candidate with no stored vector, and every candidate
+when the store does not support the read, is embedded at query time through the document-intent
+path using `atom_embed_text`, the indexing renderer, over the candidate's name, content and tags,
+so a fallback vector lands in the same space as a stored one. This includes a domain hydrated only
+from `knowledge_domains`, with no indexed mirror. No candidate vector is ever produced by the
+generic `embed_batch` path.
+
+**A5.3: the query vector.** The rerank uses the request's one query-intent embedding attempt
+(`embed_query`), attempting it if no earlier stage has. If that attempt failed, the rerank does not
+run: it does not substitute a generic or document-intent vector for the query. The generic query
+slot in `QueryEmbeddingCache` is no longer produced by the rerank.
+
+**A5.4: result-level provenance.** Whenever the rerank runs, the `knowledge.search` result carries
+
+```
+rerank_provenance {
+  stored_vector_lookup: "supported" | "unsupported",
+  candidates: <n>,
+  from_stored: <n>,
+  embedded_fallback: <n>,
+}
+```
+
+with `candidates = from_stored + embedded_fallback`. `unsupported` always reads `from_stored: 0`.
+The object is present on every run of the rerank, including a run with no fallback, so its absence
+means only that the rerank did not run. The fixed `usage` counter set is unchanged. A difference of
+`usage.embed_calls` and 1 happens to equal `embedded_fallback` on a default search today; it is not
+a contract.
+
+**A5.5: what stays.** `rerank=false` skips the rerank as before. Each new read (the by-ID read and
+any fallback embedding) runs as a request read phase: a spent deadline degrades to "rerank did not
+run", the same contract as the existing `knowledge.embedding_rerank` phase, and the lexical
+stage's own timeout (reported as `candidate_provenance.lexical: "timed_out"`) is untouched. ANN-degradation reporting is unchanged. The per-hit
+`provenance.embedding_rerank` flag keeps its meaning.
+
+**A5.6: staleness is inherited, not solved here.** A stored vector is used as stored. The ANN stage
+already scores candidates from the same stored vectors, so the rerank inherits exactly the
+staleness the ANN stage has. Comparing a stored vector's A4 `text_fingerprint` with the current
+rendering, and re-embedding on mismatch (the stale-row fallback of #2378 step 3), is a later
+amendment.
+
+### Consequences
+
+- Ranking changes by construction. Today's rerank compares generic query and candidate vectors of
+  one rendering; A5 compares a query-intent vector with document-intent vectors of the indexing
+  rendering, tags included. A test that asserts today's order would pin the old behaviour.
+- A default search on a fully indexed corpus embeds only the query when the ANN stage has already
+  embedded it, instead of the query plus every fused candidate body.
+- Every `VectorStore` implementation outside this repository keeps compiling through the default
+  and reports `unsupported`, which the result makes visible rather than silent.
+
+### Alternatives considered
+
+- **Carry the ANN similarity through fusion** and embed only lexical-only candidates. This removes
+  the need for a read seam but leaves lexical-only candidates, and every candidate while the serving
+  index is unavailable, on the query-time path, and it changes `fuse_ann_hits` and `ScoredHit` for
+  a signal only the rerank consumes. Rejected: it does not cover the degraded-serving case.
+- **Read vectors out of the ANN serving index.** Cheapest when the index is warm; unavailable in
+  exactly the state that sends lexical candidates to the rerank. Rejected.
+- **Report the fallback count as an eighth `usage` counter.** `embed_calls` cannot tell an
+  unsupported backend from a corpus with no stored vectors, and neither could another counter.
+  Rejected in favour of A5.4.
+
+### Verification
+
+1. Stored vectors are read: replace one candidate's stored vector with a known, different vector;
+   its rank must move. A test that only reproduces an order proves nothing about the read.
+2. Fallback: a candidate with no stored vector is embedded through the document-intent path from
+   `atom_embed_text`, and `rerank_provenance` reports it in `embedded_fallback`. Domains: a domain
+   whose mirror has a stored vector counts in `from_stored`; a domain hydrated only from
+   `knowledge_domains` counts in `embedded_fallback`.
+3. Unsupported store: a store without `supports_vector_read` reads `stored_vector_lookup:
+   "unsupported"`, `from_stored: 0`, `embedded_fallback == candidates`.
+4. Degraded serving: with the warm index unavailable and lexical candidates present, the rerank
+   runs from stored vectors (`from_stored > 0`).
+5. Failed query embedding: the rerank does not run and no substitute vector is used.
+6. `rerank=false` and a spent request deadline behave as before.
+7. The ordering change is characterised on a fixture that includes tagged atoms, where the indexed
+   and query-time renderings differ, and the characterisation is recorded with the change.
+8. Must-fail controls: a no-op `get_vectors` (always empty) must turn test 1 red; routing the
+   fallback through the generic path must turn test 2 red; emitting `rerank_provenance` only on
+   the fallback path must turn red a test that requires the object to be absent when
+   `rerank=false` and present with `from_stored: 0` on an unsupported store.
+
+**Refs.** #2378 (and its corrections), #2878 (A4), #2307 (query-intent vector must not be
+substituted).
