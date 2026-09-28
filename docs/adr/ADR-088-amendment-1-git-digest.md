@@ -306,6 +306,28 @@ that cluster at one instant reflect real GitHub bulk-close events (confirmed aga
 `gh issue view`), and `author` is the genuine GitHub login (commit author names come from
 git identity, a different identity system — both correct).
 
+### ADR-088 Amendment 1 rider — historical shared-commit project annotations (#3532)
+
+**Status:** Accepted (2026-09-28). This text belongs after Amendment 1's “Ingest enrichment” section. It adds a one-shot admin repair; it does not change normal `git.digest`, introduce an agent-facing verb, or backfill reference-extraction edges.
+
+#### Historical project-annotation reconciliation
+
+A commit note has a namespace-and-SHA identity, while ingestion tracks progress per project. When two project anchors share a commit, one project can already have acknowledged that SHA before the ingester learned to add a missing `commit`-note → `project` `annotates` edge. A later digest skips the acknowledged prefix and cannot repair that historical link. The ingest-enrichment section's earlier “no retroactive backfill verb” statement remains true for its reference-edge extraction. For this narrower project-annotation gap, a one-shot `kkernel` admin reconciliation is allowed.
+
+The repair is **per project**, with a read-only preview published before any apply. The operator selects a live project, its exact namespace and repository source, and a frozen Git tip. The preview reads the project's `commits` cursor and `commits_checkpoint` sidecar together and reconstructs the acknowledged commit sequence in the same reverse-topological order as normal ingest, including the sidecar's base cursor, snapshot head, and last completed SHA. A SHA cursor alone is not proof of a visited prefix across merge branches. If required objects are unavailable, the source history diverged, the sidecar is malformed or inconsistent, or a legacy cursor lacks enough evidence to prove coverage, preview reports **incomplete coverage** with a reason. It must not use current `HEAD` as proof that rewritten-away history was acknowledged. Apply refuses a project whose acknowledged coverage is incomplete.
+
+For each proved SHA, resolve the live commit note by exact namespace and full SHA. An absent, deleted, or ambiguous note is counted separately and never created or changed by this repair. Inspect its `annotates` edges to the selected project including soft-deleted edges. A live edge, including one with curated weight or metadata, is preserved byte-for-byte. A tombstoned edge is an intentional exclusion: count it as skipped, do not revive or replace it, and do not classify it as repairable. Only a live, unambiguous note with neither a live nor tombstoned project edge is a missing-link candidate. Missing notes and ambiguous identities prevent a completeness claim; the repair cannot fill them by creating provenance records.
+
+Preview publishes bounded, per-project counts before apply: acknowledged SHAs examined; live note hits; live project edges already present; repairable missing links; tombstones skipped; missing or deleted notes; ambiguous notes; and coverage errors, each with a safe diagnostic. Apply must consume the specific previewed project, namespace, source, frozen tip, and cursor snapshot, revalidate them before the first write, and refuse stale or incomplete input. It creates only the missing `annotates` links through the normal link path with `resurrect=false`, in bounded batches. It serializes with normal ingest for the same project or rechecks the note and both live/deleted edge states atomically before each link. A link failure stops that project's completion, reports the partial count, and leaves the remaining links retryable. A second apply creates no duplicate edge.
+
+Reconciliation progress, if needed, is separate from ingest cursors. Neither preview nor apply may update `commits` or `commits_checkpoint`, change note content/properties, delete a note, or alter an existing edge. Before and after each operation, assert byte-exact equality of both cursor rows, including their absence. After apply, repeat preview against the same frozen tip. Success requires complete acknowledged-history coverage, zero repairable missing links, zero missing/ambiguous notes, and no link failures; tombstones remain reported exclusions rather than repair targets. Publish both previews and the apply counters. Normal new-commit ingestion must still resume from the unchanged cursor.
+
+##### Required negative controls
+
+The implementation must fail its acceptance suite if any of these arms regresses: a curated live edge is overwritten; a tombstone is resurrected or counted as repairable; an absent/deleted note is fabricated or yields a success claim; a link failure is swallowed or marks the project complete; a merge-DAG partial checkpoint is treated as the ancestor closure of its last SHA; unavailable or diverged history yields a complete preview; or either cursor row changes by one byte. The positive control has two project anchors sharing one SHA, with the second project's cursor already beyond it: preview reports one missing link, apply creates exactly one, and a repeat preview/apply changes nothing.
+
+**Implementation follow-up:** issue #3532; design basis: ADR-088 §4, Amendment 1 “Ingest enrichment”, `crates/khive-pack-git/src/ingest.rs` commit checkpoint and annotation helpers, and `crates/khive-pack-git/docs/ingest.md` “Commit walk: ancestor-divergence and cursor-stall”.
+
 ## Commit embedding truncation (issue #764, 2026-07-10)
 
 Commit note content (subject plus body, after secret masking) has no upper bound, but
