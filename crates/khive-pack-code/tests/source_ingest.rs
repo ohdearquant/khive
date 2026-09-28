@@ -1076,6 +1076,71 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
     );
 }
 
+#[tokio::test]
+async fn many_unresolved_imports_append_once_per_project_in_encounter_order() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root.path().join("many_imports");
+    std::fs::create_dir_all(&project).unwrap();
+    let source = (0..40)
+        .map(|i| format!("import missing_{i:02}\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    std::fs::write(project.join("main.py"), source).unwrap();
+    let rt = rt_at(&root.path().join("many_imports.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: &project,
+            languages: ["python"].into_iter().collect(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("many-import sweep succeeds");
+    assert_eq!(report.unresolved_recorded, 40);
+    assert_eq!(
+        report.fts_indexed, 4,
+        "project and module upserts, one unresolved batch, one coverage stamp"
+    );
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT properties FROM entities \
+                  WHERE deleted_at IS NULL AND kind = 'project' AND name = ?1"
+                .into(),
+            params: vec![SqlValue::Text("many_imports".to_string())],
+            label: Some("many_unresolved_imports_project".into()),
+        })
+        .await
+        .expect("query project")
+        .expect("project row");
+    let properties = match row.get("properties") {
+        Some(SqlValue::Text(raw)) => {
+            serde_json::from_str::<serde_json::Value>(raw).expect("JSON properties")
+        }
+        other => panic!("expected JSON project properties, got {other:?}"),
+    };
+    let actual: Vec<String> = properties["unresolved_specifiers"]
+        .as_array()
+        .expect("unresolved list")
+        .iter()
+        .map(|value| value["specifier"].as_str().expect("specifier").to_string())
+        .collect();
+    let expected: Vec<_> = (0..40).map(|i| format!("missing_{i:02}")).collect();
+    assert_eq!(
+        actual, expected,
+        "stored import order must match source order"
+    );
+}
+
 /// `pkg_a` declares a dependency whose name is itself a secret-shaped string
 /// (`scheme://user:pass@host` — the exact url-userinfo pattern the runtime
 /// secret gate blocks, ADR-085 D6 #4). `pkg_b` is an ordinary sibling
