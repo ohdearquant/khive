@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    is_valid_mailbox_actor_label, KhiveRuntime, MailboxView, NamespaceToken, RuntimeError,
+    is_valid_mailbox_actor_label, EmailMessageIdDomains, KhiveRuntime, MailboxView, NamespaceToken,
+    RuntimeError,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
@@ -1553,6 +1554,7 @@ pub(crate) fn reply_subject_for(subject: &str) -> String {
 pub(crate) async fn handle_reply(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
+    email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -1588,6 +1590,21 @@ pub(crate) async fn handle_reply(
         .as_ref()
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // Every nonempty outbound external_id would become a parent mail header
+    // below, including a legacy row with no channel metadata at all.
+    if orig_props.get("direction").and_then(Value::as_str) == Some("outbound") {
+        if let Some(external_id) = orig_props.get("external_id").and_then(Value::as_str) {
+            if !external_id.is_empty()
+                && !verified_outbound_email_external_id(&original, email_domains)
+            {
+                return Err(external_id_unverifiable(
+                    original.id,
+                    "outbound parent has no own-ID-bound Message-ID in the configured sending domains",
+                ));
+            }
+        }
+    }
 
     // Issue #403: parent's wire Message-ID drives In-Reply-To/References for native
     // mail clients. `None` when the parent has none — see docs/api/message-lifecycle.md.
@@ -2245,6 +2262,7 @@ pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
     channel_ingest_capability: Option<&khive_runtime::ChannelIngestCapability>,
+    email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     token: &NamespaceToken,
     params: Value,
     quarantine_retention: std::time::Duration,
@@ -2429,6 +2447,8 @@ pub(crate) async fn handle_ingest(
         if !corr.is_empty() {
             // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
             let mut pass1 = None;
+            let email_reply =
+                p.channel_kind.as_deref() == Some("email") || p.from.trim().starts_with("email:");
             for candidate in message_id_match_candidates(corr) {
                 let corr_filter = NoteFilter {
                     kind: Some("message".to_string()),
@@ -2446,36 +2466,52 @@ pub(crate) async fn handle_ingest(
                     ],
                     ..Default::default()
                 };
-                let corr_page = store
-                    .query_notes_filtered_count_free(
-                        ns,
-                        &corr_filter,
-                        PageRequest {
-                            limit: 1,
-                            offset: 0,
-                        },
-                    )
-                    .await?;
-                pass1 = corr_page.items.first().map(|n| {
-                    // Falls back to the matched note's own UUID as root (#479b, ADR-040)
-                    // when it carries no valid thread_id (e.g. legacy/imported row).
-                    let thread_id = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("thread_id"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<Uuid>().ok())
-                        .map(|id| id.as_hyphenated().to_string())
-                        .unwrap_or_else(|| n.id.as_hyphenated().to_string());
-                    let from_actor = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("from_actor"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    (thread_id, from_actor)
-                });
+                let mut offset = 0;
+                loop {
+                    let corr_page = store
+                        .query_notes_filtered_count_free(
+                            ns,
+                            &corr_filter,
+                            PageRequest { limit: 100, offset },
+                        )
+                        .await?;
+                    let count = corr_page.items.len();
+                    if let Some(n) = corr_page.items.iter().find(|n| {
+                        if email_reply || outbound_email_message(n) {
+                            verified_outbound_email_external_id(n, email_domains)
+                        } else {
+                            true
+                        }
+                    }) {
+                        // A copied Message-ID can sort first. Only the row that
+                        // owns its UUID may supply the thread and actor.
+                        let thread_id = n
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("thread_id"))
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<Uuid>().ok())
+                            .map(|id| id.as_hyphenated().to_string())
+                            .unwrap_or_else(|| n.id.as_hyphenated().to_string());
+                        let from_actor = n
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("from_actor"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        pass1 = Some((thread_id, from_actor));
+                        break;
+                    }
+                    if count < 100 {
+                        break;
+                    }
+                    offset = offset.checked_add(count as u64).ok_or_else(|| {
+                        RuntimeError::Internal(
+                            "ingest: correlation pagination offset overflowed".into(),
+                        )
+                    })?;
+                }
                 if pass1.is_some() {
                     break;
                 }
@@ -3948,6 +3984,57 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
     }
 }
 
+fn outbound_email_message(note: &Note) -> bool {
+    let props = note.properties.as_ref();
+    props
+        .and_then(|p| p.get("direction"))
+        .and_then(Value::as_str)
+        == Some("outbound")
+        && (props
+            .and_then(|p| p.get("channel_kind"))
+            .and_then(Value::as_str)
+            == Some("email")
+            || props
+                .and_then(|p| p.get("channel_slug"))
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug.contains('@'))
+            || ["to_actor", "to", "from_actor", "from"].iter().any(|key| {
+                props
+                    .and_then(|p| p.get(*key))
+                    .and_then(Value::as_str)
+                    .is_some_and(|actor| actor.starts_with("email:"))
+            }))
+}
+
+fn verified_outbound_email_external_id(
+    note: &Note,
+    domains: &Result<Option<EmailMessageIdDomains>, String>,
+) -> bool {
+    let Some(domains) = domains.as_ref().ok().and_then(Option::as_ref) else {
+        return false;
+    };
+    let props = note.properties.as_ref();
+    domains.verifies_channel_slug(
+        props
+            .and_then(|p| p.get("channel_slug"))
+            .and_then(Value::as_str),
+    ) && props
+        .and_then(|p| p.get("external_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|external_id| domains.verify(note.id, external_id))
+}
+
+fn external_id_unverifiable(note_id: Uuid, reason: &str) -> RuntimeError {
+    khive_types::KhiveError::invalid_input(format!(
+        "external_id_unverifiable: outbound message {note_id}: {reason}"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "external_id_unverifiable".to_string()),
+        ("note_id", note_id.to_string()),
+    ]))
+    .into()
+}
+
 /// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed);
 /// the single place that does so for `In-Reply-To`/`References` headers.
 fn wrap_message_id(raw: &str) -> String {
@@ -4244,6 +4331,7 @@ mod tests {
             &runtime,
             &signal,
             Some(&capability),
+            &Ok(None),
             &token,
             body.clone(),
             std::time::Duration::from_secs(14 * 24 * 60 * 60),
@@ -4261,6 +4349,7 @@ mod tests {
             &runtime,
             &signal,
             Some(&capability),
+            &Ok(None),
             &token,
             body,
             std::time::Duration::from_secs(14 * 24 * 60 * 60),
@@ -4346,6 +4435,7 @@ mod tests {
             &runtime,
             &signal,
             Some(&capability),
+            &Ok(None),
             &token,
             body.clone(),
             std::time::Duration::from_secs(14 * 24 * 60 * 60),
@@ -4377,6 +4467,7 @@ mod tests {
                         &runtime,
                         &signal,
                         Some(&capability),
+                        &Ok(None),
                         &token,
                         body,
                         std::time::Duration::from_secs(14 * 24 * 60 * 60),
