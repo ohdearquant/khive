@@ -256,12 +256,12 @@ pub enum StorageError {
     )]
     WriterTaskNoRuntime,
 
-    /// A filesystem-backed capability (e.g. `BlobStore`) refused a write
-    /// because `volume`'s available space, after accounting for the pending
-    /// write, would drop below the configured free-space floor (khive#292).
+    /// A filesystem-backed capability refused a write because its free-space
+    /// floor would be violated. Blob writes account for the known byte count;
+    /// SQLite admission cannot know the next transaction's size.
     #[error(
         "refusing write on {capability:?} at {volume}: {available_bytes} bytes available, \
-         below the {floor_bytes}-byte floor"
+         the {floor_bytes}-byte free-space floor would be violated"
     )]
     CapacityFloor {
         capability: StorageCapability,

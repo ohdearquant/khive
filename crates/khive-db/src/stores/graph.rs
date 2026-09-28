@@ -34,7 +34,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Graph, op, e)
+    e.into_storage_error(StorageCapability::Graph, op)
 }
 
 fn resurrection_required_error(operation: &'static str, edge: &Edge) -> StorageError {
