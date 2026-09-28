@@ -12,9 +12,9 @@ use khive_runtime::EdgeListFilter;
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, entity_type_filter_matches,
     event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
-    normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_specific,
-    remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json,
-    validate_entity_type_filter, validate_graph_read_kind, KindSpec, ListParams,
+    normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_entity_type,
+    reconcile_specific, remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any,
+    to_json, validate_graph_read_kind, KindSpec, ListParams,
 };
 use crate::sql::sql;
 use crate::KgPack;
@@ -399,7 +399,10 @@ impl KgPack {
             ));
         }
         match spec {
-            KindSpec::Entity { specific } => {
+            KindSpec::Entity {
+                specific,
+                entity_type,
+            } => {
                 let kind_filter = reconcile_specific(
                     specific,
                     p.entity_kind.as_deref(),
@@ -409,8 +412,9 @@ impl KgPack {
                     },
                     "entity_kind",
                 )?;
-                let validated_et = validate_entity_type_filter(
+                let validated_et = reconcile_entity_type(
                     kind_filter.as_deref(),
+                    entity_type.as_deref(),
                     p.entity_type.as_deref(),
                     registry,
                 )?;

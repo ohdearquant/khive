@@ -944,8 +944,14 @@ fn delete_expected_kind(
     let spec = khive_pack_kg::handlers::resolve_kind_spec(raw, registry)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match spec {
-        khive_pack_kg::handlers::KindSpec::Entity { specific } => Ok(Some(
-            khive_runtime::atomic_prepare::AtomicDeleteKind::Entity { specific },
+        khive_pack_kg::handlers::KindSpec::Entity {
+            specific,
+            entity_type,
+        } => Ok(Some(
+            khive_runtime::atomic_prepare::AtomicDeleteKind::Entity {
+                specific,
+                entity_type,
+            },
         )),
         khive_pack_kg::handlers::KindSpec::Note { specific } => Ok(Some(
             khive_runtime::atomic_prepare::AtomicDeleteKind::Note { specific },
@@ -980,8 +986,14 @@ fn update_expected_kind(
     let spec = khive_pack_kg::handlers::resolve_kind_spec(raw, registry)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match spec {
-        khive_pack_kg::handlers::KindSpec::Entity { specific } => Ok(Some(
-            khive_runtime::atomic_prepare::AtomicUpdateKind::Entity { specific },
+        khive_pack_kg::handlers::KindSpec::Entity {
+            specific,
+            entity_type,
+        } => Ok(Some(
+            khive_runtime::atomic_prepare::AtomicUpdateKind::Entity {
+                specific,
+                entity_type,
+            },
         )),
         khive_pack_kg::handlers::KindSpec::Note { specific } => Ok(Some(
             khive_runtime::atomic_prepare::AtomicUpdateKind::Note { specific },
