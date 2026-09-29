@@ -82,7 +82,11 @@ fn relative_path(raw: &str, line: usize) -> Result<String, ClippyAdapterError> {
     let slash_path = raw.replace('\\', "/");
     #[cfg(not(windows))]
     let slash_path = raw;
-    if slash_path.starts_with('/') || slash_path.contains('\0') || slash_path.contains(':') {
+    let windows_absolute = matches!(
+        slash_path.as_bytes(),
+        [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic()
+    );
+    if slash_path.starts_with('/') || slash_path.contains('\0') || windows_absolute {
         return Err(line_error(
             line,
             "message.spans[].file_name must be a relative repository path",

@@ -273,12 +273,7 @@ fn all_documented_severity_levels_remain_mapped() {
 
 #[test]
 fn lexical_path_and_ambiguous_span_refusals_remain() {
-    for path in [
-        "/outside/lib.rs",
-        "../lib.rs",
-        r"C:\outside\lib.rs",
-        "\0.rs",
-    ] {
+    for path in ["/outside/lib.rs", "../lib.rs", "\0.rs"] {
         let mut record = diagnostic(SOURCE_A, 12);
         record["message"]["spans"][0]["file_name"] = json!(path);
         assert!(
@@ -296,6 +291,30 @@ fn lexical_path_and_ambiguous_span_refusals_remain() {
     assert!(
         err.to_string().contains("more than one primary span"),
         "{err}"
+    );
+}
+
+#[test]
+fn windows_absolute_drive_paths_refuse_under_both_separator_spellings() {
+    for path in [r"C:\outside\lib.rs", "C:/outside/lib.rs"] {
+        let mut record = diagnostic(SOURCE_A, 12);
+        record["message"]["spans"][0]["file_name"] = json!(path);
+        assert!(
+            ingest(&[record], "synthetic-commit").is_err(),
+            "accepted Windows absolute path {path:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_colon_filename_remains_relative_evidence() {
+    let mut record = diagnostic(SOURCE_A, 12);
+    record["message"]["spans"][0]["file_name"] = json!("src/generated:part.rs");
+    let batch = ingest(&[record], "synthetic-commit").expect("valid Unix filename");
+    assert_eq!(
+        props(&batch, 0)["evidence"][0]["path"],
+        "src/generated:part.rs"
     );
 }
 

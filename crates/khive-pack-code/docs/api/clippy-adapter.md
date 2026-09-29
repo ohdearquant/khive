@@ -30,7 +30,9 @@ Unknown record reasons, malformed JSON,
 missing lint fields, ambiguous primary spans, and paths outside the repository are
 reported with the input line number. The caller must supply repo, branch, commit,
 and scope strings. On Unix, a literal backslash in a filename remains a backslash;
-on Windows, native backslash separators become `/`. A run without an explicit
+on Windows, native backslash separators become `/`. A colon is a valid Unix
+filename character; an initial Windows absolute drive prefix such as `C:/`
+or `C:\foo` is refused on either host. A run without an explicit
 `source_run` uses the producer ID and commit, independent of observation date.
 
 Severity mapping is `error` → `high`, `warning` → `medium`, and
