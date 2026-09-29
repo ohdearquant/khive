@@ -277,21 +277,66 @@ async fn search_executed_rejects_unknown_result_kind() {
 }
 
 #[tokio::test]
-async fn search_executed_rejects_absent_result_kind() {
+async fn search_executed_absent_result_kind_projects_historical_note_rows() {
     let store = setup_memory_store();
     let mut event = make_event("default");
+    let note_id = Uuid::new_v4();
     event.payload = json!({
-        "candidates": [Uuid::new_v4().to_string()],
-        "selected": []
+        "candidates": [note_id.to_string()],
+        "selected": [note_id.to_string()]
     });
     let event_id = event.id;
-
-    let result = store.append_event(event).await;
-    assert!(result.is_err(), "absent result_kind must be rejected");
-    assert!(
-        store.get_event(event_id).await.unwrap().is_none(),
-        "invalid event and projection must roll back atomically"
+    store.preflight_event(&event).unwrap();
+    event_insert_statements(&event).unwrap();
+    store.append_event(event.clone()).await.unwrap();
+    let event_id_str = event_id.to_string();
+    let reader = store.pool.reader().unwrap();
+    let mut stmt = reader
+        .conn()
+        .prepare(
+            "SELECT entity_id, referent_kind, role FROM event_observations \
+             WHERE event_id = ?1 ORDER BY role, position",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([&event_id_str], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (note_id.to_string(), "note".into(), "candidate".into()),
+            (note_id.to_string(), "note".into(), "selected".into()),
+        ]
     );
+    drop(stmt);
+    drop(reader);
+    let replay = store.append_events_idempotent(vec![event]).await.unwrap();
+    assert_eq!(
+        replay.rows,
+        vec![EventAppendDisposition::AlreadyPresentIdentical]
+    );
+}
+
+#[tokio::test]
+async fn search_executed_rejects_present_non_string_result_kind() {
+    let store = setup_memory_store();
+    for result_kind in [json!(null), json!(0), json!(["note"])] {
+        let mut event = make_event("default");
+        event.payload = json!({"result_kind": result_kind, "candidates": [], "selected": []});
+        let event_id = event.id;
+        assert!(store.preflight_event(&event).is_err());
+        assert!(event_insert_statements(&event).is_err());
+        assert!(store.append_event(event).await.is_err());
+        assert!(store.get_event(event_id).await.unwrap().is_none());
+    }
 }
 
 async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String> {
