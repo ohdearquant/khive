@@ -9,8 +9,8 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::Visit;
 use syn::{
-    Attribute, Expr, ExprCall, ExprLit, ExprMethodCall, ImplItemFn, ItemFn, ItemImpl, ItemMod, Lit,
-    Macro,
+    Attribute, Block, Expr, ExprCall, ExprLit, ExprMethodCall, FnArg, ImplItemFn, ItemFn, ItemImpl,
+    ItemMod, ItemUse, Lit, Local, Macro, Pat, PatIdent, Stmt, UseTree,
 };
 
 use super::declaration::{
@@ -259,11 +259,124 @@ fn macro_strings(tokens: TokenStream, strings: &mut Vec<String>) {
     }
 }
 
+type SqlBindings = BTreeMap<String, Option<String>>;
+
+fn use_tree_imports(
+    tree: &UseTree,
+    prefix: &mut Vec<String>,
+    imports: &mut Vec<(String, Vec<String>)>,
+) {
+    match tree {
+        UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            use_tree_imports(&path.tree, prefix, imports);
+            prefix.pop();
+        }
+        UseTree::Group(group) => {
+            for item in &group.items {
+                use_tree_imports(item, prefix, imports);
+            }
+        }
+        UseTree::Name(name) => {
+            let name = name.ident.to_string();
+            let mut path = prefix.clone();
+            path.push(name.clone());
+            imports.push((name, path));
+        }
+        UseTree::Rename(rename) => {
+            let mut path = prefix.clone();
+            path.push(rename.ident.to_string());
+            imports.push((rename.rename.to_string(), path));
+        }
+        UseTree::Glob(_) => {}
+    }
+}
+
+fn import_target(
+    path: &[String],
+    known: &SqlBindings,
+    parents: &[SqlBindings],
+    current_module: Option<&SqlBindings>,
+) -> Option<String> {
+    let (original, prefix) = path.split_last()?;
+    if NOTE_PROPERTY_SQL_CONSTANTS.contains(&original.as_str()) {
+        return Some(original.clone());
+    }
+    let lookup = |scope: &SqlBindings| scope.get(original).cloned().flatten();
+    match prefix {
+        [] => lookup(known).or_else(|| current_module.and_then(&lookup)),
+        [qualifier] if qualifier.as_str() == "self" => {
+            current_module.and_then(&lookup).or_else(|| lookup(known))
+        }
+        [qualifier] if qualifier.as_str() == "crate" => parents
+            .first()
+            .or(current_module)
+            .and_then(&lookup)
+            .or_else(|| lookup(known)),
+        _ if prefix.iter().all(|qualifier| qualifier.as_str() == "super") => parents
+            .len()
+            .checked_sub(prefix.len())
+            .and_then(|index| parents.get(index))
+            .and_then(&lookup),
+        _ => None,
+    }
+}
+
+fn use_bindings<'a>(
+    uses: impl Iterator<Item = &'a ItemUse>,
+    parents: &[SqlBindings],
+    current_module: Option<&SqlBindings>,
+) -> SqlBindings {
+    let mut imports = Vec::new();
+    for item in uses {
+        use_tree_imports(&item.tree, &mut Vec::new(), &mut imports);
+    }
+    let mut bindings = imports
+        .iter()
+        .map(|(name, _)| (name.clone(), None))
+        .collect::<SqlBindings>();
+    for _ in 0..imports.len() {
+        let known = bindings.clone();
+        for (name, path) in &imports {
+            bindings.insert(
+                name.clone(),
+                import_target(path, &known, parents, current_module),
+            );
+        }
+        if known == bindings {
+            break;
+        }
+    }
+    bindings
+}
+
+#[derive(Default)]
+struct BoundNames(BTreeSet<String>);
+
+impl<'ast> Visit<'ast> for BoundNames {
+    fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
+        self.0.insert(pat.ident.to_string());
+        syn::visit::visit_pat_ident(self, pat);
+    }
+}
+
+fn shadow_bindings<'a>(
+    patterns: impl Iterator<Item = &'a Pat>,
+) -> BTreeMap<String, Option<String>> {
+    let mut names = BoundNames::default();
+    for pattern in patterns {
+        names.visit_pat(pattern);
+    }
+    names.0.into_iter().map(|name| (name, None)).collect()
+}
+
 struct SourceCollector {
     path: String,
     scope: Vec<String>,
     sites: BTreeMap<String, Site>,
     all_calls: BTreeMap<String, BTreeSet<String>>,
+    bindings: Vec<SqlBindings>,
+    parent_module_bindings: Vec<SqlBindings>,
 }
 
 impl SourceCollector {
@@ -323,9 +436,29 @@ impl<'ast> Visit<'ast> for SourceCollector {
         if test_only(&item.attrs) {
             return;
         }
+        let mut parents = self.parent_module_bindings.clone();
+        parents.push(self.bindings.first().cloned().unwrap_or_default());
+        let module_bindings = item
+            .content
+            .as_ref()
+            .map_or_else(BTreeMap::new, |(_, items)| {
+                use_bindings(
+                    items.iter().filter_map(|item| match item {
+                        syn::Item::Use(item) => Some(item),
+                        _ => None,
+                    }),
+                    &parents,
+                    None,
+                )
+            });
+        let outer_bindings = std::mem::replace(&mut self.bindings, vec![module_bindings]);
+        self.parent_module_bindings
+            .push(outer_bindings.first().cloned().unwrap_or_default());
         self.scope.push(item.ident.to_string());
         syn::visit::visit_item_mod(self, item);
         self.scope.pop();
+        self.parent_module_bindings.pop();
+        self.bindings = outer_bindings;
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -342,18 +475,68 @@ impl<'ast> Visit<'ast> for SourceCollector {
         if test_only(&item.attrs) {
             return;
         }
+        self.bindings
+            .push(shadow_bindings(item.sig.inputs.iter().filter_map(|arg| {
+                if let FnArg::Typed(arg) = arg {
+                    Some(&*arg.pat)
+                } else {
+                    None
+                }
+            })));
         self.scope.push(item.sig.ident.to_string());
         syn::visit::visit_item_fn(self, item);
         self.scope.pop();
+        self.bindings.pop();
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
         if test_only(&item.attrs) {
             return;
         }
+        self.bindings
+            .push(shadow_bindings(item.sig.inputs.iter().filter_map(|arg| {
+                if let FnArg::Typed(arg) = arg {
+                    Some(&*arg.pat)
+                } else {
+                    None
+                }
+            })));
         self.scope.push(item.sig.ident.to_string());
         syn::visit::visit_impl_item_fn(self, item);
         self.scope.pop();
+        self.bindings.pop();
+    }
+
+    fn visit_block(&mut self, block: &'ast Block) {
+        let block_bindings = use_bindings(
+            block.stmts.iter().filter_map(|stmt| {
+                if let Stmt::Item(syn::Item::Use(item)) = stmt {
+                    Some(item)
+                } else {
+                    None
+                }
+            }),
+            &self.parent_module_bindings,
+            self.bindings.first(),
+        );
+        self.bindings.push(block_bindings);
+        syn::visit::visit_block(self, block);
+        self.bindings.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        syn::visit::visit_local(self, local);
+        let shadows = shadow_bindings(std::iter::once(&local.pat));
+        self.bindings
+            .last_mut()
+            .expect("local has a block scope")
+            .extend(shadows);
+    }
+
+    fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
+        self.bindings.push(shadow_bindings(expr.inputs.iter()));
+        syn::visit::visit_expr_closure(self, expr);
+        self.bindings.pop();
     }
 
     fn visit_expr_method_call(&mut self, expr: &'ast ExprMethodCall) {
@@ -418,11 +601,47 @@ impl<'ast> Visit<'ast> for SourceCollector {
         if !self.path.starts_with("khive-db/") {
             if let Some(segment) = expr.path.segments.last() {
                 let name = segment.ident.to_string();
-                if NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str()) {
+                let segments = &expr.path.segments;
+                let imported = if segments.len() == 1 {
+                    self.bindings
+                        .iter()
+                        .rev()
+                        .find_map(|scope| scope.get(&name))
+                } else if segments.len() == 2 && segments[0].ident == "self" {
+                    self.bindings.first().and_then(|scope| scope.get(&name))
+                } else if segments.len() == 2 && segments[0].ident == "crate" {
+                    self.parent_module_bindings
+                        .first()
+                        .or_else(|| self.bindings.first())
+                        .and_then(|scope| scope.get(&name))
+                } else {
+                    let depth = segments.len() - 1;
+                    if segments
+                        .iter()
+                        .take(depth)
+                        .all(|segment| segment.ident == "super")
+                    {
+                        self.parent_module_bindings
+                            .len()
+                            .checked_sub(depth)
+                            .and_then(|index| self.parent_module_bindings.get(index))
+                            .and_then(|scope| scope.get(&name))
+                    } else {
+                        None
+                    }
+                };
+                let constant = if let Some(binding) = imported {
+                    binding.clone()
+                } else if NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str()) {
+                    Some(name.clone())
+                } else {
+                    None
+                };
+                if let Some(constant) = constant {
                     self.record(
                         Substrate::Note,
                         DetectedClass::WholeObject,
-                        format!("SQL constant {name}"),
+                        format!("SQL constant {constant}"),
                     );
                 }
             }
@@ -466,6 +685,15 @@ fn scan_source(path: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
         scope: Vec::new(),
         sites: BTreeMap::new(),
         all_calls: BTreeMap::new(),
+        bindings: vec![use_bindings(
+            file.items.iter().filter_map(|item| match item {
+                syn::Item::Use(item) => Some(item),
+                _ => None,
+            }),
+            &[],
+            None,
+        )],
+        parent_module_bindings: Vec::new(),
     };
     collector.visit_file(&file);
     Ok(collector.sites.into_values().collect())
@@ -1028,6 +1256,119 @@ fn external_note_sql_constant_requires_an_inventoried_reservation_check() {
     assert!(check_inventory(&sites, &[route], 0)
         .unwrap_err()
         .contains("whole-object write lacks its named check/callee"));
+}
+
+#[test]
+fn aliased_note_sql_constants_require_inventory_entries() {
+    assert!(!NOTE_PROPERTY_SQL_CONSTANTS.contains(&"MERGE_SQL"));
+    let path = "sample/src/lib.rs";
+    for (source, constant) in [
+        (
+            "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+             fn unlisted(conn: &Connection) { conn.prepare_cached(MERGE_SQL); }",
+            "NOTE_UPSERT_SQL",
+        ),
+        (
+            "use khive_db::stores::{note::{NOTE_UPSERT_SQL as MERGE_SQL}};
+             fn unlisted(conn: &Connection) { conn.prepare_cached(MERGE_SQL); }",
+            "NOTE_UPSERT_SQL",
+        ),
+        (
+            "fn unlisted(conn: &Connection) {
+                 use khive_db::stores::note::NOTE_INSERT_IF_ABSENT_SQL as MERGE_SQL;
+                 conn.prepare_cached(MERGE_SQL);
+             }",
+            "NOTE_INSERT_IF_ABSENT_SQL",
+        ),
+        (
+            "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+             fn unlisted(conn: &Connection) { conn.prepare_cached(self::MERGE_SQL); }",
+            "NOTE_UPSERT_SQL",
+        ),
+        (
+            "use self::MERGE_SQL as DEEP_SQL;
+             use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+             fn unlisted(conn: &Connection) { conn.prepare_cached(DEEP_SQL); }",
+            "NOTE_UPSERT_SQL",
+        ),
+    ] {
+        let sites = scan_sources(&[(path.into(), source.into())]).unwrap();
+        assert_eq!(sites.len(), 1, "{source}");
+        assert_eq!(sites[0].key, "sample/src/lib.rs::unlisted");
+        assert_eq!(sites[0].target, Substrate::Note);
+        assert_eq!(sites[0].class, DetectedClass::WholeObject);
+        assert!(
+            sites[0]
+                .evidence
+                .contains(&format!("SQL constant {constant}")),
+            "{source}"
+        );
+        assert!(
+            check_inventory(&sites, &[], 0)
+                .unwrap_err()
+                .contains("unmapped sample/src/lib.rs::unlisted"),
+            "{source}"
+        );
+    }
+
+    let glob = "use khive_db::stores::note::*;
+        fn unlisted(conn: &Connection) { conn.prepare_cached(NOTE_UPSERT_SQL); }";
+    let sites = scan_sources(&[(path.into(), glob.into())]).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert!(check_inventory(&sites, &[], 0)
+        .unwrap_err()
+        .contains("unmapped sample/src/lib.rs::unlisted"));
+
+    for qualified in ["super::MERGE_SQL", "crate::MERGE_SQL"] {
+        let source = format!(
+            "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+             mod nested {{ fn unlisted(conn: &Connection) {{ conn.prepare_cached({qualified}); }} }}"
+        );
+        let sites = scan_sources(&[(path.into(), source)]).unwrap();
+        assert_eq!(sites.len(), 1, "{qualified}");
+        assert_eq!(sites[0].key, "sample/src/lib.rs::nested::unlisted");
+        assert!(check_inventory(&sites, &[], 0)
+            .unwrap_err()
+            .contains("unmapped sample/src/lib.rs::nested::unlisted"));
+    }
+    let reimport = "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+        mod nested {
+            use super::MERGE_SQL as DEEP_SQL;
+            fn unlisted(conn: &Connection) { conn.prepare_cached(DEEP_SQL); }
+        }";
+    let sites = scan_sources(&[(path.into(), reimport.into())]).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert!(check_inventory(&sites, &[], 0)
+        .unwrap_err()
+        .contains("unmapped sample/src/lib.rs::nested::unlisted"));
+}
+
+#[test]
+fn aliased_note_sql_constants_respect_lexical_shadows() {
+    let path = "sample/src/lib.rs";
+    for source in [
+        "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+         fn reader(conn: &Connection) {
+             let MERGE_SQL = \"SELECT 1\";
+             conn.prepare_cached(MERGE_SQL);
+         }",
+        "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+         fn reader(conn: &Connection, MERGE_SQL: &str) { conn.prepare_cached(MERGE_SQL); }",
+        "mod writer { use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL; }
+         mod reader { fn read(conn: &Connection) { conn.prepare_cached(MERGE_SQL); } }",
+        "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+         fn reader(conn: &Connection) {
+             let query = |MERGE_SQL: &str| conn.prepare_cached(MERGE_SQL);
+         }",
+    ] {
+        let sites = scan_sources(&[(path.into(), source.into())]).unwrap();
+        assert!(sites.is_empty(), "{source}");
+    }
+    let unused = "use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;
+        fn reader() {}";
+    assert!(scan_sources(&[(path.into(), unused.into())])
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

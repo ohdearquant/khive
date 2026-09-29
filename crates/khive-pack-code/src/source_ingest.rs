@@ -5322,15 +5322,25 @@ mod tests {
             );
             let inserted_a = inserted_a.expect("entity insert A");
             let inserted_b = inserted_b.expect("entity insert B");
-            assert_ne!(inserted_a, inserted_b, "exactly one entity insert wins");
+            assert_ne!(
+                inserted_a,
+                inserted_b,
+                "exactly one entity insert wins in {} mode",
+                mode.label()
+            );
             let stored_entity = entity_store_a
                 .get_entity(entity_id)
                 .await
                 .expect("read entity")
                 .expect("one entity remains");
             let winner = if inserted_a { &entity_a } else { &entity_b };
-            assert_eq!(stored_entity.name, winner.name);
-            assert_eq!(stored_entity.properties, winner.properties);
+            assert_eq!(stored_entity.name, winner.name, "{} mode", mode.label());
+            assert_eq!(
+                stored_entity.properties,
+                winner.properties,
+                "{} mode",
+                mode.label()
+            );
 
             let source_id = project_uuid("insert-source");
             let target_id = project_uuid("insert-target");
@@ -5378,8 +5388,10 @@ mod tests {
             let inserted_a = inserted_a.expect("edge insert A");
             let inserted_b = inserted_b.expect("edge insert B");
             assert_ne!(
-                inserted_a, inserted_b,
-                "exactly one natural-key edge insert wins"
+                inserted_a,
+                inserted_b,
+                "exactly one natural-key edge insert wins in {} mode",
+                mode.label()
             );
             let (winning_edge, losing_edge) = if inserted_a {
                 (&edge_a, &edge_b)
@@ -5391,14 +5403,28 @@ mod tests {
                 .await
                 .expect("read edge")
                 .expect("one edge remains");
-            assert_eq!(stored_edge.id, winning_edge.id);
-            assert_eq!(stored_edge.weight, winning_edge.weight);
-            assert_eq!(stored_edge.metadata, winning_edge.metadata);
-            assert!(edge_store_a
-                .get_edge(losing_edge.id)
-                .await
-                .expect("read loser")
-                .is_none());
+            assert_eq!(stored_edge.id, winning_edge.id, "{} mode", mode.label());
+            assert_eq!(
+                stored_edge.weight,
+                winning_edge.weight,
+                "{} mode",
+                mode.label()
+            );
+            assert_eq!(
+                stored_edge.metadata,
+                winning_edge.metadata,
+                "{} mode",
+                mode.label()
+            );
+            assert!(
+                edge_store_a
+                    .get_edge(losing_edge.id)
+                    .await
+                    .expect("read loser")
+                    .is_none(),
+                "losing edge must be absent in {} mode",
+                mode.label()
+            );
         }
     }
 
