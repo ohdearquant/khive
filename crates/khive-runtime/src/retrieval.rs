@@ -1114,7 +1114,7 @@ impl KhiveRuntime {
     ///
     /// Intended to run once at startup as a background task (warm-up sequence steps 2–4).
     /// Queries the SQL substrate for entity descriptions and note contents that have no
-    /// corresponding entry in the vector store for any registered embedding model, then
+    /// corresponding entry in an eligible embedding model's vector store, then
     /// embeds and inserts them. FTS entries missing for notes are also repopulated.
     ///
     /// The operation is best-effort: individual embed/insert failures are logged and
@@ -1263,21 +1263,25 @@ impl KhiveRuntime {
             let text_store = self.text_for_notes(token).ok();
             let note_store = self.notes(token).ok();
             let mut note_total = 0usize;
+            // Excluded kinds remain absent from this model's vector table.
+            // Advancing by id prevents a full page of them from repeating.
+            let mut note_cursor = String::new();
             loop {
                 // Only the id is selected here; the full Note is fetched below so
                 // note_fts_document gets all fields and stays parity-correct.
                 let note_sql = SqlStatement {
                     sql: format!(
                         "SELECT id FROM notes \
-                         WHERE namespace = ?1 AND deleted_at IS NULL \
+                         WHERE namespace = ?1 AND deleted_at IS NULL AND id > ?3 \
                          AND id NOT IN (\
                              SELECT subject_id FROM {vec_table} \
                              WHERE namespace = ?1 AND embedding_model = ?2 \
-                         ) LIMIT {PAGE_SIZE}"
+                         ) ORDER BY id LIMIT {PAGE_SIZE}"
                     ),
                     params: vec![
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(model_name.clone()),
+                        SqlValue::Text(note_cursor.clone()),
                     ],
                     label: Some("backfill_notes".into()),
                 };
@@ -1304,6 +1308,16 @@ impl KhiveRuntime {
 
                 let batch_len = note_rows.len();
                 note_total += batch_len;
+
+                if let Some(last_id) = note_rows.last().and_then(|row| row.columns.first()) {
+                    if let SqlValue::Text(id) = &last_id.value {
+                        note_cursor.clone_from(id);
+                    } else {
+                        return Err(RuntimeError::Internal(
+                            "backfill note cursor is not text".into(),
+                        ));
+                    }
+                }
 
                 for row in &note_rows {
                     let id_str = row.columns.first().and_then(|c| {
@@ -1342,6 +1356,13 @@ impl KhiveRuntime {
                                     "backfill_missing_embeddings: note FTS upsert failed");
                             }
                         }
+                    }
+
+                    if !self
+                        .embedding_models_for_note_kind(&note.kind)
+                        .contains(model_name)
+                    {
+                        continue;
                     }
 
                     let content = note.content.clone();
@@ -3150,6 +3171,78 @@ mod tests {
         assert!(
             err_msg.contains("injected failure"),
             "error must originate from the injected reader failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_skips_a_full_page_of_excluded_messages_and_reaches_eligible_tail() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec};
+        use khive_storage::note::Note;
+
+        const PAGE: u128 = 500;
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let secondary_name = "zz-backfill-secondary";
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        rt.register_embedder(ConstantEmbedderProvider {
+            name: primary_name.clone(),
+            dimensions: primary.dimensions(),
+        });
+        rt.register_embedder(ConstantEmbedderProvider {
+            name: secondary_name.into(),
+            dimensions: 4,
+        });
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+        let tok = NamespaceToken::local();
+        let primary_store = rt.vectors_for_model(&tok, &primary_name).unwrap();
+        let secondary_store = rt.vectors_for_model(&tok, secondary_name).unwrap();
+        let notes = rt.notes(&tok).unwrap();
+        let mut seeded = Vec::new();
+        for ordinal in 1..=PAGE + 1 {
+            let mut message = Note::new("local", "message", "excluded from secondary");
+            message.id = Uuid::from_u128(ordinal);
+            seeded.push(message);
+        }
+        let mut ordinary = Note::new("local", "observation", "eligible after full page");
+        ordinary.id = Uuid::from_u128(u128::MAX);
+        seeded.push(ordinary.clone());
+        notes.upsert_notes(seeded).await.unwrap();
+
+        let backfilled = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.backfill_missing_embeddings(&tok),
+        )
+        .await
+        .expect("backfill must advance past a full excluded page")
+        .unwrap();
+        assert_eq!(backfilled, (PAGE + 2) as u64 + 1);
+        assert_eq!(primary_store.count().await.unwrap(), (PAGE + 2) as u64);
+        assert_eq!(secondary_store.count().await.unwrap(), 1);
+        let excluded_document = rt
+            .text_for_notes(&tok)
+            .unwrap()
+            .get_document("local", Uuid::from_u128(1))
+            .await
+            .unwrap()
+            .expect("first-model pass must index an excluded message");
+        assert_eq!(excluded_document.body, "excluded from secondary");
+        assert!(
+            rt.text_for_notes(&tok)
+                .unwrap()
+                .get_document("local", ordinary.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the first-model pass must still repopulate FTS"
         );
     }
 }
