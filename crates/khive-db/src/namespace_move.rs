@@ -136,8 +136,9 @@ impl MoveRequest {
 /// What a move did, per route and per table.
 ///
 /// `left_behind` is not an error column. A per-namespace aggregate with no
-/// subject cannot be split across a partitioning move, so it stays, and the
-/// caller is told rather than left to discover it.
+/// subject cannot be split across a partitioning move; separately identified
+/// operational records have no subject route at all. They stay, and the caller
+/// is told rather than left to discover them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MoveCounts {
     /// Subjects moved, keyed by the rendered route key. A routed class with no
@@ -318,6 +319,12 @@ const SUBJECT_KEYED_TABLES: &[&str] = &["brain_implicit_mass", "brain_serve_ledg
 const MEMORY_VISIBILITY_RECEIPTS: &str = "memory_visibility_receipts";
 const MEMORY_VISIBILITY_FENCES: &str = "memory_visibility_fences";
 
+/// Sender envelopes have a logical-message/device/epoch identity and survive
+/// deletion of their outbound note. The session mirror uses provider session
+/// identities, not the IDs of caller-authored `session` notes. Neither has a
+/// route in `MoveRequest`, so retain their source attribution and report it.
+const LEAVE_BEHIND_TABLES: &[&str] = &["comm_sender_transport", "sessions", "session_messages"];
+
 /// What a move does with one namespace-bearing table.
 ///
 /// This is the half of the design that cannot be derived, because it is a
@@ -368,6 +375,9 @@ pub enum TableDisposition {
     NamespaceScopedAggregate,
     /// Keyed by a subject the caller routes, so it follows that subject.
     SubjectKeyed { subject_column: &'static str },
+    /// Owns an identity outside the routed subject set. Keep its namespace and
+    /// report the retained rows so a caller can handle them separately.
+    LeaveBehind,
 }
 
 /// The disposition of a table, or `None` if this code has never seen it.
@@ -423,6 +433,7 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         "memory_visibility_fences" => SubjectKeyed {
             subject_column: "note_id",
         },
+        _ if LEAVE_BEHIND_TABLES.contains(&table.name.as_str()) => LeaveBehind,
 
         // Created at runtime, one per embedding model, and in no source file, so
         // the live store is the only place they can be identified from.
@@ -1154,6 +1165,19 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     // with foreign keys enabled. The helper keeps the reference valid throughout.
     for target in &targets {
         move_memory_visibility(conn, source, target, &mut counts.rows)?;
+    }
+    for table in [MEMORY_VISIBILITY_RECEIPTS, MEMORY_VISIBILITY_FENCES] {
+        let left = count_in_namespace(conn, table, source)?;
+        if left > 0 {
+            counts.left_behind.insert((*table).to_string(), left);
+        }
+    }
+
+    for table in LEAVE_BEHIND_TABLES {
+        let left = count_in_namespace(conn, table, source)?;
+        if left > 0 {
+            counts.left_behind.insert((*table).to_string(), left);
+        }
     }
 
     // Per-namespace aggregates with no subject. A partitioning move has no

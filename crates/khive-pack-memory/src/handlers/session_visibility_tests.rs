@@ -311,11 +311,47 @@ async fn future_sequence_refuses_with_typed_freshness_unmet_and_model() {
         .checked_add(1_000_000)
         .expect("fixture sequence leaves headroom"));
 
-    let error = registry
-        .dispatch("memory.recall", session_request(CONTENT, visibility_token))
-        .await
-        .expect_err("an unobserved future sequence cannot prove session visibility");
+    let (result, probes, exact_statements) = ann::count_session_statements(
+        registry.dispatch("memory.recall", session_request(CONTENT, visibility_token)),
+    )
+    .await;
+    let error = result.expect_err("an unobserved future sequence cannot prove session visibility");
     assert_freshness_unmet(error, MODEL);
+    assert_eq!(probes, 1, "zero wait performs exactly one fence check");
+    assert_eq!(
+        exact_statements, 0,
+        "an unobserved fence must not run memory_session_exact_snapshot KNN"
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn waiting_on_a_future_fence_polls_proof_without_repeating_knn() {
+    let rt = vector_runtime();
+    let registry = registry(&rt);
+    let remembered = remember(&registry, CONTENT).await;
+    let mut visibility_token = remembered["visibility_token"].clone();
+    let issued_seq = visibility_token["fences"][0]["ann_write_log_seq"]
+        .as_u64()
+        .expect("issued sequence");
+    visibility_token["fences"][0]["ann_write_log_seq"] = json!(issued_seq + 1_000_000);
+    let mut request = session_request(CONTENT, visibility_token);
+    request["timeout_ms"] = json!(120);
+
+    let started = std::time::Instant::now();
+    let (result, probes, exact_statements) =
+        ann::count_session_statements(registry.dispatch("memory.recall", request)).await;
+    assert_freshness_unmet(result.expect_err("future fence cannot arrive"), MODEL);
+    assert!((1..=5).contains(&probes), "40 ms probe cadence: {probes}");
+    assert_eq!(
+        exact_statements, 0,
+        "polling an unmet fence must not dispatch memory_session_exact_snapshot"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(750),
+        "retry work must stop near the caller's 120 ms wait window"
+    );
 }
 
 #[tokio::test]

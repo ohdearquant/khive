@@ -146,6 +146,18 @@ fn freshness_unmet(models: &[String]) -> RuntimeError {
     .into()
 }
 
+fn session_attempt_deadline(
+    first_attempt: bool,
+    wait_end: Instant,
+    attempt_deadline: Instant,
+) -> Instant {
+    if first_attempt {
+        attempt_deadline
+    } else {
+        attempt_deadline.min(wait_end)
+    }
+}
+
 impl MemoryPack {
     async fn collect_recall_candidates_with_session(
         &self,
@@ -168,20 +180,39 @@ impl MemoryPack {
             .iter()
             .map(|fence| fence.model.clone())
             .collect();
+        let fence = opts.session_fence.expect("nonempty session fence checked");
+        let mut first_attempt = true;
         loop {
-            if Instant::now() >= attempt_deadline {
+            // A zero wait still gets one immediate attempt. Only retries are
+            // bounded by the caller's wait window as well as the request cap.
+            let deadline = session_attempt_deadline(first_attempt, wait_end, attempt_deadline);
+            if Instant::now() >= deadline {
                 return Err(freshness_unmet(&required_models));
             }
-            let candidate_future = Box::pin(self.collect_recall_candidates(query, token, opts));
-            let candidates = tokio::time::timeout_at(attempt_deadline.into(), candidate_future)
+            first_attempt = false;
+
+            // Poll the inexpensive fence without embedding, FTS or KNN. The
+            // candidate-producing read proves it again in its own snapshot.
+            let probe = Box::pin(crate::ann::session_unmet_fences(&self.runtime, fence));
+            let unmet = tokio::time::timeout_at(deadline.into(), probe)
                 .await
-                .map_err(|_| freshness_unmet(&required_models))??;
-            if candidates.session_unmet_models.is_empty() {
-                return Ok(candidates);
-            }
+                .map_err(|_| freshness_unmet(&required_models))?;
+            let failed_models = if unmet.is_empty() {
+                let candidate_future = Box::pin(self.collect_recall_candidates(query, token, opts));
+                let candidates = tokio::time::timeout_at(deadline.into(), candidate_future)
+                    .await
+                    .map_err(|_| freshness_unmet(&required_models))??;
+                if candidates.session_unmet_models.is_empty() {
+                    return Ok(candidates);
+                }
+                candidates.session_unmet_models
+            } else {
+                unmet
+            };
+            khive_storage::ensure_request_read_active("memory.recall")?;
             let now = Instant::now();
             if now >= wait_end {
-                return Err(freshness_unmet(&candidates.session_unmet_models));
+                return Err(freshness_unmet(&failed_models));
             }
             let pause = wait_end
                 .saturating_duration_since(now)
@@ -1461,6 +1492,28 @@ mod tests {
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[test]
+    fn session_retry_deadline_obeys_caller_window_but_first_attempt_does_not() {
+        let now = std::time::Instant::now();
+        let request_cap = now + std::time::Duration::from_secs(2);
+        let caller_cap = now + std::time::Duration::from_millis(25);
+        assert_eq!(
+            super::session_attempt_deadline(true, caller_cap, request_cap),
+            request_cap,
+            "timeout_ms=0 still permits one immediate proof and candidate attempt"
+        );
+        assert_eq!(
+            super::session_attempt_deadline(false, caller_cap, request_cap),
+            caller_cap,
+            "a retry already in flight must end at the caller's wait deadline"
+        );
+        assert_eq!(
+            super::session_attempt_deadline(false, request_cap, caller_cap),
+            caller_cap,
+            "the request cap can end a retry sooner than the caller window"
+        );
+    }
 
     #[test]
     fn rank_sort_keeps_nan_last_and_breaks_equal_scores_by_id() {
