@@ -4605,7 +4605,10 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         writer_task.join().expect("commit loop must finish");
         shutdown_tx.send(()).unwrap();
-        task.await.expect("checkpoint task must not panic");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("commit-churn checkpoint task shutdown exceeded 5 s")
+            .expect("checkpoint task must not panic");
         assert!(
             !saw_oldest_pinned_frame,
             "short-lived backfill rows without a reader must not age into pins"
