@@ -61,9 +61,9 @@ caller what you found before proceeding.
 
 ### Edge creation rules
 
-Use only these 17 relations (no others — the parser rejects unknown relations):
+Use only these 19 relations (no others — the parser rejects unknown relations):
 
-- Structure: `contains`, `part_of`, `instance_of`
+- Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
 - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
 - Provenance: `derived_from`
 - Temporal: `precedes`

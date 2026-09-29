@@ -527,7 +527,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 17-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
+## The 19-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic; [ADR-191](docs/adr/ADR-191-web-pack-ontology-and-operations.md) `links_to`; [ADR-196](docs/adr/ADR-196-located-in-relation.md) `located_in`)
 
 When you `link` nodes, use ONLY these relations:
 
@@ -536,6 +536,8 @@ When you `link` nodes, use ONLY these relations:
 - `contains` — parent → child (system contains module)
 - `part_of` — inverse of contains
 - `instance_of` — specific is a case of general
+- `links_to` — a document references another document (document → document)
+- `located_in` — the source occupies, or is manifested in, the target without being a part of it (a finding in an organ); concept → concept
 
 ### Derivation
 
@@ -769,7 +771,7 @@ structural traces.
 | ------------------------------------------------- | -------------------------------------------------- |
 | Storing findings only as notes, never as entities | Notes are for context; entities are for structure  |
 | Creating duplicate entities                       | Always `search` first — link to existing if found  |
-| Using ad-hoc relations                            | Map to the closed 17-relation set or don't link    |
+| Using ad-hoc relations                            | Map to the closed 19-relation set or don't link    |
 | Reversed `introduced_by` direction                | concept → paper (the paper introduces the concept) |
 | One-hop neighbor queries when you need lineage    | Use `traverse` with `max_depth` for multi-hop      |
 | Adding `version`/`date` to entity names           | Those are properties, not names                    |
