@@ -1091,3 +1091,120 @@ returns the first pattern match strictly after the previous trigger.
 In every case the missed occurrence itself is recorded as missed and never dispatched, and
 exactly one future occurrence is armed. Legacy rows carrying an expression the parser
 rejects fail closed before invocation, as before.
+
+## Proposed Amendment H (2026-09-29): per-event missed-schedule policy (#1508)
+
+**Status**: proposed; acceptance and a signed document hash are required before
+dependent source merges. This amendment would refine Amendment A's global
+skip-and-mark rule for events whose creator explicitly opts in. Amendment F's
+claim, receipt, lease, identity, and indeterminate-outcome guarantees remain in
+force. It also proposes additive arguments to the two creation verbs governed
+by ADR-040; the accepted ADR-040 verb table remains unchanged until this
+amendment is signed and its corresponding contract update lands.
+
+### Intent and write contract
+
+Both `schedule.remind` and `schedule.schedule` accept optional
+`misfire_policy="skip" | "catch_up_once"` and `max_lateness` arguments.
+`max_lateness` is a positive integer number of seconds, not a timestamp or a
+daemon-wide setting. The pack validates both arguments before creating the
+`scheduled_event` and stores them in that note's schedule-managed `properties`.
+Values that cannot be represented by the drain's duration type are rejected.
+Missing `misfire_policy` means `skip` for new and existing rows, with precisely
+the current Amendment A behavior and `KHIVE_FIRE_GRACE_SECS` window. A `skip`
+policy, explicit or implied by omission, with `max_lateness` is rejected
+rather than silently ignoring a safety bound. Malformed or unknown stored
+policy values fail closed before action invocation and retain a
+`not_invoked` failure receipt.
+
+For `catch_up_once`, a caller may supply `max_lateness` for any recurrence. If
+it is omitted on a repeating event, the effective bound is **that due
+occurrence's own period**: the duration from the selected latest due
+occurrence to its next scheduled occurrence. This is 24 hours for `daily`,
+seven days for `weekly`, the fixed interval for `every:<N><unit>`, and the
+actual adjacent-occurrence gap for `monthly` and five-field UTC cron. The
+period is computed at drain time, since calendar and cron gaps vary; an
+omitted bound is not frozen into a numeric value at creation. A non-repeating
+event has no period, so `catch_up_once` on a one-shot requires an explicit
+positive `max_lateness`. The pack rejects an omitted bound in that case; it
+must never acquire an unbounded catch-up window by default. Existing rows
+require no migration and continue to use `skip`. Sparse cron patterns can
+have a long default period; callers that need a shorter safety window supply
+an explicit bound.
+
+### Selection and disposition
+
+The drain takes one evaluation time `now` for each due row. For a repeating
+`catch_up_once` row, let `T` be the stored next `trigger_at`; let `L` be the
+**latest** occurrence in that recurrence at or before `now`, including `T`;
+and let `F` be the first occurrence strictly after `now`. The shared recurrence
+parser and the row's original monthly anchor define those instants. A cron
+row's initial `T` remains an occurrence even if it does not match the cron
+pattern; subsequent occurrences follow the pattern. The drain skips all
+earlier due occurrences, considers only `L` for dispatch, and re-arms at the
+first future occurrence after finalization. It never loops through missed
+occurrences as separate dispatches. For a one-shot, `L = T` and there is no
+`F`.
+
+If `now - L <= max_lateness`, the opt-in row dispatches `L` exactly once, even
+when the original `T` is older than the global grace window. If the age is
+greater, it dispatches nothing: a one-shot becomes terminal `missed`, while a
+repeat records the miss and re-arms at its first future occurrence. The bound
+is a hard limit for `catch_up_once`, including when it is shorter than
+`KHIVE_FIRE_GRACE_SECS`; the global grace window governs `skip` rows only.
+Equality at the bound is admitted. The missed path keeps `fired_at` null and
+uses the pre-invocation `missed` receipt. A successful late dispatch records
+its actual completion in `fired_at`; if older occurrences were collapsed,
+`missed_at` also records that skip without claiming they fired.
+
+For example, if a daily reminder first due Monday at 09:00 is drained
+Thursday at 09:10, `L` is Thursday 09:00, `F` is Friday 09:00, and the
+omitted bound is one day: one Thursday delivery is eligible and the row next
+arms for Friday. With an explicit one-hour bound and a Thursday 12:00 drain,
+Thursday's occurrence is too old; nothing is delivered and the row next arms
+for Friday. Restoring a much older backup does not replay Monday, Tuesday,
+and Wednesday; each opted-in repeating row can yield at most one current
+catch-up invocation per drain, while default `skip` rows retain their prior
+safe behavior. Opt-in permits one side effect per eligible row, so the
+creator remains responsible for choosing an appropriate bound for
+time-sensitive actions.
+
+Successful and known-failed invoked repeats consume the selected occurrence
+and advance to the first occurrence strictly after the finalization time;
+known failure retains Amendment F's error receipt. A one-shot known failure
+retains Amendment F's retryable pending behavior, subject to a fresh
+`max_lateness` decision on retry. An ambiguous result, expired `invoking`
+lease, or corrupt receipt remains terminally indeterminate and is never
+replayed merely to satisfy the catch-up policy. A pre-invocation expired
+`claimed` lease may return to pending; the next drain makes a fresh bounded
+selection. Unsupported recurrence, missing immutable creator provenance,
+or invalid stored policy remains a pre-invocation refusal, not permission to
+fall back to daemon authority or dispatch an old payload.
+
+### Claim and receipt identity
+
+The selected `L`, not the possibly years-old stored `T`, is the occurrence
+whose action is invoked. A catch-up claim therefore records a new versioned
+receipt containing the raw `source_trigger_at` (`T`), `scheduled_for` (`L`
+as a canonical RFC 3339 UTC instant), and `decision_at` (the evaluation
+time as epoch microseconds). Its
+`occurrence_id` is the existing deterministic UUIDv5 of the event ID and
+`L` in canonical UTC; each attempt still gets a fresh `invocation_id`.
+The `pending -> firing` CAS checks the exact stored `trigger_at` bytes and
+status before persisting this receipt. Recovery validates that the source
+trigger still matches the claimed row, `L` is the latest recurrence occurrence
+at or before `decision_at` and no earlier than `T`, and the UUID names `L`.
+The existing version-1 receipt remains valid for pre-amendment claims and
+default `skip` rows; the new version must not reinterpret a version-1
+`occurrence_id` as a catch-up occurrence.
+
+The claim records `effective_max_lateness` (positive integer seconds) used
+for its decision so recovery can audit the choice without consulting a later
+daemon environment. If a
+durable success or known failure survives a crash, recovery finalizes that
+same `L` without invoking it again and computes the next future trigger from
+the recovery finalization time. The receipt's `scheduled_for` stays `L` after
+the stored `trigger_at` advances to `F`; only the active claim is required to
+match the row's source trigger. Concurrent cancel or reschedule continues to
+lose or win at the existing claim/finalize CAS seams, never by rewriting a
+claimed occurrence's identity.
