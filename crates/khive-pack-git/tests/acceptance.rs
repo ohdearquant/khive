@@ -349,6 +349,62 @@ impl EmbedderProvider for FailOnceEmbedderProvider {
     }
 }
 
+struct HeldFailCommitEmbedService {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl EmbeddingService for HeldFailCommitEmbedService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts
+            .iter()
+            .any(|text| text.contains("held-failing-commit"))
+        {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            return Err(EmbedError::InferenceFailed(
+                "held commit embedding failed".into(),
+            ));
+        }
+        Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "held-failing-commit-embedder"
+    }
+}
+
+struct HeldFailCommitEmbedderProvider(Arc<HeldFailCommitEmbedService>);
+
+#[async_trait]
+impl EmbedderProvider for HeldFailCommitEmbedderProvider {
+    fn name(&self) -> &str {
+        "held-failing-commit-embedder"
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(self.0.clone())
+    }
+}
+
 /// Full end-to-end: a fixture repo with three commits (two touching a
 /// tracked ADR path, one unrelated), a pre-ingested PR that a squash-merge
 /// commit references by `(#NNN)` suffix — asserts the provenance query
@@ -800,6 +856,214 @@ async fn shared_commit_note_links_second_project_and_new_snapshot_module_once() 
         .await
         .expect("list commits after replay");
     assert_eq!(list_items(&rows).len(), 1, "the shared note stays singular");
+}
+
+/// Both projects may begin their SHA lookup before either note is published.
+/// The key arbitrates the creates, and the losing pass must still attach its
+/// project before it advances its own checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(config_ledger)]
+async fn overlapping_commit_digests_publish_one_note_and_both_project_checkpoints() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (runtime, token, registry) = fixture().await;
+    let project_a = create(&registry, json!({"kind": "project", "name": "overlap-a"})).await;
+    let project_b = create(&registry, json!({"kind": "project", "name": "overlap-b"})).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "one commit\n");
+    commit(repo, &["README.md"], "Shared overlapping commit");
+    let sha = head_sha(repo);
+
+    let runtime = Arc::new(runtime);
+    let registry = Arc::new(registry);
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let spawn_digest = |project: Uuid| {
+        let runtime = Arc::clone(&runtime);
+        let registry = Arc::clone(&registry);
+        let token = token.clone();
+        let start = Arc::clone(&start);
+        let repo = repo.to_path_buf();
+        tokio::spawn(async move {
+            start.wait().await;
+            run_ingest(
+                &runtime,
+                &token,
+                &registry,
+                IngestOptions::unbounded(repo, project.to_string()),
+            )
+            .await
+        })
+    };
+    let a = spawn_digest(project_a);
+    let b = spawn_digest(project_b);
+    start.wait().await;
+    let (a, b) = tokio::join!(a, b);
+    let a = a.expect("first ingest task").expect("first digest");
+    let b = b.expect("second ingest task").expect("second digest");
+    assert!(!a.cursor_stalled && !b.cursor_stalled, "{a:?}; {b:?}");
+    assert_eq!(a.commits_ingested + b.commits_ingested, 1, "{a:?}; {b:?}");
+    assert_eq!(a.commits_skipped_existing + b.commits_skipped_existing, 1);
+    assert_eq!(
+        read_git_cursor(&runtime, project_a, "commits").await,
+        Some(sha.clone())
+    );
+    assert_eq!(
+        read_git_cursor(&runtime, project_b, "commits").await,
+        Some(sha)
+    );
+
+    let notes = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commit notes");
+    let notes = list_items(&notes);
+    assert_eq!(notes.len(), 1, "one live SHA holder: {notes:?}");
+    let id = notes[0]["id"].as_str().expect("commit ID");
+    for project in [project_a, project_b] {
+        assert_eq!(
+            incoming_annotating_ids(&registry, project).await,
+            std::collections::BTreeSet::from([id.to_string()]),
+            "project {project} must link the shared commit"
+        );
+    }
+}
+
+/// An embedding failure may pause for an arbitrarily long time after a
+/// commit's SHA lookup. Another digest must not see its note or checkpoint it
+/// until the create has published all dependent work successfully.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(config_ledger)]
+async fn failing_commit_embedding_never_exposes_a_provisional_sha_holder() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (runtime, token, registry) = fixture().await;
+    let project = create(
+        &registry,
+        json!({"kind": "project", "name": "provisional-commit"}),
+    )
+    .await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    runtime.register_embedder(HeldFailCommitEmbedderProvider(Arc::new(
+        HeldFailCommitEmbedService {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        },
+    )));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "pending\n");
+    commit(repo, &["README.md"], "held-failing-commit");
+
+    let runtime = Arc::new(runtime);
+    let registry = Arc::new(registry);
+    let ingest_runtime = Arc::clone(&runtime);
+    let ingest_registry = Arc::clone(&registry);
+    let ingest_token = token.clone();
+    let repo_path = repo.to_path_buf();
+    let task = tokio::spawn(async move {
+        run_ingest(
+            &ingest_runtime,
+            &ingest_token,
+            &ingest_registry,
+            IngestOptions::unbounded(repo_path, project.to_string()),
+        )
+        .await
+    });
+    entered_rx
+        .await
+        .expect("commit reached embedding preparation");
+    let notes = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list while embedding is held");
+    assert!(
+        list_items(&notes).is_empty(),
+        "a provisional SHA must not be visible: {notes}"
+    );
+    assert_eq!(read_git_cursor(&runtime, project, "commits").await, None);
+
+    release_tx.send(()).expect("release held embedding");
+    let report = task.await.expect("ingest task").expect("ingest report");
+    assert!(report.cursor_stalled, "{report:?}");
+    assert_eq!(read_git_cursor(&runtime, project, "commits").await, None);
+    let notes = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list after failed embedding");
+    assert!(list_items(&notes).is_empty(), "{notes}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn legacy_duplicate_sha_is_detected_before_checkpoint_advances() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (runtime, token, registry) = fixture().await;
+    let project = create(
+        &registry,
+        json!({"kind": "project", "name": "duplicate-legacy"}),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "duplicate\n");
+    commit(repo, &["README.md"], "Duplicate legacy SHA");
+    let sha = head_sha(repo);
+
+    for _ in 0..2 {
+        registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "commit",
+                    "content": "legacy commit note",
+                    "properties": {"sha": sha, "parents": []},
+                }),
+            )
+            .await
+            .expect("historical unkeyed commit create");
+    }
+    let report = run_ingest(
+        &runtime,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project.to_string()),
+    )
+    .await
+    .expect("a post-walk failure is reported as stopped early");
+    let Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) =
+        report.sources.commits.as_ref()
+    else {
+        panic!("duplicate SHA must stop the commit source: {report:?}");
+    };
+    assert!(
+        reason.contains(&sha) && reason.contains("reconcile legacy duplicates"),
+        "{report:?}"
+    );
+    assert!(
+        report.warnings.iter().any(
+            |warning| warning.contains(&sha) && warning.contains("reconcile legacy duplicates")
+        ),
+        "{report:?}"
+    );
+    assert_eq!(report.commits_ingested, 0, "{report:?}");
+    assert!(
+        !report.done,
+        "a stopped source cannot report completion: {report:?}"
+    );
+    assert_eq!(read_git_cursor(&runtime, project, "commits").await, None);
+    let notes = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commit notes after the refused pass");
+    assert_eq!(
+        list_items(&notes).len(),
+        2,
+        "no third note may be created: {notes}"
+    );
 }
 
 /// A tombstoned annotation is a curation choice. Replaying a shared commit
