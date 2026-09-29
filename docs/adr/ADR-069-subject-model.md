@@ -624,9 +624,13 @@ ambiguous historical edges require an audit or re-extraction, not a silent reint
 2. **Keep statement dependencies on declarations and goals.** A statement-level
    `depends_on` edge points from the declaration or goal whose type/statement references
    another declaration to that referenced declaration. The formal pack's current
-   `goal depends_on` endpoint rules retain this meaning and remain legal; they are not
-   proof-body dependencies. `dependency_kind` remains governed by ADR-002 and D4. No
-   existing `depends_on` or `variant_of` edge is renamed or migrated by this proposal.
+   `goal depends_on` endpoint rules remain legal and unchanged; the statement-level meaning
+   attaches to edges that a typed-reference extraction produces. Edges derived today from
+   the untyped v1 `refs` list keep their existing mixed, untyped meaning under D4
+   (`dependency_kind="runtime"`) until they are audited or re-extracted, as the acceptance
+   section below requires; this amendment reclassifies none of them. `dependency_kind`
+   remains governed by ADR-002 and D4. No existing `depends_on` or `variant_of` edge is
+   renamed or migrated by this proposal.
 3. **Put proof-term dependencies on the proof.** When a scanner can identify references
    from a particular proof body, that proof artifact is the source of its own `depends_on`
    edges to the referenced formal declarations. A goal must not inherit those edges from
