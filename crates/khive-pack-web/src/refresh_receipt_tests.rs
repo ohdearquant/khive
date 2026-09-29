@@ -271,6 +271,42 @@ async fn generic_receipt_shape_is_not_refresh_or_extract_provenance() {
     .await
     .unwrap();
     assert_ne!(trusted, forged.id);
+    let trusted_note = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(trusted)
+        .await
+        .unwrap()
+        .unwrap();
+    let decoy = runtime
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "newer caller-written receipt shape",
+            None,
+            Some(json!({"tags": [RECEIPT_TAG]})),
+            vec![entity_id],
+        )
+        .await
+        .unwrap();
+    let mut newer_decoy = decoy.clone();
+    newer_decoy.created_at = trusted_note.created_at + 1;
+    newer_decoy.updated_at = newer_decoy.created_at;
+    runtime
+        .backend()
+        .notes()
+        .unwrap()
+        .upsert_note(newer_decoy)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .latest_annotating_note(&token, entity_id, "observation", RECEIPT_TAG)
+            .await
+            .unwrap(),
+        Some(decoy.id)
+    );
     assert_eq!(
         latest_receipt(&runtime, &token, entity_id).await.unwrap(),
         Some(trusted)

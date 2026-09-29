@@ -41,7 +41,14 @@ pub(crate) async fn capture_for_body(
     content_ref: &str,
 ) -> Result<Option<(Uuid, Value)>, RuntimeError> {
     let latest = runtime
-        .latest_annotating_note(token, entity.id, "observation", RECEIPT_TAG)
+        .latest_annotating_note_with_property(
+            token,
+            entity.id,
+            "observation",
+            RECEIPT_TAG,
+            RECEIPT_PROVENANCE_KEY,
+            RECEIPT_PROVENANCE_VALUE,
+        )
         .await?;
     let stored = entity
         .properties

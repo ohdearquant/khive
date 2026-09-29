@@ -3365,17 +3365,55 @@ impl KhiveRuntime {
         kind: &str,
         tag: &str,
     ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(token, node_id, kind, tag, None)
+            .await
+    }
+
+    /// Select a latest annotation only after its exact top-level string
+    /// property has been checked by the bound store.
+    pub async fn latest_annotating_note_with_property(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        property_key: &str,
+        property_value: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(
+            token,
+            node_id,
+            kind,
+            tag,
+            Some((property_key, property_value)),
+        )
+        .await
+    }
+
+    async fn latest_annotating_note_inner(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        required_property: Option<(&str, &str)>,
+    ) -> RuntimeResult<Option<Uuid>> {
         if !self.substrate_exists_in_ns(token, node_id).await? {
             return Ok(None);
         }
         let mut latest: Option<(Uuid, i64)> = None;
         for namespace in token.visible_namespaces() {
             let scoped = NamespaceToken::for_namespace(namespace.clone());
-            if let Some(candidate) = self
-                .graph(&scoped)?
-                .latest_annotating_note(node_id, kind, tag)
-                .await?
-            {
+            let graph = self.graph(&scoped)?;
+            let candidate = match required_property {
+                Some((key, value)) => {
+                    graph
+                        .latest_annotating_note_with_property(node_id, kind, tag, key, value)
+                        .await?
+                }
+                None => graph.latest_annotating_note(node_id, kind, tag).await?,
+            };
+            if let Some(candidate) = candidate {
                 if latest.is_none_or(|(id, created_at)| {
                     candidate.1 > created_at || (candidate.1 == created_at && candidate.0 < id)
                 }) {

@@ -49,7 +49,14 @@ async fn latest_receipt(
     entity_id: Uuid,
 ) -> Result<Option<Uuid>, RuntimeError> {
     let latest = runtime
-        .latest_annotating_note(token, entity_id, "observation", crate::receipt::RECEIPT_TAG)
+        .latest_annotating_note_with_property(
+            token,
+            entity_id,
+            "observation",
+            crate::receipt::RECEIPT_TAG,
+            crate::receipt::RECEIPT_PROVENANCE_KEY,
+            crate::receipt::RECEIPT_PROVENANCE_VALUE,
+        )
         .await?;
     let Some(id) = latest else {
         return Ok(None);
@@ -1653,6 +1660,92 @@ mod tests {
             0,
             "the decoy is never superseded — it was never treated as a receipt"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_supersedes_genuine_receipt_behind_newer_tagged_decoy() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"same every time".to_vec();
+        let (port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let id = seed(&runtime, &token, port, &body).await;
+        let first = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let genuine = Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap();
+        let genuine_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(genuine)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::receipt::has_receipt_provenance(
+            genuine_note.properties.as_ref()
+        ));
+
+        let decoy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "caller-written tagged decoy",
+                None,
+                Some(json!({"tags": [crate::receipt::RECEIPT_TAG]})),
+                vec![id],
+            )
+            .await
+            .unwrap();
+        let mut newer_decoy = decoy.clone();
+        newer_decoy.created_at = genuine_note.created_at + 1;
+        newer_decoy.updated_at = newer_decoy.created_at;
+        runtime
+            .backend()
+            .notes()
+            .unwrap()
+            .upsert_note(newer_decoy)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .latest_annotating_note(&token, id, "observation", crate::receipt::RECEIPT_TAG)
+                .await
+                .unwrap(),
+            Some(decoy.id),
+            "the tagged decoy must be newer than the genuine receipt"
+        );
+        assert_eq!(
+            latest_receipt(&runtime, &token, id).await.unwrap(),
+            Some(genuine)
+        );
+
+        let (port2, _hits2) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let repointed_url = format!("http://127.0.0.1:{port2}/r");
+        crate::entities::patch(&runtime, &token, id, None, json!({ "url": repointed_url }))
+            .await
+            .unwrap();
+        let second = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let second_receipt = Uuid::parse_str(second["receipt_id"].as_str().unwrap()).unwrap();
+        let previous = runtime
+            .neighbors(
+                &token,
+                second_receipt,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(previous.len(), 1);
+        assert_eq!(previous[0].node_id, genuine);
+        let decoy_incoming = runtime
+            .neighbors(
+                &token,
+                decoy.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert!(decoy_incoming.is_empty());
     }
 
     // ADR-191 D2/D6: refresh follows redirects the same way fetch does and
