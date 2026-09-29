@@ -892,6 +892,9 @@ fn decode_recall_observations(event: &Event) -> Result<Vec<EventObservation>, ru
 /// the candidate and selected lists. A missing key is the historical note
 /// shape under ADR-041 A3; present unknown or non-string values are invalid.
 fn decode_search_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+    if event.payload.as_object().is_none() {
+        return Err(invalid_payload(event.kind, "payload", "expected object"));
+    }
     let referent_kind = match event.payload.get("result_kind") {
         Some(serde_json::Value::String(kind)) if kind == "entity" => ReferentKind::Entity,
         Some(serde_json::Value::String(kind)) if kind == "note" => ReferentKind::Note,

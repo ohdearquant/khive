@@ -316,6 +316,21 @@ async fn search_executed_absent_result_kind_projects_historical_note_rows() {
 }
 
 #[tokio::test]
+async fn search_executed_rejects_non_object_payload_root() {
+    let store = setup_memory_store();
+    for payload in [json!("not an object"), json!([]), json!(null)] {
+        let mut event = make_event("default");
+        event.payload = payload;
+        let event_id = event.id;
+
+        assert!(store.preflight_event(&event).is_err());
+        assert!(event_insert_statements(&event).is_err());
+        assert!(store.append_event(event).await.is_err());
+        assert!(store.get_event(event_id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn search_executed_rejects_present_non_string_result_kind() {
     let store = setup_memory_store();
     for result_kind in [json!(null), json!(0), json!(["note"])] {
