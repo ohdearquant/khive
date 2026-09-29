@@ -2236,6 +2236,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "inventory",
+ "khive-db",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",
