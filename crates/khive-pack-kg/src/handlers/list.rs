@@ -524,6 +524,28 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                let message_filters = supplied_fields.iter().any(|field| {
+                    matches!(
+                        field.as_str(),
+                        "thread_id" | "direction" | "from" | "to" | "read" | "delivered"
+                    )
+                });
+                let runtime = kind_filter
+                    .as_deref()
+                    .map(|kind| registry.kg_note_read_runtime_for_kind(&self.runtime, kind))
+                    .unwrap_or(&self.runtime);
+                if message_filters && kind_filter.as_deref() != Some("message") {
+                    let message_runtime =
+                        registry.kg_note_read_runtime_for_kind(&self.runtime, "message");
+                    if message_runtime.backend_id() != self.runtime.backend_id() {
+                        return Err(RuntimeError::Khive(khive_types::KhiveError::invalid_input(
+                            format!(
+                                "list: message filters require kind=\"message\" when messages are stored on backend {:?}",
+                                message_runtime.backend_id().as_str()
+                            ),
+                        )));
+                    }
+                }
                 if has_schedule_filters && kind_filter.as_deref() != Some("scheduled_event") {
                     return Err(RuntimeError::InvalidInput(format!(
                         "list: kind={:?} with note_kind={kind_filter:?}: status and created_by_actor filters require kind=scheduled_event or kind=note with note_kind=scheduled_event",
@@ -533,7 +555,7 @@ impl KgPack {
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
                         resolve_message_thread_filter(
-                            &self.runtime,
+                            runtime,
                             token,
                             &raw_thread_id,
                             p.key_prefix.is_some(),
@@ -546,12 +568,7 @@ impl KgPack {
                 let filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
                 if p.key_prefix.is_some() {
                     return super::note_list::list_keyed_notes(
-                        &self.runtime,
-                        token,
-                        &p,
-                        &filter,
-                        requested,
-                        limit,
+                        runtime, token, &p, &filter, requested, limit,
                     )
                     .await;
                 }
@@ -579,8 +596,7 @@ impl KgPack {
                                 break collected.len() >= target;
                             }
                             let scan_limit = MAX_SCAN_TOTAL.saturating_sub(scanned).min(PAGE_SIZE);
-                            let (page, next_raw_after) = self
-                                .runtime
+                            let (page, next_raw_after) = runtime
                                 .list_notes_filtered_after(
                                     token,
                                     filter.clone(),
@@ -630,8 +646,7 @@ impl KgPack {
                             !has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,
                         )
                     } else {
-                        let (notes, next_after) = self
-                            .runtime
+                        let (notes, next_after) = runtime
                             .list_notes_filtered_after(token, filter.clone(), after, limit)
                             .await?;
                         (notes, next_after, false)
@@ -683,8 +698,7 @@ impl KgPack {
                             scan_incomplete = true;
                             break;
                         }
-                        let page = self
-                            .runtime
+                        let page = runtime
                             .list_notes_filtered(token, filter.clone(), remaining_scan, db_offset)
                             .await?;
                         let fetched = page.len() as u32;
@@ -706,7 +720,7 @@ impl KgPack {
                     }
                     collected
                 } else {
-                    self.runtime
+                    runtime
                         .list_notes_filtered(token, filter.clone(), overfetch_limit(limit), offset)
                         .await?
                 };

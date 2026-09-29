@@ -2047,6 +2047,26 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 }
 
 impl VerbRegistry {
+    /// Select the owning pack's backend for a note-kind KG read. The caller
+    /// keeps its already-authorized token; this only selects storage.
+    pub fn kg_note_read_runtime_for_kind<'a>(
+        &'a self,
+        runtime: &'a KhiveRuntime,
+        kind: &str,
+    ) -> &'a KhiveRuntime {
+        let Some(resolver) = &self.kg_read_resolver else {
+            return runtime;
+        };
+        let Some(owner) = self
+            .packs
+            .iter()
+            .find(|pack| pack.note_kinds().contains(&kind))
+        else {
+            return runtime;
+        };
+        resolver.runtime_for_pack(owner.name())
+    }
+
     /// Resolve a KG entity/note handle across the configured backend inventory.
     ///
     /// The caller must supply its dispatch-authorized token. By-ID reads do not

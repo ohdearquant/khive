@@ -6466,6 +6466,46 @@ id = "lambda:project-actor"
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
         );
+
+        let list_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"[
+                    list(kind="message", limit=3),
+                    list(kind="message", direction="outbound", limit=3, after=""),
+                    list(kind="note", note_kind="message", direction="outbound", limit=3),
+                    comm.inbox(box="sent", limit=3),
+                    list(kind="note", direction="outbound", limit=3)
+                ]"#
+                .to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("list and inbox dispatch");
+        let list_json: serde_json::Value =
+            serde_json::from_str(&list_resp).expect("list and inbox response is valid JSON");
+        let results = list_json["results"].as_array().expect("batch results");
+        let sent_id = results[3]["result"]["messages"][0]["id"]
+            .as_str()
+            .expect("sent message id");
+        for (index, field) in [(0, "items"), (1, "notes"), (2, "items")] {
+            assert_eq!(results[index]["ok"], true, "{list_json}");
+            let notes = results[index]["result"][field]
+                .as_array()
+                .expect("listed messages");
+            assert!(
+                notes.iter().any(|note| note["id"] == sent_id),
+                "list and comm.inbox must see the same message on the comm backend: {list_json}"
+            );
+        }
+        assert_eq!(results[3]["ok"], true, "{list_json}");
+        assert_eq!(results[4]["ok"], false, "{list_json}");
+        assert_eq!(results[4]["error"]["kind"], "invalid_input", "{list_json}");
+        assert!(
+            results[4]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("secondary")),
+            "an unscoped note list with a message filter must name the comm backend: {list_json}"
+        );
     }
 
     /// ADR-124 note-write identity guard: the pack-owned note kind set must
