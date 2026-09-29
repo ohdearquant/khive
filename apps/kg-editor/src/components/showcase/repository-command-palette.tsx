@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { Copy, Download, Search, X } from "@/icons";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -65,6 +66,7 @@ type ReviewPaletteProps = Readonly<{
   views: readonly Readonly<{ id: string; label: string }>[];
   activeReviewView: string;
   onSelectReviewView: (view: string) => void;
+  hasUnsavedReviewState: boolean;
   onCopyCli?: () => void | Promise<void>;
   onDownloadReview: () => void;
   downloadSubject?: "bundle" | "report";
@@ -80,6 +82,7 @@ function includesQuery(command: PaletteCommand, query: string): boolean {
 }
 
 export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [query, setQuery] = useState("");
@@ -120,7 +123,14 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
             : APP_COMMAND_COPY.downloadDetail,
         },
       ];
-      return [...APP_NAVIGATION_COMMANDS, ...views, ...actions].filter(
+      const navigation = APP_NAVIGATION_COMMANDS.map((command) =>
+        command.href === "/" && props.hasUnsavedReviewState
+          ? { ...command, detail: APP_COMMAND_COPY.reviewStateRouteBlocked }
+          : command.href === "/review" && props.activeReviewView === "core-report"
+          ? { ...command, detail: APP_COMMAND_COPY.reviewReportCurrentView }
+          : command
+      );
+      return [...navigation, ...views, ...actions].filter(
         (command) => !normalizedQuery || includesQuery(command, normalizedQuery),
       );
     }
@@ -214,11 +224,23 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
     }
   }
 
+  function isUnavailableNavigation(command: PaletteCommand): boolean {
+    if (command.kind !== "navigation" || props.surface !== "review") return false;
+    return (command.href === "/" && props.hasUnsavedReviewState) ||
+      (command.href === "/review" && props.activeReviewView === "core-report");
+  }
+
   function execute(command: PaletteCommand | undefined) {
-    if (!command) return;
+    if (!command || isUnavailableNavigation(command)) return;
     if (command.kind === "navigation") {
       closePalette(false);
-      window.location.assign(command.href);
+      if (command.href === "/review" && props.surface === "review") {
+        props.onSelectReviewView("changes");
+      } else if (command.href === "/" && props.surface !== "review") {
+        props.onSelectView("structure_graph");
+      } else {
+        router.push(command.href);
+      }
     } else if (command.kind === "review-view" && props.surface === "review") {
       closePalette(false);
       props.onSelectReviewView(command.view);
@@ -262,12 +284,15 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
     if (open) inputRef.current?.focus();
   }, [open]);
 
-  const safeHighlightedIndex = commands.length
-    ? Math.min(highlightedIndex, commands.length - 1)
-    : 0;
+  const actionableIndices = commands.flatMap((command, index) =>
+    isUnavailableNavigation(command) ? [] : [index]
+  );
+  const safeHighlightedIndex = actionableIndices.includes(highlightedIndex)
+    ? highlightedIndex
+    : actionableIndices[0] ?? -1;
 
   useEffect(() => {
-    if (!open || commands.length === 0) return;
+    if (!open || safeHighlightedIndex < 0) return;
     optionRefs.current[safeHighlightedIndex]?.scrollIntoView?.({
       block: "nearest",
     });
@@ -277,19 +302,27 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setHighlightedIndex((index) =>
-        commands.length ? (index + 1) % commands.length : 0
+        actionableIndices.length
+          ? actionableIndices[(actionableIndices.indexOf(index) + 1) % actionableIndices.length]
+          : -1
       );
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
       setHighlightedIndex((index) =>
-        commands.length ? (index - 1 + commands.length) % commands.length : 0
+        actionableIndices.length
+          ? actionableIndices[
+            actionableIndices.indexOf(index) < 0
+              ? actionableIndices.length - 1
+              : (actionableIndices.indexOf(index) - 1 + actionableIndices.length) % actionableIndices.length
+          ]
+          : -1
       );
     } else if (event.key === "Home") {
       event.preventDefault();
-      setHighlightedIndex(0);
+      setHighlightedIndex(actionableIndices[0] ?? -1);
     } else if (event.key === "End") {
       event.preventDefault();
-      setHighlightedIndex(Math.max(0, commands.length - 1));
+      setHighlightedIndex(actionableIndices.at(-1) ?? -1);
     } else if (event.key === "Enter") {
       event.preventDefault();
       execute(commands[safeHighlightedIndex]);
@@ -307,7 +340,9 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
     }
   }
 
-  const highlightedCommand = commands[safeHighlightedIndex];
+  const highlightedCommand = safeHighlightedIndex < 0
+    ? undefined
+    : commands[safeHighlightedIndex];
   return (
     <>
       <button
@@ -394,6 +429,7 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
                 aria-label={props.surface === "review" ? APP_COMMAND_COPY.reviewResults : "Repository command results"}
               >
                 {commands.map((command, index) => {
+                  const unavailable = isUnavailableNavigation(command);
                   const current = command.kind === "view" && props.surface !== "review"
                     ? command.view === props.activeView
                     : command.kind === "module" && props.surface !== "review"
@@ -413,11 +449,15 @@ export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
                       type="button"
                       role="option"
                       tabIndex={-1}
-                      aria-selected={index === safeHighlightedIndex}
+                      aria-selected={!unavailable && index === safeHighlightedIndex}
+                      aria-disabled={unavailable || undefined}
+                      disabled={unavailable}
                       className={styles.result}
-                      data-highlighted={index === safeHighlightedIndex ||
+                      data-highlighted={!unavailable && index === safeHighlightedIndex ||
                         undefined}
-                      onMouseMove={() => setHighlightedIndex(index)}
+                      onMouseMove={() => {
+                        if (!unavailable) setHighlightedIndex(index);
+                      }}
                       onClick={() => execute(command)}
                     >
                       <span className={styles.resultIcon} aria-hidden="true">

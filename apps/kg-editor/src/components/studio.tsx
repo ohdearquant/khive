@@ -855,17 +855,21 @@ function RetrievalView({ bundle, onImport }: { bundle: ReviewBundle; onImport: (
   );
 }
 
-function ActivityView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
-  const [draft, setDraft] = useState("");
-  const [localNotes, setLocalNotes] = useState<string[]>([]);
-
-  function addLocalNote() {
-    const note = draft.trim();
-    if (!note) return;
-    setLocalNotes((current) => [...current, note]);
-    setDraft("");
-  }
-
+function ActivityView({
+  bundle,
+  onImport,
+  draft,
+  onDraft,
+  localNotes,
+  onAddLocalNote,
+}: {
+  bundle: ReviewBundle;
+  onImport: () => void;
+  draft: string;
+  onDraft: (value: string) => void;
+  localNotes: readonly string[];
+  onAddLocalNote: () => void;
+}) {
   return (
     <div className="view-stack">
       <div className="surface-toolbar"><div><span className="eyebrow">Replayable review thread</span><h2>Conversation</h2></div></div>
@@ -898,7 +902,7 @@ function ActivityView({ bundle, onImport }: { bundle: ReviewBundle; onImport: ()
       <PageNotice page={bundle.activity} label="Conversation events" />
       <div className="comment-composer">
         <div className="avatar">Y</div>
-        <div><textarea aria-label="Review comment" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Leave a review note…" /><div><span>Plain text · this session only</span><button className="button primary" type="button" disabled={!draft.trim()} onClick={addLocalNote}>Add local note</button></div></div>
+        <div><textarea aria-label="Review comment" value={draft} onChange={(event) => onDraft(event.target.value)} placeholder="Leave a review note…" /><div><span>Plain text · this session only</span><button className="button primary" type="button" disabled={!draft.trim()} onClick={onAddLocalNote}>Add local note</button></div></div>
       </div>
     </div>
   );
@@ -978,12 +982,20 @@ function ViewSurface({
   query,
   onQuery,
   onImport,
+  activityDraft,
+  onActivityDraft,
+  localNotes,
+  onAddLocalNote,
 }: {
   activeView: View;
   bundle: ReviewBundle;
   query: string;
   onQuery: (value: string) => void;
   onImport: () => void;
+  activityDraft: string;
+  onActivityDraft: (value: string) => void;
+  localNotes: readonly string[];
+  onAddLocalNote: () => void;
 }) {
   const unavailable =
     (activeView === "changes" && bundle.enrichment_status.semantic_changes === "unavailable") ||
@@ -1005,7 +1017,7 @@ function ViewSurface({
   if (activeView === "checks") return <ChecksView bundle={bundle} onImport={onImport} />;
   if (activeView === "provenance") return <ProvenanceView bundle={bundle} onImport={onImport} />;
   if (activeView === "retrieval") return <RetrievalView bundle={bundle} onImport={onImport} />;
-  if (activeView === "activity") return <ActivityView bundle={bundle} onImport={onImport} />;
+  if (activeView === "activity") return <ActivityView bundle={bundle} onImport={onImport} draft={activityDraft} onDraft={onActivityDraft} localNotes={localNotes} onAddLocalNote={onAddLocalNote} />;
   return <ChangesView bundle={bundle} query={query} onQuery={onQuery} onImport={onImport} />;
 }
 
@@ -1056,6 +1068,7 @@ function CoreReviewStudio({
           views={[]}
           activeReviewView="core-report"
           onSelectReviewView={() => undefined}
+          hasUnsavedReviewState
           onDownloadReview={onDownload}
           downloadSubject="report"
         />
@@ -1147,6 +1160,8 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
   const [query, setQuery] = useState("");
   const [reviewerFamily, setReviewerFamily] = useState(bundle.change_set.envelope.producer_model_family);
   const [decision, setDecision] = useState<ReviewDecision>("pending");
+  const [activityDraft, setActivityDraft] = useState("");
+  const [localNotes, setLocalNotes] = useState<string[]>([]);
   const [toast, setToast] = useState<Toast>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -1165,6 +1180,9 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
       const parsed = parseReviewInput(JSON.parse(await file.text()));
       if (isReviewReport(parsed)) {
         setCoreReport(parsed);
+        setActivityDraft("");
+        setLocalNotes([]);
+        setDecision("pending");
         showToast({ tone: "success", message: "Loaded a read-only khive CLI review report." });
         return;
       }
@@ -1184,6 +1202,8 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
       });
       setReviewerFamily(parsed.change_set.envelope.producer_model_family);
       setDecision("pending");
+      setActivityDraft("");
+      setLocalNotes([]);
       setCoreReport(null);
       showToast({ tone: "success", message: `Loaded review bundle for ${parsed.repository.owner}/${parsed.repository.name}.` });
     } catch (error) {
@@ -1227,6 +1247,18 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
     });
   }
 
+  function addLocalNote() {
+    const note = activityDraft.trim();
+    if (!note) return;
+    setLocalNotes((current) => [...current, note]);
+    setActivityDraft("");
+  }
+
+  const hasUnsavedReviewState = coreReport !== null || bundle !== initialBundle ||
+    decision !== "pending" ||
+    reviewerFamily !== bundle.change_set.envelope.producer_model_family ||
+    activityDraft.trim().length > 0 || localNotes.length > 0;
+
   const filePicker = (
     <input
       ref={fileInput}
@@ -1264,6 +1296,7 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
             triggerClassName="global-search"
             views={Object.entries(viewLabels).map(([id, label]) => ({ id, label }))}
             activeReviewView={activeView}
+            hasUnsavedReviewState={hasUnsavedReviewState}
             onSelectReviewView={(view) => {
               setActiveView(view as View);
               queueMicrotask(() => document.querySelector<HTMLElement>(".review-surface")?.focus());
@@ -1292,6 +1325,10 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
                 query={query}
                 onQuery={setQuery}
                 onImport={() => fileInput.current?.click()}
+                activityDraft={activityDraft}
+                onActivityDraft={setActivityDraft}
+                localNotes={localNotes}
+                onAddLocalNote={addLocalNote}
               />
             </section>
             <ReviewRail

@@ -5,6 +5,8 @@ export const APP_COMMAND_COPY = {
   showcaseDetail: "Open repository analyses.",
   review: "KG review",
   reviewDetail: "Open the local review workspace.",
+  reviewStateRouteBlocked: "Unavailable while this review has unsaved local state.",
+  reviewReportCurrentView: "Already viewing the imported report.",
   reviewViewDetail: "Switch review view.",
   reviewNavigation: "Review navigation",
   reviewCommands: "Review commands",
