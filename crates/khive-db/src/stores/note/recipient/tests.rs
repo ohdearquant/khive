@@ -204,11 +204,21 @@ async fn quarantine_bound_refuses_before_writes() {
     let (backend, mut first) = fixture();
     let store = RecipientTransportStore::new(backend.pool_arc());
     first.disposition = RecipientDisposition::Quarantined;
+    // Valid JSON leaves the Rust byte bound as the only pre-write refusal.
+    // The SQL length constraint alone must not make this control pass.
+    let delivery_item = format!("{{\"p\":\"{}\"}}", "x".repeat(98_297)).into_bytes();
+    assert_eq!(delivery_item.len(), 98_305);
+    assert!(serde_json::from_slice::<Value>(&delivery_item)
+        .unwrap()
+        .is_object());
     first.quarantine = Some(QuarantineRecord {
         reason: QuarantineReason::InvalidMessage,
-        delivery_item: vec![b' '; 98_305],
+        delivery_item,
     });
-    assert!(store.commit(first).await.is_err());
+    let error = store.commit(first).await.unwrap_err();
+    assert!(
+        matches!(error, StorageError::InvalidInput { message, .. } if message.contains("98304"))
+    );
     assert_eq!(counts(&backend), [0, 0, 0, 0]);
 }
 

@@ -135,6 +135,17 @@ impl KhiveRuntime {
         {
             return Err(invalid("invalid local recipient route"));
         }
+        // ADR-105 A.8 step 4: a successfully opened replay is answered from
+        // its durable claim before interpreting the new attempt's plaintext.
+        let binding_value = serde_json::to_value(binding)
+            .map_err(|error| invalid(&format!("invalid receipt binding: {error}")))?;
+        let recipient_store = RecipientTransportStore::new(self.backend().pool_arc());
+        if let Some(replay) = recipient_store
+            .ack_if_replayed(binding_value.clone(), &local.actor)
+            .await?
+        {
+            return Ok(replay);
+        }
         self.validate_note_kind("message")?;
         let from = format!("khive1:{}/{}", local.realm, binding.sender_agent_id);
         let received_at = chrono::Utc::now().to_rfc3339();
@@ -234,11 +245,10 @@ impl KhiveRuntime {
         }
         crate::secret_gate::check_json_at(&props, "note", "properties")?;
         note.properties = Some(props);
-        let result = RecipientTransportStore::new(self.backend().pool_arc())
+        let result = recipient_store
             .commit(RecipientCommit {
                 note,
-                binding: serde_json::to_value(binding)
-                    .map_err(|error| invalid(&format!("invalid receipt binding: {error}")))?,
+                binding: binding_value,
                 sender_agent_id: binding.sender_agent_id.clone(),
                 logical_message_id: binding.logical_message_id,
                 delivery_attempt_id: binding.delivery_attempt_id,

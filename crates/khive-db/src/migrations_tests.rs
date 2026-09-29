@@ -5189,10 +5189,7 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
         if previous != 0 {
             migrate_through(&mut conn, previous);
         }
-        assert_eq!(
-            run_migrations(&mut conn).unwrap(),
-            RECIPIENT_TRANSPORT_VERSION
-        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
         for table in [
             "comm_recipient_replay",
             "comm_recipient_quarantine",
@@ -5208,10 +5205,7 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
             )
             .unwrap();
         assert_eq!(name, "recipient_transport");
-        assert_eq!(
-            run_migrations(&mut conn).unwrap(),
-            RECIPIENT_TRANSPORT_VERSION
-        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
         conn.execute(
             "INSERT INTO comm_recipient_replay \
              (sender_agent_id, logical_message_id, recipient_agent_id, recipient_actor, \
@@ -5226,10 +5220,7 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
             [RECIPIENT_TRANSPORT_VERSION],
         )
         .unwrap();
-        assert_eq!(
-            run_migrations(&mut conn).unwrap(),
-            RECIPIENT_TRANSPORT_VERSION
-        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
         let replay_rows: i64 = conn
             .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
                 row.get(0)

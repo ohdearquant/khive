@@ -124,6 +124,105 @@ async fn inbound_message_preserves_sender_sent_at_and_local_received_at() {
         .with_timezone(&chrono::Utc);
     assert!(received_at >= before && received_at <= after);
 }
+
+#[tokio::test]
+async fn delivered_replay_is_acked_before_gate_or_timestamp_revalidation() {
+    let (runtime, token, local, binding) = fixture();
+    let first = runtime
+        .ingest_verified_recipient(
+            &token,
+            &local,
+            InboundReceiptTicket::new(binding.clone(), 1),
+            payload(None),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(first.created);
+
+    let mut retry = binding.clone();
+    retry.delivery_attempt_id = Uuid::new_v4();
+    let fake_secret = format!("ghp_{}", "A".repeat(36));
+    assert!(matches!(
+        crate::secret_gate::check_at(&fake_secret, "note", "content"),
+        Err(RuntimeError::SecretDetected(_))
+    ));
+    let replay = runtime
+        .ingest_verified_recipient(
+            &token,
+            &local,
+            InboundReceiptTicket::new(retry, 1),
+            VerifiedInboundContent::Message {
+                content: fake_secret,
+                subject: None,
+                kind: None,
+                in_reply_to: None,
+                correlation: None,
+                sent_at: "2026-09-01T12:34:56Z".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.note_id, first.note_id);
+    assert_eq!(replay.disposition, RecipientDisposition::Stored);
+    assert!(replay.note.is_none());
+
+    let mut invalid_timestamp_retry = binding;
+    invalid_timestamp_retry.delivery_attempt_id = Uuid::new_v4();
+    let replay = runtime
+        .ingest_verified_recipient(
+            &token,
+            &local,
+            InboundReceiptTicket::new(invalid_timestamp_retry, 1),
+            VerifiedInboundContent::Message {
+                content: "redelivered body".into(),
+                subject: None,
+                kind: None,
+                in_reply_to: None,
+                correlation: None,
+                sent_at: "not-a-timestamp".into(),
+            },
+            b"not JSON".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.note_id, first.note_id);
+    assert_eq!(replay.disposition, RecipientDisposition::Stored);
+    let stored = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(first.note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, "hello");
+    let backend = runtime.backend();
+    let writer = backend.pool().writer().unwrap();
+    let ack_count: i64 = writer
+        .conn()
+        .query_row("SELECT count(*) FROM comm_ack_work", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ack_count, 3, "every new attempt receives its own ack");
+    let replay_count: i64 = writer
+        .conn()
+        .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let quarantine_count: i64 = writer
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM comm_recipient_quarantine",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((replay_count, quarantine_count), (1, 0));
+}
+
 #[tokio::test]
 async fn inbound_message_persists_declared_or_unspecified_kind() {
     for (declared, expected) in [

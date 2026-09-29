@@ -157,6 +157,51 @@ const INSERT_ACK_SQL: &str = concat!(
     "VALUES (?1,?2,?3,?4,?5,?6,?6)",
 );
 
+struct AckIdentity<'a> {
+    binding: &'a Value,
+    sender_agent_id: &'a str,
+    logical_message_id: Uuid,
+    delivery_attempt_id: Uuid,
+}
+
+fn record_ack(
+    conn: &rusqlite::Connection,
+    identity: AckIdentity<'_>,
+    disposition: RecipientDisposition,
+    now: i64,
+    op: &'static str,
+) -> StorageResult<()> {
+    let prior_ack: Option<(String, String)> = conn
+        .query_row(
+            ACK_LOOKUP_SQL,
+            [identity.delivery_attempt_id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| map_err(error, op))?;
+    if let Some((prior_binding, prior_disposition)) = prior_ack {
+        let prior_binding: Value = serde_json::from_str(&prior_binding)
+            .map_err(|_| invalid("invalid stored ack binding"))?;
+        if prior_binding != *identity.binding || prior_disposition != disposition.as_str() {
+            return Err(invalid("ack attempt binding conflict"));
+        }
+    } else {
+        conn.execute(
+            INSERT_ACK_SQL,
+            params![
+                identity.delivery_attempt_id.to_string(),
+                identity.sender_agent_id,
+                identity.logical_message_id.to_string(),
+                identity.binding.to_string(),
+                disposition.as_str(),
+                now
+            ],
+        )
+        .map_err(|error| map_err(error, op))?;
+    }
+    Ok(())
+}
+
 pub struct RecipientTransportStore {
     notes: SqlNoteStore,
 }
@@ -166,6 +211,79 @@ impl RecipientTransportStore {
             notes: SqlNoteStore::new(pool, false),
         }
     }
+    /// Answer an already committed logical message before its plaintext is
+    /// interpreted again. The authenticated caller supplies the current local
+    /// actor and binding; a hit writes only the new attempt's ack journal row.
+    /// A miss makes no claim: `commit` rechecks replay under its own writer
+    /// transaction after the new delivery has been validated.
+    pub async fn ack_if_replayed(
+        &self,
+        binding: Value,
+        recipient_actor: &str,
+    ) -> StorageResult<Option<RecipientCommitResult>> {
+        let (sender_agent_id, recipient_agent_id, logical_message_id, delivery_attempt_id) = {
+            let string_field = |name: &str| {
+                binding
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("invalid replay receipt binding"))
+            };
+            let logical_message_id = Uuid::parse_str(&string_field("logical_message_id")?)
+                .map_err(|_| invalid("invalid replay logical message id"))?;
+            let delivery_attempt_id = Uuid::parse_str(&string_field("delivery_attempt_id")?)
+                .map_err(|_| invalid("invalid replay delivery attempt id"))?;
+            (
+                string_field("sender_agent_id")?,
+                string_field("recipient_agent_id")?,
+                logical_message_id,
+                delivery_attempt_id,
+            )
+        };
+        let recipient_actor = recipient_actor.to_owned();
+        self.notes
+            .with_writer_tx_storage("recipient_transport_replay", move |conn| {
+                let op = "recipient_transport_replay";
+                let prior: Option<(String, String, String, String)> = conn
+                    .query_row(
+                        REPLAY_SQL,
+                        params![sender_agent_id, logical_message_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()
+                    .map_err(|error| map_err(error, op))?;
+                let Some((id, disposition, prior_recipient, prior_actor)) = prior else {
+                    return Ok(None);
+                };
+                if prior_recipient != recipient_agent_id || prior_actor != recipient_actor {
+                    return Err(invalid("replay recipient binding changed"));
+                }
+                let note_id =
+                    Uuid::parse_str(&id).map_err(|_| invalid("invalid replay note id"))?;
+                let disposition = RecipientDisposition::parse(&disposition)?;
+                record_ack(
+                    conn,
+                    AckIdentity {
+                        binding: &binding,
+                        sender_agent_id: &sender_agent_id,
+                        logical_message_id,
+                        delivery_attempt_id,
+                    },
+                    disposition,
+                    chrono::Utc::now().timestamp_micros(),
+                    op,
+                )?;
+                Ok(Some(RecipientCommitResult {
+                    note_id,
+                    disposition,
+                    created: false,
+                    note: None,
+                }))
+            })
+            .await
+    }
+
     /// Commit all recipient effects together, or none. A replay keeps its first
     /// disposition and creates only the acknowledgement for a new attempt.
     pub async fn commit(&self, mut input: RecipientCommit) -> StorageResult<RecipientCommitResult> {
@@ -368,34 +486,18 @@ impl RecipientTransportStore {
                         (n.id, input.disposition, true)
                     };
                 // This insertion deliberately shares the message/replay transaction.
-                let prior_ack: Option<(String, String)> = conn
-                    .query_row(
-                        ACK_LOOKUP_SQL,
-                        [input.delivery_attempt_id.to_string()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()
-                    .map_err(|e| map_err(e, op))?;
-                if let Some((binding, prior_disposition)) = prior_ack {
-                    let binding: Value = serde_json::from_str(&binding)
-                        .map_err(|_| invalid("invalid stored ack binding"))?;
-                    if binding != input.binding || prior_disposition != disposition.as_str() {
-                        return Err(invalid("ack attempt binding conflict"));
-                    }
-                } else {
-                    conn.execute(
-                        INSERT_ACK_SQL,
-                        params![
-                            input.delivery_attempt_id.to_string(),
-                            input.sender_agent_id,
-                            input.logical_message_id.to_string(),
-                            input.binding.to_string(),
-                            disposition.as_str(),
-                            now
-                        ],
-                    )
-                    .map_err(|e| map_err(e, op))?;
-                }
+                record_ack(
+                    conn,
+                    AckIdentity {
+                        binding: &input.binding,
+                        sender_agent_id: &input.sender_agent_id,
+                        logical_message_id: input.logical_message_id,
+                        delivery_attempt_id: input.delivery_attempt_id,
+                    },
+                    disposition,
+                    now,
+                    op,
+                )?;
                 Ok(RecipientCommitResult {
                     note_id,
                     disposition,
