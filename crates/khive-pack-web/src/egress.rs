@@ -501,6 +501,15 @@ pub(crate) struct PinnedClients {
 }
 
 impl PinnedClients {
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, url: &Url, checked_addr: IpAddr, client: reqwest::Client) {
+        self.clients.lock().unwrap().push_back((
+            url.origin().ascii_serialization(),
+            checked_addr,
+            client,
+        ));
+    }
+
     pub(crate) fn for_checked_address(
         &self,
         url: &Url,
