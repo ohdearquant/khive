@@ -530,6 +530,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
     }
 
     async fn try_insert_note(&self, note: Note) -> StorageResult<bool> {
+        reject_reserved_note_properties(note.properties.as_ref(), "try_insert_note")?;
         reject_if_forged_message_note(&note, "try_insert_note")?;
         self.inner.try_insert_note(note).await
     }

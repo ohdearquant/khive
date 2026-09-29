@@ -137,6 +137,7 @@ pub(crate) enum TransactionOwner {
     RunAtomicUnit,
     WithWriter,
     SingleStatement,
+    Migration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,6 +531,18 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         acceptance: Acceptance::Test { path: "khive-runtime/src/note_store_guard/tests.rs::public_note_store_refuses_reserved_property_on_every_whole_object_route" },
     },
     RouteInventoryEntry {
+        id: "runtime.note_store.try_insert_note",
+        site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::try_insert_note",
+        target: Substrate::Note,
+        write_class: WriteClass::WholeObject,
+        kind_policy: KindPolicy::None,
+        reservation: Reservation::NamedCheck { function: "reject_reserved_note_properties", file: "khive-runtime/src/note_store_guard.rs" },
+        transaction: TransactionOwner::WriterTask,
+        stamp: StampCapability::ReservationOnly,
+        family: None,
+        acceptance: Acceptance::Test { path: "khive-runtime/src/note_store_guard/tests.rs::public_note_store_refuses_reserved_property_on_every_whole_object_route" },
+    },
+    RouteInventoryEntry {
         id: "runtime.note_store.replace_note_if_unchanged",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::replace_note_if_unchanged",
         target: Substrate::Note,
@@ -614,6 +627,18 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         acceptance: Acceptance::Test { path: "khive-runtime/src/note_store_guard/tests.rs::public_note_store_refuses_reserved_property_on_every_whole_object_route" },
     },
     RouteInventoryEntry {
+        id: "runtime.try_create_note",
+        site: "khive-runtime/src/operations.rs::KhiveRuntime::try_create_note_impl",
+        target: Substrate::Note,
+        write_class: WriteClass::WholeObject,
+        kind_policy: KindPolicy::SpecializedWriter,
+        reservation: Reservation::NamedCheck { function: "reject_reserved_secret_gate_property", file: "khive-runtime/src/secret_gate.rs" },
+        transaction: TransactionOwner::WriterTask,
+        stamp: StampCapability::ReservationOnly,
+        family: Some("note.create"),
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::try_create_note_rejects_reserved_secret_gate_key" },
+    },
+    RouteInventoryEntry {
         id: "runtime.claim_entity",
         site: "khive-runtime/src/operations.rs::KhiveRuntime::claim_entity_if_absent",
         target: Substrate::Entity,
@@ -696,6 +721,18 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
         acceptance: Acceptance::Test { path: "kkernel/src/code_ingest.rs::tests::direct_ingest_writers_reject_reserved_properties_before_storage" },
+    },
+    RouteInventoryEntry {
+        id: "migration.005.unique_comm_external_id",
+        site: "khive-db/sql/005-unique-comm-external-id.sql::statement_1",
+        target: Substrate::Note,
+        write_class: WriteClass::PrivilegedEscape,
+        kind_policy: KindPolicy::None,
+        reservation: Reservation::PrivilegedEscape,
+        transaction: TransactionOwner::Migration,
+        stamp: StampCapability::ReservationOnly,
+        family: None,
+        acceptance: Acceptance::Test { path: "khive-runtime/src/secret_gate_finalizer/route_census.rs::migration_sql_is_inventoried" },
     },
 ];
 

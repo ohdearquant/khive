@@ -30,6 +30,8 @@ async fn public_note_store_refuses_reserved_property_on_every_whole_object_route
             .unwrap_err(),
     );
     assert_eq!(raw.get_note(fresh.id).await.unwrap(), None);
+    assert_secret_gate_refusal(store.try_insert_note(fresh.clone()).await.unwrap_err());
+    assert_eq!(raw.get_note(fresh.id).await.unwrap(), None);
 
     let mut replacement = before.clone();
     replacement.content = "unrelated edit".into();

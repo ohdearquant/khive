@@ -14,21 +14,21 @@ use syn::{
 };
 
 use super::declaration::{
-    Acceptance, Reservation, RouteInventoryEntry, Substrate, WriteClass, PINNED_MISSING_ACCEPTANCE,
-    ROUTE_INVENTORY,
+    Acceptance, Reservation, RouteInventoryEntry, Substrate, TransactionOwner, WriteClass,
+    PINNED_MISSING_ACCEPTANCE, ROUTE_INVENTORY,
 };
 
 const STORE_WRITES: &[&str] = &[
     "upsert_entity",
     "upsert_entities",
-    "batch_upsert_entities",
     "upsert_entity_with_attachments",
     "insert_entity_if_absent",
     "replace_entity_if_unchanged",
     "upsert_note",
     "upsert_notes",
-    "batch_upsert_notes",
     "insert_note_if_absent",
+    "try_insert_note",
+    "try_insert_note_with_attachments",
     "replace_note_if_unchanged",
     "update_note_properties",
     "set_note_property",
@@ -36,9 +36,34 @@ const STORE_WRITES: &[&str] = &[
     "patch_note_property_atomic",
 ];
 
-// These are storage operations that never set an entity/note properties
-// column. Keep the list named and independently checked against trait source.
-const NON_PROPERTIES_WRITES: &[&str] = &[];
+// The complement is explicit, including readers: a new trait method of any
+// spelling makes the census red until its properties behavior is classified.
+const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
+    "get_entity",
+    "delete_entity",
+    "query_entities",
+    "entity_sequence",
+    "query_entities_after",
+    "count_entities",
+    "get_entity_including_deleted",
+    "get_live_notes_by_key",
+    "query_keyed_notes",
+    "get_note",
+    "get_note_including_deleted",
+    "delete_note",
+    "query_notes",
+    "query_notes_count_free",
+    "query_notes_filtered",
+    "query_notes_filtered_count_free",
+    "count_notes_filtered_in_snapshot",
+    "count_notes_filtered_bounded_in_snapshot",
+    "note_sequence",
+    "query_notes_filtered_after",
+    "query_notes_filtered_bounded",
+    "count_notes",
+    "count_notes_in_namespaces",
+    "get_notes_batch",
+];
 
 const ENTITY_BUILDERS: &[&str] = &[
     "entity_upsert_statement",
@@ -60,10 +85,17 @@ enum DetectedClass {
     SingleKey(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteClass {
+    Application,
+    Migration,
+}
+
 #[derive(Debug, Clone)]
 struct Site {
     key: String,
     target: Substrate,
+    route_class: RouteClass,
     class: DetectedClass,
     calls: BTreeSet<String>,
     evidence: BTreeSet<String>,
@@ -158,6 +190,9 @@ fn sql_target(literal: &str) -> Option<Substrate> {
                 && window[3] == into
                 && window[4] == table
         });
+        let plain_replace = words
+            .windows(3)
+            .any(|window| window[0] == replace && window[1] == into && window[2] == table);
         let properties_update = words.windows(3).enumerate().any(|(index, window)| {
             window[0] == update
                 && window[1] == table
@@ -167,7 +202,7 @@ fn sql_target(literal: &str) -> Option<Substrate> {
                     .next()
                     .is_some_and(|set_clause| set_clause.contains(&properties))
         });
-        if plain_insert || conflict_insert || properties_update {
+        if plain_insert || conflict_insert || plain_replace || properties_update {
             return Some(target);
         }
     }
@@ -247,6 +282,7 @@ impl SourceCollector {
         let site = self.sites.entry(key.clone()).or_insert_with(|| Site {
             key: key.clone(),
             target,
+            route_class: RouteClass::Application,
             class: class.clone(),
             calls,
             evidence: BTreeSet::new(),
@@ -316,7 +352,7 @@ impl<'ast> Visit<'ast> for SourceCollector {
 
     fn visit_expr_method_call(&mut self, expr: &'ast ExprMethodCall) {
         let name = expr.method.to_string();
-        if STORE_WRITES.contains(&name.as_str()) {
+        if !self.path.starts_with("khive-db/") && STORE_WRITES.contains(&name.as_str()) {
             let path_index = match name.as_str() {
                 "set_note_property" => Some(1),
                 "try_patch_note_property" | "patch_note_property_atomic" => Some(3),
@@ -411,6 +447,104 @@ fn scan_source(path: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
     };
     collector.visit_file(&file);
     Ok(collector.sites.into_values().collect())
+}
+
+fn sql_statements(sql: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Sql,
+        SingleQuote,
+        DoubleQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut statements = Vec::new();
+    let mut statement = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut mode = Mode::Sql;
+    while let Some(character) = chars.next() {
+        match mode {
+            Mode::Sql => match character {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    statement.push(' ');
+                    mode = Mode::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    statement.push(' ');
+                    mode = Mode::BlockComment;
+                }
+                '\'' => {
+                    statement.push(character);
+                    mode = Mode::SingleQuote;
+                }
+                '"' => {
+                    statement.push(character);
+                    mode = Mode::DoubleQuote;
+                }
+                ';' => {
+                    if !statement.trim().is_empty() {
+                        statements.push(std::mem::take(&mut statement));
+                    }
+                }
+                _ => statement.push(character),
+            },
+            Mode::SingleQuote | Mode::DoubleQuote => {
+                statement.push(character);
+                let quote = if matches!(mode, Mode::SingleQuote) {
+                    '\''
+                } else {
+                    '"'
+                };
+                if character == quote {
+                    if chars.peek() == Some(&quote) {
+                        statement.push(chars.next().expect("peeked quote"));
+                    } else {
+                        mode = Mode::Sql;
+                    }
+                }
+            }
+            Mode::LineComment => {
+                if character == '\n' {
+                    statement.push(' ');
+                    mode = Mode::Sql;
+                }
+            }
+            Mode::BlockComment => {
+                if character == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    statement.push(' ');
+                    mode = Mode::Sql;
+                }
+            }
+        }
+    }
+    if !statement.trim().is_empty() {
+        statements.push(statement);
+    }
+    statements
+}
+
+fn scan_migration_sources(sources: &[(String, String)]) -> Vec<Site> {
+    let mut sites = Vec::new();
+    for (path, sql) in sources {
+        for (index, statement) in sql_statements(sql).iter().enumerate() {
+            if let Some(target) = sql_target(statement) {
+                sites.push(Site {
+                    key: format!("{path}::statement_{}", index + 1),
+                    target,
+                    route_class: RouteClass::Migration,
+                    class: DetectedClass::WholeObject,
+                    calls: BTreeSet::new(),
+                    evidence: BTreeSet::from(["migration SQL".into()]),
+                });
+            }
+        }
+    }
+    sites.sort_by(|a, b| a.key.cmp(&b.key));
+    sites
 }
 
 fn source_path(path: &Path) -> Option<String> {
@@ -607,6 +741,24 @@ fn check_inventory(
                 site.key
             ));
         }
+        let declared_class = if row.transaction == TransactionOwner::Migration {
+            RouteClass::Migration
+        } else {
+            RouteClass::Application
+        };
+        if site.route_class != declared_class {
+            failures.push(format!("{}: route class disagrees with source", site.key));
+        }
+        if site.route_class == RouteClass::Migration
+            && (row.write_class != WriteClass::PrivilegedEscape
+                || row.reservation != Reservation::PrivilegedEscape
+                || row.transaction != TransactionOwner::Migration)
+        {
+            failures.push(format!(
+                "{}: migration requires an explicit privileged escape",
+                site.key
+            ));
+        }
         match (&row.write_class, &site.class) {
             (WriteClass::SingleKey { key_path }, DetectedClass::SingleKey(actual))
                 if *key_path == actual.as_str() =>
@@ -656,6 +808,8 @@ fn check_inventory(
 
 fn check_store_trait_methods(sources: &[(String, String)]) -> Result<(), String> {
     let mut failures = Vec::new();
+    let mut observed = BTreeSet::new();
+    let mut traits_seen = BTreeSet::new();
     for (path, source) in sources {
         if path != "khive-storage/src/entity.rs" && path != "khive-storage/src/note.rs" {
             continue;
@@ -668,28 +822,39 @@ fn check_store_trait_methods(sources: &[(String, String)]) -> Result<(), String>
             if trait_item.ident != "EntityStore" && trait_item.ident != "NoteStore" {
                 continue;
             }
+            traits_seen.insert(trait_item.ident.to_string());
             for member in trait_item.items {
                 let syn::TraitItem::Fn(method) = member else {
                     continue;
                 };
                 let name = method.sig.ident.to_string();
-                if [
-                    "upsert",
-                    "insert",
-                    "replace",
-                    "update",
-                    "set",
-                    "patch",
-                    "batch_upsert",
-                ]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-                    && !STORE_WRITES.contains(&name.as_str())
-                    && !NON_PROPERTIES_WRITES.contains(&name.as_str())
+                if !STORE_WRITES.contains(&name.as_str())
+                    && !NON_PROPERTIES_STORE_METHODS.contains(&name.as_str())
                 {
-                    failures.push(format!("{path}: unclassified store write method {name}"));
+                    failures.push(format!("{path}: unclassified store method {name}"));
                 }
+                observed.insert(name);
             }
+        }
+    }
+    for trait_name in ["EntityStore", "NoteStore"] {
+        if !traits_seen.contains(trait_name) {
+            failures.push(format!("missing store trait {trait_name}"));
+        }
+    }
+    for name in STORE_WRITES {
+        if NON_PROPERTIES_STORE_METHODS.contains(name) {
+            failures.push(format!("store method {name} has two classifications"));
+        }
+    }
+    for name in STORE_WRITES
+        .iter()
+        .chain(NON_PROPERTIES_STORE_METHODS.iter())
+    {
+        if !observed.contains(*name) {
+            failures.push(format!(
+                "classified store method {name} is absent from traits"
+            ));
         }
     }
     if failures.is_empty() {
@@ -754,11 +919,34 @@ fn live_workspace_sources() -> Vec<(String, String)> {
     sources
 }
 
+fn live_migration_sources() -> Vec<(String, String)> {
+    let sql_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .join("khive-db/sql");
+    let mut sources = Vec::new();
+    for entry in
+        std::fs::read_dir(&sql_dir).unwrap_or_else(|error| panic!("{}: {error}", sql_dir.display()))
+    {
+        let path = entry.expect("SQL source entry").path();
+        if path.extension().is_some_and(|extension| extension == "sql") {
+            let name = path.file_name().expect("SQL source name").to_string_lossy();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            sources.push((format!("khive-db/sql/{name}"), source));
+        }
+    }
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    sources
+}
+
 #[test]
 fn source_census_matches_closed_route_inventory() {
     let sources = live_workspace_sources();
     check_store_trait_methods(&sources).expect("store method surface drifted");
-    let sites = scan_sources(&sources).expect("parse workspace sources");
+    let mut sites = scan_sources(&sources).expect("parse workspace sources");
+    sites.extend(scan_migration_sources(&live_migration_sources()));
+    sites.sort_by(|a, b| a.key.cmp(&b.key));
     for site in &sites {
         eprintln!(
             "ROUTE SITE | {} | {:?} | {:?} | {:?}",
@@ -767,6 +955,25 @@ fn source_census_matches_closed_route_inventory() {
     }
     check_inventory(&sites, ROUTE_INVENTORY, PINNED_MISSING_ACCEPTANCE)
         .unwrap_or_else(|failure| panic!("ADR-115 route census failed:\n{failure}"));
+}
+
+#[test]
+fn migration_sql_is_inventoried() {
+    let sites = scan_migration_sources(&live_migration_sources());
+    assert!(sites.iter().any(|site| {
+        site.key == "khive-db/sql/005-unique-comm-external-id.sql::statement_1"
+            && site.target == Substrate::Note
+            && site.route_class == RouteClass::Migration
+    }));
+    let fixture = scan_migration_sources(&[(
+        "khive-db/sql/999-census-fixture.sql".into(),
+        "-- UPDATE entities SET properties is only a comment\nUPDATE notes SET properties = '{}' WHERE id = 'fixture';".into(),
+    )]);
+    assert_eq!(fixture.len(), 1);
+    assert_eq!(fixture[0].route_class, RouteClass::Migration);
+    assert!(check_inventory(&fixture, &[], 0)
+        .unwrap_err()
+        .contains("unmapped khive-db/sql/999-census-fixture.sql::statement_1"));
 }
 
 #[test]
@@ -851,8 +1058,30 @@ fn synthetic_census_controls() {
         vec!["INSERT", "INTO", "entities"],
         vec!["INSERT", "OR", "IGNORE", "INTO", "entities"],
         vec!["INSERT", "OR", "REPLACE", "INTO", "entities"],
+        vec!["REPLACE", "INTO", "entities"],
     ] {
         assert_eq!(sql_target(&prefix.join(" ")), Some(Substrate::Entity));
+    }
+    for (replace, target) in [
+        (
+            "REPLACE INTO notes (id, properties) VALUES (?1, ?2)",
+            Substrate::Note,
+        ),
+        (
+            "REPLACE INTO entities (id, properties) VALUES (?1, ?2)",
+            Substrate::Entity,
+        ),
+    ] {
+        assert_eq!(sql_target(replace), Some(target));
+        let replace_sites = scan_sources(&[(
+            "sample/src/lib.rs".into(),
+            format!("fn replace() {{ let _ = {replace:?}; }}"),
+        )])
+        .unwrap();
+        assert_eq!(replace_sites[0].target, target);
+        assert!(check_inventory(&replace_sites, &[], 0)
+            .unwrap_err()
+            .contains("unmapped sample/src/lib.rs::replace"));
     }
     assert_eq!(
         sql_target(&["UPDATE", "entities", "SET", "properties", "=", "?1"].join(" ")),
@@ -983,11 +1212,25 @@ fn synthetic_census_controls() {
     .unwrap();
     assert!(included_test_module.is_empty());
 
-    let trait_source = vec![(
-        "khive-storage/src/note.rs".into(),
-        "trait NoteStore { fn upsert_brand_new(&self); }".into(),
-    )];
-    assert!(check_store_trait_methods(&trait_source)
+    let mut trait_sources = live_workspace_sources()
+        .into_iter()
+        .filter(|(path, _)| {
+            path == "khive-storage/src/entity.rs" || path == "khive-storage/src/note.rs"
+        })
+        .collect::<Vec<_>>();
+    assert!(check_store_trait_methods(&trait_sources).is_ok());
+    let note_trait = trait_sources
+        .iter_mut()
+        .find(|(path, _)| path == "khive-storage/src/note.rs")
+        .expect("note trait source");
+    let declaration = "pub trait NoteStore: Send + Sync + 'static {";
+    assert_eq!(note_trait.1.matches(declaration).count(), 1);
+    note_trait.1 = note_trait.1.replacen(
+        declaration,
+        "pub trait NoteStore: Send + Sync + 'static { fn write_note_properties(&self) {}",
+        1,
+    );
+    assert!(check_store_trait_methods(&trait_sources)
         .unwrap_err()
-        .contains("upsert_brand_new"));
+        .contains("unclassified store method write_note_properties"));
 }

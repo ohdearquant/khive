@@ -20704,6 +20704,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_create_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .try_create_note(
+                &tok,
+                "observation",
+                None,
+                "reserved-key conditional note",
+                Some(reserved_key_props()),
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn create_many_rejects_reserved_secret_gate_key_atomically() {
         let rt = rt();
         let tok = NamespaceToken::local();
