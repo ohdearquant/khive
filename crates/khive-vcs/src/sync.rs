@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -26,6 +26,9 @@ use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
 use crate::types::SnapshotId;
 
+#[cfg(test)]
+#[path = "remote_cache_perf_tests.rs"]
+mod remote_cache_perf_tests;
 #[cfg(test)]
 #[path = "remote_cache_recovery_tests.rs"]
 mod remote_cache_recovery_tests;
@@ -954,17 +957,18 @@ fn build_kg_archive(
 /// the canonical sort order used by `snapshot_id_for_archive`.
 fn write_sorted_entities(path: &Path, records: &[NdjsonEntity]) -> Result<()> {
     let mut sorted: Vec<&NdjsonEntity> = records.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.id.to_string()
-            .to_ascii_lowercase()
-            .cmp(&b.id.to_string().to_ascii_lowercase())
-    });
-    let mut lines = Vec::with_capacity(sorted.len());
-    for r in sorted {
-        let line = serde_json::to_string(r).context("serializing entity")?;
-        lines.push(line);
+    sorted.sort_by_key(|entity| entity.id);
+    let file = File::create(path).context("creating entities file")?;
+    let mut writer = BufWriter::new(file);
+    for (index, record) in sorted.into_iter().enumerate() {
+        if index != 0 {
+            writer
+                .write_all(b"\n")
+                .context("writing entity separator")?;
+        }
+        serde_json::to_writer(&mut writer, record).context("serializing entity")?;
     }
-    std::fs::write(path, lines.join("\n")).context("writing entities file")?;
+    writer.flush().context("writing entities file")?;
     Ok(())
 }
 
@@ -975,24 +979,17 @@ fn write_sorted_entities(path: &Path, records: &[NdjsonEntity]) -> Result<()> {
 fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
     let mut sorted: Vec<&NdjsonEdge> = records.iter().collect();
     sorted.sort_by(|a, b| {
-        let ak = (
-            a.source.to_string(),
-            a.target.to_string(),
-            a.relation.clone(),
-        );
-        let bk = (
-            b.source.to_string(),
-            b.target.to_string(),
-            b.relation.clone(),
-        );
-        ak.cmp(&bk)
+        (a.source, a.target, a.relation.as_str()).cmp(&(b.source, b.target, b.relation.as_str()))
     });
-    let mut lines = Vec::with_capacity(sorted.len());
-    for r in sorted {
-        let line = serde_json::to_string(r).context("serializing edge")?;
-        lines.push(line);
+    let file = File::create(path).context("creating edges file")?;
+    let mut writer = BufWriter::new(file);
+    for (index, record) in sorted.into_iter().enumerate() {
+        if index != 0 {
+            writer.write_all(b"\n").context("writing edge separator")?;
+        }
+        serde_json::to_writer(&mut writer, record).context("serializing edge")?;
     }
-    std::fs::write(path, lines.join("\n")).context("writing edges file")?;
+    writer.flush().context("writing edges file")?;
     Ok(())
 }
 
