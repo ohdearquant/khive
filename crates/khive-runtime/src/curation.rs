@@ -2886,8 +2886,7 @@ impl KhiveRuntime {
         let exponent = attempts.saturating_sub(1).min(127) as u32;
         let delay_nanos = base_delay
             .as_nanos()
-            .checked_shl(exponent)
-            .unwrap_or(u128::MAX)
+            .saturating_mul(1u128 << exponent)
             .min(max_delay.as_nanos());
         let delay = std::time::Duration::new(
             (delay_nanos / 1_000_000_000) as u64,
@@ -6407,6 +6406,124 @@ mod tests {
             props.get("delivery").is_none(),
             "a transient failure must remain pending"
         );
+    }
+
+    fn assert_outbound_retry_schedule(
+        note: &Note,
+        attempted_at: chrono::DateTime<chrono::Utc>,
+        expected_attempts: u64,
+        expected_delay_seconds: i64,
+    ) {
+        let properties = note.properties.as_ref().expect("retry properties");
+        assert_eq!(
+            properties["delivery_attempts"].as_u64(),
+            Some(expected_attempts)
+        );
+        let next_attempt_at = chrono::DateTime::parse_from_rfc3339(
+            properties["next_attempt_at"]
+                .as_str()
+                .expect("retry deadline"),
+        )
+        .expect("RFC 3339 retry deadline")
+        .with_timezone(&chrono::Utc);
+        assert_eq!(
+            next_attempt_at.signed_duration_since(attempted_at),
+            chrono::TimeDelta::seconds(expected_delay_seconds)
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_transient_failure_saturates_backoff_and_keeps_ordinary_growth() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+        let store = rt.notes(&token).expect("note store");
+        let attempted_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        for (prior_attempts, expected_attempts, ceiling_seconds, expected_delay_seconds) in [
+            (119, 120, 1800, 1800),
+            (u64::MAX, u64::MAX, 1800, 1800),
+            (0, 1, 60, 5),
+            (1, 2, 60, 10),
+            (2, 3, 60, 20),
+            (4, 5, 60, 60),
+        ] {
+            let mut note = outbound_message_note();
+            note.properties = Some(serde_json::json!({
+                "direction": "outbound",
+                "delivery_attempts": prior_attempts,
+            }));
+            let id = note.id;
+            store.upsert_note(note).await.expect("seed pending message");
+
+            let marked = rt
+                .mark_outbound_message_transient_failure(
+                    &token,
+                    id,
+                    attempted_at,
+                    "temporary failure".to_string(),
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(ceiling_seconds),
+                )
+                .await
+                .expect("schedule retry");
+            assert_outbound_retry_schedule(
+                &marked,
+                attempted_at,
+                expected_attempts,
+                expected_delay_seconds,
+            );
+            assert_eq!(marked, store.get_note(id).await.unwrap().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_claim_transient_failure_saturates_backoff_and_keeps_ordinary_growth() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+        let store = rt.notes(&token).expect("note store");
+        let attempted_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        for (prior_attempts, expected_attempts, ceiling_seconds, expected_delay_seconds) in [
+            (119, 120, 1800, 1800),
+            (u64::MAX, u64::MAX, 1800, 1800),
+            (0, 1, 60, 5),
+            (1, 2, 60, 10),
+            (2, 3, 60, 20),
+            (4, 5, 60, 60),
+        ] {
+            let mut note = outbound_message_note();
+            note.properties = Some(serde_json::json!({
+                "direction": "outbound",
+                "delivery_attempts": prior_attempts,
+            }));
+            let id = note.id;
+            store.upsert_note(note).await.expect("seed pending message");
+
+            let marked = rt
+                .mark_outbound_message_claim_transient_failure(
+                    &token,
+                    id,
+                    attempted_at,
+                    "temporary claim failure".to_string(),
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(ceiling_seconds),
+                )
+                .await
+                .expect("schedule claim retry");
+            assert_outbound_retry_schedule(
+                &marked,
+                attempted_at,
+                expected_attempts,
+                expected_delay_seconds,
+            );
+            assert_eq!(marked, store.get_note(id).await.unwrap().unwrap());
+        }
     }
 
     #[tokio::test]
