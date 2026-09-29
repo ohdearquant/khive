@@ -267,9 +267,9 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 ## Amendment 1 (2026-09-29): per-upload leases on a shared filesystem root
 
 **Status: Proposed (2026-09-29).** This amendment specifies the fix for the shared-root expiry gap in
-[#3643](https://github.com/ohdearquant/khive/issues/3643). It supersedes only the filesystem
-staging sweep's mtime rule in §3b and §4 and the corresponding filesystem expiry arms in
-Acceptance 5–6. Today a filesystem sweep compares every staged file's mtime with the
+[#3643](https://github.com/ohdearquant/khive/issues/3643). It amends §2, §3b, §4 and Acceptance
+5–6 as follows, and adds the five Acceptance arms at its end. Today a filesystem sweep
+compares every staged file's mtime with the
 sweeping daemon's `KHIVE_BLOB_UPLOAD_IDLE_SECS`; a shorter-bound daemon can therefore
 remove another daemon's still-live upload. The S3 multipart lifecycle rule and its sweep
 are unchanged. This amendment closes the design gap identified in
