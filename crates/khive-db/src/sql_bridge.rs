@@ -8451,7 +8451,7 @@ mod tests {
                 "{mode}: {result:?}"
             );
             assert!(
-                pool.try_writer_nowait().is_err(),
+                pool.try_checkpoint_nowait().is_err(),
                 "{mode}: writer was not retired"
             );
             let mut writer = bridge.writer().await.unwrap();
@@ -8498,7 +8498,10 @@ mod tests {
                             label: None,
                         })
                         .await?;
-                    observed.store(probe_pool.try_writer_nowait().is_err(), Ordering::SeqCst);
+                    observed.store(
+                        probe_pool.try_checkpoint_nowait().is_err(),
+                        Ordering::SeqCst,
+                    );
                     Err(StorageError::Internal("rollback guard probe".into()))
                 })
             }))
@@ -8596,7 +8599,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(sum, Some(SqlValue::Integer(2))), "{sum:?}");
-        assert!(pool.try_writer_nowait().unwrap().is_autocommit());
+        assert!(pool.writer().unwrap().is_autocommit());
     }
 
     /// ADR-067 Component A: before

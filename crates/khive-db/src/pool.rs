@@ -1354,6 +1354,59 @@ pub struct WriterGuard<'pool> {
     origin: TxOrigin,
 }
 
+/// A zero-wait checkout that can run only the fixed checkpoint recovery
+/// pragmas. The connection remains private: exposing it would let a caller
+/// execute logical writes without disk-reserve admission (ADR-154 §5).
+///
+/// Ordinary SQL is deliberately unavailable through this capability:
+/// ```compile_fail
+/// use khive_db::{ConnectionPool, PoolConfig};
+/// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+/// pool.try_checkpoint_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
+/// ```
+pub struct CheckpointGuard<'pool> {
+    guard: parking_lot::MutexGuard<'pool, Connection>,
+}
+
+/// SQLite's three-column result from a fixed WAL checkpoint pragma.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointResult {
+    /// Whether SQLite reported a busy checkpoint.
+    pub busy: i64,
+    /// WAL frames observed by SQLite (`-1` when there is no WAL).
+    pub log_frames: i64,
+    /// WAL frames copied back into the database.
+    pub checkpointed_frames: i64,
+}
+
+impl CheckpointGuard<'_> {
+    /// Run a PASSIVE checkpoint without disk-reserve admission.
+    pub fn passive(&self) -> Result<CheckpointResult, SqliteError> {
+        self.guard
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok(CheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Run a TRUNCATE checkpoint without disk-reserve admission.
+    pub fn truncate(&self) -> Result<CheckpointResult, SqliteError> {
+        self.guard
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok(CheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+}
+
 /// Process-local monotonic counters for every instrumented writer acquisition
 /// boundary owned by one [`ConnectionPool`].
 ///
@@ -1915,20 +1968,24 @@ impl ConnectionPool {
         }
     }
 
-    /// Zero-wait writer checkout for background tasks.
+    /// Zero-wait checkpoint checkout for recovery maintenance.
     ///
     /// Uses `try_lock()` (no timeout, no spin) — returns `Err` immediately when
-    /// any other caller holds the writer Mutex. Background tasks (e.g. the WAL
-    /// checkpoint task) MUST use this instead of `try_writer` so that a busy
-    /// writer causes the background task to skip its current tick rather than
-    /// stalling for up to `checkout_timeout` (default 5s) while write traffic
-    /// is in progress.
+    /// any other caller holds the writer Mutex. The scheduled checkpoint task
+    /// uses its own dedicated connection (ADR-091 Amendment 5); this optional
+    /// pooled capability remains available for zero-wait recovery callers.
     ///
-    /// This public checkout deliberately bypasses the disk-space admission
-    /// floor so checkpoint and recovery can run when the volume is low. It
-    /// returns a general writer guard; callers must reserve it for maintenance
-    /// and use `try_writer` for ordinary writes.
-    pub fn try_writer_nowait(&self) -> Result<WriterGuard<'_>, SqliteError> {
+    /// It bypasses the disk-reserve floor because checkpoints can recover WAL
+    /// space at or below that floor (ADR-154 §5). The returned guard exposes
+    /// only fixed PASSIVE and TRUNCATE checkpoint operations.
+    ///
+    /// The former unrestricted checkout must not return:
+    /// ```compile_fail
+    /// use khive_db::{ConnectionPool, PoolConfig};
+    /// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+    /// pool.try_writer_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
+    /// ```
+    pub fn try_checkpoint_nowait(&self) -> Result<CheckpointGuard<'_>, SqliteError> {
         self.ensure_pooled_writer_active()?;
         let guard = self.writer.try_lock().ok_or_else(|| {
             SqliteError::InvalidData(
@@ -1936,10 +1993,7 @@ impl ConnectionPool {
             )
         })?;
         self.ensure_pooled_writer_active()?;
-        Ok(WriterGuard {
-            guard,
-            origin: self.origin(),
-        })
+        Ok(CheckpointGuard { guard })
     }
 
     pub(crate) fn retire_pooled_writer(&self, conn: &Connection) {
@@ -5581,7 +5635,7 @@ mod tests {
         let before = pool.writer_acquisition_snapshot();
 
         assert!(
-            pool.try_writer_nowait().is_err(),
+            pool.try_checkpoint_nowait().is_err(),
             "zero-wait maintenance checkout must skip while held"
         );
 
@@ -5591,6 +5645,43 @@ mod tests {
             "a checkpoint-style zero-wait skip is not a finite-wait checkout timeout"
         );
         drop(held);
+    }
+
+    #[test]
+    fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_floor.db");
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(0, |_| Ok(0));
+        pool.writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE checkpoint_floor (id INTEGER); \
+                 INSERT INTO checkpoint_floor VALUES (1)",
+            )
+            .unwrap();
+
+        let wal_path = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
+        pool.set_test_write_admission(100, |_| Ok(99));
+        assert!(matches!(
+            pool.writer(),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        let before = pool.writer_acquisition_snapshot();
+
+        let checkpoint = pool
+            .try_checkpoint_nowait()
+            .expect("checkpoint recovery must bypass the floor");
+        assert_eq!(checkpoint.passive().unwrap().busy, 0);
+        assert_eq!(checkpoint.truncate().unwrap().busy, 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert_eq!(pool.writer_acquisition_snapshot(), before);
     }
 
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers/deregisters a

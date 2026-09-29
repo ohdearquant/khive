@@ -25,8 +25,8 @@ check after the handle was opened. The sampled value is not cached across
 admissions.
 
 Checkpoint and diagnostics infrastructure connections, including the
-zero-wait checkpoint checkout, remain available below the floor so recovery
-can reclaim WAL space. Pool startup also remains available; opening and
+zero-wait `try_checkpoint_nowait` capability, remain available below the floor
+so recovery can reclaim WAL space. Pool startup also remains available; opening and
 configuring SQLite connections may perform setup I/O before any operation is
 admitted. A caller's `execute_script_top_level` is still a request-path
 operation, including `khive-vcs` sync's `WalCheckpointTruncate`; it is refused
@@ -36,6 +36,11 @@ exempt. The check cannot predict the size of an arbitrary SQL transaction or
 writes by other processes, so a very large already-admitted transaction can
 still reach `SQLITE_FULL`. The reserve protects subsequent admissions and
 provides headroom for recovery; it is not a transaction-size quota.
+
+`try_checkpoint_nowait` returns a restricted `CheckpointGuard`. It has fixed
+PASSIVE and TRUNCATE operations and exposes no raw SQLite connection or
+general SQL execution. A busy pooled writer causes an immediate skip; the
+scheduled ADR-091 task continues to use its dedicated connection.
 
 ## WAL autocheckpoint ownership
 
