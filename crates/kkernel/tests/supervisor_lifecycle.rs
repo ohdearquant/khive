@@ -867,11 +867,18 @@ async fn supervisor_client_first_handover_and_legacy_control() {
     );
 
     // Pre-A2 control in this same test file: publish the declaration, then
-    // start the old direct daemon path without the launcher's handover.
+    // start the old direct daemon path without the launcher's handover. Both
+    // the rendezvous and store are occupied; the socket verdict wins.
     let control = Fixture::new();
     let (status, log) = control.completed(&mut control.exec_command(), "control-client.log");
     assert!(status.success(), "control client auto-spawn failed: {log}");
     let control_holder = wait_for_holder(&control, None).await;
+    let store_lock = control.database.with_file_name(".db.khived.lock");
+    assert_eq!(
+        std::fs::read_to_string(&store_lock).expect("incumbent store claim"),
+        control_holder.to_string(),
+        "the socket and store claims must both be held for this precedence check"
+    );
     let (mut legacy_job, legacy_log) =
         control.spawn(&mut control.direct_daemon_command(), "legacy-job.log");
     let legacy_pid = legacy_job.0.id();

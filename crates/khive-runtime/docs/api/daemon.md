@@ -56,6 +56,45 @@ for the daemon's own boot sequence where waiting until quiescence IS the desired
 caller only trying to _detect_ whether a lock is currently free — without committing to wait
 forever for a possibly-wedged holder — needs a deadline instead.
 
+## Store-bound daemon ownership
+
+The HOME-bound socket, PID file, and boot/recovery lock coordinate one client
+rendezvous. They do not identify a SQLite store: two clients with different
+`HOME` values may discover the same absolute `[[backends]]` paths. Both
+`kkernel mcp --daemon` boot paths therefore claim a separate exclusive
+`.DATABASE.khived.lock` sidecar beside
+each canonical file-backed database path before runtime construction opens
+stores or runs migrations. Under the HOME boot lock, a bounded protocol
+probe first refuses an identified daemon already serving the same socket.
+The claims are sorted and deduplicated across the configured topology, held
+until serving and shutdown finish, and never unlinked. A store contender
+refuses immediately; it names the holder PID when that PID has been written,
+or reports an unknown holder during the narrow
+post-lock/pre-PID window. In-memory backends take no store lock. The guard is
+daemon-only; ordinary local/stdio writers keep their existing coordination.
+
+Each daemon freezes the canonical pathname used for its actual SQLite open.
+It revalidates a configured symlink spelling after claiming and refuses a
+retarget, naming both the claimed and current paths; it never opens the
+re-resolved spelling. For an existing database, the guard records `(dev, ino)`
+at claim and checks it while binding an open file under the lock. For a new
+writable database, it claims the sidecar first, creates the canonical file
+under that lock, then binds its new identity. A missing read-only database
+refuses without creating it. The daemon re-stats every canonical pathname
+after SQLite construction and refuses startup on an observed identity change.
+The daemon also checks immediately after each backend opens, before schema
+preparation or migrations. The SQLite binding does not expose its opened file
+descriptor's identity, so
+this check does not claim atomic protection against a concurrent replace-and-
+restore between checks.
+
+Distinct hardlink names for the same SQLite inode have different sidecars:
+a second daemon can claim the other name. Hardlink aliases are unsupported.
+A database replaced at the same canonical pathname still uses the same
+persistent sidecar. The database directory must permit sidecar creation,
+including when the database itself is opened read-only, or daemon boot fails
+closed.
+
 ## build_metrics_snapshot
 
 `tx_registry` (ADR-091 Plank 0) is a process-global singleton reachable directly, with no plumbing

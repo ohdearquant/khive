@@ -1743,6 +1743,26 @@ pub async fn probe_supervisor_socket(timeout: std::time::Duration) -> Supervisor
     probe_supervisor_socket_inner(timeout, false).await
 }
 
+/// Keep the existing socket-owner refusal ahead of a contended store claim.
+/// The caller holds the HOME boot lock; this read-only probe cannot open SQLite
+/// or disturb the incumbent's rendezvous. Unknown peers still reach the normal
+/// boot fence after the store claims have been acquired.
+#[cfg(unix)]
+pub async fn refuse_serving_socket_before_store_claim() -> anyhow::Result<()> {
+    if let SupervisorSocketProbe::Daemon(peer) =
+        probe_supervisor_socket(std::time::Duration::from_millis(500)).await
+    {
+        let holder = peer
+            .pid
+            .map_or_else(|| "unknown pid".to_string(), |pid| format!("pid {pid}"));
+        anyhow::bail!(
+            "refusing to start: a khived instance is already serving this socket {} ({holder})",
+            socket_path().display()
+        );
+    }
+    Ok(())
+}
+
 /// Ask the process on the connected socket to enter its own SIGTERM shutdown
 /// path. The peer receives this on the same connection that supplies its
 /// credentials and identity response, so no later numeric PID signal is sent.
