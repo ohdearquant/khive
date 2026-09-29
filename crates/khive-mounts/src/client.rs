@@ -41,6 +41,22 @@ struct Job {
     deadline: Instant,
 }
 
+impl Job {
+    fn into_ready(self) -> Option<Self> {
+        let fence = CallFence {
+            reply: &self.reply,
+            deadline: self.deadline,
+        };
+        match fence.check() {
+            Ok(()) => Some(self),
+            Err(error) => {
+                let _ = self.reply.send(Err(error));
+                None
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CallFence<'a> {
     reply: &'a oneshot::Sender<Result<Value, Failure>>,
@@ -119,8 +135,8 @@ async fn supervise(config: MountConfig, connection: Connection, mut receiver: mp
             _ = current.child.wait() => true,
             job = receiver.recv() => {
                 let Some(job) = job else { return };
+                let Some(job) = job.into_ready() else { continue };
                 let fence = CallFence { reply: &job.reply, deadline: job.deadline };
-                if fence.check().is_err() { continue; }
                 let result = timeout_at(job.deadline, current.perform(&config, job.operation, fence)).await.unwrap_or_else(|_| Err(Failure::timeout()));
                 let fatal = result.as_ref().err().is_some_and(|error| error.fatal);
                 let _ = job.reply.send(result);
@@ -148,6 +164,7 @@ struct Connection {
     stdout: BufReader<ChildStdout>,
     sequence: u64,
 }
+
 impl Connection {
     async fn start(config: &MountConfig) -> Result<Self, Failure> {
         timeout(Duration::from_millis(config.timeout_ms), async {
@@ -338,5 +355,28 @@ impl Connection {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expired_queued_job_replies_with_timeout() {
+        let (reply, receiver) = oneshot::channel();
+        let job = Job {
+            operation: Operation::Catalog,
+            reply,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+
+        assert!(job.into_ready().is_none());
+        let failure = receiver
+            .await
+            .expect("the worker must reply to a queued job")
+            .expect_err("the expired job must be refused");
+        assert_eq!(failure.class, "tool_timeout");
+        assert_eq!(failure.reason, "deadline_exceeded");
     }
 }
