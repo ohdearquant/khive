@@ -219,14 +219,72 @@ pub(crate) async fn handle_vacuum(
     writer
         .execute_script_top_level(TopLevelMaintenance::Vacuum)
         .await?;
-    let (page_size_after, page_count_after, bytes_after) = allocated_bytes(writer.as_mut()).await?;
-    let (file_bytes_after, wal_bytes_after) = file_sizes(path.as_deref())?;
+    // VACUUM has committed. A request-read deadline may have elapsed during
+    // this long-running write, so a subsequent PRAGMA can time out. Preserve
+    // the committed outcome even when its optional after-measurement fails.
+    Ok(vacuum_result_after_commit(
+        writer.as_mut(),
+        path.as_deref(),
+        page_size_before,
+        page_count_before,
+        bytes_before,
+        file_bytes_before,
+        wal_bytes_before,
+    )
+    .await)
+}
 
-    Ok(json!({
+async fn vacuum_result_after_commit<R: SqlReader + ?Sized>(
+    writer: &mut R,
+    path: Option<&Path>,
+    page_size_before: u64,
+    page_count_before: u64,
+    bytes_before: u64,
+    file_bytes_before: Option<u64>,
+    wal_bytes_before: Option<u64>,
+) -> Value {
+    let after = async {
+        let (page_size, page_count, bytes) = allocated_bytes(writer).await?;
+        let (file_bytes, wal_bytes) = file_sizes(path)?;
+        Ok::<_, RuntimeError>((page_size, page_count, bytes, file_bytes, wal_bytes))
+    }
+    .await;
+    let (
+        page_size_after,
+        page_count_after,
+        bytes_after,
+        file_bytes_after,
+        wal_bytes_after,
+        measurement_status,
+        measurement_error,
+    ) = match after {
+        Ok((page_size, page_count, bytes, file_bytes, wal_bytes)) => (
+            Some(page_size),
+            Some(page_count),
+            Some(bytes),
+            file_bytes,
+            wal_bytes,
+            "available",
+            None,
+        ),
+        Err(error) => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            "unavailable_after_commit",
+            Some(error.to_string()),
+        ),
+    };
+
+    json!({
         "ok": true,
+        "post_vacuum_metrics_status": measurement_status,
+        "post_vacuum_metrics_error": measurement_error,
         "database_bytes_before": bytes_before,
         "database_bytes_after": bytes_after,
-        "allocated_bytes_reclaimed": bytes_before.saturating_sub(bytes_after),
+        "allocated_bytes_reclaimed": bytes_after.map(|bytes| bytes_before.saturating_sub(bytes)),
         "page_size_bytes_before": page_size_before,
         "page_size_bytes_after": page_size_after,
         "page_count_before": page_count_before,
@@ -235,7 +293,7 @@ pub(crate) async fn handle_vacuum(
         "file_bytes_after": file_bytes_after,
         "wal_bytes_before": wal_bytes_before,
         "wal_bytes_after": wal_bytes_after,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -244,7 +302,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{handle_stats, handle_vacuum};
+    use super::{allocated_bytes, handle_stats, handle_vacuum, vacuum_result_after_commit};
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
 
     async fn setup() -> (KhiveRuntime, TempDir) {
@@ -326,5 +384,41 @@ mod tests {
             "VACUUM must reclaim pages released by deleted session rows: {result}"
         );
         assert!(result["allocated_bytes_reclaimed"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn committed_vacuum_keeps_success_when_after_read_deadline_has_elapsed() {
+        let (runtime, _directory) = setup().await;
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        let (page_size_before, page_count_before, bytes_before) = allocated_bytes(writer.as_mut())
+            .await
+            .expect("before metrics");
+        writer
+            .execute_script_top_level(khive_storage::TopLevelMaintenance::Vacuum)
+            .await
+            .expect("vacuum committed");
+        let path = sql.database_path();
+
+        let result = khive_storage::scope_request_read_deadline(std::time::Duration::ZERO, async {
+            vacuum_result_after_commit(
+                writer.as_mut(),
+                path.as_deref(),
+                page_size_before,
+                page_count_before,
+                bytes_before,
+                None,
+                None,
+            )
+            .await
+        })
+        .await;
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["post_vacuum_metrics_status"],
+            "unavailable_after_commit"
+        );
+        assert!(result["database_bytes_after"].is_null());
+        assert_eq!(result["database_bytes_before"], bytes_before);
     }
 }

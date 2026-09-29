@@ -22,3 +22,12 @@ wait for active readers. It does not delete session rows or set a retention
 policy. The mirror currently exposes no pass-in-progress signal, so the verb
 serializes with mirror database writes through the writer but cannot refuse an
 entire mirror pass in progress.
+
+Once VACUUM commits, the response retains `ok: true` even if a request read
+deadline or another post-commit measurement error prevents the after figures.
+In that case `post_vacuum_metrics_status` is `unavailable_after_commit`,
+`post_vacuum_metrics_error` names the measurement error, and the after and
+reclaimed fields are `null`. A successful measurement reports status
+`available`. SQLite's VACUUM may use an in-memory temporary copy because this
+backend configures `temp_store=MEMORY`; operators should budget memory for a
+large database.

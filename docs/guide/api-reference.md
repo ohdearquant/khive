@@ -26,7 +26,7 @@ An always-machine-readable copy of this page is at
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
@@ -2604,7 +2604,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 5 verbs
+## `session` pack — 7 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2687,6 +2687,20 @@ authenticated connection identity.
 
 The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
 specifies the scoped key, migration, and search result identity.
+
+### `session.stats` — Assertive
+
+Report database-wide row counts and allocated bytes for session mirror tables,
+plus database-file and WAL sizes. Requires SQLite `dbstat`. See the
+[maintenance contract](../../crates/khive-pack-session/docs/api/session-maintenance.md).
+
+### `session.vacuum` — Commissive
+
+Run explicit SQLite compaction. The result reports `ok: true` once VACUUM
+commits. Before/after byte and page figures are returned when the post-commit
+read succeeds; if the request read deadline expires during VACUUM, the after
+figures are `null` with `post_vacuum_metrics_status:
+"unavailable_after_commit"`. See the [maintenance contract](../../crates/khive-pack-session/docs/api/session-maintenance.md).
 
 ---
 
