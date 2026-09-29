@@ -8,6 +8,8 @@ mod egress;
 mod entities;
 mod extract;
 mod fetch;
+#[cfg(test)]
+mod fhcrc_probe_tests;
 mod identity;
 mod ingest;
 mod namespace;
