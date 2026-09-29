@@ -19,7 +19,7 @@ const QUERY: &str = "zznamespaceguard zzsecondguard";
 const TERM: &str = "zznamespaceguard";
 // Byte-for-byte copy of the rejected frozen V48 proposal, held as a test
 // fixture rather than installed as a numbered migration.
-const FROZEN_V48_SQL: &str = include_str!("namespace_trigram_v48_frozen.sql");
+const FROZEN_V48_SQL: &str = include_str!("namespace_trigram_v48_frozen.sql.txt");
 
 struct Fixture {
     _directory: tempfile::TempDir,
