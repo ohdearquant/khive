@@ -490,6 +490,8 @@ mod tests {
     use super::*;
     use crate::engine_config::StorageSectionConfig;
     use serial_test::serial;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
 
     #[tokio::test]
     async fn read_only_upload_methods_refuse_without_mutating_staging() {
@@ -889,6 +891,57 @@ mod tests {
             .expect("second hydration should succeed");
         assert_eq!(second.bytes(), b"x");
         drop(second);
+        wait_for_background_task_count(before).await;
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn large_queued_reservation_is_not_overtaken_by_a_later_small_one() {
+        let before = crate::background_task_count();
+        let store = HydrationReadStore::immediate(b"x".to_vec());
+        let hydrator = BlobHydrator::new(
+            Arc::clone(&store) as Arc<dyn BlobStore>,
+            khive_storage::MAX_BLOB_WHOLE_BYTES,
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("a".repeat(64)).unwrap();
+        let held = hydrator
+            .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES - 1)
+            .await
+            .unwrap();
+        assert_eq!(hydrator.admission.available_permits(), 1);
+        assert_eq!(store.calls(), 1);
+
+        let mut large =
+            Box::pin(hydrator.hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES));
+        poll_fn(|cx| {
+            assert!(large.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let mut small = Box::pin(hydrator.hydrate_verified(&content_ref, 1));
+        poll_fn(|cx| {
+            assert!(small.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            hydrator.admission.available_permits(),
+            0,
+            "the queued large waiter holds the one permit not held by the first read"
+        );
+        assert_eq!(store.calls(), 1, "neither queued read reaches the backend");
+
+        drop(large);
+        let verified = tokio::time::timeout(std::time::Duration::from_secs(1), small)
+            .await
+            .expect("small waiter proceeds when the large waiter is cancelled")
+            .expect("small hydration succeeds");
+        assert_eq!(verified.bytes(), b"x");
+        assert_eq!(store.calls(), 2, "cancelled large waiter starts no read");
+        drop(verified);
+        drop(held);
         wait_for_background_task_count(before).await;
     }
 
