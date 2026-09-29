@@ -4609,6 +4609,7 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_db::StorageBackend;
     use khive_runtime::{Namespace, RuntimeConfig};
     use tempfile::TempDir;
 
@@ -4631,6 +4632,63 @@ mod tests {
             ..RuntimeConfig::no_embeddings()
         })
         .expect("target runtime opens");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        (runtime, token)
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestJournalMode {
+        Wal,
+        Delete,
+    }
+
+    impl TestJournalMode {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Wal => "wal",
+                Self::Delete => "delete",
+            }
+        }
+
+        fn wal_mode(self) -> bool {
+            matches!(self, Self::Wal)
+        }
+    }
+
+    fn runtime_on_with_mode(
+        db_path: &Path,
+        mode: TestJournalMode,
+    ) -> (KhiveRuntime, NamespaceToken) {
+        let backend = Arc::new(
+            StorageBackend::sqlite_for_test_with_journal_mode(
+                db_path,
+                mode.wal_mode(),
+                std::time::Duration::from_secs(5),
+            )
+            .expect("target backend opens"),
+        );
+        backend.prepare_core_schema().expect("fresh schema");
+        let runtime = KhiveRuntime::from_prepared_backend(
+            backend,
+            RuntimeConfig {
+                db_path: Some(db_path.to_path_buf()),
+                packs: vec![],
+                ..RuntimeConfig::no_embeddings()
+            },
+        )
+        .expect("target runtime opens");
+        let writer = runtime.backend().pool().writer().expect("writer");
+        let actual_mode: String = writer
+            .conn()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        let busy_timeout_ms: i64 = writer
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout");
+        assert_eq!(actual_mode.to_ascii_lowercase(), mode.label());
+        assert_eq!(busy_timeout_ms, 5_000);
+        drop(writer);
         let token = runtime.authorize(Namespace::local()).expect("token");
         (runtime, token)
     }
@@ -4936,11 +4994,12 @@ mod tests {
         assert_eq!(report.l2.expect("L2 report").symbols_created, 0);
     }
 
-    #[tokio::test]
-    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier() {
+    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier_in_mode(
+        mode: TestJournalMode,
+    ) {
         let root = TempDir::new().expect("temporary database directory");
-        let db_path = root.path().join("entity-race.db");
-        let (runtime_a, token_a) = runtime_on(&db_path);
+        let db_path = root.path().join(format!("entity-race-{}.db", mode.label()));
+        let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
         let entity_id = project_uuid("race-fixture");
         let mut entity = Entity::new(token_a.namespace().as_str(), "project", "race-fixture");
         entity.id = entity_id;
@@ -4953,7 +5012,7 @@ mod tests {
             .await
             .expect("seed entity");
 
-        let (runtime_b, token_b) = runtime_on(&db_path);
+        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
         let specifier_a = UnresolvedSpec {
             specifier: "alpha".to_string(),
             target_kind: "project".to_string(),
@@ -5021,6 +5080,14 @@ mod tests {
         assert_eq!(report_b.unresolved_recorded, 1);
         assert_eq!(report_a.fts_indexed, 1);
         assert_eq!(report_b.fts_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier() {
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            concurrent_unresolved_additions_rebase_without_losing_either_specifier_in_mode(mode)
+                .await;
+        }
     }
 
     #[tokio::test]
@@ -5099,11 +5166,12 @@ mod tests {
         assert_eq!(report.blocked[0].file, "blocked.toml");
     }
 
-    #[tokio::test]
-    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind() {
+    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind_in_mode(
+        mode: TestJournalMode,
+    ) {
         let root = TempDir::new().expect("temporary database directory");
-        let db_path = root.path().join("edge-race.db");
-        let (runtime_a, token_a) = runtime_on(&db_path);
+        let db_path = root.path().join(format!("edge-race-{}.db", mode.label()));
+        let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
         let source_id = project_uuid("source");
         let target_id = project_uuid("target");
         for (id, name) in [(source_id, "source"), (target_id, "target")] {
@@ -5132,7 +5200,7 @@ mod tests {
         .await
         .expect("seed dependency edge");
 
-        let (runtime_b, token_b) = runtime_on(&db_path);
+        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let pause_a = std::sync::Arc::new(race_seam::OneShotPause::new(std::sync::Arc::clone(
             &barrier,
@@ -5210,6 +5278,296 @@ mod tests {
         assert_eq!(report_a.edges_updated, 1);
         assert_eq!(report_b.edges_updated, 1);
         assert!(edge.updated_at > update_time);
+    }
+
+    #[tokio::test]
+    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind() {
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            concurrent_dependency_evidence_rebases_without_losing_either_kind_in_mode(mode).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_conditional_inserts_preserve_entity_and_edge_winners() {
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            let root = TempDir::new().expect("temporary database directory");
+            let db_path = root.path().join(format!("insert-race-{}.db", mode.label()));
+            let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
+            let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
+            let entity_id = project_uuid("insert-race");
+            let mut entity_a = Entity::new("local", "project", "first-candidate");
+            entity_a.id = entity_id;
+            entity_a.properties = Some(json!({"candidate": "a"}));
+            let mut entity_b = entity_a.clone();
+            entity_b.name = "second-candidate".to_string();
+            entity_b.properties = Some(json!({"candidate": "b"}));
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let entity_store_a = runtime_a.entities(&token_a).expect("entity store A");
+            let entity_store_b = runtime_b.entities(&token_b).expect("entity store B");
+            let (inserted_a, inserted_b) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    entity_store_a
+                        .insert_entity_if_absent(entity_a.clone())
+                        .await
+                },
+                async {
+                    barrier.wait().await;
+                    entity_store_b
+                        .insert_entity_if_absent(entity_b.clone())
+                        .await
+                },
+            );
+            let inserted_a = inserted_a.expect("entity insert A");
+            let inserted_b = inserted_b.expect("entity insert B");
+            assert_ne!(inserted_a, inserted_b, "exactly one entity insert wins");
+            let stored_entity = entity_store_a
+                .get_entity(entity_id)
+                .await
+                .expect("read entity")
+                .expect("one entity remains");
+            let winner = if inserted_a { &entity_a } else { &entity_b };
+            assert_eq!(stored_entity.name, winner.name);
+            assert_eq!(stored_entity.properties, winner.properties);
+
+            let source_id = project_uuid("insert-source");
+            let target_id = project_uuid("insert-target");
+            for (id, name) in [(source_id, "insert-source"), (target_id, "insert-target")] {
+                let mut endpoint = Entity::new("local", "project", name);
+                endpoint.id = id;
+                entity_store_a
+                    .upsert_entity(endpoint)
+                    .await
+                    .expect("seed endpoint");
+            }
+            let now = Utc::now();
+            let edge_a = Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: "local".to_string(),
+                source_id,
+                target_id,
+                relation: EdgeRelation::DependsOn,
+                weight: 1.0,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata: Some(json!({"candidate": "a"})),
+                target_backend: None,
+            };
+            let edge_b = Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                weight: 0.25,
+                metadata: Some(json!({"candidate": "b"})),
+                ..edge_a.clone()
+            };
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let edge_store_a = runtime_a.graph(&token_a).expect("edge store A");
+            let edge_store_b = runtime_b.graph(&token_b).expect("edge store B");
+            let (inserted_a, inserted_b) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    edge_store_a.insert_edge_if_absent(edge_a.clone()).await
+                },
+                async {
+                    barrier.wait().await;
+                    edge_store_b.insert_edge_if_absent(edge_b.clone()).await
+                },
+            );
+            let inserted_a = inserted_a.expect("edge insert A");
+            let inserted_b = inserted_b.expect("edge insert B");
+            assert_ne!(
+                inserted_a, inserted_b,
+                "exactly one natural-key edge insert wins"
+            );
+            let (winning_edge, losing_edge) = if inserted_a {
+                (&edge_a, &edge_b)
+            } else {
+                (&edge_b, &edge_a)
+            };
+            let stored_edge = edge_store_a
+                .get_edge(winning_edge.id)
+                .await
+                .expect("read edge")
+                .expect("one edge remains");
+            assert_eq!(stored_edge.id, winning_edge.id);
+            assert_eq!(stored_edge.weight, winning_edge.weight);
+            assert_eq!(stored_edge.metadata, winning_edge.metadata);
+            assert!(edge_store_a
+                .get_edge(losing_edge.id)
+                .await
+                .expect("read loser")
+                .is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock() {
+        let root = TempDir::new().expect("temporary database directory");
+        let db_path = root.path().join("busy-delete.db");
+        let (runtime_a, _) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
+        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
+        let pool_b = runtime_b.backend().pool();
+        let writer_task = pool_b
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("file-backed writer task");
+        writer_task
+            .send_top_level(|conn| {
+                conn.busy_handler(None)
+                    .map_err(|error| khive_storage::StorageError::Internal(error.to_string()))
+            })
+            .await
+            .expect("disable SQLite wait on first BEGIN");
+
+        let lock_holder = runtime_a.backend().pool().writer().expect("lock holder");
+        lock_holder
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("reserve rollback-journal writer lock");
+        let id = project_uuid("busy-retry");
+        let mut report = CodeSourceIngestReport::default();
+        let write = mutate_entity(&runtime_b, &token_b, id, "busy.rs", &mut report, |_| {
+            let mut entity = Entity::new("local", "project", "busy-retry");
+            entity.id = id;
+            Some(entity)
+        });
+        let release = async {
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while pool_b.writer_acquisition_snapshot().writer_task_begin_busy == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            lock_holder
+                .conn()
+                .execute_batch("ROLLBACK")
+                .expect("release rollback-journal writer lock");
+            observed.expect("the other runtime must observe a real SQLITE_BUSY refusal");
+        };
+        let (result, ()) = tokio::join!(write, release);
+        assert_eq!(
+            result.expect("busy BEGIN retries after release"),
+            RowMutationOutcome::Created
+        );
+        assert_eq!(report.fts_indexed, 1);
+        let counters = pool_b.writer_acquisition_snapshot();
+        assert!(counters.writer_task_begin_busy >= 1);
+        assert!(counters.writer_task_begin_busy_absorbed >= 1);
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .expect("git command starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git output is UTF-8")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual A8 WAL/DELETE wall-clock comparison"]
+    async fn measure_concurrent_code_map_ingest_a8_32_commits() {
+        const COMMITS: usize = 32;
+        const REPO_NAME: &str = "code-map-a8-32";
+        let root = TempDir::new().expect("temporary measurement directory");
+        let repo = root.path().join(REPO_NAME);
+        let src = repo.join("src");
+        fs::create_dir_all(&src).expect("source directory");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"code-map-a8-32\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("stable manifest");
+        fs::write(src.join("lib.rs"), "").expect("initial library");
+        git_in(&repo, &["init", "-q"]);
+        for i in 0..COMMITS {
+            fs::write(
+                src.join(format!("module_{i:02}.rs")),
+                format!("pub fn value_{i:02}() -> usize {{ {i} }}\n"),
+            )
+            .expect("small module");
+            let mut lib = fs::read_to_string(src.join("lib.rs")).expect("read library");
+            lib.push_str(&format!("pub mod module_{i:02};\n"));
+            fs::write(src.join("lib.rs"), lib).expect("extend library");
+            git_in(&repo, &["add", "-A"]);
+            let message = format!("add module {i:02}");
+            git_in(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=A8 Fixture",
+                    "-c",
+                    "user.email=a8@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    &message,
+                ],
+            );
+        }
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "HEAD"]).trim(),
+            COMMITS.to_string()
+        );
+
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            let db_path = root.path().join(format!("map-{}.db", mode.label()));
+            let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
+            let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let sweep_time = Utc::now();
+            let run_a = async {
+                barrier.wait().await;
+                run_code_ingest(
+                    &runtime_a,
+                    &token_a,
+                    CodeSourceIngestOptions {
+                        path: &repo,
+                        languages: ["rust"].into_iter().collect(),
+                        sweep_time,
+                        enable_l1: true,
+                        enable_l1_5: true,
+                        enable_l2: false,
+                    },
+                )
+                .await
+            };
+            let run_b = async {
+                barrier.wait().await;
+                run_code_ingest(
+                    &runtime_b,
+                    &token_b,
+                    CodeSourceIngestOptions {
+                        path: &repo,
+                        languages: ["rust"].into_iter().collect(),
+                        sweep_time,
+                        enable_l1: true,
+                        enable_l1_5: true,
+                        enable_l2: false,
+                    },
+                )
+                .await
+            };
+            let started = std::time::Instant::now();
+            let (report_a, report_b) = tokio::join!(run_a, run_b);
+            let wall = started.elapsed();
+            let report_a = report_a.expect("concurrent ingest A");
+            let report_b = report_b.expect("concurrent ingest B");
+            assert_eq!(report_a.source_revision, report_b.source_revision);
+            println!(
+                "A8_MEASURE mode={} repo={REPO_NAME} commits={COMMITS} wall_ms={}",
+                mode.label(),
+                wall.as_millis()
+            );
+        }
     }
 }
 
