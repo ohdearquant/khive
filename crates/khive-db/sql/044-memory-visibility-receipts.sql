@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS memory_visibility_receipts (
     FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS memory_visibility_receipts_note_id
+    ON memory_visibility_receipts (note_id);
+
 CREATE TABLE IF NOT EXISTS memory_visibility_fences (
     namespace TEXT NOT NULL,
     note_id TEXT NOT NULL,

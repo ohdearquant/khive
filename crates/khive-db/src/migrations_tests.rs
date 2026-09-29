@@ -1890,6 +1890,33 @@ fn v43_vector_provenance_sidecar_starts_empty() {
     );
 }
 
+#[test]
+fn v44_indexes_memory_visibility_receipts_by_note_id() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("apply core migrations");
+
+    let columns = conn
+        .prepare("SELECT name FROM pragma_index_info('memory_visibility_receipts_note_id') ORDER BY seqno")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columns, vec!["note_id".to_owned()]);
+
+    let detail: String = conn
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT model_count FROM memory_visibility_receipts WHERE note_id = ?1",
+            ["note-id"],
+            |row| row.get(3),
+        )
+        .unwrap();
+    assert!(
+        detail.contains("USING INDEX memory_visibility_receipts_note_id (note_id=?)"),
+        "note-only lookup must use the receipts index: {detail}"
+    );
+}
+
 #[cfg(feature = "vectors")]
 #[tokio::test]
 async fn v43_upgrade_preserves_v42_vector_as_unknown_provenance() {
