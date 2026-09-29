@@ -559,6 +559,12 @@ pub fn acquire_daemon_store_guards(
             );
         }
     }
+    let mut configured_identities = Vec::new();
+    for database in &database_paths {
+        if let Some(identity) = regular_store_identity(database)? {
+            configured_identities.push((database.clone(), identity));
+        }
+    }
     let mut guards = Vec::with_capacity(database_paths.len());
 
     for (database, lock_path) in database_paths.into_iter().zip(lock_paths) {
@@ -595,12 +601,34 @@ pub fn acquire_daemon_store_guards(
                 database.display()
             )
         })?;
-        if !file.metadata()?.is_file() {
+        let sidecar_metadata = file.metadata()?;
+        if !sidecar_metadata.is_file() {
             anyhow::bail!(
                 "daemon store lock {} is not a regular file",
                 lock_path.display()
             );
         }
+        let sidecar_identity = (sidecar_metadata.dev(), sidecar_metadata.ino());
+        if let Some((matching_database, _)) = configured_identities
+            .iter()
+            .find(|(_, identity)| *identity == sidecar_identity)
+        {
+            anyhow::bail!(
+                "refusing daemon store claim: opened lock sidecar {} for database {} is the same \
+                 file as configured database {}; no sidecar lock was acquired or truncated",
+                lock_path.display(),
+                database.display(),
+                matching_database.display()
+            );
+        }
+        anyhow::ensure!(
+            sidecar_metadata.nlink() <= 1,
+            "refusing daemon store claim: opened lock sidecar {} for database {} has {} hard \
+             links; no sidecar lock was acquired or truncated",
+            lock_path.display(),
+            database.display(),
+            sidecar_metadata.nlink()
+        );
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -6955,6 +6983,7 @@ mod tests {
             message.contains(&second_database.display().to_string()),
             "{message}"
         );
+        assert!(message.contains("no store lock was opened"), "{message}");
         assert_eq!(
             std::fs::read(&second_database).unwrap(),
             b"second-backend-sentinel",
@@ -6966,6 +6995,65 @@ mod tests {
             1,
             "preflight must refuse before opening any claim sidecar"
         );
+    }
+
+    #[test]
+    fn store_guard_refuses_hardlinked_sidecar_before_lock_or_truncate() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("claim.db");
+        let temp_database = root.join("temp-database.db");
+        let lock = daemon_store_lock_path(&database).unwrap();
+        let sentinel = b"temp-database-sentinel";
+        std::fs::write(&temp_database, sentinel).unwrap();
+        std::fs::hard_link(&temp_database, &lock).unwrap();
+        assert!(std::fs::metadata(&temp_database).unwrap().nlink() > 1);
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temp_database)
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let error = acquire_daemon_store_guards([database.clone()])
+            .expect_err("opened sidecar hardlink must refuse before lock or truncate");
+        let message = error.to_string();
+        assert!(message.contains("hard links"), "{message}");
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert!(
+            message.contains(&database.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&temp_database).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&lock).unwrap(), sentinel);
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn store_guard_names_a_configured_database_matching_the_opened_sidecar() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let first_database = root.join("a.db");
+        let second_database = root.join("z.db");
+        let lock = daemon_store_lock_path(&first_database).unwrap();
+        let sentinel = b"configured-database-sentinel";
+        std::fs::write(&second_database, sentinel).unwrap();
+        std::fs::hard_link(&second_database, &lock).unwrap();
+
+        let error = acquire_daemon_store_guards([first_database.clone(), second_database.clone()])
+            .expect_err("opened sidecar must not alias another configured database");
+        let message = error.to_string();
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert!(
+            message.contains(&first_database.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second_database.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&second_database).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&lock).unwrap(), sentinel);
     }
 
     #[test]

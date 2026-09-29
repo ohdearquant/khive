@@ -1555,7 +1555,11 @@ topology supplies its effective SQLite paths; an implicit single backend
 supplies the resolved database path. An in-memory target supplies none. Sort
 and deduplicate canonical paths before claiming. If a claim's derived lock
 sidecar pathname is itself a configured database pathname, refuse the whole
-boot before opening any sidecar for writing. If one claim is unavailable
+boot before opening any sidecar for writing; after opening each sidecar but
+before locking or truncating it, refuse when the opened descriptor's
+`(device, inode)` matches any configured database identity observed at claim
+time or its hard-link count exceeds one (a configured database missing at
+claim time remains covered by the pathname preflight). If one claim is unavailable
 or contended, abort the entire boot and release earlier claims. Hold all
 claims through serving and shutdown. Never unlink a lock sidecar. A contender
 refuses even when the holder PID is temporarily unavailable; PID text is only
@@ -1595,7 +1599,8 @@ the first daemon serves the same inode; hardlink aliases are unsupported. The re
 `store_guard_hardlink_names_remain_independent_unsupported_aliases` in
 `crates/khive-runtime/src/daemon.rs` demonstrates the separate claims. This
 is a property of the sidecar scheme, not a claim about SQLite's support for
-multi-link database files. Replacing a database at the same canonical pathname does not erase its
+multi-link database files. A sidecar hardlinked to any file is refused before
+lock or truncation. Replacing a database at the same canonical pathname does not erase its
 persistent sidecar claim.
 
 ### Acceptance and controls
@@ -1614,9 +1619,14 @@ persistent sidecar claim.
 6. A second claim through a distinct hardlink name succeeds in the fixture,
    documenting the excluded alias rather than accidentally promising safety.
 7. A claim set whose derived lock sidecar is another configured database
-   refuses the whole boot before any sidecar is opened for writing;
+   refuses the whole boot before any sidecar is opened for writing; an opened
+   sidecar whose descriptor identity matches a configured database or whose
+   hard-link count exceeds one refuses before lock or truncation.
    `store_guard_refuses_a_database_at_another_stores_lock_sidecar` goes red if
-   the sidecar-collision preflight check is dropped.
+   the pathname preflight is dropped;
+   `store_guard_names_a_configured_database_matching_the_opened_sidecar` and
+   `store_guard_refuses_hardlinked_sidecar_before_lock_or_truncate` cover the
+   descriptor-identity and hard-link arms, respectively.
 
 The HOME boot/recovery lock still serializes startup and client recovery for
 one rendezvous. This amendment adds a separate store claim; it does not
