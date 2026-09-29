@@ -5,6 +5,7 @@
 //! in the `properties` JSON column; `content` is the message body.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -2973,6 +2974,36 @@ async fn detach_deleted_legacy_original(
     Ok(true)
 }
 
+fn delete_note_error_committed(error: &RuntimeError, id: Uuid) -> bool {
+    let RuntimeError::Khive(domain) = error.refusal_source() else {
+        return false;
+    };
+    let Some(details) = domain.details() else {
+        return false;
+    };
+    details.get("reason") == Some("post_commit_degraded")
+        && details.get("operation") == Some("delete_note")
+        && details
+            .get("record_id")
+            .is_some_and(|stored| Uuid::parse_str(stored).ok() == Some(id))
+        && details.get("committed") == Some("true")
+}
+
+async fn note_deleted_after_attempt<F>(
+    delete_result: &Result<bool, RuntimeError>,
+    id: Uuid,
+    probe_absent: F,
+) -> Result<bool, RuntimeError>
+where
+    F: Future<Output = Result<bool, RuntimeError>>,
+{
+    match delete_result {
+        Ok(deleted) => Ok(*deleted),
+        Err(error) if delete_note_error_committed(error, id) => Ok(true),
+        Err(_) => probe_absent.await,
+    }
+}
+
 /// Internal channel-poller maintenance. One bounded page per tick ensures an
 /// empty poll still makes progress without monopolizing the writer. The token
 /// carries the ingest namespace explicitly; heartbeat rows use a different
@@ -3149,13 +3180,13 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         // repaired original lives on canonical main and is detached by exact
         // ID/ref only after that transaction commits.
         let delete_result = runtime.delete_note(token, id, true).await;
-        // Index or event cleanup can fail after the row/edge transaction has
-        // committed. In that case the row will not be selected next tick, so
-        // still detach its routed owner before reporting the original error.
-        let note_deleted = match &delete_result {
-            Ok(deleted) => *deleted,
-            Err(_) => store.get_note_including_deleted(id).await?.is_none(),
-        };
+        // A typed post-commit error already proves the row/edge transaction
+        // committed. A second read can fail and must not block detaching the
+        // routed original that the now-absent note can never select again.
+        let note_deleted = note_deleted_after_attempt(&delete_result, id, async {
+            Ok(store.get_note_including_deleted(id).await?.is_none())
+        })
+        .await?;
         if note_deleted {
             deleted += 1;
             if routed_legacy {
@@ -4376,6 +4407,181 @@ mod tests {
     use khive_storage::note::Note;
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    #[tokio::test]
+    async fn post_commit_delete_detaches_original_even_if_followup_read_would_fail() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = super::KhiveRuntime::memory().expect("runtime");
+        let note_id = uuid::Uuid::new_v4();
+        let content_ref =
+            khive_storage::ContentRef::from_hex("a".repeat(64)).expect("fixture content ref");
+        let attachments = runtime.core().attachments().expect("main attachments");
+        assert!(attachments
+            .try_insert_attachment(khive_storage::Attachment::from_new(
+                note_id,
+                khive_storage::AttachmentSubstrate::Note,
+                khive_storage::NewAttachment {
+                    role: "quarantine-original".into(),
+                    content_ref: content_ref.clone(),
+                    media_type: None,
+                    size_bytes: None,
+                },
+                1,
+            ))
+            .await
+            .expect("seed routed owner"));
+        let original_message = "injected post-commit delete failure";
+        let delete_error: khive_runtime::RuntimeError =
+            khive_types::KhiveError::internal(original_message)
+                .with_details(khive_types::Details::new_owned([
+                    ("reason", "post_commit_degraded".to_string()),
+                    ("operation", "delete_note".to_string()),
+                    ("record_id", note_id.to_string()),
+                    ("committed", "true".to_string()),
+                ]))
+                .into();
+        let delete_result = Err(delete_error);
+        let read_attempted = AtomicBool::new(false);
+        let note_deleted = super::note_deleted_after_attempt(&delete_result, note_id, async {
+            read_attempted.store(true, Ordering::SeqCst);
+            Err(khive_runtime::RuntimeError::Internal(
+                "injected follow-up read failure".into(),
+            ))
+        })
+        .await
+        .expect("typed committed error settles deletion without a read");
+        assert!(note_deleted);
+        assert!(!read_attempted.load(Ordering::SeqCst));
+        assert!(super::detach_deleted_legacy_original(
+            &runtime,
+            note_id,
+            Some(content_ref.as_str()),
+        )
+        .await
+        .expect("detach routed original"));
+        assert!(attachments
+            .get_attachment(note_id, "quarantine-original")
+            .await
+            .expect("owner lookup")
+            .is_none());
+        let returned = match delete_result {
+            Ok(_) => panic!("expected the original post-commit error"),
+            Err(error) => error,
+        };
+        let khive_runtime::RuntimeError::Khive(domain) = returned.refusal_source() else {
+            panic!("expected the typed post-commit error");
+        };
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(details.get("operation"), Some("delete_note"));
+        assert_eq!(details.get("committed"), Some("true"));
+        let note_id_str = note_id.to_string();
+        assert_eq!(details.get("record_id"), Some(note_id_str.as_str()));
+        assert!(returned.to_string().contains(original_message));
+    }
+
+    #[tokio::test]
+    async fn routed_cleanup_preserves_post_commit_error_after_detaching_original() {
+        use std::sync::Arc;
+
+        use khive_runtime::{BackendId, Namespace, RuntimeConfig, StorageBackend};
+        use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+
+        let main = Arc::new(StorageBackend::memory().expect("main backend"));
+        let comm = Arc::new(StorageBackend::memory().expect("comm backend"));
+        main.prepare_core_schema().expect("main schema");
+        comm.prepare_core_schema().expect("comm schema");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.backend_id = BackendId::parse("old-comm").expect("backend id");
+        config.packs = vec!["kg".into(), "comm".into()];
+        let runtime = super::KhiveRuntime::from_backend(comm, config).with_core_backend(main);
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let content_ref = ContentRef::from_hex("b".repeat(64)).expect("content ref");
+        let mut note = khive_storage::note::Note::new("local", "message", "legacy quarantine")
+            .with_properties(json!({
+                "quarantined": true,
+                "channel_kind": "email",
+                "quarantine_content_ref": content_ref.to_string(),
+            }));
+        note.expires_at = Some(note.created_at - 1);
+        let note_id = note.id;
+        let as_of = note.created_at + 1;
+        assert!(runtime
+            .backend()
+            .notes()
+            .expect("comm notes")
+            .try_insert_note(note)
+            .await
+            .expect("seed note"));
+        let attachments = runtime.core().attachments().expect("main attachments");
+        assert!(attachments
+            .try_insert_attachment(Attachment::from_new(
+                note_id,
+                AttachmentSubstrate::Note,
+                NewAttachment {
+                    role: "quarantine-original".into(),
+                    content_ref,
+                    media_type: None,
+                    size_bytes: None,
+                },
+                as_of,
+            ))
+            .await
+            .expect("seed original owner"));
+        runtime
+            .sql()
+            .writer()
+            .await
+            .expect("comm writer")
+            .execute_script(
+                "CREATE TRIGGER fail_note_deleted_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'note_deleted' \
+                 BEGIN SELECT RAISE(ABORT, 'injected delete event failure'); END;"
+                    .into(),
+            )
+            .await
+            .expect("install post-commit fault");
+
+        let error = super::handle_cleanup_expired_quarantine(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "",
+                "mode": "legacy_slugless",
+                "as_of_micros": as_of,
+            }),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("original post-commit error must surface");
+        let khive_runtime::RuntimeError::Khive(original) = error.refusal_source() else {
+            panic!("cleanup replaced the typed delete error: {error:?}");
+        };
+        let details = original.details().expect("post-commit error details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(details.get("operation"), Some("delete_note"));
+        assert_eq!(details.get("record_id"), Some(note_id.to_string().as_str()));
+        assert!(
+            details
+                .get("post_commit_degradations")
+                .is_some_and(|stages| stages.contains("injected delete event failure")),
+            "{error}"
+        );
+        assert!(runtime
+            .notes(&token)
+            .expect("comm notes")
+            .get_note_including_deleted(note_id)
+            .await
+            .expect("note lookup")
+            .is_none());
+        assert!(attachments
+            .get_attachment(note_id, "quarantine-original")
+            .await
+            .expect("main owner lookup")
+            .is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn inbox_query_crossing_deadline_requeries_after_publish() {
