@@ -1139,6 +1139,144 @@ async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_req
     assert_eq!(stored_body, b"newly-created GET body");
 }
 
+#[tokio::test]
+async fn run_refresh_redirect_loses_to_get_after_terminal_request() {
+    use crate::egress::resolver_fixture::ScriptedResolver;
+
+    async fn request_line(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let byte = socket.read_u8().await.expect("read HTTP request");
+            bytes.push(byte);
+            assert!(bytes.len() < 16_384, "request headers exceeded test bound");
+        }
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    let (runtime, token, _dir) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let source_url =
+        Url::parse(&format!("http://refresh-race.example.test:{port}/source")).unwrap();
+    let terminal_url =
+        Url::parse(&format!("http://refresh-race.example.test:{port}/terminal")).unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = seed(&runtime, &token, &terminal_url, &[]).await;
+    let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server_terminal_url = terminal_url.clone();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        assert_eq!(request_line(&mut first).await, "GET /source HTTP/1.1");
+        first
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {server_terminal_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        first.shutdown().await.unwrap();
+        drop(first);
+
+        let (mut terminal, _) = listener.accept().await.unwrap();
+        assert_eq!(request_line(&mut terminal).await, "GET /terminal HTTP/1.1");
+        request_seen_tx.send(()).unwrap();
+        release_rx.await.expect("release older refresh response");
+        let body = b"older refresh body";
+        terminal
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: older-refresh\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        terminal.write_all(body).await.unwrap();
+        terminal.shutdown().await.unwrap();
+    });
+
+    // Policy still validates a public DNS answer. Only this test's checked
+    // transport maps that host to the local paused HTTP server.
+    let resolver = ScriptedResolver::new(None);
+    let clients = crate::egress::PinnedClients::default();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(
+            "refresh-race.example.test",
+            std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+        )
+        .build()
+        .unwrap();
+    clients.insert_for_test(&source_url, resolver.address, client);
+    let run_runtime = runtime.clone();
+    let run_token = token.clone();
+    let run = tokio::spawn(async move {
+        let params = serde_json::from_value(json!({"id": source_id, "timeout_s": 5})).unwrap();
+        run_refresh(
+            &run_runtime,
+            &run_token,
+            &resolver,
+            &Default::default(),
+            params,
+            &clients,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), request_seen_rx)
+        .await
+        .expect("production refresh did not reach the terminal request")
+        .unwrap();
+    let mut newer_headers = response_headers();
+    newer_headers.insert("etag", "newer-get".parse().unwrap());
+    let newer = settle_with_request_headers(
+        &runtime,
+        &token,
+        "GET",
+        &terminal_url,
+        200,
+        &newer_headers,
+        Some((b"newer GET body".to_vec(), false)),
+        &[],
+        true,
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(newer["id"], terminal_id.to_string());
+    release_tx.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("refresh did not settle")
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(reply["lost_race"], true, "{reply}");
+    assert_eq!(reply["changed"], false, "{reply}");
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newer-get");
+    let body_ref =
+        khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
+    let body = crate::blob_store(&runtime)
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(body, b"newer GET body");
+}
+
 // Simulate a fetch paused between its body settlement and negotiation write.
 #[tokio::test]
 async fn overlapping_fetch_keeps_negotiation_with_the_stored_body() {

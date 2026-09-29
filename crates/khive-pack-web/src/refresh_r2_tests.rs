@@ -326,6 +326,7 @@ async fn refresh_refuses_foreign_original_and_terminal() {
                     timeout_s: None,
                     namespace: None,
                 },
+                &egress::PinnedClients::default(),
             )
             .await
             .unwrap_err()
