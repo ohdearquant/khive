@@ -568,6 +568,59 @@ mod tests {
         );
     }
 
+    /// ADR-166 G5: count rows at the runtime's post-fusion hydration seam,
+    /// including the note-search ANN consumer's fresh-tail candidate.
+    #[tokio::test]
+    #[serial(note_search_ann)]
+    #[serial_test::serial(config_ledger)]
+    async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(&dir.path().join("g5.db"), "main", true);
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let pack = MemoryPack::new(rt.clone());
+        pack.register_note_search_ann_provider(&rt);
+        for index in 0..40 {
+            seed(&rt, &token, &format!("g5 candidate note {index}")).await;
+        }
+        warm(&rt, &token, &pack).await;
+        seed(&rt, &token, "g5 candidate note fresh tail").await;
+        let query = rt.embed_query("g5 candidate note").await.expect("query");
+        let before = rt
+            .db_diagnostics()
+            .await
+            .expect("diagnostics before search");
+
+        let limit = 3;
+        let hits = rt
+            .search_notes(
+                &token,
+                "g5 candidate note",
+                Some(query),
+                limit,
+                None,
+                false,
+                &[],
+                None,
+            )
+            .await
+            .expect("warm note search");
+
+        let after = rt.db_diagnostics().await.expect("diagnostics after search");
+        let hydrated = after.search_mechanism.note_candidate_hydration_rows
+            - before.search_mechanism.note_candidate_hydration_rows;
+        assert_eq!(hits.len(), limit as usize);
+        assert!(
+            hydrated >= hits.len() as u64,
+            "returned notes must have been hydrated: {hydrated}"
+        );
+        let per_arm = u64::from(limit) * 4;
+        let fresh_tail = 1;
+        assert!(
+            hydrated <= per_arm * 2 + fresh_tail,
+            "post-fusion hydration exceeded two bounded arms plus fresh tail: {hydrated}"
+        );
+    }
+
     #[tokio::test]
     #[serial(note_search_ann)]
     #[serial_test::serial(config_ledger)]
