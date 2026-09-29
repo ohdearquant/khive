@@ -637,37 +637,7 @@ where
 /// belongs to the terminal request, including when that request followed a
 /// redirect; callers can use it as an optimistic-write guard at settlement.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_hop_chain_observed<F, O, Fut, T>(
-    resolver: &dyn Resolver,
-    cfg: &WebSectionConfig,
-    url: Url,
-    method: reqwest::Method,
-    max_bytes: u64,
-    deadline: Instant,
-    headers_for_hop: F,
-    before_request: O,
-) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
-where
-    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
-    O: FnMut(Url) -> Fut,
-    Fut: Future<Output = Result<T, RuntimeError>>,
-{
-    run_hop_chain_with_clients_observed(
-        &egress::PinnedClients::default(),
-        resolver,
-        cfg,
-        url,
-        method,
-        max_bytes,
-        deadline,
-        headers_for_hop,
-        before_request,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
+pub(crate) async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
     clients: &egress::PinnedClients,
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
