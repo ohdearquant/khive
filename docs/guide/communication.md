@@ -417,9 +417,9 @@ Optional, with defaults:
   quarantine record instead of dropping it)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; actor assigned to fresh,
-  uncorrelated email messages. Set it to `channel:email` to opt into a separate
-  mailbox.)
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `channel:email`; actor assigned to fresh,
+  uncorrelated email messages. Set it to `local` only to retain the previous
+  shared inbox routing.)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)
 

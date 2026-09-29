@@ -2,6 +2,7 @@ use super::*;
 use crate::migrations::run_migrations;
 use crate::pool::PoolConfig;
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef};
+use rusqlite::StatementStatus;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -41,6 +42,168 @@ fn setup_memory_store() -> SqlEntityStore {
 
 fn setup_memory_store_ns(_ns: &str) -> SqlEntityStore {
     SqlEntityStore::new(setup_pool(), false)
+}
+
+fn id_filter_plan(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Vec<String> {
+    assert!(
+        sql.contains("entities INDEXED BY sqlite_autoindex_entities_1"),
+        "ID-filtered SQL must force the primary-key index independently of statistics: {sql}"
+    );
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(params, |row| row.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn assert_entity_id_seek(plan: &[String]) {
+    assert!(
+        plan.iter().any(|detail| detail
+            .contains("SEARCH entities USING INDEX sqlite_autoindex_entities_1 (id=?")),
+        "ID-filtered entity read must seek the primary key: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|detail| detail.contains("SCAN entities")
+            || detail.contains("SEARCH entities USING INDEX idx_entities_namespace")),
+        "ID-filtered entity read must not walk the namespace: {plan:?}"
+    );
+}
+
+#[test]
+fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
+    let filter = EntityFilter {
+        ids: (1..=48).map(Uuid::from_u128).collect(),
+        ..EntityFilter::default()
+    };
+    let (where_sql, mut params) = build_entity_where("target", &filter);
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    assert_entity_id_seek(&id_filter_plan(
+        &conn,
+        &build_entity_count_query(&filter, &where_sql),
+        &refs,
+    ));
+
+    params.push(Box::new(10_i64));
+    params.push(Box::new(0_i64));
+    let limit_idx = params.len() - 1;
+    let offset_idx = params.len();
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let page_sql = build_entity_page_query(
+        ENTITY_SELECT_COLUMNS,
+        &filter,
+        &where_sql,
+        "created_at DESC, id DESC",
+        limit_idx,
+        offset_idx,
+    );
+    assert_entity_id_seek(&id_filter_plan(&conn, &page_sql, &refs));
+
+    let (where_sql, mut params) = build_entity_where("target", &filter);
+    params.push(Box::new(11_i64));
+    let limit_idx = params.len();
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let cursor_sql =
+        build_entity_cursor_query(ENTITY_SELECT_COLUMNS, &filter, &where_sql, limit_idx);
+    let cursor_plan = id_filter_plan(&conn, &cursor_sql, &refs);
+    assert_entity_id_seek(&cursor_plan);
+    let entity_seek = cursor_plan
+        .iter()
+        .position(|row| row.contains("SEARCH entities USING INDEX sqlite_autoindex_entities_1"))
+        .unwrap();
+    let sequence_probe = cursor_plan
+        .iter()
+        .position(|row| row.contains("SEARCH entities_seq"))
+        .unwrap();
+    assert!(
+        entity_seek < sequence_probe,
+        "ID-filtered cursor must drive entities before the sequence ledger: {cursor_plan:?}"
+    );
+
+    let mut candidate_filter = filter.clone();
+    candidate_filter.names_ci.push("needle".to_string());
+    let (where_sql, mut params) = build_entity_where("target", &candidate_filter);
+    params.push(Box::new("needle".to_string()));
+    let candidate_idx = params.len();
+    params.push(Box::new(10_i64));
+    params.push(Box::new(0_i64));
+    let limit_idx = params.len() - 1;
+    let offset_idx = params.len();
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let candidate_sql = build_candidate_entity_query(
+        ENTITY_SELECT_COLUMNS,
+        &candidate_filter,
+        &where_sql,
+        &[candidate_idx],
+        "created_at DESC, id DESC",
+        limit_idx,
+        offset_idx,
+    );
+    assert_entity_id_seek(&id_filter_plan(&conn, &candidate_sql, &refs));
+}
+
+fn id_filtered_page_steps(unrelated: usize) -> (Vec<String>, i32) {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 1..=2 + unrelated {
+        let id = if i <= 2 {
+            Uuid::from_u128(i as u128)
+        } else {
+            Uuid::from_u128(1000 + i as u128)
+        };
+        conn.execute(
+            "INSERT INTO entities(id, namespace, kind, name, created_at, updated_at) \
+             VALUES (?1, 'target', 'concept', 'row', ?2, ?2)",
+            rusqlite::params![id.to_string(), i as i64],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    let filter = EntityFilter {
+        ids: (1..=48).map(Uuid::from_u128).collect(),
+        ..EntityFilter::default()
+    };
+    let (where_sql, mut params) = build_entity_where("target", &filter);
+    params.push(Box::new(10_i64));
+    params.push(Box::new(0_i64));
+    let limit_idx = params.len() - 1;
+    let offset_idx = params.len();
+    let sql = build_entity_page_query(
+        ENTITY_SELECT_COLUMNS,
+        &filter,
+        &where_sql,
+        "created_at DESC, id DESC",
+        limit_idx,
+        offset_idx,
+    );
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let ids: Vec<String> = stmt
+        .query_map(refs.as_slice(), |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    (ids, stmt.get_status(StatementStatus::VmStep))
+}
+
+#[test]
+fn id_filtered_entity_work_is_bounded_by_ids_not_namespace_size() {
+    // No ANALYZE: the plan must be stable on newly created databases too.
+    let (small_ids, small_steps) = id_filtered_page_steps(200);
+    let (large_ids, large_steps) = id_filtered_page_steps(3200);
+    assert_eq!(small_ids, large_ids);
+    assert_eq!(small_ids.len(), 2);
+    assert!(large_steps < small_steps * 2,
+        "non-candidate rows in the same namespace must not scale ID hydration: {small_steps} -> {large_steps}");
 }
 
 fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
@@ -102,6 +265,7 @@ fn case_insensitive_candidate_lookup_uses_one_partial_index_seek_per_candidate()
     let offset_idx = params.len();
     let data_sql = build_candidate_entity_query(
         "id",
+        &lookup_filter,
         &where_sql,
         &candidate_param_indices,
         "created_at DESC",

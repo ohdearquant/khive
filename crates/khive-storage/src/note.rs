@@ -553,6 +553,10 @@ pub enum FilterOp {
     /// The value is a `Timestamp` or RFC 3339 `Text`.
     Rfc3339Gte,
     Rfc3339Lte,
+    /// Matches an RFC 3339 instant at or before the supplied timestamp, or a
+    /// missing, null, non-text, or malformed value. The outbox uses this to
+    /// fail open on legacy retry deadlines without filtering after LIMIT.
+    Rfc3339LteOrInvalid,
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.

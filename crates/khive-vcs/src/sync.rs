@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -26,6 +26,9 @@ use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
 use crate::types::SnapshotId;
 
+#[cfg(test)]
+#[path = "remote_cache_perf_tests.rs"]
+mod remote_cache_perf_tests;
 #[cfg(test)]
 #[path = "remote_cache_recovery_tests.rs"]
 mod remote_cache_recovery_tests;
@@ -367,10 +370,21 @@ const REMOTE_BACKUP_OWNER_HEADER: &str = "khive-vcs remote cache backup v1\n";
 const REMOTES_GITIGNORE: &[u8] = b"*\n";
 const REMOTES_GITIGNORE_PENDING_PREFIX: &str = ".khive-gitignore-pending-";
 
+fn read_bounded_marker(path: &Path, expected_len: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(expected_len as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn tool_owned_remote_cache_gitignore_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if !metadata.is_file() || fs::read(path)?.as_slice() != REMOTES_GITIGNORE {
+            if !metadata.is_file()
+                || read_bounded_marker(path, REMOTES_GITIGNORE.len())?.as_slice()
+                    != REMOTES_GITIGNORE
+            {
                 bail!(
                     "remote cache ignore file {} is not the tool-owned `*` rule",
                     path.display()
@@ -553,15 +567,18 @@ fn is_owned_backup(backup: &Path) -> Result<bool> {
     let marker = backup.join(REMOTE_BACKUP_OWNER_FILE);
     let metadata = match std::fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", marker.display())),
+        Err(_) => return Ok(false),
     };
     if !metadata.file_type().is_file() {
         return Ok(false);
     }
-    let contents = std::fs::read_to_string(&marker)
-        .with_context(|| format!("reading {}", marker.display()))?;
-    Ok(contents == backup_owner_contents(backup)?)
+    let Ok(expected) = backup_owner_contents(backup) else {
+        return Ok(false);
+    };
+    let Ok(contents) = read_bounded_marker(&marker, expected.len()) else {
+        return Ok(false);
+    };
+    Ok(contents == expected.as_bytes())
 }
 
 fn mark_cache_for_backup(target_dir: &Path, backup: &Path) -> Result<()> {
@@ -571,13 +588,17 @@ fn mark_cache_for_backup(target_dir: &Path, backup: &Path) -> Result<()> {
             if !metadata.file_type().is_file() {
                 bail!("cache backup marker {} is not a file", marker.display());
             }
-            let previous = std::fs::read_to_string(&marker)
-                .with_context(|| format!("reading {}", marker.display()))?;
             let name = target_dir
                 .file_name()
                 .and_then(|part| part.to_str())
                 .context("cache target has no UTF-8 name")?;
             let prefix = format!("{REMOTE_BACKUP_OWNER_HEADER}{name}{REMOTE_BACKUP_MARKER}");
+            // Every tool-generated suffix is a u32 process id (at most ten
+            // digits). A contributor-owned marker need not be read in full.
+            let previous_bytes = read_bounded_marker(&marker, prefix.len() + 10 + 1)
+                .with_context(|| format!("reading {}", marker.display()))?;
+            let previous = std::str::from_utf8(&previous_bytes)
+                .with_context(|| format!("decoding {}", marker.display()))?;
             let suffix = previous
                 .strip_prefix(&prefix)
                 .and_then(|value| value.strip_suffix('\n'));
@@ -936,17 +957,18 @@ fn build_kg_archive(
 /// the canonical sort order used by `snapshot_id_for_archive`.
 fn write_sorted_entities(path: &Path, records: &[NdjsonEntity]) -> Result<()> {
     let mut sorted: Vec<&NdjsonEntity> = records.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.id.to_string()
-            .to_ascii_lowercase()
-            .cmp(&b.id.to_string().to_ascii_lowercase())
-    });
-    let mut lines = Vec::with_capacity(sorted.len());
-    for r in sorted {
-        let line = serde_json::to_string(r).context("serializing entity")?;
-        lines.push(line);
+    sorted.sort_by_key(|entity| entity.id);
+    let file = File::create(path).context("creating entities file")?;
+    let mut writer = BufWriter::new(file);
+    for (index, record) in sorted.into_iter().enumerate() {
+        if index != 0 {
+            writer
+                .write_all(b"\n")
+                .context("writing entity separator")?;
+        }
+        serde_json::to_writer(&mut writer, record).context("serializing entity")?;
     }
-    std::fs::write(path, lines.join("\n")).context("writing entities file")?;
+    writer.flush().context("writing entities file")?;
     Ok(())
 }
 
@@ -957,24 +979,17 @@ fn write_sorted_entities(path: &Path, records: &[NdjsonEntity]) -> Result<()> {
 fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
     let mut sorted: Vec<&NdjsonEdge> = records.iter().collect();
     sorted.sort_by(|a, b| {
-        let ak = (
-            a.source.to_string(),
-            a.target.to_string(),
-            a.relation.clone(),
-        );
-        let bk = (
-            b.source.to_string(),
-            b.target.to_string(),
-            b.relation.clone(),
-        );
-        ak.cmp(&bk)
+        (a.source, a.target, a.relation.as_str()).cmp(&(b.source, b.target, b.relation.as_str()))
     });
-    let mut lines = Vec::with_capacity(sorted.len());
-    for r in sorted {
-        let line = serde_json::to_string(r).context("serializing edge")?;
-        lines.push(line);
+    let file = File::create(path).context("creating edges file")?;
+    let mut writer = BufWriter::new(file);
+    for (index, record) in sorted.into_iter().enumerate() {
+        if index != 0 {
+            writer.write_all(b"\n").context("writing edge separator")?;
+        }
+        serde_json::to_writer(&mut writer, record).context("serializing edge")?;
     }
-    std::fs::write(path, lines.join("\n")).context("writing edges file")?;
+    writer.flush().context("writing edges file")?;
     Ok(())
 }
 

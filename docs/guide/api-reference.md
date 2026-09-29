@@ -1102,6 +1102,11 @@ still report. If main itself fails, its error remains in the first entry and the
 only `databases` because there is no valid primary report to flatten. The list uses only pools
 opened at startup; it does not open an unserved path or create a missing database file.
 
+The top-level process-lifetime `note_search_ann_route_total` and
+`note_search_fallback_route_total` counters distinguish warm-graph searches from
+the exact sqlite-vec fallback. Unlike pool-scoped contention counters, these
+totals do not reset when a database pool is reopened.
+
 Every successful per-file report includes `process` alongside `build`:
 
 ```json

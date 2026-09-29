@@ -24,6 +24,24 @@ The hook ignores other note kinds and authorization failure. It attaches to `sel
 
 The hook must be installed before expecting generic KG mutations to invalidate memory ANN state. Production registry boot calls the pack hook registration seam; hand-built tests must call it explicitly.
 
+## Note-search ANN provider
+
+The memory pack implements the runtime-owned `NoteSearchAnnProvider` seam for the
+global live-note `note.content` graph. `register_note_search_ann_provider` runs
+at the same transport boot sites as the mutation hook and installs only on the
+same opened backend instance and logical backend ID. The `note_search` consumer
+has its own durable wildcard watermark. An existing memory graph cannot serve
+note search until a full checkpoint activates that row; memory recall may keep
+using its own protected graph meanwhile. A warm note-search request overfetches
+and filters to live notes in the caller's primary namespace, always merging
+the exact fresh tail.
+Its internal candidate adapter carries the canonical fixed-point score in
+lossless f64 form through graph and tail re-resolution; memory recall keeps its
+existing f32 candidate API.
+This merge does not use the memory/knowledge `KHIVE_ANN_FRESH_TAIL` policy.
+Without an eligible installed graph, the runtime uses its existing exact
+sqlite-vec route.
+
 ## Dispatch and deadline boundary
 
 `dispatch` routes the public memory verbs and the dotted subhandlers. Unknown names return `InvalidInput`. The `memory.recall` route goes through the end-to-end deadline wrapper before entering the main handler. Other verbs call their concern-specific handlers directly.

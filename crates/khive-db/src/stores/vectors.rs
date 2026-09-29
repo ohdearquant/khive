@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
-use khive_score::{cmp_desc_then_id, try_score_from_distance, DeterministicScore, ScoreError};
+use khive_score::{cmp_desc_then_id, try_cosine_score_with_f32_tolerance, DeterministicScore};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, IndexRebuildScope,
@@ -19,7 +19,7 @@ use khive_storage::types::{
 use khive_storage::StorageResult;
 use khive_storage::VectorStore;
 use khive_storage::{ContentRef, StorageCapability};
-use khive_types::{DistanceMetric, SubstrateKind};
+use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -215,23 +215,10 @@ fn non_finite_vector_error(op: &'static str, idx: usize, value: f32) -> StorageE
 /// Normalize only that f32-scale boundary roundoff, then route through the
 /// strict canonical f32 score contract.
 fn sqlite_cosine_score(distance: f64) -> Result<DeterministicScore, rusqlite::Error> {
-    const BOUNDARY_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
-
     let conversion_error = |error| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Real, Box::new(error))
     };
-    if !distance.is_finite() {
-        return Err(conversion_error(ScoreError::NonFiniteDistance));
-    }
-    if !(-BOUNDARY_EPSILON..=2.0 + BOUNDARY_EPSILON).contains(&distance) {
-        return Err(conversion_error(ScoreError::InvalidDistanceRange {
-            metric_name: "Cosine",
-            dist_bits: (distance as f32).to_bits(),
-        }));
-    }
-
-    try_score_from_distance(distance.clamp(0.0, 2.0) as f32, DistanceMetric::Cosine)
-        .map_err(conversion_error)
+    try_cosine_score_with_f32_tolerance(distance).map_err(conversion_error)
 }
 
 #[cfg(test)]

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Fresh, uncorrelated inbound email now defaults to the `channel:email` mailbox
+  when `KHIVE_EMAIL_DEFAULT_ACTOR` is unset or blank. Deployments currently
+  reading new mail from `local` must configure a `channel:email` serving actor
+  with `[actor].mailbox_readers` and select that mailbox, or explicitly set
+  `KHIVE_EMAIL_DEFAULT_ACTOR=local` to retain the previous routing. Correlated
+  replies still route to the original sender.
+
 ## [0.9.0] - 2026-09-27
 
 ### Removed
