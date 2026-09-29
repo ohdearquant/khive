@@ -5693,11 +5693,15 @@ impl KhiveRuntime {
             statement: row_statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
-        if substrate == SubstrateKind::Entity {
+        if matches!(substrate, SubstrateKind::Entity | SubstrateKind::Note) {
             statements.push(PlanStatement {
                 statement: khive_db::stores::attachment::delete_record_attachments_statement(
                     node_id,
-                    AttachmentSubstrate::Entity,
+                    if substrate == SubstrateKind::Entity {
+                        AttachmentSubstrate::Entity
+                    } else {
+                        AttachmentSubstrate::Note
+                    },
                 ),
                 guard: None,
             });
@@ -20809,5 +20813,128 @@ mod tests {
         assert_eq!(attachments[0].content_ref, content_ref);
         assert_eq!(attachments[1].role, "fann-network");
         assert_eq!(attachments[1].content_ref, network_ref);
+    }
+
+    #[tokio::test]
+    async fn create_entity_with_attachments_reports_failed_created_event_after_commit() {
+        use khive_db::stores::blob::FsBlobStore;
+        use khive_storage::BlobStore as _;
+
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let blob_store =
+            Arc::new(FsBlobStore::new(blob_dir.path().to_path_buf(), 0).expect("blob store"));
+        let content_ref = blob_store
+            .put(b"bundle".to_vec())
+            .await
+            .expect("publish bundle");
+        let network_ref = blob_store
+            .put(b"network".to_vec())
+            .await
+            .expect("publish network");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+
+        let mut writer = runtime.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_attachment_created_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'entity_created' \
+                 BEGIN SELECT RAISE(ABORT, 'injected attachment created-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let error = runtime
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                None,
+                "artifact with failed created event",
+                None,
+                None,
+                vec![],
+                vec![
+                    NewAttachment {
+                        role: "content".to_string(),
+                        content_ref: content_ref.clone(),
+                        media_type: Some("application/json".to_string()),
+                        size_bytes: Some(6),
+                    },
+                    NewAttachment {
+                        role: "fann-network".to_string(),
+                        content_ref: network_ref.clone(),
+                        media_type: Some("application/octet-stream".to_string()),
+                        size_bytes: Some(7),
+                    },
+                ],
+            )
+            .await
+            .expect_err("the committed entity must report the failed event append");
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("attachment create lost its typed post-commit error: {error:?}");
+        };
+        assert_eq!(domain.kind(), khive_types::ErrorKind::Internal);
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(
+            details.get("operation"),
+            Some("create_entity_with_attachments")
+        );
+        assert_eq!(details.get("committed"), Some("true"));
+        assert_eq!(details.get("retryable"), Some("false"));
+        let entity_id = details
+            .get("record_id")
+            .expect("committed entity id")
+            .parse::<Uuid>()
+            .expect("canonical entity id");
+        let degradations: serde_json::Value = serde_json::from_str(
+            details
+                .get("post_commit_degradations")
+                .expect("complete degradation list"),
+        )
+        .expect("degradations are JSON");
+        let failures = degradations.as_array().expect("degradation array");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["stage"], "event_append");
+        assert!(failures[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("injected attachment created-event failure")));
+
+        let stored = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("entity row committed");
+        assert_eq!(stored.id, entity_id);
+        assert_eq!(stored.content_ref.as_deref(), Some(content_ref.as_str()));
+        let attachments = runtime
+            .attachments()
+            .expect("main attachment store")
+            .list_attachments(entity_id)
+            .await
+            .expect("attachment rows committed");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].role, "content");
+        assert_eq!(attachments[0].content_ref, content_ref);
+        assert_eq!(attachments[1].role, "fann-network");
+        assert_eq!(attachments[1].content_ref, network_ref);
+
+        let events = runtime
+            .list_events(
+                &token,
+                EventFilter {
+                    target_id: Some(entity_id),
+                    kinds: vec![EventKind::EntityCreated],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("query created events");
+        assert!(events.items.is_empty());
     }
 }
