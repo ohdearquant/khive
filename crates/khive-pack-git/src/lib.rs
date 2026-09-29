@@ -55,6 +55,7 @@ mod params_tests;
 #[cfg(test)]
 mod policy_tests;
 mod receipts;
+pub mod reconcile;
 #[cfg(test)]
 mod recovery_tests;
 pub mod refs;

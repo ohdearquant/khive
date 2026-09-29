@@ -153,3 +153,28 @@ refused/failed record — including past a later _existing_ record, whose
 natural-key lookup proves only its own landing, not the failed record's —
 would strand the failed commit behind the floor and skip it forever instead
 of retrying it on the next pass.
+
+### Historical shared-commit annotation repair (#3532)
+
+An already acknowledged SHA does not enter a later page, so a commit note
+shared by two project anchors can remain without the second project's
+`annotates` edge. `kkernel git-annotation-repair` previews one project against
+one local source and frozen tip, then applies only the missing project links
+when given the preview ID. It never changes the `commits` or
+`commits_checkpoint` cursor rows or the commit note. The preview counts live
+edges, tombstones, missing links, missing/deleted/ambiguous notes, and
+coverage errors. Existing edges, including their curated fields, and
+tombstones are left byte-for-byte unchanged.
+
+Under the [accepted ADR-088 Amendment 1 rider — historical shared-commit
+project annotations (#3532)](../../../docs/adr/ADR-088-amendment-1-git-digest.md#adr-088-amendment-1-rider--historical-shared-commit-project-annotations-3532),
+this implementation accepts only a surviving checkpoint with
+`base_cursor=null` as proof of the entire acknowledged reverse-topological
+prefix. A later checkpoint with a non-null base identifies only its current
+span; its SHA does not prove an earlier recorded merge-DAG walk. Such projects
+are reported as **coverage incomplete** with a reason and are not applied.
+Missing source objects,
+a divergent frozen tip, changed cursor rows, and an exceeded walk bound also
+stop application. A post-apply preview must show complete coverage and zero
+missing links before the command reports success. A partial write failure is
+retryable by taking a new preview and applying its new ID.

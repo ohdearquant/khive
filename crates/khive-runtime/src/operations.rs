@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
@@ -7714,6 +7715,61 @@ impl KhiveRuntime {
                 .await?;
         }
         Ok(outcome.rows)
+    }
+
+    /// Create a historical commit-to-project annotation without replacing a
+    /// curated edge or reviving a tombstone. The store rechecks the exact live
+    /// commit SHA and project under its writer transaction; only a newly
+    /// inserted edge produces the ordinary LinkCreated lifecycle event.
+    pub async fn link_commit_annotation_if_absent(
+        &self,
+        token: &NamespaceToken,
+        commit_id: Uuid,
+        project_id: Uuid,
+        guard: CommitAnnotationGuard,
+    ) -> RuntimeResult<CommitAnnotationInsertOutcome> {
+        if !matches!(guard.expected_sha.len(), 40 | 64)
+            || !guard
+                .expected_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "expected full commit SHA".into(),
+            ));
+        }
+        let edge = self
+            .build_edge(
+                token,
+                &LinkSpec {
+                    namespace: None,
+                    source_id: commit_id,
+                    target_id: project_id,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                },
+            )
+            .await?;
+        let result = self
+            .graph(token)?
+            .insert_commit_annotation_if_absent(edge, guard)
+            .await?;
+        if let CommitAnnotationInsertOutcome::Created(edge) = &result {
+            self.append_link_mutation_event(
+                token,
+                &EdgeUpsertResult {
+                    edge: edge.clone(),
+                    disposition: EdgeUpsertDisposition::Created,
+                    previous: None,
+                },
+                EdgeEndpointKind::Note,
+                EdgeEndpointKind::Entity,
+            )
+            .await?;
+        }
+        Ok(result)
     }
 
     /// Create a batch of entities atomically.
