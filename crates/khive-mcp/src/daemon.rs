@@ -19,6 +19,7 @@ use khive_runtime::daemon::{
     self, acquire_recovery_lock, env_truthy, pid_path, read_frame, socket_path, write_frame,
     DaemonRequestFrame, DaemonResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+use khive_runtime::process_retry::{spawn_retrying_executable_busy, EXECUTABLE_BUSY_BACKOFF_MS};
 use rmcp::ErrorData as McpError;
 use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
@@ -1384,29 +1385,6 @@ fn spawn_daemon_with_exe_and_config(
     spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || cmd.spawn())
 }
 
-/// Short finite backoff budget for a transient `ExecutableFileBusy` spawn
-/// failure — see the call site in [`spawn_daemon_with_exe_and_config`].
-const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
-
-/// Retry `spawn` up to `delays_ms.len()` extra times, sleeping the
-/// corresponding delay between attempts, but only when the failure is
-/// `ErrorKind::ExecutableFileBusy`. Any other error — or the final attempt
-/// after the backoff budget is exhausted — is returned immediately.
-fn spawn_retrying_executable_busy<T>(
-    delays_ms: &[u64],
-    mut spawn: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    for delay_ms in delays_ms {
-        match spawn() {
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            }
-            outcome => return outcome,
-        }
-    }
-    spawn()
-}
-
 /// Return `true` if `args` (the full `ps -o args=` output for a process)
 /// identifies a khive daemon.
 ///
@@ -2155,6 +2133,14 @@ async fn quiesce_then_probe_identity(
 /// Only `Dead` once every round agrees. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcome {
+    confirm_genuinely_dead_with_round_observer(config_id, namespace, |_, _| {}).await
+}
+
+async fn confirm_genuinely_dead_with_round_observer(
+    config_id: &str,
+    namespace: &str,
+    mut observe_round: impl FnMut(u32, &ProbeOutcome),
+) -> ProbeOutcome {
     // `LockContended` means "still could not confirm this round" — the same
     // "keep polling" shape as `Dead`, not a terminal state like `Alive`/
     // `Timeout`. A peer's boot can legitimately hold the lock across several
@@ -2173,7 +2159,10 @@ async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcom
     // `LockContended` regardless of what any other round returned.
     let mut saw_contention = false;
     for round in 0..DEAD_CONFIRM_ROUNDS {
-        match quiesce_then_probe_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
+        let outcome =
+            quiesce_then_probe_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await;
+        observe_round(round, &outcome);
+        match outcome {
             ProbeOutcome::Dead => {}
             ProbeOutcome::LockContended => saw_contention = true,
             other => return other,
@@ -8935,12 +8924,9 @@ mod tests {
     // `Dead`, which `kill_and_respawn` trusts enough to kill+spawn — even
     // though quiescence was never actually established across every round.
     //
-    // This test drives that exact sequence directly: a background thread
-    // holds the real boot/recovery lock for longer than a single round's
-    // bounded wait (`BOOT_QUIESCENCE_LOCK_TIMEOUT_MS` = 500ms), guaranteeing
-    // round 1 cannot acquire it and returns `LockContended`, then releases
-    // the lock before `confirm_genuinely_dead` returns — so the remaining
-    // rounds observe the (genuinely absent) daemon and return `Dead`.
+    // This test drives that exact sequence directly: it holds the real
+    // boot/recovery lock until round 1 reports `LockContended`, then releases
+    // it so the remaining rounds observe the (genuinely absent) daemon as `Dead`.
     //
     // Fail-if-reverted: with the old last-round-wins aggregation, this
     // LockContended-then-Dead sequence resolves to `ProbeOutcome::Dead`, and
@@ -8969,40 +8955,37 @@ mod tests {
         let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string();
 
         // Hold the real boot/recovery lock from before `confirm_genuinely_dead`
-        // starts, for strictly longer than one round's bounded wait, so round
-        // 1 is deterministically unable to acquire it (LockContended) — not a
-        // probabilistic race, since the hold spans the round's entire
-        // deadline window.
-        let guard = khive_runtime::daemon::acquire_daemon_boot_guard()
-            .expect("test lock holder must acquire the recovery lock");
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let boot_thread = std::thread::spawn(move || {
-            let _ = release_rx.recv();
-            drop(guard);
-        });
+        // starts until round 1 has actually reported its result.
+        let mut guard = Some(
+            khive_runtime::daemon::acquire_daemon_boot_guard()
+                .expect("test lock holder must acquire the recovery lock"),
+        );
+        let mut observed_rounds = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            confirm_genuinely_dead_with_round_observer(&config_id, "test", |round, outcome| {
+                observed_rounds.push((
+                    round,
+                    matches!(outcome, ProbeOutcome::LockContended),
+                    matches!(outcome, ProbeOutcome::Dead),
+                ));
+                if round == 0 {
+                    drop(guard.take());
+                }
+            }),
+        )
+        .await
+        .expect("confirm_genuinely_dead must resolve once the lock is released");
 
-        let confirm_config_id = config_id.clone();
-        let confirm_handle =
-            tokio::spawn(async move { confirm_genuinely_dead(&confirm_config_id, "test").await });
-
-        // Round 1's bounded wait is 500ms; sleeping past it while still
-        // holding the lock guarantees round 1 observed LockContended before
-        // release. `confirm_handle` runs concurrently on the runtime during
-        // this sleep (unlike a merely-pinned, never-polled future), so round
-        // 1 genuinely contends against the held lock here.
-        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
-        release_tx
-            .send(())
-            .expect("boot-holder thread still awaiting release");
-        boot_thread
-            .join()
-            .expect("boot-holder thread must not panic");
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), confirm_handle)
-            .await
-            .expect("confirm_genuinely_dead must resolve once the lock is released")
-            .expect("confirm_genuinely_dead task must not panic");
-
+        assert_eq!(observed_rounds.len(), DEAD_CONFIRM_ROUNDS as usize);
+        assert_eq!(observed_rounds[0], (0, true, false));
+        assert!(
+            observed_rounds
+                .iter()
+                .skip(1)
+                .all(|(_, contended, dead)| !contended && *dead),
+            "every round after release must observe the absent daemon"
+        );
         assert!(
             matches!(outcome, ProbeOutcome::LockContended),
             "an earlier LockContended round must make the whole call \

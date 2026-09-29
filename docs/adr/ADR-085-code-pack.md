@@ -1784,3 +1784,119 @@ Acceptance, stated before any implementation runs:
   an allow-list.
 
 Refs: #3298, #1855, #1793, #3056.
+
+## Amendment 10 (2026-09-28): bounded source ingest execution
+
+**Status**: Accepted (2026-09-28).
+
+### Context
+
+L1 manifest discovery, L1.5 source scanning, and L2 source reads previously mixed recursive
+filesystem work with the async ingest executor. Reopening the governing manifest for every source
+also multiplied parsing work in large packages. The reading surfaces are precise: L1/L1.5 read
+`Cargo.toml` for Rust, `pyproject.toml` for Python, and `package.json` for TypeScript; L1.5 reads
+`.rs`, `.py`, and `.ts` respectively (not `.tsx`); L2 reads only `.rs` and its governing
+`Cargo.toml`. The same 2 MiB source ceiling was already used by the L2 scanner on main (source_ingest.rs:51).
+
+An offline regular-file census of three available local checkouts, pruning the walk's hidden and
+build directories, found no candidate above 2 MiB. On khive-oss `78ad6641`, the candidate counts
+were 52 `Cargo.toml`, 3 `pyproject.toml`, 9 `package.json`, and 1,028 `.rs`, 128 `.py`, 115 `.ts`
+(maximum source: 743,833 bytes). On the TypeScript-heavy ARW checkout `6c314a14`, 65
+`package.json` and 798 `.ts` candidates had a 125,771-byte maximum `.ts` file. On the
+Python-heavy lionagi-oss checkout `b9175445`, one `pyproject.toml` and 1,586 `.py` candidates
+had a 272,428-byte maximum `.py` file. This is local impact evidence, not a guarantee for other
+repositories.
+
+### Decision
+
+`code.ingest` performs recursive discovery, file reads, and source parsing on blocking workers.
+Graph and FTS writes remain on the async side. A sweep parses each governing manifest at most once
+per tier and resolves source ownership against that sweep's manifest snapshot, so a repository with
+many files in one package does not repeatedly read and parse the same manifest. L2 discovers
+manifests from the canonical source paths it actually walked, including files reached through
+symlinks that remain inside the ingest root.
+
+The L1/L1.5 manifest and source readers require regular files and cap each input at 2 MiB. They
+check metadata on the opened handle and read at most 2 MiB plus one byte from that same handle,
+so a file growing during the read cannot allocate without bound. An oversized manifest or L1.5 source
+is skipped with a warning; healthy siblings continue. The existing L2 refusal path retains its
+per-file parse-failure record and source fingerprint. Oversized manifests and L1.5 sources increment the existing
+`manifest_files_refused` and `source_files_refused` counters respectively. L2 retains its
+`symbol_parse_failures` counter and per-file warning. No report field or default wire shape changes.
+
+Every manifest and L1.5/L2 source read checks the **opened file descriptor's** resolved path
+against the canonical ingest root before reading bytes. A symlink planted after traversal or
+metadata preflight cannot redirect a read outside the requested tree. Refused opened manifest and
+L1.5 source paths increment their existing refusal counters and emit path-specific warnings;
+L2 source refusals follow its established per-file reporting. A dangling or looping symlink is
+skipped with a warning, and the source walk records its existing dropped-path count. L2 also deduplicates canonical directory visits, so directory symlink cycles
+terminate. This source-file boundary does not change the target-database VFS fence decided in E7
+and tracked by #1855.
+
+### Alternatives and residuals
+
+Refusing an entire ingest when one source or manifest exceeds 2 MiB would make a healthy sibling
+unavailable and turn a single generated file into a repository-wide failure. This amendment
+instead skips that input, reports it, and lets the next sweep include it if it becomes eligible.
+An unbounded read would preserve coverage but lets one input dominate worker memory and parsing
+time. Checking only the pathname discovered by the walk was rejected because a concurrent writer
+can replace it with an external symlink before open (#3449); the opened-descriptor check closes
+that particular gap. A file may still be edited while its already-accepted descriptor is read:
+the byte ceiling remains enforced, but one sweep is not a transactional snapshot of all files.
+The parsed manifest index likewise reflects the manifests observed during that sweep, not edits
+made afterward; a later sweep reconciles ordinary edits. Pinning Git blobs or locking the whole
+tree would be a different ingest contract and is deferred.
+
+Acceptance:
+
+1. A file exactly at the byte ceiling is readable; one byte over is refused before parsing.
+2. An oversized manifest and L1.5 source increment the existing refusal counters, while a small
+   sibling still ingests.
+3. L2-only ingest retains its oversized Rust parse-failure reporting.
+4. Source walks and reads yield the async executor; governing manifest resolution uses one parsed
+   snapshot per sweep rather than reopening manifests per file.
+5. A source or manifest swapped to an external symlink after preflight is rejected by the opened
+   descriptor check. Existing source-walk tests retain canonical excluded-tree and symlink-cycle
+   boundaries. This is the source boundary from #3449, separate from #1855 and the E7
+   target-database VFS fence.
+
+Refs: #3299, #3292, #3449, #1855.
+
+## Amendment 11 (2026-09-28): State the Code-Map Database Fence That Ships
+
+**Status**: Accepted (2026-09-28)\
+**Amends**: ADR-085 Amendment 4 E7 and Amendment 9 A9\
+**Tracking**: #1855; opened-handle proof #3552
+
+## Context
+
+E7 describes a thin VFS wrapper that rejects a target from the identity of the file handle SQLite actually opens, including the main database and its journal, WAL, and shared-memory companions. A9 expands the protected set to the production anchor, runtime database, all declared backends, the events database beside each, and their companions. The current `code.ingest` route implements a narrower, useful fence: it rejects the known production paths and compares existing files' path-level identities before constructing the target runtime. The three read-only analysis verbs named in E7 are not shipped; only `code.ingest` is dispatched today.
+
+A delegating wrapper around SQLite's default VFS cannot by itself deliver E7's opened-handle proof. The default VFS opens `-shm` within the main file's `xShmMap`, outside wrapper `xOpen`; its Unix file handle is opaque through the public VFS API, and the Windows native path can follow a reparse point before the wrapper sees the handle. The prior “thin VFS wrapper” design is therefore not an implemented cross-platform boundary.
+
+## Decision
+
+1. **Current production fence.** On the shipped `code.ingest` path, explicit `db` syntax is restricted to plain absolute filesystem paths and an existing regular file; only the omitted-`db` default is create-capable. The target is compared against A9's complete known-production set by normalized path and, for existing files, by path-level file identity (`dev`/`ino` on Unix and the platform file-identity comparison on Windows). This is a **courtesy preflight**, before ordinary SQLite open, and remains useful for a direct production path or hard link. It is not proof about the descriptor SQLite ultimately uses. SQLite's `SQLITE_OPEN_NOFOLLOW` behavior, where the selected native VFS and platform honor it, and native no-follow handling on Unix are additional symlink hardening only; neither substitutes for identity checks on the opened main and companion handles. This amendment makes no claim that the code-pack constructor already requests `SQLITE_OPEN_NOFOLLOW` on every SQLite open.
+
+2. **Final-component symlink refusal in the preflight.** The courtesy preflight rejects a target whose final path component is a symlink, checked with `lstat`/`symlink_metadata` before any target runtime is constructed, rather than following it to a regular file. An explicit existing-file check uses that non-following metadata. The default target is checked when its final component exists; a missing default remains create-capable. A symlinked target refuses even when it points to an otherwise valid dedicated map. An independent byte copy of a protected database, at a new file identity, remains admissible under A9. Parent-directory aliases still use the existing normalization rule. This is a preflight rule, not a claim that a path cannot change afterward.
+
+3. **Residual threat.** A local writer can swap the target between the courtesy preflight and SQLite's actual open, so the currently shipped fence does not establish E7's opened-handle exclusion.
+
+4. **Deferred handle-level proof.** Issue #3552 owns the full guarded native VFS design for code-pack target opens. It must cover main, journal, WAL, and SHM, including the `xShmMap` path and native locking semantics, and prove no-follow traversal plus the identity of each actual retained OS handle before first use. On Unix this means handle-relative no-follow traversal and `fstat` identity; on Windows it means reparse-safe opens and identity from the retained handle. The design must specify refresh or snapshot semantics for protected companions that appear or change during an attempted open. A path re-probe after delegating a native open is not an opened-handle proof.
+
+The #3552 acceptance suite must place a deterministic barrier after courtesy preflight and before SQLite open, then swap the target main and each companion to a production hard link and to a symlink or reparse point. Each arm must refuse before migration or companion writes. It must also refuse an unrelated hard-linked writable companion with link count above one, admit an independent byte copy and an ordinary dedicated map, and test identity refresh after a refused open. For every refusal, compare the protected main/WAL/SHM presence, bytes, size, and modification time before and after. Exercise pooled writers, pooled and standalone readers, and any other code-pack-created connection on Unix and Windows; one unguarded open invalidates the proof.
+
+This amendment narrows E7's present-tense implementation claim. It does not remove E7's target opened-handle security objective or A9's production deny set. The three analysis verbs remain unshipped, and their read-only constructor and migration-free requirements remain target design rather than a claim about current runtime behavior.
+
+## Acceptance for this amendment
+
+- A `code.ingest` explicit target that is a final-component symlink to a dedicated map is refused before runtime construction; a symlink to a protected file is refused as well.
+- A separate byte copy of a protected database at a new inode/file identity remains admissible, subject to the existing map-target rules.
+- The source and public documentation describe the current check as a path-level courtesy preflight and name the local swap race. No test or documentation claims that #3552's handle-level guarantee is already shipped.
+
+## References
+
+- ADR-085 Amendment 4 E7 and Amendment 9 A9
+- `crates/khive-pack-code/src/db_target.rs` and `crates/khive-pack-code/src/pack.rs`
+- `crates/khive-db/src/pool.rs` SQLite connection opens
+- #1855 and #3552

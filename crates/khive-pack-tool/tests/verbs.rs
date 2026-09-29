@@ -84,6 +84,19 @@ async fn register_is_idempotent_by_name() {
     assert_eq!(listed["count"], json!(1));
 }
 
+#[tokio::test]
+async fn wide_list_limit_clamps_before_narrowing() {
+    let f = fixture();
+    for name in ["wide_limit_a", "wide_limit_b", "wide_limit_c"] {
+        f.call("tool.register", json!({"name": name})).await;
+    }
+
+    let listed = f
+        .call("tool.list", json!({"limit": 4_294_967_296_u64}))
+        .await;
+    assert_eq!(listed["count"], json!(3), "{listed}");
+}
+
 // Arm 2: capabilities are created once and linked with implements edges.
 #[tokio::test]
 async fn capabilities_are_created_once_and_linked() {
@@ -365,6 +378,49 @@ async fn expired_grant_is_ignored() {
     assert_eq!(check["source"], json!("default"));
 }
 
+async fn requested_grant_for_expiry_test() -> (Fixture, String) {
+    let f = fixture();
+    f.call("tool.register", json!({"name": "send_mail"})).await;
+    let request = f
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    (f, s(&request, "request_id"))
+}
+
+async fn assert_expiry_overflow_rejected(f: &Fixture, id: &str, seconds: i64) {
+    let err = f
+        .call_err("tool.grant", json!({"id": id, "expires_in_s": seconds}))
+        .await;
+    assert!(err.contains("expires_in_s is too large"), "{err}");
+
+    let pending = f
+        .call("tool.requests", json!({"status": "requested"}))
+        .await;
+    assert_eq!(pending["count"], json!(1), "{pending}");
+    let check = f
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    assert_eq!(check["decision"], json!("ask"), "{check}");
+}
+
+#[tokio::test]
+async fn grant_expiry_multiplication_overflow_is_rejected() {
+    let (f, id) = requested_grant_for_expiry_test().await;
+    assert_expiry_overflow_rejected(&f, &id, i64::MAX).await;
+}
+
+#[tokio::test]
+async fn grant_expiry_addition_overflow_is_rejected() {
+    let (f, id) = requested_grant_for_expiry_test().await;
+    assert_expiry_overflow_rejected(&f, &id, i64::MAX / 1_000_000).await;
+}
+
 // Arm 7: an illegal transition is refused with the current status in the message.
 #[tokio::test]
 async fn deny_on_revoked_is_refused() {
@@ -535,6 +591,102 @@ async fn registry_rows_are_opaque_to_the_generic_entity_verbs() {
         .await;
     assert_eq!(again["created"], json!(false));
     assert_eq!(again["tool"]["full_id"], json!(id));
+}
+
+#[tokio::test]
+async fn generic_create_refuses_registry_tags_in_single_and_bulk_forms() {
+    let f = fixture();
+    let err = f
+        .call_err(
+            "create",
+            json!({
+                "kind": "entity", "entity_kind": "project", "name": "forged-tool",
+                "tags": ["ToOl-ReGiStRy"],
+                "properties": {"source": "mcp:other", "side_effect": "read"},
+            }),
+        )
+        .await;
+    assert!(err.contains("tool-registry"), "{err}");
+
+    let batch = f
+        .call(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "project", "name": "forged-bulk", "tags": ["tool-registry"]},
+                    {"kind": "concept", "name": "ordinary-bulk"},
+                ],
+                "atomic": false,
+            }),
+        )
+        .await;
+    assert_eq!(batch["results"][0]["ok"], json!(false), "{batch}");
+    assert_eq!(batch["results"][1]["ok"], json!(true), "{batch}");
+    let err = f
+        .call_err("tool.describe", json!({"tool": "forged-bulk"}))
+        .await;
+    assert!(err.contains("not registered"), "{err}");
+
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary-then-tagged"}),
+        )
+        .await;
+    let err = f
+        .call_err(
+            "update",
+            json!({"id": ordinary["id"], "tags": ["TOOL-REGISTRY"]}),
+        )
+        .await;
+    assert!(err.contains("tool-registry"), "{err}");
+    let err = f
+        .call_err("tool.describe", json!({"tool": "ordinary-then-tagged"}))
+        .await;
+    assert!(err.contains("not registered"), "{err}");
+}
+
+#[tokio::test]
+async fn id_references_require_a_registry_row() {
+    let f = fixture();
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary-project"}),
+        )
+        .await;
+    let id = ordinary["id"].as_str().expect("created id");
+    for reference in [id, &id[..8]] {
+        let err = f
+            .call_err("tool.describe", json!({"tool": reference}))
+            .await;
+        assert!(err.contains("not registered"), "{reference}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn generic_merge_cannot_rewrite_or_consume_a_registry_row() {
+    let f = fixture();
+    let registered = f.call("tool.register", json!({"name": "kept-tool"})).await;
+    let tool_id = s(&registered["tool"], "full_id");
+    let ordinary = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "merge-control"}),
+        )
+        .await;
+    let ordinary_id = ordinary["id"].as_str().expect("created id");
+    for (into_id, from_id) in [(&tool_id[..], ordinary_id), (ordinary_id, &tool_id[..])] {
+        let err = f
+            .call_err(
+                "merge",
+                json!({"kind": "entity", "into_id": into_id, "from_id": from_id, "force": true}),
+            )
+            .await;
+        assert!(err.contains("tool-registry"), "{err}");
+    }
+    let described = f.call("tool.describe", json!({"tool": "kept-tool"})).await;
+    assert_eq!(described["tool"]["full_id"], json!(tool_id));
 }
 
 // Arm 11 (control): the rule keys on the registry tag, not on the entity kind

@@ -426,6 +426,7 @@ pub(crate) enum FeedbackEventWrite {
         gate_mode: crate::fold_gate::FeedbackGateMode,
         gate_now_us: i64,
         dedup_key: Option<(String, String)>,
+        grade: Option<String>,
     },
 }
 
@@ -732,6 +733,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                     gate_mode,
                     gate_now_us,
                     dedup_key,
+                    grade,
                 } => {
                     event.created_at = commit_at_us;
                     let dedup_ref = dedup_key
@@ -746,6 +748,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                         gate_mode,
                         gate_now_us,
                         dedup_ref,
+                        grade.as_deref(),
                         move |fold_outcome, forced_zero| {
                             let (effective_weight, mass_before, mass_after) = match fold_outcome {
                                 Some(outcome) => (
@@ -2942,6 +2945,7 @@ mod snapshot_copy_regression {
                     gate_mode: FeedbackGateMode::Nominal(0.1),
                     gate_now_us: 1_700_000_000_000_000,
                     dedup_key: Some(("snapshot-scorer".into(), "snapshot-ledger".into())),
+                    grade: None,
                 },
                 16,
                 |proposed, signal| {

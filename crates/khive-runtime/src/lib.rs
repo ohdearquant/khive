@@ -21,6 +21,7 @@ pub mod config_ledger;
 pub mod cost_unit;
 pub mod curation;
 pub mod daemon;
+pub mod email_message_id;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod entity_write;
@@ -53,6 +54,7 @@ pub mod phase_events;
 pub mod portability;
 pub mod preference_verification;
 pub mod presentation;
+pub mod process_retry;
 pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
@@ -109,6 +111,7 @@ pub use daemon::{
     track_named_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard,
     PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
 };
+pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
@@ -186,7 +189,7 @@ pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
     BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
-    NoteMutationHookFn, NoteWriteValidatorFn, RuntimeConfig,
+    NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use telemetry_config::{

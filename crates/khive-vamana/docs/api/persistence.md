@@ -146,7 +146,7 @@ live corpus. Decision tree:
   fast path (`load_v2_fast`, O(N) — no reverse_adj rebuild)
 - `KHVVAMG2` but checksum or fingerprint mismatch → rebuild from commit config, then
   `save_atomic`
-- `metadata.bin` with `KHVVAMM1` (v1) → v1 `load`, then `save_atomic` upgrade
+- `metadata.bin` with `KHVVAMM1` (v1) → v1 `load`; upgrade with `save_atomic` only when its dimensions (against the caller's fallback configuration), vector count, and vector bytes match the supplied corpus. Otherwise rebuild from that corpus using the loaded tuning with the caller's dimensions before publishing.
 - `metadata.bin` missing or corrupt → rebuild from `fallback_config`, then `save_atomic`
 
 `VamanaIndex::load_v2_raw` (private) is the non-rebuilding half of that fast path: it

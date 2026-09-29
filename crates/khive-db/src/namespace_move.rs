@@ -398,6 +398,10 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
             trigger_maintained: false,
         },
         "fts_notes_rowids" | "fts_entities_rowids" => DerivedRowidMap,
+        // `move_vectors` clears these rows using the staged vec0 subjects.
+        "vector_provenance" => Derived {
+            trigger_maintained: false,
+        },
 
         "ann_write_log" => Appended,
         "events" => History,
@@ -900,6 +904,29 @@ fn move_vectors(
         "every staged vector is re-inserted or the move is losing embeddings"
     );
 
+    // The sidecar is optional on databases predating vector provenance. The
+    // move re-inserts vec0 bytes without capturing a new prepared input or
+    // attributable write time, so discard the old provenance for the exact
+    // staged subject set in the same transaction. An equal BLOB would not
+    // invalidate the old digest on its own.
+    let has_provenance: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'vector_provenance')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_provenance {
+        let model_key = table
+            .strip_prefix("vec_")
+            .expect("runtime vector tables use the vec_ prefix");
+        conn.execute(
+            "DELETE FROM vector_provenance \
+             WHERE model_key = ?1 \
+               AND subject_id IN (SELECT subject_id FROM temp.namespace_move_vectors)",
+            [model_key],
+        )?;
+    }
+
     // The staging table is still here because THIS is what the write log has to
     // be built from. It holds the moved rows and nothing else; the live table now
     // holds them beside whatever the target already had, and a log built by
@@ -1037,6 +1064,16 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
             if left > 0 {
                 *counts.left_behind.entry(table.name.clone()).or_default() += left;
             }
+        }
+    }
+    if census
+        .tables
+        .iter()
+        .any(|table| table.name == "vector_provenance")
+    {
+        let left = count_in_namespace(conn, "vector_provenance", source)?;
+        if left > 0 {
+            counts.left_behind.insert("vector_provenance".into(), left);
         }
     }
 
@@ -1424,6 +1461,137 @@ mod tests {
             )
             .expect("count");
         assert_eq!(taken_by_target, 1);
+    }
+
+    #[cfg(feature = "vectors")]
+    #[tokio::test]
+    async fn vector_provenance_namespace_move_clears_sidecar() {
+        use std::sync::Arc;
+
+        use khive_storage::VectorStore;
+
+        use crate::pool::{ConnectionPool, PoolConfig};
+        use crate::stores::vectors::SqliteVecStore;
+
+        crate::extension::ensure_extensions_loaded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("namespace-move-provenance.db");
+        let mut conn = Connection::open(&path).expect("open database");
+        run_migrations(&mut conn).expect("migrate database");
+        let subject_id = uuid::Uuid::new_v4();
+        let subject = subject_id.to_string();
+        seed_note(&conn, &subject, "source", "observation");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_test_model USING vec0(\
+             subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, embedding float[2] distance_metric=cosine)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vec_test_model \
+             (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES (?1, 'source', 'observation', 'content', 'test-model', '[0.1, 0.2]')",
+            [&subject],
+        )
+        .unwrap();
+        let before_blob: Vec<u8> = conn
+            .query_row(
+                "SELECT embedding FROM vec_test_model WHERE subject_id = ?1",
+                [&subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let digest = blake3::hash(&before_blob).to_hex().to_string();
+        conn.execute(
+            "INSERT INTO vector_provenance \
+             (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
+             VALUES ('test_model', ?1, 'source', ?2, ?3, '2026-09-25T12:34:56Z')",
+            rusqlite::params![&subject, &digest, "a".repeat(64)],
+        )
+        .unwrap();
+
+        // A target-scoped stale sidecar with equal BLOB bytes would become
+        // apparently current after the move if clearing were source-scoped.
+        let stale_target_id = uuid::Uuid::new_v4();
+        let stale_target_subject = stale_target_id.to_string();
+        seed_note(&conn, &stale_target_subject, "source", "observation");
+        conn.execute(
+            "INSERT INTO vec_test_model \
+             (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES (?1, 'source', 'observation', 'content', 'test-model', '[0.1, 0.2]')",
+            [&stale_target_subject],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vector_provenance \
+             (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
+             VALUES ('test_model', ?1, 'target', ?2, ?3, '2026-09-25T12:34:56Z')",
+            rusqlite::params![&stale_target_subject, &digest, "b".repeat(64)],
+        )
+        .unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        move_namespace(
+            &conn,
+            &MoveRequest::new("source", vec![route("note:observation", "target")]),
+        )
+        .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        let sidecars: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vector_provenance \
+                 WHERE model_key = 'test_model' AND subject_id IN (?1, ?2)",
+                rusqlite::params![&subject, &stale_target_subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sidecars, 0,
+            "a move must invalidate even an equal-BLOB sidecar"
+        );
+        let after_blob: Vec<u8> = conn
+            .query_row(
+                "SELECT embedding FROM vec_test_model \
+                 WHERE subject_id = ?1 AND namespace = 'target'",
+                [&subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_blob, before_blob, "the vector itself must survive");
+        drop(conn);
+
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .expect("reopen moved database"),
+        );
+        let vectors = SqliteVecStore::new(
+            pool,
+            true,
+            "test_model".into(),
+            "test-model".into(),
+            2,
+            "target".into(),
+        )
+        .expect("open target vector store");
+        let observed = vectors
+            .provenance(subject_id)
+            .await
+            .expect("read moved vector")
+            .expect("moved vector remains present");
+        assert_eq!(observed.text_fingerprint, None);
+        assert_eq!(observed.updated_at, None);
+        let stale_target = vectors
+            .provenance(stale_target_id)
+            .await
+            .expect("read formerly stale target vector")
+            .expect("second moved vector remains present");
+        assert_eq!(stale_target.text_fingerprint, None);
+        assert_eq!(stale_target.updated_at, None);
     }
 
     /// The instructions are about the vectors that MOVED, and a target is

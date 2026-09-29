@@ -1517,8 +1517,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     HandlerDef {
         name: "db_diagnostics",
         description: "Report reader- and writer-contention, graph-edge integrity, and WAL/checkpoint \
-                      diagnostics for the main \
-                      database: reader admission capacity/availability, pooled reader checkouts, \
+                      diagnostics for every already-open database. Existing root fields \
+                      describe main; `databases` has one canonical-file entry with backend_names, \
+                      path, diagnostics, and error for each opened backend: reader admission \
+                      capacity/availability, pooled reader checkouts, \
                       separately attributed request/infrastructure standalone reader opens, \
                       reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
                       completed hold time; aggregate and class-specific pooled/standalone/writer-task \

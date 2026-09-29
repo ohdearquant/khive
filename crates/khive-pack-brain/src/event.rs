@@ -102,6 +102,7 @@ pub fn interpret(event: &Event) -> BrainSignal {
                     target_id: target,
                     event_kind,
                     served_by_profile_id: served_by,
+                    section_signals,
                     effective_weight,
                 }
             } else {
@@ -430,6 +431,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_feedback_preserves_section_signals_for_replay() {
+        use khive_brain_core::SectionType;
+        let id = Uuid::new_v4();
+        let mut event = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        event.payload = serde_json::json!({
+            "signal": "explicit_positive",
+            "section_signals": {"overview": "useful", "examples": "wrong"}
+        });
+        match interpret(&event) {
+            BrainSignal::SemanticFeedback {
+                section_signals: Some(signals),
+                ..
+            } => {
+                assert_eq!(signals[&SectionType::Overview], FeedbackSignal::Useful);
+                assert_eq!(signals[&SectionType::Examples], FeedbackSignal::Wrong);
+            }
+            other => panic!("semantic section signals were dropped: {other:?}"),
+        }
+    }
+
     // ── FeedbackEventKind unit tests (MAJ-001 coverage) ──────────────────────
 
     #[test]
@@ -492,11 +514,13 @@ mod tests {
                 target_id,
                 event_kind,
                 served_by_profile_id,
+                section_signals,
                 effective_weight,
             } => {
                 assert_eq!(target_id, id);
                 assert_eq!(event_kind, FeedbackEventKind::ExplicitPositive);
                 assert!(served_by_profile_id.is_none());
+                assert!(section_signals.is_none());
                 assert!((effective_weight - 1.5).abs() < 1e-12);
             }
             other => panic!("expected SemanticFeedback, got {other:?}"),
@@ -543,6 +567,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::ExplicitPositive,
             served_by_profile_id: None,
+            section_signals: None,
             effective_weight: FeedbackEventKind::ExplicitPositive.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, true)));
@@ -555,6 +580,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::ImplicitNegative,
             served_by_profile_id: None,
+            section_signals: None,
             effective_weight: FeedbackEventKind::ImplicitNegative.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));
@@ -567,6 +593,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::Correction,
             served_by_profile_id: None,
+            section_signals: None,
             effective_weight: FeedbackEventKind::Correction.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));

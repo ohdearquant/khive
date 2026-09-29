@@ -681,14 +681,48 @@ fn build_entity_where(
     (clause, params)
 }
 
+/// An ID-filtered read is bounded by the caller's IDs, even on a fresh
+/// database without sqlite_stat1. The other predicates can match a large
+/// namespace; letting one of their indexes drive turns a bounded lookup into
+/// a scan of every row in that namespace.
+fn entity_read_source(filter: &EntityFilter) -> &'static str {
+    if filter.ids.is_empty() {
+        "entities"
+    } else {
+        "entities INDEXED BY sqlite_autoindex_entities_1"
+    }
+}
+
+fn build_entity_count_query(filter: &EntityFilter, where_sql: &str) -> String {
+    let source = entity_read_source(filter);
+    format!("SELECT COUNT(*) FROM {source}{where_sql}")
+}
+
+fn build_entity_page_query(
+    columns: &str,
+    filter: &EntityFilter,
+    where_sql: &str,
+    order_by: &str,
+    limit_idx: usize,
+    offset_idx: usize,
+) -> String {
+    let source = entity_read_source(filter);
+    format!(
+        "SELECT {columns} FROM {source}{where_sql} \
+         ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    )
+}
+
 fn build_candidate_entity_query(
     columns: &str,
+    filter: &EntityFilter,
     where_sql: &str,
     candidate_param_indices: &[usize],
     order_by: &str,
     limit_idx: usize,
     offset_idx: usize,
 ) -> String {
+    let source = entity_read_source(filter);
     let candidate_rows = candidate_param_indices
         .iter()
         .map(|idx| format!("(?{idx})"))
@@ -699,13 +733,37 @@ fn build_candidate_entity_query(
         "WITH candidates(folded_name) AS (VALUES {candidate_rows}), \
          matched_entities(entity_id) AS (\
              SELECT (\
-                 SELECT id FROM entities{where_sql} \
+                 SELECT id FROM {source}{where_sql} \
                  AND LOWER(name) = candidates.folded_name LIMIT 1\
              ) FROM candidates\
          ) \
          SELECT {columns} FROM entities \
          JOIN matched_entities ON entities.id = matched_entities.entity_id \
          ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    )
+}
+
+fn build_entity_cursor_query(
+    columns: &str,
+    filter: &EntityFilter,
+    where_sql: &str,
+    limit_idx: usize,
+) -> String {
+    // CROSS JOIN fixes the loop order. An explicit ID set drives entities by
+    // primary key, then looks up each sequence. The unfiltered walk drives
+    // the sequence first. Kind-filtered walks without IDs retain the
+    // planner's existing index choice.
+    let source = entity_read_source(filter);
+    let from_clause = if !filter.ids.is_empty() {
+        format!("{source} CROSS JOIN entities_seq ON entities.id = entities_seq.entity_id")
+    } else if filter.kinds.is_empty() {
+        "entities_seq CROSS JOIN entities ON entities.id = entities_seq.entity_id".to_string()
+    } else {
+        "entities_seq JOIN entities ON entities.id = entities_seq.entity_id".to_string()
+    };
+    format!(
+        "SELECT {columns}, entities_seq.seq FROM {from_clause}{where_sql} \
+         ORDER BY entities_seq.seq ASC LIMIT ?{limit_idx}"
     )
 }
 
@@ -937,7 +995,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("query_entities", move |conn| {
             let total = if filter.names_ci.is_empty() && !skip_total {
                 let (count_sql, count_params) = build_entity_where(&namespace, &filter);
-                let sql = format!("SELECT COUNT(*) FROM entities{count_sql}");
+                let sql = build_entity_count_query(&filter, &count_sql);
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     count_params.iter().map(|p| p.as_ref()).collect();
@@ -1004,13 +1062,18 @@ impl EntityStore for SqlEntityStore {
 
             let columns = ENTITY_SELECT_COLUMNS;
             let data_sql = if filter.names_ci.is_empty() {
-                format!(
-                    "SELECT {columns} FROM entities{where_sql} \
-                     ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                build_entity_page_query(
+                    columns,
+                    effective_filter,
+                    &where_sql,
+                    &order_by,
+                    limit_idx,
+                    offset_idx,
                 )
             } else {
                 build_candidate_entity_query(
                     columns,
+                    effective_filter,
                     &where_sql,
                     &candidate_param_indices,
                     &order_by,
@@ -1065,24 +1128,7 @@ impl EntityStore for SqlEntityStore {
             let limit_idx = params.len();
 
             let columns = ENTITY_SELECT_COLUMNS;
-            // CROSS JOIN is load-bearing for the unfiltered walk: SQLite must
-            // drive the query from the sequence INTEGER PRIMARY KEY range
-            // instead of scanning the namespace index and sorting all matches
-            // into a temp B-tree. When a kind filter is active, forcing that
-            // same seq-first plan prevents SQLite from using
-            // idx_entities_kind(namespace, kind) as the driving index, so a
-            // plain JOIN is used instead and left to the query planner — the
-            // cursor's page order is still entities_seq.seq, unchanged.
-            let join_kind = if filter.kinds.is_empty() {
-                "CROSS JOIN"
-            } else {
-                "JOIN"
-            };
-            let sql = format!(
-                "SELECT {columns}, entities_seq.seq FROM entities_seq \
-                 {join_kind} entities ON entities.id = entities_seq.entity_id{where_sql} \
-                 ORDER BY entities_seq.seq ASC LIMIT ?{limit_idx}"
-            );
+            let sql = build_entity_cursor_query(columns, &filter, &where_sql, limit_idx);
             let mut stmt = conn.prepare(&sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|param| param.as_ref()).collect();
@@ -1134,7 +1180,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("count_entities", move |conn| {
             if filter.namespaces.is_empty() {
                 let (where_sql, params) = build_entity_where(&namespace, &filter);
-                let sql = format!("SELECT COUNT(*) FROM entities{}", where_sql);
+                let sql = build_entity_count_query(&filter, &where_sql);
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -1157,7 +1203,7 @@ impl EntityStore for SqlEntityStore {
                     ..filter.clone()
                 };
                 let (where_sql, params) = build_entity_where(&namespace, &chunk_filter);
-                let sql = format!("SELECT COUNT(*) FROM entities{}", where_sql);
+                let sql = build_entity_count_query(&chunk_filter, &where_sql);
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();

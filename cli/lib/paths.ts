@@ -8,7 +8,7 @@ export const ENTITIES_FILE = ".khive/kg/entities.ndjson";
 export const EDGES_FILE = ".khive/kg/edges.ndjson";
 export const SCHEMA_FILE = ".khive/kg/schema.yaml";
 export const MIGRATIONS_DIR = ".khive/kg/migrations";
-export const REMOTE_CACHE_DIR = ".khive/kg/.remote-cache";
+export const REMOTE_CACHE_DIR = ".khive/kg/remotes";
 
 export const CONFIG_FILE = ".khive/config.toml";
 export const SETTINGS_FILE = ".khive/settings.json";

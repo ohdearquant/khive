@@ -40,6 +40,16 @@ pub const TOOL_REGISTRY_TAG: &str = "tool-registry";
 /// capability-bearing property, which is exactly how `side_effect` was missed.
 pub const PACK_REGISTRY_TAGS: &[&str] = &[TOOL_REGISTRY_TAG];
 
+/// Canonical registry tag carried by a row, including legacy case variants.
+/// Storage name resolution folds tags to lowercase, so generic write guards
+/// must use the same comparison or a differently cased tag can bypass them.
+pub fn pack_registry_tag(tag: &str) -> Option<&'static str> {
+    PACK_REGISTRY_TAGS
+        .iter()
+        .copied()
+        .find(|registered| registered.eq_ignore_ascii_case(tag))
+}
+
 /// Visibility tier for a handler.
 ///
 /// `Verb` entries appear on the MCP wire and are invokable by agents.
