@@ -2423,6 +2423,8 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        #[cfg(feature = "namespace-trigram-proto")]
+        register_namespace_trigram(&conn)?;
         register_writer_clock(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
@@ -2836,7 +2838,10 @@ fn read_only_wal_open_target_for_path(path: &Path) -> Result<PathBuf, SqliteErro
 pub(crate) fn open_read_only_snapshot_connection(path: &Path) -> Result<Connection, SqliteError> {
     let (_, physical_path) = mint_db_identity(path)?;
     let target = read_only_wal_open_target_for_path(&physical_path)?;
-    Connection::open_with_flags(&target, reader_open_flags()).map_err(Into::into)
+    let conn = Connection::open_with_flags(&target, reader_open_flags())?;
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(&conn)?;
+    Ok(conn)
 }
 
 fn sqlite_header_uses_wal(path: &Path) -> Result<bool, SqliteError> {
@@ -2926,6 +2931,11 @@ fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
+#[cfg(feature = "namespace-trigram-proto")]
+fn register_namespace_trigram(conn: &Connection) -> Result<(), SqliteError> {
+    crate::namespace_trigram_proto::register(conn).map_err(SqliteError::InvalidData)
+}
+
 fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
     // Evaluated by SQLite at statement execution, never deterministic: stream
     // observation deadlines use the same UTC microsecond source as note stamps.
@@ -2996,6 +3006,8 @@ fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(conn)?;
     register_writer_clock(conn)?;
     register_rfc3339_key(conn)?;
     if config.read_only {
@@ -3046,6 +3058,8 @@ fn configure_writer_connection(
 }
 
 fn configure_reader_connection(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(conn)?;
     register_rfc3339_key(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
