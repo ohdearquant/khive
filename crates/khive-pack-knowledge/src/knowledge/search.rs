@@ -27,10 +27,10 @@ use super::scoring::{
 };
 use super::sections::to_slug;
 use super::util::{
-    atom_embed_text, atom_from_row, deser, domain_from_row, estimate_compose_item_tokens,
-    explicitly_requested_status, is_stop, row_bool, row_i64, row_str, sql_err, status_multiplier,
-    status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN, D_SUGGEST_RERANK_ALPHA,
-    MIN_TERM_LEN,
+    atom_embed_text, atom_embed_text_fields, atom_from_row, deser, domain_from_row,
+    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
+    sql_err, status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
+    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -44,6 +44,8 @@ struct ScoredHit {
     name: String,
     content: Option<String>,
     tags: Option<String>,
+    /// The index-time atom renderer, independent of the result's display tags.
+    atom_embed_text: Option<String>,
     finalized: bool,
     is_domain: bool,
     status: Option<String>,
@@ -1548,6 +1550,7 @@ async fn search_core(
                 name: cand.name_raw.clone(),
                 content: cand.content_raw.clone(),
                 tags: cand.tags_raw.clone(),
+                atom_embed_text: cand.atom_embed_text.clone(),
                 status: cand.status_raw.clone(),
                 finalized: cand.finalized,
                 is_domain: cand.is_domain,
@@ -1838,6 +1841,159 @@ async fn rerank_with_embeddings(
     Ok(false)
 }
 
+/// Search uses the same document-intent vectors as knowledge indexing. The
+/// older generic reranker remains for suggest, whose candidates are domains.
+async fn rerank_search_with_stored_vectors(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    namespace: &str,
+    query: &str,
+    query_embedding: &mut QueryEmbeddingCache,
+    hits: &mut [ScoredHit],
+    alpha: f32,
+) -> Result<Option<Value>, RuntimeError> {
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    if query_embedding.role_specific.is_not_attempted() {
+        query_embedding.role_specific = match khive_storage::await_request_read_phase(
+            "knowledge.embedding_rerank",
+            runtime.embed_query(query),
+        )
+        .await
+        {
+            Ok(Ok(vector)) => RoleSpecificEmbedding::Vector(vector),
+            Ok(Err(_)) => RoleSpecificEmbedding::Failed,
+            Err(error) if is_timeout(&error) => RoleSpecificEmbedding::Failed,
+            Err(error) => return Err(error.into()),
+        };
+    }
+    let Some(query_vector) = query_embedding.role_specific.as_deref() else {
+        return Ok(None);
+    };
+    let store = match runtime.vectors_for_model(token, runtime.default_embedder_name()) {
+        Ok(store) => Some(store),
+        Err(RuntimeError::Storage(khive_storage::StorageError::Unsupported { .. })) => None,
+        Err(error) => return Err(error),
+    };
+
+    rerank_search_from_store(
+        runtime,
+        store.as_deref(),
+        namespace,
+        query_vector,
+        hits,
+        alpha,
+    )
+    .await
+}
+
+/// Kept separate from store resolution so a backend without by-ID reads can
+/// exercise the fallback and its response provenance in focused tests.
+async fn rerank_search_from_store(
+    runtime: &KhiveRuntime,
+    store: Option<&dyn khive_storage::VectorStore>,
+    namespace: &str,
+    query_vector: &[f32],
+    hits: &mut [ScoredHit],
+    alpha: f32,
+) -> Result<Option<Value>, RuntimeError> {
+    let candidate_ids: Vec<Uuid> = hits
+        .iter()
+        .filter_map(|hit| Uuid::parse_str(&hit.id).ok())
+        .collect();
+    let mut stored_vectors = HashMap::new();
+    let mut stored_vector_lookup = "unsupported";
+    if let Some(store) = store {
+        if store.capabilities().supports_vector_read {
+            stored_vector_lookup = "supported";
+            if !candidate_ids.is_empty() {
+                stored_vectors = match khive_storage::await_request_read_phase(
+                    "knowledge.embedding_rerank.vector_read",
+                    store.get_vectors(&candidate_ids, namespace, "knowledge.atom"),
+                )
+                .await
+                {
+                    Ok(Ok(vectors)) => vectors,
+                    Ok(Err(khive_storage::StorageError::Unsupported { .. })) => {
+                        stored_vector_lookup = "unsupported";
+                        HashMap::new()
+                    }
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(error) if is_timeout(&error) => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+            }
+        }
+    }
+
+    let mut fallback_indices = Vec::new();
+    let mut fallback_texts = Vec::new();
+    let mut candidate_vectors = vec![None; hits.len()];
+    for (index, hit) in hits.iter().enumerate() {
+        let stored = Uuid::parse_str(&hit.id)
+            .ok()
+            .and_then(|id| stored_vectors.get(&id));
+        if let Some(vector) = stored {
+            candidate_vectors[index] = Some(vector.clone());
+            continue;
+        }
+        fallback_indices.push(index);
+        fallback_texts.push(hit.atom_embed_text.clone().unwrap_or_else(|| {
+            atom_embed_text_fields(
+                &hit.name,
+                hit.content.as_deref().unwrap_or(""),
+                hit.tags.as_deref().unwrap_or("[]"),
+            )
+        }));
+    }
+
+    if !fallback_texts.is_empty() {
+        let embedded = match khive_storage::await_request_read_phase(
+            "knowledge.embedding_rerank.fallback",
+            runtime.embed_document_batch(&fallback_texts),
+        )
+        .await
+        {
+            Ok(Ok(vectors)) => vectors,
+            Ok(Err(_)) => return Ok(None),
+            Err(error) if is_timeout(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if embedded.len() != fallback_indices.len() {
+            return Ok(None);
+        }
+        for (index, vector) in fallback_indices.iter().copied().zip(embedded) {
+            candidate_vectors[index] = Some(vector);
+        }
+    }
+
+    let from_stored = hits.len() - fallback_indices.len();
+    let max_score = hits
+        .iter()
+        .map(|hit| hit.score)
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
+    for (hit, vector) in hits.iter_mut().zip(candidate_vectors) {
+        let vector = vector.expect("every rerank candidate has a stored or fallback vector");
+        let cosine = cosine_similarity(query_vector, &vector);
+        hit.score = alpha * (hit.score / max_score) + (1.0 - alpha) * cosine.max(0.0);
+        hit.provenance.embedding_rerank = true;
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
+    Ok(Some(json!({
+        "stored_vector_lookup": stored_vector_lookup,
+        "candidates": hits.len(),
+        "from_stored": from_stored,
+        "embedded_fallback": fallback_indices.len(),
+    })))
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -2023,6 +2179,11 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
             hit.name = row_str(row, "name").unwrap_or_default();
             hit.content = row_str(row, "content");
             hit.tags = row_str(row, "tags");
+            hit.atom_embed_text = Some(atom_embed_text_fields(
+                &hit.name,
+                hit.content.as_deref().unwrap_or(""),
+                hit.tags.as_deref().unwrap_or("[]"),
+            ));
             hit.finalized = row_bool(row, "finalized");
             hit.status = row_str(row, "status");
             let tags_arr: Vec<String> = hit
@@ -2071,6 +2232,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
             hit.name = row_str(row, "name").unwrap_or_default();
             hit.content = row_str(row, "description");
             hit.tags = row_str(row, "tags");
+            hit.atom_embed_text = None;
             hit.finalized = false;
             hit.is_domain = true;
             hit.status = row_str(row, "status");
@@ -2264,6 +2426,7 @@ async fn search_eligible_ann_with_refill(
                 name: String::new(),
                 content: None,
                 tags: None,
+                atom_embed_text: None,
                 finalized: false,
                 is_domain: false,
                 status: None,
@@ -3411,9 +3574,12 @@ impl KnowledgeHandlers {
         // deadline is spent — only that stage's narrower budget is. Gate on
         // the live ambient deadline instead: a lexical-only degradation
         // with request time left to spare still gets its embedding rerank.
+        let mut rerank_provenance = None;
         if do_rerank && !hits.is_empty() && !khive_storage::request_read_is_cancelled() {
-            rerank_with_embeddings(
+            rerank_provenance = rerank_search_with_stored_vectors(
                 runtime,
+                token,
+                &ns,
                 &raw_query,
                 &mut query_embedding,
                 &mut hits,
@@ -3480,6 +3646,9 @@ impl KnowledgeHandlers {
                 "terms_truncated": term_budget.truncated(),
             },
         });
+        if let Some(provenance) = rerank_provenance {
+            out["rerank_provenance"] = provenance;
+        }
         if ann_unavailable {
             out["ann_unavailable"] = json!(true);
         }
@@ -6571,7 +6740,7 @@ mod tests {
     #[tokio::test]
     async fn embedding_rerank_provenance_is_true_when_rerank_runs() {
         let (runtime, _, fail_query) = rt_with_role_aware_recording_embedder();
-        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+        fail_query.store(false, std::sync::atomic::Ordering::SeqCst);
         {
             let access = runtime.sql();
             let mut writer = access.writer().await.expect("writer");
@@ -6610,6 +6779,103 @@ mod tests {
             out["results"][0]["score_provenance"]["embedding_rerank"], true,
             "a successful embedding rerank must record embedding_rerank: true; got {out:?}"
         );
+        assert_eq!(out["rerank_provenance"]["candidates"], 1);
+        assert_eq!(out["rerank_provenance"]["embedded_fallback"], 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_vector_store_reports_fallback_provenance() {
+        let (runtime, _, _) = rt_with_role_aware_recording_embedder();
+        let store = crate::knowledge::a5_rerank_tests::NoReadStore;
+        let mut hits = vec![make_hit(
+            "94000000-0000-0000-0000-000000000001",
+            Some("reviewed"),
+            1.0,
+        )];
+        let query_vector = vec![0.25; ROLE_RECORDING_DIM];
+        let provenance = rerank_search_from_store(
+            &runtime,
+            Some(&store),
+            "local",
+            &query_vector,
+            &mut hits,
+            0.7,
+        )
+        .await
+        .expect("unsupported store degrades to document embedding")
+        .expect("rerank ran");
+        assert_eq!(provenance["stored_vector_lookup"], "unsupported");
+        assert_eq!(provenance["candidates"], 1);
+        assert_eq!(provenance["from_stored"], 0);
+        assert_eq!(provenance["embedded_fallback"], 1);
+        assert!(hits[0].provenance.embedding_rerank);
+    }
+
+    #[tokio::test]
+    async fn canonical_domain_without_mirror_vector_uses_document_fallback() {
+        let (runtime, _, _) = rt_with_role_aware_recording_embedder();
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        let store = runtime
+            .vectors_for_model(&token, runtime.default_embedder_name())
+            .expect("model vector store");
+        let mut hits = vec![ScoredHit {
+            id: "94000000-0000-0000-0000-000000000002".into(),
+            slug: "canonical-only-domain".into(),
+            name: "Canonical Only Domain".into(),
+            content: Some("canonical description".into()),
+            tags: Some("[\"domain-tag\",\"type:domain\"]".into()),
+            atom_embed_text: None,
+            finalized: false,
+            is_domain: true,
+            status: Some("reviewed".into()),
+            score: 1.0,
+            provenance: ScoreProvenance::lexical(),
+        }];
+        let query_vector = vec![0.25; ROLE_RECORDING_DIM];
+        let provenance = rerank_search_from_store(
+            &runtime,
+            Some(store.as_ref()),
+            "local",
+            &query_vector,
+            &mut hits,
+            0.7,
+        )
+        .await
+        .expect("missing mirror vector uses document fallback")
+        .expect("rerank ran");
+        assert_eq!(provenance["stored_vector_lookup"], "supported");
+        assert_eq!(provenance["candidates"], 1);
+        assert_eq!(provenance["from_stored"], 0);
+        assert_eq!(provenance["embedded_fallback"], 1);
+        assert!(hits[0].provenance.embedding_rerank);
+    }
+
+    #[tokio::test]
+    async fn spent_read_deadline_skips_document_fallback_rerank() {
+        let (runtime, _, _) = rt_with_role_aware_recording_embedder();
+        let store = crate::knowledge::a5_rerank_tests::NoReadStore;
+        let mut hits = vec![make_hit(
+            "94000000-0000-0000-0000-000000000001",
+            Some("reviewed"),
+            1.0,
+        )];
+        let query_vector = vec![0.25; ROLE_RECORDING_DIM];
+        let result = khive_storage::scope_request_read_deadline(
+            std::time::Duration::ZERO,
+            rerank_search_from_store(
+                &runtime,
+                Some(&store),
+                "local",
+                &query_vector,
+                &mut hits,
+                0.7,
+            ),
+        )
+        .await
+        .expect("spent deadline degrades rather than errors");
+        assert!(result.is_none());
+        assert_eq!(hits[0].score, 1.0);
+        assert!(!hits[0].provenance.embedding_rerank);
     }
 
     #[test]
@@ -6634,6 +6900,7 @@ mod tests {
             name: String::new(),
             content: None,
             tags: None,
+            atom_embed_text: None,
             finalized: false,
             is_domain: false,
             status: None,
@@ -6712,6 +6979,7 @@ mod tests {
                 name: String::new(),
                 content: None,
                 tags: None,
+                atom_embed_text: None,
                 finalized: false,
                 is_domain: false,
                 status: None,
@@ -6884,6 +7152,7 @@ mod tests {
             name: String::new(),
             content: None,
             tags: None,
+            atom_embed_text: None,
             finalized: false,
             is_domain: false,
             status: None,
@@ -6939,7 +7208,8 @@ mod tests {
         // introduces the generic-embed needle either. Count the query-intent
         // call sites directly so a silent removal (or mutation-away) of one
         // is caught: the shared ANN candidate runner and `compose`'s
-        // KG-blend gate are the only two production call sites.
+        // KG-blend gate use raw_query, while search rerank can independently
+        // attempt its query if the candidate runner did not.
         let query_intent_needle: String = [".embed_query(", "raw_query)"].concat();
         let query_intent_borrowed_needle: String = [".embed_query(", "&raw_query)"].concat();
         let query_intent_count = src
@@ -6949,10 +7219,20 @@ mod tests {
                 l.contains(&query_intent_needle) || l.contains(&query_intent_borrowed_needle)
             })
             .count();
+        let rerank_query_needle: String = [".embed_query(", "query)"].concat();
+        let rerank_query_count = src
+            .lines()
+            .filter(|l| !l.contains("concat") && !l.contains("needle"))
+            .filter(|l| l.contains(&rerank_query_needle))
+            .count();
         assert_eq!(
             query_intent_count, 2,
             "expected exactly 2 query-intent call sites \
              (shared ANN runner + compose KG-blend gate), found {query_intent_count}"
+        );
+        assert_eq!(
+            rerank_query_count, 1,
+            "search rerank must retain its query-intent fallback call site"
         );
     }
 
@@ -7652,6 +7932,7 @@ mod tests {
             name: id.to_string(),
             content: None,
             tags: None,
+            atom_embed_text: None,
             finalized: false,
             is_domain: false,
             status: status.map(str::to_string),
@@ -7773,11 +8054,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_reports_lexical_provenance_and_successful_embedding_rerank() {
+    async fn search_reports_lexical_and_ann_sources_and_successful_embedding_rerank() {
         let (runtime, calls, fail_query) = rt_with_role_aware_recording_embedder();
         let registry = build_role_recording_registry(&runtime);
         seed_role_recording_corpus(&registry).await;
-        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+        fail_query.store(false, std::sync::atomic::Ordering::SeqCst);
         let token = runtime.authorize(Namespace::local()).expect("local token");
         let ann = vamana::new_shared();
 
@@ -7796,7 +8077,7 @@ mod tests {
             assert_eq!(
                 response["results"][0]["score_provenance"],
                 json!({
-                    "sources": ["lexical"],
+                    "sources": ["lexical", "ann"],
                     "embedding_rerank": rerank,
                     "normalization": "s_over_s_plus_1",
                     "calibrated": false,
@@ -7805,13 +8086,14 @@ mod tests {
             let recorded = calls.lock().expect("recording lock");
             if rerank {
                 assert_eq!(
-                    recorded.generic,
-                    [
-                        ROLE_RECORDING_QUERY.to_string(),
-                        format!("Role Recording Atom {ROLE_RECORDING_ATOM_CONTENT}")
-                    ]
+                    response["rerank_provenance"]["stored_vector_lookup"],
+                    "supported"
                 );
+                assert_eq!(response["rerank_provenance"]["from_stored"], 1);
+                assert_eq!(response["rerank_provenance"]["embedded_fallback"], 0);
+                assert!(recorded.generic.is_empty());
             } else {
+                assert!(response.get("rerank_provenance").is_none());
                 assert!(recorded.generic.is_empty());
             }
         }

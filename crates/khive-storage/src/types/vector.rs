@@ -40,6 +40,9 @@ pub struct VectorStoreCapabilities {
     /// per subject per namespace -- this field is `false` for those backends.
     #[serde(default)]
     pub supports_multi_field: bool,
+    /// Supports reading persisted embeddings by subject ID, namespace, and field.
+    #[serde(default)]
+    pub supports_vector_read: bool,
     /// Maximum supported embedding dimension, or `None` if unbounded.
     pub max_dimensions: Option<u32>,
     /// Index algorithms available in this backend.
