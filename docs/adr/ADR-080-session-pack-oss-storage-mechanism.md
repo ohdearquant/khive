@@ -237,12 +237,12 @@ from zero when backfill is enabled: its prefix was already eligible for ingestio
 insert-once event keys make replay safe. With `KHIVE_MIRROR_BACKFILL=false`, a legacy cursor
 instead adopts and persists the observed identity at its existing offset when the file is not
 shorter than that offset. The pre-offset prefix may never have been ingested, and replaying it
-would import history the operator excluded. Truncation still restarts from zero regardless of
-backfill. Subsequent unchanged polls use the new witness and retain the cheap length guard. The
-reader verifies that the opened file still has the identity observed by the service's metadata
-probe before it can advance the cursor.
-
-> a legacy cursor whose file was replaced before the upgrade by one at least as long adopts the replacement and skips its first <offset> bytes; with no stored identity the replacement cannot be detected
+would import history the operator excluded. A legacy cursor whose file was replaced before the
+upgrade by one at least as long adopts the replacement and skips its first `<offset>` bytes; with
+no stored identity the replacement cannot be detected. Truncation still restarts from zero
+regardless of backfill. Subsequent unchanged polls use the new witness and retain the cheap
+length guard. The reader verifies that the opened file still has the identity observed by the
+service's metadata probe before it can advance the cursor.
 
 Regular-file checks and no-follow opens keep a symlinked transcript from making the mirror read a
 target outside its configured tree. A symlink supplied as a configured export root is refused once
