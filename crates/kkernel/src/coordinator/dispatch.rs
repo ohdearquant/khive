@@ -588,6 +588,8 @@ impl SubstrateCoordinator {
                 &token,
                 source_id,
                 target_id,
+                src_located.kind,
+                tgt_located.kind,
                 relation,
                 weight,
                 metadata,

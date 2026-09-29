@@ -346,7 +346,7 @@ impl KhiveRuntime {
                 .validate_edge_relation_endpoints(token, ee.source, ee.target, ee.relation)
                 .await
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(e @ (RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_))) => {
                     tracing::warn!(
                         source = %ee.source,
