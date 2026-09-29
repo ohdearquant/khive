@@ -927,6 +927,9 @@ impl KhiveRuntime {
         report
             .writer_contention
             .audit_obligation_append_failures_unavailable_reason = None;
+        let (ann_routes, fallback_routes) = crate::note_search_ann::route_totals();
+        report.note_search_ann_route_total = ann_routes;
+        report.note_search_fallback_route_total = fallback_routes;
         Ok(report)
     }
 
