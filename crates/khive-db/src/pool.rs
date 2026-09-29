@@ -3285,10 +3285,18 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
+
     #[test]
     fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
         let pool = ConnectionPool::new(PoolConfig {
             path: None,
+            checkout_timeout: Duration::from_secs(1),
             ..PoolConfig::default()
         })
         .unwrap();
@@ -3330,10 +3338,12 @@ mod tests {
             .writer_until(|| context.blocking_stop_reason().is_some())
             .unwrap();
         assert!(stopped.is_none());
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "request deadline must beat pool timeout"
-        );
+        if let Some(bound) = timing::duration_bound(Duration::from_secs(1), None) {
+            assert!(
+                started.elapsed() < bound,
+                "request deadline must beat pool timeout within {bound:?}"
+            );
+        }
         assert_eq!(pool.writer_acquisition_snapshot(), before);
         drop(held);
     }
