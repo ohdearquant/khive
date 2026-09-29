@@ -1525,7 +1525,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
                       completed hold time; aggregate and class-specific pooled/standalone/writer-task \
                       writer acquisitions, finite-wait pool timeouts, writer-task request failures and \
-                      their unknown-side-effects subset, swallowed best-effort audit \
+                      their unknown-side-effects subset, pool-scoped search_mechanism counters \
+                      (coordinator dispatches by backend and requested kind, plus post-fusion \
+                      note candidate hydration rows), swallowed best-effort audit \
                       append failures, additive audit-batch flush-failure/degraded-row/degraded \
                       counters (present once a runtime audit-batch control is wired; \
                       unavailable with a reason otherwise), build identity, duplicate edge-ID \
