@@ -62,6 +62,12 @@ fn run_identity_open_hook(path: &Path, stage: IdentityOpenStage, conn: Option<&C
 #[cfg(test)]
 type SpaceProbe = dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync;
 
+#[cfg(test)]
+thread_local! {
+    static STARTUP_SPACE_PROBE: std::cell::RefCell<Option<(u64, Arc<SpaceProbe>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The SQLite write reserve is sampled at each operation admission. SQLite
 /// does not expose the size of an arbitrary upcoming transaction, so the
 /// reserve is a warning boundary, not a guarantee that a single very large
@@ -75,11 +81,19 @@ pub(crate) struct WriteAdmission {
 
 impl WriteAdmission {
     fn new(volume: Option<PathBuf>, floor_bytes: u64) -> Self {
+        #[cfg(test)]
+        let (floor_bytes, space_probe) = STARTUP_SPACE_PROBE.with(|probe| {
+            probe
+                .borrow()
+                .as_ref()
+                .map(|(floor, probe)| (*floor, Some(Arc::clone(probe))))
+                .unwrap_or((floor_bytes, None))
+        });
         Self {
             volume,
             floor_bytes,
             #[cfg(test)]
-            space_probe: Mutex::new(None),
+            space_probe: Mutex::new(space_probe),
         }
     }
 
@@ -1640,6 +1654,9 @@ impl ConnectionPool {
             read_only_open_target.as_deref(),
             identity_path.as_deref(),
         )?;
+        // The identity bootstrap can take a write lock before the remaining
+        // connection pragmas are configured. Honor the caller's wait bound.
+        writer.busy_timeout(config.busy_timeout)?;
         // A read of main.sqlite_master forces SQLite's main file open without
         // changing either database. Reject an already-swapped target before
         // installing a nonce into a legacy or initially empty database.
@@ -1665,8 +1682,14 @@ impl ConnectionPool {
         }
         let opened_database_id =
             if identity_path.is_some() && !config.read_only && initial_database_id.is_none() {
-                write_admission.check()?;
-                Some(initialize_database_id(&mut writer)?)
+                match write_admission.check() {
+                    Ok(()) => Some(initialize_database_id(&mut writer)?),
+                    // Recovery must be able to open this pool and its checkpoint
+                    // connection below the reserve. Unix dev/inode pinning still
+                    // applies; a later pool open can install the nonce.
+                    Err(SqliteError::CapacityFloor { .. }) => None,
+                    Err(error) => return Err(error),
+                }
             } else {
                 initial_database_id
             };
@@ -2588,7 +2611,13 @@ impl ConnectionPool {
     }
 
     fn verify_opened_database_id(&self, conn: &Connection) -> Result<(), SqliteError> {
-        if self.identity_path.is_some() && read_database_id(conn)? != self.opened_database_id {
+        // A read-only pool, or a writable pool opened below the space reserve,
+        // may precede installation of the nonce by another process. Without a
+        // nonce to pin, use the existing file identity checks where available.
+        let Some(expected) = self.opened_database_id else {
+            return Ok(());
+        };
+        if self.identity_path.is_some() && read_database_id(conn)? != Some(expected) {
             return Err(SqliteError::InvalidData(
                 "pool database identity changed since the first open; refusing standalone connection"
                     .to_string(),
@@ -2678,12 +2707,23 @@ impl ConnectionPool {
     ) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
 
+        #[cfg(unix)]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(identity_path)?;
+        }
+
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        #[cfg(unix)]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(identity_path)?;
+            verify_sqlite_opened_file_still_at_path(&conn)?;
+        }
+        self.verify_opened_database_id(&conn)?;
         configure_reader_connection(&conn, &self.config)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         self.reader_acquisition_counters
@@ -3594,6 +3634,28 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(hook));
         });
         IdentityOpenHookReset
+    }
+
+    struct StartupSpaceProbeReset;
+
+    impl Drop for StartupSpaceProbeReset {
+        fn drop(&mut self) {
+            STARTUP_SPACE_PROBE.with(|probe| *probe.borrow_mut() = None);
+        }
+    }
+
+    fn install_startup_space_probe(
+        floor_bytes: u64,
+        probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
+    ) -> StartupSpaceProbeReset {
+        STARTUP_SPACE_PROBE.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "startup space probe already installed"
+            );
+            *slot.borrow_mut() = Some((floor_bytes, Arc::new(probe)));
+        });
+        StartupSpaceProbeReset
     }
 
     #[cfg(unix)]
@@ -5153,6 +5215,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn standalone_reader_refuses_replaced_pinned_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let replacement = dir.path().join("replacement.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open the first database");
+        let replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .unwrap();
+        drop(replacement_conn);
+        fs::rename(&replacement, &path).unwrap();
+
+        let error = pool
+            .open_standalone_reader(StandaloneReaderPurpose::ExplicitSqlReadTransaction)
+            .expect_err("a replaced file must not serve a standalone read");
+        assert!(
+            error.to_string().contains("file identity changed"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn initially_absent_path_replacement_cannot_pin_a_different_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.db");
@@ -5938,6 +6028,78 @@ mod tests {
             "the refusal must keep its typed capacity classification"
         );
         assert_eq!(pool.writer_acquisition_snapshot().pooled_acquisitions, 0);
+    }
+
+    #[test]
+    fn db_capacity_floor_keeps_legacy_pool_and_checkpoint_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-capacity.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE existing_data (value INTEGER)")
+            .unwrap();
+        drop(conn);
+
+        let _probe = install_startup_space_probe(100, |_| Ok(100));
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("pool startup must remain available below the reserve");
+
+        assert_eq!(pool.opened_database_id, None);
+        let reader = pool.reader().expect("pooled reads remain available");
+        let exists: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM main.sqlite_master WHERE name = ?1",
+                [DATABASE_ID_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "low-space startup must not write a nonce");
+        drop(reader);
+        assert!(matches!(
+            pool.writer(),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        pool.open_standalone_writer_untracked()
+            .expect("checkpoint infrastructure must still open");
+    }
+
+    #[test]
+    fn read_only_legacy_pool_accepts_later_nonce_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-read-only.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE existing_data (value INTEGER)")
+            .unwrap();
+        drop(conn);
+
+        let read_only = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            read_only: true,
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open legacy database read-only");
+        assert_eq!(read_only.opened_database_id, None);
+
+        let _probe = install_startup_space_probe(0, |_| {
+            panic!("the disabled floor must not sample disk space")
+        });
+        let writable = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("writable pool installs the nonce");
+        assert!(writable.opened_database_id.is_some());
+
+        read_only
+            .open_reader_connection()
+            .expect("the preexisting read-only pool must keep replacing readers");
     }
 
     #[test]

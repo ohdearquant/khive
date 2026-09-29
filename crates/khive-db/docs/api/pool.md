@@ -7,6 +7,25 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+## Physical database identity
+
+On the first writable open of a new or legacy file-backed database, the pool
+creates `main._khive_database_identity`, a singleton table containing a UUID.
+This is a persistent startup write and a schema change. The pool reads the
+UUID from each subsequently opened connection to detect a swapped main file.
+It is pool infrastructure rather than a service table: the pool needs the
+identity before `apply_schema()`, and it also opens secondary databases with
+independent migration ledgers. For that reason, this table is installed by the
+pool instead of a numbered service migration. Read-only pools never install it.
+
+At or below the write reserve, a writable pool skips installation when the
+table is absent, so startup and checkpoint infrastructure remain available.
+Write admissions still fail at the reserve. A pool with no UUID pinned accepts
+a later installation by another process; on Unix, device/inode checks still
+guard new connections to its opened file. The next writable pool open above
+the reserve installs and pins the UUID. The startup transaction uses the
+configured busy timeout.
+
 ## SQLite write reserve
 
 Writable file-backed pools use `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` as their
