@@ -193,11 +193,12 @@ fn annotation_guard(
     })
 }
 
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    crate::local_git::git_command(Path::new("git"), repo, args, None)
+}
+
 fn git_status(repo: &Path, args: &[&str]) -> Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
+    let status = git_command(repo, args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -214,34 +215,46 @@ fn git_commit_exists(repo: &Path, sha: &str) -> Result<bool> {
     if !oid(sha) {
         return Ok(false);
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "-t", sha])
+    let output = git_command(repo, &["cat-file", "-t", sha])
         .stdin(Stdio::null())
         .output()
         .context("checking frozen git object")?;
     Ok(output.status.success() && output.stdout == b"commit\n")
 }
 
+fn git_repository_is_shallow(repo: &Path) -> Result<bool> {
+    let output = git_command(repo, &["rev-parse", "--is-shallow-repository"])
+        .stdin(Stdio::null())
+        .output()
+        .context("checking repository history depth")?;
+    if !output.status.success() {
+        bail!("repository history depth check failed");
+    }
+    match output.stdout.as_slice() {
+        b"true\n" => Ok(true),
+        b"false\n" => Ok(false),
+        _ => bail!("repository history depth check returned an invalid result"),
+    }
+}
+
 fn acknowledged_prefix(repo: &Path, checkpoint: &CommitCheckpoint) -> Result<Vec<String>> {
     use std::io::{BufRead, BufReader};
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
+    let mut child = git_command(
+        repo,
+        &[
             "log",
             "--reverse",
             "--topo-order",
             "--format=%H",
             &checkpoint.snapshot_head,
             "--",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("walking frozen commit history")?;
+        ],
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .context("walking frozen commit history")?;
     let stdout = child.stdout.take().context("missing git log output")?;
     let mut shas = Vec::new();
     let mut position = None;
@@ -333,6 +346,9 @@ async fn preview(
         &before,
     ))?);
     let coverage = (|| -> Result<Vec<String>> {
+        if git_repository_is_shallow(repo)? {
+            bail!("shallow repository cannot prove complete acknowledged history");
+        }
         if !git_commit_exists(repo, frozen_tip)? {
             bail!("frozen tip is unavailable as a commit");
         }
@@ -707,6 +723,7 @@ mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     use khive_runtime::{Namespace, VerbRegistry, VerbRegistryBuilder};
     use serde_json::{json, Value};
@@ -714,12 +731,27 @@ mod tests {
     use crate::GitPack;
 
     fn git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
+        let output = git_command(repo, args).output().expect("start git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is UTF-8")
+            .trim()
+            .into()
+    }
+
+    fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> String {
+        let mut child = git_command(repo, args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("start git");
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let output = child.wait_with_output().expect("wait for git");
         assert!(
             output.status.success(),
             "git {args:?}: {}",
@@ -772,6 +804,15 @@ mod tests {
             git(repo.path(), &["config", "user.name", "Test User"]);
             let first_sha = commit(repo.path(), "first.txt");
             let second_sha = commit(repo.path(), "second.txt");
+            git(
+                repo.path(),
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/khive/reconcile-fixture.git",
+                ],
+            );
             let identity = repo_identity(&DigestSource::Local(repo.path().to_path_buf())).await;
             let project_a = Self::create(
                 &registry,
@@ -1334,6 +1375,150 @@ mod tests {
         assert!(!applied.success);
         assert!(!applied.cursors_unchanged);
         assert_eq!(applied.apply.as_ref().unwrap().created, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn configured_gpg_program_is_not_executed_during_preview_or_apply() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new().await;
+        let tree_ref = format!("{}^{{tree}}", fixture.second_sha);
+        let tree = git(fixture.repo.path(), &["rev-parse", &tree_ref]);
+        let raw = format!(
+            "tree {tree}\nparent {}\nauthor Test <test@example.com> 946684800 +0000\n\
+             committer Test <test@example.com> 946684800 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n fake\n -----END PGP SIGNATURE-----\n\n\
+             signed child\n",
+            fixture.second_sha
+        );
+        let signed_sha = git_with_input(
+            fixture.repo.path(),
+            &["hash-object", "-w", "-t", "commit", "--stdin"],
+            raw.as_bytes(),
+        );
+        assert!(git(fixture.repo.path(), &["cat-file", "-p", &signed_sha]).contains("gpgsig"));
+        git(
+            fixture.repo.path(),
+            &["update-ref", "refs/heads/main", &signed_sha],
+        );
+        fixture
+            .set_checkpoint(fixture.project_b, None, &signed_sha, &fixture.second_sha)
+            .await;
+
+        let marker_dir = tempfile::tempdir().unwrap();
+        let script = marker_dir.path().join("gpg-marker.sh");
+        let marker = marker_dir.path().join("called");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf called > \"{}\"\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        git(
+            fixture.repo.path(),
+            &["config", "log.showSignature", "true"],
+        );
+        git(
+            fixture.repo.path(),
+            &["config", "gpg.program", script.to_str().unwrap()],
+        );
+
+        let mut options = fixture.options(None);
+        options.frozen_tip = signed_sha;
+        let preview = run_reconciliation(&fixture.runtime, &fixture.token, options.clone())
+            .await
+            .unwrap();
+        assert!(preview.complete_coverage, "{preview:?}");
+        assert!(!marker.exists(), "preview executed repository gpg.program");
+        options.apply_preview_id = Some(preview.preview_id);
+        let applied = run_reconciliation(&fixture.runtime, &fixture.token, options)
+            .await
+            .unwrap();
+        assert!(applied.success, "{applied:?}");
+        assert!(!marker.exists(), "apply executed repository gpg.program");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn full_checkpoint_in_shallow_clone_refuses_incomplete_coverage_and_apply() {
+        let fixture = Fixture::new().await;
+        let third_sha = commit(fixture.repo.path(), "third.txt");
+        Fixture::create(
+            &fixture.registry,
+            json!({"kind":"commit","name":"third","content":"third",
+                   "properties":{"sha":third_sha.clone()},
+                   "annotates":[fixture.project_b.to_string()]}),
+        )
+        .await;
+        fixture
+            .set_checkpoint(fixture.project_b, None, &third_sha, &third_sha)
+            .await;
+        let mut options = fixture.options(None);
+        options.frozen_tip = third_sha.clone();
+        let full = run_reconciliation(&fixture.runtime, &fixture.token, options.clone())
+            .await
+            .unwrap();
+        assert!(full.complete_coverage, "{full:?}");
+        assert_eq!(full.counts.acknowledged_shas_examined, 3);
+        assert_eq!(full.counts.repairable_missing_links, 1);
+
+        let shallow = tempfile::tempdir().unwrap();
+        let source = format!("file://{}", fixture.repo.path().display());
+        git(
+            fixture.repo.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--quiet",
+                "--depth=2",
+                "--no-local",
+                &source,
+                shallow.path().to_str().unwrap(),
+            ],
+        );
+        git(
+            shallow.path(),
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/khive/reconcile-fixture.git",
+            ],
+        );
+        assert_eq!(
+            repo_identity(&DigestSource::Local(shallow.path().to_path_buf())).await,
+            fixture.source_identity
+        );
+        assert_eq!(
+            git(shallow.path(), &["rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+        let shallow_walk = git(shallow.path(), &["log", "--format=%H", &third_sha]);
+        assert!(!shallow_walk
+            .lines()
+            .any(|sha| sha == fixture.first_sha.as_str()));
+
+        options.repo = shallow.path().to_path_buf();
+        let preview = run_reconciliation(&fixture.runtime, &fixture.token, options.clone())
+            .await
+            .unwrap();
+        assert!(!preview.complete_coverage, "{preview:?}");
+        assert_eq!(preview.counts.coverage_errors, 1);
+        assert!(preview.diagnostics[0].contains("shallow repository"));
+        options.apply_preview_id = Some(preview.preview_id);
+        let refused = run_reconciliation(&fixture.runtime, &fixture.token, options)
+            .await
+            .unwrap();
+        assert!(!refused.success);
+        assert_eq!(refused.apply.as_ref().unwrap().created, 0);
+        assert_eq!(fixture.edge_bytes(fixture.first_note).await, None);
     }
 
     #[tokio::test]
