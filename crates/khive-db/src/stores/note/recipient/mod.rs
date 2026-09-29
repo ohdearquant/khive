@@ -60,6 +60,7 @@ pub struct RecipientCommit {
     pub delivery_attempt_id: Uuid,
     pub disposition: RecipientDisposition,
     pub quarantine: Option<QuarantineRecord>,
+    pub in_reply_to: Option<Uuid>,
     pub correlation: Option<String>,
 }
 #[derive(Debug)]
@@ -81,6 +82,18 @@ fn invalid(message: &str) -> StorageError {
 const REPLAY_SQL: &str = concat!(
     "SELECT note_id,disposition,recipient_agent_id,recipient_actor FROM ",
     "comm_recipient_replay WHERE sender_agent_id=?1 AND logical_message_id=?2",
+);
+
+// An outbox transport row alone survives deletion of its message note. A
+// parent proves reply status only while that exact outbound note is live and
+// belongs to this recipient, addressed to the authenticated sender.
+const OUTBOUND_PARENT_SQL: &str = concat!(
+    "SELECT EXISTS(SELECT 1 FROM comm_sender_transport AS t JOIN notes AS n ",
+    "ON n.id=t.outbound_note_id AND n.namespace=t.namespace WHERE ",
+    "t.namespace=?1 AND t.kind='khive' AND t.logical_message_id=?2 AND ",
+    "t.sender_agent_id=?3 AND t.recipient_agent_id=?4 AND ",
+    "n.kind='message' AND n.deleted_at IS NULL AND ",
+    "json_extract(n.properties,'$.direction')='outbound')",
 );
 
 const CORRELATION_SQL: &str = concat!(
@@ -280,6 +293,28 @@ impl RecipientTransportStore {
                             .get("from_actor")
                             .and_then(Value::as_str)
                             .ok_or_else(|| invalid("missing sender actor"))?;
+                        if input.disposition == RecipientDisposition::Stored {
+                            if let Some(parent) = input.in_reply_to {
+                                let is_reply: bool = conn
+                                    .query_row(
+                                        OUTBOUND_PARENT_SQL,
+                                        params![
+                                            input.note.namespace.as_str(),
+                                            parent.to_string(),
+                                            recipient.as_str(),
+                                            input.sender_agent_id.as_str()
+                                        ],
+                                        |row| row.get(0),
+                                    )
+                                    .map_err(|e| map_err(e, op))?;
+                                if is_reply {
+                                    props.insert(
+                                        "message_kind".into(),
+                                        Value::String("reply".into()),
+                                    );
+                                }
+                            }
+                        }
                         let thread = correlated_thread.unwrap_or(input.note.id);
                         props.insert("thread_id".into(), serde_json::json!(thread));
                         let n = &input.note;

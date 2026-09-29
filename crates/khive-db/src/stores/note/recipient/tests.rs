@@ -25,6 +25,7 @@ fn fixture() -> (StorageBackend, RecipientCommit) {
             delivery_attempt_id: attempt,
             disposition: RecipientDisposition::Stored,
             quarantine: None,
+            in_reply_to: None,
             correlation: None,
         },
     )

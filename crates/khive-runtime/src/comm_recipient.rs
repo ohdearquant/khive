@@ -64,6 +64,7 @@ pub(crate) enum VerifiedInboundContent {
         content: String,
         subject: Option<String>,
         kind: Option<DeclaredMessageKind>,
+        in_reply_to: Option<Uuid>,
         correlation: Option<String>,
         sent_at: String,
     },
@@ -137,12 +138,14 @@ impl KhiveRuntime {
         self.validate_note_kind("message")?;
         let from = format!("khive1:{}/{}", local.realm, binding.sender_agent_id);
         let received_at = chrono::Utc::now().to_rfc3339();
+        let mut in_reply_to = None;
         let (content, subject, kind, correlation, disposition, quarantine, sent_at) = match payload
         {
             VerifiedInboundContent::Message {
                 content,
                 subject,
                 kind,
+                in_reply_to: parent,
                 correlation,
                 sent_at,
             } => {
@@ -157,6 +160,7 @@ impl KhiveRuntime {
                     if let Some(subject) = &subject {
                         crate::secret_gate::check_at(subject, "note", "name")?;
                     }
+                    in_reply_to = parent;
                     (
                         content,
                         subject,
@@ -222,6 +226,9 @@ impl KhiveRuntime {
         if let Some(kind) = kind {
             props["message_kind"] = json!(kind);
         }
+        if let Some(parent) = in_reply_to {
+            props["in_reply_to"] = json!(parent);
+        }
         if disposition == RecipientDisposition::Quarantined {
             props["quarantined"] = json!(true);
         }
@@ -237,6 +244,7 @@ impl KhiveRuntime {
                 delivery_attempt_id: binding.delivery_attempt_id,
                 disposition,
                 quarantine,
+                in_reply_to,
                 correlation,
             })
             .await?;
