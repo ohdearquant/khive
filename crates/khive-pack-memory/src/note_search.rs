@@ -36,7 +36,7 @@ impl MemoryNoteSearchAnnProvider {
         let live: HashSet<Uuid> = self
             .runtime
             .notes(token)?
-            .get_notes_batch(&ids)
+            .get_note_visibility_batch(&ids)
             .await?
             .into_iter()
             .filter(|note| {
@@ -215,6 +215,43 @@ mod tests {
                 .expect("consumer row")
                 .is_some_and(|watermark| watermark >= 0),
             "the note-search consumer must be active before the graph serves"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(note_search_ann)]
+    #[serial_test::serial(config_ledger)]
+    async fn note_search_visibility_filters_foreign_and_tombstoned_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(&dir.path().join("visibility.db"), "main", true);
+        let local = rt.authorize(Namespace::local()).expect("local token");
+        let foreign = rt
+            .authorize(Namespace::parse("bench-arm-a").expect("foreign namespace"))
+            .expect("foreign token");
+        let pack = MemoryPack::new(rt.clone());
+        let visible_id = seed(&rt, &local, "visible note").await;
+        let foreign_id = seed(&rt, &foreign, "foreign note").await;
+        let tombstoned_id = seed(&rt, &local, "deleted note").await;
+        rt.delete_note(&local, tombstoned_id, false)
+            .await
+            .expect("soft delete");
+
+        let provider = MemoryNoteSearchAnnProvider::new(rt.clone(), pack.ann.clone());
+        let hits = provider
+            .visible_hits(
+                &local,
+                vec![(visible_id, 0.9), (foreign_id, 1.0), (tombstoned_id, 1.0)],
+            )
+            .await
+            .expect("visibility projection");
+        assert!(hits.iter().any(|hit| hit.subject_id == visible_id));
+        assert!(
+            !hits.iter().any(|hit| hit.subject_id == foreign_id),
+            "foreign namespace candidate leaked into local search"
+        );
+        assert!(
+            !hits.iter().any(|hit| hit.subject_id == tombstoned_id),
+            "soft-deleted candidate leaked into local search"
         );
     }
 

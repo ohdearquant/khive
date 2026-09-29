@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use super::matching;
 use super::schema::{Atom, SearchParams};
 use super::util::{
-    D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_EXACT_NAME, D_W_NAME,
-    D_W_TAGS, STOP_WORDS,
+    atom_embed_text, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_EXACT_NAME,
+    D_W_NAME, D_W_TAGS, STOP_WORDS,
 };
 
 fn is_stop(w: &str) -> bool {
@@ -69,6 +69,7 @@ pub(super) struct Candidate {
     pub name_raw: String,
     pub content_raw: Option<String>,
     pub tags_raw: Option<String>,
+    pub atom_embed_text: Option<String>,
     pub status_raw: Option<String>,
     pub finalized: bool,
     pub is_domain: bool,
@@ -101,6 +102,7 @@ pub(super) fn load_candidates_from_atoms(
                 name_raw: atom.name.clone(),
                 content_raw: Some(atom.content.clone()).filter(|s| !s.is_empty()),
                 tags_raw: Some(tags_str.clone()),
+                atom_embed_text: Some(atom_embed_text(atom)),
                 status_raw: atom.status.clone(),
                 finalized: atom.finalized,
                 is_domain,
@@ -291,6 +293,7 @@ mod tests {
             name_raw: String::new(),
             content_raw: Some(content.into()),
             tags_raw: None,
+            atom_embed_text: None,
             status_raw: None,
             finalized: false,
             is_domain: false,

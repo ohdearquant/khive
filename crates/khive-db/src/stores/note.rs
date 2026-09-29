@@ -13,7 +13,7 @@ use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NoteSeekAfter, NoteTagMode,
-    SortDir,
+    NoteVisibility, SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -1820,6 +1820,49 @@ impl NoteStore for SqlNoteStore {
                 })
                 .await?;
             result.extend(notes);
+        }
+        Ok(result)
+    }
+
+    async fn get_note_visibility_batch(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<NoteVisibility>, StorageError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Stay below SQLite's baseline 999-parameter limit for large ANN candidate sets.
+        const CHUNK: usize = 900;
+        let id_strings: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let mut result = Vec::with_capacity(ids.len());
+        for chunk in id_strings.chunks(CHUNK) {
+            let chunk_owned = chunk.to_vec();
+            let rows = self
+                .with_reader("get_note_visibility_batch", move |conn| {
+                    let placeholders = (1..=chunk_owned.len())
+                        .map(|i| format!("?{i}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT id, namespace, deleted_at FROM notes WHERE id IN ({placeholders})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_owned
+                        .iter()
+                        .map(|s| s as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let rows = stmt.query_map(params.as_slice(), |row| {
+                        let id: String = row.get(0)?;
+                        Ok(NoteVisibility {
+                            id: parse_uuid(&id)?,
+                            namespace: row.get(1)?,
+                            deleted_at: row.get(2)?,
+                        })
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .await?;
+            result.extend(rows);
         }
         Ok(result)
     }
