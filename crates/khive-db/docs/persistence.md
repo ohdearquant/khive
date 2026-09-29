@@ -40,6 +40,30 @@ JSON paths cannot address those labels without ambiguous prefix matching.
 
 Each pack DDL plan is applied atomically in one transaction and remains idempotent on repeat application.
 
+## Audit unreadable event profile versions
+
+Run the [read-only event profile version audit](api/event-profile-state-version-audit.sql)
+on demand against the database with a read-only SQLite connection, for example:
+
+```sh
+sqlite3 -readonly /absolute/path/to/khive.db \
+  < crates/khive-db/docs/api/event-profile-state-version-audit.sql
+```
+
+Each result identifies an event ID, namespace, SQLite storage type, and quoted
+stored value. The query finds every non-null `profile_state_version` that the
+event reader cannot decode: a non-integer storage type or a negative integer.
+An empty result means this specific column has no unreadable rows. This is an
+explicit full-table audit; normal `db_diagnostics` calls do not run it.
+
+There is no automatic repair or quarantine. Events are immutable audit and
+replay records ([ADR-004](../../../docs/adr/ADR-004-substrate-observables.md)),
+and an invalid stored value does not reveal the version originally intended.
+Coercing it to zero, null, or a guessed value would fabricate history; removing
+the row could also break replay and its `event_observations` projection. Preserve
+a database copy and investigate the listed IDs and their original source before
+any operator-led recovery decision.
+
 ## Connection pooling
 
 `pool.rs` manages a writer lock (exclusive) and reader connections. All store
