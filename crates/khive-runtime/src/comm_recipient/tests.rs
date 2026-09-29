@@ -32,6 +32,57 @@ fn payload(correlation: Option<String>) -> VerifiedInboundContent {
         content: "hello".into(),
         subject: None,
         correlation,
+        sent_at: "2026-09-01T12:34:56Z".into(),
+    }
+}
+#[tokio::test]
+async fn inbound_message_preserves_sender_sent_at_and_local_received_at() {
+    let (runtime, token, local, binding) = fixture();
+    let before = chrono::Utc::now();
+    let result = runtime
+        .ingest_verified_recipient(
+            &token,
+            &local,
+            InboundReceiptTicket::new(binding, 1),
+            payload(None),
+            vec![],
+        )
+        .await
+        .unwrap();
+    let after = chrono::Utc::now();
+    let props = result.note.unwrap().properties.unwrap();
+    assert_eq!(props["sent_at"], "2026-09-01T12:34:56Z");
+    let received_at = chrono::DateTime::parse_from_rfc3339(props["received_at"].as_str().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(received_at >= before && received_at <= after);
+}
+#[tokio::test]
+async fn invalid_sender_timestamp_is_quarantined_without_message_body() {
+    for sent_at in ["not-a-timestamp", "2026-09-01T12:34:56+01:00"] {
+        let (runtime, token, local, binding) = fixture();
+        let result = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(binding, 1),
+                VerifiedInboundContent::Message {
+                    content: "private body".into(),
+                    subject: None,
+                    correlation: None,
+                    sent_at: sent_at.into(),
+                },
+                b"{\"delivery\":\"opaque\"}".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.disposition, RecipientDisposition::Quarantined);
+        let note = result.note.unwrap();
+        assert!(!note.content.contains("private body"));
+        let props = note.properties.unwrap();
+        assert_eq!(props["quarantined"], true);
+        assert!(props.get("sent_at").is_none());
+        assert!(props["received_at"].is_string());
     }
 }
 #[tokio::test]

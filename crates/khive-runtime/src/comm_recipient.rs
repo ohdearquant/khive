@@ -28,6 +28,7 @@ pub enum VerifiedInboundContent {
         content: String,
         subject: Option<String>,
         correlation: Option<String>,
+        sent_at: String,
     },
     Quarantine {
         reason: QuarantineReason,
@@ -98,26 +99,50 @@ impl KhiveRuntime {
         }
         self.validate_note_kind("message")?;
         let from = format!("khive1:{}/{}", local.realm, binding.sender_agent_id);
-        let (content, subject, correlation, disposition, quarantine) = match payload {
+        let received_at = chrono::Utc::now().to_rfc3339();
+        let (content, subject, correlation, disposition, quarantine, sent_at) = match payload {
             VerifiedInboundContent::Message {
                 content,
                 subject,
                 correlation,
+                sent_at,
             } => {
-                if content.trim().is_empty() {
-                    return Err(invalid("verified message content is empty"));
+                let parsed_sent_at = chrono::DateTime::parse_from_rfc3339(&sent_at)
+                    .ok()
+                    .filter(|stamp| stamp.offset().local_minus_utc() == 0);
+                if let Some(stamp) = parsed_sent_at {
+                    if content.trim().is_empty() {
+                        return Err(invalid("verified message content is empty"));
+                    }
+                    crate::secret_gate::check_at(&content, "note", "content")?;
+                    if let Some(subject) = &subject {
+                        crate::secret_gate::check_at(subject, "note", "name")?;
+                    }
+                    (
+                        content,
+                        subject,
+                        correlation,
+                        RecipientDisposition::Stored,
+                        None,
+                        Some(
+                            stamp
+                                .with_timezone(&chrono::Utc)
+                                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        ),
+                    )
+                } else {
+                    (
+                        "Quarantined authenticated message".into(),
+                        None,
+                        None,
+                        RecipientDisposition::Quarantined,
+                        Some(QuarantineRecord {
+                            reason: QuarantineReason::InvalidPlaintext,
+                            delivery_item,
+                        }),
+                        None,
+                    )
                 }
-                crate::secret_gate::check_at(&content, "note", "content")?;
-                if let Some(subject) = &subject {
-                    crate::secret_gate::check_at(subject, "note", "name")?;
-                }
-                (
-                    content,
-                    subject,
-                    correlation,
-                    RecipientDisposition::Stored,
-                    None,
-                )
             }
             VerifiedInboundContent::Quarantine { reason } => (
                 "Quarantined authenticated message".into(),
@@ -128,6 +153,7 @@ impl KhiveRuntime {
                     reason,
                     delivery_item,
                 }),
+                None,
             ),
         };
         let mut note = Note::new(token.namespace().as_str(), "message", content);
@@ -140,11 +166,14 @@ impl KhiveRuntime {
             "to_actor": local.actor,
             "direction": "inbound",
             "read": false,
-            "sent_at": chrono::Utc::now().to_rfc3339(),
+            "received_at": received_at,
             "channel_kind": "khive",
             "channel_slug": local.slug,
             "logical_message_id": binding.logical_message_id,
         });
+        if let Some(sent_at) = sent_at {
+            props["sent_at"] = json!(sent_at);
+        }
         if let Some(subject) = subject {
             props["subject"] = json!(subject);
         }

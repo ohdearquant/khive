@@ -1,6 +1,8 @@
 use super::*;
+use crate::pool::PoolConfig;
 use crate::StorageBackend;
 use khive_storage::{DeleteMode, NoteStore};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
 fn fixture() -> (StorageBackend, RecipientCommit) {
     let backend = StorageBackend::memory().unwrap();
@@ -181,4 +183,141 @@ async fn quarantine_replay_keeps_first_disposition() {
         "quarantine disposition must survive replay"
     );
     assert_eq!(counts(&backend), [1, 1, 2, 1]);
+}
+
+#[tokio::test]
+async fn malformed_matched_thread_uses_matched_note_as_root() {
+    let (backend, mut input) = fixture();
+    let sender = input.note.properties.as_ref().unwrap()["from_actor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut matched = Note::new("local", "message", "matched");
+    matched.properties = Some(serde_json::json!({
+        "external_id":"correlation",
+        "thread_id":"not-a-uuid",
+        "from_actor":"lambda:receiver",
+        "to_actor":sender,
+        "direction":"outbound"
+    }));
+    let matched_id = matched.id;
+    SqlNoteStore::new(backend.pool_arc(), false)
+        .upsert_note(matched)
+        .await
+        .unwrap();
+    input.correlation = Some("correlation".into());
+
+    let note = RecipientTransportStore::new(backend.pool_arc())
+        .commit(input)
+        .await
+        .unwrap()
+        .note
+        .unwrap();
+    assert_eq!(
+        note.properties.unwrap()["thread_id"],
+        matched_id.to_string()
+    );
+}
+
+#[tokio::test]
+async fn correlation_matches_precanonical_thread_spellings() {
+    let thread_root = Uuid::parse_str("abcdefab-cdef-abcd-efab-cdefabcdefab").unwrap();
+    let spellings = [
+        thread_root.simple().to_string(),
+        thread_root.braced().to_string(),
+        thread_root.urn().to_string(),
+        format!("{:X}", thread_root.as_hyphenated()),
+        format!("{:X}", thread_root.simple()),
+        format!("{:X}", thread_root.braced()),
+        format!("{:X}", thread_root.urn()),
+    ];
+    for spelling in spellings {
+        let (backend, mut input) = fixture();
+        let sender = input.note.properties.as_ref().unwrap()["from_actor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut matched = Note::new("local", "message", "matched");
+        matched.properties = Some(serde_json::json!({
+            "thread_id":spelling,
+            "from_actor":"lambda:receiver",
+            "to_actor":sender,
+            "direction":"outbound"
+        }));
+        SqlNoteStore::new(backend.pool_arc(), false)
+            .upsert_note(matched)
+            .await
+            .unwrap();
+        input.correlation = Some(thread_root.to_string());
+        let note = RecipientTransportStore::new(backend.pool_arc())
+            .commit(input)
+            .await
+            .unwrap()
+            .note
+            .unwrap();
+        assert_eq!(
+            note.properties.unwrap()["thread_id"],
+            thread_root.to_string(),
+            "stored thread spelling {spelling} must correlate"
+        );
+    }
+}
+
+#[tokio::test]
+async fn correlation_lookup_uses_reader_before_writer_transaction() {
+    let (_memory, mut input) = fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(directory.path().join("recipient-correlation.sqlite3")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    crate::run_migrations(pool.writer().unwrap().conn_mut()).unwrap();
+    let sender = input.note.properties.as_ref().unwrap()["from_actor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut matched = Note::new("local", "message", "matched");
+    matched.properties = Some(serde_json::json!({
+        "external_id":"correlation",
+        "from_actor":"lambda:receiver",
+        "to_actor":sender,
+        "direction":"outbound"
+    }));
+    let matched_id = matched.id;
+    SqlNoteStore::new(Arc::clone(&pool), false)
+        .upsert_note(matched)
+        .await
+        .unwrap();
+    input.correlation = Some("correlation".into());
+
+    pool.writer()
+        .unwrap()
+        .conn()
+        .authorizer(Some(|context: AuthContext<'_>| {
+            if let AuthAction::Read { table_name, .. } = context.action {
+                if table_name == "notes" && context.accessor.is_none() {
+                    return Authorization::Deny;
+                }
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+    let result = RecipientTransportStore::new(Arc::clone(&pool))
+        .commit(input)
+        .await;
+    pool.writer()
+        .unwrap()
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+
+    let note = result.unwrap().note.unwrap();
+    assert_eq!(
+        note.properties.unwrap()["thread_id"],
+        matched_id.to_string()
+    );
 }

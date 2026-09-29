@@ -84,16 +84,35 @@ const REPLAY_SQL: &str = concat!(
 );
 
 const CORRELATION_SQL: &str = concat!(
-    "SELECT COALESCE(json_extract(properties,'$.thread_id'),id) FROM notes WHERE ",
+    "SELECT id,CAST(json_extract(properties,'$.thread_id') AS TEXT) FROM notes WHERE ",
     "namespace=?1 AND kind='message' AND deleted_at IS NULL AND ",
     "((json_extract(properties,'$.from_actor')=?2 AND ",
     "json_extract(properties,'$.to_actor')=?3) OR ",
     "(json_extract(properties,'$.from_actor')=?3 AND ",
     "json_extract(properties,'$.to_actor')=?2)) AND ",
     "(json_extract(properties,'$.external_id')=?4 OR ",
-    "json_extract(properties,'$.thread_id')=?4 OR id=?4) ORDER BY created_at,id ",
+    "json_extract(properties,'$.thread_id') IN (?5,?6,?7,?8,?9,?10,?11,?12,?13) ",
+    "OR id=?14) ORDER BY created_at,id ",
     "LIMIT 1",
 );
+
+fn correlation_match_values(correlation: &str) -> ([Option<String>; 9], String) {
+    let raw = correlation.trim();
+    let mut spellings = std::array::from_fn(|_| None);
+    spellings[0] = Some(raw.to_owned());
+    let Ok(root) = Uuid::parse_str(raw) else {
+        return (spellings, correlation.to_owned());
+    };
+    spellings[1] = Some(root.as_hyphenated().to_string());
+    spellings[2] = Some(root.simple().to_string());
+    spellings[3] = Some(root.braced().to_string());
+    spellings[4] = Some(root.urn().to_string());
+    spellings[5] = Some(format!("{:X}", root.as_hyphenated()));
+    spellings[6] = Some(format!("{:X}", root.simple()));
+    spellings[7] = Some(format!("{:X}", root.braced()));
+    spellings[8] = Some(format!("{:X}", root.urn()));
+    (spellings, root.to_string())
+}
 
 const INSERT_NOTE_SQL: &str = concat!(
     "INSERT INTO notes ",
@@ -176,6 +195,58 @@ impl RecipientTransportStore {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid("missing recipient actor"))?
             .to_owned();
+        let correlated_thread = if let (Some(correlation), Some(sender)) = (
+            input.correlation.as_deref(),
+            input
+                .note
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("from_actor"))
+                .and_then(Value::as_str),
+        ) {
+            let (spellings, id) = correlation_match_values(correlation);
+            let namespace = input.note.namespace.clone();
+            let sender = sender.to_owned();
+            let actor_for_query = actor.clone();
+            let correlation = correlation.to_owned();
+            let matched: Option<(String, Option<String>)> = self
+                .notes
+                .with_reader("recipient_transport_correlation", move |conn| {
+                    conn.query_row(
+                        CORRELATION_SQL,
+                        params![
+                            namespace,
+                            sender,
+                            actor_for_query,
+                            correlation,
+                            &spellings[0],
+                            &spellings[1],
+                            &spellings[2],
+                            &spellings[3],
+                            &spellings[4],
+                            &spellings[5],
+                            &spellings[6],
+                            &spellings[7],
+                            &spellings[8],
+                            id
+                        ],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                })
+                .await?;
+            matched
+                .map(|(id, thread)| {
+                    let matched_id =
+                        Uuid::parse_str(&id).map_err(|_| invalid("invalid correlated note id"))?;
+                    Ok(thread
+                        .and_then(|s| Uuid::parse_str(&s).ok())
+                        .unwrap_or(matched_id))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         self.notes
             .with_writer_tx_storage("recipient_transport_commit", move |conn| {
                 let op = "recipient_transport_commit";
@@ -205,26 +276,11 @@ impl RecipientTransportStore {
                             .as_mut()
                             .and_then(Value::as_object_mut)
                             .ok_or_else(|| invalid("missing message properties"))?;
-                        let sender = props
+                        props
                             .get("from_actor")
                             .and_then(Value::as_str)
-                            .ok_or_else(|| invalid("missing sender actor"))?
-                            .to_owned();
-                        let thread: Option<String> =
-                            if let Some(correlation) = input.correlation.as_deref() {
-                                conn.query_row(
-                                    CORRELATION_SQL,
-                                    params![input.note.namespace, sender, actor, correlation],
-                                    |r| r.get(0),
-                                )
-                                .optional()
-                                .map_err(|e| map_err(e, op))?
-                            } else {
-                                None
-                            };
-                        let thread = thread
-                            .and_then(|s| Uuid::parse_str(&s).ok())
-                            .unwrap_or(input.note.id);
+                            .ok_or_else(|| invalid("missing sender actor"))?;
+                        let thread = correlated_thread.unwrap_or(input.note.id);
                         props.insert("thread_id".into(), serde_json::json!(thread));
                         let n = &input.note;
                         conn.execute(
