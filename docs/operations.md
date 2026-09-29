@@ -586,8 +586,8 @@ computation happens today. Do not script against these as if they perform work.
 `vector capabilities [--human] [--engine <name>] [--db <path>]` prints a **static** capability
 record matching the sqlite-vec backend's compiled-in `OnceLock` (`supports_filter` /
 `supports_batch_search` / `supports_quantization` / `supports_update` / `supports_multi_field`
-all `false`, `supports_orphan_sweep: true`, `max_dimensions: 8192`,
-`index_kinds: ["sqlite_vec"]`). Every capability field is pinned to the backend's
+all `false`, `supports_orphan_sweep: true`, `supports_vector_read: true`,
+`max_dimensions: 8192`, `index_kinds: ["sqlite_vec"]`). Every capability field is pinned to the backend's
 `capabilities()` value by a comparison test. The command does not open the database named by
 `--db` or inspect the configured engines; `--engine` only sets the report's `engine_name` label
 (default `"default"`). The capability values describe the compiled sqlite-vec backend
