@@ -7,7 +7,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 
@@ -801,6 +801,11 @@ pub async fn decide_with_receipt(
     side_effect: Option<&str>,
     registration: Option<&RegistryPin>,
 ) -> Result<Decision, RuntimeError> {
+    // The receipt copies both strings into the namespace event log, so they get
+    // the same credential refusal every other persisted write path applies.
+    let record = invocation.caller.verb();
+    secret_gate::check_at(invocation.actor, record, "actor")?;
+    secret_gate::check_at(invocation.tool, record, "tool")?;
     let decision = decide(
         rt,
         invocation.token.namespace().as_str(),

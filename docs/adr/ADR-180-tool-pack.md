@@ -601,7 +601,11 @@ remain untouched. A policy decision needs a separate typed event kind.
    event outcome is `success` when evaluation completed, even if the policy
    decision was `deny` or `ask`; readers use `data.decision` for that result.
    The existing response shape does not change. A failed event append prevents a
-   successful decision response or an allowed exec preflight.
+   successful decision response or an allowed exec preflight. Because the
+   receipt copies `actor` and `tool` into the namespace event log, both strings
+   pass the ADR-115 credential gate (`secret_gate::check_at`) before the
+   decision is computed; a credential-shaped value is refused with the
+   secret-detected error, names the field, and leaves no receipt.
 2. A gate refusal of `tool.check` or `exec.run` never reaches the policy seam
    and leaves zero `tool_check_decided` events. The generic `Audit` event for
    that refusal may still exist. Other policy probes (`tool.suggest`,
@@ -614,28 +618,58 @@ remain untouched. A policy decision needs a separate typed event kind.
    The current `event_kinds` wire field maps to `EventFilter.kinds`
    (`crates/khive-pack-kg/src/handler_defs.rs` and
    `crates/khive-pack-kg/src/handlers/common.rs`). The list returns newest
-   first by `(created_at DESC, event_id DESC)` as ADR-022 specifies. The
-   caller retains the largest processed pair `(created_at, event_id)`, where
-   `created_at` is converted to microseconds, and requests
-   `since=max(created_at-1, 0)` on the next poll. It discards returned rows
-   with `created_at < cursor.created_at`, or with equal `created_at` and
-   `event_id <= cursor.event_id`; the remaining rows are after the cursor.
-   The one-microsecond overlap is necessary because the shipped `since`
-   predicate is strictly `created_at > since`. Event id breaks ties by
-   canonical UUID order, giving a stable replay order rather than a claim of
-   causal insertion order among same-microsecond events.
+   first by `(created_at DESC, event_id DESC)` as ADR-022 specifies, and the
+   `since` predicate is strictly `created_at > since`. The event list has no
+   insertion-sequence cursor: the list verb's `after` cursor covers entities,
+   notes and edges only, and no verb exposes a sequence for the events table. A `(created_at, event_id)` high-water mark is therefore
+   not a lossless cursor, for two reasons. `created_at` is stamped when the
+   event is constructed, before the append waits for the writer, so a row can
+   become visible after a row with a later timestamp has been read
+   (ADR-171 rejects a timestamp cursor for the same reason). And event ids are
+   random UUIDs, so a row appended after the cursor was saved that shares the
+   cursor's microsecond can sort below the cursor's id. A caller that discards
+   rows at or below its saved `(created_at, event_id)` loses both.
+
+   The catch-up procedure keeps ids instead of an id order. The caller
+   chooses an overlap window `W`, in microseconds, and keeps `newest`, the
+   largest `created_at` it has processed (microseconds, converted from the
+   listed timestamp), and `seen`, a map from event id to `created_at` for
+   every processed row with `created_at >= newest - W`. Each poll requests
+   `since=max(newest - W - 1, 0)`, pages until `has_more` is false, and
+   processes exactly the returned rows whose id is not in `seen`. It then
+   raises `newest`, adds the processed ids, and drops from `seen` every entry
+   with `created_at < newest - W`. A dropped id cannot be returned again,
+   because the next request excludes everything at or before
+   `newest - W - 1`. Paging newest first can repeat a row when an event lands
+   between pages, and `seen` absorbs the repeat. Rows recovered
+   late are delivered late; a reader that needs replay order sorts by
+   `(created_at, event_id)`, which orders same-microsecond rows stably but
+   makes no claim about their insertion order.
+
+   The state is bounded by the number of receipts inside one window. The
+   guarantee is bounded by `W`: a row is recovered when it becomes visible
+   within `W` microseconds of its own `created_at`. That gap is the writer
+   queue wait plus the commit. The queue admission deadline defaults to 2000 ms
+   and is capped at 10 000 ms (ADR-131, `write_admission_deadline_ms`), and the
+   pool busy timeout defaults to 30 s (`KHIVE_BUSY_TIMEOUT_SECS`), so
+   `W = 60_000_000` is a conservative choice for the shipped defaults; a
+   deployment that raises either setting raises `W` with it. A row that becomes visible later than
+   `W` after its timestamp is not returned by this procedure.
 4. `tool_check_decided` is `age_archivable`, the same ADR-168 class as
    `RecallExecuted`, `RerankExecuted`, and `SearchExecuted` (Table A rows
    10–12). It is pure decision telemetry without a graph referent. An
    archive horizon is disclosed under ADR-168; a live list does not promise
    indefinite retention.
 
-Acceptance: a gate refusal yields no decision-kind row after the cursor; an
+Acceptance: a credential-shaped `actor` or `tool` is refused and no stored
+event carries it; a gate refusal yields no decision-kind row after the cursor; an
 allowed `tool.check` yields exactly one with the evaluated actor and tool;
 deny-then-allow and allow-then-deny checks yield distinguishable decision
-sequences when ordered by the event cursor; `exec.run` preflight yields the
-same data with `caller_verb="exec.run"`. A pair forced to share one
-microsecond remains recoverable through the overlap and id filter. Removing
+sequences when ordered by `(created_at, event_id)`; `exec.run` preflight yields
+the same data with `caller_verb="exec.run"`. A row appended after the cursor
+was saved is returned by the next poll whether it shares the cursor's
+microsecond with a lower id or carries an older timestamp inside `W`, and the
+`seen` map holds only ids inside the window. Removing
 the shared emission call, emitting before the gate, or dropping `caller_verb`
 must turn the corresponding acceptance arm red.
 

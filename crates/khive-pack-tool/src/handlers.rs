@@ -831,19 +831,26 @@ pub(crate) async fn list(
 
 // ── policy and grants ────────────────────────────────────────────────────────
 
+/// Whether a decision is persisted as an event or only computed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Receipt {
+    Record,
+    Skip,
+}
+
 async fn decision_for(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     reference: &str,
     actor: &str,
-    with_receipt: bool,
+    receipt: Receipt,
 ) -> Result<(String, bool, Decision), RuntimeError> {
     let ns = token.namespace().as_str().to_string();
     match resolve_tool(rt, token, reference).await {
         Ok(entity) => {
             let registration = RegistryPin::from_entity(&entity)?;
             let side_effect = side_effect_of(&entity);
-            let d = if with_receipt {
+            let d = if receipt == Receipt::Record {
                 policy::decide_with_receipt(
                     rt,
                     DecisionInvocation {
@@ -871,7 +878,7 @@ async fn decision_for(
             Ok((entity.name.clone(), true, d))
         }
         Err(RuntimeError::NotFound(_)) => {
-            let d = if with_receipt {
+            let d = if receipt == Receipt::Record {
                 policy::decide_with_receipt(
                     rt,
                     DecisionInvocation {
@@ -901,7 +908,8 @@ pub(crate) async fn check(
 ) -> Result<Value, RuntimeError> {
     let reference = req_str(&params, "tool")?;
     let actor = opt_str(&params, "actor")?.unwrap_or_else(|| actor_label(token));
-    let (name, registered, decision) = decision_for(rt, token, &reference, &actor, true).await?;
+    let (name, registered, decision) =
+        decision_for(rt, token, &reference, &actor, Receipt::Record).await?;
     let mut v = decision.to_json();
     v["ok"] = json!(true);
     v["tool"] = json!(name);
@@ -923,7 +931,8 @@ pub(crate) async fn request(
     let notify = opt_str(&params, "notify")?;
     let ns = token.namespace().as_str().to_string();
 
-    let (name, registered, decision) = decision_for(rt, token, &reference, &actor, false).await?;
+    let (name, registered, decision) =
+        decision_for(rt, token, &reference, &actor, Receipt::Skip).await?;
     if decision.decision == "allow" {
         let mut v = decision.to_json();
         v["ok"] = json!(true);

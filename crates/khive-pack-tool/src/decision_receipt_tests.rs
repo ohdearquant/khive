@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use khive_gate::{Gate, GateDecision, GateError, GateRequest};
@@ -234,7 +235,7 @@ async fn opposite_policy_sequences_are_distinguishable_from_rows() {
 }
 
 #[tokio::test]
-async fn same_microsecond_cursor_replays_tie_then_filters_by_id() {
+async fn same_microsecond_rows_list_newest_id_first() {
     let fixture = Fixture::new(false);
     let timestamp = now_micros();
     let events = fixture.runtime.events(&fixture.token).expect("event store");
@@ -270,11 +271,160 @@ async fn same_microsecond_cursor_replays_tie_then_filters_by_id() {
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].id, Uuid::from_u128(2));
     assert_eq!(page.items[1].id, Uuid::from_u128(1));
-    let after_cursor = page
-        .items
-        .into_iter()
-        .filter(|row| (row.created_at, row.id) > (timestamp, Uuid::from_u128(1)))
-        .collect::<Vec<_>>();
-    assert_eq!(after_cursor.len(), 1);
-    assert_eq!(after_cursor[0].id, Uuid::from_u128(2));
+}
+
+/// A credential-shaped value built at run time from parts.
+fn credential_shaped() -> String {
+    format!("{}{}", ["gh", "p_"].concat(), "A".repeat(36))
+}
+
+#[tokio::test]
+async fn credential_shaped_check_input_leaves_no_receipt_carrying_it() {
+    let secret = credential_shaped();
+    for field in ["actor", "tool"] {
+        let fixture = Fixture::new(false);
+        let mut params = json!({"tool": "unregistered", "actor": "agent:receipt"});
+        params[field] = json!(secret);
+
+        let error = fixture
+            .registry
+            .dispatch("tool.check", params)
+            .await
+            .expect_err("credential-shaped input must be refused");
+        assert!(
+            matches!(error, RuntimeError::SecretDetected(_)),
+            "{field}: {error:?}"
+        );
+        assert!(
+            !error.to_string().contains(&secret),
+            "{field}: the refusal must not echo the value"
+        );
+
+        let events = fixture
+            .runtime
+            .list_events(
+                &fixture.token,
+                EventFilter::default(),
+                PageRequest {
+                    limit: 100,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("list all events");
+        for event in &events.items {
+            assert!(
+                !serde_json::to_string(event)
+                    .expect("event serializes")
+                    .contains(&secret),
+                "{field}: an event row stores the credential-shaped value"
+            );
+        }
+        assert!(fixture.decisions(0).await.is_empty(), "{field}");
+    }
+}
+
+/// Caller side of the catch-up procedure in the ADR: re-read a window behind
+/// the newest row seen, and deduplicate by event id instead of by id order.
+struct DecisionPoller {
+    window: i64,
+    newest: i64,
+    seen: HashMap<Uuid, i64>,
+}
+
+impl DecisionPoller {
+    fn new(window: i64) -> Self {
+        Self {
+            window,
+            newest: 0,
+            seen: HashMap::new(),
+        }
+    }
+
+    async fn poll(&mut self, fixture: &Fixture) -> Vec<Uuid> {
+        let since = self.newest.saturating_sub(self.window + 1).max(0);
+        let mut fresh = Vec::new();
+        for row in fixture.decisions(since).await {
+            let at = khive_runtime::rfc3339_to_utc_micros(row["created_at"].as_str().unwrap())
+                .expect("created_at parses");
+            let id = Uuid::parse_str(row["id"].as_str().unwrap()).expect("event id");
+            if self.seen.insert(id, at).is_none() {
+                fresh.push((at, id));
+            }
+            self.newest = self.newest.max(at);
+        }
+        let floor = self.newest - self.window;
+        self.seen.retain(|_, at| *at >= floor);
+        fresh.sort();
+        fresh.into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+async fn append_receipt(fixture: &Fixture, id: Uuid, created_at: i64) {
+    let mut event = khive_storage::Event::new(
+        "local",
+        "tool.check",
+        EventKind::ToolCheckDecided,
+        SubstrateKind::Event,
+        actor_label(&fixture.token),
+    )
+    .with_payload(json!({"actor":"agent:receipt","tool":"late"}));
+    event.id = id;
+    event.created_at = created_at;
+    fixture
+        .runtime
+        .events(&fixture.token)
+        .expect("event store")
+        .append_event(event)
+        .await
+        .expect("receipt append");
+}
+
+#[tokio::test]
+async fn late_arrival_sharing_the_cursor_microsecond_is_returned() {
+    let fixture = Fixture::new(false);
+    let timestamp = now_micros();
+    let first = Uuid::from_u128(2);
+    let mut poller = DecisionPoller::new(1_000_000);
+
+    append_receipt(&fixture, first, timestamp).await;
+    assert_eq!(poller.poll(&fixture).await, vec![first]);
+
+    // Appended after the cursor was saved: same microsecond, lower id.
+    let late = Uuid::from_u128(1);
+    append_receipt(&fixture, late, timestamp).await;
+    assert_eq!(poller.poll(&fixture).await, vec![late]);
+    assert!(poller.poll(&fixture).await.is_empty());
+}
+
+#[tokio::test]
+async fn late_arrival_older_than_the_cursor_is_returned_inside_the_window_only() {
+    let fixture = Fixture::new(false);
+    let window = 1_000_000;
+    let timestamp = now_micros();
+    let mut poller = DecisionPoller::new(window);
+
+    append_receipt(&fixture, Uuid::from_u128(5), timestamp).await;
+    poller.poll(&fixture).await;
+
+    // Stamped before the cursor row but committed after it was read.
+    let inside = Uuid::from_u128(3);
+    let outside = Uuid::from_u128(4);
+    append_receipt(&fixture, inside, timestamp - window / 2).await;
+    append_receipt(&fixture, outside, timestamp - window * 2).await;
+    assert_eq!(poller.poll(&fixture).await, vec![inside]);
+}
+
+#[tokio::test]
+async fn poller_keeps_only_the_ids_inside_the_window() {
+    let fixture = Fixture::new(false);
+    let window = 1_000_000;
+    let timestamp = now_micros();
+    let mut poller = DecisionPoller::new(window);
+
+    append_receipt(&fixture, Uuid::from_u128(7), timestamp - window * 10).await;
+    append_receipt(&fixture, Uuid::from_u128(8), timestamp).await;
+    assert_eq!(poller.poll(&fixture).await.len(), 2);
+    assert_eq!(poller.seen.len(), 1);
+    assert!(poller.seen.contains_key(&Uuid::from_u128(8)));
 }
