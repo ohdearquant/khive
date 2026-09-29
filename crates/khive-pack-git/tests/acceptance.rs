@@ -12,7 +12,7 @@ mod test_process;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
@@ -394,6 +394,58 @@ struct HeldFailCommitEmbedderProvider(Arc<HeldFailCommitEmbedService>);
 impl EmbedderProvider for HeldFailCommitEmbedderProvider {
     fn name(&self) -> &str {
         "held-failing-commit-embedder"
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(self.0.clone())
+    }
+}
+
+struct BothLookupsCommitEmbedService {
+    before_create: tokio::sync::Barrier,
+    arrivals: AtomicUsize,
+}
+
+#[async_trait]
+impl EmbeddingService for BothLookupsCommitEmbedService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts
+            .iter()
+            .any(|text| text.contains("Shared overlapping commit"))
+        {
+            // Ingest invokes the embedder only after its SHA lookup, but
+            // before the keyed create. Both passes must reach this point.
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.before_create.wait())
+                .await
+                .map_err(|_| EmbedError::Internal("second digest did not reach create".into()))?;
+        }
+        Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "both-lookups-commit-embedder"
+    }
+}
+
+struct BothLookupsCommitEmbedderProvider(Arc<BothLookupsCommitEmbedService>);
+
+#[async_trait]
+impl EmbedderProvider for BothLookupsCommitEmbedderProvider {
+    fn name(&self) -> &str {
+        "both-lookups-commit-embedder"
     }
 
     fn dimensions(&self) -> usize {
@@ -858,9 +910,9 @@ async fn shared_commit_note_links_second_project_and_new_snapshot_module_once() 
     assert_eq!(list_items(&rows).len(), 1, "the shared note stays singular");
 }
 
-/// Both projects may begin their SHA lookup before either note is published.
-/// The key arbitrates the creates, and the losing pass must still attach its
-/// project before it advances its own checkpoint.
+/// Both projects complete their SHA lookup before either keyed create starts.
+/// The key arbitrates the concurrent creates, and the losing pass must still
+/// attach its project before it advances its own checkpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(config_ledger)]
 async fn overlapping_commit_digests_publish_one_note_and_both_project_checkpoints() {
@@ -874,6 +926,12 @@ async fn overlapping_commit_digests_publish_one_note_and_both_project_checkpoint
     write(repo, "README.md", "one commit\n");
     commit(repo, &["README.md"], "Shared overlapping commit");
     let sha = head_sha(repo);
+
+    let embeds = Arc::new(BothLookupsCommitEmbedService {
+        before_create: tokio::sync::Barrier::new(2),
+        arrivals: AtomicUsize::new(0),
+    });
+    runtime.register_embedder(BothLookupsCommitEmbedderProvider(Arc::clone(&embeds)));
 
     let runtime = Arc::new(runtime);
     let registry = Arc::new(registry);
@@ -898,7 +956,16 @@ async fn overlapping_commit_digests_publish_one_note_and_both_project_checkpoint
     let a = spawn_digest(project_a);
     let b = spawn_digest(project_b);
     start.wait().await;
-    let (a, b) = tokio::join!(a, b);
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(a, b)
+    })
+    .await
+    .expect("both digests must finish after the post-lookup barrier");
+    assert_eq!(
+        embeds.arrivals.load(Ordering::SeqCst),
+        2,
+        "both digests must reach embedding after their SHA lookup"
+    );
     let a = a.expect("first ingest task").expect("first digest");
     let b = b.expect("second ingest task").expect("second digest");
     assert!(!a.cursor_stalled && !b.cursor_stalled, "{a:?}; {b:?}");
@@ -972,8 +1039,9 @@ async fn failing_commit_embedding_never_exposes_a_provisional_sha_holder() {
         )
         .await
     });
-    entered_rx
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
         .await
+        .expect("commit embedding did not start within five seconds")
         .expect("commit reached embedding preparation");
     let notes = registry
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
@@ -1063,6 +1131,68 @@ async fn legacy_duplicate_sha_is_detected_before_checkpoint_advances() {
         list_items(&notes).len(),
         2,
         "no third note may be created: {notes}"
+    );
+}
+
+/// A pre-existing malformed holder can survive from an older write path or
+/// direct database repair. The ingest cannot advance past it, and its warning
+/// must identify the row that needs reconciliation.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn conflicting_commit_key_names_the_holder_and_stalls_cursor() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (runtime, token, registry) = fixture().await;
+    let project = create(
+        &registry,
+        json!({"kind": "project", "name": "key-holder-repo"}),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "one commit\n");
+    commit(repo, &["README.md"], "Key holder mismatch");
+    let sha = head_sha(repo);
+    let other_sha = if sha == "b".repeat(40) {
+        "a".repeat(40)
+    } else {
+        "b".repeat(40)
+    };
+    let holder_id = Uuid::new_v4();
+    let key = format!("git.commit:{sha}");
+    let mut writer = runtime.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO notes(id, namespace, kind, key, content, properties, created_at, updated_at) \
+                  VALUES(?1, 'local', 'commit', ?2, '', ?3, 0, 0)"
+                .into(),
+            params: vec![
+                SqlValue::Text(holder_id.to_string()),
+                SqlValue::Text(key.clone()),
+                SqlValue::Text(json!({"sha": other_sha, "parents": []}).to_string()),
+            ],
+            label: Some("test_conflicting_commit_key_holder".into()),
+        })
+        .await
+        .expect("seed pre-existing key holder outside the hook");
+    drop(writer);
+
+    let mut options = IngestOptions::unbounded(repo.to_path_buf(), project.to_string());
+    options.include.issues = false;
+    options.include.pull_requests = false;
+    let report = run_ingest(&runtime, &token, &registry, options)
+        .await
+        .expect("a key collision is an in-band commit write failure");
+    assert!(report.cursor_stalled && !report.done, "{report:?}");
+    assert_eq!(read_git_cursor(&runtime, project, "commits").await, None);
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains(&holder_id.to_string())
+                && warning.contains("kind commit")
+                && warning.contains(&other_sha)
+                && warning.contains(&sha)
+        }),
+        "the warning must identify the conflicting holder: {report:?}"
     );
 }
 

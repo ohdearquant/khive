@@ -3127,53 +3127,81 @@ async fn ingest_commits(
         // after our initial SHA lookup; both exact replay and key conflict
         // then reuse only the committed winner, including this project's
         // missing annotations, before acknowledging the checkpoint.
-        let (id, created) =
-            match crate::dispatch_from_token(registry, token, "create", create_request).await {
-                Ok(v) => {
-                    let Some(id) = v
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .and_then(|s| Uuid::parse_str(s).ok())
-                    else {
-                        record_write_failure(
-                            report,
-                            "create",
-                            "commit",
-                            c.sha.clone(),
-                            RuntimeError::Internal("create commit returned no valid id".into()),
-                        );
-                        stall_cursor(&mut cursor_stalled, report);
-                        continue;
-                    };
-                    let Some(created) = v.get("created").and_then(Value::as_bool) else {
-                        record_write_failure(
-                            report,
-                            "create",
-                            "commit",
-                            c.sha.clone(),
-                            RuntimeError::Internal(
-                                "keyed create commit returned no created flag".into(),
-                            ),
-                        );
-                        stall_cursor(&mut cursor_stalled, report);
-                        continue;
-                    };
-                    (id, created)
-                }
-                Err(error) if is_note_key_conflict(&error) => {
-                    let Some(id) = find_commit_by_sha(runtime, token, &c.sha).await? else {
-                        record_write_failure(report, "create", "commit", c.sha.clone(), error);
-                        stall_cursor(&mut cursor_stalled, report);
-                        continue;
-                    };
-                    (id, false)
-                }
-                Err(error) => {
-                    record_write_failure(report, "create", "commit", c.sha.clone(), error);
+        let (id, created) = match crate::dispatch_from_token(
+            registry,
+            token,
+            "create",
+            create_request,
+        )
+        .await
+        {
+            Ok(v) => {
+                let Some(id) = v
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                else {
+                    record_write_failure(
+                        report,
+                        "create",
+                        "commit",
+                        c.sha.clone(),
+                        RuntimeError::Internal("create commit returned no valid id".into()),
+                    );
                     stall_cursor(&mut cursor_stalled, report);
                     continue;
-                }
-            };
+                };
+                let Some(created) = v.get("created").and_then(Value::as_bool) else {
+                    record_write_failure(
+                        report,
+                        "create",
+                        "commit",
+                        c.sha.clone(),
+                        RuntimeError::Internal(
+                            "keyed create commit returned no created flag".into(),
+                        ),
+                    );
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                (id, created)
+            }
+            Err(error) if is_note_key_conflict(&error) => {
+                let Some(id) = find_commit_by_sha(runtime, token, &c.sha).await? else {
+                    let key = format!("git.commit:{}", c.sha);
+                    let holder = runtime
+                        .get_note_by_key(token, &key, Some("commit"), false)
+                        .await;
+                    let failure = match holder {
+                            Ok(note) => {
+                                let holder_sha = note
+                                    .properties
+                                    .as_ref()
+                                    .and_then(|properties| properties.get("sha"))
+                                    .and_then(Value::as_str)
+                                    .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+                                    .unwrap_or("<missing or malformed>");
+                                RuntimeError::Internal(format!(
+                                    "git commit key {key:?} is held by note {} kind {} properties.sha {holder_sha:?}; expected SHA {}",
+                                    note.id, note.kind, c.sha
+                                ))
+                            }
+                            Err(lookup_error) => RuntimeError::Internal(format!(
+                                "git commit key {key:?} conflicted but holder lookup failed: {lookup_error}; create error: {error}"
+                            )),
+                        };
+                    record_write_failure(report, "create", "commit", c.sha.clone(), failure);
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                (id, false)
+            }
+            Err(error) => {
+                record_write_failure(report, "create", "commit", c.sha.clone(), error);
+                stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+        };
         if !created {
             let links = missing_commit_annotation_specs(runtime, token, id, &annotates).await?;
             if let Err(error) = runtime.link_many(token, links).await {
