@@ -2252,7 +2252,7 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BackendAliasIdentity {
     /// An existing file can have several distinct canonical hard-link paths.
     #[cfg(unix)]
@@ -2288,6 +2288,178 @@ fn backend_alias_identity(
         let _ = backend_name;
         Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
     }
+}
+
+/// Read the identity that SQLite's pool pinned during open. A second pathname
+/// stat alone can agree with the pre-open stat after an A→B→A replacement,
+/// while SQLite actually holds B.
+fn opened_backend_alias_identity(
+    backend: &StorageBackend,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(unix)]
+    {
+        let (device, inode) = backend.pool().opened_file_identity().ok_or_else(|| {
+            anyhow::anyhow!(
+                "file-backed backend {} has no opened SQLite file identity",
+                canonical.display()
+            )
+        })?;
+        Ok(BackendAliasIdentity::File(FileIdentity { device, inode }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = backend;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+fn snapshot_matches_opened_backend(
+    snapshot: &BackendAliasIdentity,
+    opened: &BackendAliasIdentity,
+) -> bool {
+    #[cfg(unix)]
+    {
+        // An absent first-open path has no file identity to compare yet.
+        matches!(snapshot, BackendAliasIdentity::Path(_)) || snapshot == opened
+    }
+    #[cfg(not(unix))]
+    {
+        snapshot == opened
+    }
+}
+
+/// Bind a configured file identity to the database actually opened by SQLite.
+/// The opener is injectable only so the path-replacement window can be tested
+/// deterministically; production passes `open_backend` unchanged.
+fn open_backend_bound_to_alias_identity_with<F>(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    opener: F,
+) -> anyhow::Result<(StorageBackend, BackendAliasIdentity)>
+where
+    F: FnOnce(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let backend = opener(cfg, max_readers)?;
+    let opened = opened_backend_alias_identity(&backend, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if opened != at_path
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &opened)
+    {
+        anyhow::bail!(
+            "backend {}: database identity changed between topology snapshot and SQLite open \
+             at {}: snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok((backend, opened))
+}
+
+fn verify_reused_backend_alias_identity(
+    cfg: &BackendConfig,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    existing: &StorageBackend,
+) -> anyhow::Result<()> {
+    let opened = opened_backend_alias_identity(existing, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if at_path != opened
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &at_path)
+    {
+        anyhow::bail!(
+            "backend {}: alias identity changed before cached backend reuse at {}: \
+             snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
+/// Open the entire declared topology against one pre-open snapshot. The
+/// injectable opener makes the snapshot→SQLite-open race executable without a
+/// scheduler or global hook; production passes `open_backend` directly.
+fn open_effective_backends_with<F>(
+    effective_backends: &[BackendConfig],
+    max_readers: Option<usize>,
+    mut opener: F,
+) -> anyhow::Result<HashMap<String, Arc<StorageBackend>>>
+where
+    F: FnMut(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    let identities = effective_backends
+        .iter()
+        .map(|cfg| {
+            canonical_backend_path(cfg)?.map_or(Ok(None), |canonical| {
+                backend_alias_identity(&cfg.name, &canonical)
+                    .map(|identity| Some((identity, canonical)))
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut identity_to_backend: HashMap<BackendAliasIdentity, Arc<StorageBackend>> =
+        HashMap::new();
+    for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
+        if let Some((ref key, ref canon)) = identity {
+            if let Some(existing) = identity_to_backend.get(key) {
+                verify_reused_backend_alias_identity(backend_cfg, key, canon, existing)?;
+                if existing.is_read_only() != backend_cfg.read_only {
+                    anyhow::bail!(
+                        "backend {} aliases {} but declares read_only={} while the same \
+                         physical database was already opened with read_only={}; every alias \
+                         of one database must use the same access mode",
+                        backend_cfg.name,
+                        canon.display(),
+                        backend_cfg.read_only,
+                        existing.is_read_only(),
+                    );
+                }
+                backends.insert(backend_cfg.name.clone(), existing.clone());
+                continue;
+            }
+        }
+        let (backend, opened_key) = if let Some((ref key, ref canon)) = identity {
+            let (backend, opened) = open_backend_bound_to_alias_identity_with(
+                backend_cfg,
+                max_readers,
+                key,
+                canon,
+                &mut opener,
+            )?;
+            (backend, Some(opened))
+        } else {
+            (opener(backend_cfg, max_readers)?, None)
+        };
+        let arc = Arc::new(backend);
+        if let (Some((snapshot, _)), Some(opened)) = (identity, opened_key) {
+            if identity_to_backend.contains_key(&opened) {
+                anyhow::bail!(
+                    "backend {}: opened database identity was already cached under another \
+                     configured path; refusing duplicate pool after topology changed",
+                    backend_cfg.name
+                );
+            }
+            identity_to_backend.insert(opened, arc.clone());
+            if matches!(&snapshot, BackendAliasIdentity::Path(_)) {
+                identity_to_backend.insert(snapshot, arc.clone());
+            }
+        }
+        backends.insert(backend_cfg.name.clone(), arc);
+    }
+    Ok(backends)
 }
 
 /// Reject conflicting access modes without opening any configured database.
@@ -2986,43 +3158,7 @@ async fn prepare_configured_storage_topology(
     // preparation is deferred until after main is identified: every distinct
     // secondary must be inventoried before main can atomically enable
     // attachment-only GC at V21.
-    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
-    let identities = effective_backends
-        .iter()
-        .map(|cfg| {
-            canonical_backend_path(cfg)?.map_or(Ok(None), |canonical| {
-                backend_alias_identity(&cfg.name, &canonical)
-                    .map(|identity| Some((identity, canonical)))
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut identity_to_backend: HashMap<BackendAliasIdentity, Arc<StorageBackend>> =
-        HashMap::new();
-    for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
-        if let Some((ref key, ref canon)) = identity {
-            if let Some(existing) = identity_to_backend.get(key) {
-                if existing.is_read_only() != backend_cfg.read_only {
-                    anyhow::bail!(
-                        "backend {} aliases {} but declares read_only={} while the same \
-                         physical database was already opened with read_only={}; every alias \
-                         of one database must use the same access mode",
-                        backend_cfg.name,
-                        canon.display(),
-                        backend_cfg.read_only,
-                        existing.is_read_only(),
-                    );
-                }
-                backends.insert(backend_cfg.name.clone(), existing.clone());
-                continue;
-            }
-        }
-        let backend = open_backend(backend_cfg, max_readers)?;
-        let arc = Arc::new(backend);
-        if let Some((key, _)) = identity {
-            identity_to_backend.insert(key, arc.clone());
-        }
-        backends.insert(backend_cfg.name.clone(), arc);
-    }
+    let backends = open_effective_backends_with(&effective_backends, max_readers, open_backend)?;
 
     let main_backend = backends
         .get(BackendId::MAIN)
@@ -9639,6 +9775,283 @@ region = "us-east-1"
             &topology.backends["main"],
             &topology.backends["alias"]
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_aba_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for (path, marker) in [(&main, "original"), (&replacement, "replacement")] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE {marker} (id INTEGER)"))
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let mut opened_alias = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                let staged_replacement = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged_replacement).unwrap();
+                std::fs::rename(&staged_replacement, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                opened_main = true;
+                assert_eq!(file_identity(&main), Some(replacement_identity));
+                let staged_original = dir.path().join("staged-original.db");
+                std::fs::hard_link(&alias, &staged_original).unwrap();
+                std::fs::rename(&staged_original, &main).unwrap();
+                Ok(backend)
+            } else {
+                opened_alias = true;
+                open_backend(cfg, max_readers)
+            }
+        })
+        .err()
+        .expect("the opened replacement must not be cached under the original inode");
+        assert!(opened_main);
+        assert!(
+            !opened_alias,
+            "reject before alias routing or schema preparation"
+        );
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        let message = error.to_string();
+        assert!(message.contains("identity changed"), "{message}");
+        assert!(message.contains("opened="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                let staged = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                assert_eq!(
+                    backend.pool().opened_file_identity(),
+                    Some((replacement_identity.device, replacement_identity.inode))
+                );
+                opened_main = true;
+                Ok(backend)
+            } else {
+                panic!("reject before looking up or opening the hard-link alias")
+            }
+        })
+        .err()
+        .expect("the opened replacement must not inherit the old topology snapshot");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_path_swap_after_sqlite_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                assert_eq!(file_identity(&main), Some(original_identity));
+                assert_eq!(
+                    backend.pool().opened_file_identity(),
+                    Some((original_identity.device, original_identity.inode))
+                );
+                opened_main = true;
+                let staged = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &main).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("the path replacement after SQLite open must fail before alias reuse");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_hard_link_alias_rechecks_path_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                let staged = dir.path().join("staged-alias.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("changed alias must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        assert!(error.to_string().contains("before cached backend reuse"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_symlink_alias_rechecks_configured_target_before_reuse() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("retargeted symlink must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(message.contains("before cached backend reuse"), "{message}");
+        assert!(message.contains("configured_now="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_rechecks_configured_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[0].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("retargeted configured path must fail before caching the opened backend");
+        assert_eq!(opened_count, 1, "reject before opening the next backend");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(
+            message.contains("between topology snapshot and SQLite open"),
+            "{message}"
+        );
+        assert!(message.contains("configured_now="), "{message}");
     }
 
     /// Regression for #720: changing `HOME` after runtime-config resolution but

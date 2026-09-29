@@ -36,6 +36,7 @@ static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IdentityOpenStage {
+    AfterMainOpenBeforeFirstStat,
     AfterInitialIdentityWrite,
     BeforeStandaloneOpen,
     AfterStandaloneOpen,
@@ -1665,6 +1666,14 @@ impl ConnectionPool {
         } else {
             None
         };
+        #[cfg(test)]
+        if let Some(path) = identity_path.as_deref() {
+            run_identity_open_hook(
+                path,
+                IdentityOpenStage::AfterMainOpenBeforeFirstStat,
+                Some(&writer),
+            );
+        }
         #[cfg(unix)]
         let identity_before_write = identity_path
             .as_deref()
@@ -2252,6 +2261,16 @@ impl ConnectionPool {
     /// re-deriving a path from the raw configured one.
     pub fn canonical_path(&self) -> Option<&Path> {
         self.identity_path.as_deref()
+    }
+
+    /// Unix file identity pinned while opening this pool's SQLite main file.
+    /// Construction verifies this path identity around SQLite's actual open
+    /// (including `SQLITE_FCNTL_HAS_MOVED`) before admitting the pool. This is
+    /// the identity topology dedup must use after open, not a pre-open stat.
+    #[cfg(unix)]
+    pub fn opened_file_identity(&self) -> Option<(u64, u64)> {
+        self.opened_file_identity
+            .map(|identity| (identity.device, identity.inode))
     }
 
     /// Whether the write queue is effectively enabled for this pool: the
@@ -5243,6 +5262,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn existing_path_replacement_after_sqlite_open_before_first_stat_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.db");
+        let replacement = dir.path().join("replacement.db");
+        let original = Connection::open(&path).unwrap();
+        original
+            .execute_batch("CREATE TABLE original_marker (id INTEGER)")
+            .unwrap();
+        drop(original);
+        let other = Connection::open(&replacement).unwrap();
+        other
+            .execute_batch("CREATE TABLE replacement_marker (id INTEGER)")
+            .unwrap();
+        drop(other);
+        let pinned_path = mint_db_identity(&path).unwrap().1;
+        let original_identity = database_file_identity(&path).unwrap();
+        let replacement_identity = database_file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+
+        let swapped = std::rc::Rc::new(Cell::new(false));
+        let _hook = install_identity_open_hook({
+            let path = path.clone();
+            let swapped = std::rc::Rc::clone(&swapped);
+            move |target, stage, conn| {
+                if target != pinned_path.as_path()
+                    || stage != IdentityOpenStage::AfterMainOpenBeforeFirstStat
+                {
+                    return;
+                }
+                let opened = conn.expect("SQLite main must already be open");
+                let marker: i64 = opened
+                    .query_row(
+                        "SELECT count(*) FROM main.sqlite_master WHERE name='original_marker'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(marker, 1, "the opened handle belongs to the original file");
+                let staged = path.with_extension("staged.db");
+                fs::hard_link(&replacement, &staged).unwrap();
+                fs::rename(&staged, &path).unwrap();
+                swapped.set(true);
+            }
+        });
+        let error = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            read_only: true,
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .err()
+        .expect("changed path must fail before pool admission");
+        assert!(
+            swapped.get(),
+            "swap must occur in the open-to-first-stat window"
+        );
+        assert_eq!(database_file_identity(&path).unwrap(), replacement_identity);
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn initially_absent_path_replacement_cannot_pin_a_different_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.db");
@@ -5333,6 +5415,7 @@ mod tests {
                     return;
                 }
                 match stage {
+                    IdentityOpenStage::AfterMainOpenBeforeFirstStat => {}
                     IdentityOpenStage::BeforeStandaloneOpen => {
                         rename_pair_on_other_thread(&path, &parked, &replacement, &path);
                         swap_ran.set(true);
