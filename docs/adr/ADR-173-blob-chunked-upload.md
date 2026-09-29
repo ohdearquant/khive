@@ -268,7 +268,7 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 
 **Status: Proposed (2026-09-29).** This amendment specifies the fix for the shared-root expiry gap in
 [#3643](https://github.com/ohdearquant/khive/issues/3643). It amends §2, §3b, §4 and Acceptance
-5–6 as follows, and adds the five Acceptance arms at its end. Today a filesystem sweep
+5–6 as follows, and adds the six Acceptance arms at its end. Today a filesystem sweep
 compares every staged file's mtime with the
 sweeping daemon's `KHIVE_BLOB_UPLOAD_IDLE_SECS`; a shorter-bound daemon can therefore
 remove another daemon's still-live upload. The S3 multipart lifecycle rule and its sweep
@@ -317,8 +317,9 @@ neither amendment treats an upload as an orphan-GC object.
 
 3. **A filesystem sweep obeys each lease's bound.** For every id-named staging file,
    the sweeper reads its lease while holding the root write lock and removes the staged
-   file only when `now >= renewed_at + idle_secs` from that lease. It then removes the
-   lease. The `idle_for` argument to `sweep_uploads` remains for backends that use it but
+   file only when `now >= renewed_at + idle_secs + 300 s` from that lease, where `now` is
+   the sweeper's wall clock and 300 seconds is the skew allowance below. It then removes
+   the lease. The `idle_for` argument to `sweep_uploads` remains for backends that use it but
    is not the expiry bound for a leased filesystem upload. Any daemon sharing the root
    may reap an expired upload even if its own in-memory manager does not know the id;
    `owner` records whose bound applies, not an exclusive sweeper. If the lease is absent,
@@ -329,6 +330,17 @@ neither amendment treats an upload as an orphan-GC object.
    durable owner ID and positive supported bound, not equality with the sweeping daemon's
    owner ID. A lease with no staging file may be removed under
    the same lock. No sweep follows a symlink or removes a non-id-named entry.
+
+   **Clock skew.** `renewed_at` is written from the owner's wall clock and compared with
+   the sweeper's, so the two clocks can disagree, most sharply when daemons on different
+   hosts share one root. The fixed five-minute allowance absorbs disagreement up to five
+   minutes in either direction, including a clock step of that size. A lease whose
+   `renewed_at` is more than five minutes ahead of the sweeper's clock is retained and
+   reported as a clock fault; it is never reaped and never read as expired. Daemons sharing
+   a root must keep their clocks within the allowance. Beyond it the rule detects but does
+   not prevent: if host A runs more than five minutes ahead of host B, B reports A's leases
+   as clock faults while A can reap B's uploads early. The report on B is the signal that
+   the deployment is outside the allowance.
 
 4. **Roll out lease-aware sweepers together.** Every daemon allowed to sweep a shared
    filesystem root must use this rule before shared-root operation is enabled. Drain
@@ -348,14 +360,14 @@ neither amendment treats an upload as an orphan-GC object.
 
 ### Acceptance
 
-1. Two daemons use one root with different idle bounds. Both begin uploads and each
-   lease records its own durable owner and bound. At an age past the short bound but
-   below the long bound, a tick from the short-bound daemon removes only the
-   short-bound upload; the long-bound owner's next part succeeds and commits. A mutant
-   that compares both files with the sweeping daemon's `idle_for` fails this test.
-2. A lease from another owner with `renewed_at` past its own `idle_secs` is reaped by a
-   sweeper that has no in-memory record for its id; both the staged file and lease are
-   gone. A mutant that skips unknown ids fails this test.
+1. Two daemons use one root with different idle bounds. Both begin uploads and each lease
+   records its own durable owner and bound. At an age past the short bound plus the five-
+   minute allowance but below the long bound, a tick from the short-bound daemon removes
+   only the short-bound upload; the long-bound owner's next part succeeds and commits. A
+   mutant that compares both files with the sweeping daemon's `idle_for` fails this test.
+2. A lease from another owner with `renewed_at` past its own `idle_secs` plus the five-
+   minute allowance is reaped by a sweeper that has no in-memory record for its id; both
+   the staged file and lease are gone. A mutant that skips unknown ids fails this test.
 3. An id-named staged file without a lease survives a sweep with a one-hour bound when
    its mtime is younger than 24 hours, and is removed at or after 24 hours. A malformed
    lease beside an equally old staged file is retained and reported, rather than
@@ -369,3 +381,8 @@ neither amendment treats an upload as an orphan-GC object.
    emits a warning naming `KHIVE_BLOB_UPLOAD_IDLE_SECS`, the configured 43,200 seconds,
    and the 21,600-second clamp. A configured bound at or below six hours remains
    effective unchanged. This cap does not change the S3 upload policy.
+6. A lease whose `renewed_at + idle_secs` is less than five minutes behind the sweeper's
+   clock survives a sweep, and is removed once it is five minutes or more behind. A lease
+   whose `renewed_at` is more than five minutes ahead of the sweeper's clock is retained and
+   reported as a clock fault. A mutant that drops the allowance fails the first arm; a
+   mutant that treats a future `renewed_at` as expired or as absent fails the second.
