@@ -28,6 +28,16 @@ fn make_event(namespace: &str) -> Event {
     .with_payload(json!({ "result_kind": "note" }))
 }
 
+async fn observations_for(store: &SqlEventStore, event_id: Uuid) -> Vec<EventObservation> {
+    let pool = Arc::clone(&store.pool);
+    tokio::task::spawn_blocking(move || {
+        let guard = pool.reader().unwrap();
+        fetch_event_observations(guard.conn(), event_id).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn operation_attribution_round_trips_and_changes_idempotent_identity() {
     use khive_storage::operation_context::scope_operation_attribution;
@@ -786,9 +796,27 @@ async fn link_events_project_edge_referents_and_observed_matches_any_role() {
         "id": edge_id,
         "source_id": source_id,
         "target_id": target_id,
+        "source_kind": "entity",
+        "target_kind": "entity",
         "mutation": "created"
     }));
     let event_id = event.id;
+    let mut legacy = event.clone();
+    legacy
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove("source_kind");
+    legacy
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove("target_kind");
+    assert_eq!(
+        decode_link_observations(&event).unwrap(),
+        decode_link_observations(&legacy).unwrap(),
+        "explicit entity endpoints must preserve today's observation bytes"
+    );
     store.append_event(event).await.unwrap();
 
     for observed in [source_id, target_id, edge_id] {
@@ -809,29 +837,126 @@ async fn link_events_project_edge_referents_and_observed_matches_any_role() {
         assert_eq!(page.items[0].id, event_id);
     }
 
-    let pool = Arc::clone(&store.pool);
-    let edge_id = edge_id.to_string();
-    let row = tokio::task::spawn_blocking(move || {
-        let guard = pool.reader().unwrap();
-        guard
-            .conn()
-            .query_row(
-                "SELECT referent_kind, role, position FROM event_observations \
-                 WHERE event_id = ?1 AND entity_id = ?2",
-                rusqlite::params![event_id.to_string(), edge_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .unwrap()
-    })
-    .await
-    .unwrap();
-    assert_eq!(row, ("edge".to_string(), "target".to_string(), 2));
+    let rows = observations_for(&store, event_id).await;
+    assert_eq!(rows.len(), 3);
+    for (position, id, kind) in [
+        (0, source_id, ReferentKind::Entity),
+        (1, target_id, ReferentKind::Entity),
+        (2, edge_id, ReferentKind::Edge),
+    ] {
+        assert_eq!(rows[position].entity_id, id);
+        assert_eq!(rows[position].referent_kind, kind);
+        assert_eq!(rows[position].role, ObservationRole::Target);
+        assert_eq!(rows[position].position, position as u32);
+    }
+}
+
+#[tokio::test]
+async fn link_note_endpoints_project_note_referents() {
+    let store = setup_memory_store();
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let edge_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_id,
+        "source_kind": "note",
+        "target_kind": "note",
+        "relation": "supports"
+    }));
+    let event_id = event.id;
+    store.append_event(event).await.unwrap();
+
+    let rows = observations_for(&store, event_id).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].entity_id, source_id);
+    assert_eq!(rows[0].referent_kind, ReferentKind::Note);
+    assert_eq!(rows[1].entity_id, target_id);
+    assert_eq!(rows[1].referent_kind, ReferentKind::Note);
+    assert_eq!(rows[2].entity_id, edge_id);
+    assert_eq!(rows[2].referent_kind, ReferentKind::Edge);
+}
+
+#[tokio::test]
+async fn legacy_link_payload_replays_with_entity_endpoint_fallback() {
+    let store = setup_memory_store();
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let edge_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_id
+    }));
+    let first = store
+        .append_events_idempotent(vec![event.clone()])
+        .await
+        .unwrap();
+    assert_eq!(first.rows, vec![EventAppendDisposition::Inserted]);
+    let rows = observations_for(&store, event.id).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].referent_kind, ReferentKind::Entity);
+    assert_eq!(rows[1].referent_kind, ReferentKind::Entity);
+    assert_eq!(rows[2].referent_kind, ReferentKind::Edge);
+
+    let retry = store.append_events_idempotent(vec![event]).await.unwrap();
+    assert_eq!(
+        retry.rows,
+        vec![EventAppendDisposition::AlreadyPresentIdentical]
+    );
+}
+
+#[tokio::test]
+async fn link_to_event_projects_edge_without_event_endpoint() {
+    let store = setup_memory_store();
+    let source_id = Uuid::new_v4();
+    let target_event_id = Uuid::new_v4();
+    let edge_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_event_id,
+        "source_kind": "note",
+        "target_kind": "event",
+        "relation": "annotates"
+    }));
+    let event_id = event.id;
+    store.append_event(event).await.unwrap();
+
+    let rows = observations_for(&store, event_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].entity_id, source_id);
+    assert_eq!(rows[0].referent_kind, ReferentKind::Note);
+    assert_eq!(rows[0].position, 0);
+    assert_eq!(rows[1].entity_id, edge_id);
+    assert_eq!(rows[1].referent_kind, ReferentKind::Edge);
+    assert_eq!(rows[1].position, 2);
+    assert!(rows.iter().all(|row| row.entity_id != target_event_id));
 }
 
 #[tokio::test]

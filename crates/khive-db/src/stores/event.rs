@@ -941,23 +941,29 @@ fn decode_rerank_observations(event: &Event) -> Result<Vec<EventObservation>, ru
 
 fn decode_link_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
     let mut rows = Vec::new();
+    let source_kind = payload_link_referent_kind(event, "source_kind")?;
+    let target_kind = payload_link_referent_kind(event, "target_kind")?;
     if let Some(source) = payload_uuid(event, "source_id")? {
-        rows.push(EventObservation {
-            event_id: event.id,
-            entity_id: source,
-            referent_kind: ReferentKind::Entity,
-            role: ObservationRole::Target,
-            position: 0,
-        });
+        if let Some(referent_kind) = source_kind {
+            rows.push(EventObservation {
+                event_id: event.id,
+                entity_id: source,
+                referent_kind,
+                role: ObservationRole::Target,
+                position: 0,
+            });
+        }
     }
     if let Some(target) = payload_uuid(event, "target_id")? {
-        rows.push(EventObservation {
-            event_id: event.id,
-            entity_id: target,
-            referent_kind: ReferentKind::Entity,
-            role: ObservationRole::Target,
-            position: 1,
-        });
+        if let Some(referent_kind) = target_kind {
+            rows.push(EventObservation {
+                event_id: event.id,
+                entity_id: target,
+                referent_kind,
+                role: ObservationRole::Target,
+                position: 1,
+            });
+        }
     }
     if let Some(edge_id) = event.target_id.or(payload_uuid(event, "id")?) {
         rows.push(EventObservation {
@@ -969,6 +975,26 @@ fn decode_link_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
         });
     }
     Ok(rows)
+}
+
+fn payload_link_referent_kind(
+    event: &Event,
+    field: &'static str,
+) -> Result<Option<ReferentKind>, rusqlite::Error> {
+    match event.payload.get(field) {
+        None => Ok(Some(ReferentKind::Entity)),
+        Some(value) => match value.as_str() {
+            Some("entity") => Ok(Some(ReferentKind::Entity)),
+            Some("note") => Ok(Some(ReferentKind::Note)),
+            Some("edge") => Ok(Some(ReferentKind::Edge)),
+            Some("event") => Ok(None),
+            _ => Err(invalid_payload(
+                event.kind,
+                field,
+                "expected \"entity\", \"note\", \"edge\", or \"event\"",
+            )),
+        },
+    }
 }
 
 fn decode_edge_target_observation(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {

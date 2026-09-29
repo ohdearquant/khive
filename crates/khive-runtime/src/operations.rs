@@ -690,6 +690,18 @@ pub enum EdgeEndpointKind {
     Edge,
 }
 
+impl EdgeEndpointKind {
+    /// Wire name carried by a link lifecycle event for this endpoint.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Note => "note",
+            Self::Event => "event",
+            Self::Edge => "edge",
+        }
+    }
+}
+
 /// Map a resolved endpoint to its `(substrate, kind, entity_type)` triple, or
 /// `None` if the substrate is not a valid edge endpoint (events, edges).
 ///
@@ -1153,6 +1165,20 @@ pub(crate) fn canonical_edge_endpoints(
         (target_id, source_id)
     } else {
         (source_id, target_id)
+    }
+}
+
+/// Keep endpoint substrates paired with their IDs when a symmetric link swaps direction.
+pub(crate) fn canonical_edge_endpoint_kinds(
+    requested_source_id: Uuid,
+    canonical_source_id: Uuid,
+    source_kind: EdgeEndpointKind,
+    target_kind: EdgeEndpointKind,
+) -> (EdgeEndpointKind, EdgeEndpointKind) {
+    if requested_source_id == canonical_source_id {
+        (source_kind, target_kind)
+    } else {
+        (target_kind, source_kind)
     }
 }
 
@@ -2560,8 +2586,8 @@ impl KhiveRuntime {
     /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
     /// - All other 13 relations: both endpoints MUST be entities.
     ///
-    /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
-    /// the same messages as the previous inline block (byte-identical behaviour).
+    /// Returns the validated endpoint substrates when valid; otherwise
+    /// `InvalidInput` or `NotFound` for an invalid endpoint pair.
     ///
     /// `pub(crate)`: the atomic prepare pass (`crate::atomic_prepare`) reuses
     /// this exact endpoint-type validation during its async prepare step,
@@ -2572,7 +2598,7 @@ impl KhiveRuntime {
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<(EdgeEndpointKind, EdgeEndpointKind)> {
         if source_id == target_id {
             return Err(RuntimeError::InvalidInput(
                 "self-loop edges are not allowed: source_id and target_id must be different".into(),
@@ -2602,11 +2628,26 @@ impl KhiveRuntime {
                 }
             }
             // Target may be any substrate (entity, note, event, or edge) — by-ID, unfiltered.
-            if !self.substrate_exists_by_id(token, target_id).await? {
-                return Err(RuntimeError::NotFound(format!(
-                    "link target {target_id} not found"
-                )));
-            }
+            let target_kind = match self.resolve_edge_endpoint(token, target_id).await? {
+                Some(Resolved::Entity(_)) => EdgeEndpointKind::Entity,
+                Some(Resolved::Note(_)) => EdgeEndpointKind::Note,
+                Some(Resolved::Event(_)) => EdgeEndpointKind::Event,
+                Some(Resolved::PackRecord { .. }) => {
+                    return Err(RuntimeError::InvalidInput(
+                        "pack-private record is not a valid edge endpoint for annotates".into(),
+                    ));
+                }
+                None => match self.get_edge(token, target_id).await {
+                    Ok(Some(_)) => EdgeEndpointKind::Edge,
+                    Ok(None) | Err(RuntimeError::NotFound(_)) => {
+                        return Err(RuntimeError::NotFound(format!(
+                            "link target {target_id} not found"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            return Ok((EdgeEndpointKind::Note, target_kind));
         } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
@@ -2638,7 +2679,7 @@ impl KhiveRuntime {
                     )));
                 }
             };
-            match (&src, &tgt) {
+            return match (&src, &tgt) {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
                     if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
                         let legal_relations = accepted_entity_relations_description(
@@ -2662,8 +2703,11 @@ impl KhiveRuntime {
                             src_e.kind, tgt_e.kind, src_e.kind, tgt_e.kind
                         )));
                     }
+                    Ok((EdgeEndpointKind::Entity, EdgeEndpointKind::Entity))
                 }
-                (Resolved::Note(_), Resolved::Note(_)) => {}
+                (Resolved::Note(_), Resolved::Note(_)) => {
+                    Ok((EdgeEndpointKind::Note, EdgeEndpointKind::Note))
+                }
                 (Resolved::Event(_), _) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "{rel_name} does not apply to events; source {source_id} is an event"
@@ -2691,7 +2735,7 @@ impl KhiveRuntime {
                         "pack-private record is not a valid edge endpoint for {rel_name}"
                     )));
                 }
-            }
+            };
         } else {
             // All remaining base relations require entity→entity with kind-level
             // restrictions (see base allowlist). Packs may extend the allowlist
@@ -2704,7 +2748,17 @@ impl KhiveRuntime {
             let pack_rules = self.pack_edge_rules();
 
             if pack_rule_allows(&pack_rules, relation, src_res.as_ref(), tgt_res.as_ref()) {
-                return Ok(());
+                let kind = |resolved: Option<&Resolved>| match resolved {
+                    Some(Resolved::Entity(_)) => Some(EdgeEndpointKind::Entity),
+                    Some(Resolved::Note(_)) => Some(EdgeEndpointKind::Note),
+                    _ => None,
+                };
+                return match (kind(src_res.as_ref()), kind(tgt_res.as_ref())) {
+                    (Some(source_kind), Some(target_kind)) => Ok((source_kind, target_kind)),
+                    _ => Err(RuntimeError::Internal(
+                        "pack endpoint rule admitted an unsupported substrate".into(),
+                    )),
+                };
             }
 
             // Substrate check: both endpoints must be entities.
@@ -2765,7 +2819,7 @@ impl KhiveRuntime {
                 )));
             }
         }
-        Ok(())
+        Ok((EdgeEndpointKind::Entity, EdgeEndpointKind::Entity))
     }
 
     /// Public delegator for cross-backend link validation.
@@ -2781,6 +2835,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<()> {
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await
+            .map(|_| ())
     }
 
     /// Validate an edge relation using pre-fetched endpoint records.
@@ -3042,9 +3097,14 @@ impl KhiveRuntime {
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
         validate_edge_metadata(relation, metadata.as_ref())?;
-        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
+        let (source_kind, target_kind) = self
+            .validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
-        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        let (canonical_source, canonical_target) =
+            canonical_edge_endpoints(relation, source_id, target_id);
+        let (source_kind, target_kind) =
+            canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
+        let (source_id, target_id) = (canonical_source, canonical_target);
         let metadata = if relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
             // above. The visible-set-scoped `resolve` would silently drop the
@@ -3107,7 +3167,8 @@ impl KhiveRuntime {
                 )))
             }
         };
-        self.append_link_mutation_event(token, &result).await?;
+        self.append_link_mutation_event(token, &result, source_kind, target_kind)
+            .await?;
         Ok(result)
     }
 
@@ -3115,7 +3176,8 @@ impl KhiveRuntime {
     ///
     /// Called by the `SubstrateCoordinator` when source and target are on
     /// different backends. The coordinator validates endpoints before calling
-    /// this method via [`Self::validate_link_endpoints`], so endpoint validation is
+    /// this method via [`Self::validate_link_endpoints`], and supplies the
+    /// resolved endpoint kinds for the lifecycle event. Endpoint validation is
     /// skipped here. The edge is written on the source backend only.
     #[allow(clippy::too_many_arguments)]
     pub async fn link_with_target_backend(
@@ -3123,6 +3185,8 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
+        source_kind: EdgeEndpointKind,
+        target_kind: EdgeEndpointKind,
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
@@ -3132,6 +3196,8 @@ impl KhiveRuntime {
             token,
             source_id,
             target_id,
+            source_kind,
+            target_kind,
             relation,
             weight,
             metadata,
@@ -3151,6 +3217,8 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
+        source_kind: EdgeEndpointKind,
+        target_kind: EdgeEndpointKind,
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
@@ -3158,7 +3226,11 @@ impl KhiveRuntime {
         resurrect: bool,
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
-        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        let (canonical_source, canonical_target) =
+            canonical_edge_endpoints(relation, source_id, target_id);
+        let (source_kind, target_kind) =
+            canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
+        let (source_id, target_id) = (canonical_source, canonical_target);
         validate_edge_metadata(relation, metadata.as_ref())?;
         let now = chrono::Utc::now();
         let ns = token.namespace().as_str();
@@ -3188,7 +3260,8 @@ impl KhiveRuntime {
                     error.into()
                 }
             })?;
-        self.append_link_mutation_event(token, &result).await?;
+        self.append_link_mutation_event(token, &result, source_kind, target_kind)
+            .await?;
         Ok(result)
     }
 
@@ -3196,6 +3269,8 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         result: &EdgeUpsertResult,
+        source_kind: EdgeEndpointKind,
+        target_kind: EdgeEndpointKind,
     ) -> RuntimeResult<()> {
         let kind = match result.disposition {
             EdgeUpsertDisposition::Created => EventKind::LinkCreated,
@@ -3205,15 +3280,7 @@ impl KhiveRuntime {
         };
         let edge_id = Uuid::from(result.edge.id);
         let actor = format!("{}:{}", token.actor().kind, token.actor().id);
-        let event = khive_storage::event::Event::new(
-            result.edge.namespace.clone(),
-            "link",
-            kind,
-            SubstrateKind::Entity,
-            actor,
-        )
-        .with_target(edge_id)
-        .with_payload(serde_json::json!({
+        let mut payload = serde_json::json!({
             "id": edge_id,
             "namespace": result.edge.namespace,
             "mutation": result.disposition.name(),
@@ -3223,7 +3290,20 @@ impl KhiveRuntime {
             "weight": result.edge.weight,
             "metadata": result.edge.metadata,
             "previous": result.previous,
-        }));
+        });
+        if kind == EventKind::LinkCreated {
+            payload["source_kind"] = serde_json::json!(source_kind.name());
+            payload["target_kind"] = serde_json::json!(target_kind.name());
+        }
+        let event = khive_storage::event::Event::new(
+            result.edge.namespace.clone(),
+            "link",
+            kind,
+            SubstrateKind::Entity,
+            actor,
+        )
+        .with_target(edge_id)
+        .with_payload(payload);
         self.events(token)?
             .append_event(event)
             .await
@@ -7477,6 +7557,16 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        self.build_edge_with_endpoint_kinds(token, spec)
+            .await
+            .map(|(edge, _)| edge)
+    }
+
+    async fn build_edge_with_endpoint_kinds(
+        &self,
+        token: &NamespaceToken,
+        spec: &LinkSpec,
+    ) -> RuntimeResult<(Edge, (EdgeEndpointKind, EdgeEndpointKind))> {
         validate_edge_metadata(spec.relation, spec.metadata.as_ref())?;
         let ns_str = match &spec.namespace {
             Some(s) => {
@@ -7491,10 +7581,17 @@ impl KhiveRuntime {
             }
             None => token.namespace().as_str(),
         };
-        self.validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
+        let endpoint_kinds = self
+            .validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
             .await?;
         let (source_id, target_id) =
             canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
+        let endpoint_kinds = canonical_edge_endpoint_kinds(
+            spec.source_id,
+            source_id,
+            endpoint_kinds.0,
+            endpoint_kinds.1,
+        );
         let metadata = if spec.relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
             // above. The visible-set-scoped `resolve` would silently drop the
@@ -7514,19 +7611,22 @@ impl KhiveRuntime {
         };
         validate_edge_metadata(spec.relation, metadata.as_ref())?;
         let now = chrono::Utc::now();
-        Ok(Edge {
-            id: LinkId::from(Uuid::new_v4()),
-            namespace: ns_str.to_string(),
-            source_id,
-            target_id,
-            relation: spec.relation,
-            weight: spec.weight,
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-            metadata,
-            target_backend: None,
-        })
+        Ok((
+            Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: ns_str.to_string(),
+                source_id,
+                target_id,
+                relation: spec.relation,
+                weight: spec.weight,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata,
+                target_backend: None,
+            },
+            endpoint_kinds,
+        ))
     }
 
     /// Validate and atomically upsert a batch of edges.
@@ -7567,8 +7667,11 @@ impl KhiveRuntime {
             return Ok(vec![]);
         }
         let mut edges = Vec::with_capacity(specs.len());
+        let mut endpoint_kinds = Vec::with_capacity(specs.len());
         for spec in &specs {
-            edges.push(self.build_edge(token, spec).await?);
+            let (edge, kinds) = self.build_edge_with_endpoint_kinds(token, spec).await?;
+            edges.push(edge);
+            endpoint_kinds.push(kinds);
         }
         // `upsert_edges_guarded` re-checks every edge's endpoints as part of the
         // same write, not the separate per-spec `build_edge` validation reads
@@ -7607,8 +7710,14 @@ impl KhiveRuntime {
                 }
             };
         }
-        for row in &outcome.rows {
-            self.append_link_mutation_event(token, row).await?;
+        if outcome.rows.len() != endpoint_kinds.len() {
+            return Err(RuntimeError::Internal(
+                "link_many: edge result count differs from validated endpoint count".into(),
+            ));
+        }
+        for (row, (source_kind, target_kind)) in outcome.rows.iter().zip(endpoint_kinds) {
+            self.append_link_mutation_event(token, row, source_kind, target_kind)
+                .await?;
         }
         Ok(outcome.rows)
     }
