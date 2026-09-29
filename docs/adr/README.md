@@ -144,6 +144,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-116](ADR-116-memory-ann-generation-coherence.md)                   | Durable Per-Model Generation Coherence for the Memory ANN Warm Path                                        |
 | [ADR-117](ADR-117-session-continuity-search.md)                         | Session Continuity — Cross-Session Search and Remote Ingestion                                             |
 | [ADR-117a](ADR-117a-session-identity-tenant-isolation.md)               | Session Identity and Tenant Isolation                                                                      |
+| [ADR-117b](ADR-117b-session-deletion-retention.md)                      | Session Mirror Deletion and Storage-Cap Retention                                                          |
 | [ADR-118](ADR-118-fresh-tail-recall-visibility.md)                      | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                       |
 | [ADR-119](ADR-119-daemon-component-supervision.md)                      | Host-Supervised Daemon Components Beside the Verb Plane                                                    |
 | [ADR-120](ADR-120-khive-flow-control-flow-envelope.md)                  | Khive Flow — A Bounded Control-Flow Envelope in the Request DSL                                            |
