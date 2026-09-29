@@ -70,7 +70,7 @@ for the full admission-vs-SQLite-lock distinction.
 
 **Threshold-crossing WARN semantics**: both the `warn_pages` and
 `high_water_pages` warnings fire at most once per below→above crossing.
-Skipped ticks (dedicated connection unavailable) leave the crossing state
+Skipped ticks (dedicated connection unavailable or a busy PASSIVE row) leave the crossing state
 unchanged so that a skip cannot spuriously re-arm the rate limit while WAL
 pressure is still elevated. The ADR-091 Plank 0 open-transaction-registry
 WARNs (oldest-entry escalation and the high-water snapshot enumeration) ride
@@ -166,8 +166,8 @@ delivered for writes by a later ADR.
 What ships here instead is the part of Plank 1 that still applies to every
 registered span regardless of which mechanism created it: on EVERY tick —
 Skipped as well as Observed, since the sweep must not go blind for the
-duration of a Skipped outage (dedicated connection unavailable) any more
-than for an ordinary busy tick — `TxAgeSweepState`
+duration of a Skipped outage (dedicated connection unavailable or a busy
+PASSIVE row) — `TxAgeSweepState`
 checks `khive_storage::tx_registry::oldest()`'s age against
 `tx_warn_secs`/`tx_max_age_secs` and escalates to `warn!`/`error!` on each
 below→above crossing (same debounce idiom as the WAL-pressure ladder — a
@@ -241,7 +241,7 @@ process-lifetime aggregates across checkpoint tasks. They preserve per-attempt
 operator evidence without writing one event row per attempt into a pinned WAL.
 
 Each periodic tick issues exactly one routine `PRAGMA wal_checkpoint(PASSIVE)`
-and retains that row's `busy`, `log`, and `checkpointed` values. Logical
+and retains a valid row's `busy`, `log`, and `checkpointed` values. Logical
 backlog is `max(log - checkpointed, 0)`. The same tick stats the backend's
 physical `-wal` sidecar and records its byte allocation independently. This
 matters because PASSIVE can drain every logical frame while SQLite retains the
@@ -249,12 +249,23 @@ sidecar's high-water allocation for reuse. `routine_wal_observation(pool)` is
 a pure backend-scoped memory read: a metrics scrape performs neither another
 checkpoint nor another filesystem stat, and a secondary backend cannot win a
 process-global race and masquerade as the main backend's sample (#1849).
+When SQLite returns a busy row, its frame columns are not used for pressure
+decisions, even if populated. The tick keeps the last valid routine sample and
+WAL-page gauge, counts the busy call in `checkpoint_timing`, and leaves the
+severity, high-water, and lifecycle episode states unchanged. A direct
+`checkpoint_once` caller receives `SQLITE_BUSY` for that unavailable sample.
+The sample's timestamp remains the time of the last valid row. A nonbusy
+`(-1, -1)` frame pair means no WAL and is measured as zero; a mixed negative
+pair is unavailable rather than clamped to zero.
 
-The existing `WAL checkpoint issued` DEBUG record also carries `elapsed_us` and the
-raw SQLite `busy` result. `checkpoint_timing(pool)` reads cumulative per-store
+The `WAL checkpoint issued` DEBUG record carries `elapsed_us` and the raw
+SQLite `busy` result for a measured row; an unavailable row has a separate
+DEBUG record with the same timing and busy fields. `checkpoint_timing(pool)`
+reads cumulative per-store
 routine PASSIVE call count, elapsed-microsecond sum/max, busy count, and error count.
-Timing encloses only the actual PASSIVE call; skipped ticks and post-TRUNCATE probes
-do not contribute. Failed calls contribute elapsed time and an error count, without
+Timing encloses only the actual PASSIVE call; a busy row counts as a call, while a
+tick with no call and post-TRUNCATE probes do not contribute. Failed calls
+contribute elapsed time and an error count, without
 inventing a busy result. A held reader can leave pending frames with `busy=0`;
 incomplete progress is not counted as SQLite busy. Counters are process-lifetime,
 coherently read under one registry lock, and saturate rather than wrap. This adds
@@ -382,6 +393,12 @@ attempt, then consumed only if that attempt makes no progress. The reported
 identities therefore include a transient holder that releases during the
 bounded TRUNCATE wait, before the no-progress diagnostic is emitted. Sidecar
 enumeration remains deferred to the no-progress path.
+If the post-TRUNCATE PASSIVE re-measure errors or returns busy, progress is
+unmeasured. That attempt still increments the attempt count and runs possible
+holder attribution, while the last WAL-page gauge and consecutive measured
+failure count remain unchanged. Only a measured below-`warn_pages` result
+clears that failure count. A busy or invalid backfill probe reports its gap
+as unavailable rather than logging a zero-frame gap.
 
 ## `TxAgeSweepState` — identity tracking rationale
 
