@@ -430,34 +430,52 @@ mod tests {
             "CREATE TABLE session_messages (mirror_rowid INTEGER PRIMARY KEY, text TEXT); \
              CREATE VIRTUAL TABLE session_messages_fts USING \
                fts5(text, content='session_messages', content_rowid='mirror_rowid'); \
-             INSERT INTO session_messages VALUES (1, 'needle winner'); \
-             INSERT INTO session_messages_fts(rowid, text) VALUES (1, 'needle winner');",
+             INSERT INTO session_messages VALUES \
+               (1, 'needle winner'), (2, 'needle candidate'), \
+               (3, 'needle candidate'), (4, 'needle candidate'); \
+             INSERT INTO session_messages_fts(rowid, text) VALUES \
+               (1, 'needle winner'), (2, 'needle candidate'), \
+               (3, 'needle candidate'), (4, 'needle candidate');",
         )
         .expect("FTS fixture");
 
-        fn steps(conn: &Connection, sql: &str) -> i32 {
+        fn steps(conn: &Connection, sql: &str, expected_snippets: usize) -> i32 {
             let mut stmt = conn.prepare(sql).expect("snippet statement");
-            let snippet: String = stmt
-                .query_row(params!["\"needle\""], |row| row.get(0))
-                .expect("snippet result");
-            assert!(snippet.contains("[needle]"));
+            let snippets = stmt
+                .query_map(params!["\"needle\""], |row| row.get::<_, String>(0))
+                .expect("snippet query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("snippet results");
+            assert_eq!(snippets.len(), expected_snippets);
+            assert!(snippets.iter().all(|snippet| snippet.contains("[needle]")));
             stmt.get_status(StatementStatus::VmStep)
         }
 
-        let bounded = "SELECT snippet(session_messages_fts, 0, '[', ']', '…', 32) \
-                       FROM (SELECT 1 AS fts_rowid) AS c \
-                       CROSS JOIN session_messages_fts \
-                       WHERE session_messages_fts MATCH ?1 \
-                         AND session_messages_fts.rowid = c.fts_rowid";
+        let (_, snippet_stages) = SEARCH_SQL
+            .split_once("), top_snippet_rowids AS MATERIALIZED (")
+            .expect("production query must include the snippet rowid stage");
+        let (snippet_stages, _) = snippet_stages
+            .split_once("\nSELECT r.namespace")
+            .expect("production query must select from the snippet stages");
+        let bounded = format!(
+            r#"WITH hits AS MATERIALIZED (
+                 SELECT 'local' AS namespace, 'codex' AS source, 'winner' AS session_id,
+                        column1 AS fts_rowid, column2 AS created_at, column3 AS fts_rank
+                   FROM (VALUES (1, 4, 0.0), (2, 3, 0.0), (3, 2, 0.0), (4, 1, 0.0))
+               ), limited_sessions AS MATERIALIZED (
+                 SELECT 'local' AS namespace, 'codex' AS source, 'winner' AS session_id
+               ), top_snippet_rowids AS MATERIALIZED ({snippet_stages}
+               SELECT snippet FROM selected_snippets ORDER BY snippet_order"#
+        );
         let unbounded = "WITH hits AS MATERIALIZED ( \
                            SELECT snippet(session_messages_fts, 0, '[', ']', '…', 32) AS snippet \
                              FROM session_messages_fts WHERE session_messages_fts MATCH ?1 \
                          ) SELECT max(snippet) FROM hits";
-        let small_bounded_steps = steps(&conn, bounded);
-        let small_unbounded_steps = steps(&conn, unbounded);
+        let small_bounded_steps = steps(&conn, &bounded, 3);
+        let small_unbounded_steps = steps(&conn, unbounded, 1);
 
         let tx = conn.transaction().expect("fixture transaction");
-        for rowid in 2..=1001 {
+        for rowid in 5..=1004 {
             tx.execute(
                 "INSERT INTO session_messages VALUES (?1, 'needle unrelated')",
                 params![rowid],
@@ -471,11 +489,11 @@ mod tests {
         }
         tx.commit().expect("commit unrelated matches");
 
-        let large_bounded_steps = steps(&conn, bounded);
-        let large_unbounded_steps = steps(&conn, unbounded);
+        let large_bounded_steps = steps(&conn, &bounded, 3);
+        let large_unbounded_steps = steps(&conn, unbounded, 1);
         assert!(
             large_bounded_steps <= small_bounded_steps + 64,
-            "one selected snippet must not visit unrelated FTS matches: \
+            "selected snippets must not visit unrelated FTS matches: \
              {small_bounded_steps} -> {large_bounded_steps} VM steps"
         );
         assert!(
