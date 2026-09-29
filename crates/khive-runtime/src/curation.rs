@@ -2152,6 +2152,15 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        if note.properties.as_ref().is_some_and(|properties| {
+            properties
+                .as_object()
+                .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_WEB_RECEIPT_KEY))
+        }) {
+            return Err(RuntimeError::InvalidInput(
+                "web receipt notes are immutable through generic update".into(),
+            ));
+        }
         // The stored row as read. A no-op answers with this, not with the
         // patched snapshot: the patch may differ from the row in ways the
         // no-op decision ignores (tag order), and nothing was written.

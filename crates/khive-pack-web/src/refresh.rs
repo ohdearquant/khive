@@ -41,18 +41,24 @@ use crate::receipt::write_receipt;
 use crate::vocab::RefreshParams;
 use crate::WebPack;
 
-/// The newest `web.receipt`-tagged `observation` annotating `entity_id` —
-/// never a decoy `annotates` note a caller wrote by hand, since only the
-/// receipt-tag/kind pair identifies a row this function may chain onto or
-/// supersede.
+/// The newest web-written receipt annotating `entity_id`. A generic note
+/// carrying the same tag is not eligible for the refresh chain.
 async fn latest_receipt(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     entity_id: Uuid,
 ) -> Result<Option<Uuid>, RuntimeError> {
-    runtime
+    let latest = runtime
         .latest_annotating_note(token, entity_id, "observation", crate::receipt::RECEIPT_TAG)
-        .await
+        .await?;
+    let Some(id) = latest else {
+        return Ok(None);
+    };
+    let note = runtime.notes(token)?.get_note(id).await?;
+    Ok(note
+        .as_ref()
+        .filter(|note| crate::receipt::has_receipt_provenance(note.properties.as_ref()))
+        .map(|_| id))
 }
 
 fn document_id_for_url(url: &Url) -> Uuid {

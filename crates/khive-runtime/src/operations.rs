@@ -3939,9 +3939,43 @@ impl KhiveRuntime {
         let (note, _, degradations) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
+                false,
             )
             .await?;
         legacy_post_commit_result("create_note", note.id, note, degradations)
+    }
+
+    /// Publish a network receipt with provenance that generic note writes
+    /// cannot supply. The web pack provides only the request record and the
+    /// annotation targets; this entry point fixes the note kind, tag, and
+    /// provenance before the first storage write.
+    pub async fn create_web_receipt_note(
+        &self,
+        token: &NamespaceToken,
+        summary: &str,
+        request: serde_json::Value,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        let properties = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": request,
+        });
+        let (note, _, degradations) = self
+            .create_note_inner(
+                token,
+                "observation",
+                None,
+                summary,
+                None,
+                None,
+                None,
+                Some(properties),
+                annotates,
+                None,
+                true,
+            )
+            .await?;
+        legacy_post_commit_result("create_web_receipt_note", note.id, note, degradations)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3978,6 +4012,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4012,6 +4047,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4050,6 +4086,7 @@ impl KhiveRuntime {
             properties,
             annotates,
             None,
+            false,
         )
         .await
     }
@@ -4112,6 +4149,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 embedding_model,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4399,6 +4437,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
+        web_receipt: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
@@ -4410,8 +4449,20 @@ impl KhiveRuntime {
         // the generic `create` verb and direct Rust callers alike — stores the
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
-        let properties = self.derive_note_write_properties(kind, token, properties)?;
+        let mut properties = self.derive_note_write_properties(kind, token, properties)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
+        if web_receipt {
+            let map = properties
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("web receipt properties are constructed as an object");
+            map.insert(
+                crate::secret_gate::RESERVED_WEB_RECEIPT_KEY.to_string(),
+                serde_json::Value::String(
+                    crate::secret_gate::WEB_RECEIPT_PROVENANCE_VALUE.to_string(),
+                ),
+            );
+        }
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
@@ -4487,7 +4538,12 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(token)?.upsert_note(note.clone()).await?;
+        let notes = if web_receipt {
+            self.raw_notes(token)?
+        } else {
+            self.notes(token)?
+        };
+        notes.upsert_note(note.clone()).await?;
 
         // From here on, any error must compensate by removing the note row, its
         // FTS document, and any vector entries already inserted — the same
@@ -20705,6 +20761,60 @@ mod tests {
         assert!(
             matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_web_receipt_writer_can_establish_provenance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let forged = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": {"verb": "web.fetch"},
+            "khive:web_receipt": "v1",
+        });
+        let error = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "forged",
+                None,
+                Some(forged),
+                vec![],
+            )
+            .await
+            .expect_err("generic create must reject receipt provenance");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("khive:web_receipt"))
+        );
+
+        let receipt = rt
+            .create_web_receipt_note(
+                &tok,
+                "web.fetch",
+                serde_json::json!({"verb": "web.fetch"}),
+                vec![],
+            )
+            .await
+            .expect("web writer must publish provenance with its receipt");
+        assert_eq!(
+            receipt.properties.as_ref().unwrap()["khive:web_receipt"],
+            "v1"
+        );
+        let error = rt
+            .update_note(
+                &tok,
+                receipt.id,
+                crate::curation::NotePatch {
+                    properties: Some(serde_json::json!({"request": {"verb": "web.refresh"}})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("generic update must not rewrite a trusted receipt");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("web receipt"))
         );
     }
 

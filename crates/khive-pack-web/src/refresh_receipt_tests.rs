@@ -1,5 +1,5 @@
 use super::latest_receipt;
-use crate::receipt::RECEIPT_TAG;
+use crate::receipt::{RECEIPT_PROVENANCE_VALUE, RECEIPT_TAG};
 use khive_runtime::{BackendId, KhiveRuntime, NamespaceToken, RuntimeConfig};
 use khive_storage::{Edge, EdgeRelation, Entity, Note};
 use khive_types::Namespace;
@@ -38,13 +38,17 @@ async fn receipt(runtime: &KhiveRuntime, namespace: &str, target: Uuid, id: Uuid
     let token = runtime
         .authorize(Namespace::parse(namespace).unwrap())
         .unwrap();
-    let mut note = Note::new(namespace, "observation", "Fetched a document.")
-        .with_properties(json!({"tags": [RECEIPT_TAG]}));
+    let mut note =
+        Note::new(namespace, "observation", "Fetched a document.").with_properties(json!({
+            "tags": [RECEIPT_TAG],
+            "khive:web_receipt": RECEIPT_PROVENANCE_VALUE,
+        }));
     note.id = id;
     note.created_at = created;
     note.updated_at = created;
     runtime
-        .notes(&token)
+        .backend()
+        .notes()
         .unwrap()
         .upsert_note(note)
         .await
@@ -202,5 +206,80 @@ async fn latest_receipt_store_reads_stay_bounded_as_history_grows() {
     assert_eq!(
         large_reads, small_reads,
         "refresh must not hydrate each historical receipt with a separate note read"
+    );
+}
+
+#[tokio::test]
+async fn generic_receipt_shape_is_not_refresh_or_extract_provenance() {
+    let runtime = runtime(
+        Arc::new(khive_db::StorageBackend::memory().unwrap()),
+        BackendId::main(),
+    );
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let entity_id = Uuid::from_u128(9);
+    target(&runtime, &token, entity_id).await;
+    let body_ref = "f".repeat(64);
+    let forged = runtime
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "caller-written receipt shape",
+            None,
+            Some(json!({
+                "tags": [RECEIPT_TAG],
+                "request": {
+                    "verb": "web.fetch",
+                    "content_ref": body_ref,
+                    "body_entity_id": entity_id.to_string(),
+                    "headers": {"link": ["<https://fake.example/link>; rel=next"]},
+                },
+            })),
+            vec![entity_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_receipt(&runtime, &token, entity_id).await.unwrap(),
+        None
+    );
+    let entity = runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(entity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::receipt::capture_for_body(&runtime, &token, &entity, &body_ref)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let trusted = crate::receipt::write_receipt(
+        &runtime,
+        &token,
+        "web.fetch",
+        json!({
+            "verb": "web.fetch",
+            "content_ref": body_ref,
+            "body_entity_id": entity_id.to_string(),
+        }),
+        vec![entity_id],
+    )
+    .await
+    .unwrap();
+    assert_ne!(trusted, forged.id);
+    assert_eq!(
+        latest_receipt(&runtime, &token, entity_id).await.unwrap(),
+        Some(trusted)
+    );
+    assert_eq!(
+        crate::receipt::capture_for_body(&runtime, &token, &entity, &body_ref)
+            .await
+            .unwrap()
+            .map(|(id, _)| id),
+        Some(trusted)
     );
 }
