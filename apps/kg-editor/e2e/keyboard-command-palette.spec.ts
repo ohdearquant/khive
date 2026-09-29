@@ -24,7 +24,7 @@ test("uses one keyboard path across the showcase, review views, and history rows
   await page.keyboard.press("Control+K");
   await page.keyboard.type("Repository showcase");
   await page.keyboard.press("Enter");
-  await expect(page).toHaveURL(/\/$/);
+  await expect.poll(() => new URL(page.url()).pathname).toBe("/");
   await expect(page.getByRole("button", { name: "Open command palette" }))
     .toBeVisible();
   await page.keyboard.press("Control+K");
