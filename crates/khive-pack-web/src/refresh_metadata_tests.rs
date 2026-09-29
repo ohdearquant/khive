@@ -1355,7 +1355,7 @@ fn vary_accept_encoding_with_fixed_record_sends_validator() {
 }
 
 #[test]
-fn stored_gzip_encoding_map_replays_as_the_fixed_encoding() {
+fn stored_gzip_encoding_map_replays_identity_without_validators() {
     let url = Url::parse("https://metadata.example/stored-gzip-map").unwrap();
     let properties = json!({
         "url": url.as_str(),
@@ -1376,8 +1376,86 @@ fn stored_gzip_encoding_map_replays_as_the_fixed_encoding() {
         ]),
         "an earlier record keeps its replayed fields and never resends gzip"
     );
-    assert!(sent.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("if-none-match") && value == "stored-etag"
+    assert!(sent.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("if-none-match")
+            && !name.eq_ignore_ascii_case("if-modified-since")
+    }));
+}
+
+#[tokio::test]
+async fn legacy_gzip_body_requires_identity_get_before_validation() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/legacy-gzip-body").unwrap();
+    let id = seed(&runtime, &token, &url, &[]).await;
+    crate::entities::patch(
+        &runtime,
+        &token,
+        id,
+        None,
+        json!({
+            "vary": ["Accept-Encoding"],
+            "request_headers": {"accept-encoding": ["gzip"]}
+        }),
+    )
+    .await
+    .unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    let sent = refresh_request_headers(properties).unwrap();
+    assert_eq!(
+        crate::fetch::negotiation_headers(&sent)["accept-encoding"],
+        vec!["identity".to_string()]
+    );
+    assert!(sent.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("if-none-match")
+            && !name.eq_ignore_ascii_case("if-modified-since")
+    }));
+
+    let no_body = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        url.as_str(),
+        properties["blob_ref"].as_str().unwrap(),
+        HopOutcome {
+            status: 304,
+            final_url: url.clone(),
+            headers: HeaderMap::new(),
+            redirect_to: None,
+            body: Some((vec![], false)),
+        },
+        &[],
+        &sent,
+    )
+    .await;
+    assert!(
+        no_body
+            .unwrap_err()
+            .to_string()
+            .contains("unsolicited_not_modified"),
+        "an unsolicited 304 cannot bless the legacy body"
+    );
+    assert_eq!(
+        serde_json::to_value(entity(&runtime, &token, id).await).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "a bodyless reply cannot change the legacy row"
+    );
+    assert_eq!(
+        entity(&runtime, &token, id).await.properties.unwrap()["request_headers"]
+            ["accept-encoding"],
+        json!(["gzip"])
+    );
+
+    refresh(&runtime, &token, id, &url, 200, response_headers(), &[]).await;
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.unwrap();
+    assert_eq!(
+        properties["request_headers"]["accept-encoding"],
+        json!(["identity"])
+    );
+    let next = refresh_request_headers(&properties).unwrap();
+    assert!(next.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("if-none-match") && value == "old-etag"
     }));
 }
 

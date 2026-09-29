@@ -129,6 +129,76 @@ async fn capped_get(response: Vec<u8>, cap: usize) -> (Result<HopOutcome, Runtim
     (result, request)
 }
 
+/// A canned response with an explicit status line, header lines and body. The
+/// caller supplies every header, `Content-Length` included, so a response can
+/// declare a length it does not send (HEAD) or carry none (204, 304).
+fn raw_response(status_line: &str, header_lines: &[&str], body: &[u8]) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 {status_line}\r\n").into_bytes();
+    for line in header_lines {
+        response.extend_from_slice(line.as_bytes());
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"Connection: close\r\n\r\n");
+    response.extend_from_slice(body);
+    response
+}
+
+/// Serve one canned response per connection, in order, whatever the method.
+/// Hands back the request head each connection sent.
+async fn spawn_script(responses: Vec<Vec<u8>>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::with_capacity(4096);
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.expect("read request");
+                assert!(read > 0, "client must send complete request headers");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 16 * 1024, "request headers too large");
+            }
+            let _ = stream.write_all(&response).await;
+            let _ = stream.shutdown().await;
+            requests.push(String::from_utf8(request).expect("ASCII request headers"));
+        }
+        requests
+    });
+    (port, server)
+}
+
+async fn served_requests(server: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server must receive every request")
+        .expect("server task")
+}
+
+const PINNED_HOST: &str = "identity.example";
+
+/// One hop through the production client builder. Every hop gets its own
+/// pinned client, as a caller that re-dials each redirect target builds one.
+async fn hop_to(
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+) -> Result<HopOutcome, RuntimeError> {
+    let client = egress::pinned_client(PINNED_HOST, IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        .expect("pinned client builds");
+    let url = url::Url::parse(&format!("http://{PINNED_HOST}:{port}{path}")).expect("test URL");
+    run_one_hop(
+        &client,
+        &url,
+        method,
+        &[],
+        1_000,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+}
+
 fn first_eight_hex(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -307,4 +377,179 @@ async fn identity_responses_return_the_exact_plaintext_prefix_at_each_cap() {
             }
         }
     }
+}
+
+// The refusal applies where a body would be read: a GET that is neither a
+// followable redirect, a 204 nor a 304. Each test below pins one response the
+// refusal must leave alone, after proving in the same test that the same
+// declared coding on a GET 200 is refused by the same client and hop.
+
+async fn assert_get_200_declaring_gzip_is_refused() {
+    let body = gzip_body(b"exemption control body", HeaderCrc::Absent, 0);
+    let (result, _) = capped_get(http_response(Some("gzip"), &body), 64).await;
+    assert_content_encoding_refusal("GET 200 declaring gzip", &result);
+}
+
+fn assert_declared_gzip_reaches_the_hop(label: &str, outcome: &HopOutcome) {
+    assert_eq!(
+        outcome
+            .headers
+            .get("content-encoding")
+            .unwrap_or_else(|| panic!("{label}: the declared coding must reach the hop"))
+            .to_str()
+            .expect("ASCII header value"),
+        "gzip",
+        "{label}"
+    );
+}
+
+async fn assert_bodiless_status_declaring_gzip_is_not_refused(status_line: &str, status: u16) {
+    assert_get_200_declaring_gzip_is_refused().await;
+
+    let response = raw_response(status_line, &["Content-Encoding: gzip"], b"");
+    let (port, server) = spawn_script(vec![response]).await;
+    let label = format!("GET {status}");
+    let outcome = hop_to(port, reqwest::Method::GET, "/bodiless")
+        .await
+        .unwrap_or_else(|error| panic!("{label} declaring gzip must not be refused: {error}"));
+    assert_eq!(outcome.status, status, "{label}");
+    assert!(outcome.redirect_to.is_none(), "{label}");
+    assert_eq!(
+        outcome
+            .body
+            .as_ref()
+            .map(|(bytes, truncated)| (bytes.len(), *truncated)),
+        Some((0, false)),
+        "{label}: a GET slot with no bytes read"
+    );
+    assert_declared_gzip_reaches_the_hop(&label, &outcome);
+    let requests = served_requests(server).await;
+    assert_eq!(requests.len(), 1, "{label}");
+    assert!(
+        requests[0].starts_with("GET /bodiless HTTP/1.1\r\n"),
+        "{label}: {}",
+        requests[0]
+    );
+    assert_offers_only_identity(&label, &requests[0]);
+}
+
+#[tokio::test]
+async fn head_response_declaring_gzip_is_not_refused() {
+    assert_get_200_declaring_gzip_is_refused().await;
+
+    // A HEAD response describes a body it does not send.
+    let response = raw_response(
+        "200 OK",
+        &["Content-Encoding: gzip", "Content-Length: 46"],
+        b"",
+    );
+    let (port, server) = spawn_script(vec![response]).await;
+    let outcome = hop_to(port, reqwest::Method::HEAD, "/head")
+        .await
+        .unwrap_or_else(|error| panic!("HEAD declaring gzip must not be refused: {error}"));
+    assert_eq!(outcome.status, 200);
+    assert!(
+        outcome.body.is_none(),
+        "HEAD has no body slot: {:?}",
+        outcome.body
+    );
+    assert!(outcome.redirect_to.is_none());
+    assert_declared_gzip_reaches_the_hop("HEAD", &outcome);
+    let requests = served_requests(server).await;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("HEAD /head HTTP/1.1\r\n"),
+        "{}",
+        requests[0]
+    );
+    assert_offers_only_identity("HEAD", &requests[0]);
+}
+
+#[tokio::test]
+async fn not_modified_response_declaring_gzip_is_not_refused() {
+    assert_bodiless_status_declaring_gzip_is_not_refused("304 Not Modified", 304).await;
+}
+
+#[tokio::test]
+async fn no_content_response_declaring_gzip_is_not_refused() {
+    assert_bodiless_status_declaring_gzip_is_not_refused("204 No Content", 204).await;
+}
+
+#[tokio::test]
+async fn redirect_declaring_gzip_is_returned_and_followed_to_the_identity_response() {
+    assert_get_200_declaring_gzip_is_refused().await;
+
+    // The redirect carries a small body and a coding; neither is read.
+    let moved = gzip_body(b"moved", HeaderCrc::Absent, 0);
+    let length = format!("Content-Length: {}", moved.len());
+    let redirect = raw_response(
+        "302 Found",
+        &[
+            "Location: /landing",
+            "Content-Encoding: gzip",
+            length.as_str(),
+        ],
+        &moved,
+    );
+    let landing = http_response(Some("identity"), b"landed on identity");
+    let (port, server) = spawn_script(vec![redirect, landing]).await;
+
+    let first = hop_to(port, reqwest::Method::GET, "/start")
+        .await
+        .unwrap_or_else(|error| panic!("a redirect declaring gzip must not be refused: {error}"));
+    assert_eq!(first.status, 302);
+    let target = format!("http://{PINNED_HOST}:{port}/landing");
+    assert_eq!(
+        first.redirect_to.as_ref().map(url::Url::as_str),
+        Some(target.as_str())
+    );
+    assert!(
+        first.body.is_none(),
+        "a followed redirect reads no body: {:?}",
+        first.body
+    );
+    assert_declared_gzip_reaches_the_hop("302", &first);
+
+    // The caller re-dials the target and gets the identity representation.
+    let landing_path = first.redirect_to.as_ref().expect("redirect target").path();
+    let second = hop_to(port, reqwest::Method::GET, landing_path)
+        .await
+        .expect("the redirect target answers with identity");
+    assert_eq!(Some(&second.final_url), first.redirect_to.as_ref());
+    assert_eq!(second.status, 200);
+    assert!(second.redirect_to.is_none());
+    assert_eq!(
+        second.body,
+        Some((b"landed on identity".to_vec(), false)),
+        "the identity body arrives unchanged"
+    );
+
+    let requests = served_requests(server).await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /start HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with("GET /landing HTTP/1.1\r\n"));
+    assert_offers_only_identity("redirect hop", &requests[0]);
+    assert_offers_only_identity("landing hop", &requests[1]);
+}
+
+// The redirect exemption belongs to a redirect that can be followed, not to
+// the 3xx status: a 302 with no Location has nowhere to go, so its body is
+// read like any other and the declared coding is refused.
+#[tokio::test]
+async fn redirect_without_a_location_declaring_gzip_is_refused() {
+    assert_get_200_declaring_gzip_is_refused().await;
+
+    let moved = gzip_body(b"moved", HeaderCrc::Absent, 0);
+    let length = format!("Content-Length: {}", moved.len());
+    let response = raw_response(
+        "302 Found",
+        &["Content-Encoding: gzip", length.as_str()],
+        &moved,
+    );
+    let (port, server) = spawn_script(vec![response]).await;
+    let result = hop_to(port, reqwest::Method::GET, "/dead-end").await;
+    assert_content_encoding_refusal("302 without Location declaring gzip", &result);
+    let requests = served_requests(server).await;
+    assert_eq!(requests.len(), 1);
+    assert_offers_only_identity("302 without Location", &requests[0]);
 }

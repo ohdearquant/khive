@@ -119,8 +119,9 @@ pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> V
 /// body it hands on is the identity representation or the request is refused.
 pub(crate) const FIXED_ACCEPT_ENCODING: &str = "identity";
 /// The value earlier versions recorded when the client offered gzip. A stored
-/// request map carrying it is still a valid map; it reads as the current value.
-const LEGACY_ACCEPT_ENCODING: &str = "gzip";
+/// request map carrying it is valid for negotiation replay, but its body must
+/// be replaced by an unconditional identity GET before validators can be sent.
+pub(crate) const LEGACY_ACCEPT_ENCODING: &str = "gzip";
 const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language", "accept-encoding"];
 
 /// Keep only representation negotiation, never credentials or conditional
