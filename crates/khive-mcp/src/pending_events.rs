@@ -2013,6 +2013,13 @@ fn final_properties_after_dispatch(
                     }
                 }
                 Err(error) => {
+                    if properties
+                        .pointer("/dispatch_receipt/error_payload")
+                        .is_some_and(action_error_disposition_may_have_committed)
+                    {
+                        properties["dispatch_receipt"]["state"] =
+                            json!(DispatchReceiptState::Indeterminate.as_str());
+                    }
                     mark_recurrence_failure(&mut properties, error, &completed_at_rfc);
                     (properties, FinalDisposition::RecurrenceFailed)
                 }
@@ -3839,6 +3846,25 @@ mod tests {
 
     struct OrdinaryHandlerFailurePack {
         invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct DenyOrdinaryHandlerFailureGate {
+        checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Gate for DenyOrdinaryHandlerFailureGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "test.ordinary_handler_failure" {
+                self.checks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(GateDecision::deny(
+                    "scheduled action refused before dispatch",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
     }
 
     impl khive_types::Pack for OrdinaryHandlerFailurePack {
@@ -6558,6 +6584,70 @@ mod tests {
         assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
     }
 
+    #[test]
+    fn committed_error_with_unadvanceable_repeat_keeps_indeterminate_receipt() {
+        let trigger_at = Utc::now();
+        let failure = DispatchFailure::with_payload(
+            "post-commit maintenance failed",
+            json!({"kind": "internal", "domain_disposition": "committed"}),
+        );
+        let receipt = json!({
+            "state": "failed",
+            "completed_at": trigger_at.timestamp_micros(),
+            "error_payload": failure.payload.clone(),
+        });
+        let repeat = Some("every:100000000d".to_string());
+        let (properties, disposition) = final_properties_after_dispatch(
+            json!({
+                "event_type": "schedule",
+                "repeat": "every:100000000d",
+                "trigger_at": trigger_at.to_rfc3339(),
+            }),
+            receipt,
+            &DispatchCompletion::Failed(failure),
+            trigger_at,
+            FixedOffset::east_opt(0).unwrap(),
+            &repeat,
+        );
+        assert_eq!(disposition, FinalDisposition::RecurrenceFailed);
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["recurrence_error"], UNADVANCEABLE_REPEAT);
+        assert!(properties["recurrence_failed_at"].as_str().is_some());
+        assert_eq!(properties["trigger_at"], trigger_at.to_rfc3339());
+        assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
+    }
+
+    #[test]
+    fn unknown_error_with_unadvanceable_repeat_keeps_indeterminate_receipt() {
+        let trigger_at = Utc::now();
+        let failure = DispatchFailure::with_payload(
+            "handler outcome is unknown",
+            json!({"kind": "internal", "domain_disposition": "unknown"}),
+        );
+        let receipt = json!({
+            "state": "failed",
+            "completed_at": trigger_at.timestamp_micros(),
+            "error_payload": failure.payload.clone(),
+        });
+        let repeat = Some("every:100000000d".to_string());
+        let (properties, disposition) = final_properties_after_dispatch(
+            json!({
+                "event_type": "schedule",
+                "repeat": "every:100000000d",
+                "trigger_at": trigger_at.to_rfc3339(),
+            }),
+            receipt,
+            &DispatchCompletion::Failed(failure),
+            trigger_at,
+            FixedOffset::east_opt(0).unwrap(),
+            &repeat,
+        );
+        assert_eq!(disposition, FinalDisposition::RecurrenceFailed);
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["recurrence_error"], UNADVANCEABLE_REPEAT);
+        assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
+    }
+
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn one_shot_handler_error_runs_once_across_two_drains() {
@@ -8166,10 +8256,14 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
         let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut builder = khive_runtime::VerbRegistryBuilder::new();
         builder.with_default_namespace("local");
+        builder.with_gate(std::sync::Arc::new(DenyOrdinaryHandlerFailureGate {
+            checks: invocations.clone(),
+        }));
         builder.register(OrdinaryHandlerFailurePack {
-            invocations: invocations.clone(),
+            invocations: handler_invocations.clone(),
         });
         let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
         let id = create_scheduled_event(
@@ -8199,6 +8293,10 @@ mod tests {
         let properties = get_note_props(&rt, id).await;
         assert_eq!(properties["status"], "failed", "{properties}");
         assert_eq!(properties["dispatch_receipt"]["state"], "failed");
+        assert_eq!(
+            properties["dispatch_receipt"]["error_payload"]["domain_disposition"],
+            "not_committed"
+        );
         assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
         assert_eq!(
             properties["dispatch_error"], properties["dispatch_receipt"]["error"],
@@ -8211,6 +8309,10 @@ mod tests {
             .expect("terminal row remains inert");
         assert_eq!(second.invoked, 0, "{second:?}");
         assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            handler_invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
