@@ -6,6 +6,9 @@
 **Depends on**: ADR-001 (Entity Kind Taxonomy), ADR-002 (Edge Ontology), ADR-013 (Note Kind
 Taxonomy), ADR-017 (Pack Standard -- extends `EndpointKind` with `EntityOfType` variant)
 
+**Proposed amendment (2026-09-29, #1491)**: [theorem declarations, goals, and proof attempts](#proposed-amendment-2026-09-29-theorem-declarations-goals-and-proof-attempts).
+This proposal does not change the accepted relation set or live endpoint rules before approval.
+
 ## Context
 
 khive stores typed entities and typed edges whose semantics are governed by closed, auditable
@@ -589,3 +592,98 @@ carries no such guarantee.
   workaround and its reason ("depends_on is NOT c->c in base, only under draft ADR-065")
 - Local proof-gate `mathlib/PHASE2-SELECTION.md`: verified selection
   counts (316,040 raw; 62,038 final selected; T=3 threshold)
+
+## Proposed amendment (2026-09-29): theorem declarations, goals, and proof attempts
+
+**Status**: proposed for #1491; not an accepted change to D2-D4 or to the formal pack.
+
+### Context
+
+D3 describes library declarations but does not distinguish a theorem declaration from a goal
+that restates it or from an attempt to close that goal. The current formal pack declares
+endpoint rules for six `concept` subtypes, including `goal`: its `goal depends_on` rules name
+theorem, definition, structure, and axiom targets, and its `goal variant_of` rules name theorem
+and definition targets. It has no proof subtype or `proves` relation. The corpus model in
+#1491 also has proof attempts with verdicts and potentially several attempts per goal.
+
+The v1 scanner described above emits one untyped `refs` list that mixes statement and proof
+references. Its existing edges cannot be classified into the two populations merely by
+reading their source kind. Future ingestion needs separate, source-grounded reference lists;
+ambiguous historical edges require an audit or re-extraction, not a silent reinterpretation.
+
+### Decision proposed
+
+1. **Keep three identities.** A `theorem` is a library declaration, modeled as a `concept`
+   with `entity_type=theorem`; it records the declared proposition and its library identity.
+   A `goal` is a distinct `concept` with `entity_type=goal`, representing an obligation to
+   close, even if its statement restates a theorem or definition. A `proof` is a distinct
+   `artifact` with a governed `entity_type=proof`, representing one produced attempt with
+   source provenance and a checker verdict. Several proof artifacts may target the same goal;
+   neither the goal nor the theorem stores a proof attempt as its own identity. Registering
+   the `proof` subtype is future source work; the current formal pack does not register it.
+2. **Keep statement dependencies on declarations and goals.** A statement-level
+   `depends_on` edge points from the declaration or goal whose type/statement references
+   another declaration to that referenced declaration. The formal pack's current
+   `goal depends_on` endpoint rules retain this meaning and remain legal; they are not
+   proof-body dependencies. `dependency_kind` remains governed by ADR-002 and D4. No
+   existing `depends_on` or `variant_of` edge is renamed or migrated by this proposal.
+3. **Put proof-term dependencies on the proof.** When a scanner can identify references
+   from a particular proof body, that proof artifact is the source of its own `depends_on`
+   edges to the referenced formal declarations. A goal must not inherit those edges from
+   any of its attempts. The later pack change adds subtype-scoped endpoint rules from
+   `artifact/proof` to the evidenced declaration subtypes; it does not permit every
+   `artifact depends_on concept` pair. The current flat `refs` field is insufficient
+   evidence to populate this population.
+4. **Preserve restatement semantics.** `goal variant_of theorem` and
+   `goal variant_of definition` continue to mean a restatement or variant of the
+   declaration's statement. They assert neither that the goal is closed nor that a
+   particular proof succeeds. No `refines` label is introduced.
+5. **Reserve a native `proves` relation for a verified proof.** Subject to the separate
+   ADR-002 two-tier relation mechanism tracked in #1720 and its relation certificate, the
+   formal pack will declare a namespaced Tier-2 label conceptually named `proves`, with
+   only `artifact`/`proof` as source and `concept`/`goal` as target. A `proves` edge asserts
+   that this specific attempt has been checked successfully against that specific goal;
+   an attempted, failed, or unchecked proof must not receive it. Attempt-to-goal targeting
+   and verdict provenance must remain inspectable even without a `proves` edge, under a
+   separately specified artifact contract. The label is exact-match queryable under the
+   future Tier-2 design, not a new Tier-1 `EdgeRelation` variant, category, or inferred
+   `supports` edge. Until that mechanism and its ADR-002 governance are accepted, no
+   `proves` edge is emitted or approximated with another core relation.
+
+The proposed Tier-2 endpoint rule is precisely `EntityOfType { kind: "artifact",
+entity_type: "proof" }` to `EntityOfType { kind: "concept", entity_type: "goal" }`.
+Its storage syntax and pack declaration API belong to the two-tier mechanism, not to this
+amendment. The distinction from Tier-1 `supports` is a machine-checked formal closure
+claim rather than weighted evidence for a claim; `implements` describes realization and
+`derived_from` describes production lineage, neither of which asserts proof of a goal.
+ADR-002's seven-eliminator and system-role analysis still gates ratification of the label;
+this paragraph does not claim that certificate has run.
+
+### Acceptance and sequencing
+
+- The accepted D2 core relation contract and all 21 current formal-pack endpoint rules
+  remain in force until a separately accepted implementation changes them. In particular,
+  a goal's statement-level `depends_on` and its `variant_of` restatement edges remain valid.
+- A future typed-reference fixture distinguishes a theorem statement's dependencies, a
+  goal statement's dependencies, and each proof body's dependencies. Two proofs of one
+  goal may have different proof-term dependencies without changing the goal's edges.
+- A future verified-proof fixture links the successful proof artifact to its goal with
+  `proves`; failed and unchecked attempts have no such edge. No proof-to-theorem or
+  blanket artifact-to-concept endpoint is implied.
+- Source work for `artifact/proof` registration and typed proof-body references follows
+  this amendment's acceptance. Source work for `proves` additionally waits for an
+  accepted ADR-002 Tier-2 mechanism and relation certificate. Historical mixed `refs`
+  edges are audited or re-extracted before being assigned either meaning.
+
+### Alternatives considered
+
+- **Model proof attempts as `concept`/`proof`.** Rejected: an attempt is a produced,
+  versionable artifact with provenance and a verdict; it is not the mathematical
+  proposition or the obligation. Keeping it separate allows many attempts per goal.
+- **Use `supports`, `implements`, or `derived_from` for `proves`.** Rejected as a semantic
+  mapping in this proposal: evidence strength, implementation, and production lineage do
+  not assert that a checker accepted this proof for this goal. The separate ADR-002 audit
+  must still decide whether a native label earns a Tier-2 system role.
+- **Attach proof-body dependencies to the goal.** Rejected: two attempts can cite different
+  lemmas, while the goal's statement remains the same. Those dependencies belong to the
+  individual proof artifacts.
