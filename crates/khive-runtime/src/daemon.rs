@@ -11,11 +11,15 @@
 use std::sync::Arc;
 
 #[cfg(unix)]
-use std::io::Write as _;
+use std::ffi::{CString, OsStr};
+#[cfg(unix)]
+use std::io::{Read as _, Write as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -223,6 +227,460 @@ pub fn lock_path() -> PathBuf {
         }
     }
     khive_dir().join("khived.recovery.lock")
+}
+
+/// One daemon-lifetime path-sidecar claim and its bound database-file identity.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DaemonStoreGuard {
+    /// Pins the directory in which the sidecar was claimed. Both the sidecar
+    /// and the database are opened relative to this same descriptor.
+    parent_dir: std::fs::File,
+    _sidecar: std::fs::File,
+    database: PathBuf,
+    claimed_identity: Option<(u64, u64)>,
+    _bound_database: Option<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl Drop for DaemonStoreGuard {
+    fn drop(&mut self) {
+        // An inherited or duplicated descriptor can outlive this guard.
+        // Closing only this descriptor would keep its flock alive.
+        if let Err(error) = self._sidecar.unlock() {
+            tracing::warn!(
+                database = %self.database.display(),
+                %error,
+                "cannot release daemon store lock"
+            );
+        }
+    }
+}
+
+/// Placeholder for platforms where serving daemons and store claims are unavailable.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct DaemonStoreGuard;
+
+#[cfg(unix)]
+fn regular_store_identity(database: &std::path::Path) -> anyhow::Result<Option<(u64, u64)>> {
+    let metadata = match std::fs::symlink_metadata(database) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            anyhow::bail!(
+                "cannot inspect claimed database {}: {error}",
+                database.display()
+            )
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "claimed database {} is not a regular file",
+        database.display()
+    );
+    Ok(Some((metadata.dev(), metadata.ino())))
+}
+
+/// Open a single directory entry without re-resolving any parent pathname.
+#[cfg(unix)]
+fn open_claimed_entry(
+    parent: &std::fs::File,
+    name: &OsStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<std::fs::File> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "store entry contains U+0000",
+        )
+    })?;
+    // SAFETY: the directory fd and NUL-terminated entry name stay live through
+    // openat. FromRawFd takes ownership of the returned fd exactly once.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            // Variadic arguments require C default promotion; mode_t is u16 on macOS.
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new, valid fd owned by this process.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Walk an already-canonical absolute parent path one component at a time.
+/// A newly planted ancestor symlink cannot redirect the claim before the
+/// sidecar is opened; each later component is relative to the held directory.
+#[cfg(unix)]
+fn open_claimed_directory(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "claimed store directory must be absolute",
+        ));
+    }
+    let mut directory = std::fs::File::open("/")?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory =
+                    open_claimed_entry(&directory, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "claimed store directory must be canonical",
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+/// Refuse a stable retarget of the canonical parent pathname. This check is
+/// useful before binding and after SQLite open, but is not an atomic proof of
+/// the pathname SQLite itself traversed in between.
+#[cfg(unix)]
+fn ensure_claimed_parent_identity(
+    directory: &std::fs::File,
+    database: &std::path::Path,
+) -> anyhow::Result<()> {
+    let parent = database.parent().expect("claimed path has a parent");
+    let held = directory.metadata()?;
+    let observed = std::fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        observed.is_dir() && (held.dev(), held.ino()) == (observed.dev(), observed.ino()),
+        "claimed database {} parent directory changed since claim",
+        database.display()
+    );
+    Ok(())
+}
+
+/// Inspect the claimed directory entry, including a missing database, without
+/// following a final-component symlink or reopening the directory by name.
+#[cfg(unix)]
+fn regular_store_identity_at(
+    parent: &std::fs::File,
+    name: &OsStr,
+    database: &std::path::Path,
+) -> anyhow::Result<Option<(u64, u64)>> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("database name {} contains U+0000", database.display()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat points to writable storage and name is NUL-terminated.
+    let rc = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "cannot inspect claimed database {}: {error}",
+            database.display()
+        );
+    }
+    // SAFETY: fstatat succeeded and initialized the complete stat structure.
+    let stat = unsafe { stat.assume_init() };
+    anyhow::ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+        "claimed database {} is not a regular file",
+        database.display()
+    );
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev;
+    #[cfg(not(target_os = "linux"))]
+    let device = stat.st_dev as u64;
+    Ok(Some((device, stat.st_ino)))
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static STORE_BIND_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn set_store_bind_race_hook(hook: impl FnOnce() + 'static) {
+    STORE_BIND_RACE_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, unix))]
+fn take_store_bind_race_hook() -> Option<Box<dyn FnOnce()>> {
+    STORE_BIND_RACE_HOOK.with(|cell| cell.borrow_mut().take())
+}
+
+/// Open each database relative to the directory that holds its sidecar claim.
+/// A missing writable database is created here, after the claim; a missing
+/// read-only database fails without creating it. The descriptor pins the
+/// identity to compare against the later SQLite pathname check.
+#[cfg(unix)]
+pub fn bind_daemon_store_files(
+    guards: &mut [DaemonStoreGuard],
+    read_only_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    for guard in guards {
+        let read_only = read_only_paths.contains(&guard.database);
+        ensure_claimed_parent_identity(&guard.parent_dir, &guard.database)?;
+        let filename = guard
+            .database
+            .file_name()
+            .expect("claimed path has a file name");
+        #[cfg(test)]
+        if let Some(hook) = take_store_bind_race_hook() {
+            hook();
+        }
+        let flags = if read_only {
+            libc::O_RDONLY
+        } else {
+            libc::O_RDWR | libc::O_CREAT
+        };
+        let file =
+            open_claimed_entry(&guard.parent_dir, filename, flags, 0o666).map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot open claimed database {}: {error}",
+                    guard.database.display()
+                )
+            })?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "claimed database {} is not a regular file",
+            guard.database.display()
+        );
+        let opened_identity = (metadata.dev(), metadata.ino());
+        if let Some(claimed_identity) = guard.claimed_identity {
+            anyhow::ensure!(
+                claimed_identity == opened_identity,
+                "claimed database {} changed inode between claim and open",
+                guard.database.display()
+            );
+        }
+        guard.claimed_identity = Some(opened_identity);
+        guard._bound_database = Some(file);
+        anyhow::ensure!(
+            regular_store_identity(&guard.database)? == Some(opened_identity),
+            "claimed database {} changed inode while binding its open file",
+            guard.database.display()
+        );
+    }
+    Ok(())
+}
+
+/// Fail boot if the canonical pathname no longer names the descriptor-bound
+/// file. Call after SQLite has opened the database and before serving. The
+/// SQLite binding does not expose its opened fd for an identity comparison:
+/// replacement and restoration of the pathname around SQLite's open remains
+/// a residual window when a local process can rename or replace a store
+/// ancestor during boot. The pool opens
+/// SQLite by pathname and may set `journal_mode=WAL` inside its constructor,
+/// before its caller can make this post-open check; later schema migration is
+/// guarded by an in-build post-open check.
+#[cfg(unix)]
+pub fn assert_daemon_store_identities(guards: &[DaemonStoreGuard]) -> anyhow::Result<()> {
+    for guard in guards {
+        ensure_claimed_parent_identity(&guard.parent_dir, &guard.database)?;
+        let bound = guard._bound_database.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "claimed database {} was not bound",
+                guard.database.display()
+            )
+        })?;
+        let metadata = bound.metadata()?;
+        let bound_identity = (metadata.dev(), metadata.ino());
+        let observed = regular_store_identity(&guard.database)?;
+        anyhow::ensure!(
+            observed == Some(bound_identity) && observed == guard.claimed_identity,
+            "claimed database {} changed inode after open (claimed {:?}, now {:?}); refusing daemon boot",
+            guard.database.display(),
+            guard.claimed_identity,
+            observed
+        );
+    }
+    Ok(())
+}
+
+/// Non-Unix hosts cannot run the daemon and have no store claims to verify.
+#[cfg(not(unix))]
+pub fn assert_daemon_store_identities(_guards: &[DaemonStoreGuard]) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// The persistent claim sidecar for one canonical database pathname.
+#[cfg(unix)]
+fn daemon_store_lock_path(database: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let filename = database
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("database path {} has no file name", database.display()))?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(filename);
+    lock_name.push(".khived.lock");
+    Ok(database.with_file_name(lock_name))
+}
+
+/// PID text is diagnostic only. A malformed or oversized lock marker cannot
+/// make a contender allocate or read without a fixed bound.
+#[cfg(unix)]
+fn store_lock_holder_pid(file: &mut std::fs::File) -> Option<u32> {
+    let mut holder_text = String::new();
+    file.take(64).read_to_string(&mut holder_text).ok()?;
+    holder_text.trim().parse::<u32>().ok()
+}
+
+/// Hold one exclusive daemon-lifetime lock for each resolved SQLite file.
+/// Unlike the HOME-bound boot/recovery lock, these locks follow the storage
+/// topology. Callers acquire them before SQLite opens any store and retain
+/// them until daemon shutdown. Never unlink a lock file: unlinking a held
+/// inode would let a second boot lock a new one.
+///
+/// `database_paths` must contain canonical absolute paths. This function
+/// sorts and deduplicates them so overlapping multi-backend topologies acquire
+/// in one order and aliases of one path use one lock. It refuses a claim set
+/// whose derived lock sidecar is a configured database before opening any
+/// sidecar for writing.
+#[cfg(unix)]
+pub fn acquire_daemon_store_guards(
+    database_paths: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<Vec<DaemonStoreGuard>> {
+    let mut database_paths: Vec<PathBuf> = database_paths.into_iter().collect();
+    database_paths.sort();
+    database_paths.dedup();
+    let lock_paths: Vec<PathBuf> = database_paths
+        .iter()
+        .map(|database| daemon_store_lock_path(database))
+        .collect::<anyhow::Result<_>>()?;
+    for (database, lock_path) in database_paths.iter().zip(&lock_paths) {
+        if database_paths.binary_search(lock_path).is_ok() {
+            anyhow::bail!(
+                "refusing daemon store claim: lock sidecar {} for database {} is itself a \
+                 configured database; no store lock was opened",
+                lock_path.display(),
+                database.display()
+            );
+        }
+    }
+    let mut configured_identities = Vec::new();
+    for database in &database_paths {
+        if let Some(identity) = regular_store_identity(database)? {
+            configured_identities.push((database.clone(), identity));
+        }
+    }
+    let mut guards = Vec::with_capacity(database_paths.len());
+
+    for (database, lock_path) in database_paths.into_iter().zip(lock_paths) {
+        let filename = database
+            .file_name()
+            .expect("store lock preflight required a database file name");
+        let parent = lock_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("store lock {} has no parent", lock_path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot create store lock directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        let parent_dir = open_claimed_directory(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot open daemon store directory {} for {}: {error}",
+                parent.display(),
+                database.display()
+            )
+        })?;
+        ensure_claimed_parent_identity(&parent_dir, &database)?;
+        let mut file = open_claimed_entry(
+            &parent_dir,
+            lock_path.file_name().expect("sidecar path has a file name"),
+            libc::O_RDWR | libc::O_CREAT,
+            0o600,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot open daemon store lock {} for {}: {error}",
+                lock_path.display(),
+                database.display()
+            )
+        })?;
+        let sidecar_metadata = file.metadata()?;
+        if !sidecar_metadata.is_file() {
+            anyhow::bail!(
+                "daemon store lock {} is not a regular file",
+                lock_path.display()
+            );
+        }
+        let sidecar_identity = (sidecar_metadata.dev(), sidecar_metadata.ino());
+        if let Some((matching_database, _)) = configured_identities
+            .iter()
+            .find(|(_, identity)| *identity == sidecar_identity)
+        {
+            anyhow::bail!(
+                "refusing daemon store claim: opened lock sidecar {} for database {} is the same \
+                 file as configured database {}; no sidecar lock was acquired or truncated",
+                lock_path.display(),
+                database.display(),
+                matching_database.display()
+            );
+        }
+        anyhow::ensure!(
+            sidecar_metadata.nlink() <= 1,
+            "refusing daemon store claim: opened lock sidecar {} for database {} has {} hard \
+             links; no sidecar lock was acquired or truncated",
+            lock_path.display(),
+            database.display(),
+            sidecar_metadata.nlink()
+        );
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // The winning process writes its pid immediately after locking.
+                // A contender can race that write, so an empty/unreadable pid
+                // is an unknown holder, never permission to proceed.
+                let holder = store_lock_holder_pid(&mut file)
+                    .map(|pid| format!("pid {pid}"))
+                    .unwrap_or_else(|| "an unknown pid".to_string());
+                anyhow::bail!(
+                    "refusing to start: khived is already running as {holder} for database {}; \
+                     daemon store lock {} is held",
+                    database.display(),
+                    lock_path.display()
+                );
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                anyhow::bail!(
+                    "cannot acquire daemon store lock {} for {}: {error}",
+                    lock_path.display(),
+                    database.display()
+                );
+            }
+        }
+        file.set_len(0)?;
+        file.write_all(std::process::id().to_string().as_bytes())?;
+        file.sync_data()?;
+        let claimed_identity = regular_store_identity_at(&parent_dir, filename, &database)?;
+        guards.push(DaemonStoreGuard {
+            parent_dir,
+            _sidecar: file,
+            database,
+            claimed_identity,
+            _bound_database: None,
+        });
+    }
+    Ok(guards)
 }
 
 /// Advisory lock file used to serialize RECOVERY (kill+respawn) attempts
@@ -6483,6 +6941,293 @@ mod tests {
             std::fs::read_dir(home).unwrap().next().is_none(),
             "both daemon lock producers must leave the child HOME empty"
         );
+    }
+
+    #[test]
+    fn store_guard_refuses_a_second_claim_and_names_the_holder() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("stores/khive.db");
+        let first = acquire_daemon_store_guards([database.clone()]).expect("first daemon claim");
+        let lock = root.join("stores/.khive.db.khived.lock");
+        assert!(lock.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            std::process::id().to_string()
+        );
+
+        let error = acquire_daemon_store_guards([database.clone()])
+            .expect_err("a second daemon claim must not own the same store");
+        let message = error.to_string();
+        assert!(message.contains("already running"), "{message}");
+        assert!(
+            message.contains(&format!("pid {}", std::process::id())),
+            "{message}"
+        );
+        assert_eq!(
+            lock.parent(),
+            database.parent(),
+            "the guard must be anchored beside the database, independent of the HOME rendezvous"
+        );
+
+        drop(first);
+        let replacement = acquire_daemon_store_guards([database]).expect("guard released");
+        drop(replacement);
+        assert!(
+            lock.is_file(),
+            "the stable lock inode must never be unlinked"
+        );
+    }
+
+    #[test]
+    fn store_guard_refuses_a_database_at_another_stores_lock_sidecar() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let main = root.join("main.db");
+        let second_database = root.join(".main.db.khived.lock");
+        std::fs::write(&second_database, b"second-backend-sentinel").unwrap();
+
+        let error = acquire_daemon_store_guards([main.clone(), second_database.clone()])
+            .expect_err("a store claim must not open another configured database as its lock");
+        let message = error.to_string();
+        assert!(message.contains(&main.display().to_string()), "{message}");
+        assert!(
+            message.contains(&second_database.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("no store lock was opened"), "{message}");
+        assert_eq!(
+            std::fs::read(&second_database).unwrap(),
+            b"second-backend-sentinel",
+            "refusal must precede the lock file's set_len(0)"
+        );
+        assert!(!main.exists(), "the main database must remain unopened");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "preflight must refuse before opening any claim sidecar"
+        );
+    }
+
+    #[test]
+    fn store_guard_refuses_hardlinked_sidecar_before_lock_or_truncate() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("claim.db");
+        let temp_database = root.join("temp-database.db");
+        let lock = daemon_store_lock_path(&database).unwrap();
+        let sentinel = b"temp-database-sentinel";
+        std::fs::write(&temp_database, sentinel).unwrap();
+        std::fs::hard_link(&temp_database, &lock).unwrap();
+        assert!(std::fs::metadata(&temp_database).unwrap().nlink() > 1);
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temp_database)
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let error = acquire_daemon_store_guards([database.clone()])
+            .expect_err("opened sidecar hardlink must refuse before lock or truncate");
+        let message = error.to_string();
+        assert!(message.contains("hard links"), "{message}");
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert!(
+            message.contains(&database.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&temp_database).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&lock).unwrap(), sentinel);
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn store_guard_names_a_configured_database_matching_the_opened_sidecar() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let first_database = root.join("a.db");
+        let second_database = root.join("z.db");
+        let lock = daemon_store_lock_path(&first_database).unwrap();
+        let sentinel = b"configured-database-sentinel";
+        std::fs::write(&second_database, sentinel).unwrap();
+        std::fs::hard_link(&second_database, &lock).unwrap();
+
+        let error = acquire_daemon_store_guards([first_database.clone(), second_database.clone()])
+            .expect_err("opened sidecar must not alias another configured database");
+        let message = error.to_string();
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert!(
+            message.contains(&first_database.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second_database.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&second_database).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&lock).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn store_lock_holder_pid_reads_at_most_64_bytes_from_the_claimed_file() {
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, &vec![b'9'; 1024]).unwrap();
+        std::io::Seek::rewind(&mut file).unwrap();
+        assert_eq!(store_lock_holder_pid(&mut file), None);
+        assert_eq!(std::io::Seek::stream_position(&mut file).unwrap(), 64);
+
+        file.set_len(0).unwrap();
+        std::io::Seek::rewind(&mut file).unwrap();
+        std::io::Write::write_all(&mut file, b"4242\n").unwrap();
+        std::io::Seek::rewind(&mut file).unwrap();
+        assert_eq!(store_lock_holder_pid(&mut file), Some(4242));
+    }
+
+    #[test]
+    fn store_guard_deduplicates_and_releases_partial_claims() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let first_path = root.join("a.db");
+        let second_path = root.join("b.db");
+        let first = acquire_daemon_store_guards([second_path.clone()]).unwrap();
+        let error = acquire_daemon_store_guards([
+            second_path.clone(),
+            first_path.clone(),
+            first_path.clone(),
+        ])
+        .expect_err("overlap on the second lock must refuse the full topology");
+        assert!(error.to_string().contains("b.db"), "{error}");
+        let independent = acquire_daemon_store_guards([first_path.clone(), first_path])
+            .expect("the failed candidate released its earlier lock and deduplicated aliases");
+        drop(independent);
+        drop(first);
+        acquire_daemon_store_guards([second_path]).expect("second store released");
+    }
+
+    #[test]
+    fn store_guard_drop_releases_lock_with_duplicated_descriptor() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("store.db");
+        let guards = acquire_daemon_store_guards([database.clone()]).expect("first claim");
+        let duplicate = guards[0]._sidecar.try_clone().expect("duplicate lock fd");
+
+        let error = acquire_daemon_store_guards([database.clone()])
+            .expect_err("a live guard must still exclude another claim");
+        assert!(error.to_string().contains("already running"), "{error}");
+
+        drop(guards);
+        let replacement = acquire_daemon_store_guards([database])
+            .expect("dropping the guard must unlock even while a duplicate fd remains open");
+        drop(replacement);
+        drop(duplicate);
+    }
+
+    #[test]
+    fn store_guard_missing_database_binds_created_inode_under_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("new.db");
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        assert!(
+            !database.exists(),
+            "claiming the sidecar must not create SQLite data"
+        );
+        bind_daemon_store_files(&mut guards, &[]).unwrap();
+        assert!(database.is_file());
+        assert_daemon_store_identities(&guards).unwrap();
+    }
+
+    #[test]
+    fn store_guard_directory_retarget_before_bind_refuses_claimed_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let claimed_dir = root.join("claimed");
+        let moved_dir = root.join("moved");
+        let database = claimed_dir.join("new.db");
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        assert!(!database.exists(), "the database is absent at claim time");
+
+        let retarget = claimed_dir.clone();
+        set_store_bind_race_hook(move || {
+            std::fs::rename(&retarget, &moved_dir).unwrap();
+            std::fs::create_dir(&retarget).unwrap();
+        });
+        let error = bind_daemon_store_files(&mut guards, &[])
+            .expect_err("directory retarget must refuse the claimed store");
+        assert!(
+            error.to_string().contains("changed inode while binding"),
+            "{error}"
+        );
+        assert!(
+            !database.exists(),
+            "a replacement directory must not receive the database"
+        );
+        assert!(
+            root.join("moved/.new.db.khived.lock").is_file(),
+            "the sidecar remains in the claimed directory"
+        );
+    }
+
+    #[test]
+    fn store_guard_missing_read_only_database_refuses_without_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("missing-snapshot.db");
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        let error = bind_daemon_store_files(&mut guards, std::slice::from_ref(&database))
+            .expect_err("read-only database must already exist");
+        assert!(
+            error.to_string().contains("cannot open claimed database"),
+            "{error}"
+        );
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn store_guard_replaced_canonical_inode_refuses_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("database.db");
+        std::fs::write(&database, b"original").unwrap();
+        let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+        bind_daemon_store_files(&mut guards, &[]).unwrap();
+
+        let replacement = root.join("replacement.db");
+        std::fs::write(&replacement, b"replacement").unwrap();
+        std::fs::rename(&replacement, &database).unwrap();
+        let error = assert_daemon_store_identities(&guards)
+            .expect_err("a replaced canonical inode must refuse daemon boot");
+        assert!(
+            error.to_string().contains("changed inode after open"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn store_guard_hardlink_names_remain_independent_unsupported_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let database = first_dir.join("database.db");
+        let hardlink = second_dir.join("alias.db");
+        std::fs::write(&database, b"same inode").unwrap();
+        std::fs::hard_link(&database, &hardlink).unwrap();
+        let original = regular_store_identity(&database).unwrap();
+        assert_eq!(original, regular_store_identity(&hardlink).unwrap());
+
+        let first = acquire_daemon_store_guards([database]).unwrap();
+        let second = acquire_daemon_store_guards([hardlink]).expect(
+            "distinct hardlink names have distinct path sidecars and are unsupported aliases",
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
     }
 
     // ── the recovery lock actually serializes two boot sequences ─────────────

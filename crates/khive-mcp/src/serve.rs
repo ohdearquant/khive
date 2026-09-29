@@ -152,19 +152,55 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         );
     }
     // #667: in daemon mode, failing to acquire the boot guard must abort
-    // before `build_server` runs migrations/FTS DDL unguarded — see
-    // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
-    // lock (dropped right after construction below).
+    // before runtime construction runs migrations/FTS DDL unguarded. #3069:
+    // the resolved store claims below also precede that construction and stay
+    // held while the daemon serves, even when a second process uses another
+    // HOME and therefore has a different socket/boot lock. Non-daemon callers
+    // keep the existing best-effort boot lock only.
     if args.daemon {
         khive_runtime::daemon::mark_warm_index_host();
     }
+    let (cli_ns_explicit, cli_ns) =
+        resolve_cli_namespace(&args).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let mut prepared = prepare_server_boot(&args, cli_ns, cli_ns_explicit, cli_ns_explicit)?;
     #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
     } else {
         khive_runtime::daemon::acquire_recovery_lock()
     };
-    let (server, schedule_rt) = build_server(&args).await?;
+    #[cfg(unix)]
+    if args.daemon {
+        crate::daemon::refuse_serving_socket_before_store_claim().await?;
+    }
+    #[cfg(unix)]
+    let store_guards = if args.daemon {
+        let plan = prepare_daemon_store_plan(
+            &mut prepared.config.db_path,
+            &mut prepared.db_anchor,
+            &mut prepared.khive_cfg.backends,
+            args.db.as_deref() == Some(":memory:"),
+        )?;
+        let mut guards = khive_runtime::daemon::acquire_daemon_store_guards(plan.paths.clone())?;
+        plan.assert_aliases_unchanged()?;
+        khive_runtime::daemon::bind_daemon_store_files(&mut guards, &plan.read_only_paths)?;
+        // Refuse a stable retarget before constructing a pool. The pool later
+        // opens SQLite by pathname and sets journal_mode inside its constructor.
+        khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
+        Some(guards)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let daemon_claims = store_guards.as_deref();
+    #[cfg(not(unix))]
+    let daemon_claims = None;
+    let (server, schedule_rt) =
+        build_server_from_prepared(&args, prepared, true, daemon_claims).await?;
+    #[cfg(unix)]
+    if let Some(guards) = store_guards.as_deref() {
+        khive_runtime::daemon::assert_daemon_store_identities(guards)?;
+    }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
 
     #[cfg(unix)]
@@ -2200,6 +2236,27 @@ pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers(
     db_anchor: Option<&std::path::Path>,
     max_readers: Option<usize>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+        max_readers,
+        None,
+    )
+    .await
+}
+
+/// Daemon boot variant: verify each claimed pathname immediately after its
+/// backend opens, before schema preparation can write to that backend.
+pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+    max_readers: Option<usize>,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
+) -> anyhow::Result<MultiBackendRegistry> {
     // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
     // so it must agree with the canonical anchor for this same `--db` input.
     // This is the shared choke point both multi-backend boot paths funnel
@@ -2213,6 +2270,7 @@ pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers(
         khive_cfg,
         cli_db_override,
         max_readers,
+        daemon_claims,
     )
     .await
 }
@@ -2432,6 +2490,7 @@ pub async fn migrate_configured_storage_topology(
         khive_cfg,
         cli_db_override,
         StorageTopologyPurpose::SchemaAdministration,
+        None,
         None,
     )
     .await?;
@@ -2904,6 +2963,7 @@ async fn prepare_configured_storage_topology(
     cli_db_override: Option<&str>,
     purpose: StorageTopologyPurpose,
     max_readers: Option<usize>,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<PreparedStorageTopology> {
     let force_memory =
         normalize_redundant_db_override(&mut base_config, cli_db_override, &khive_cfg.backends)?;
@@ -2967,6 +3027,9 @@ async fn prepare_configured_storage_topology(
             }
         }
         let backend = open_backend(backend_cfg, max_readers)?;
+        if let Some(claims) = daemon_claims {
+            khive_runtime::daemon::assert_daemon_store_identities(claims)?;
+        }
         let arc = Arc::new(backend);
         if let Some(canon) = canonical {
             path_to_backend.insert(canon, arc.clone());
@@ -3119,6 +3182,7 @@ async fn build_registry_for_multi_backend_inner(
         khive_cfg,
         cli_db_override,
         None,
+        None,
     )
     .await
 }
@@ -3128,6 +3192,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
     max_readers: Option<usize>,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<MultiBackendRegistry> {
     let PreparedStorageTopology {
         base_config,
@@ -3140,6 +3205,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         cli_db_override,
         StorageTopologyPurpose::Serving,
         max_readers,
+        daemon_claims,
     )
     .await?;
 
@@ -3520,6 +3586,25 @@ async fn build_server_inner(
     actor_explicit: bool,
     mcp_host: bool,
 ) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
+    let prepared = prepare_server_boot(args, namespace, namespace_explicit, actor_explicit)?;
+    build_server_from_prepared(args, prepared, mcp_host, None).await
+}
+
+struct PreparedServerBoot {
+    config: RuntimeConfig,
+    db_anchor: Option<PathBuf>,
+    khive_cfg: KhiveConfig,
+}
+
+/// Resolve storage topology without opening a database. The daemon takes its
+/// store locks from this exact snapshot before `build_server_from_prepared`
+/// starts migrations; it must not rediscover HOME/config between the two.
+fn prepare_server_boot(
+    args: &Args,
+    namespace: khive_runtime::Namespace,
+    namespace_explicit: bool,
+    actor_explicit: bool,
+) -> anyhow::Result<PreparedServerBoot> {
     let (config, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
@@ -3582,6 +3667,25 @@ async fn build_server_inner(
         )?;
     }
 
+    Ok(PreparedServerBoot {
+        config,
+        db_anchor,
+        khive_cfg,
+    })
+}
+
+async fn build_server_from_prepared(
+    args: &Args,
+    prepared: PreparedServerBoot,
+    mcp_host: bool,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
+) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
+    let PreparedServerBoot {
+        config,
+        db_anchor,
+        khive_cfg,
+    } = prepared;
+
     let max_readers = if mcp_host {
         mcp_max_readers(args, &config, &khive_cfg.backends, None)
     } else {
@@ -3596,8 +3700,13 @@ async fn build_server_inner(
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
-        let runtime =
-            build_single_backend_runtime_with_max_readers(config, &khive_cfg, max_readers).await?;
+        let runtime = build_single_backend_runtime_with_max_readers(
+            config,
+            &khive_cfg,
+            max_readers,
+            daemon_claims,
+        )
+        .await?;
         #[cfg(feature = "bench-embedder")]
         {
             for name in runtime.registered_embedding_model_names() {
@@ -3635,12 +3744,13 @@ async fn build_server_inner(
     }
 
     // Multi-backend path (ADR-028).
-    let multi = build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+    let multi = build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
         config,
         &khive_cfg,
         args.db.as_deref(),
         db_anchor.as_deref(),
         max_readers,
+        daemon_claims,
     )
     .await?;
     let schedule_rt = writable_schedule_runtime(
@@ -3672,6 +3782,116 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
     canonical_path_no_side_effects(&path)
         .map(Some)
         .map_err(|e| anyhow::anyhow!("backend {}: cannot resolve path: {e}", cfg.name))
+}
+
+/// Resolve the daemon's physical SQLite targets before runtime construction.
+/// The declared topology, when present, owns the actual files; the runtime's
+/// default `db_path` is then only a config-discovery anchor. A `:memory:`
+/// override makes every declared backend ephemeral.
+#[cfg(unix)]
+pub fn daemon_store_paths(
+    resolved_db_path: Option<&std::path::Path>,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut resolved_db_path = resolved_db_path.map(std::path::Path::to_path_buf);
+    let mut db_anchor = resolved_db_path.clone();
+    let mut backends = backends.to_vec();
+    Ok(prepare_daemon_store_plan(
+        &mut resolved_db_path,
+        &mut db_anchor,
+        &mut backends,
+        force_memory,
+    )?
+    .paths)
+}
+
+/// A daemon-only snapshot binding configured spellings to the canonical paths
+/// it will actually open. Alias validation may re-resolve a spelling, but the
+/// open target stays the captured canonical path.
+#[cfg(unix)]
+pub struct DaemonStorePlan {
+    pub paths: Vec<PathBuf>,
+    pub read_only_paths: Vec<PathBuf>,
+    aliases: Vec<(PathBuf, PathBuf)>,
+}
+
+#[cfg(unix)]
+impl DaemonStorePlan {
+    pub fn assert_aliases_unchanged(&self) -> anyhow::Result<()> {
+        for (configured, claimed) in &self.aliases {
+            let current = canonical_path_no_side_effects(configured)?;
+            anyhow::ensure!(
+                current == *claimed,
+                "configured database path {} changed target after claim (claimed {}, now {}); refusing daemon boot",
+                configured.display(),
+                claimed.display(),
+                current.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Freeze every daemon SQLite open path before taking its sidecar claims.
+/// This mutates only the daemon's private boot snapshot; clients and non-daemon
+/// writers retain their original config paths.
+#[cfg(unix)]
+pub fn prepare_daemon_store_plan(
+    resolved_db_path: &mut Option<PathBuf>,
+    db_anchor: &mut Option<PathBuf>,
+    backends: &mut [BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<DaemonStorePlan> {
+    if force_memory {
+        return Ok(DaemonStorePlan {
+            paths: Vec::new(),
+            read_only_paths: Vec::new(),
+            aliases: Vec::new(),
+        });
+    }
+    let mut paths = Vec::new();
+    let mut read_only_paths = Vec::new();
+    let mut aliases = Vec::new();
+    if let Some(original) = resolved_db_path.clone() {
+        let canonical = canonical_path_no_side_effects(&original)?;
+        *resolved_db_path = Some(canonical.clone());
+        if db_anchor.is_some() {
+            *db_anchor = Some(canonical.clone());
+        }
+        if backends.is_empty() {
+            // The legacy single-backend constructor infers read-only mode
+            // from an existing file's permissions. Bind its daemon claim in
+            // the same mode so a chmod-frozen snapshot still boots.
+            if std::fs::metadata(&canonical).is_ok_and(|metadata| metadata.permissions().readonly())
+            {
+                read_only_paths.push(canonical.clone());
+            }
+            aliases.push((original, canonical.clone()));
+            paths.push(canonical);
+        }
+    }
+    for backend in backends.iter_mut() {
+        if let Some(canonical) = canonical_backend_path(backend)? {
+            let configured = backend.path.clone().expect("SQLite path was resolved");
+            backend.path = Some(canonical.clone());
+            aliases.push((configured, canonical.clone()));
+            if backend.read_only {
+                read_only_paths.push(canonical.clone());
+            }
+            paths.push(canonical);
+        }
+    }
+    validate_effective_backend_alias_modes(backends)?;
+    paths.sort();
+    paths.dedup();
+    read_only_paths.sort();
+    read_only_paths.dedup();
+    Ok(DaemonStorePlan {
+        paths,
+        read_only_paths,
+        aliases,
+    })
 }
 
 /// Bound on final-component symlink hops [`canonical_path_no_side_effects`]
@@ -4066,15 +4286,19 @@ pub async fn build_single_backend_runtime(
     config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<KhiveRuntime> {
-    build_single_backend_runtime_with_max_readers(config, khive_cfg, None).await
+    build_single_backend_runtime_with_max_readers(config, khive_cfg, None, None).await
 }
 
 async fn build_single_backend_runtime_with_max_readers(
     config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     max_readers: Option<usize>,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
     let backend = Arc::new(open_single_backend(&config, max_readers)?);
+    if let Some(claims) = daemon_claims {
+        khive_runtime::daemon::assert_daemon_store_identities(claims)?;
+    }
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator =
@@ -8439,6 +8663,260 @@ region = "us-east-1"
              must canonicalize to the same target as the real directory: {resolved_via_symlink:?} \
              vs {resolved_via_real:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_store_paths_follow_physical_backends_not_the_home_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let main = real.join("main.db");
+        let canonical_main = std::fs::canonicalize(&real).unwrap().join("main.db");
+        let khive_cfg = sqlite_multi_backend_config(main.clone(), alias.join("main.db"));
+        let unrelated_home_anchor = dir.path().join("other-home/.khive/khive.db");
+
+        assert_eq!(
+            daemon_store_paths(Some(&unrelated_home_anchor), &khive_cfg.backends, false).unwrap(),
+            vec![canonical_main.clone()],
+            "two declared aliases must take one store lock independent of HOME"
+        );
+        let mut boot_db = Some(unrelated_home_anchor.clone());
+        let mut boot_anchor = boot_db.clone();
+        let mut boot_backends = khive_cfg.backends.clone();
+        let plan =
+            prepare_daemon_store_plan(&mut boot_db, &mut boot_anchor, &mut boot_backends, false)
+                .unwrap();
+        assert_eq!(plan.paths, vec![canonical_main.clone()]);
+        assert!(
+            boot_backends
+                .iter()
+                .all(|backend| backend.path.as_deref() == Some(canonical_main.as_path())),
+            "every declared alias must open the frozen claimed pathname"
+        );
+        assert!(
+            !main.exists() && !unrelated_home_anchor.exists(),
+            "target discovery must not open a database"
+        );
+        assert!(
+            daemon_store_paths(Some(&unrelated_home_anchor), &khive_cfg.backends, true)
+                .unwrap()
+                .is_empty(),
+            ":memory: overrides every declared file backend"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_run_refuses_cross_home_store_overlap_before_opening_sqlite() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+        use clap::Parser;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().expect("canonical fixture");
+        let database = root.join("shared/khive.db");
+        let config = root.join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = 'main'\npath = {:?}\n",
+                database.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let first = khive_runtime::daemon::acquire_daemon_store_guards([database.clone()])
+            .expect("incumbent store claim");
+        let second_home = root.join("second-home");
+        std::fs::create_dir(&second_home).unwrap();
+        let _home_guard = HomeGuard::redirect_to(&second_home);
+        let args = Args::parse_from([
+            "mcp",
+            "--daemon",
+            "--config",
+            config.to_str().unwrap(),
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let registry = TransportRegistry::with_builtins();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), run(args, &registry))
+            .await
+            .expect("store overlap must refuse promptly, before serving")
+            .expect_err("daemon cannot serve a store claimed under another HOME");
+        let message = error.to_string();
+        assert!(message.contains("already running"), "{message}");
+        assert!(
+            message.contains(&format!("pid {}", std::process::id())),
+            "{message}"
+        );
+        assert!(
+            !database.exists(),
+            "refusal must precede SQLite construction"
+        );
+        assert!(!second_home.join(".khive/khive.db").exists());
+        drop(first);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_store_plan_refuses_retargeted_symlink_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("first.db");
+        let second = fixture.path().join("second.db");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let alias = fixture.path().join("configured.db");
+        symlink(&first, &alias).unwrap();
+
+        let mut configured = Some(alias.clone());
+        let mut anchor = configured.clone();
+        let mut backends = Vec::new();
+        let plan = prepare_daemon_store_plan(&mut configured, &mut anchor, &mut backends, false)
+            .expect("resolve original alias once");
+        let claimed = first.canonicalize().unwrap();
+        assert_eq!(configured.as_deref(), Some(claimed.as_path()));
+        assert_eq!(plan.paths, vec![claimed.clone()]);
+        let _guards = khive_runtime::daemon::acquire_daemon_store_guards(plan.paths.clone())
+            .expect("claim original target");
+
+        let replacement_alias = fixture.path().join("new-link");
+        symlink(&second, &replacement_alias).unwrap();
+        std::fs::rename(replacement_alias, &alias).unwrap();
+        let error = plan
+            .assert_aliases_unchanged()
+            .expect_err("retargeting the configured spelling must refuse before open");
+        let message = error.to_string();
+        assert!(
+            message.contains(&claimed.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second.canonicalize().unwrap().display().to_string()),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_retains_store_guard_while_its_socket_is_serving() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+        use clap::Parser;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().expect("canonical fixture");
+        let database = root.join("served.db");
+        let args = Args::parse_from([
+            "mcp",
+            "--daemon",
+            "--db",
+            database.to_str().unwrap(),
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let daemon = tokio::spawn(async move {
+            let registry = TransportRegistry::with_builtins();
+            run(args, &registry).await
+        });
+        let socket = khive_runtime::daemon::socket_path();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !socket.exists() {
+            assert!(
+                !daemon.is_finished(),
+                "daemon exited before binding its socket"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "daemon did not bind its socket"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let error = khive_runtime::daemon::acquire_daemon_store_guards([database])
+            .expect_err("a serving daemon must retain its store claim");
+        assert!(error.to_string().contains("already running"), "{error}");
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_run_serves_chmod_read_only_single_backend_snapshot() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().expect("canonical fixture");
+        let database = root.join("snapshot.db");
+        let db_arg = database.to_str().expect("utf8 fixture path");
+        let seed_args = Args::parse_from(["mcp", "--db", db_arg, "--no-embed", "--pack", "kg"]);
+        {
+            let (_server, _schedule_rt) = build_server(&seed_args)
+                .await
+                .expect("seed current kg schema before freezing snapshot");
+        }
+        let mut permissions = std::fs::metadata(&database).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&database, permissions).unwrap();
+        freeze_snapshot_sidecars(&database);
+
+        let mut planned_db = Some(database.clone());
+        let mut db_anchor = planned_db.clone();
+        let mut backends = Vec::new();
+        let plan = prepare_daemon_store_plan(&mut planned_db, &mut db_anchor, &mut backends, false)
+            .expect("plan the undeclared single-backend store");
+        assert_eq!(plan.paths, vec![database.clone()]);
+        assert_eq!(
+            plan.read_only_paths,
+            vec![database.clone()],
+            "the daemon claim must use the backend's chmod-detected read-only mode"
+        );
+
+        let args = Args::parse_from([
+            "mcp",
+            "--daemon",
+            "--db",
+            db_arg,
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let daemon = tokio::spawn(async move {
+            let registry = TransportRegistry::with_builtins();
+            run(args, &registry).await
+        });
+        let socket = khive_runtime::daemon::socket_path();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !socket.exists() {
+            if daemon.is_finished() {
+                let outcome = daemon.await.expect("join daemon boot");
+                panic!("read-only daemon exited before binding its socket: {outcome:?}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "read-only daemon did not bind its socket"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        daemon.abort();
+        let _ = daemon.await;
     }
 
     /// A `..` inside the not-yet-created tail used to be dropped (recorded as

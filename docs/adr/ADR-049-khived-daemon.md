@@ -1531,3 +1531,103 @@ auto/table formats preserve the full `bridge_instance_id`. A replaced bridge exe
 does not mask this memory-only read. A real in-place re-exec leaves PID continuity possible
 but changes `bridge_instance_id` and restarts all counts. A daemon-side frame counter or log
 proves that the diagnostics operation, including help and formatted reads, was never forwarded.
+
+## Amendment 13 (2026-09-27): daemon ownership follows claimed stores
+
+**Status**: Accepted.
+
+### Context
+
+ADR-049's accepted daemon singleton is scoped to one socket/PID rendezvous. Its
+HOME-derived socket path and the matching boot/recovery lock do not identify a
+SQLite store (`docs/adr/ADR-049-khived-daemon.md`, lines 94–97 and 281–286).
+Two serving processes with different HOME values can therefore open the same
+absolute `[[backends]].path`. ADR-028 already deduplicates configured SQLite
+backends by canonical pathname (`docs/adr/ADR-028-pack-scoped-backends.md`,
+lines 366–370); that pathname is the ownership key for this amendment.
+
+### Decision
+
+An OSS serving daemon claims every distinct file-backed SQLite pathname in its
+effective topology before opening SQLite or running migrations. The claim is
+independent of HOME, socket, PID file, and recovery lock. A declared backend
+topology supplies its effective SQLite paths; an implicit single backend
+supplies the resolved database path. An in-memory target supplies none. Sort
+and deduplicate canonical paths before claiming. If a claim's derived lock
+sidecar pathname is itself a configured database pathname, refuse the whole
+boot before opening any sidecar for writing; after opening each sidecar but
+before locking or truncating it, refuse when the opened descriptor's
+`(device, inode)` matches any configured database identity observed at claim
+time or its hard-link count exceeds one (a configured database missing at
+claim time remains covered by the pathname preflight). If one claim is unavailable
+or contended, abort the entire boot and release earlier claims. Hold all
+claims through serving and shutdown. Never unlink a lock sidecar. A contender
+refuses even when the holder PID is temporarily unavailable; PID text is only
+best-effort diagnostic evidence. Ordinary non-daemon stdio/local writers
+retain their existing coordination and are outside this daemon singleton
+guarantee. With the HOME boot lock held, an identified daemon already serving
+the same socket retains ADR-049's socket-owner refusal before store claims are
+attempted. This bounded, read-only protocol probe neither opens SQLite nor
+changes the rendezvous. An absent or unidentified socket proceeds to the store
+claims; those claims still precede every SQLite open and migration. The normal
+socket/PID boot fence remains authoritative after construction.
+
+Each claim uses a persistent `.DATABASE.khived.lock` sibling of the canonical
+database pathname. After the sidecar lock is held, freeze that canonical path
+as the _only_ path passed to SQLite. Re-resolve the configured spelling once
+for validation before opening; if a symlink now targets another path, refuse
+and name both the claimed and current paths. Validation must not replace the
+frozen open target.
+
+For a regular file present at claim, record `(device, inode)`. For a
+missing writable target, keep a Missing claim state, create/open the frozen
+path under the held lock, and bind its newly observed `(device, inode)`.
+Missing read-only targets refuse without creation. Re-stat each canonical path
+immediately after its SQLite backend opens and before schema preparation, then
+again before serving; observed identity drift fails boot. This post-open path
+check is not an atomic proof of SQLite's opened file
+descriptor: the SQLite binding used here does not expose that descriptor's
+identity (`crates/khive-mcp/src/serve.rs`, `reverify_reindex_target_identity`
+comment). Concurrent replace-and-restore within the gap remains a stated
+limitation.
+
+The guarantee is **per stable canonical pathname among participating daemon
+boots**, not per physical inode across distinct hardlink names. Symlink
+spellings that resolve to one stable pathname converge. A hardlink's distinct
+pathname gets a distinct sidecar, so another daemon can claim it even while
+the first daemon serves the same inode; hardlink aliases are unsupported. The repository test
+`store_guard_hardlink_names_remain_independent_unsupported_aliases` in
+`crates/khive-runtime/src/daemon.rs` demonstrates the separate claims. This
+is a property of the sidecar scheme, not a claim about SQLite's support for
+multi-link database files. A sidecar hardlinked to any file is refused before
+lock or truncation. Replacing a database at the same canonical pathname does not erase its
+persistent sidecar claim.
+
+### Acceptance and controls
+
+1. Distinct HOME rendezvous with one absolute SQLite store: the second daemon
+   refuses before constructing SQLite and names the contended store.
+2. Multiple declared backends with one shared secondary canonical path: the
+   second daemon refuses the full topology and drops any earlier claims.
+3. A configured symlink retargeted after claim is refused before open, with
+   both paths named; mutation of alias revalidation turns its named test red.
+4. A canonical file replaced after claim/binding is refused on the post-open
+   `(device, inode)` check; a no-op post-open assertion turns its named test red.
+5. A fresh writable database is created and identity-bound only after its
+   sidecar claim; a missing read-only target is not created. A serving daemon
+   retains every claim until shutdown.
+6. A second claim through a distinct hardlink name succeeds in the fixture,
+   documenting the excluded alias rather than accidentally promising safety.
+7. A claim set whose derived lock sidecar is another configured database
+   refuses the whole boot before any sidecar is opened for writing; an opened
+   sidecar whose descriptor identity matches a configured database or whose
+   hard-link count exceeds one refuses before lock or truncation.
+   `store_guard_refuses_a_database_at_another_stores_lock_sidecar` goes red if
+   the pathname preflight is dropped;
+   `store_guard_names_a_configured_database_matching_the_opened_sidecar` and
+   `store_guard_refuses_hardlinked_sidecar_before_lock_or_truncate` cover the
+   descriptor-identity and hard-link arms, respectively.
+
+The HOME boot/recovery lock still serializes startup and client recovery for
+one rendezvous. This amendment adds a separate store claim; it does not
+replace that lock or extend daemon ownership to non-daemon writers.
