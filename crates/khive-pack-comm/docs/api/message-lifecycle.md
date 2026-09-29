@@ -653,7 +653,10 @@ commits a `quarantine-original` note attachment with that same reference in the
 note's transaction. This attachment is the blob sweep's liveness root; metadata
 alone does not own stored bytes. A duplicate transport id repairs a missing
 attachment only when its stored reference matches the replayed bytes and the
-exact channel kind and slug match. A matching channel-scoped replay also
+exact channel kind and slug match. The one-release legacy IMAP lookup applies
+those same ownership checks before acknowledging a quarantined replay; the
+old-key note is not rewritten, though a missing matching attachment can be
+restored. A matching channel-scoped replay also
 installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed

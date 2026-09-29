@@ -2104,4 +2104,175 @@ mod tests {
              none repeated"
         );
     }
+
+    // Use the builders themselves, then pass the same fields as serve.rs's
+    // channel poll loop. The replay bytes are handled separately by the loop.
+    fn quarantine_ingest_cases() -> Vec<(&'static str, ChannelEnvelope)> {
+        let ch = build_channel("maintainer@example.com", vec![]);
+        let gate_email = make_email("outsider@example.com", "imap:imap.example.com:17:41");
+        vec![
+            (
+                "attribution gate",
+                ch.quarantine_envelope(&gate_email, QuarantineReason::OffAllowlist),
+            ),
+            (
+                "malformed UID",
+                ch.malformed_quarantine_envelope(
+                    42,
+                    "imap:imap.example.com:17:42",
+                    QuarantineReason::MissingBody,
+                    None,
+                ),
+            ),
+        ]
+    }
+
+    fn quarantine_ingest_params(env: &ChannelEnvelope, slug: &str) -> serde_json::Value {
+        serde_json::json!({
+            "namespace": "local",
+            "from": env.from.clone(),
+            "to": env.to.clone(),
+            "content": env.content.clone(),
+            "subject": env.subject.clone(),
+            "channel_kind": "email",
+            "channel_slug": slug,
+            "external_id": env.external_id.clone(),
+            "legacy_external_id": env.legacy_external_id.clone(),
+            "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
+            "correlation_external_id": env.correlation_external_id.clone(),
+            "default_inbound_actor": "lambda:maintainer",
+            "wire_message_id": env.wire_message_id.clone(),
+            "wire_references": env.wire_references.clone(),
+            "metadata": env.metadata.clone(),
+        })
+    }
+
+    fn quarantine_ingest_registry() -> (khive_runtime::VerbRegistry, khive_runtime::KhiveRuntime) {
+        use khive_pack_comm as _;
+        use khive_pack_kg as _;
+        use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(
+            &["kg".to_string(), "comm".to_string()],
+            runtime.clone(),
+            &mut builder,
+        )
+        .expect("register packs");
+        builder.with_default_namespace("local");
+        (builder.build().expect("build registry"), runtime)
+    }
+
+    #[tokio::test]
+    async fn both_email_quarantine_builders_ingest_on_first_call() {
+        use khive_runtime::Namespace;
+
+        for (builder, env) in quarantine_ingest_cases() {
+            let (registry, runtime) = quarantine_ingest_registry();
+            let params = quarantine_ingest_params(&env, "user@example.com");
+            let reason = env
+                .metadata
+                .get("quarantine_reason")
+                .expect("adapter reason");
+            assert!(params["legacy_external_id"].is_string(), "{builder}");
+            assert_eq!(params["metadata"]["quarantined"], "true", "{builder}");
+
+            let first = registry
+                .dispatch("comm.ingest", params.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{builder} first ingest: {error}"));
+            assert_eq!(first["deduplicated"], false, "{builder}");
+            let retry = registry
+                .dispatch("comm.ingest", params)
+                .await
+                .unwrap_or_else(|error| panic!("{builder} retry: {error}"));
+            assert_eq!(retry["deduplicated"], true, "{builder}");
+            assert_eq!(retry["thread_id"], first["thread_id"], "{builder}");
+
+            let token = runtime.authorize(Namespace::local()).expect("local token");
+            let notes = runtime.notes(&token).expect("note store");
+            assert_eq!(
+                notes.count_notes("local", Some("message")).await.unwrap(),
+                1,
+                "{builder}"
+            );
+            let id = first["full_id"]
+                .as_str()
+                .expect("note id")
+                .parse()
+                .expect("UUID");
+            let note = notes.get_note(id).await.unwrap().expect("quarantine note");
+            let props = note.properties.expect("message properties");
+            assert_eq!(
+                props["external_id"],
+                env.external_id.as_deref().unwrap(),
+                "{builder}"
+            );
+            assert_eq!(
+                props["quarantine_reason"].as_str(),
+                Some(reason.as_str()),
+                "{builder}"
+            );
+            assert_eq!(props["quarantined"], "true", "{builder}");
+            assert_eq!(props["from_actor"], EMAIL_QUARANTINE_SENDER, "{builder}");
+        }
+    }
+
+    #[tokio::test]
+    async fn both_email_quarantine_builders_dedup_old_key_without_rewriting_it() {
+        use khive_runtime::Namespace;
+
+        for (builder, env) in quarantine_ingest_cases() {
+            let (registry, runtime) = quarantine_ingest_registry();
+            let mut old_params = quarantine_ingest_params(&env, "user@example.com");
+            let old_id = env.legacy_external_id.as_deref().expect("old IMAP key");
+            old_params["external_id"] = serde_json::json!(old_id);
+            old_params
+                .as_object_mut()
+                .unwrap()
+                .remove("legacy_external_id");
+            let old = registry
+                .dispatch("comm.ingest", old_params)
+                .await
+                .unwrap_or_else(|error| panic!("{builder} old-key seed: {error}"));
+            assert_eq!(old["deduplicated"], false, "{builder}");
+
+            let replay = registry
+                .dispatch(
+                    "comm.ingest",
+                    quarantine_ingest_params(&env, "user@example.com"),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{builder} old-key replay: {error}"));
+            assert_eq!(replay["deduplicated"], true, "{builder}");
+            assert_eq!(replay["thread_id"], old["thread_id"], "{builder}");
+
+            let token = runtime.authorize(Namespace::local()).expect("local token");
+            let notes = runtime.notes(&token).expect("note store");
+            assert_eq!(
+                notes.count_notes("local", Some("message")).await.unwrap(),
+                1,
+                "{builder}"
+            );
+            let id = old["full_id"]
+                .as_str()
+                .expect("note id")
+                .parse()
+                .expect("UUID");
+            let note = notes
+                .get_note(id)
+                .await
+                .unwrap()
+                .expect("old quarantine note");
+            let props = note.properties.expect("message properties");
+            assert_eq!(props["external_id"], old_id, "{builder}");
+            assert_eq!(
+                props["quarantine_reason"].as_str(),
+                env.metadata.get("quarantine_reason").map(String::as_str),
+                "{builder}"
+            );
+            assert_eq!(props["quarantined"], "true", "{builder}");
+        }
+    }
 }

@@ -5688,7 +5688,7 @@ async fn imap_account_keys_keep_accounts_distinct_and_recognize_same_account_leg
 }
 
 #[tokio::test]
-async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
+async fn imap_legacy_key_repairs_duplicate_quarantine_before_ack() {
     use khive_storage::BlobStore as _;
 
     let (registry, runtime) = build_registry_for_ns("local");
@@ -5701,6 +5701,10 @@ async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
         .put(b"quarantined original".to_vec())
         .await
         .expect("publish original");
+    let wrong_ref = blob_store
+        .put(b"different original".to_vec())
+        .await
+        .expect("publish different original");
     runtime
         .install_blob_store(blob_store)
         .expect("install blob store");
@@ -5732,32 +5736,57 @@ async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
         .await
         .expect("leave metadata-only legacy row"));
 
+    let replay = |content_ref: String| {
+        serde_json::json!({
+            "from": "email:quarantine", "to": "email:a@example.com",
+            "content": "quarantined replay", "channel_kind": "email",
+            "channel_slug": "a@example.com", "external_id": new_id,
+            "legacy_external_id": old_id,
+            "metadata": {
+                "quarantined": true,
+                "quarantine_content_ref": content_ref,
+            },
+        })
+    };
     let error = registry
-        .dispatch(
-            "comm.ingest",
-            serde_json::json!({
-                "from": "email:quarantine", "to": "email:a@example.com",
-                "content": "quarantined replay", "channel_kind": "email",
-                "channel_slug": "a@example.com", "external_id": new_id,
-                "legacy_external_id": old_id,
-                "metadata": {
-                    "quarantined": true,
-                    "quarantine_content_ref": original_ref.to_string(),
-                },
-            }),
-        )
+        .dispatch("comm.ingest", replay(wrong_ref.to_string()))
         .await
-        .expect_err("a legacy-key ack must not bypass quarantine ownership repair");
+        .expect_err("different original bytes must not receive a duplicate ack");
     assert!(matches!(
         error,
         khive_runtime::RuntimeError::InvalidInput(message)
-            if message.contains("legacy_external_id cannot be combined with quarantine metadata")
+            if message.contains("duplicate quarantine external_id holds different original bytes")
     ));
     assert!(attachments
         .get_attachment(note_id, "quarantine-original")
         .await
         .expect("attachment lookup")
         .is_none());
+
+    let duplicate = registry
+        .dispatch("comm.ingest", replay(original_ref.to_string()))
+        .await
+        .expect("matching legacy quarantine replay repairs before ack");
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(duplicate["thread_id"], original["thread_id"]);
+    let attachment = attachments
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .expect("owner repaired");
+    assert_eq!(attachment.content_ref, original_ref);
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime.notes(&token).expect("note store");
+    assert_eq!(
+        notes.count_notes("local", Some("message")).await.unwrap(),
+        1
+    );
+    let old_note = notes
+        .get_note(note_id)
+        .await
+        .unwrap()
+        .expect("old row retained");
+    assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
 }
 
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
