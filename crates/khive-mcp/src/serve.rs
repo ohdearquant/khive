@@ -3850,6 +3850,13 @@ pub fn prepare_daemon_store_plan(
             *db_anchor = Some(canonical.clone());
         }
         if backends.is_empty() {
+            // The legacy single-backend constructor infers read-only mode
+            // from an existing file's permissions. Bind its daemon claim in
+            // the same mode so a chmod-frozen snapshot still boots.
+            if std::fs::metadata(&canonical).is_ok_and(|metadata| metadata.permissions().readonly())
+            {
+                read_only_paths.push(canonical.clone());
+            }
             aliases.push((original, canonical.clone()));
             paths.push(canonical);
         }
@@ -8830,6 +8837,74 @@ region = "us-east-1"
         let error = khive_runtime::daemon::acquire_daemon_store_guards([database])
             .expect_err("a serving daemon must retain its store claim");
         assert!(error.to_string().contains("already running"), "{error}");
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_run_serves_chmod_read_only_single_backend_snapshot() {
+        if crate::test_isolation::rerun_with_private_home() {
+            return;
+        }
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().expect("canonical fixture");
+        let database = root.join("snapshot.db");
+        let db_arg = database.to_str().expect("utf8 fixture path");
+        let seed_args = Args::parse_from(["mcp", "--db", db_arg, "--no-embed", "--pack", "kg"]);
+        {
+            let (_server, _schedule_rt) = build_server(&seed_args)
+                .await
+                .expect("seed current kg schema before freezing snapshot");
+        }
+        let mut permissions = std::fs::metadata(&database).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&database, permissions).unwrap();
+        freeze_snapshot_sidecars(&database);
+
+        let mut planned_db = Some(database.clone());
+        let mut db_anchor = planned_db.clone();
+        let mut backends = Vec::new();
+        let plan = prepare_daemon_store_plan(&mut planned_db, &mut db_anchor, &mut backends, false)
+            .expect("plan the undeclared single-backend store");
+        assert_eq!(plan.paths, vec![database.clone()]);
+        assert_eq!(
+            plan.read_only_paths,
+            vec![database.clone()],
+            "the daemon claim must use the backend's chmod-detected read-only mode"
+        );
+
+        let args = Args::parse_from([
+            "mcp",
+            "--daemon",
+            "--db",
+            db_arg,
+            "--no-embed",
+            "--pack",
+            "kg",
+        ]);
+        let daemon = tokio::spawn(async move {
+            let registry = TransportRegistry::with_builtins();
+            run(args, &registry).await
+        });
+        let socket = khive_runtime::daemon::socket_path();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !socket.exists() {
+            if daemon.is_finished() {
+                let outcome = daemon.await.expect("join daemon boot");
+                panic!("read-only daemon exited before binding its socket: {outcome:?}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "read-only daemon did not bind its socket"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         daemon.abort();
         let _ = daemon.await;
     }
