@@ -81,6 +81,9 @@ pub(crate) struct AtomicNoteOptions<'a> {
     pub embedding_content: Option<&'a str>,
     pub embed: Option<bool>,
     pub key: Option<&'a str>,
+    /// Keyed memory only: persist a zero-model receipt header and each model's
+    /// exact log-upsert rowid in this same atomic unit.
+    pub memory_visibility_receipt: bool,
     /// Ask the writer transaction to compare a live key holder against this
     /// candidate and report the result (ADR-172 Amendment 6). Every other
     /// keyed route defaults this to `false` and gets today's Details shape
@@ -646,6 +649,24 @@ pub(crate) async fn prepare_atomic_note_requests(
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
 
+        if requests[note_idx].options.memory_visibility_receipt {
+            statements.push(PlanStatement {
+                statement: SqlStatement {
+                    sql:
+                        "INSERT INTO memory_visibility_receipts (namespace, note_id, model_count) \
+                          VALUES (?1, ?2, ?3)"
+                            .into(),
+                    params: vec![
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(note.id.to_string()),
+                        SqlValue::Integer(note_models[note_idx].len() as i64),
+                    ],
+                    label: Some("memory-visibility-receipt".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+        }
+
         if let Some(fault) = maybe_inject_fts_failure(&note.namespace, "fault-injected-fts") {
             statements.push(fault);
         } else {
@@ -700,6 +721,27 @@ pub(crate) async fn prepare_atomic_note_requests(
                     &outcome.vector,
                     &format!("atomic-message-vec-{table}-{}", note.id),
                 ));
+                if requests[note_idx].options.memory_visibility_receipt {
+                    // The preceding statement is the model's ann_write_log
+                    // upsert. Keep this insert adjacent: last_insert_rowid()
+                    // reads that exact transaction-local sequence, never a
+                    // later MAX(seq) vulnerable to concurrency/compaction.
+                    statements.push(PlanStatement {
+                        statement: SqlStatement {
+                            sql: "INSERT INTO memory_visibility_fences \
+                                  (namespace, note_id, model, ann_write_log_seq) \
+                                  VALUES (?1, ?2, ?3, last_insert_rowid())"
+                                .into(),
+                            params: vec![
+                                SqlValue::Text(note.namespace.clone()),
+                                SqlValue::Text(note.id.to_string()),
+                                SqlValue::Text(model_name.clone()),
+                            ],
+                            label: Some("memory-visibility-fence".into()),
+                        },
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    });
+                }
             }
         }
 

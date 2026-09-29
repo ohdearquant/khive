@@ -7,14 +7,21 @@ use khive_storage::{AtomicUnitOp, SqlStatement, SqlValue};
 
 use crate::{KhiveRuntime, RuntimeError, RuntimeResult};
 
+struct NoteIndexRevision {
+    applied: bool,
+    ann_write_log_seq: Option<i64>,
+}
+
 impl KhiveRuntime {
     pub(crate) async fn apply_note_index_revision(
         &self,
         note: &Note,
         statements: Vec<SqlStatement>,
     ) -> RuntimeResult<bool> {
-        self.apply_note_revision_statements(note, statements, false)
-            .await
+        Ok(self
+            .apply_note_revision_statements(note, statements, false, false)
+            .await?
+            .applied)
     }
 
     pub(crate) async fn publish_note_vector_revision(
@@ -24,6 +31,48 @@ impl KhiveRuntime {
         model_name: &str,
         vector: &[f32],
     ) -> RuntimeResult<bool> {
+        Ok(self
+            .publish_note_vector_revision_inner(token, note, model_name, vector, false)
+            .await?
+            .applied)
+    }
+
+    /// Return the exact upsert-log sequence from the same transaction that
+    /// published this note's vector. A version-guard miss writes no vector and
+    /// returns `None`; callers must never substitute a later `MAX(seq)` read.
+    pub(crate) async fn publish_note_vector_revision_with_seq(
+        &self,
+        token: &crate::NamespaceToken,
+        note: &Note,
+        model_name: &str,
+        vector: &[f32],
+    ) -> RuntimeResult<Option<u64>> {
+        let revision = self
+            .publish_note_vector_revision_inner(token, note, model_name, vector, true)
+            .await?;
+        if !revision.applied {
+            return Ok(None);
+        }
+        let seq = revision
+            .ann_write_log_seq
+            .and_then(|seq| u64::try_from(seq).ok())
+            .filter(|seq| *seq > 0)
+            .ok_or_else(|| {
+                RuntimeError::Internal(
+                    "note vector revision committed without a positive ANN log sequence".into(),
+                )
+            })?;
+        Ok(Some(seq))
+    }
+
+    async fn publish_note_vector_revision_inner(
+        &self,
+        token: &crate::NamespaceToken,
+        note: &Note,
+        model_name: &str,
+        vector: &[f32],
+        capture_ann_seq: bool,
+    ) -> RuntimeResult<NoteIndexRevision> {
         let (model_name, dimensions) = self.vector_model_metadata(model_name)?;
         self.backend().vectors_for_namespace(
             &crate::config::sanitize_key(&model_name),
@@ -61,7 +110,8 @@ impl KhiveRuntime {
         .into_iter()
         .map(|planned| planned.statement)
         .collect();
-        self.apply_note_index_revision(note, statements).await
+        self.apply_note_revision_statements(note, statements, false, capture_ann_seq)
+            .await
     }
 
     pub(crate) async fn compensate_note_creation(&self, note: &Note) -> bool {
@@ -112,8 +162,10 @@ impl KhiveRuntime {
                 khive_storage::attachment::AttachmentSubstrate::Note,
             ),
         );
-        self.apply_note_revision_statements(note, statements, true)
-            .await
+        Ok(self
+            .apply_note_revision_statements(note, statements, true, false)
+            .await?
+            .applied)
     }
 
     async fn apply_note_revision_statements(
@@ -121,7 +173,8 @@ impl KhiveRuntime {
         note: &Note,
         statements: Vec<SqlStatement>,
         purge_vectors: bool,
-    ) -> RuntimeResult<bool> {
+        capture_ann_seq: bool,
+    ) -> RuntimeResult<NoteIndexRevision> {
         let namespace = note.namespace.clone();
         let id = note.id.to_string();
         let version = note.version;
@@ -133,7 +186,10 @@ impl KhiveRuntime {
                 vec![SqlValue::Text(namespace), SqlValue::Text(id)],
             )).await?;
                 if !matches!(current, Some(SqlValue::Integer(current)) if current == version) {
-                    return Ok(Box::new(false) as Box<dyn Any + Send>);
+                    return Ok(Box::new(NoteIndexRevision {
+                        applied: false,
+                        ann_write_log_seq: None,
+                    }) as Box<dyn Any + Send>);
                 }
                 if purge_vectors {
                     purge.apply(writer).await?;
@@ -141,13 +197,30 @@ impl KhiveRuntime {
                 for statement in statements {
                     writer.execute(statement).await?;
                 }
-                Ok(Box::new(true) as Box<dyn Any + Send>)
+                let ann_write_log_seq = if capture_ann_seq {
+                    match writer
+                        .query_scalar(crate::note_write::statement(
+                            "SELECT last_insert_rowid()",
+                            Vec::new(),
+                        ))
+                        .await?
+                    {
+                        Some(SqlValue::Integer(seq)) => Some(seq),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                Ok(Box::new(NoteIndexRevision {
+                    applied: true,
+                    ann_write_log_seq,
+                }) as Box<dyn Any + Send>)
             })
         });
         self.sql()
             .atomic_unit(op)
             .await?
-            .downcast::<bool>()
+            .downcast::<NoteIndexRevision>()
             .map(|result| *result)
             .map_err(|_| RuntimeError::Internal("invalid note index outcome".into()))
     }

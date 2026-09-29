@@ -61,6 +61,9 @@ fn effective_config_uses_defaults() {
         fusion_strategy: None,
         score_floor: None,
         embedding_model: None,
+        consistency: None,
+        visibility_token: None,
+        timeout_ms: None,
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
@@ -92,6 +95,9 @@ fn effective_config_legacy_overrides() {
         fusion_strategy: None,
         score_floor: None,
         embedding_model: None,
+        consistency: None,
+        visibility_token: None,
+        timeout_ms: None,
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
@@ -125,6 +131,9 @@ fn effective_config_explicit_config_wins() {
         fusion_strategy: None,
         score_floor: None,
         embedding_model: None,
+        consistency: None,
+        visibility_token: None,
+        timeout_ms: None,
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
@@ -162,6 +171,9 @@ fn test_weighted_strategy_preserves_pack_weights() {
         fusion_strategy: Some("weighted".to_string()),
         score_floor: None,
         embedding_model: None,
+        consistency: None,
+        visibility_token: None,
+        timeout_ms: None,
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
@@ -222,6 +234,9 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         fusion_strategy: Some("weighted".to_string()),
         score_floor: None,
         embedding_model: None,
+        consistency: None,
+        visibility_token: None,
+        timeout_ms: None,
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
@@ -312,6 +327,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
     let cfg_rrf = RecallConfig {
@@ -328,6 +344,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
     let cfg_weighted = RecallConfig {
@@ -388,6 +405,7 @@ fn vector_only_fusion_unions_hits_across_every_engine() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
@@ -435,6 +453,7 @@ fn vector_only_with_zero_vector_models_never_leaks_text_hits() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
@@ -487,6 +506,7 @@ fn keyword_only_with_zero_vector_models_still_returns_text_hits() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
@@ -549,6 +569,7 @@ fn multi_engine_rrf_gives_each_engine_a_separate_rank_contribution() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
@@ -884,6 +905,7 @@ fn vector_candidates_per_model_shape_is_array_of_model_objects() {
         visible_namespaces: vec!["test".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
         timings: RecallStageTimings::default(),
     };
 
@@ -1126,4 +1148,24 @@ fn recall_handler_schema_params_are_all_accepted_by_recall_params() {
     serde_json::from_value::<RecallParams>(Value::Object(obj)).unwrap_or_else(|e| {
         panic!("RecallParams must accept every HandlerDef-advertised param: {e}")
     });
+}
+
+#[test]
+fn recall_params_distinguish_missing_session_fields_from_explicit_null() {
+    let missing: RecallParams = serde_json::from_value(serde_json::json!({"query": "x"}))
+        .expect("missing session controls are optional");
+    assert!(missing.consistency.is_none());
+    assert!(missing.visibility_token.is_none());
+    assert!(missing.timeout_ms.is_none());
+
+    let explicit_null: RecallParams = serde_json::from_value(serde_json::json!({
+        "query": "x",
+        "consistency": null,
+        "visibility_token": null,
+        "timeout_ms": null
+    }))
+    .expect("explicit null reaches the strict session-control parser");
+    assert_eq!(explicit_null.consistency.as_ref(), Some(&Value::Null));
+    assert_eq!(explicit_null.visibility_token.as_ref(), Some(&Value::Null));
+    assert_eq!(explicit_null.timeout_ms.as_ref(), Some(&Value::Null));
 }
