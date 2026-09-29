@@ -49,6 +49,12 @@ pub(super) fn checkpoint_policy(ann: &SharedAnn) -> CheckpointPolicy {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The replay-versus-rebuild cost boundary is independent of the cumulative
+/// delta-chain compaction limit (ADR-079 Amendment 1, restart rule 7).
+pub(super) fn replay_limit(live: u64, rebuild_fraction: f64) -> u64 {
+    (rebuild_fraction * live as f64).ceil() as u64
+}
+
 pub(super) async fn checkpoint_due(ann: &SharedAnn, key: &AnnKey) -> bool {
     if !ann.builds_corpus_indexes {
         return false;
@@ -64,6 +70,10 @@ pub(super) async fn checkpoint_due(ann: &SharedAnn, key: &AnnKey) -> bool {
 pub(super) fn load_segment(ann: &SharedAnn, dir: &std::path::Path) -> Result<AnnBridge, String> {
     #[cfg(test)]
     ann.segment_load_count.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    if ann.fail_next_segment_load.swap(false, Ordering::SeqCst) {
+        return Err("injected segment re-adoption failure".into());
+    }
     #[cfg(not(test))]
     let _ = ann;
     AnnBridge::load(dir)
@@ -149,17 +159,18 @@ pub(super) async fn maintain_installed(
     epoch: u64,
     details: &mut AnnWarmDetails,
 ) -> Result<InstalledMaintenance, RuntimeError> {
-    let Some((applied, base_ops, delta_raw_ops)) = ann.indexes.read().await.get(key).map(|b| {
+    let Some((applied, live)) = ann.indexes.read().await.get(key).map(|b| {
         (
             b.index.last_applied_seq().unwrap_or(0),
-            b.base_ops,
-            b.delta_raw_ops,
+            b.index.live_count(),
         )
     }) else {
         return Ok(InstalledMaintenance::Absent);
     };
     let policy = checkpoint_policy(ann);
-    let max_delta = delta::compaction_limit(base_ops).saturating_sub(delta_raw_ops);
+    // Bound this *tail* by replay cost. Cumulative delta headroom only chooses
+    // whether the accepted tail publishes another chunk or a full checkpoint.
+    let max_delta = replay_limit(live as u64, policy.rebuild_fraction);
     let IncrementalTail {
         ops,
         applied: new_s,
@@ -200,7 +211,9 @@ pub(super) async fn maintain_installed(
             // Deltas span all namespaces. Empty is the conservative over-fetch policy.
             bridge.namespace_set.clear();
         }
-        let publish = policy.due(bridge);
+        // Crossing the chain limit must compact the already-applied bridge in
+        // this pass. It is not a reason to rescan and rebuild the corpus.
+        let publish = policy.due(bridge) || (raw_count > 0 && bridge.needs_full_compaction());
         if publish && bridge.needs_full_compaction() {
             bridge
                 .consolidate_if_needed(policy.consolidate_tau)
@@ -223,13 +236,20 @@ pub(super) async fn maintain_installed(
             persist_file_checkpoint(rt, ann, model, &dir, bridge, WatermarkAuthority::Active).await;
         drop(indexes);
         match publication {
-            Ok(CheckpointResult::Full(Some(mut reopened))) => {
+            Ok(CheckpointResult::Full {
+                reopened: Some(mut reopened),
+                ..
+            }) => {
                 reopened.generation = generation;
                 reopened.epoch_baseline = epoch;
                 install_replacing(ann, key, *reopened).await;
             }
-            Ok(CheckpointResult::Full(None)) => {
+            Ok(CheckpointResult::Full {
+                reopened: None,
+                base_digest,
+            }) => {
                 if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                    bridge.mark_full_checkpoint_base(base_digest);
                     bridge.mark_checkpointed();
                 }
             }
@@ -278,6 +298,10 @@ pub(super) async fn maintain_installed(
         }
         let mut indexes = ann.indexes.write().await;
         if let Some(bridge) = indexes.get_mut(key) {
+            // A pathless publication has no delta chain to retain or compact.
+            bridge.delta_batches.clear();
+            bridge.delta_raw_ops = 0;
+            bridge.base_ops = bridge.index.num_vectors();
             bridge.mark_checkpointed();
         }
         drop(indexes);

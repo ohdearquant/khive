@@ -178,6 +178,8 @@ pub(crate) struct AnnState {
     #[cfg(test)]
     segment_load_count: AtomicUsize,
     #[cfg(test)]
+    fail_next_segment_load: AtomicBool,
+    #[cfg(test)]
     publication_count: AtomicUsize,
     /// Synchronous so `WarmingGuard::drop` can release it on every exit path.
     warming: std::sync::Mutex<HashSet<AnnKey>>,
@@ -289,6 +291,8 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         checkpoint_timers_enabled: cfg!(not(test)),
         #[cfg(test)]
         segment_load_count: AtomicUsize::new(0),
+        #[cfg(test)]
+        fail_next_segment_load: AtomicBool::new(false),
         #[cfg(test)]
         publication_count: AtomicUsize::new(0),
         warming: std::sync::Mutex::new(HashSet::new()),
@@ -690,6 +694,19 @@ impl AnnBridge {
         self.last_checkpoint = std::time::Instant::now();
     }
 
+    /// A full save can succeed even when the immediate mmap re-adoption fails.
+    /// The retained owned bridge represents that exact durable base and must
+    /// carry its identity before another incremental delta can be published.
+    fn mark_full_checkpoint_base(&mut self, digest: [u8; 32]) {
+        self.commit_digest = Some(digest);
+        self.base_commit_digest = Some(digest);
+        self.base_applied_seq = self.index.last_applied_seq().unwrap_or(0);
+        self.base_ops = self.index.num_vectors();
+        self.delta_batches.clear();
+        self.delta_raw_ops = 0;
+        self.last_delta_nonce = None;
+    }
+
     fn record_delta_batch(
         &mut self,
         ops: Vec<(Uuid, Option<Vec<f32>>)>,
@@ -839,7 +856,7 @@ impl AnnBridge {
     /// record is the gate), then the id-map sidecar bound to the blake3
     /// digest of that record. A crash between the two writes leaves a
     /// digest mismatch that `load` detects as a torn pair.
-    pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
+    pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<[u8; 32], String> {
         let count = self.id_map.len();
         if count != self.index.num_vectors() {
             return Err(format!(
@@ -856,7 +873,8 @@ impl AnnBridge {
                 "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
             })?;
         write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())?;
-        delta::clear(dir)
+        delta::clear(dir)?;
+        Ok(digest)
     }
 
     /// Load a bridge from a segment directory written by `save_atomic`. Any
@@ -3563,7 +3581,15 @@ struct CheckpointPublication {
 }
 
 enum CheckpointResult {
-    Full(Option<Box<AnnBridge>>),
+    Full {
+        reopened: Option<Box<AnnBridge>>,
+        base_digest: [u8; 32],
+    },
+    Delta(delta::DeltaPublication),
+}
+
+enum WrittenCheckpoint {
+    Full([u8; 32]),
     Delta(delta::DeltaPublication),
 }
 
@@ -3615,8 +3641,17 @@ async fn checkpoint_raise_compact_readopt(
     };
 
     match persist_file_checkpoint(rt, ann, model, &dir, &bridge, authority).await {
-        Ok(CheckpointResult::Full(reopened)) => {
-            let mut replacement = reopened.map_or(bridge, |reopened| *reopened);
+        Ok(CheckpointResult::Full {
+            reopened,
+            base_digest,
+        }) => {
+            let mut replacement = match reopened {
+                Some(reopened) => *reopened,
+                None => {
+                    bridge.mark_full_checkpoint_base(base_digest);
+                    bridge
+                }
+            };
             replacement.mark_checkpointed();
             replacement.set_namespace_set(namespace_set);
             install_replacing(ann, key, stamp(replacement)).await
@@ -3715,11 +3750,11 @@ async fn persist_file_checkpoint(
     }
 
     let persisted = if bridge.needs_full_compaction() {
-        bridge.save_atomic(dir).map(|()| None)
+        bridge.save_atomic(dir).map(WrittenCheckpoint::Full)
     } else {
-        delta::write(dir, bridge).map(Some)
+        delta::write(dir, bridge).map(WrittenCheckpoint::Delta)
     };
-    let delta_publication = match persisted {
+    let written = match persisted {
         Ok(publication) => publication,
         Err(e) => {
             tracing::error!(error = %e, "failed to persist memory ANN checkpoint");
@@ -3743,13 +3778,19 @@ async fn persist_file_checkpoint(
     if let Err(e) = compact_log(rt, model).await {
         tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
     }
-    match delta_publication {
-        Some(publication) => Ok(CheckpointResult::Delta(publication)),
-        None => match load_segment(ann, dir) {
-            Ok(mmap_bridge) => Ok(CheckpointResult::Full(Some(Box::new(mmap_bridge)))),
+    match written {
+        WrittenCheckpoint::Delta(publication) => Ok(CheckpointResult::Delta(publication)),
+        WrittenCheckpoint::Full(base_digest) => match load_segment(ann, dir) {
+            Ok(mmap_bridge) => Ok(CheckpointResult::Full {
+                reopened: Some(Box::new(mmap_bridge)),
+                base_digest,
+            }),
             Err(e) => {
                 tracing::warn!(error = %e, "memory ann mmap re-adoption failed; serving Owned build");
-                Ok(CheckpointResult::Full(None))
+                Ok(CheckpointResult::Full {
+                    reopened: None,
+                    base_digest,
+                })
             }
         },
     }
@@ -3803,7 +3844,7 @@ async fn classify_and_adopt_segment(
             "pre-amendment memory v2 segment (no watermark); Cold rebuild");
         return SegmentOutcome::Cold;
     };
-    let (s, persisted_delta_ops) = match effective_persisted_state(seg_dir, base_seq) {
+    let (s, _persisted_delta_ops) = match effective_persisted_state(seg_dir, base_seq) {
         Ok(state) => state,
         Err(error) => {
             tracing::warn!(%error, model, "memory delta commit is invalid; Cold rebuild");
@@ -3888,12 +3929,10 @@ async fn classify_and_adopt_segment(
         return SegmentOutcome::Empty;
     }
 
-    // Rule 7: tail within threshold → Stale-tail: mmap load + final-state
-    // replay, then checkpoint so the next restart's tail starts empty and the
-    // served bridge returns to mmap backing.
-    let threshold =
-        delta::compaction_limit(usize::try_from(info.vector_count).unwrap_or(usize::MAX))
-            .saturating_sub(persisted_delta_ops);
+    // Rule 7: compare replay cost with the live corpus, independently of
+    // cumulative delta-chain headroom. A replay that reaches the chain limit
+    // publishes a full checkpoint after applying the tail.
+    let threshold = replay_limit(live, ann_rebuild_threshold());
     if tail <= threshold {
         let mut bridge = match load_segment(ann, seg_dir) {
             Ok(b) => b,

@@ -286,6 +286,128 @@ async fn dirty_threshold_publishes_once_and_fresh_state_adopts_hot() {
 }
 
 #[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn failed_full_checkpoint_readopt_can_publish_next_incremental_delta() {
+    const MODEL: &str = "ann-full-checkpoint-readopt-fallback-model";
+    let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    for i in 0..SEED_COUNT {
+        write_note(&rt, &token, &format!("readopt fallback seed {i}")).await;
+    }
+    let ann = new_shared();
+    *ann.checkpoint_policy.write().expect("checkpoint policy") = CheckpointPolicy {
+        max_dirty_ops: 1,
+        interval: Duration::ZERO,
+        consolidate_tau: 40_000,
+        rebuild_fraction: 0.20,
+    };
+    let key = AnnKey::new(MODEL);
+    let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+
+    // Control: a bridge without a committed base is not allowed to append a
+    // delta. The fallback below must acquire a real digest from its full save.
+    let mut no_base = AnnBridge::build(vec![1.0; DIMS], DIMS, vec![Uuid::new_v4()], HashSet::new())
+        .expect("build no-base control");
+    no_base.record_delta_batch(vec![(Uuid::new_v4(), None)], 1, 1);
+    assert_eq!(
+        delta::write(&dir, &no_base)
+            .err()
+            .expect("missing base must fail"),
+        "memory delta has no base segment commit",
+        "a missing base digest must refuse delta publication"
+    );
+
+    ann.fail_next_segment_load.store(true, Ordering::SeqCst);
+    let initial = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+        .await
+        .expect("full checkpoint must install fallback");
+    assert!(matches!(
+        initial,
+        AnnEnsureStatus::Built {
+            vectors: SEED_COUNT
+        }
+    ));
+    assert_eq!(ann.segment_load_count.load(Ordering::SeqCst), 1);
+    assert!(
+        !ann.fail_next_segment_load.load(Ordering::SeqCst),
+        "the forced re-adoption failure must have been consumed"
+    );
+    let digest = segment_commit_digest(&dir)
+        .expect("read full checkpoint digest")
+        .expect("full checkpoint exists");
+    let loaded = AnnBridge::load(&dir).expect("saved base is valid without injected failure");
+    assert_eq!(loaded.commit_digest, Some(digest));
+    {
+        let indexes = ann.indexes.read().await;
+        let fallback = indexes.get(&key).expect("owned fallback installed");
+        assert_eq!(fallback.base_commit_digest, Some(digest));
+        assert_eq!(fallback.commit_digest, Some(digest));
+        assert_eq!(
+            fallback.base_applied_seq,
+            fallback.index.last_applied_seq().unwrap()
+        );
+        assert_eq!(fallback.base_ops, SEED_COUNT);
+        assert_eq!(fallback.delta_raw_ops, 0);
+        assert!(fallback.last_delta_nonce.is_none());
+    }
+
+    let text = "incremental write after failed mmap re-adoption";
+    let id = write_note(&rt, &token, text).await;
+    bump_generation(&ann, &key).await;
+    let (_, event) = warm_with_event(&rt, &token, &ann, MODEL).await;
+    assert_eq!(event["path"], "incremental_checkpoint");
+    assert!(dir.join(delta::HEAD_FILE).exists());
+    assert_recalled(&rt, &ann, &key, MODEL, id, text).await;
+    let restarted = AnnBridge::load(&dir).expect("delta based on saved checkpoint must load");
+    assert_eq!(restarted.base_commit_digest, Some(digest));
+    assert!(restarted.id_map.contains(&id));
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn failed_installed_compaction_readopt_resets_base_for_next_delta() {
+    const MODEL: &str = "ann-installed-compaction-readopt-fallback-model";
+    let (rt, token, ann, key, _) = seeded(MODEL).await;
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    {
+        let mut indexes = ann.indexes.write().await;
+        let bridge = indexes.get_mut(&key).expect("seeded bridge");
+        bridge.delta_raw_ops = delta::compaction_limit(bridge.base_ops) - 1;
+    }
+    ann.fail_next_segment_load.store(true, Ordering::SeqCst);
+    write_note(&rt, &token, "write crossing compaction limit").await;
+    bump_generation(&ann, &key).await;
+    let (_, event) = warm_with_event(&rt, &token, &ann, MODEL).await;
+    assert_eq!(event["path"], "incremental_checkpoint");
+    assert!(!ann.fail_next_segment_load.load(Ordering::SeqCst));
+    let digest = segment_commit_digest(&dir)
+        .expect("read compacted commit")
+        .expect("compacted commit exists");
+    {
+        let indexes = ann.indexes.read().await;
+        let fallback = indexes.get(&key).expect("installed owned fallback");
+        assert_eq!(fallback.base_commit_digest, Some(digest));
+        assert_eq!(fallback.commit_digest, Some(digest));
+        assert_eq!(fallback.delta_raw_ops, 0);
+        assert!(fallback.delta_batches.is_empty());
+        assert!(fallback.last_delta_nonce.is_none());
+    }
+
+    ann.checkpoint_policy
+        .write()
+        .expect("checkpoint policy")
+        .max_dirty_ops = 1;
+    let id = write_note(&rt, &token, "write following failed compaction readopt").await;
+    bump_generation(&ann, &key).await;
+    let (_, event) = warm_with_event(&rt, &token, &ann, MODEL).await;
+    assert_eq!(event["path"], "incremental_checkpoint");
+    assert!(dir.join(delta::HEAD_FILE).exists());
+    let reopened = AnnBridge::load(&dir).expect("delta on compacted base must load");
+    assert_eq!(reopened.base_commit_digest, Some(digest));
+    assert!(reopened.id_map.contains(&id));
+}
+
+#[tokio::test]
 #[serial(pathless_fresh_tail)]
 async fn pathless_incremental_checkpoint_keeps_committed_rows_visible_during_publication() {
     const MODEL: &str = "ann-pathless-incremental-checkpoint-race-model";
@@ -399,6 +521,10 @@ async fn pathless_incremental_checkpoint_keeps_committed_rows_visible_during_pub
             .expect("read published watermark"),
         Some((baseline + committed_ids.len() as u64) as i64)
     );
+    let indexes = ann.indexes.read().await;
+    let bridge = indexes.get(&key).expect("published pathless bridge");
+    assert!(bridge.delta_batches.is_empty());
+    assert_eq!(bridge.delta_raw_ops, 0);
 }
 
 #[tokio::test]
@@ -813,6 +939,81 @@ async fn checkpoint_consolidates_updates_and_deletes_with_correct_uuid_mapping()
     for (id, text) in updates {
         assert_recalled(&rt, &restarted, &key, MODEL, id, text).await;
     }
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn crossing_delta_limit_rewrites_installed_index_without_corpus_rebuild() {
+    const MODEL: &str = "ann-delta-crossing-compaction-model";
+    let (rt, token, ann, key, _) = seeded(MODEL).await;
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    let base_commit = commit_record(&rt, MODEL);
+    let publications = ann.publication_count.load(Ordering::SeqCst);
+    let mut added = Vec::new();
+    {
+        let mut indexes = ann.indexes.write().await;
+        let bridge = indexes.get_mut(&key).expect("seeded bridge");
+        // Leave less cumulative headroom than the next individually cheap
+        // tail. The old cap rejected this tail and rebuilt the whole corpus.
+        bridge.delta_raw_ops = delta::compaction_limit(bridge.base_ops) - 2;
+    }
+    for i in 0..3 {
+        let text = format!("crossing-limit note {i}");
+        added.push((write_note(&rt, &token, &text).await, text));
+    }
+    bump_generation(&ann, &key).await;
+    let (status, event) = warm_with_event(&rt, &token, &ann, MODEL).await;
+    assert!(matches!(status, AnnEnsureStatus::AlreadyLoaded));
+    assert_eq!(event["path"], "incremental_checkpoint");
+    assert_eq!(event["ops_applied"], 3);
+    assert_eq!(
+        ann.publication_count.load(Ordering::SeqCst) - publications,
+        1
+    );
+    assert_ne!(commit_record(&rt, MODEL), base_commit);
+    assert!(
+        !dir.join(delta::HEAD_FILE).exists(),
+        "crossing the chain limit must rewrite the base checkpoint"
+    );
+    for (id, text) in added {
+        assert_recalled(&rt, &ann, &key, MODEL, id, &text).await;
+    }
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn restart_rule_seven_uses_live_fraction_not_delta_headroom() {
+    const MODEL: &str = "ann-live-fraction-restart-model";
+    let (rt, token, _host, key, ids) = seeded(MODEL).await;
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    let tail_count = replay_limit(SEED_COUNT as u64, ann_rebuild_threshold()) + 1;
+    assert!(tail_count < delta::compaction_limit(SEED_COUNT));
+    // Repeated updates leave the live count fixed while the raw replay cost
+    // crosses the configured fraction. The delta-chain budget remains ample.
+    for i in 0..tail_count {
+        rt.update_note(
+            &token,
+            ids[0],
+            khive_runtime::NotePatch::new(
+                None,
+                Some(format!("restart fraction update {i}")),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("update one seeded note");
+    }
+    let adopter = new_shared();
+    let mut details = AnnWarmDetails::default();
+    let outcome =
+        classify_and_adopt_segment(&rt, &adopter, &key, MODEL, &dir, 0, 0, &mut details).await;
+    assert!(
+        matches!(outcome, SegmentOutcome::Cold),
+        "rule 8 must choose the rebuild path when raw tail exceeds ceil(f * live)"
+    );
+    assert_eq!(adopter.publication_count.load(Ordering::SeqCst), 0);
 }
 
 #[path = "incremental_edge_tests.rs"]
