@@ -1265,6 +1265,16 @@ impl VerbRegistryBuilder {
             .map(|h| h.name)
             .collect();
 
+        // Keep the first declaration for duplicate subhandler names, matching
+        // the registry's existing pack-order metadata lookup behavior. Public
+        // verb names have already been checked for uniqueness above.
+        let mut handler_by_name: HashMap<&'static str, &'static HandlerDef> = HashMap::new();
+        for pack in &ordered_packs {
+            for handler in pack.handlers() {
+                handler_by_name.entry(handler.name).or_insert(handler);
+            }
+        }
+
         // Admission-degrade eligibility (#2147/#2217, khive-oss#2311): decided
         // once here, from the trust bit the composition root recorded at
         // registration time (never from `pack.name()`'s self-report) plus
@@ -1357,6 +1367,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            handler_by_name: Arc::new(handler_by_name),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
             read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
@@ -1650,6 +1661,9 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     available_verbs: Arc<Vec<&'static str>>,
+    /// Static handler metadata indexed once at build time. Duplicate internal
+    /// subhandler names retain the first pack's declaration, as before.
+    handler_by_name: Arc<HashMap<&'static str, &'static HandlerDef>>,
     /// Verbs eligible for admission-pressure audit degradation, precomputed
     /// once at `build()` time from registration-time pack trust plus each
     /// handler's declared category and
@@ -3942,10 +3956,7 @@ impl VerbRegistry {
     /// guaranteed-failed `dispatch` (and its audit write) when an optional
     /// pack is absent can probe first and skip the call entirely.
     pub fn has_verb(&self, verb: &str) -> bool {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter())
-            .any(|h| h.name == verb)
+        self.handler_by_name.contains_key(verb)
     }
 
     /// Advisory metadata for synchronous planning and MCP initialization.
@@ -4304,30 +4315,28 @@ impl VerbRegistry {
 
     /// Resolve the presentation policy for a verb name.
     ///
-    /// Walks all registered handlers (including subhandlers) for the first
-    /// matching name and returns its declared [`VerbPresentationPolicy`].
+    /// Uses the first registered handler (including subhandlers) with this name
+    /// and returns its declared [`VerbPresentationPolicy`].
     /// Returns `Standard` for unknown verbs — unknown verbs will fail at
     /// dispatch anyway, so the fallback here is safe.
     pub fn presentation_policy_for(&self, verb: &str) -> khive_types::VerbPresentationPolicy {
-        for pack in self.packs.iter() {
-            if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
-                return handler.presentation_policy();
-            }
-        }
-        khive_types::VerbPresentationPolicy::Standard
+        self.handler_by_name
+            .get(verb)
+            .map_or(khive_types::VerbPresentationPolicy::Standard, |handler| {
+                handler.presentation_policy()
+            })
     }
 
     /// Resolve the declared [`VerbCategory`] for a verb name.
     ///
-    /// Walks all registered handlers (including subhandlers) for the first
-    /// matching name and returns its speech-act category. Returns `None` for
+    /// Uses the first registered handler (including subhandlers) with this name
+    /// and returns its speech-act category. Returns `None` for
     /// an unregistered verb name, so a caller deciding transport-level
     /// behavior (e.g. whether a post-dispatch condition is safe to retry)
     /// can fail closed on an unknown verb instead of guessing a category.
     pub fn verb_category(&self, verb: &str) -> Option<VerbCategory> {
-        self.packs
-            .iter()
-            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
+        self.handler_by_name
+            .get(verb)
             .map(|handler| handler.category)
     }
 
@@ -4373,12 +4382,9 @@ impl VerbRegistry {
     /// boundary without blocking internal callers that invoke the same verbs
     /// through the runtime directly.
     pub fn is_subhandler_verb(&self, verb: &str) -> bool {
-        for pack in self.packs.iter() {
-            if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
-                return matches!(handler.visibility, Visibility::Subhandler);
-            }
-        }
-        false
+        self.handler_by_name
+            .get(verb)
+            .is_some_and(|handler| matches!(handler.visibility, Visibility::Subhandler))
     }
 
     /// Apply all non-empty pack-auxiliary schema plans to the given backend.
@@ -6366,6 +6372,99 @@ pub(crate) mod tests {
             calls.load(Ordering::SeqCst),
             after_build,
             "a miss must not re-scan any pack's handlers() either"
+        );
+    }
+
+    #[test]
+    fn verb_metadata_uses_build_time_index_across_packs() {
+        static FIRST_HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "get",
+                description: "first public handler",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "internal.shared",
+                description: "first internal handler",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+        static SECOND_HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "comm.send",
+                description: "second public handler",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "internal.shared",
+                description: "second internal handler",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Directive,
+                params: &[],
+            },
+        ];
+
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(CountingHandlersPack {
+            name: "kg",
+            handlers: &FIRST_HANDLERS,
+            calls: first_calls.clone(),
+        });
+        builder.register(CountingHandlersPack {
+            name: "comm",
+            handlers: &SECOND_HANDLERS,
+            calls: second_calls.clone(),
+        });
+        let registry = builder.build().expect("registry builds");
+        let after_build = (
+            first_calls.load(Ordering::SeqCst),
+            second_calls.load(Ordering::SeqCst),
+        );
+        assert!(after_build.0 > 0 && after_build.1 > 0);
+
+        assert_eq!(
+            registry.presentation_policy_for("get"),
+            VerbPresentationPolicy::AlwaysVerbose
+        );
+        assert_eq!(
+            registry.presentation_policy_for("comm.send"),
+            VerbPresentationPolicy::Standard
+        );
+        assert_eq!(
+            registry.presentation_policy_for("missing"),
+            VerbPresentationPolicy::Standard
+        );
+        assert_eq!(registry.verb_category("get"), Some(VerbCategory::Assertive));
+        assert_eq!(
+            registry.verb_category("comm.send"),
+            Some(VerbCategory::Commissive)
+        );
+        assert_eq!(registry.verb_category("missing"), None);
+        // Duplicate internal names retain the first pack's metadata.
+        assert_eq!(
+            registry.verb_category("internal.shared"),
+            Some(VerbCategory::Assertive)
+        );
+        assert!(registry.is_subhandler_verb("internal.shared"));
+        assert!(!registry.is_subhandler_verb("comm.send"));
+        assert!(!registry.is_subhandler_verb("missing"));
+        assert!(registry.has_verb("comm.send"));
+        assert!(!registry.has_verb("missing"));
+        assert_eq!(
+            (
+                first_calls.load(Ordering::SeqCst),
+                second_calls.load(Ordering::SeqCst)
+            ),
+            after_build,
+            "metadata lookups must not re-read either pack's handler slice"
         );
     }
 
