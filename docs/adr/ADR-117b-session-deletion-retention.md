@@ -66,8 +66,11 @@ handler that assumes the writer's hard-coded stamp is tenant-aware.
   schedule-kind action in D3.
 
 `session.deletion_status(operation_id)` reports local and remote completion without
-returning deleted content; it is required once remote ingestion exists. A remote-pending
-operation is never represented as complete. The verbs are separate from the existing
+returning deleted content; it is required once remote ingestion exists. It is scoped like
+the three Directive verbs: the operation must have been issued in the caller's resolved
+account scope, a missing scope refuses before any lookup, and an `operation_id` outside
+that scope is reported as not found, never as another account's completion state. A
+remote-pending operation is never represented as complete. The verbs are separate from the existing
 T1 note verbs and must describe their mirror scope in catalog text and responses.
 Migration-only `source=unknown` orphan messages from ADR-117a are included in account
 wipe and charge accounting. Aging treats each `(namespace, unknown, session_id)` group
