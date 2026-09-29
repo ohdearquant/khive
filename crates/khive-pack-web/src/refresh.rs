@@ -11,9 +11,10 @@
 //! redirected 304 is refused before any graph mutation.
 //! A genuinely changed body puts the new blob and patches the entity in
 //! place, same as `fetch`. Every refresh receipt chains to the immediately
-//! prior one for the same entity via `note supersedes note` (D4's "receipt
-//! chain: the history of one resource's fetches"), whether or not the body
-//! changed.
+//! prior web-provenanced receipt for the same entity via `note supersedes
+//! note` (D4's receipt chain), whether or not the body changed. Pre-marker
+//! receipts remain stored but the first provenanced receipt starts a new chain
+//! (ADR-191 Amendment 9).
 //!
 //! Follows redirects the same bounded chain `fetch` does, through the same
 //! egress checks on every hop — [`crate::fetch::run_hop_chain`], shared
@@ -41,8 +42,8 @@ use crate::receipt::write_receipt;
 use crate::vocab::RefreshParams;
 use crate::WebPack;
 
-/// The newest web-written receipt annotating `entity_id`. A generic note
-/// carrying the same tag is not eligible for the refresh chain.
+/// The newest web-written receipt annotating `entity_id`. An unmarked legacy
+/// receipt or generic note carrying the same tag is not eligible for the chain.
 async fn latest_receipt(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1581,6 +1582,95 @@ mod tests {
             "the second refresh's receipt supersedes the first"
         );
         assert_eq!(second_neighbors[0].node_id, first_receipt);
+    }
+
+    #[tokio::test]
+    async fn first_refresh_after_legacy_receipt_starts_a_new_chain() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"same every time".to_vec();
+        let (port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let id = seed(&runtime, &token, port, &body).await;
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let body_ref = entity.properties.as_ref().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap();
+        let legacy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "pre-upgrade web receipt",
+                None,
+                Some(json!({
+                    "tags": [crate::receipt::RECEIPT_TAG],
+                    "request": {
+                        "verb": "web.fetch",
+                        "status": 200,
+                        "content_ref": body_ref,
+                        "body_entity_id": id.to_string(),
+                    },
+                })),
+                vec![id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest_receipt(&runtime, &token, id).await.unwrap(), None);
+
+        let first = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let first_id = Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap();
+        let first_previous = runtime
+            .neighbors(
+                &token,
+                first_id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            first_previous.is_empty(),
+            "legacy receipt is not superseded"
+        );
+        assert!(runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(legacy.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (next_port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        crate::entities::patch(
+            &runtime,
+            &token,
+            id,
+            None,
+            json!({ "url": format!("http://127.0.0.1:{next_port}/r") }),
+        )
+        .await
+        .unwrap();
+        let second = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let second_id = Uuid::parse_str(second["receipt_id"].as_str().unwrap()).unwrap();
+        let second_previous = runtime
+            .neighbors(
+                &token,
+                second_id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_previous.len(), 1);
+        assert_eq!(second_previous[0].node_id, first_id);
+        assert_ne!(second_previous[0].node_id, legacy.id);
     }
 
     // `latest_receipt` filters on kind+tag, not just "newest annotates
