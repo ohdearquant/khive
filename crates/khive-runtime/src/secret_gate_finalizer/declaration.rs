@@ -495,6 +495,18 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         acceptance: Acceptance::Test { path: "khive-runtime/src/curation/merge_reservation_tests.rs::merge_reservation_refuses_forged_source_and_target_before_domain_mutation" },
     },
     RouteInventoryEntry {
+        id: "curation.merge.note",
+        site: "khive-runtime/src/curation.rs::merge_note_sql",
+        target: Substrate::Note,
+        write_class: WriteClass::WholeObject,
+        kind_policy: KindPolicy::UpdateAgainstSnapshot,
+        reservation: Reservation::NamedCheck { function: "reject_reserved_secret_gate_property", file: "khive-runtime/src/secret_gate.rs" },
+        transaction: TransactionOwner::WithWriter,
+        stamp: StampCapability::ReservationOnly,
+        family: None,
+        acceptance: Acceptance::Test { path: "khive-runtime/src/curation/merge_reservation_tests.rs::merge_reservation_refuses_forged_source_and_target_before_domain_mutation" },
+    },
+    RouteInventoryEntry {
         id: "runtime.keyed_message",
         site: "khive-runtime/src/keyed_message.rs::create_keyed_message_pair",
         target: Substrate::Note,

@@ -63,6 +63,7 @@ const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
     "count_notes",
     "count_notes_in_namespaces",
     "get_notes_batch",
+    "get_note_visibility_batch",
 ];
 
 const ENTITY_BUILDERS: &[&str] = &[
@@ -78,6 +79,11 @@ const NOTE_BUILDERS: &[&str] = &[
     "note_update_properties_statement",
     "note_set_property_statement",
 ];
+
+// External references to these khive-db statements bypass the builder and
+// store-method detectors. Both statements insert a whole note properties
+// object, even when an ON CONFLICT clause does not replace an existing row.
+const NOTE_PROPERTY_SQL_CONSTANTS: &[&str] = &["NOTE_UPSERT_SQL", "NOTE_INSERT_IF_ABSENT_SQL"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DetectedClass {
@@ -406,6 +412,22 @@ impl<'ast> Visit<'ast> for SourceCollector {
             }
         }
         syn::visit::visit_expr_call(self, expr);
+    }
+
+    fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+        if !self.path.starts_with("khive-db/") {
+            if let Some(segment) = expr.path.segments.last() {
+                let name = segment.ident.to_string();
+                if NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str()) {
+                    self.record(
+                        Substrate::Note,
+                        DetectedClass::WholeObject,
+                        format!("SQL constant {name}"),
+                    );
+                }
+            }
+        }
+        syn::visit::visit_expr_path(self, expr);
     }
 
     fn visit_expr_lit(&mut self, expr: &'ast ExprLit) {
@@ -974,6 +996,38 @@ fn migration_sql_is_inventoried() {
     assert!(check_inventory(&fixture, &[], 0)
         .unwrap_err()
         .contains("unmapped khive-db/sql/999-census-fixture.sql::statement_1"));
+}
+
+#[test]
+fn external_note_sql_constant_requires_an_inventoried_reservation_check() {
+    let route = *ROUTE_INVENTORY
+        .iter()
+        .find(|route| route.id == "curation.merge.note")
+        .expect("note merge route is declared");
+    let source_path = "khive-runtime/src/curation.rs";
+    let checked = "fn merge_note_sql() {
+        reject_reserved_secret_gate_property(merged_props);
+        let _ = khive_db::stores::note::NOTE_UPSERT_SQL;
+    }";
+    let sites = scan_sources(&[(source_path.into(), checked.into())]).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].key, route.site);
+    assert_eq!(sites[0].target, Substrate::Note);
+    assert_eq!(sites[0].class, DetectedClass::WholeObject);
+    assert!(sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"));
+    assert!(check_inventory(&sites, &[route], 0).is_ok());
+    assert!(check_inventory(&sites, &[], 0)
+        .unwrap_err()
+        .contains("unmapped khive-runtime/src/curation.rs::merge_note_sql"));
+
+    let unchecked = "fn merge_note_sql() {
+        let _ = khive_db::stores::note::NOTE_UPSERT_SQL;
+    }";
+    let sites = scan_sources(&[(source_path.into(), unchecked.into())]).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert!(check_inventory(&sites, &[route], 0)
+        .unwrap_err()
+        .contains("whole-object write lacks its named check/callee"));
 }
 
 #[test]
