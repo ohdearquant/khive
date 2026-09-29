@@ -2083,7 +2083,12 @@ impl KhiveRuntime {
             return Ok(crate::retrieval::EmbeddingTruncationReport::default());
         }
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
-        for model_name in embedding_plan.model_names() {
+        let selected_models = self.embedding_models_for_note_kind(&note.kind);
+        for model_name in embedding_plan
+            .model_names()
+            .iter()
+            .filter(|name| selected_models.contains(*name))
+        {
             match self
                 .embed_document_with_model_outcome_for_token(
                     token,

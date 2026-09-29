@@ -3309,8 +3309,11 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         .map(str::to_string)
         .collect();
     default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    let note_embedding_policies = registry.all_note_embedding_policies();
+    default_runtime.install_note_embedding_policies(&note_embedding_policies);
     for rt in per_pack_runtimes_local.values() {
         rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+        rt.install_note_embedding_policies(&note_embedding_policies);
     }
     // The validator is installed on every runtime the kind list reaches, not
     // just the default: each per-pack runtime is built independently, so none
