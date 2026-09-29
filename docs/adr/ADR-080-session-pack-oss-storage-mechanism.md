@@ -231,13 +231,23 @@ has not fallen below the cursor.
 **File replacement amendment (2026-09-28, #1761).** Each cursor advance stores a nullable
 `file_identity` in the same row and transaction as its byte offset. The identity is stable
 across appends and changes when a new file replaces the path (device and inode on Unix; file
-creation time where Unix IDs are unavailable). A different identity, a file shorter than the
-stored offset, or a legacy cursor with no identity restarts ingestion at byte zero. Replaying a
-legacy cursor once is safe under the existing insert-once event keys; subsequent unchanged polls
-use the new witness and retain the cheap length guard. The reader verifies that the opened file
-still has the identity observed by the service's metadata probe before it can advance the cursor.
+creation time where Unix IDs are unavailable). A different identity or a file shorter than the
+stored offset restarts ingestion at byte zero. A legacy cursor with no identity also restarts
+from zero when backfill is enabled: its prefix was already eligible for ingestion, so the
+insert-once event keys make replay safe. With `KHIVE_MIRROR_BACKFILL=false`, a legacy cursor
+instead adopts and persists the observed identity at its existing offset when the file is not
+shorter than that offset. The pre-offset prefix may never have been ingested, and replaying it
+would import history the operator excluded. Truncation still restarts from zero regardless of
+backfill. Subsequent unchanged polls use the new witness and retain the cheap length guard. The
+reader verifies that the opened file still has the identity observed by the service's metadata
+probe before it can advance the cursor.
+
+> a legacy cursor whose file was replaced before the upgrade by one at least as long adopts the replacement and skips its first <offset> bytes; with no stored identity the replacement cannot be detected
+
 Regular-file checks and no-follow opens keep a symlinked transcript from making the mirror read a
-target outside its configured tree. A same-inode rewrite that grows beyond the old cursor remains
+target outside its configured tree. A symlink supplied as a configured export root is refused once
+at discovery and is not polled; entries reached while walking a configured directory are also
+ignored when they are symlinks. A same-inode rewrite that grows beyond the old cursor remains
 indistinguishable from an append without reading and hashing previously consumed bytes.
 
 A single line is never buffered past a hard per-line byte cap (`MirrorLimits::max_line_bytes`,

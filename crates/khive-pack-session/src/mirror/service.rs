@@ -307,6 +307,26 @@ mod config_tests {
         discovery.add_directory_tree(root.path(), DirectoryKind::ClaudeCodeProject, true);
         assert!(!discovery.files.contains_key(&link));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_symlinked_export_root_is_refused_before_polling() {
+        let root = tempfile::TempDir::new().expect("root");
+        let target = tempfile::NamedTempFile::new().expect("export target");
+        std::fs::write(target.path(), "[]").expect("export fixture");
+        let link = root.path().join("conversations.json");
+        std::os::unix::fs::symlink(target.path(), &link).expect("export symlink");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_export_root(
+            &link,
+            DirectoryKind::ChatGptExport,
+            DiscoveredKind::ChatGptExport,
+        );
+        assert!(discovery.files.is_empty());
+        assert!(discovery.directories.is_empty());
+        assert!(discovery.schedule_files().is_empty());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -367,18 +387,42 @@ struct CursorState {
 }
 
 impl CursorState {
-    fn reset_if_replaced(&mut self, identity: &str, file_len: u64) -> bool {
+    fn reset_if_replaced(&mut self, identity: &str, file_len: u64, backfill: bool) -> bool {
         let prior = self.file_identity.as_deref();
         let identity_changed = prior.is_some_and(|old| old != identity);
         let legacy_without_witness = prior.is_none();
         let truncated = file_len < self.byte_offset;
-        if !identity_changed && !legacy_without_witness && !truncated {
-            return false;
+        if identity_changed || truncated || (legacy_without_witness && backfill) {
+            self.byte_offset = 0;
+            self.file_identity = Some(identity.to_string());
+            return true;
         }
-        self.byte_offset = 0;
-        self.file_identity = Some(identity.to_string());
-        true
+        if legacy_without_witness {
+            self.file_identity = Some(identity.to_string());
+        }
+        false
     }
+}
+
+async fn reconcile_cursor_identity(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    cursor: &mut CursorState,
+    identity: &str,
+    file_len: u64,
+    backfill: bool,
+) -> Result<bool, RuntimeError> {
+    let legacy_without_witness = cursor.file_identity.is_none();
+    let restarted = cursor.reset_if_replaced(identity, file_len, backfill);
+    if legacy_without_witness && !restarted {
+        if let Err(error) =
+            ingest::adopt_cursor_identity(runtime, path, cursor.byte_offset, identity).await
+        {
+            cursor.file_identity = None;
+            return Err(error);
+        }
+    }
+    Ok(restarted)
 }
 
 struct ScheduledFile {
@@ -536,6 +580,13 @@ impl DiscoveryIndex {
         directory_kind: DirectoryKind,
         file_kind: DiscoveredKind,
     ) {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            tracing::warn!(
+                path = %path.display(),
+                "session mirror: refusing a symlinked configured export root"
+            );
+            return;
+        }
         if path.is_file() {
             if path.file_name().and_then(|name| name.to_str()) == Some("conversations.json") {
                 self.add_file(path.to_path_buf(), file_kind, true);
@@ -1374,6 +1425,38 @@ fn classify_entry(
     }
 }
 
+fn trusted_root_for_file<'a>(
+    config: &'a MirrorConfig,
+    path: &Path,
+    kinds: &[DiscoveredKind],
+) -> Option<&'a Path> {
+    kinds.iter().find_map(|kind| {
+        let configured = match kind {
+            DiscoveredKind::LineTail {
+                source: LineTailSource::ClaudeCode,
+                ..
+            } => config.projects_dir.as_path(),
+            DiscoveredKind::LineTail {
+                source: LineTailSource::Codex,
+                ..
+            } => config.codex_sessions_dir.as_path(),
+            DiscoveredKind::ChatGptExport => config.chatgpt_exports_dir.as_path(),
+            DiscoveredKind::ClaudeAiExport => config.claude_ai_exports_dir.as_path(),
+        };
+        // A configured export may name conversations.json itself. Anchor its
+        // final component at the containing directory in that case.
+        let root = if configured == path {
+            configured.parent().unwrap_or(Path::new(""))
+        } else {
+            configured
+        };
+        path.strip_prefix(root)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|_| root)
+    })
+}
+
 /// Infinite background polling loop.  Returns only on a fatal setup error.
 ///
 /// Seed state from the `session_mirror_cursor` table and one initial discovery
@@ -1450,31 +1533,49 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         let mut rows_inserted: u64 = 0;
 
         for scheduled_file in scheduled {
-            let metadata = match std::fs::symlink_metadata(&scheduled_file.path) {
-                Ok(metadata) => metadata,
-                Err(e) => {
-                    let missing = e.kind() == io::ErrorKind::NotFound;
-                    discovery.record_probe_error(
-                        &scheduled_file.path,
-                        scheduled_file.was_cold,
-                        missing,
-                    );
-                    if !missing {
-                        tracing::warn!(
-                            path = %scheduled_file.path.display(),
-                            error = %e,
-                            "session mirror: stat failed"
-                        );
-                    } else {
-                        tracing::debug!(
-                            path = %scheduled_file.path.display(),
-                            error = %e,
-                            "session mirror: file missing during probe"
-                        );
-                    }
-                    continue;
-                }
+            let Some(root) = discovery
+                .files
+                .get(&scheduled_file.path)
+                .and_then(|file| trusted_root_for_file(&config, &scheduled_file.path, &file.kinds))
+            else {
+                discovery.record_probe_error(&scheduled_file.path, scheduled_file.was_cold, false);
+                tracing::warn!(
+                    path = %scheduled_file.path.display(),
+                    "session mirror: scheduled file is outside its configured root"
+                );
+                continue;
             };
+            let (metadata, directory_identities) =
+                match ingest::open_source_file_beneath(root, &scheduled_file.path, None).and_then(
+                    |(file, directory_identities)| {
+                        file.metadata()
+                            .map(|metadata| (metadata, directory_identities))
+                    },
+                ) {
+                    Ok(probe) => probe,
+                    Err(e) => {
+                        let missing = e.kind() == io::ErrorKind::NotFound;
+                        discovery.record_probe_error(
+                            &scheduled_file.path,
+                            scheduled_file.was_cold,
+                            missing,
+                        );
+                        if !missing {
+                            tracing::warn!(
+                                path = %scheduled_file.path.display(),
+                                error = %e,
+                                "session mirror: stat failed"
+                            );
+                        } else {
+                            tracing::debug!(
+                                path = %scheduled_file.path.display(),
+                                error = %e,
+                                "session mirror: file missing during probe"
+                            );
+                        }
+                        continue;
+                    }
+                };
             if !metadata.is_file() {
                 discovery.record_probe_error(&scheduled_file.path, scheduled_file.was_cold, false);
                 tracing::warn!(
@@ -1494,7 +1595,27 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                     file_identity: Some(observed_identity.clone()),
                 });
             let previous_offset = cursor.byte_offset;
-            if cursor.reset_if_replaced(&observed_identity, file_len) {
+            let restarted = match reconcile_cursor_identity(
+                &runtime,
+                &scheduled_file.path,
+                cursor,
+                &observed_identity,
+                file_len,
+                config.backfill,
+            )
+            .await
+            {
+                Ok(restarted) => restarted,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %scheduled_file.path.display(),
+                        error = %error,
+                        "session mirror: could not persist legacy cursor identity"
+                    );
+                    continue;
+                }
+            };
+            if restarted {
                 tracing::info!(
                     path = %scheduled_file.path.display(),
                     previous_offset,
@@ -1525,6 +1646,10 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             };
             let mut candidate_dispatch = CandidateDispatch::default();
             let mut ended_by_inserting = false;
+            let trusted_source = ingest::TrustedSource {
+                root,
+                directory_identities: &directory_identities,
+            };
             for kind in kinds {
                 let result = match kind {
                     DiscoveredKind::LineTail { source, session_id } => {
@@ -1542,6 +1667,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                             source,
                             session_id.as_deref(),
                             Some(&observed_identity),
+                            Some(trusted_source),
                         )
                         .await
                     }
@@ -1551,6 +1677,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                             &scheduled_file.path,
                             offset,
                             &observed_identity,
+                            trusted_source,
                         )
                         .await
                     }
@@ -1560,6 +1687,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                             &scheduled_file.path,
                             offset,
                             &observed_identity,
+                            trusted_source,
                         )
                         .await
                     }
@@ -2736,8 +2864,9 @@ mod discovery_tests {
 mod cursor_retry_tests {
     use super::{
         delete_cursors, drain_pending_cursor_deletes, finalize_dispatch_stats, load_cursors,
-        queue_cursor_deletes, tally_dispatch_errors, CandidateDispatch, CursorState,
-        DiscoveredKind, DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
+        queue_cursor_deletes, reconcile_cursor_identity, tally_dispatch_errors, CandidateDispatch,
+        CursorState, DiscoveredKind, DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT,
+        FILE_ERROR_POLLS_BEFORE_COLD,
     };
     use crate::mirror::ingest::{file_identity, mirror_file, LineTailSource, MirrorStats};
     use crate::vocab::{SESSION_SCHEMA_COLUMN_ADDITIONS, SESSION_SCHEMA_PLAN_STMTS};
@@ -2847,8 +2976,8 @@ mod cursor_retry_tests {
             byte_offset: 100,
             file_identity: Some("old-file".into()),
         };
-        assert!(!cursor.reset_if_replaced("old-file", 100));
-        assert!(!cursor.reset_if_replaced("old-file", 150));
+        assert!(!cursor.reset_if_replaced("old-file", 100, true));
+        assert!(!cursor.reset_if_replaced("old-file", 150, true));
         assert_eq!(cursor.byte_offset, 100, "an append keeps its offset");
     }
 
@@ -2858,7 +2987,7 @@ mod cursor_retry_tests {
             byte_offset: 100,
             file_identity: Some("old-file".into()),
         };
-        assert!(cursor.reset_if_replaced("old-file", 50));
+        assert!(cursor.reset_if_replaced("old-file", 50, true));
         assert_eq!(cursor.byte_offset, 0, "truncation restarts from zero");
     }
 
@@ -2893,13 +3022,14 @@ mod cursor_retry_tests {
         assert!(!cursor.reset_if_replaced(
             &file_identity(&std::fs::metadata(&path).expect("unchanged metadata")),
             original.len() as u64,
+            true,
         ));
 
         let staged = dir.path().join("replacement.jsonl");
         std::fs::write(&staged, replacement).expect("replacement transcript");
         std::fs::rename(&staged, &path).expect("atomic replacement");
         let new_identity = file_identity(&std::fs::metadata(&path).expect("replacement metadata"));
-        assert!(cursor.reset_if_replaced(&new_identity, original.len() as u64));
+        assert!(cursor.reset_if_replaced(&new_identity, original.len() as u64, true));
         assert_eq!(cursor.byte_offset, 0);
         let second = mirror_file(
             &rt,
@@ -2948,8 +3078,79 @@ mod cursor_retry_tests {
             .expect("legacy row retained");
         assert_eq!(cursor.byte_offset, 123);
         assert_eq!(cursor.file_identity, None);
-        assert!(cursor.reset_if_replaced("current-file", 123));
+        assert!(cursor.reset_if_replaced("current-file", 123, true));
         assert_eq!(cursor.byte_offset, 0, "legacy row must replay once");
+    }
+
+    #[tokio::test]
+    async fn legacy_cursor_without_backfill_keeps_skipped_prefix_and_persists_identity() {
+        let (rt, dir) = runtime_without_schema();
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute_script(
+                "CREATE TABLE session_mirror_cursor (file_path TEXT PRIMARY KEY, session_id TEXT, byte_offset INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)"
+                    .to_string(),
+            )
+            .await
+            .expect("legacy cursor table");
+        drop(writer);
+
+        let path = dir.path().join("legacy.jsonl");
+        let skipped = concat!(
+            r#"{"uuid":"event-before-opt-out","sessionId":"sess-legacy","type":"user","timestamp":"2026-08-05T10:00:00Z","message":{"role":"user","content":"skipped"}}"#,
+            "\n"
+        );
+        let appended = concat!(
+            r#"{"uuid":"event-after-opt-out","sessionId":"sess-legacy","type":"user","timestamp":"2026-08-05T10:01:00Z","message":{"role":"user","content":"mirrored"}}"#,
+            "\n"
+        );
+        std::fs::write(&path, format!("{skipped}{appended}")).expect("transcript");
+        insert_cursor_row(&rt, &path, skipped.len() as i64).await;
+        rt.backend()
+            .apply_pack_ddl_statements_with_columns(
+                &SESSION_SCHEMA_PLAN_STMTS,
+                &SESSION_SCHEMA_COLUMN_ADDITIONS,
+            )
+            .expect("pack column upgrade");
+
+        let mut cursor = load_cursors(&rt)
+            .await
+            .expect("load upgraded cursor")
+            .remove(&path)
+            .expect("legacy row retained");
+        let file_len = std::fs::metadata(&path).expect("transcript metadata").len();
+        let identity = file_identity(&std::fs::metadata(&path).expect("transcript metadata"));
+        assert!(
+            !reconcile_cursor_identity(&rt, &path, &mut cursor, &identity, file_len, false)
+                .await
+                .expect("adopt legacy identity")
+        );
+        assert_eq!(cursor.byte_offset, skipped.len() as u64);
+        assert_eq!(cursor.file_identity.as_deref(), Some(identity.as_str()));
+
+        let saved = load_cursors(&rt)
+            .await
+            .expect("reload adopted cursor")
+            .remove(&path)
+            .expect("adopted row");
+        assert_eq!(saved, cursor);
+        let mirrored = mirror_file(
+            &rt,
+            &path,
+            cursor.byte_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("tail after skipped prefix");
+        assert_eq!(mirrored.inserted, 1, "only the appended event is imported");
+
+        let mut truncated_legacy = CursorState {
+            byte_offset: skipped.len() as u64,
+            file_identity: None,
+        };
+        assert!(truncated_legacy.reset_if_replaced(&identity, 1, false));
+        assert_eq!(truncated_legacy.byte_offset, 0);
     }
 
     #[tokio::test]

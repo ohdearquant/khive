@@ -22,14 +22,21 @@ allowing equal provider identifiers from different sources.
 
 The service pairs each persisted offset with the identity of the file handle
 that supplied its bytes. On Unix this is the device and inode; elsewhere it
-uses file creation time when available. A same-path replacement, a file that
-shrinks below the offset, or an older cursor row without an identity starts at
-zero. An ordinary append keeps its offset, and an unchanged completed file is
-skipped after a metadata probe. The service passes the probed identity to the
-reader, which refuses a file swapped between the probe and open; the next poll
-then retries. Each cursor upsert stores the identity in the same transaction
-as the consumed offset, including cursor-only advances. Symlinked files are
-ignored by discovery and refused at open on Unix.
+uses file creation time when available. A same-path replacement or a file that
+shrinks below the offset restarts at zero. An older cursor row without an identity
+starts at zero when backfill is enabled; with `KHIVE_MIRROR_BACKFILL=false`, it
+keeps its offset and persists the observed identity so the skipped prefix stays
+excluded. Truncation still rewinds. An ordinary append keeps its offset, and an
+unchanged completed file is skipped after a metadata probe. The service passes
+the probed identity to the reader, which refuses a file swapped between the
+probe and open; the next poll then retries. Each cursor upsert stores the identity
+in the same transaction as the consumed offset, including cursor-only advances.
+Symlinked entries found while walking directories are ignored by discovery and
+refused at open on Unix. Scheduled files are probed and opened through
+no-follow directory components beneath their configured root; a parent that
+changes between probe and open is refused.
+A configured export root that is itself a symlink is refused once at discovery
+and is not scheduled for polling.
 An idempotent replay compares the stored content hash with the newly parsed
 text and raw line. A changed payload leaves the original event unchanged,
 increments `MirrorStats.replay_mismatches`, and advances the cursor; the pass

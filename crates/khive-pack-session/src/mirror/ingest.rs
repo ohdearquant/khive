@@ -152,6 +152,126 @@ fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Open a scheduled source through its configured directory, refusing linked
+/// ancestors as well as a linked final file. Each directory handle pins the
+/// component used by the next `openat`, so replacing a parent during the walk
+/// cannot redirect the remaining components outside `root`.
+#[derive(Clone, Copy)]
+pub(crate) struct TrustedSource<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) directory_identities: &'a [String],
+}
+
+#[cfg(unix)]
+pub(crate) fn open_source_file_beneath(
+    root: &Path,
+    path: &Path,
+    expected_directories: Option<&[String]>,
+) -> std::io::Result<(std::fs::File, Vec<String>)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    let relative = path.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mirror source is outside its configured root",
+        )
+    })?;
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mirror source does not name a file beneath its configured root",
+        ));
+    }
+
+    let root_path = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let mut directory = options.open(root_path)?;
+    let mut directory_identities = Vec::new();
+    let root_identity = file_identity(&directory.metadata()?);
+    if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
+        return Err(std::io::Error::other(
+            "mirror source root changed after its metadata probe",
+        ));
+    }
+    if expected_directories.is_none() {
+        directory_identities.push(root_identity);
+    }
+    let mut directory_depth = 1;
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source contains a non-normal path component",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source contains a NUL byte",
+            )
+        })?;
+        let last = components.peek().is_none();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let flags = if last {
+            flags
+        } else {
+            flags | libc::O_DIRECTORY
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        if last {
+            if expected_directories.is_some_and(|expected| expected.len() != directory_depth) {
+                return Err(std::io::Error::other(
+                    "mirror source ancestor count changed after its metadata probe",
+                ));
+            }
+            return Ok((opened, directory_identities));
+        }
+        let identity = file_identity(&opened.metadata()?);
+        if expected_directories
+            .is_some_and(|expected| expected.get(directory_depth) != Some(&identity))
+        {
+            return Err(std::io::Error::other(
+                "mirror source parent changed after its metadata probe",
+            ));
+        }
+        if expected_directories.is_none() {
+            directory_identities.push(identity);
+        }
+        directory_depth += 1;
+        directory = opened;
+    }
+    unreachable!("nonempty component iterator must return its final file")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_source_file_beneath(
+    _root: &Path,
+    _path: &Path,
+    _expected_directories: Option<&[String]>,
+) -> std::io::Result<(std::fs::File, Vec<String>)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure directory-relative mirror source opens are unavailable on this platform",
+    ))
+}
+
 fn checked_identity(
     metadata: &std::fs::Metadata,
     expected_identity: Option<&str>,
@@ -259,7 +379,16 @@ pub async fn mirror_file_deferred(
     source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
-    mirror_file_deferred_checked(runtime, path, start_offset, source, codex_session_id, None).await
+    mirror_file_deferred_checked(
+        runtime,
+        path,
+        start_offset,
+        source,
+        codex_session_id,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn mirror_file_deferred_checked(
@@ -269,6 +398,7 @@ pub(crate) async fn mirror_file_deferred_checked(
     source: LineTailSource,
     codex_session_id: Option<&str>,
     expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> Result<MirrorStats, RuntimeError> {
     mirror_file_inner(
         runtime,
@@ -279,6 +409,7 @@ pub(crate) async fn mirror_file_deferred_checked(
         MirrorLimits::production(),
         false,
         expected_identity,
+        trusted_source,
     )
     .await
 }
@@ -304,6 +435,16 @@ pub async fn commit_empty_advance(
         stats.file_identity.as_deref(),
     )
     .await
+}
+
+/// Store a legacy cursor's first observed identity without changing its offset.
+pub async fn adopt_cursor_identity(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    offset: u64,
+    identity: &str,
+) -> Result<(), RuntimeError> {
+    write_cursor_only(runtime, path, &None, offset, Some(identity)).await
 }
 
 /// A single bounded read pass: at most `limits.max_bytes_per_pass` bytes and
@@ -409,8 +550,14 @@ fn read_bounded_chunk(
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
     expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> std::io::Result<MirrorChunk> {
-    let mut file = open_source_file(path)?;
+    let mut file = match trusted_source {
+        Some(source) => {
+            open_source_file_beneath(source.root, path, Some(source.directory_identities))?.0
+        }
+        None => open_source_file(path)?,
+    };
     let metadata = file.metadata()?;
     let identity = checked_identity(&metadata, expected_identity)?;
     let file_len = metadata.len();
@@ -547,6 +694,7 @@ async fn mirror_file_with_limits(
         limits,
         true,
         None,
+        None,
     )
     .await
 }
@@ -567,6 +715,7 @@ async fn mirror_file_inner(
     limits: MirrorLimits,
     commit_empty_advance: bool,
     expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> Result<MirrorStats, RuntimeError> {
     let chunk = read_bounded_chunk(
         path,
@@ -575,6 +724,7 @@ async fn mirror_file_inner(
         codex_session_id,
         limits,
         expected_identity,
+        trusted_source,
     )
     .map_err(|e| {
         RuntimeError::Internal(format!(
@@ -747,6 +897,7 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
         max_bytes,
         CHATGPT_EXPORT_SPEC,
         None,
+        None,
     )
     .await
 }
@@ -756,6 +907,7 @@ pub(crate) async fn mirror_chatgpt_export_file_checked(
     path: &Path,
     start_offset: u64,
     expected_identity: &str,
+    trusted_source: TrustedSource<'_>,
 ) -> Result<MirrorStats, RuntimeError> {
     mirror_whole_file_export(
         runtime,
@@ -764,6 +916,7 @@ pub(crate) async fn mirror_chatgpt_export_file_checked(
         chatgpt_max_bytes(),
         CHATGPT_EXPORT_SPEC,
         Some(expected_identity),
+        Some(trusted_source),
     )
     .await
 }
@@ -793,6 +946,7 @@ async fn mirror_claude_ai_export_file_with_max_bytes(
         max_bytes,
         CLAUDE_AI_EXPORT_SPEC,
         None,
+        None,
     )
     .await
 }
@@ -802,6 +956,7 @@ pub(crate) async fn mirror_claude_ai_export_file_checked(
     path: &Path,
     start_offset: u64,
     expected_identity: &str,
+    trusted_source: TrustedSource<'_>,
 ) -> Result<MirrorStats, RuntimeError> {
     mirror_whole_file_export(
         runtime,
@@ -810,6 +965,7 @@ pub(crate) async fn mirror_claude_ai_export_file_checked(
         claude_ai_max_bytes(),
         CLAUDE_AI_EXPORT_SPEC,
         Some(expected_identity),
+        Some(trusted_source),
     )
     .await
 }
@@ -821,8 +977,16 @@ async fn mirror_whole_file_export(
     max_bytes: u64,
     spec: WholeFileExportSpec,
     expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> Result<MirrorStats, RuntimeError> {
-    let file = open_source_file(path).map_err(|e| {
+    let file = match trusted_source {
+        Some(source) => {
+            open_source_file_beneath(source.root, path, Some(source.directory_identities))
+                .map(|(file, _)| file)
+        }
+        None => open_source_file(path),
+    }
+    .map_err(|e| {
         RuntimeError::Internal(format!("{}: failed to open {path:?}: {e}", spec.operation))
     })?;
     let metadata = file.metadata().map_err(|e| {
@@ -1416,6 +1580,46 @@ mod tests {
         let link = dir.path().join("linked.jsonl");
         std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
         assert!(open_source_file(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_file_rejects_replaced_parent_symlink_at_probe_and_open() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("root");
+        let parent = root.join("staged");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&parent).expect("inside parent");
+        std::fs::create_dir_all(&outside).expect("outside parent");
+        let source = parent.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("inside source");
+        let outside_source = outside.join("source.jsonl");
+        std::fs::write(&outside_source, b"outside\n").expect("outside source");
+
+        let (original_probe, directory_identities) =
+            open_source_file_beneath(&root, &source, None).expect("initial probe");
+        assert!(original_probe
+            .metadata()
+            .expect("inside metadata")
+            .is_file());
+        std::fs::rename(&parent, root.join("staged-old")).expect("move inside parent");
+        std::os::unix::fs::symlink(&outside, &parent).expect("replace parent with symlink");
+
+        assert!(open_source_file_beneath(&root, &source, None).is_err());
+        let outside_identity = file_identity(&std::fs::metadata(&outside_source).expect("outside"));
+        assert!(read_bounded_chunk(
+            &source,
+            0,
+            LineTailSource::ClaudeCode,
+            None,
+            MirrorLimits::production(),
+            Some(&outside_identity),
+            Some(TrustedSource {
+                root: &root,
+                directory_identities: &directory_identities,
+            }),
+        )
+        .is_err());
     }
 
     /// Build a file-backed runtime (exercises the real `atomic_unit`
