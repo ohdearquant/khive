@@ -46,7 +46,7 @@ verbs read and write (ADR-182).
    to the run directory; no credential of the daemon or the operator reaches the process. The binary
    is the registered absolute path, never a `PATH` lookup. The profile text is stored with the receipt
    as a digest.
-4. Bound. `timeout_s` (default and maximum from config) kills the process group; stdout and stderr are
+4. Bound. `timeout_s` (default and maximum from config) kills the initial process group; stdout and stderr are
    captured to blobs up to a configured size each and truncated with a marker beyond it.
 5. Capture. After exit the run directory is walked; every entry whose content changed, every new file
    and every deleted entry is recorded, changed content stored as blobs, and a result tree manifest
@@ -65,11 +65,12 @@ The run never reads or writes a repository; the git verbs (ADR-182) move trees i
    `ask`, refused with `ask`; after `tool.grant`, the same call runs.
 3. Materialization reproduces the tree: every entry's content and mode match; a manifest with `..`,
    an absolute path or a symlink entry is refused by `exec.tree`.
-4. No network: a registered tool that opens a socket fails inside the run; the same binary outside the
-   sandbox succeeds (control).
+4. No network: a registered tool that attempts an outbound connection or binds and listens on a
+   network port fails inside the run; both operations succeed outside the sandbox (controls).
 5. No writes outside the tree: a run that writes to the operator's home leaves no file there and
    reports a non-zero exit; a write inside the tree appears in the change list.
 6. Timeout: a run exceeding `timeout_s` ends with `timed_out: true` and no process survives it.
+   This remains a target, not a claim that the current implementation meets it; see Amendment 11.
 7. Capture classifies added, modified and deleted paths; every reference returned resolves through
    `blob.get` to the content the run left.
 8. The receipt's `tree_in`, `tree_out`, output references and profile digest match the stored
@@ -477,10 +478,41 @@ failure has its own `binary_digest_read` or `binary_digest_worker` code and may 
 The run wall deadline is established when spawning begins. Reading the child's resource-limit
 report and waiting for the child spend that same `timeout_s` budget. If the deadline expires
 during report collection, the report is uncertified and the existing timeout branch kills and
-reaps the process group with `timed_out: true`.
+reaps the directly waited child after killing its initial process group with `timed_out: true`.
 
 Acceptance: a denied registered tool causes no binary digest attempt; an over-budget binary gets
 the named byte-limit refusal; a digest reader stalled past `binary_digest_timeout_s` gets
 `binary_digest_time_limit` with `elapsed_ms >= time_cap_ms` and no digest in any receipt; a delayed
 report consumes the wall budget so a child cannot receive a fresh full timeout after report
 collection.
+
+## Amendment 11 (2026-09-29): timeout residual for detached descendants
+
+Status: Proposed for sign-off as a statement of current behavior; the containment target in
+acceptance 6 is **not met** for a descendant that leaves the initial process group (for example,
+by calling `setsid`). The follow-up design issue is #3631. This amendment does not change the
+Seatbelt profile or timeout algorithm, and leaves acceptance 6's lifetime target intact.
+
+Acceptance 4 now names the operations the Seatbelt profile actually refuses: outbound connect and
+bind/listen on a network port, each with an unsandboxed control. Its earlier "opens a socket"
+wording was too broad: `socket()` can return an unconnected descriptor inside the sandbox, while
+the attempted connection or bind is refused. This clarification replaces acceptance 4's prior
+predicate; it does not claim that opening an unconnected descriptor is denied.
+
+On a run deadline, the wrapper signals the initial process group and waits for the directly
+spawned child. A descendant that has moved into another process group can remain alive after
+`exec.run` returns. `timed_out: true` in a receipt or exit event reports that the run deadline was
+reached; it does not certify that every descendant has exited. The `exited` event concerns the
+directly waited child. The run's output collection has a separate bounded close grace, so output
+references and capture status also do not prove descendant termination.
+
+The detached descendant retains the Seatbelt profile inherited at launch. Its continued lifetime
+does not grant writes outside the allowed roots or network reach. A macOS regression arm must let
+a `setsid` descendant live past the timed-out receipt, then observe a refused write outside the
+run root, a refused outbound connection, and a refused bind/listen. The same operations must
+succeed from an unsandboxed process; launching the survivor unsandboxed is the must-fail mutation
+control. This tests confinement after the wrapper returns; it does not satisfy acceptance 6's
+lifetime target.
+
+Until #3631 resolves the design, consumers must treat `timed_out: true` as a deadline outcome and
+must not infer whole-process-tree termination from it.

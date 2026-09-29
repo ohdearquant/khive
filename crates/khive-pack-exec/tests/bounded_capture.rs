@@ -168,3 +168,123 @@ async fn run_deadline_closes_a_descendant_held_pipe() {
     .expect("descendant did not report pipe state");
     assert_eq!(state, b"closed", "host read end stayed open");
 }
+
+#[tokio::test]
+async fn detached_timeout_survivor_retains_file_and_network_denials() {
+    let fixture = Fixture::new();
+    let tree = fixture.ready_tree().await;
+    let outside = fixture._dir.path().join("outside-guard");
+    std::fs::write(&outside, b"guard").expect("host can write outside the run root");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let address = listener.local_addr().expect("listener address");
+    let baseline = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
+        .expect("host can connect to the loopback listener");
+    drop(baseline);
+    let bind_control = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("unsandboxed host can bind and listen on loopback");
+    drop(bind_control);
+
+    let script = r#"/usr/bin/perl -MPOSIX -MIO::Socket::INET -e '
+        pipe(my $signal_read, my $signal_write) or die "pipe: $!";
+        my $child = fork(); die "fork: $!" unless defined $child;
+        if ($child) {
+            close($signal_write);
+            my $signal = <$signal_read>;
+            die "no readiness signal" unless defined $signal;
+            close($signal_read);
+            sleep 20;
+            exit 0;
+        }
+        close($signal_read);
+        POSIX::setsid() >= 0 or die "setsid: $!";
+        close(STDOUT);
+        close(STDERR);
+        open(my $ready, ">", "$ENV{HOME}/survivor-ready") or die "ready: $!";
+        print $ready "ready";
+        close($ready);
+        print $signal_write "ready\n";
+        close($signal_write);
+
+        my $release = "$ENV{HOME}/survivor-release";
+        for (1..750) {
+            last if -e $release;
+            select(undef, undef, undef, 0.02);
+        }
+        exit 2 unless -e $release;
+
+        my $write_allowed = open(my $outside_file, ">", $ARGV[0]);
+        if ($write_allowed) {
+            print $outside_file "escaped";
+            close($outside_file);
+        }
+        my $socket = IO::Socket::INET->new(
+            PeerAddr => "127.0.0.1", PeerPort => $ARGV[1],
+            Proto => "tcp", Timeout => 1
+        );
+        my $connect_allowed = defined $socket;
+        close($socket) if $connect_allowed;
+        my $listener = IO::Socket::INET->new(
+            LocalAddr => "127.0.0.1", LocalPort => 0,
+            Proto => "tcp", Listen => 1
+        );
+        my $bind_allowed = defined $listener;
+        close($listener) if $bind_allowed;
+        open(my $state, ">", "$ENV{HOME}/survivor-state.tmp") or die "state: $!";
+        print $state "write=", ($write_allowed ? "allowed" : "denied"), "\n";
+        print $state "connect=", ($connect_allowed ? "allowed" : "denied"), "\n";
+        print $state "bind=", ($bind_allowed ? "allowed" : "denied"), "\n";
+        close($state);
+        rename("$ENV{HOME}/survivor-state.tmp", "$ENV{HOME}/survivor-state")
+            or die "publish state: $!";
+    ' "$1" "$2" & wait"#;
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        fixture.call(
+            "exec.run",
+            json!({
+                "tree": tree,
+                "tool": "sh",
+                "args": [
+                    "-c",
+                    script,
+                    "sh",
+                    outside.to_string_lossy().into_owned(),
+                    address.port().to_string()
+                ],
+                "actor": "local",
+                "timeout_s": 1.0
+            }),
+        ),
+    )
+    .await
+    .expect("run did not return after killing its initial process group");
+    let receipt = &result["receipt"];
+    assert_eq!(receipt["timed_out"], true, "{receipt}");
+    assert!(
+        receipt["sandbox"]["profile_digest"].is_string(),
+        "{receipt}"
+    );
+
+    let run_dir = fixture.root.join(receipt["id"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(run_dir.join("survivor-ready")).expect("detached descendant readiness"),
+        b"ready"
+    );
+    std::fs::write(run_dir.join("survivor-release"), b"go")
+        .expect("release survivor after the timeout receipt");
+    let state = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(run_dir.join("survivor-state")) {
+                if !bytes.is_empty() {
+                    break bytes;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("detached descendant did not report post-timeout probes");
+    assert_eq!(state, b"write=denied\nconnect=denied\nbind=denied\n");
+    assert_eq!(std::fs::read(outside).unwrap(), b"guard");
+}

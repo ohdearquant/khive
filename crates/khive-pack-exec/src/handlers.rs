@@ -360,6 +360,7 @@ struct Receipt {
     exit_code: Option<i64>,
     exit_signal: Option<i64>,
     limiting_resource: Option<&'static str>,
+    // Deadline outcome only; detached descendants can outlive the run (ADR-181 Amendment 11).
     timed_out: bool,
     denied: bool,
     success: bool,
@@ -1580,7 +1581,8 @@ async fn execute(
             None
         }
     };
-    // Whatever the child left behind in its group ends with the run.
+    // Signal any remaining members of the initial group. A descendant that
+    // called setsid is outside this group and can outlive the run.
     kill_group(pid);
     let out = collect_stream(out_task, deadline, cap).await;
     let err = collect_stream(err_task, deadline, cap).await;
@@ -1592,6 +1594,7 @@ async fn execute(
         append_failure_reason(receipt, "output collection failed to read a stream".into());
     }
     receipt.finished_at = Some(receipts::now_micros());
+    // "exited" observes the directly waited child, not the whole process tree.
     if let Err(error) = receipts::event(
         rt,
         ns,
