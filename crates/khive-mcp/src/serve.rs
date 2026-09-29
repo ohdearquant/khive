@@ -466,8 +466,7 @@ fn spawn_email_channel_loops(
             let verb_reg = server.verb_registry_clone();
             let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
             if allowlist.is_empty() {
                 allowlist.push(email_ch.maintainer_address().to_string());
@@ -563,11 +562,17 @@ fn ingest_namespace_from_env() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+/// Resolve the default inbound actor for fresh (uncorrelated) email messages.
+#[cfg(feature = "channel-email")]
+fn email_default_inbound_actor_from_env() -> String {
+    default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email")
+}
+
 /// Resolve the default inbound actor for fresh (uncorrelated) channel messages.
 ///
-/// Reads the supplied environment variable; falls back to the channel's
-/// recipient when it is unset or blank. Email defaults to `local`; Telegram's
-/// fallback is isolated from the anonymous `local` mailbox.
+/// Reads the supplied environment variable; falls back to the supplied channel
+/// actor when it is unset or blank. Both channel defaults are isolated
+/// from the anonymous `local` mailbox.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> String {
     std::env::var(actor_variable)
@@ -10124,21 +10129,24 @@ region = "us-east-1"
 
         #[test]
         #[serial]
-        fn default_inbound_actor_defaults_to_local() {
+        fn default_inbound_actor_defaults_to_channel_email() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local"),
-                "local",
-                "an unset actor must resolve to the neutral namespace, not to any particular \
-                 deployment's identity"
-            );
+            let actor = email_default_inbound_actor_from_env();
+            assert_eq!(actor, "channel:email");
+            for caller in [None, Some("  ")] {
+                assert_ne!(
+                    actor,
+                    khive_runtime::resolve_actor(caller).id,
+                    "an unconfigured caller must never resolve to the email mailbox actor"
+                );
+            }
         }
 
         #[test]
         #[serial]
         fn default_inbound_actor_reads_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
-            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "lambda:mybot");
         }
@@ -10147,21 +10155,24 @@ region = "us-east-1"
         #[serial]
         fn default_inbound_actor_ignores_blank_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
-            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(actor, "local", "blank env var must fall back to default");
+            assert_eq!(
+                actor, "channel:email",
+                "blank env var must use the channel actor"
+            );
         }
 
         #[tokio::test]
         #[serial]
-        async fn fresh_uncorrelated_email_defaults_to_local_inbox() {
+        async fn explicit_local_override_routes_fresh_email_to_local_inbox() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             assert_eq!(default_actor, "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-default-local", &default_actor).await;
+            ingest_fresh_email(&registry, "email-explicit-local", &default_actor).await;
 
             let inbox = registry
                 .dispatch("comm.inbox", serde_json::json!({}))
@@ -10179,12 +10190,11 @@ region = "us-east-1"
 
         #[tokio::test]
         #[serial]
-        async fn opt_in_email_mailbox_is_visible_only_to_a_configured_reader() {
-            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+        async fn fresh_uncorrelated_email_defaults_to_channel_mailbox() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor = email_default_inbound_actor_from_env();
             assert_eq!(default_actor, "channel:email");
+            assert_ne!(default_actor, khive_runtime::resolve_actor(None).id);
 
             let config: KhiveConfig = toml::from_str(&format!(
                 "[actor]\nid = 'channel:email'\nmailbox_readers = ['{EMAIL_READER}']\n"
@@ -10202,7 +10212,7 @@ region = "us-east-1"
             );
             let runtime = KhiveRuntime::new(runtime_config).expect("configured runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-opt-in-reader", &default_actor).await;
+            ingest_fresh_email(&registry, "email-default-channel", &default_actor).await;
 
             let inbox = dispatch_as(
                 &registry,
@@ -10215,6 +10225,18 @@ region = "us-east-1"
             let messages = inbox["messages"].as_array().expect("inbox messages");
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0]["content"], "fresh email");
+            assert_eq!(messages[0]["properties"]["to_actor"], "channel:email");
+
+            let local = dispatch_as(&registry, None, "comm.inbox", serde_json::json!({}))
+                .await
+                .expect("the anonymous local caller can read its own inbox");
+            assert!(
+                local["messages"]
+                    .as_array()
+                    .expect("inbox messages")
+                    .is_empty(),
+                "fresh email must not appear in the anonymous local inbox"
+            );
 
             let denied = dispatch_as(
                 &registry,
@@ -10237,9 +10259,9 @@ region = "us-east-1"
         #[tokio::test]
         #[serial]
         async fn email_sender_prefix_filters_fresh_ingest_from_local_sends() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
             ingest_fresh_email(&registry, "email-prefix-filter", &default_actor).await;
