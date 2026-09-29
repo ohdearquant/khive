@@ -22,18 +22,7 @@ AND EXISTS (
       AND json_type(properties, '$.repo_slug') = 'text'
       AND json_extract(properties, '$.repo_slug') = ?10 COLLATE BINARY
 )
-AND EXISTS (
-    SELECT 1 FROM git_mirror_cursor
-    WHERE project_id = ?4 AND kind = 'commits'
-      AND typeof(cursor_value) = 'text'
-      AND CAST(cursor_value AS BLOB) = ?11 AND updated_at = ?12
-)
-AND EXISTS (
-    SELECT 1 FROM git_mirror_cursor
-    WHERE project_id = ?4 AND kind = 'commits_checkpoint'
-      AND typeof(cursor_value) = 'text'
-      AND CAST(cursor_value AS BLOB) = ?13 AND updated_at = ?14
-)
+AND ?11
 AND NOT EXISTS (
     SELECT 1 FROM graph_edges
     WHERE namespace = ?1 AND source_id = ?3 AND target_id = ?4

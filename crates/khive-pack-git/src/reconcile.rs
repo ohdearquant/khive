@@ -1036,6 +1036,44 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
+    async fn conditional_annotation_link_refuses_a_stale_cursor_before_inserting() {
+        let fixture = Fixture::new().await;
+        let guard = annotation_guard(
+            &cursor_snapshot(&fixture.runtime, fixture.project_b)
+                .await
+                .unwrap(),
+            &fixture.first_sha,
+            &fixture.source_identity,
+        )
+        .unwrap();
+        fixture
+            .execute(
+                "UPDATE git_mirror_cursor SET updated_at=updated_at+1 \
+                 WHERE project_id=?1 AND kind='commits'",
+                vec![SqlValue::Text(fixture.project_b.to_string())],
+            )
+            .await;
+
+        let outcome = fixture
+            .runtime
+            .link_commit_annotation_if_absent(
+                &fixture.token,
+                fixture.first_note,
+                fixture.project_b,
+                guard,
+            )
+            .await
+            .expect("stale cursor is a classified refusal");
+        assert!(matches!(
+            outcome,
+            CommitAnnotationInsertOutcome::CursorChanged
+        ));
+        assert_eq!(fixture.edge_bytes(fixture.first_note).await, None);
+        assert_eq!(fixture.link_created_events(fixture.first_note).await, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn conditional_annotation_link_emits_only_for_created_outcome() {
         let fixture = Fixture::new().await;
         let guard = annotation_guard(

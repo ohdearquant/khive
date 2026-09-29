@@ -1543,6 +1543,27 @@ fn conditional_commit_annotation_insert(
     edge: Edge,
     guard: &CommitAnnotationGuard,
 ) -> Result<CommitAnnotationInsertOutcome, rusqlite::Error> {
+    // This connection is inside BEGIN IMMEDIATE on both writer paths. Check
+    // the pack-owned cursor rows here, then bind the result into the core-only
+    // INSERT: no other writer can change them between this probe and the DML.
+    let cursor_matches: bool = conn.query_row(
+        "SELECT (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
+                 WHERE project_id=?1 AND kind='commits' \
+                 AND typeof(cursor_value)='text' \
+                 AND CAST(cursor_value AS BLOB)=?2 AND updated_at=?3)) \
+              AND (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
+                 WHERE project_id=?1 AND kind='commits_checkpoint' \
+                 AND typeof(cursor_value)='text' \
+                 AND CAST(cursor_value AS BLOB)=?4 AND updated_at=?5))",
+        rusqlite::params![
+            edge.target_id.to_string(),
+            guard.commits.value,
+            guard.commits.updated_at,
+            guard.checkpoint.value,
+            guard.checkpoint.updated_at,
+        ],
+        |row| row.get(0),
+    )?;
     let metadata = edge
         .metadata
         .as_ref()
@@ -1562,10 +1583,7 @@ fn conditional_commit_annotation_insert(
             metadata,
             guard.expected_sha,
             guard.source_identity,
-            guard.commits.value,
-            guard.commits.updated_at,
-            guard.checkpoint.value,
-            guard.checkpoint.updated_at,
+            cursor_matches,
         ],
     )?;
     if affected == 1 {
@@ -1604,24 +1622,6 @@ fn conditional_commit_annotation_insert(
     if !target_live {
         return Ok(CommitAnnotationInsertOutcome::TargetChanged);
     }
-    let cursor_matches: bool = conn.query_row(
-        "SELECT (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
-                 WHERE project_id=?1 AND kind='commits' \
-                 AND typeof(cursor_value)='text' \
-                 AND CAST(cursor_value AS BLOB)=?2 AND updated_at=?3)) \
-              AND (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
-                 WHERE project_id=?1 AND kind='commits_checkpoint' \
-                 AND typeof(cursor_value)='text' \
-                 AND CAST(cursor_value AS BLOB)=?4 AND updated_at=?5))",
-        rusqlite::params![
-            edge.target_id.to_string(),
-            guard.commits.value,
-            guard.commits.updated_at,
-            guard.checkpoint.value,
-            guard.checkpoint.updated_at,
-        ],
-        |row| row.get(0),
-    )?;
     if !cursor_matches {
         return Ok(CommitAnnotationInsertOutcome::CursorChanged);
     }
