@@ -1,12 +1,23 @@
+//! The fetch path returns the identity representation or refuses.
+//!
+//! Some gzip decoders mishandle the optional header CRC (FHCRC): they feed the
+//! two CRC bytes to the inflater, so a byte-capped read can return bytes that
+//! are not a prefix of the plaintext with no error. Whether a given stream
+//! errors or silently corrupts depends on header fields such as the mtime, so
+//! these tests scan those fields instead of checking one fixture.
+
 use std::io::Write as _;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
+use khive_runtime::RuntimeError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::fetch::run_one_hop;
+use crate::egress;
+use crate::fetch::{run_one_hop, HopOutcome};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum HeaderCrc {
     Absent,
     Correct,
@@ -28,22 +39,24 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn gzip_body(plaintext: &[u8], header_crc: HeaderCrc) -> Vec<u8> {
+fn gzip_body(plaintext: &[u8], header_crc: HeaderCrc, mtime: u32) -> Vec<u8> {
     let mut deflater =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     deflater.write_all(plaintext).expect("write deflate body");
     let compressed = deflater.finish().expect("finish deflate body");
 
-    let flags = if matches!(header_crc, HeaderCrc::Absent) {
+    let flags = if header_crc == HeaderCrc::Absent {
         0_u8
     } else {
         0x02_u8
     };
-    let header = [0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 255];
-    let mut gzip = header.to_vec();
-    if !matches!(header_crc, HeaderCrc::Absent) {
+    let mut header = vec![0x1f, 0x8b, 8, flags];
+    header.extend_from_slice(&mtime.to_le_bytes());
+    header.extend_from_slice(&[0, 255]);
+    let mut gzip = header.clone();
+    if header_crc != HeaderCrc::Absent {
         let crc16 = crc32(&header) as u16;
-        let crc16 = if matches!(header_crc, HeaderCrc::Wrong) {
+        let crc16 = if header_crc == HeaderCrc::Wrong {
             crc16 ^ 1
         } else {
             crc16
@@ -56,28 +69,64 @@ fn gzip_body(plaintext: &[u8], header_crc: HeaderCrc) -> Vec<u8> {
     gzip
 }
 
-fn http_response(gzip: &[u8]) -> Vec<u8> {
+fn http_response(content_encoding: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let encoding = content_encoding
+        .map(|value| format!("Content-Encoding: {value}\r\n"))
+        .unwrap_or_default();
     let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        gzip.len()
+        "HTTP/1.1 200 OK\r\n{encoding}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     )
     .into_bytes();
-    response.extend_from_slice(gzip);
+    response.extend_from_slice(body);
     response
 }
 
-async fn spawn_once(response: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
+/// Serve one canned response and hand back the request head the client sent.
+async fn spawn_once(response: Vec<u8>) -> (u16, tokio::task::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept request");
-        let mut request = [0_u8; 4096];
-        let read = stream.read(&mut request).await.expect("read request");
-        assert!(read > 0, "client must reach the local test server");
+        let mut request = Vec::with_capacity(4096);
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).await.expect("read request");
+            assert!(read > 0, "client must send complete request headers");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= 16 * 1024, "request headers too large");
+        }
+        assert!(request.starts_with(b"GET "), "expected a GET request");
+        // The client may refuse and hang up before the write finishes.
         let _ = stream.write_all(&response).await;
         let _ = stream.shutdown().await;
+        String::from_utf8(request).expect("ASCII request headers")
     });
     (port, server)
+}
+
+/// One capped GET through the production client builder. Returns the hop
+/// result and the request head the server saw.
+async fn capped_get(response: Vec<u8>, cap: usize) -> (Result<HopOutcome, RuntimeError>, String) {
+    let (port, server) = spawn_once(response).await;
+    let host = "identity.example";
+    let client = egress::pinned_client(host, IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        .expect("pinned client builds");
+    let url = url::Url::parse(&format!("http://{host}:{port}/body")).expect("pinned test URL");
+    let result = run_one_hop(
+        &client,
+        &url,
+        reqwest::Method::GET,
+        &[],
+        cap as u64,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+    let request = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server must receive the request")
+        .expect("server task");
+    (result, request)
 }
 
 fn first_eight_hex(bytes: &[u8]) -> String {
@@ -89,112 +138,172 @@ fn first_eight_hex(bytes: &[u8]) -> String {
         .join("")
 }
 
-fn assert_plaintext_prefix(plaintext: &[u8], decoded: &[u8]) {
-    assert!(
-        plaintext.starts_with(decoded),
-        "decoded bytes are not a plaintext prefix: first8_hex={}",
-        first_eight_hex(decoded)
+fn assert_content_encoding_refusal(label: &str, result: &Result<HopOutcome, RuntimeError>) {
+    match result {
+        Ok(outcome) => {
+            let (bytes, truncated) = outcome.body.clone().unwrap_or_default();
+            panic!(
+                "{label}: expected a refusal, got status={} truncated={truncated} bytes={} first8_hex={}",
+                outcome.status,
+                bytes.len(),
+                first_eight_hex(&bytes)
+            );
+        }
+        Err(RuntimeError::InvalidInput(message))
+            if message.starts_with("unsupported_content_encoding:") => {}
+        Err(error) => panic!("{label}: expected unsupported_content_encoding, got {error}"),
+    }
+}
+
+fn assert_offers_only_identity(label: &str, request: &str) {
+    let offered: Vec<&str> = request
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("accept-encoding:"))
+        .map(|line| line.split_once(':').expect("header line").1.trim())
+        .collect();
+    assert_eq!(
+        offered,
+        ["identity"],
+        "{label}: the request must offer no compression: {request}"
     );
 }
 
-#[tokio::test]
-async fn fhcrc_gzip_caps_yield_only_plaintext_prefixes_or_explicit_refusals() {
+fn plaintext() -> Vec<u8> {
     let plaintext = b"Test FHCRC boundary; decode before truncating.\n".repeat(100);
     assert!(plaintext.len() > 1300);
+    plaintext
+}
+
+fn caps(plaintext: &[u8]) -> [usize; 4] {
+    let caps = [1, 1300, plaintext.len(), plaintext.len() + 1];
+    assert!(
+        caps.contains(&plaintext.len()),
+        "the exact byte cap must be probed"
+    );
+    caps
+}
+
+/// Header mtime decides the header CRC, so it decides whether a mishandled
+/// stream errors or corrupts. Every low byte value, plus values that set each
+/// higher byte.
+fn mtimes() -> Vec<u32> {
+    (0_u32..256)
+        .chain([
+            0x100,
+            0x1234,
+            0x0001_0000,
+            0x0100_0000,
+            0xdead_beef,
+            u32::MAX,
+        ])
+        .collect()
+}
+
+#[tokio::test]
+async fn gzip_streams_with_a_header_crc_are_refused_across_mtimes_and_caps() {
+    let plaintext = plaintext();
     assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
 
-    // Predeclared control: this deliberately wrong first byte must trip the
-    // same prefix assertion used for every successful network arm.
+    // Predeclared controls: each assertion must fail on the input it exists
+    // to reject before it is trusted on the population.
     assert!(
-        std::panic::catch_unwind(|| assert_plaintext_prefix(&plaintext, b"S")).is_err(),
-        "the nonprefix control must fail the prefix assertion"
+        std::panic::catch_unwind(|| assert_content_encoding_refusal(
+            "wrong-cause control",
+            &Err(RuntimeError::InvalidInput(
+                "transport_error: error decoding response body".into()
+            ))
+        ))
+        .is_err(),
+        "a decode error is not the named refusal"
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_offers_only_identity(
+            "offer control",
+            "GET / HTTP/1.1\r\naccept-encoding: gzip\r\n\r\n"
+        ))
+        .is_err(),
+        "an offer of gzip must fail the identity assertion"
     );
 
-    let plain = gzip_body(&plaintext, HeaderCrc::Absent);
-    let correct = gzip_body(&plaintext, HeaderCrc::Correct);
-    let wrong = gzip_body(&plaintext, HeaderCrc::Wrong);
-    assert_eq!(plain[3], 0);
-    assert_eq!(correct[3], 0x02);
-    assert_eq!(wrong[3], 0x02);
-    assert_eq!(&correct[..10], &wrong[..10]);
-    assert_eq!(correct[10] ^ 1, wrong[10]);
-    assert_eq!(correct[11], wrong[11]);
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .gzip(true)
-        .build()
-        .expect("gzip client");
-    let caps = [1, 1300, plaintext.len() + 1];
-    let mut observations = Vec::new();
-
-    for (variant, gzip) in [
-        ("plain", plain),
-        ("fhcrc_correct", correct),
-        ("fhcrc_wrong", wrong),
-    ] {
-        for cap in caps {
-            let (port, server) = spawn_once(http_response(&gzip)).await;
-            let url =
-                url::Url::parse(&format!("http://127.0.0.1:{port}/gzip")).expect("local test URL");
-            let result = run_one_hop(
-                &client,
-                &url,
-                reqwest::Method::GET,
-                &[],
-                cap as u64,
-                Instant::now() + Duration::from_secs(5),
-            )
-            .await;
-            tokio::time::timeout(Duration::from_secs(5), server)
-                .await
-                .expect("server must receive the request")
-                .expect("server task");
-
-            match &result {
-                Ok(outcome) => match &outcome.body {
-                    Some((decoded, truncated)) => println!(
-                        "fhcrc_probe variant={variant} cap={cap} status={} truncated={truncated} bytes={} first8_hex={} error=none",
-                        outcome.status,
-                        decoded.len(),
-                        first_eight_hex(decoded)
-                    ),
-                    None => println!(
-                        "fhcrc_probe variant={variant} cap={cap} status={} truncated=none bytes=none first8_hex=none error=missing_GET_body",
-                        outcome.status
-                    ),
-                },
-                Err(error) => println!(
-                    "fhcrc_probe variant={variant} cap={cap} status=none truncated=none bytes=none first8_hex=none error={error}"
-                ),
+    let mut population = 0_usize;
+    for header_crc in [HeaderCrc::Correct, HeaderCrc::Wrong] {
+        for mtime in mtimes() {
+            let gzip = gzip_body(&plaintext, header_crc, mtime);
+            assert_eq!(gzip[3], 0x02, "FHCRC flag set");
+            assert_eq!(&gzip[4..8], &mtime.to_le_bytes());
+            for cap in caps(&plaintext) {
+                let (result, request) = capped_get(http_response(Some("gzip"), &gzip), cap).await;
+                let label = format!("fhcrc mtime={mtime:#x} cap={cap}");
+                assert_content_encoding_refusal(&label, &result);
+                assert_offers_only_identity(&label, &request);
+                population += 1;
             }
-            observations.push((variant, cap, result));
         }
     }
+    assert_eq!(population, 2 * mtimes().len() * 4);
+}
 
-    for (variant, cap, result) in observations {
-        match result {
-            Ok(outcome) => {
-                assert_eq!(outcome.status, 200, "{variant} cap={cap}");
-                let (decoded, truncated) = outcome.body.expect("GET must return a body slot");
-                assert_plaintext_prefix(&plaintext, &decoded);
-                assert_eq!(
-                    decoded.len(),
-                    cap.min(plaintext.len()),
-                    "{variant} cap={cap}"
-                );
-                assert_eq!(truncated, cap < plaintext.len(), "{variant} cap={cap}");
-            }
-            Err(error) => {
-                assert!(
-                    !error.to_string().is_empty(),
-                    "{variant} cap={cap}: refusal must carry an error"
-                );
-                assert_ne!(
-                    variant, "plain",
-                    "the ordinary gzip positive control refused at cap={cap}: {error}"
-                );
+#[tokio::test]
+async fn plain_gzip_without_a_header_crc_is_refused() {
+    let plaintext = plaintext();
+    let mut population = 0_usize;
+    for mtime in mtimes() {
+        let gzip = gzip_body(&plaintext, HeaderCrc::Absent, mtime);
+        assert_eq!(gzip[3], 0, "no header flags");
+        for cap in caps(&plaintext) {
+            let (result, request) = capped_get(http_response(Some("gzip"), &gzip), cap).await;
+            let label = format!("plain gzip mtime={mtime:#x} cap={cap}");
+            assert_content_encoding_refusal(&label, &result);
+            assert_offers_only_identity(&label, &request);
+            population += 1;
+        }
+    }
+    assert_eq!(population, mtimes().len() * 4);
+}
+
+#[tokio::test]
+async fn every_declared_content_coding_is_refused() {
+    let body = gzip_body(&plaintext(), HeaderCrc::Correct, 7);
+    for coding in [
+        "gzip",
+        "GZIP",
+        " gzip ",
+        "x-gzip",
+        "br",
+        "deflate",
+        "zstd",
+        "compress",
+        "aes128gcm",
+        "identity, gzip",
+        "gzip, identity",
+        "identity,identity,br",
+    ] {
+        let (result, _) = capped_get(http_response(Some(coding), &body), 64).await;
+        assert_content_encoding_refusal(&format!("content-encoding {coding:?}"), &result);
+    }
+}
+
+#[tokio::test]
+async fn identity_responses_return_the_exact_plaintext_prefix_at_each_cap() {
+    let plaintext = plaintext();
+    // Undecoded gzip bytes served as the identity representation are just
+    // bytes: they come back verbatim, never decoded.
+    let gzip_as_identity = gzip_body(&plaintext, HeaderCrc::Correct, 2);
+    for (label, body) in [
+        ("plaintext", plaintext.clone()),
+        ("gzip bytes as identity", gzip_as_identity),
+    ] {
+        for declared in [None, Some("identity"), Some("Identity"), Some("")] {
+            for cap in [1, 50, 1300, body.len(), body.len() + 1] {
+                let (result, request) = capped_get(http_response(declared, &body), cap).await;
+                let label = format!("{label} content-encoding={declared:?} cap={cap}");
+                let outcome = result.unwrap_or_else(|error| panic!("{label}: {error}"));
+                assert_eq!(outcome.status, 200, "{label}");
+                let (received, truncated) = outcome.body.expect("GET must return a body slot");
+                let expected = cap.min(body.len());
+                assert_eq!(received, body[..expected], "{label}");
+                assert_eq!(truncated, cap < body.len(), "{label}");
+                assert_offers_only_identity(&label, &request);
             }
         }
     }
