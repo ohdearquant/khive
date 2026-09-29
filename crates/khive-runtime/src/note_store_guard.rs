@@ -46,8 +46,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_storage::{
-    BatchWriteSummary, BoundedCount, DeleteMode, Note, NoteFilter, NoteStore, Page, PageRequest,
-    SeekCursor, SeekPage, StorageCapability, StorageError, StorageResult,
+    BatchWriteSummary, BoundedCount, DeleteMode, Note, NoteFilter, NoteStore, NoteVisibility, Page,
+    PageRequest, SeekCursor, SeekPage, StorageCapability, StorageError, StorageResult,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -494,6 +494,10 @@ impl NoteStore for PolicyEnforcingNoteStore {
 
     async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
         self.inner.get_notes_batch(ids).await
+    }
+
+    async fn get_note_visibility_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<NoteVisibility>> {
+        self.inner.get_note_visibility_batch(ids).await
     }
 }
 

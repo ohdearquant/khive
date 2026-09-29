@@ -153,6 +153,17 @@ async fn profile_state_version_refuses_overflow_before_any_event_is_persisted() 
     );
 }
 
+#[test]
+fn profile_state_version_builder_binds_input_value() {
+    let event = make_event("default").with_profile_state_version(41);
+    let statements = event_insert_statements(&event).unwrap();
+    assert_eq!(statements.len(), 1);
+    match statements[0].params.get(9) {
+        Some(SqlValue::Integer(value)) => assert_eq!(*value, 41),
+        other => panic!("expected bound profile_state_version 41, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn prepared_event_insert_stores_and_reads_i64_max_profile_state_version() {
     let store = setup_memory_store();
