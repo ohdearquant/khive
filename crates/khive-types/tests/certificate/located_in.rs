@@ -150,7 +150,9 @@ fn er_extends_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
     let r = all_pairs(graph, R);
     let restricted: Pairs = all_pairs(graph, "extends")
         .into_iter()
-        .filter(|(s, t)| kind_of(graph, s) == Some("concept") && kind_of(graph, t) == Some("concept"))
+        .filter(|(s, t)| {
+            kind_of(graph, s) == Some("concept") && kind_of(graph, t) == Some("concept")
+        })
         .collect();
     if !r.is_empty() && r == restricted {
         EliminatorCheck::Eliminated {
@@ -446,7 +448,12 @@ fn er_extends_fixture_pairs_lineage_with_location_on_the_shared_signature() {
     assert!(ER_EXTENDS
         .graph
         .contains(&("lung", "located_in", "thoracic_cavity")));
-    for node in ["lung", "thoracic_cavity", "pneumonia", "bacterial_pneumonia"] {
+    for node in [
+        "lung",
+        "thoracic_cavity",
+        "pneumonia",
+        "bacterial_pneumonia",
+    ] {
         assert_eq!(kind_of(ER_EXTENDS.graph, node), Some("concept"));
     }
 }
