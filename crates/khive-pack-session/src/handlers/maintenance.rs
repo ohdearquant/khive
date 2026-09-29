@@ -274,8 +274,11 @@ mod tests {
         assert_eq!(before["tables"]["session_mirror_cursor"]["rows"], 0);
 
         let mut writer = runtime.sql().writer().await.expect("writer");
+        // Test setup scripts use pack-owned tables and are not standalone lint queries.
         writer
-            .execute_script(include_str!("fixtures/session_maintenance_seed.sql").to_owned())
+            .execute_script(
+                include_str!("fixtures/session_maintenance_seed.sql.fixture").to_owned(),
+            )
             .await
             .expect("seed session rows");
         drop(writer);
@@ -303,11 +306,15 @@ mod tests {
         let (runtime, _directory) = setup().await;
         let mut writer = runtime.sql().writer().await.expect("writer");
         writer
-            .execute_script(include_str!("fixtures/session_maintenance_bulk.sql").to_owned())
+            .execute_script(
+                include_str!("fixtures/session_maintenance_bulk.sql.fixture").to_owned(),
+            )
             .await
             .expect("bulk session cursor rows");
         writer
-            .execute_script(include_str!("fixtures/session_maintenance_delete.sql").to_owned())
+            .execute_script(
+                include_str!("fixtures/session_maintenance_delete.sql.fixture").to_owned(),
+            )
             .await
             .expect("delete fixture rows");
         drop(writer);
