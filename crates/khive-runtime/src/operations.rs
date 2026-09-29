@@ -5058,13 +5058,7 @@ impl KhiveRuntime {
         let mut vector_error: Option<String> = None;
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             match self
-                .vector_search(
-                    token,
-                    query_vector,
-                    Some(query_text),
-                    candidates,
-                    Some(SubstrateKind::Note),
-                )
+                .note_search_vector_search(token, query_vector, query_text, candidates)
                 .await
             {
                 Ok(hits) => hits,
