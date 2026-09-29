@@ -307,7 +307,12 @@ neither amendment treats an upload as an orphan-GC object.
    which increments `renew_seq`, and still resets the pack's in-memory idle clock; a
    rejected call does neither. The lease write uses a temporary file in `.uploads`, syncs
    it, renames it over `<id>.lease`, and syncs the directory; begin uses the same
-   temporary-file-and-rename publication. Both operations and the sweep hold the existing
+   temporary-file-and-rename publication. On platforms without a directory persistence
+   barrier, begin and renewal keep the file sync and the atomic replacing rename and claim
+   no directory barrier, as the non-Unix put path does; a crash that loses the rename also
+   ends the owning daemon, whose upload capability is process-local, and a lost or reverted
+   lease is covered by a changed `renew_seq` or the 24-hour no-lease floor. Both operations
+   and the sweep hold the existing
    cross-process root write lock through their staging and lease work, so a sweep cannot
    decide expiry between an append and its renewal. If renewal fails, the call is not
    acknowledged and the upload is aborted through the existing error path. The storage
