@@ -76,3 +76,5 @@ required-features = ["vectors"]
 test-support = []
 default = []
 vectors = ["dep:sqlite-vec"]
+# Experimental namespace-bounded FTS5 trigram tokenizer; no schema migration.
+namespace-trigram-proto = []
