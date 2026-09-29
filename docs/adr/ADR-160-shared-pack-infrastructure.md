@@ -315,6 +315,48 @@ disagreement fails with `BlobSizeMismatch`; a wrong digest fails with `BlobDiges
 `size()` remains the admission reservation, with no equality guarantee; D2, D3, and Amendment 2's
 reservation decision are otherwise unchanged.
 
+#### Amendment 4 (accepted 2026-09-28): reserve known whole-object sizes
+
+Status: Accepted (2026-09-28).
+
+**Context.** `web.extract` and moodboard source-image search each hydrate a complete stored object
+under the same shared byte budget as `blob.get`, but currently pass the 64 MiB caller ceiling as
+every reservation (#3531). Several small reads can therefore exhaust the budget while using only a
+small fraction of its raw-buffer capacity. Amendment 2 sized `blob.get`'s reservation; the same
+resource rule should apply to other whole-object consumers when size is available before
+admission.
+
+**Proposed decision.** A whole-object `hydrate_verified` caller reserves the object's size when
+that size is known before admission, either from its content reference or from one `BlobStore::size()`
+stat. Stat is metadata work and takes no raw-byte reservation. Each caller's existing byte cap
+remains an upper bound: a known size above that cap fails before admission, while a known size of
+zero reserves zero. When size is unknown (`Ok(None)`) or stat is unsupported, the caller reserves
+its cap; other stat failures propagate. The bounded read then determines whether the object exists
+and verifies it. The 64 MiB portable envelope, shared budget floor, and pack-specific derived or
+preprocessing budgets remain unchanged. The earlier size is only a reservation: bytes beyond it
+fail `BlobTooLarge`; a shorter, size-consistent body may succeed, per Amendment 3. Read-local
+metadata disagreement remains `BlobSizeMismatch`, and a wrong digest remains
+`BlobDigestMismatch` under D2.
+
+This implementation covers the following production `hydrate_verified` call families. The table
+is a coverage record, not a claim that every caller has already been converted:
+
+| Caller                                        | Reservation in this implementation                             | State                                                                                                                                                                |
+| --------------------------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `blob.get`                                    | Reported whole-object size, bounded by its existing 64 MiB cap | Already accepted under Amendment 2                                                                                                                                   |
+| `exec` registered-tool reads                  | Known object size under their existing caps                    | Already sized                                                                                                                                                        |
+| `web.extract` source body                     | One stat; known size or 64 MiB fallback                        | Converted by this proposal                                                                                                                                           |
+| Moodboard source image                        | One stat; known size or 64 MiB fallback                        | Converted by this proposal                                                                                                                                           |
+| Moodboard preference bundle and network reads | Existing 1 MiB cap                                             | Deferred: these refs carry no size and the current paths perform no pre-admission stat; a separate change must assess their four call sites and retain the 1 MiB cap |
+
+**Consequences.** Small web bodies and source images can be admitted concurrently in proportion
+to their reported sizes. A changed or understated size cannot cause an uncharged verified buffer;
+the bounded backend refuses bytes beyond the reservation. FIFO `acquire_many` admission continues
+to apply, including when a large waiter precedes a smaller one (#3543). The preference paths
+remain a named implementation gap under this proposed general rule; their cap is unchanged.
+
+**Refs.** #3531, #3543
+
 ### D4 — Artifact consumers converge on ADR-121 attachments
 
 The shared blob operation is independent of record modeling. Packs attach original bytes through

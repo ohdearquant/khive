@@ -1468,6 +1468,12 @@ mod substrate_labels {
                 profile_state_version INTEGER, session_id TEXT,
                 aggregate_kind TEXT, aggregate_id TEXT
             );
+            CREATE TABLE event_observations (
+                event_id TEXT NOT NULL, entity_id TEXT NOT NULL,
+                referent_kind TEXT NOT NULL, role TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (event_id, role, position)
+            );
             CREATE TABLE graph_edges (
                 namespace TEXT NOT NULL, id TEXT NOT NULL, source_id TEXT NOT NULL,
                 target_id TEXT NOT NULL, relation TEXT NOT NULL,
@@ -1517,6 +1523,37 @@ mod substrate_labels {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn synthetic_candidate_and_selected_queries_follow_entity_and_note_referents() {
+        let conn = fixture_db();
+        conn.execute_batch(
+            "INSERT INTO events
+                (id, namespace, verb, substrate, actor, outcome, created_at, kind, payload)
+             VALUES
+                ('ev-search', 'local', 'search', 'entity', 'agent:test', 'success', 1,
+                 'search_executed', '{}'),
+                ('ev-recall', 'local', 'memory.recall', 'note', 'agent:test', 'success', 2,
+                 'recall_executed', '{}');
+             INSERT INTO event_observations
+                (event_id, entity_id, referent_kind, role, position)
+             VALUES
+                ('ev-search', 'e-fixture-1', 'entity', 'candidate', 0),
+                ('ev-search', 'e-fixture-1', 'entity', 'selected', 0),
+                ('ev-recall', 'n-fixture-1', 'note', 'candidate', 0),
+                ('ev-recall', 'n-fixture-1', 'note', 'selected', 0);",
+        )
+        .unwrap();
+        for role in ["candidate", "selected"] {
+            for (substrate, expected) in [("entity", "e-fixture-1"), ("note", "n-fixture-1")] {
+                let query =
+                    format!("MATCH (ev:event)-[:observed_as_{role}]->(t:{substrate}) RETURN t.id");
+                let parsed = parse(QueryLanguage::Gql, &query).unwrap();
+                let compiled = compile(&parsed, &scoped("local")).unwrap();
+                assert_eq!(run(&conn, &compiled), vec![expected], "query: {query}");
+            }
+        }
     }
 
     fn insert_entity(conn: &Connection, id: &str, name: &str, properties: &str) {

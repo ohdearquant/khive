@@ -43,6 +43,7 @@ mod mailbox_view;
 mod note_create;
 mod note_index;
 mod note_read;
+pub mod note_search_ann;
 mod note_store_guard;
 pub mod note_write;
 #[cfg(test)]

@@ -3672,6 +3672,13 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use serde_json::json;
 
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn loaded_traversal_leaves_the_lexical_executor_runnable() {
         let ann = new_shared_for_role(false);
@@ -4486,17 +4493,16 @@ mod tests {
     // ── unavailable marker: terminal warm outcome (issue #1026) ──────────────
 
     fn assert_terminal_wait_latency(elapsed: std::time::Duration) {
-        // Keep the existing half-deadline discriminator under coverage. The
-        // ordinary lane also rejects a one-second delay on this immediate
-        // path, using ten polling intervals rather than half the full wait.
-        let bound_ms = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-            ANN_WARM_WAIT_TIMEOUT_MS / 2
-        } else {
-            ANN_WARM_WAIT_POLL_MS * 10
-        };
+        let bound = timing::duration_bound(
+            std::time::Duration::from_millis(ANN_WARM_WAIT_POLL_MS * 10),
+            Some(std::time::Duration::from_millis(
+                ANN_WARM_WAIT_TIMEOUT_MS / 2,
+            )),
+        )
+        .expect("terminal wait has a numeric bound in both test tiers");
         assert!(
-            elapsed < std::time::Duration::from_millis(bound_ms),
-            "terminal unavailable outcome must short-circuit within {bound_ms}ms: {elapsed:?}"
+            elapsed < bound,
+            "terminal unavailable outcome must short-circuit within {bound:?}: {elapsed:?}"
         );
     }
 

@@ -34,6 +34,15 @@ pub struct Note {
     pub version: i64,
 }
 
+/// The columns needed to decide whether a note may appear in an ID-based result.
+/// Includes soft-deleted rows so the caller can apply its visibility policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteVisibility {
+    pub id: Uuid,
+    pub namespace: String,
+    pub deleted_at: Option<i64>,
+}
+
 const fn initial_note_version() -> i64 {
     1
 }
@@ -553,6 +562,10 @@ pub enum FilterOp {
     /// The value is a `Timestamp` or RFC 3339 `Text`.
     Rfc3339Gte,
     Rfc3339Lte,
+    /// Matches an RFC 3339 instant at or before the supplied timestamp, or a
+    /// missing, null, non-text, or malformed value. The outbox uses this to
+    /// fail open on legacy retry deadlines without filtering after LIMIT.
+    Rfc3339LteOrInvalid,
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.
@@ -1040,6 +1053,22 @@ pub trait NoteStore: Send + Sync + 'static {
         for &id in ids {
             if let Some(n) = self.get_note(id).await? {
                 out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch only the columns needed for note visibility checks by UUID.
+    /// Missing IDs are omitted; soft-deleted rows retain their deletion time.
+    async fn get_note_visibility_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<NoteVisibility>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(note) = self.get_note_including_deleted(id).await? {
+                out.push(NoteVisibility {
+                    id: note.id,
+                    namespace: note.namespace,
+                    deleted_at: note.deleted_at,
+                });
             }
         }
         Ok(out)

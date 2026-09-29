@@ -217,13 +217,15 @@ are ignored. The environment is sampled once during `KhiveRuntime` construction;
 memory and knowledge serving read that immutable per-runtime policy and never re-read or
 mutate process-global environment state on a request path.
 
-### 4. Scope: both delta-log consumers
+### 4. Scope: delta-log consumers
 
-The mechanism is normative for both consumers of the ADR-079 Amendment 1 classifier:
+The mechanism is normative for consumers of the ADR-079 Amendment 1 classifier:
 
 - **memory pack** (global-scope note index) — the regression's primary surface; lands first.
 - **knowledge pack** (per-namespace index) — same architecture, same fix; may land in a
   follow-up PR, but the contract applies to it from acceptance.
+- **note-substrate search** (global-scope `note.content` index, consumer `note_search`) —
+  a separate durable watermark over the memory pack's graph, added by ADR-165 Slice 3.
 
 Any future consumer of the delta-log/watermark lifecycle inherits this contract: a serving
 path that draws candidates from a watermarked index MUST merge the tail above that watermark

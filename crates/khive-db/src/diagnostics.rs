@@ -1461,6 +1461,10 @@ fn request_census_budget() -> Option<Duration> {
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
     pub process: ProcessIdentity,
+    /// Process-lifetime note-search vector route counts, independent of this
+    /// report's database file and reset only with the serving process.
+    pub note_search_ann_route_total: u64,
+    pub note_search_fallback_route_total: u64,
     /// `None` for an in-memory backend — the file-backed sections then carry
     /// their own unavailability reasons.
     pub db_path: Option<String>,
@@ -1740,6 +1744,8 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         return Ok(DbDiagnostics {
             build,
             process,
+            note_search_ann_route_total: 0,
+            note_search_fallback_route_total: 0,
             db_path: None,
             wal_file: None,
             checkpoint_counters: counters,
@@ -1793,6 +1799,8 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     Ok(DbDiagnostics {
         build,
         process,
+        note_search_ann_route_total: 0,
+        note_search_fallback_route_total: 0,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
@@ -1859,6 +1867,8 @@ fn collect_inner(
         return DbDiagnostics {
             build,
             process,
+            note_search_ann_route_total: 0,
+            note_search_fallback_route_total: 0,
             db_path: None,
             wal_file: None,
             checkpoint_counters: counters,
@@ -1907,6 +1917,8 @@ fn collect_inner(
     DbDiagnostics {
         build,
         process,
+        note_search_ann_route_total: 0,
+        note_search_fallback_route_total: 0,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,

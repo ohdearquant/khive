@@ -3,8 +3,8 @@
 **Status**: accepted (2026-09-23)\
 **Date**: 2026-08-11\
 **Authors**: khive maintainers\
-**Tracking**: Refs #1844\
-**Implementation**: none in this ADR; accepting or merging this document does not close #1844
+**Tracking**: Refs #1844 (first slice, PR #3423); #3551 (remaining ADR contract)\
+**Implementation**: partial; PR #3423 shipped a local floor and SQLITE_FULL escalation. See Amendment 1 for remaining obligations.
 
 ## Context
 
@@ -41,7 +41,10 @@ writer surfaces and therefore follows this merge order:
 3. #1912 and #1913 (checkpoint ownership publication and standalone-writer journal limits).
    These two are semantically independent, but both touch the pool and must be rebased/merged
    serially when Git requires it; and
-4. the #1844 implementation, rebased on all four.
+4. the original #1844 implementation target, rebased on all four.
+
+PR #3423 delivered only the first local floor slice. #3551 owns completion of the remaining
+ADR-154 contract; the historical merge-order decision above remains unchanged.
 
 The implementation is one storage-safety slice, not part of the single-owner topology migration.
 It must work in the present cooperative multi-process topology and in ADR-150's future owner
@@ -51,6 +54,24 @@ This ADR addresses #1844's disk-admission floor. It does not satisfy #1876's WAL
 requirement; that requirement is decided separately in ADR-194. Its own implementation covers
 every writer surface listed in §4, including compatibility and standalone routes; merging a
 strict-routing change alone is not proof of complete coverage.
+
+#### Amendment 1 — Partial implementation status after PR #3423 (2026-09-28)
+
+Status: Accepted (2026-09-28).
+
+ADR-154 was accepted as a target contract before the disk-floor code landed. PR #3423 closed #1844 after shipping an initial, local free-space admission floor and separate native `SQLITE_FULL` escalation. Closing that issue does **not** mean the implementation satisfies this ADR. The first slice is useful, but the following differences remain:
+
+| Contract                                                                                                                        | Current first slice                                                                                                                                | Remaining obligation                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| §2: per-backend `disk_reserve_bytes` and bounded `disk_guard_deadline_ms`, with effective values in the warm-daemon `config_id` | `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` is read when the pool opens; no guard deadline or backend/config-id fold                                         | Implement §2's configuration, validation, warnings, and coherence contract. Define a deliberate transition for existing `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` installations before changing precedence or removing the old setting. |
+| §3: a stable volume identity and bounded, cross-process lease held through transaction settlement                               | Each database probes its canonical parent without a shared volume lease                                                                            | Implement the volume-key registry, advisory lease, deadline, lock order, and failure stages.                                                                                                                                    |
+| §4: probe after successful `BEGIN IMMEDIATE`; rollback on refusal; top-level and migration parity                               | The writer task probes at dequeue before `BEGIN`; other entry points probe before writer checkout or operation                                     | Move each admission to the specified execution point while retaining the lease, and prove rollback/autocommit behavior on refusal.                                                                                              |
+| §§4–5: checkpoint operations, including caller-issued `WalCheckpointTruncate`, bypass floor admission                           | Dedicated checkpoint infrastructure is exempt, but caller-issued `WalCheckpointTruncate` through the request path is refused at or below the floor | Classify the checkpoint operation at the central request boundary and bypass the floor without bypassing native SQLite errors.                                                                                                  |
+| §4: bootstrap DDL guarded before either pre-transaction table creation                                                          | Pool startup/setup can write before floor admission                                                                                                | Guard both named bootstrap writes and verify below-floor/probe-failure refusal leaves the tables and WAL unchanged from the post-open baseline.                                                                                 |
+
+The existing `crates/khive-db/docs/api/pool.md` documents the **shipped** first slice. The `writer-task.md` section headed “Proposed disk-reserve admission” describes the **target**, not current behavior; its #1844/not-implemented label needs updating so it does not imply that no disk-floor code exists. Neither source document should imply that the first slice conforms to all of ADR-154.
+
+The accepted behavior in §§2–7 and the Acceptance section remains normative. In particular, this amendment does not accept pre-`BEGIN` sampling or a floor-refused caller checkpoint as the final contract. Full implementation requires the acceptance controls already listed in this ADR, including the cross-process lease, post-`BEGIN` refusal, bootstrap, and bypass cases. A dedicated open implementation issue must carry the remaining obligations before #3523 is closed; the closed #1844 alone is not a live tracking reference.
 
 ### 2. Reserve configuration and daemon coherence
 
@@ -310,7 +331,8 @@ not evidence that the typed refusal path ran.
 
 ## References
 
-- #1844 — SQLite/WAL disk-reserve pre-write guard
+- #1844 — first implementation slice, PR #3423
+- #3551 — remaining ADR-154 volume-coordinated disk-reserve admission
 - [ADR-015](ADR-015-schema-migrations.md) — startup schema migrations
 - [ADR-091](ADR-091-wal-snapshot-lifetime.md) — checkpoint and WAL-pin governance
 - [ADR-111](ADR-111-blob-store.md) — filesystem capacity-floor precedent

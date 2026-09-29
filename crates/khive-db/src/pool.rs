@@ -3237,6 +3237,27 @@ fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
             Ok(key)
         },
     )?;
+    // The outbox's legacy retry predicate used parse_from_rfc3339, while the
+    // general key above accepts Chrono's relaxed DateTime FromStr grammar.
+    // Keep the strict grammar separate so a relaxed-only future value still
+    // fails open as malformed, instead of postponing the message forever.
+    conn.create_scalar_function(
+        "khive_rfc3339_strict_key",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let text = match ctx.get_raw(0) {
+                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let key = text
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)));
+            Ok(key)
+        },
+    )?;
     Ok(())
 }
 
@@ -3591,10 +3612,18 @@ mod tests {
         .unwrap();
     }
 
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
+
     #[test]
     fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
         let pool = ConnectionPool::new(PoolConfig {
             path: None,
+            checkout_timeout: Duration::from_secs(1),
             ..PoolConfig::default()
         })
         .unwrap();
@@ -3636,10 +3665,12 @@ mod tests {
             .writer_until(|| context.blocking_stop_reason().is_some())
             .unwrap();
         assert!(stopped.is_none());
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "request deadline must beat pool timeout"
-        );
+        if let Some(bound) = timing::duration_bound(Duration::from_secs(1), None) {
+            assert!(
+                started.elapsed() < bound,
+                "request deadline must beat pool timeout within {bound:?}"
+            );
+        }
         assert_eq!(pool.writer_acquisition_snapshot(), before);
         drop(held);
     }

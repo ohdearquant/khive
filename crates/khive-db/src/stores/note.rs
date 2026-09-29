@@ -13,7 +13,7 @@ use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NoteSeekAfter, NoteTagMode,
-    SortDir,
+    NoteVisibility, SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -895,7 +895,7 @@ fn build_note_filter_where(
                 let expr = json_extract_expr(&pf.json_path);
                 conditions.push(format!("khive_rfc3339_key({expr}) IS NOT NULL"));
             }
-            FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte => {
+            FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte | FilterOp::Rfc3339LteOrInvalid => {
                 let instant = match &pf.value {
                     SqlValue::Timestamp(instant) => *instant,
                     SqlValue::Text(text) => {
@@ -917,7 +917,19 @@ fn build_note_filter_where(
                     "<="
                 };
                 params.push(Box::new(crate::pool::rfc3339_instant_key(instant)));
-                conditions.push(format!("khive_rfc3339_key({expr}) {op} ?{}", params.len()));
+                let key_expr = if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
+                    format!("khive_rfc3339_strict_key({expr})")
+                } else {
+                    format!("khive_rfc3339_key({expr})")
+                };
+                if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
+                    conditions.push(format!(
+                        "({key_expr} IS NULL OR {key_expr} <= ?{})",
+                        params.len()
+                    ));
+                } else {
+                    conditions.push(format!("{key_expr} {op} ?{}", params.len()));
+                }
             }
             FilterOp::EqOrMissing => {
                 let expr = json_extract_expr(&pf.json_path);
@@ -1076,7 +1088,10 @@ fn build_note_filter_where(
                     | FilterOp::TextStartsWithIndexed => {
                         unreachable!()
                     }
-                    FilterOp::Rfc3339Valid | FilterOp::Rfc3339Gte | FilterOp::Rfc3339Lte => {
+                    FilterOp::Rfc3339Valid
+                    | FilterOp::Rfc3339Gte
+                    | FilterOp::Rfc3339Lte
+                    | FilterOp::Rfc3339LteOrInvalid => {
                         unreachable!()
                     }
                 };
@@ -1805,6 +1820,49 @@ impl NoteStore for SqlNoteStore {
                 })
                 .await?;
             result.extend(notes);
+        }
+        Ok(result)
+    }
+
+    async fn get_note_visibility_batch(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<NoteVisibility>, StorageError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Stay below SQLite's baseline 999-parameter limit for large ANN candidate sets.
+        const CHUNK: usize = 900;
+        let id_strings: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let mut result = Vec::with_capacity(ids.len());
+        for chunk in id_strings.chunks(CHUNK) {
+            let chunk_owned = chunk.to_vec();
+            let rows = self
+                .with_reader("get_note_visibility_batch", move |conn| {
+                    let placeholders = (1..=chunk_owned.len())
+                        .map(|i| format!("?{i}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT id, namespace, deleted_at FROM notes WHERE id IN ({placeholders})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_owned
+                        .iter()
+                        .map(|s| s as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let rows = stmt.query_map(params.as_slice(), |row| {
+                        let id: String = row.get(0)?;
+                        Ok(NoteVisibility {
+                            id: parse_uuid(&id)?,
+                            namespace: row.get(1)?,
+                            deleted_at: row.get(2)?,
+                        })
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .await?;
+            result.extend(rows);
         }
         Ok(result)
     }

@@ -14,7 +14,9 @@ use khive_storage::blob::ContentRef;
 use khive_storage::types::{
     SqlStatement, SqlValue, VectorIndexKind, VectorSearchHit, VectorSearchRequest,
 };
-use khive_storage::{BlobStore, Entity, NewAttachment, VectorStore};
+use khive_storage::{
+    BlobStore, Entity, NewAttachment, StorageCapability, StorageError, VectorStore,
+};
 use khive_types::SubstrateKind;
 
 use crate::model::{validate_embedding, DescriptorIdentity, LoadedVisionModel, VisionModelState};
@@ -383,9 +385,30 @@ async fn prepare_source_raster(
     content_ref: &ContentRef,
 ) -> Result<PreparedRaster, RuntimeError> {
     let hydrator = require_blob_hydrator(runtime)?;
-    let original = hydrator
-        .hydrate_verified(content_ref, MAX_OBJECT_BYTES as u64)
-        .await?;
+    let blob_store = require_blob_store(runtime)?;
+    let size = match khive_storage::await_request_read_phase(
+        "moodboard_search_blob_size",
+        blob_store.size(content_ref),
+    )
+    .await?
+    {
+        Ok(Some(size)) => size,
+        Ok(None)
+        | Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            ..
+        }) => MAX_OBJECT_BYTES as u64,
+        Err(error) => return Err(error.into()),
+    };
+    if size > MAX_OBJECT_BYTES as u64 {
+        return Err(StorageError::BlobTooLarge {
+            content_ref: content_ref.clone(),
+            max_bytes: MAX_OBJECT_BYTES as u64,
+            observed_at_least: size,
+        }
+        .into());
+    }
+    let original = hydrator.hydrate_verified(content_ref, size).await?;
     let preprocessing_permit = pack.model_state().acquire_preprocessing_permit().await?;
     // The verified raw-byte lease moves with the permit into the blocking
     // worker. Cancellation of the waiter cannot admit a second decoder while
@@ -670,8 +693,12 @@ mod tests {
     struct OrderedHydrationStore {
         bytes: Vec<u8>,
         content_ref: ContentRef,
+        reported_size: Option<u64>,
+        unsupported_size: bool,
+        first_expected_max: u64,
         started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
         calls: AtomicUsize,
+        size_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -686,10 +713,18 @@ mod tests {
             max_bytes: u64,
         ) -> khive_storage::StorageResult<Vec<u8>> {
             assert_eq!(content_ref, &self.content_ref);
-            assert_eq!(max_bytes, MAX_OBJECT_BYTES as u64);
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert_eq!(max_bytes, self.first_expected_max);
+            }
             if let Some(started) = self.started.lock().unwrap().take() {
                 let _ = started.send(());
+            }
+            if self.bytes.len() as u64 > max_bytes {
+                return Err(StorageError::BlobTooLarge {
+                    content_ref: content_ref.clone(),
+                    max_bytes,
+                    observed_at_least: self.bytes.len() as u64,
+                });
             }
             Ok(self.bytes.clone())
         }
@@ -700,9 +735,18 @@ mod tests {
 
         async fn size(
             &self,
-            _content_ref: &ContentRef,
+            content_ref: &ContentRef,
         ) -> khive_storage::StorageResult<Option<u64>> {
-            panic!("search source hydration must not compose size with a read")
+            self.size_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(content_ref, &self.content_ref);
+            if self.unsupported_size {
+                return Err(StorageError::Unsupported {
+                    capability: StorageCapability::Blob,
+                    operation: "size".into(),
+                    message: "stat unavailable".into(),
+                });
+            }
+            Ok(self.reported_size)
         }
 
         async fn delete(&self, _content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
@@ -790,13 +834,18 @@ mod tests {
     #[tokio::test]
     async fn source_hydration_precedes_and_waits_through_preprocessing_admission() {
         let bytes = b"digest-valid but not a raster".to_vec();
+        let source_size = bytes.len() as u64;
         let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let store = Arc::new(OrderedHydrationStore {
             bytes,
             content_ref: content_ref.clone(),
+            reported_size: Some(source_size),
+            unsupported_size: false,
+            first_expected_max: source_size,
             started: StdMutex::new(Some(started_tx)),
             calls: AtomicUsize::new(0),
+            size_calls: AtomicUsize::new(0),
         });
         let mut config = RuntimeConfig::no_embeddings();
         config.db_path = None;
@@ -829,6 +878,16 @@ mod tests {
         );
 
         let hydrator = runtime.blob_hydrator().expect("installed hydrator");
+        let sibling = tokio::time::timeout(
+            Duration::from_secs(1),
+            hydrator.hydrate_verified(&content_ref, source_size),
+        )
+        .await
+        .expect("a second small hydration fits beside the source lease")
+        .expect("second small hydration succeeds");
+        drop(sibling);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+
         let mut second_hydration =
             Box::pin(hydrator.hydrate_verified(&content_ref, MAX_OBJECT_BYTES as u64));
         assert!(
@@ -839,7 +898,7 @@ mod tests {
         );
         assert_eq!(
             store.calls.load(Ordering::SeqCst),
-            1,
+            2,
             "the queued hydration must not reach the backend before lease release"
         );
 
@@ -851,7 +910,142 @@ mod tests {
             .await
             .expect("queued hydration proceeds after source lease release")
             .expect("second hydration succeeds");
-        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn source_size_stops_before_backend_on_expired_deadline_or_cancellation() {
+        let bytes = b"source".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        let store = Arc::new(OrderedHydrationStore {
+            bytes,
+            content_ref: content_ref.clone(),
+            reported_size: Some(6),
+            unsupported_size: false,
+            first_expected_max: 6,
+            started: StdMutex::new(None),
+            calls: AtomicUsize::new(0),
+            size_calls: AtomicUsize::new(0),
+        });
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.packs = vec!["kg".to_string()];
+        let runtime = KhiveRuntime::new(config).expect("memory runtime");
+        runtime
+            .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+            .expect("install blob store");
+        let pack = MoodboardPack::new(runtime.clone());
+
+        let expired = khive_storage::RequestReadDeadline::after(Duration::ZERO);
+        let error = khive_storage::scope_request_read_deadline_at(
+            expired,
+            prepare_source_raster(&pack, &runtime, &content_ref),
+        )
+        .await
+        .expect_err("expired deadline must stop source size");
+        assert!(matches!(error,
+            RuntimeError::Storage(StorageError::Timeout { ref operation })
+            if operation == "moodboard_search_blob_size"));
+
+        let (_cancel, cancelled) = tokio::sync::watch::channel(true);
+        let error = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            prepare_source_raster(&pack, &runtime, &content_ref),
+        )
+        .await
+        .expect_err("cancelled request must stop source size");
+        assert!(matches!(error,
+            RuntimeError::Storage(StorageError::Timeout { ref operation })
+            if operation == "moodboard_search_blob_size"));
+        assert_eq!(store.size_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn source_hydration_refuses_underreported_or_oversized_object() {
+        let bytes = b"not a raster".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        for (reported_size, expected_reads) in [(1, 1usize), (MAX_OBJECT_BYTES as u64 + 1, 0usize)]
+        {
+            let store = Arc::new(OrderedHydrationStore {
+                bytes: bytes.clone(),
+                content_ref: content_ref.clone(),
+                reported_size: Some(reported_size),
+                unsupported_size: false,
+                first_expected_max: reported_size.min(MAX_OBJECT_BYTES as u64),
+                started: StdMutex::new(None),
+                calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
+            });
+            let mut config = RuntimeConfig::no_embeddings();
+            config.db_path = None;
+            config.packs = vec!["kg".to_string()];
+            let runtime = KhiveRuntime::new(config).expect("memory runtime");
+            runtime
+                .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+                .expect("install blob store");
+            let pack = MoodboardPack::new(runtime.clone());
+
+            let error = prepare_source_raster(&pack, &runtime, &content_ref)
+                .await
+                .expect_err("wrong size must refuse before raster preparation");
+            let (max_bytes, observed_at_least) = match error {
+                RuntimeError::Storage(StorageError::BlobTooLarge {
+                    max_bytes,
+                    observed_at_least,
+                    ..
+                }) => (max_bytes, observed_at_least),
+                other => panic!("expected BlobTooLarge, got {other:?}"),
+            };
+            assert_eq!(max_bytes, reported_size.min(MAX_OBJECT_BYTES as u64));
+            assert!(observed_at_least > max_bytes);
+            assert_eq!(store.calls.load(Ordering::SeqCst), expected_reads);
+            if reported_size > MAX_OBJECT_BYTES as u64 {
+                let verified = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    runtime
+                        .blob_hydrator()
+                        .unwrap()
+                        .hydrate_verified(&content_ref, MAX_OBJECT_BYTES as u64),
+                )
+                .await
+                .expect("the refused preflight did not consume admission")
+                .expect("full-budget probe succeeds");
+                assert_eq!(verified.bytes(), bytes.as_slice());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_hydration_uses_caller_cap_when_size_is_unknown() {
+        let bytes = b"not a raster".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        for unsupported_size in [false, true] {
+            let store = Arc::new(OrderedHydrationStore {
+                bytes: bytes.clone(),
+                content_ref: content_ref.clone(),
+                reported_size: None,
+                unsupported_size,
+                first_expected_max: MAX_OBJECT_BYTES as u64,
+                started: StdMutex::new(None),
+                calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
+            });
+            let mut config = RuntimeConfig::no_embeddings();
+            config.db_path = None;
+            config.packs = vec!["kg".to_string()];
+            let runtime = KhiveRuntime::new(config).expect("memory runtime");
+            runtime
+                .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+                .expect("install blob store");
+            let pack = MoodboardPack::new(runtime.clone());
+
+            let error = prepare_source_raster(&pack, &runtime, &content_ref)
+                .await
+                .expect_err("fixture bytes are not a raster");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)));
+            assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     async fn moodboard_ann_delta_count(
