@@ -1081,6 +1081,10 @@ fn orphan_sweep_dml(
 #[path = "orphan_sweep_dml_tests.rs"]
 mod orphan_sweep_dml_tests;
 
+#[cfg(all(test, feature = "vectors"))]
+#[path = "vector_read_tests.rs"]
+mod vector_read_tests;
+
 #[async_trait]
 impl VectorStore for SqliteVecStore {
     async fn insert(
@@ -1666,6 +1670,68 @@ impl VectorStore for SqliteVecStore {
         .await
     }
 
+    async fn get_vectors(
+        &self,
+        ids: &[Uuid],
+        namespace: &str,
+        field: &str,
+    ) -> StorageResult<std::collections::HashMap<Uuid, Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let table = self.table_name.clone();
+        let namespace = namespace.to_owned();
+        let field = field.to_owned();
+        let model = self.embedding_model.clone();
+        let dims = self.dimensions;
+        let ids = ids.to_vec();
+
+        self.with_reader("vec_get_vectors", move |conn| {
+            // The vec0 subject_id primary key constrains each lookup before
+            // metadata filtering, so the work is bounded by ids.len().
+            let sql = format!(
+                "SELECT embedding FROM {table} WHERE subject_id = ?1 \
+                 AND namespace = ?2 AND field = ?3 AND embedding_model = ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut found = std::collections::HashMap::with_capacity(ids.len());
+            for id in ids {
+                let blob: Option<Vec<u8>> = stmt
+                    .query_row(
+                        rusqlite::params![id.to_string(), &namespace, &field, &model],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(blob) = blob {
+                    if blob.len() != dims * std::mem::size_of::<f32>() {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "stored vector has {} bytes, expected {}",
+                                    blob.len(),
+                                    dims * std::mem::size_of::<f32>()
+                                ),
+                            )),
+                        ));
+                    }
+                    let vector = blob
+                        .chunks_exact(std::mem::size_of::<f32>())
+                        // Inserts bind f32_slice_as_bytes, which writes native-endian
+                        // f32 bytes. Decode with the same layout on every target.
+                        .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        .collect();
+                    found.insert(id, vector);
+                }
+            }
+            Ok(found)
+        })
+        .await
+    }
+
     async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
         let table = self.table_name.clone();
 
@@ -1784,6 +1850,7 @@ impl VectorStore for SqliteVecStore {
             supports_quantization: false,
             supports_update: false,
             supports_orphan_sweep: true,
+            supports_vector_read: true,
             // sqlite-vec uses subject_id as PRIMARY KEY — only one vector per
             // subject per namespace is stored. Callers must use a single canonical
             // field (e.g. "content") and are not permitted to store both
