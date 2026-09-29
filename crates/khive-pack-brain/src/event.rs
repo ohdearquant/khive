@@ -132,7 +132,7 @@ pub fn interpret(event: &Event) -> BrainSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_brain_core::{entity_signal, is_recall_positive};
+    use khive_brain_core::{entity_signal, is_recall_positive, SectionPosteriorState};
     use khive_types::{EventKind, SubstrateKind};
     use uuid::Uuid;
 
@@ -524,6 +524,61 @@ mod tests {
                 assert!((effective_weight - 1.5).abs() < 1e-12);
             }
             other => panic!("expected SemanticFeedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_feedback_keeps_section_signals_for_every_scalar() {
+        for scalar in [
+            "explicit_positive",
+            "explicit_negative",
+            "implicit_positive",
+            "implicit_negative",
+            "correction",
+        ] {
+            let mut event = make_event(
+                "brain.feedback",
+                EventOutcome::Success,
+                Some(Uuid::new_v4()),
+            );
+            event.payload = serde_json::json!({
+                "signal": scalar,
+                "section_signals": {
+                    "overview": "useful",
+                    "formalism": "not_useful",
+                    "examples": "wrong"
+                }
+            });
+
+            let signal = interpret(&event);
+            let BrainSignal::SemanticFeedback {
+                section_signals: Some(sections),
+                ..
+            } = &signal
+            else {
+                panic!("{scalar} must retain section signals: {signal:?}");
+            };
+            assert_eq!(sections.len(), 3);
+            assert_eq!(sections[&SectionType::Overview], FeedbackSignal::Useful);
+            assert_eq!(sections[&SectionType::Formalism], FeedbackSignal::NotUseful);
+            assert_eq!(sections[&SectionType::Examples], FeedbackSignal::Wrong);
+
+            let mut state = SectionPosteriorState::new();
+            state.apply_signal(&signal);
+            assert_eq!(state.total_events, 1, "{scalar}");
+            let weight = FeedbackEventKind::from_signal_str(scalar)
+                .expect("known semantic scalar")
+                .update_weight();
+            assert!(
+                (state.posteriors[&SectionType::Overview].alpha() - 2.0 - weight).abs() < 1e-12
+            );
+            assert!(
+                (state.posteriors[&SectionType::Formalism].beta() - 4.0 - weight).abs() < 1e-12
+            );
+            assert!(
+                (state.posteriors[&SectionType::Examples].beta() - 2.0 - 2.0 * weight).abs()
+                    < 1e-12
+            );
         }
     }
 
