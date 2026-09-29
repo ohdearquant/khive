@@ -38,13 +38,17 @@ Severity mapping is `error` → `high`, `warning` → `medium`, and
 provides repository-relative path, start/end lines, and start/end columns in
 evidence. The stable producer fingerprint uses producer ID, repository, normalized path,
 lint code, diagnostic message, verbatim primary-span source text, and columns.
-For a unique diagnostic it excludes line numbers, so lines inserted elsewhere in
-the file do not change it; edits within the source snippet, including literal
-whitespace, do. When otherwise identical diagnostics occur more than once, their
-positions disambiguate the entire group regardless of record order. The existing
-finding note ID remains content-versioned and can change when the evidence line
-changes; the fingerprint in `finding_id` and `raw.fingerprint` is the cross-run
-correlation key. Identical duplicate diagnostic records are collapsed.
+It excludes line numbers, so a uniform line shift does not change it; edits within
+the source snippet, including literal whitespace, do. When otherwise identical
+diagnostics occur at distinct spans, the first in source-position order retains
+that base fingerprint. Each later occurrence gets a `clippy-occurrence/v1`
+fingerprint derived from the base and its one-based ordinal, independent of
+Cargo record order and absolute line numbers. Inserting or removing an earlier
+identical occurrence can renumber later occurrences. The existing finding note
+ID remains content-versioned and can change when the evidence line changes;
+the fingerprint in `finding_id` and `raw.fingerprint` is the cross-run correlation
+key. Identical duplicate records collapse; conflicting records at one primary
+span refuse with the input line.
 
 The adapter test builds a miniature JSON-lines stream from synthetic records in
 code. It contains only repository-relative example paths and no host paths.

@@ -249,10 +249,10 @@ fn finding_from_message(
 /// `no_marker`); a missing marker still yields usable diagnostics but never attests completeness.
 /// Other documented Cargo records and non-Clippy compiler messages are ignored. Invalid JSON
 /// and incomplete Clippy records fail the whole conversion with an input-line reason. The finding
-/// fingerprint omits line numbers for a unique diagnostic; repeated occurrences
-/// of the same lint/snippet are disambiguated by their source position. The
-/// versioned note ID still follows `ingest_findings_json`'s content identity
-/// contract.
+/// fingerprint omits line numbers. The first occurrence of a repeated
+/// lint/snippet retains that fingerprint; later occurrences use their ordinal
+/// in source order. The versioned note ID still follows
+/// `ingest_findings_json`'s content identity contract.
 pub fn ingest_clippy_json_lines(
     input: &[u8],
     provenance: ClippyProvenance<'_>,
@@ -305,7 +305,23 @@ pub fn ingest_clippy_json_lines(
                         .as_str()
                         .expect("adapter constructs a string id");
                     let occurrences = seen.entry(id.to_owned()).or_default();
-                    if occurrences.iter().any(|&index| findings[index] == finding) {
+                    let mut duplicate = false;
+                    for &previous_index in occurrences.iter() {
+                        let previous = &findings[previous_index];
+                        if previous["evidence"][0]["line"] == finding["evidence"][0]["line"]
+                            && previous["evidence"][0]["end_line"]
+                                == finding["evidence"][0]["end_line"]
+                        {
+                            if previous == &finding {
+                                duplicate = true;
+                                break;
+                            }
+                            return Err(line_error(line_number, format!(
+                                "ambiguous Clippy fingerprint {id}: conflicting diagnostic records share one primary span"
+                            )));
+                        }
+                    }
+                    if duplicate {
                         continue;
                     }
                     occurrences.push(findings.len());
@@ -335,25 +351,24 @@ pub fn ingest_clippy_json_lines(
         }
     }
 
-    // Retain the stable, line-independent fingerprint for unique diagnostics.
-    // Only a repeated lint with otherwise identical fingerprint parts needs
-    // position in its identity. Resolve the whole group after parsing so Cargo
-    // record order cannot decide which occurrence keeps the old ID.
-    for (base_id, occurrences) in seen {
+    // Resolve duplicate fingerprints after parsing so Cargo record order does
+    // not choose which source occurrence retains the original identity.
+    for (base_id, mut occurrences) in seen {
         if occurrences.len() < 2 {
             continue;
         }
-        for index in occurrences {
+        occurrences.sort_by_key(|&index| {
             let evidence = &findings[index]["evidence"][0];
-            let position = (
-                base_id.as_str(),
+            (
                 evidence["line"].as_u64().expect("validated start line"),
                 evidence["end_line"].as_u64().expect("validated end line"),
-                findings[index]["severity"]
-                    .as_str()
-                    .expect("adapter severity"),
+            )
+        });
+        for (ordinal, index) in occurrences.into_iter().enumerate().skip(1) {
+            let fingerprint = Uuid::new_v5(
+                &CODE_INGEST_NAMESPACE,
+                &serde_json::to_vec(&("clippy-occurrence/v1", base_id.as_str(), ordinal))?,
             );
-            let fingerprint = Uuid::new_v5(&CODE_INGEST_NAMESPACE, &serde_json::to_vec(&position)?);
             findings[index]["id"] = json!(format!("clippy-v1:{fingerprint}"));
             findings[index]["fingerprint"] = json!(fingerprint.to_string());
         }
