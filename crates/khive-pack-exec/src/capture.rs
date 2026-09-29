@@ -167,10 +167,18 @@ mod platform {
 
     #[derive(Debug, Clone)]
     pub struct Found {
-        parent: Arc<File>,
+        // Reopen checked ancestors at read time instead of pinning one fd per directory.
+        root: Arc<File>,
+        parent_path: Arc<Vec<DirectoryComponent>>,
         name: OsString,
         identity: Identity,
         pub mode: u32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DirectoryComponent {
+        name: OsString,
+        identity: Identity,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +266,17 @@ mod platform {
             return Err(changed());
         }
         Ok((file, stat))
+    }
+
+    /// Re-resolve from the pre-launch root, refusing changed or linked ancestors.
+    fn open_directory_path(root: &File, path: &[DirectoryComponent]) -> io::Result<Option<File>> {
+        let mut opened = None;
+        for component in path {
+            let parent = opened.as_ref().unwrap_or(root);
+            let (child, _) = open_checked(parent, &component.name, component.identity)?;
+            opened = Some(child);
+        }
+        Ok(opened)
     }
 
     struct DirStream(*mut libc::DIR);
@@ -382,18 +401,20 @@ mod platform {
 
     impl Found {
         pub fn read_content_bounded(&self, max_bytes: u64) -> io::Result<CaptureRead> {
+            let opened_parent = open_directory_path(&self.root, &self.parent_path)?;
+            let parent = opened_parent.as_ref().unwrap_or(&self.root);
             if self.mode == 120000 {
-                let checked = stat_at(&self.parent, &self.name)?;
+                let checked = stat_at(parent, &self.name)?;
                 if Identity::from(&checked) != self.identity {
                     return Err(changed());
                 }
-                let content = read_link_at(&self.parent, &self.name, max_bytes)?;
-                if Identity::from(&stat_at(&self.parent, &self.name)?) != self.identity {
+                let content = read_link_at(parent, &self.name, max_bytes)?;
+                if Identity::from(&stat_at(parent, &self.name)?) != self.identity {
                     return Err(changed());
                 }
                 Ok(content)
             } else {
-                let (file, stat) = open_checked(&self.parent, &self.name, self.identity)?;
+                let (file, stat) = open_checked(parent, &self.name, self.identity)?;
                 read_regular_bounded(file, stat.st_size.max(0) as u64, max_bytes)
             }
         }
@@ -404,9 +425,17 @@ mod platform {
     pub fn walk(root: &CaptureRoot) -> io::Result<(BTreeMap<String, Found>, Vec<String>)> {
         let mut files = BTreeMap::new();
         let mut skipped = Vec::new();
-        let mut stack = vec![(Arc::clone(&root.directory), String::new())];
-        while let Some((directory, rel)) = stack.pop() {
-            let entries = names(&directory).map_err(|error| {
+        let mut stack = vec![(Arc::new(Vec::new()), String::new())];
+        while let Some((path, rel)) = stack.pop() {
+            let opened_directory =
+                open_directory_path(&root.directory, &path).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("read capture directory {rel:?}: {error}"),
+                    )
+                })?;
+            let directory = opened_directory.as_ref().unwrap_or(&root.directory);
+            let entries = names(directory).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!("read capture directory {rel:?}: {error}"),
@@ -418,7 +447,7 @@ mod platform {
                 } else {
                     format!("{rel}/{}", name.to_string_lossy())
                 };
-                let stat = stat_at(&directory, &name).map_err(|error| {
+                let stat = stat_at(directory, &name).map_err(|error| {
                     io::Error::new(
                         error.kind(),
                         format!("stat capture entry {child_rel:?}: {error}"),
@@ -426,14 +455,12 @@ mod platform {
                 })?;
                 match stat.st_mode & libc::S_IFMT {
                     libc::S_IFDIR => {
-                        let (child, _) = open_checked(&directory, &name, Identity::from(&stat))
-                            .map_err(|error| {
-                                io::Error::new(
-                                    error.kind(),
-                                    format!("read capture directory {child_rel:?}: {error}"),
-                                )
-                            })?;
-                        stack.push((Arc::new(child), child_rel));
+                        let mut child_path = path.as_ref().clone();
+                        child_path.push(DirectoryComponent {
+                            name,
+                            identity: Identity::from(&stat),
+                        });
+                        stack.push((Arc::new(child_path), child_rel));
                     }
                     libc::S_IFREG | libc::S_IFLNK => {
                         let mode = if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
@@ -446,7 +473,8 @@ mod platform {
                         files.insert(
                             child_rel,
                             Found {
-                                parent: Arc::clone(&directory),
+                                root: Arc::clone(&root.directory),
+                                parent_path: Arc::clone(&path),
                                 name,
                                 identity: Identity::from(&stat),
                                 mode,
@@ -489,6 +517,75 @@ mod tests {
             CaptureRead::Complete(content) => content.bytes,
             CaptureRead::TooLarge { .. } => panic!("small fixture exceeded capture cap"),
         }
+    }
+
+    #[test]
+    fn walk_captures_many_directories_under_256_fd_limit() {
+        const CHILD_MARKER: &str = "KHIVE_EXEC_CAPTURE_LOW_NOFILE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let marker_dir = tempfile::tempdir().unwrap();
+            let marker = marker_dir.path().join("completed");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "capture::tests::walk_captures_many_directories_under_256_fd_limit",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_MARKER, &marker)
+                .output()
+                .expect("spawn isolated low-fd test process");
+            assert!(
+                output.status.success(),
+                "low-fd capture child failed: status={}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(&marker).expect("the filtered child test must run"),
+                b"completed"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..400 {
+            let child = dir.path().join(format!("sub-{i:03}"));
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(child.join("output"), b"captured").unwrap();
+        }
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(
+            limit.rlim_max >= 256,
+            "test requires a hard fd limit >= 256"
+        );
+        limit.rlim_cur = 256;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let (files, skipped) = walk(&root).expect("capture must not retain one fd per directory");
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 400);
+        for i in 0..400 {
+            assert_eq!(
+                captured_bytes(&files[&format!("sub-{i:03}/output")]),
+                b"captured"
+            );
+        }
+        std::fs::write(
+            std::path::PathBuf::from(std::env::var_os(CHILD_MARKER).unwrap()),
+            b"completed",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -684,6 +781,30 @@ mod tests {
         let (files, skipped) = walk(&root).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(captured_bytes(&files["output"]), b"inside bytes");
+    }
+
+    #[test]
+    fn reopened_parent_refuses_replaced_directory() {
+        let run = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = run.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("output"), b"inside bytes").unwrap();
+        std::fs::write(outside.path().join("output"), b"outside bytes").unwrap();
+
+        let root = CaptureRoot::open(run.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert!(skipped.is_empty());
+        std::fs::rename(&parent, run.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+
+        let error = files["parent/output"]
+            .read_content_bounded(1024)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed after inspection"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
