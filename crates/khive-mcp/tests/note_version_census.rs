@@ -437,7 +437,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (EVENTS, "finalize_corrupt_receipt"),
         (EVENTS, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
-        (GTD_REPAIR, "UPDATE_SQL"),
+        (GTD_REPAIR, "checked_update_sql"),
         (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
@@ -557,7 +557,12 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"inbox"}"#,
         ),
-        (GTD_REPAIR, "UPDATE_SQL", "task", r#"{"status":"archived"}"#),
+        (
+            GTD_REPAIR,
+            "checked_update_sql",
+            "task",
+            r#"{"status":"archived"}"#,
+        ),
         (
             SCHEDULE,
             "cancel_pending_event",
@@ -626,7 +631,10 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     r#"{"originals":{}}"#,
                 ],
             ),
-            SCHEDULE => conn.execute(sql, params!["2026-09-09T00:00:00Z", 200_i64, ID, "local"]),
+            SCHEDULE => conn.execute(
+                sql,
+                params!["2026-09-09T00:00:00Z", 200_i64, ID, "local", properties],
+            ),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
             OPERATIONS => conn.execute(

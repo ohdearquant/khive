@@ -161,6 +161,19 @@ fn reject_reserved_replacement_properties(
     })
 }
 
+fn reject_reserved_note_properties(
+    properties: Option<&Value>,
+    operation: &'static str,
+) -> StorageResult<()> {
+    crate::secret_gate::reject_reserved_secret_gate_property(properties).map_err(|error| {
+        StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: operation.into(),
+            message: error.to_string(),
+        }
+    })
+}
+
 fn reject_changed_identity_properties(
     existing: &Note,
     properties: Option<&Value>,
@@ -236,7 +249,19 @@ impl PolicyEnforcingNoteStore {
         operation: &'static str,
     ) -> StorageResult<()> {
         if let Some(existing) = self.inner.get_note_including_deleted(note.id).await? {
+            reject_reserved_note_properties(existing.properties.as_ref(), operation)?;
             reject_changed_identity_note(&existing, note, operation)?;
+        }
+        Ok(())
+    }
+
+    async fn reject_existing_secret_gate_property(
+        &self,
+        id: Uuid,
+        operation: &'static str,
+    ) -> StorageResult<()> {
+        if let Some(existing) = self.inner.get_note_including_deleted(id).await? {
+            reject_reserved_note_properties(existing.properties.as_ref(), operation)?;
         }
         Ok(())
     }
@@ -267,12 +292,14 @@ impl NoteStore for PolicyEnforcingNoteStore {
     }
 
     async fn upsert_note(&self, note: Note) -> StorageResult<()> {
+        reject_reserved_note_properties(note.properties.as_ref(), "upsert_note")?;
         reject_if_forged_message_note(&note, "upsert_note")?;
         self.reject_identity_change(&note, "upsert_note").await?;
         self.inner.upsert_note(note).await
     }
 
     async fn insert_note_if_absent(&self, note: Note) -> StorageResult<bool> {
+        reject_reserved_note_properties(note.properties.as_ref(), "insert_note_if_absent")?;
         reject_if_forged_message_note(&note, "insert_note_if_absent")?;
         self.inner.insert_note_if_absent(note).await
     }
@@ -283,6 +310,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
         expected_updated_at: i64,
         expected_deleted_at: Option<i64>,
     ) -> StorageResult<bool> {
+        reject_reserved_note_properties(note.properties.as_ref(), "replace_note_if_unchanged")?;
         reject_if_forged_message_note(&note, "replace_note_if_unchanged")?;
         self.reject_identity_change(&note, "replace_note_if_unchanged")
             .await?;
@@ -293,6 +321,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
 
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary> {
         for note in &notes {
+            reject_reserved_note_properties(note.properties.as_ref(), "upsert_notes")?;
             reject_if_forged_message_note(note, "upsert_notes")?;
         }
         {
@@ -329,8 +358,13 @@ impl NoteStore for PolicyEnforcingNoteStore {
         properties: Option<Value>,
         updated_at: i64,
     ) -> StorageResult<bool> {
+        reject_reserved_note_properties(properties.as_ref(), "update_note_properties")?;
         reject_reserved_replacement_properties(properties.as_ref(), "update_note_properties")?;
         if let Some(existing) = self.inner.get_note_including_deleted(id).await? {
+            reject_reserved_note_properties(
+                existing.properties.as_ref(),
+                "update_note_properties",
+            )?;
             reject_changed_identity_properties(
                 &existing,
                 properties.as_ref(),
@@ -350,6 +384,8 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_patch_target(key, "set_note_property")?;
+        self.reject_existing_secret_gate_property(id, "set_note_property")
+            .await?;
         self.inner
             .set_note_property(id, key, value, updated_at)
             .await
@@ -365,6 +401,8 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_patch_target(json_path, "try_patch_note_property")?;
+        self.reject_existing_secret_gate_property(id, "try_patch_note_property")
+            .await?;
         self.inner
             .try_patch_note_property(id, namespace, filter, json_path, value, updated_at)
             .await
@@ -380,6 +418,10 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<()> {
         reject_reserved_patch_target(json_path, "patch_note_property_atomic")?;
+        for id in &ids {
+            self.reject_existing_secret_gate_property(*id, "patch_note_property_atomic")
+                .await?;
+        }
         self.inner
             .patch_note_property_atomic(ids, namespace, filter, json_path, value, updated_at)
             .await

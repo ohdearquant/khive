@@ -86,6 +86,9 @@ pub(crate) async fn get_or_create(
     let mut bare = Entity::new(token.namespace().as_str(), entity_kind, "")
         .with_entity_type(Some(entity_type));
     bare.id = id;
+    // Check caller properties before the deterministic-ID placeholder insert;
+    // otherwise a refused later update would leave a bare entity behind.
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let inserted = store
         .insert_entity_if_absent(bare)
         .await
@@ -139,6 +142,36 @@ mod tests {
     use super::*;
     use khive_runtime::{Namespace, RuntimeConfig};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn get_or_create_rejects_reserved_properties_before_placeholder_insert() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let id = Uuid::new_v4();
+
+        let error = get_or_create(
+            &runtime,
+            &token,
+            id,
+            "document",
+            "resource",
+            "reserved web entity",
+            json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"}),
+        )
+        .await
+        .expect_err("reserved caller properties must be refused");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("khive:secret_gate")),
+            "unexpected error: {error:?}"
+        );
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn lost_insert_race_refuses_foreign_winner_without_mutating_it() {

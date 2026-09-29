@@ -3305,10 +3305,8 @@ pub(crate) async fn handle_heartbeat(
         None => now.to_rfc3339(),
     };
 
-    // `HeartbeatParams` (khive-pack-comm/src/params.rs) carries no free-form
-    // `properties` field — every key assigned below is a fixed literal, so no
-    // caller-supplied JSON can reach (create/replace) the reserved top-level
-    // `khive:secret_gate` key through this carry-forward merge.
+    // Preserve the current row's other properties, then validate the final
+    // object: a legacy row may already carry a runtime-owned key.
     let mut props = existing
         .as_ref()
         .and_then(|n| n.properties.clone())
@@ -3343,6 +3341,7 @@ pub(crate) async fn handle_heartbeat(
         _ => unreachable!("outcome already validated above"),
     }
 
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
     khive_runtime::secret_gate::check_json_at(&props, "channel", "properties")?;
 
     let content = format!("channel heartbeat: {}:{}", p.channel_kind, p.channel_slug);
