@@ -11,6 +11,11 @@ use crate::ingest::{
 };
 use crate::CodeIngestError;
 
+#[cfg(test)]
+thread_local! {
+    static PRIMARY_SPAN_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub const CLIPPY_PRODUCER_ID: &str = "cargo-clippy/json/v1";
 
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +121,26 @@ fn relative_path(raw: &str, line: usize) -> Result<String, ClippyAdapterError> {
 
 fn normalized_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrimarySpan {
+    start: u64,
+    end: u64,
+}
+
+impl Ord for PrimarySpan {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(test)]
+        PRIMARY_SPAN_COMPARISONS.with(|count| count.set(count.get() + 1));
+        (self.start, self.end).cmp(&(other.start, other.end))
+    }
+}
+
+impl PartialOrd for PrimarySpan {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn finding_from_message(
@@ -285,7 +310,7 @@ pub fn ingest_clippy_json_lines(
     })?;
 
     let mut findings: Vec<Value> = Vec::new();
-    let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut seen: BTreeMap<String, BTreeMap<PrimarySpan, usize>> = BTreeMap::new();
     let mut build_outcome = None;
     for (index, raw) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -308,27 +333,21 @@ pub fn ingest_clippy_json_lines(
                     let id = finding["id"]
                         .as_str()
                         .expect("adapter constructs a string id");
+                    let evidence = &finding["evidence"][0];
+                    let span = PrimarySpan {
+                        start: evidence["line"].as_u64().expect("validated start line"),
+                        end: evidence["end_line"].as_u64().expect("validated end line"),
+                    };
                     let occurrences = seen.entry(id.to_owned()).or_default();
-                    let mut duplicate = false;
-                    for &previous_index in occurrences.iter() {
-                        let previous = &findings[previous_index];
-                        if previous["evidence"][0]["line"] == finding["evidence"][0]["line"]
-                            && previous["evidence"][0]["end_line"]
-                                == finding["evidence"][0]["end_line"]
-                        {
-                            if previous == &finding {
-                                duplicate = true;
-                                break;
-                            }
+                    if let Some(&previous_index) = occurrences.get(&span) {
+                        if findings[previous_index] != finding {
                             return Err(line_error(line_number, format!(
                                 "ambiguous Clippy fingerprint {id}: conflicting diagnostic records share one primary span"
                             )));
                         }
-                    }
-                    if duplicate {
                         continue;
                     }
-                    occurrences.push(findings.len());
+                    occurrences.insert(span, findings.len());
                     findings.push(finding);
                 }
             }
@@ -357,18 +376,11 @@ pub fn ingest_clippy_json_lines(
 
     // Resolve duplicate fingerprints after parsing so Cargo record order does
     // not choose which source occurrence retains the original identity.
-    for (base_id, mut occurrences) in seen {
+    for (base_id, occurrences) in seen {
         if occurrences.len() < 2 {
             continue;
         }
-        occurrences.sort_by_key(|&index| {
-            let evidence = &findings[index]["evidence"][0];
-            (
-                evidence["line"].as_u64().expect("validated start line"),
-                evidence["end_line"].as_u64().expect("validated end line"),
-            )
-        });
-        for (ordinal, index) in occurrences.into_iter().enumerate().skip(1) {
+        for (ordinal, index) in occurrences.into_values().enumerate().skip(1) {
             let fingerprint = Uuid::new_v5(
                 &CODE_INGEST_NAMESPACE,
                 &serde_json::to_vec(&("clippy-occurrence/v1", base_id.as_str(), ordinal))?,
@@ -403,4 +415,64 @@ pub fn ingest_clippy_json_lines(
                 .or(Some(&source_run)),
         },
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_snippet_on_many_lines_has_bounded_span_comparisons() {
+        const OCCURRENCES: usize = 512;
+        let input = (1..=OCCURRENCES)
+            .map(|line| {
+                json!({
+                    "reason": "compiler-message",
+                    "message": {
+                        "message": "this borrow is unnecessary",
+                        "code": {"code": "clippy::needless_borrow"},
+                        "level": "warning",
+                        "spans": [{
+                            "file_name": "src/lib.rs",
+                            "line_start": line,
+                            "line_end": line,
+                            "column_start": 5,
+                            "column_end": 13,
+                            "is_primary": true,
+                            "text": [{"text": "    consume(&value);"}]
+                        }]
+                    }
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let observed_at = "2026-09-29T00:00:00Z"
+            .parse()
+            .expect("fixed observation time");
+        PRIMARY_SPAN_COMPARISONS.with(|count| count.set(0));
+        let batch = ingest_clippy_json_lines(
+            input.as_bytes(),
+            ClippyProvenance {
+                repo: "example",
+                branch: "main",
+                commit: "example-commit",
+                scope: "example-crate",
+            },
+            CodeIngestOptions {
+                namespace: "local",
+                observed_at,
+                source_run: None,
+            },
+        )
+        .expect("all distinct source positions are valid");
+        let comparisons = PRIMARY_SPAN_COMPARISONS.with(std::cell::Cell::get);
+
+        assert_eq!(batch.notes.len(), OCCURRENCES);
+        assert!(comparisons > 0, "span comparison hook was not exercised");
+        assert!(
+            comparisons <= OCCURRENCES * 128,
+            "{comparisons} span comparisons for {OCCURRENCES} findings exceeds the ordered-map bound"
+        );
+    }
 }
