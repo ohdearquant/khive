@@ -31,6 +31,14 @@ CREATE INDEX idx_comm_message_outbound_recipient
  json_extract(properties, '$.to_actor'), created_at DESC, id ASC)
  WHERE deleted_at IS NULL;";
 
+const OUTBOX_DUE_INDEX: &str = "CREATE INDEX idx_comm_message_outbound_due
+ ON notes(namespace, kind, json_extract(properties, '$.direction'),
+ substr(json_extract(properties, '$.to_actor'), 1,
+        instr(json_extract(properties, '$.to_actor'), ':')),
+ ifnull(khive_rfc3339_strict_key(json_extract(properties, '$.next_attempt_at')), x''),
+ created_at DESC, id ASC)
+ WHERE deleted_at IS NULL;";
+
 const RECIPIENT_ONLY: &str = "CREATE INDEX idx_candidate_recipient_only
  ON notes(namespace, kind, ifnull(json_extract(properties, '$.to_actor'), ''))
  WHERE deleted_at IS NULL";
@@ -42,15 +50,18 @@ const FULL_RECIPIENT: &str = "CREATE INDEX IF NOT EXISTS idx_notes_message_recip
 fn register_comm_indexes(conn: &Connection) {
     // Pack registration follows migrations at startup. Recreate these fixture
     // indexes to exercise that order instead of retaining an earlier catalog.
+    crate::pool::register_rfc3339_key(conn).unwrap();
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_comm_message_direction;
          DROP INDEX IF EXISTS idx_comm_message_thread;
          DROP INDEX IF EXISTS idx_comm_message_to_actor;
          DROP INDEX IF EXISTS idx_comm_message_outbound_ref;
-         DROP INDEX IF EXISTS idx_comm_message_outbound_recipient;",
+         DROP INDEX IF EXISTS idx_comm_message_outbound_recipient;
+         DROP INDEX IF EXISTS idx_comm_message_outbound_due;",
     )
     .unwrap();
     conn.execute_batch(COMM_INDEXES).unwrap();
+    conn.execute_batch(OUTBOX_DUE_INDEX).unwrap();
 }
 
 fn fixture(foreign_count: usize, read_backlog: usize) -> Connection {
@@ -120,7 +131,7 @@ fn fixture_with_connection(
             i + 20_000,
         );
         insert(
-            json!({"direction":"outbound", "to_actor":"test:other",
+            json!({"direction":"outbound", "to_actor":"other:other",
                    "from_actor":"test:other", "read":false}),
             i + 20_000,
         );
@@ -184,8 +195,9 @@ fn sent_filter() -> NoteFilter {
 }
 
 /// The channel delivery loops' scan: pending predicate plus the channel
-/// prefix on the recipient, all in the statement, newest-first. The prefix
-/// selects the caller-owned `test:target` rows and excludes `test:other`.
+/// prefix on the recipient and the deadline bound, all in the statement,
+/// newest-first. The `test:` bucket selects caller-owned `test:target` rows
+/// and excludes `other:other` outbound rows.
 fn outbox_filter() -> NoteFilter {
     NoteFilter {
         kind: Some("message".into()),
@@ -209,9 +221,24 @@ fn outbox_filter() -> NoteFilter {
                 value: SqlValue::Null,
             },
             PropertyFilter {
+                json_path: "$.delivery_hold".into(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.next_attempt_at".into(),
+                op: FilterOp::Rfc3339LteOrInvalid,
+                value: SqlValue::Text("2030-01-01T00:00:00Z".into()),
+            },
+            PropertyFilter {
                 json_path: "$.to_actor".into(),
-                op: FilterOp::TextStartsWithIndexed,
-                value: SqlValue::Text("test:t".into()),
+                op: FilterOp::TextColonPrefixBucketIndexed,
+                value: SqlValue::Text("test:".into()),
+            },
+            PropertyFilter {
+                json_path: "$.channel_slug".into(),
+                op: FilterOp::JsonTypeMissing,
+                value: SqlValue::Null,
             },
         ],
         ..Default::default()
@@ -227,6 +254,15 @@ fn measure_unpinned(conn: &Connection, filter: &NoteFilter) -> Value {
 }
 
 fn measure_with_pin(conn: &Connection, filter: &NoteFilter, pinned: bool) -> Value {
+    measure_with_sql(conn, filter, pinned, |sql| sql)
+}
+
+fn measure_with_sql(
+    conn: &Connection,
+    filter: &NoteFilter,
+    pinned: bool,
+    edit_sql: impl FnOnce(String) -> String,
+) -> Value {
     let (where_sql, mut params) = if pinned {
         build_note_filter_read_clause("default", filter).unwrap()
     } else {
@@ -234,12 +270,12 @@ fn measure_with_pin(conn: &Connection, filter: &NoteFilter, pinned: bool) -> Val
     };
     params.push(Box::new(21_i64));
     params.push(Box::new(0_i64));
-    let sql = format!(
+    let sql = edit_sql(format!(
         "SELECT {NOTE_COLUMNS} FROM notes{where_sql}{} LIMIT ?{} OFFSET ?{}",
         note_filter_page_order_clause(filter),
         params.len() - 1,
         params.len(),
-    );
+    ));
     let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let plan: Vec<String> = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -258,12 +294,11 @@ fn measure_with_pin(conn: &Connection, filter: &NoteFilter, pinned: bool) -> Val
            "vm_steps":statement.get_status(StatementStatus::VmStep)})
 }
 
-/// The scan seeks the outbound-recipient index on (direction, recipient
-/// prefix range). Ordering by `created_at` after a range seek needs a sort,
-/// but that sort covers only the channel's own pending rows, never the
-/// actor-to-actor backlog the prefix excludes.
+/// The scan seeks the outbound-due index on channel bucket and normalized
+/// deadline. Ordering by `created_at` after the deadline range needs a sort,
+/// but the future backlog is excluded before that work.
 #[test]
-fn outbox_filter_plan_seeks_the_outbound_recipient_index() {
+fn outbox_filter_plan_seeks_the_channel_deadline_index() {
     let result = measure(&fixture(0, 10_000), &outbox_filter());
     let plan = result["plan"]
         .as_array()
@@ -274,8 +309,26 @@ fn outbox_filter_plan_seeks_the_outbound_recipient_index() {
 
     assert!(
         plan.iter()
-            .any(|detail| detail.contains("idx_comm_message_outbound_recipient")),
-        "outbox filter must seek the outbound recipient index, got plan: {plan:?}"
+            .any(|detail| detail.contains("idx_comm_message_outbound_due")
+                && detail.contains("<expr>=?")
+                && detail.contains("<expr><?")),
+        "outbox filter must seek the channel bucket and deadline range, got plan: {plan:?}"
+    );
+    assert_eq!(
+        result["sql"]
+            .as_str()
+            .unwrap()
+            .matches("khive_rfc3339_strict_key")
+            .count(),
+        1,
+        "the deadline parser must occur once in the generated SQL"
+    );
+    assert!(
+        result["sql"]
+            .as_str()
+            .unwrap()
+            .contains("ORDER BY +created_at DESC, id ASC"),
+        "the outbox sort must not entice a scan of the creation-order index"
     );
     assert_eq!(
         result["ids"].as_array().unwrap().len(),
@@ -298,6 +351,147 @@ fn outbox_filter_work_is_bounded_by_the_channels_own_rows() {
     assert!(
         large_steps <= small_steps + 128,
         "foreign outbound growth must not add row-proportional outbox work: {small_steps} -> {large_steps}"
+    );
+}
+
+fn future_outbox_fixture(future_count: usize) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
+        .unwrap();
+    register_comm_indexes(&conn);
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..future_count {
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at) \
+             VALUES (?1, 'default', 'message', ?2, ?3, ?3)",
+            rusqlite::params![
+                format!("{i:036}"),
+                r#"{"direction":"outbound","to_actor":"test:recipient","next_attempt_at":"2999-01-01T00:00:00Z"}"#,
+                i as i64,
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    conn
+}
+
+#[test]
+fn outbox_zero_due_scan_cost_stays_bounded_as_same_channel_future_rows_grow() {
+    let small_conn = future_outbox_fixture(0);
+    let large_conn = future_outbox_fixture(10_000);
+    for stage in ["fresh", "analyzed"] {
+        if stage == "analyzed" {
+            small_conn.execute_batch("ANALYZE").unwrap();
+            large_conn.execute_batch("ANALYZE").unwrap();
+        }
+        let small = measure(&small_conn, &outbox_filter());
+        let large = measure(&large_conn, &outbox_filter());
+        assert_eq!(small["ids"], json!([]));
+        assert_eq!(large["ids"], small["ids"]);
+        let plan = large["plan"].to_string();
+        assert!(
+            plan.contains("idx_comm_message_outbound_due") && plan.contains("<expr><?"),
+            "{stage}: future backlog lost its indexed deadline bound: {plan}"
+        );
+        let small_steps = small["vm_steps"].as_i64().unwrap();
+        let large_steps = large["vm_steps"].as_i64().unwrap();
+        assert!(
+            large_steps <= small_steps + 128,
+            "{stage}: future same-channel backlog must not add row-proportional due-scan work: {small_steps} -> {large_steps}"
+        );
+    }
+}
+
+#[test]
+fn outbox_due_scan_cost_controls_fail_when_index_contract_is_broken() {
+    let conn = future_outbox_fixture(10_000);
+    conn.execute_batch("ANALYZE").unwrap();
+    let filter = outbox_filter();
+    let optimized = measure(&conn, &filter);
+    assert_eq!(optimized["ids"], json!([]));
+    let optimized_steps = optimized["vm_steps"].as_i64().unwrap();
+
+    // The deadline expression must match the expression index exactly.
+    let mut raw_deadline = filter.clone();
+    raw_deadline
+        .property_filters
+        .iter_mut()
+        .find(|property| property.json_path == "$.next_attempt_at")
+        .unwrap()
+        .op = FilterOp::Rfc3339Lte;
+    let raw_deadline = measure_with_sql(&conn, &raw_deadline, true, |sql| {
+        let changed = sql.replacen(
+            "ORDER BY created_at DESC, id ASC",
+            "ORDER BY +created_at DESC, id ASC",
+            1,
+        );
+        assert_ne!(changed, sql);
+        changed
+    });
+    assert_eq!(raw_deadline["ids"], optimized["ids"]);
+    assert!(
+        raw_deadline["vm_steps"].as_i64().unwrap() >= optimized_steps + 1000,
+        "changing the indexed deadline expression must expose row-proportional work: {raw_deadline}"
+    );
+}
+
+#[test]
+fn outbox_due_index_backfills_existing_deadlines_and_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("comm-upgrade.sqlite");
+    let conn = Connection::open(&path).unwrap();
+    crate::pool::register_rfc3339_key(&conn).unwrap();
+    conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
+        .unwrap();
+    conn.execute_batch(COMM_INDEXES).unwrap();
+    for (id, deadline) in [
+        (1, "2999-01-01T00:00:00Z"),
+        (2, "2000-01-01T00:00:00Z"),
+        (3, "not-a-timestamp"),
+    ] {
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at) \
+             VALUES (?1, 'default', 'message', ?2, ?3, ?3)",
+            rusqlite::params![
+                format!("{id:036}"),
+                json!({"direction":"outbound", "to_actor":"test:recipient", "next_attempt_at":deadline}).to_string(),
+                id,
+            ],
+        )
+        .unwrap();
+    }
+    // Keep enough pre-upgrade future rows for the post-ANALYZE planner to
+    // prefer the newly registered due index over older recipient indexes.
+    for id in 100..1100 {
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at) \
+             VALUES (?1, 'default', 'message', ?2, ?3, ?3)",
+            rusqlite::params![
+                format!("{id:036}"),
+                r#"{"direction":"outbound","to_actor":"test:recipient","next_attempt_at":"2999-01-01T00:00:00Z"}"#,
+                id,
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("ANALYZE").unwrap();
+    conn.execute_batch(OUTBOX_DUE_INDEX).unwrap();
+    drop(conn);
+
+    let reopened = Connection::open(&path).unwrap();
+    crate::pool::register_rfc3339_key(&reopened).unwrap();
+    let result = measure(&reopened, &outbox_filter());
+    assert_eq!(
+        result["ids"],
+        json!([format!("{:036}", 3), format!("{:036}", 2)]),
+        "existing malformed and due deadlines must remain eligible after index backfill"
+    );
+    assert!(
+        result["plan"]
+            .to_string()
+            .contains("idx_comm_message_outbound_due"),
+        "reopened, preanalyzed database lost its due-index seek: {result}"
     );
 }
 
@@ -460,6 +654,7 @@ fn comm_filter_recreated_unread_index_preserves_fresh_reopen_and_analyzed_plans(
             if stage.ends_with("reopened") {
                 drop(conn);
                 conn = Connection::open(&path).unwrap();
+                crate::pool::register_rfc3339_key(&conn).unwrap();
             }
             if stage == "analyzed" {
                 conn.execute_batch("ANALYZE").unwrap();
@@ -530,8 +725,8 @@ fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
     conn.execute_batch("ANALYZE").unwrap();
     let catalog_before = comm_catalog(&conn);
     let stats_before = comm_stats(&conn);
-    assert_eq!(catalog_before.len(), 5);
-    assert_eq!(stats_before.len(), 5);
+    assert_eq!(catalog_before.len(), 6);
+    assert_eq!(stats_before.len(), 6);
     let filters: Vec<_> = ["unread", "read", "all", "sent"]
         .iter()
         .map(|status| {
@@ -558,6 +753,7 @@ fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
         if stage == "reopened" {
             drop(conn);
             conn = Connection::open(&path).unwrap();
+            crate::pool::register_rfc3339_key(&conn).unwrap();
         }
         assert_eq!(comm_catalog(&conn), catalog_before, "{stage}");
         assert_eq!(comm_stats(&conn), stats_before, "{stage}");
@@ -635,8 +831,10 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                 if stage.ends_with("reopened") {
                     drop(conn);
                     conn = Connection::open(&path).unwrap();
+                    crate::pool::register_rfc3339_key(&conn).unwrap();
                     drop(baseline_conn);
                     baseline_conn = Connection::open(&baseline_path).unwrap();
+                    crate::pool::register_rfc3339_key(&baseline_conn).unwrap();
                 }
                 if *stage == "analyzed" {
                     conn.execute_batch("ANALYZE").unwrap();

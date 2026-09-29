@@ -2947,7 +2947,7 @@ pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec
     key
 }
 
-fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+pub(crate) fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
     use rusqlite::functions::FunctionFlags;
     use rusqlite::types::ValueRef;
 

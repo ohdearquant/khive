@@ -769,6 +769,21 @@ fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
                 json_extract_expr(path)
             )
         }
+        // After ANALYZE, SQLite may choose the creation-order index to fill
+        // LIMIT and scan every future retry. The unary plus preserves the
+        // INTEGER timestamp order while making SQLite sort only due rows
+        // reached through the channel/deadline index.
+        None if filter
+            .property_filters
+            .iter()
+            .any(|property| matches!(&property.op, FilterOp::TextColonPrefixBucketIndexed))
+            && filter
+                .property_filters
+                .iter()
+                .any(|property| matches!(&property.op, FilterOp::Rfc3339LteOrInvalid)) =>
+        {
+            " ORDER BY +created_at DESC, id ASC".to_string()
+        }
         // `id ASC` over the primary key is already the stable tiebreak for
         // notes sharing a creation timestamp.
         None => " ORDER BY created_at DESC, id ASC".to_string(),
@@ -917,18 +932,13 @@ fn build_note_filter_where(
                     "<="
                 };
                 params.push(Box::new(crate::pool::rfc3339_instant_key(instant)));
-                let key_expr = if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
-                    format!("khive_rfc3339_strict_key({expr})")
-                } else {
-                    format!("khive_rfc3339_key({expr})")
-                };
                 if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
                     conditions.push(format!(
-                        "({key_expr} IS NULL OR {key_expr} <= ?{})",
+                        "ifnull(khive_rfc3339_strict_key({expr}), x'') <= ?{}",
                         params.len()
                     ));
                 } else {
-                    conditions.push(format!("{key_expr} {op} ?{}", params.len()));
+                    conditions.push(format!("khive_rfc3339_key({expr}) {op} ?{}", params.len()));
                 }
             }
             FilterOp::EqOrMissing => {
@@ -1049,6 +1059,27 @@ fn build_note_filter_where(
                     }
                 }
             }
+            FilterOp::TextColonPrefixBucketIndexed => {
+                let SqlValue::Text(prefix) = &pf.value else {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        "TextColonPrefixBucketIndexed takes a text prefix".into(),
+                    ));
+                };
+                if prefix
+                    .strip_suffix(':')
+                    .is_none_or(|head| head.is_empty() || head.contains(':'))
+                {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        "TextColonPrefixBucketIndexed requires one trailing colon".into(),
+                    ));
+                }
+                let expr = json_extract_expr(&pf.json_path);
+                params.push(Box::new(prefix.clone()));
+                conditions.push(format!(
+                    "substr({expr}, 1, instr({expr}, ':')) = ?{}",
+                    params.len()
+                ));
+            }
             FilterOp::NotInOrMissing(values) => {
                 let expr = json_extract_expr(&pf.json_path);
                 if values.is_empty() {
@@ -1085,7 +1116,8 @@ fn build_note_filter_where(
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_)
-                    | FilterOp::TextStartsWithIndexed => {
+                    | FilterOp::TextStartsWithIndexed
+                    | FilterOp::TextColonPrefixBucketIndexed => {
                         unreachable!()
                     }
                     FilterOp::Rfc3339Valid

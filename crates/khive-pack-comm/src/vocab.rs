@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 7] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 8] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -29,6 +29,13 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 7] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_recipient \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.to_actor'), \
+        created_at DESC, id ASC) \
+        WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_due \
+        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+        substr(json_extract(properties, '$.to_actor'), 1, \
+               instr(json_extract(properties, '$.to_actor'), ':')), \
+        ifnull(khive_rfc3339_strict_key(json_extract(properties, '$.next_attempt_at')), x''), \
         created_at DESC, id ASC) \
         WHERE deleted_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_comm_quarantine_expiry \

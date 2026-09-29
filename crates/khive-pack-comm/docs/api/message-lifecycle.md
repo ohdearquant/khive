@@ -744,13 +744,25 @@ idempotent (`CREATE INDEX IF NOT EXISTS`).
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
-`idx_comm_message_outbound_recipient` serves the channel delivery loops' outbox
-scan: a seek on direction plus a range on `properties.to_actor` (the channel
-prefix, `email:` or `telegram:`, rendered by `FilterOp::TextStartsWithIndexed`),
-then `created_at DESC, id ASC`. The prefix is in the statement because every
-actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
-scan that pages first and filters the recipient afterwards stops reaching a
-channel's rows once enough other rows sort ahead of them.
+`idx_comm_message_outbound_recipient` serves outbox scans with arbitrary
+partial recipient prefixes: a seek on direction plus a range on
+`properties.to_actor` rendered by `FilterOp::TextStartsWithIndexed`, then
+`created_at DESC, id ASC`. The prefix belongs in the SQL statement because
+actor-to-actor outbound rows remain pending indefinitely; filtering them after
+the page would starve channel rows.
+
+`idx_comm_message_outbound_due` serves full colon-terminated channel prefixes.
+Its first-colon recipient bucket is an equality key ahead of the parsed retry
+deadline, so a channel with many future retries and no due messages can seek
+past the backlog. Missing or malformed deadlines use the empty BLOB key and
+remain eligible. The strict parser is registered as a deterministic, innocuous
+SQLite function on each khive connection before this expression index is
+created or used. A full `name:` bucket exactly matches the corresponding
+recipient prefix; arbitrary partial prefixes use the recipient index above.
+The channel due page sorts by `+created_at DESC, id ASC`: `created_at` is an
+INTEGER timestamp, so this preserves the answer order while preventing an
+analyzed planner from walking the creation-order index through future retries
+to fill a small `LIMIT`.
 
 `idx_comm_quarantine_expiry` supports the daemon's bounded, channel-scoped
 expiry page by namespace, kind, channel identity, and expiry timestamp.
