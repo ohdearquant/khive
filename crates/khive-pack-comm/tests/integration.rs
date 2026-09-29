@@ -3575,15 +3575,9 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         combined.contains("idx_comm_message_outbound_ref"),
         "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
     );
-    let due_index = plan
-        .statements
-        .iter()
-        .find(|statement| statement.contains("idx_comm_message_outbound_due"))
-        .expect("schema plan must register the channel deadline index");
     assert!(
-        due_index.contains("substr(json_extract(properties, '$.to_actor')")
-            && due_index.contains("ifnull(khive_rfc3339_strict_key("),
-        "the registered index must contain the channel bucket and fail-open deadline expressions: {due_index}"
+        !combined.contains("idx_comm_message_outbound_due"),
+        "the function-backed channel deadline index must be installed by a numbered core migration"
     );
     assert!(
         combined.contains("CREATE INDEX IF NOT EXISTS"),

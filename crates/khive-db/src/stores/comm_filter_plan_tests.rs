@@ -4,7 +4,7 @@ use super::{
     build_note_filter_read_clause, build_note_filter_where, comm_filter_index_clause,
     note_filter_page_order_clause, NOTE_COLUMNS,
 };
-use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::SqlValue;
 use rusqlite::{Connection, StatementStatus};
 use serde_json::{json, Value};
@@ -31,13 +31,7 @@ CREATE INDEX idx_comm_message_outbound_recipient
  json_extract(properties, '$.to_actor'), created_at DESC, id ASC)
  WHERE deleted_at IS NULL;";
 
-const OUTBOX_DUE_INDEX: &str = "CREATE INDEX idx_comm_message_outbound_due
- ON notes(namespace, kind, json_extract(properties, '$.direction'),
- substr(json_extract(properties, '$.to_actor'), 1,
-        instr(json_extract(properties, '$.to_actor'), ':')),
- ifnull(khive_rfc3339_strict_key(json_extract(properties, '$.next_attempt_at')), x''),
- created_at DESC, id ASC)
- WHERE deleted_at IS NULL;";
+const OUTBOX_DUE_INDEX: &str = include_str!("../../sql/044-comm-outbound-due-b-index.sql");
 
 const RECIPIENT_ONLY: &str = "CREATE INDEX idx_candidate_recipient_only
  ON notes(namespace, kind, ifnull(json_extract(properties, '$.to_actor'), ''))
@@ -48,6 +42,7 @@ const FULL_RECIPIENT: &str = "CREATE INDEX IF NOT EXISTS idx_notes_message_recip
  WHERE deleted_at IS NULL";
 
 fn register_comm_indexes(conn: &Connection) {
+    // Read filters use the strict function; schema indexes use builtins only.
     // Pack registration follows migrations at startup. Recreate these fixture
     // indexes to exercise that order instead of retaining an earlier catalog.
     crate::pool::register_rfc3339_key(conn).unwrap();
@@ -359,15 +354,19 @@ fn future_outbox_fixture(future_count: usize) -> Connection {
     conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
         .unwrap();
     register_comm_indexes(&conn);
+    let due_key = crate::pool::strict_rfc3339_key("2999-01-01T00:00:00Z").unwrap();
     conn.execute_batch("BEGIN").unwrap();
     for i in 0..future_count {
         conn.execute(
-            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at) \
-             VALUES (?1, 'default', 'message', ?2, ?3, ?3)",
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at, \
+             strict_due_key, due_source) \
+             VALUES (?1, 'default', 'message', ?2, ?3, ?3, ?4, ?5)",
             rusqlite::params![
                 format!("{i:036}"),
                 r#"{"direction":"outbound","to_actor":"test:recipient","next_attempt_at":"2999-01-01T00:00:00Z"}"#,
                 i as i64,
+                &due_key,
+                "2999-01-01T00:00:00Z",
             ],
         )
         .unwrap();
@@ -400,6 +399,83 @@ fn outbox_zero_due_scan_cost_stays_bounded_as_same_channel_future_rows_grow() {
             large_steps <= small_steps + 128,
             "{stage}: future same-channel backlog must not add row-proportional due-scan work: {small_steps} -> {large_steps}"
         );
+    }
+}
+
+#[test]
+fn outbox_stale_key_falls_back_without_false_negative_or_early_delivery() {
+    let conn = future_outbox_fixture(1);
+    let id = format!("{:036}", 0);
+    assert_eq!(measure(&conn, &outbox_filter())["ids"], json!([]));
+
+    // A direct properties edit leaves the old stored future key in place.
+    // The built-in freshness guard must expose this newly due row to the
+    // strict residual even though no application writer recomputed the key.
+    conn.execute(
+        "UPDATE notes SET properties = json_set(properties, '$.next_attempt_at', ?1) \
+         WHERE id = ?2",
+        rusqlite::params!["2020-01-01T00:00:00Z", &id],
+    )
+    .unwrap();
+    assert_eq!(measure(&conn, &outbox_filter())["ids"], json!([id.clone()]));
+
+    conn.execute(
+        "UPDATE notes SET properties = json_set(properties, '$.next_attempt_at', ?1) \
+         WHERE id = ?2",
+        rusqlite::params!["2998-01-01T00:00:00Z", &id],
+    )
+    .unwrap();
+    assert_eq!(measure(&conn, &outbox_filter())["ids"], json!([]));
+
+    for value in ["123", "null"] {
+        conn.execute(
+            "UPDATE notes SET properties = json_set(properties, '$.next_attempt_at', json(?1)) \
+             WHERE id = ?2",
+            rusqlite::params![value, &id],
+        )
+        .unwrap();
+        assert_eq!(measure(&conn, &outbox_filter())["ids"], json!([id.clone()]));
+    }
+}
+
+#[test]
+fn supported_note_upsert_recomputes_strict_due_key_with_properties() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
+        .unwrap();
+    register_comm_indexes(&conn);
+    let mut note = Note::new("default", "message", "queued");
+    let id = note.id.to_string();
+    let write = |note: &Note| {
+        let statement = super::note_upsert_statement(note);
+        let mut prepared = conn.prepare(&statement.sql).unwrap();
+        crate::sql_bridge::bind_params(&mut prepared, &statement.params).unwrap();
+        prepared.raw_execute().unwrap();
+    };
+    for (deadline, due) in [
+        ("2999-01-01T00:00:00Z", false),
+        ("2020-01-01T00:00:00Z", true),
+        ("2998-01-01T00:00:00Z", false),
+    ] {
+        note.properties = Some(json!({
+            "direction": "outbound", "to_actor": "test:recipient",
+            "next_attempt_at": deadline,
+        }));
+        note.updated_at += 1;
+        write(&note);
+        assert_eq!(
+            measure(&conn, &outbox_filter())["ids"],
+            if due { json!([id.clone()]) } else { json!([]) }
+        );
+        let (key, source): (Option<Vec<u8>>, Option<String>) = conn
+            .query_row(
+                "SELECT strict_due_key, due_source FROM notes WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(key, crate::pool::strict_rfc3339_key(deadline));
+        assert_eq!(source.as_deref(), Some(deadline));
     }
 }
 
@@ -440,8 +516,7 @@ fn outbox_due_scan_cost_controls_fail_when_index_contract_is_broken() {
 fn outbox_due_index_backfills_existing_deadlines_and_reopens() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("comm-upgrade.sqlite");
-    let conn = Connection::open(&path).unwrap();
-    crate::pool::register_rfc3339_key(&conn).unwrap();
+    let mut conn = Connection::open(&path).unwrap();
     conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
         .unwrap();
     conn.execute_batch(COMM_INDEXES).unwrap();
@@ -476,11 +551,13 @@ fn outbox_due_index_backfills_existing_deadlines_and_reopens() {
         .unwrap();
     }
     conn.execute_batch("ANALYZE").unwrap();
-    conn.execute_batch(OUTBOX_DUE_INDEX).unwrap();
+    let tx = conn.transaction().unwrap();
+    crate::migrations::migrate_outbound_due_key(&tx).unwrap();
+    tx.commit().unwrap();
     drop(conn);
 
     let reopened = Connection::open(&path).unwrap();
-    crate::pool::register_rfc3339_key(&reopened).unwrap();
+    crate::pool::register_rfc3339_key(&reopened).unwrap(); // read residual
     let result = measure(&reopened, &outbox_filter());
     assert_eq!(
         result["ids"],

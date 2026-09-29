@@ -4718,6 +4718,7 @@ fn merge_note_sql(
     let props_str = merged_props
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let (due_key, due_source) = khive_db::stores::note::note_due_key_values(&merged_props);
 
     // The loop always runs so a dry-run reports a predictive `edges_rewired`
     // count instead of zero (mirrors the entity merge path).
@@ -4936,6 +4937,8 @@ fn merge_note_sql(
                 now,
                 into_note.deleted_at,
                 &into_note.key,
+                &due_key,
+                &due_source,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);

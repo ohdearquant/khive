@@ -2951,7 +2951,17 @@ pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec
     key
 }
 
-pub(crate) fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+/// The outbox deadline grammar is stricter than the general timestamp filter.
+/// This is shared by app-maintained stored keys, V44 backfill, and the read
+/// residual; no schema expression calls an application-defined function.
+pub(crate) fn strict_rfc3339_key(text: &str) -> Option<Vec<u8>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)))
+}
+
+/// Register timestamp-key functions for read filters on pooled connections.
+pub(crate) fn register_rfc3339_key(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     use rusqlite::types::ValueRef;
 
@@ -2987,9 +2997,7 @@ pub(crate) fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError>
                 ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
                 _ => None,
             };
-            let key = text
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)));
+            let key = text.and_then(strict_rfc3339_key);
             Ok(key)
         },
     )?;
