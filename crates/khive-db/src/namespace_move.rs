@@ -313,6 +313,11 @@ const NAMESPACE_SCOPED_TABLES: &[&str] = &[
 /// leave learned state under a namespace its subject has left.
 const SUBJECT_KEYED_TABLES: &[&str] = &["brain_implicit_mass", "brain_serve_ledger"];
 
+/// A memory visibility receipt belongs to its note. Its fences name the
+/// receipt by `(namespace, note_id)`, so they must follow it in dependency order.
+const MEMORY_VISIBILITY_RECEIPTS: &str = "memory_visibility_receipts";
+const MEMORY_VISIBILITY_FENCES: &str = "memory_visibility_fences";
+
 /// What a move does with one namespace-bearing table.
 ///
 /// This is the half of the design that cannot be derived, because it is a
@@ -411,6 +416,12 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         "brain_profile_snapshots" | "brain_event_log" => NamespaceScopedAggregate,
         "brain_implicit_mass" | "brain_serve_ledger" => SubjectKeyed {
             subject_column: "target_id",
+        },
+        "memory_visibility_receipts" => SubjectKeyed {
+            subject_column: "note_id",
+        },
+        "memory_visibility_fences" => SubjectKeyed {
+            subject_column: "note_id",
         },
 
         // Created at runtime, one per embedding model, and in no source file, so
@@ -849,6 +860,44 @@ fn move_whole_table(
     Ok(moved)
 }
 
+/// Carry a note's visibility receipt and fences without breaking their composite
+/// foreign key. Copy the receipt under the target first, re-key its fences, then
+/// remove the source receipt. The counts describe rows carried, not the extra
+/// insert and delete needed to preserve the reference at each statement.
+fn move_memory_visibility(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+    rows: &mut BTreeMap<String, u64>,
+) -> rusqlite::Result<()> {
+    let receipts = conn.execute(
+        "INSERT INTO memory_visibility_receipts (namespace, note_id, model_count) \
+         SELECT ?2, receipt.note_id, receipt.model_count \
+         FROM memory_visibility_receipts AS receipt \
+         JOIN notes AS note ON note.id = receipt.note_id \
+         WHERE receipt.namespace = ?1 AND note.namespace = ?2",
+        rusqlite::params![source, target],
+    )? as u64;
+    *rows.entry(MEMORY_VISIBILITY_RECEIPTS.into()).or_default() += receipts;
+
+    let fences = conn.execute(
+        "UPDATE memory_visibility_fences SET namespace = ?2 \
+         WHERE namespace = ?1 AND note_id IN (\
+           SELECT note_id FROM memory_visibility_receipts WHERE namespace = ?2)",
+        rusqlite::params![source, target],
+    )? as u64;
+    *rows.entry(MEMORY_VISIBILITY_FENCES.into()).or_default() += fences;
+
+    let removed = conn.execute(
+        "DELETE FROM memory_visibility_receipts \
+         WHERE namespace = ?1 AND note_id IN (\
+           SELECT note_id FROM memory_visibility_receipts WHERE namespace = ?2)",
+        rusqlite::params![source, target],
+    )? as u64;
+    debug_assert_eq!(removed, receipts);
+    Ok(())
+}
+
 /// A vec0 row moves by delete and re-insert, carrying the stored embedding.
 ///
 /// No `UPDATE` against vec0 exists anywhere in the tree, and re-embedding would
@@ -1100,6 +1149,13 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
         }
     }
 
+    // Visibility receipts follow notes, but their fences reference the receipt
+    // including its namespace. A plain UPDATE of either table first would fail
+    // with foreign keys enabled. The helper keeps the reference valid throughout.
+    for target in &targets {
+        move_memory_visibility(conn, source, target, &mut counts.rows)?;
+    }
+
     // Per-namespace aggregates with no subject. A partitioning move has no
     // target to carry them to, so they stay and the caller is told, rather than
     // being left to find out.
@@ -1171,6 +1227,113 @@ mod tests {
         let counts = move_namespace(&conn, &request).expect("a backend with nothing routed here");
         assert_eq!(counts.subjects.get("note:observation"), Some(&0));
         assert_eq!(counts.subjects.get("atom"), Some(&0));
+        assert_eq!(counts.rows.get(MEMORY_VISIBILITY_RECEIPTS), Some(&0));
+        assert_eq!(counts.rows.get(MEMORY_VISIBILITY_FENCES), Some(&0));
+    }
+
+    #[test]
+    fn a_memory_visibility_receipt_follows_its_note_and_reports_count() {
+        let conn = migrated();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        seed_note(&conn, "n1", "source", "observation");
+        conn.execute(
+            "INSERT INTO memory_visibility_receipts (namespace, note_id, model_count) \
+             VALUES ('source', 'n1', 0)",
+            [],
+        )
+        .unwrap();
+
+        let request = MoveRequest::new("source", vec![route("note:observation", "target")]);
+        let counts = move_namespace(&conn, &request).expect("the receipt follows its note");
+        assert_eq!(counts.subjects.get("note:observation"), Some(&1));
+        assert_eq!(counts.rows.get(MEMORY_VISIBILITY_RECEIPTS), Some(&1));
+        assert_eq!(counts.rows.get(MEMORY_VISIBILITY_FENCES), Some(&0));
+        let stored: (String, i64) = conn
+            .query_row(
+                "SELECT namespace, model_count FROM memory_visibility_receipts \
+                 WHERE note_id = 'n1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("target".into(), 0));
+        let source_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_visibility_receipts WHERE namespace = 'source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_rows, 0);
+    }
+
+    #[test]
+    fn memory_visibility_fences_follow_their_note_with_foreign_keys_enabled() {
+        let conn = migrated();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        seed_note(&conn, "n1", "source", "observation");
+        seed_note(&conn, "n2", "source", "decision");
+        conn.execute(
+            "INSERT INTO memory_visibility_receipts (namespace, note_id, model_count) \
+             VALUES ('source', 'n1', 2), ('source', 'n2', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_visibility_fences \
+             (namespace, note_id, model, ann_write_log_seq) VALUES \
+             ('source', 'n1', 'model-a', 10), ('source', 'n1', 'model-b', 11)",
+            [],
+        )
+        .unwrap();
+
+        let request = MoveRequest::new(
+            "source",
+            vec![
+                route("note:observation", "target-a"),
+                route("note:decision", "target-b"),
+            ],
+        );
+        let counts = move_namespace(&conn, &request).expect("both receipts follow their notes");
+        assert_eq!(counts.rows.get(MEMORY_VISIBILITY_RECEIPTS), Some(&2));
+        assert_eq!(counts.rows.get(MEMORY_VISIBILITY_FENCES), Some(&2));
+        let receipt_places: Vec<(String, String)> = conn
+            .prepare("SELECT note_id, namespace FROM memory_visibility_receipts ORDER BY note_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            receipt_places,
+            vec![
+                ("n1".into(), "target-a".into()),
+                ("n2".into(), "target-b".into())
+            ]
+        );
+        let fences: Vec<(String, String, i64)> = conn
+            .prepare(
+                "SELECT namespace, model, ann_write_log_seq \
+                 FROM memory_visibility_fences ORDER BY model",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            fences,
+            vec![
+                ("target-a".into(), "model-a".into(), 10),
+                ("target-a".into(), "model-b".into(), 11)
+            ]
+        );
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
     }
 
     /// And the case it must stay distinguishable from. A host binding a pack
