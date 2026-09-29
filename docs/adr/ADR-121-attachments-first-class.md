@@ -1171,7 +1171,11 @@ upload that was progressing normally is lost.
    `KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS`, default 600 seconds, and its first tick comes one interval after
    daemon start (`uploads.rs:57`, `crates/khive-mcp/src/components.rs:172-192`). The bind and the orphan
    collector never remove a staged file. A root holding an abandoned upload younger than the bound refuses
-   the bind on that boot, and the first boot after the sweeper has removed the file can bind it.
+   the bind on that boot, and the first boot after the sweeper has removed the file can bind it. The
+   expiry pass itself is not yet limited to abandoned uploads: `sweep_uploads` removes any id-named file
+   older than the sweeping process's own bound with no owner check (`blob_uploads.rs:385-447`), so on a
+   root shared by two daemons with different bounds it can remove the other daemon's open upload, a gap
+   this amendment does not close and #3643 tracks.
 4. **An upload begin cannot land inside the bind.** Item 8 says the emptiness check runs "under database GC
    ownership and the root write lock". That sentence keeps the check itself apart from any upload begin,
    because `begin_upload` takes the root write lock: the store's per-root mutex and the
