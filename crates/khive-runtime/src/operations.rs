@@ -20810,4 +20810,106 @@ mod tests {
         assert_eq!(attachments[1].role, "fann-network");
         assert_eq!(attachments[1].content_ref, network_ref);
     }
+
+    #[tokio::test]
+    async fn create_entity_with_attachments_reports_committed_event_failure() {
+        use khive_db::stores::blob::FsBlobStore;
+        use khive_storage::BlobStore as _;
+
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let blob_store =
+            Arc::new(FsBlobStore::new(blob_dir.path().to_path_buf(), 0).expect("blob store"));
+        let content_ref = blob_store
+            .put(b"bundle".to_vec())
+            .await
+            .expect("publish bundle");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+        let mut writer = runtime.sql().writer().await.expect("event writer");
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_attachment_created_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'entity_created' \
+                 BEGIN SELECT RAISE(ABORT, 'legacy attachment-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .expect("inject event failure");
+        drop(writer);
+
+        let error = runtime
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                None,
+                "committed attachment entity",
+                None,
+                None,
+                vec![],
+                vec![NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: content_ref.clone(),
+                    media_type: Some("application/octet-stream".to_string()),
+                    size_bytes: Some(6),
+                }],
+            )
+            .await
+            .expect_err("created-event failure must report a committed entity");
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("expected typed post-commit error: {error:?}");
+        };
+        let failures: serde_json::Value = serde_json::from_str(
+            domain
+                .details()
+                .expect("post-commit details")
+                .get("post_commit_degradations")
+                .expect("degradation list"),
+        )
+        .expect("degradations JSON");
+        assert_eq!(failures.as_array().expect("degradations array").len(), 1);
+        assert!(
+            failures[0]["error"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("legacy attachment-event failure")),
+            "injected failure must be carried in detail: {failures}"
+        );
+        let entity_id = assert_legacy_post_commit_error(
+            error,
+            "create_entity_with_attachments",
+            &["event_append"],
+        );
+        let entity = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("committed entity remains readable");
+        assert_eq!(entity.content_ref.as_deref(), Some(content_ref.as_str()));
+        let attachments = runtime
+            .attachments()
+            .expect("main attachment store")
+            .list_attachments(entity_id)
+            .await
+            .expect("committed attachment remains readable");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].role, "content");
+        assert_eq!(attachments[0].content_ref, content_ref);
+        let events = runtime
+            .list_events(
+                &token,
+                EventFilter {
+                    target_id: Some(entity_id),
+                    kinds: vec![EventKind::EntityCreated],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("created-event query");
+        assert!(
+            events.items.is_empty(),
+            "the created event was not appended"
+        );
+    }
 }
