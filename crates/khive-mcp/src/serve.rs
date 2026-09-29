@@ -2246,14 +2246,54 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
+#[derive(PartialEq, Eq, Hash)]
+enum BackendAliasIdentity {
+    /// An existing file can have several distinct canonical hard-link paths.
+    #[cfg(unix)]
+    File(FileIdentity),
+    /// A not-yet-created file has only a resolved path to compare.
+    Path(PathBuf),
+}
+
+fn backend_alias_identity(
+    backend_name: &str,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        match std::fs::metadata(canonical) {
+            Ok(meta) => Ok(BackendAliasIdentity::File(FileIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+            }
+            Err(error) => anyhow::bail!(
+                "backend {backend_name}: cannot inspect database identity at {}: {error}",
+                canonical.display()
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = backend_name;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
 /// Reject conflicting access modes without opening any configured database.
 pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
-    let mut physical_sqlite: HashMap<std::path::PathBuf, (&str, bool)> = HashMap::new();
+    let mut physical_sqlite: HashMap<BackendAliasIdentity, (&str, bool)> = HashMap::new();
     for backend in backends {
         let Some(canonical) = canonical_backend_path(backend)? else {
             continue;
         };
-        if let Some((first_name, first_read_only)) = physical_sqlite.get(&canonical) {
+        let identity = backend_alias_identity(&backend.name, &canonical)?;
+
+        if let Some((first_name, first_read_only)) = physical_sqlite.get(&identity) {
             if *first_read_only != backend.read_only {
                 anyhow::bail!(
                     "backend {} aliases {} (already declared by backend {}) but declares \
@@ -2267,7 +2307,7 @@ pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> any
                 );
             }
         } else {
-            physical_sqlite.insert(canonical, (&backend.name, backend.read_only));
+            physical_sqlite.insert(identity, (&backend.name, backend.read_only));
         }
     }
     Ok(())
@@ -2563,7 +2603,7 @@ pub fn reject_conflicting_db_override_with_source(
 /// Filesystem identity of a reindex target, captured so a symlink retargeted
 /// or a file replaced in place between validation and open can be told apart
 /// from the declared file validation actually checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -2935,16 +2975,26 @@ async fn prepare_configured_storage_topology(
         }
     }
 
-    // Open each declared backend, deduplicating SQLite backends by canonical
-    // path (ADR-028 §8). Schema preparation is deliberately deferred until
-    // after main is identified: every distinct secondary must be inventoried
-    // before main can atomically enable attachment-only GC at V21.
+    // Open each declared backend, deduplicating SQLite backends by physical
+    // file identity (or canonical path before creation; ADR-028 §8). Schema
+    // preparation is deferred until after main is identified: every distinct
+    // secondary must be inventoried before main can atomically enable
+    // attachment-only GC at V21.
     let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
-    let mut path_to_backend: HashMap<std::path::PathBuf, Arc<StorageBackend>> = HashMap::new();
-    for backend_cfg in &effective_backends {
-        let canonical = canonical_backend_path(backend_cfg)?;
-        if let Some(ref canon) = canonical {
-            if let Some(existing) = path_to_backend.get(canon) {
+    let identities = effective_backends
+        .iter()
+        .map(|cfg| {
+            canonical_backend_path(cfg)?.map_or(Ok(None), |canonical| {
+                backend_alias_identity(&cfg.name, &canonical)
+                    .map(|identity| Some((identity, canonical)))
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut identity_to_backend: HashMap<BackendAliasIdentity, Arc<StorageBackend>> =
+        HashMap::new();
+    for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
+        if let Some((ref key, ref canon)) = identity {
+            if let Some(existing) = identity_to_backend.get(key) {
                 if existing.is_read_only() != backend_cfg.read_only {
                     anyhow::bail!(
                         "backend {} aliases {} but declares read_only={} while the same \
@@ -2962,8 +3012,8 @@ async fn prepare_configured_storage_topology(
         }
         let backend = open_backend(backend_cfg, max_readers)?;
         let arc = Arc::new(backend);
-        if let Some(canon) = canonical {
-            path_to_backend.insert(canon, arc.clone());
+        if let Some((key, _)) = identity {
+            identity_to_backend.insert(key, arc.clone());
         }
         backends.insert(backend_cfg.name.clone(), arc);
     }
@@ -9532,6 +9582,53 @@ region = "us-east-1"
         let message = error.to_string();
         assert!(message.contains("same physical database"), "{message}");
         assert!(message.contains("read_only"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_backend_aliases_must_agree_on_access_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        config.backends[1].read_only = true;
+        let error = validate_effective_backend_alias_modes(&config.backends)
+            .expect_err("hard links to one database cannot have conflicting modes");
+        let message = error.to_string();
+        assert!(message.contains("same physical database"), "{message}");
+        assert!(message.contains("read_only"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn hard_linked_backend_aliases_share_one_open_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        rusqlite::Connection::open(&database).unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        let topology = prepare_configured_storage_topology(
+            base_runtime_config_for_multi_backend(),
+            &config,
+            None,
+            StorageTopologyPurpose::Serving,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &topology.backends["main"],
+            &topology.backends["alias"]
+        ));
     }
 
     /// Regression for #720: changing `HOME` after runtime-config resolution but

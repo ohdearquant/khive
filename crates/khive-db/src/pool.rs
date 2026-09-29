@@ -763,6 +763,10 @@ pub struct ConnectionPool {
     /// derivation) use this, the same canonical value the identity was
     /// minted from, via [`Self::canonical_path`].
     identity_path: Option<PathBuf>,
+    /// The file observed at the canonical target after the first writer opens.
+    /// Later standalone opens refuse a replacement at that path.
+    #[cfg(unix)]
+    opened_file_identity: Option<DatabaseFileIdentity>,
     /// Registered only after every connection opens successfully. RAII removes
     /// the path when the last pool for it drops, including failed construction.
     identity_registration: Option<PoolIdentityRegistration>,
@@ -1595,7 +1599,28 @@ impl ConnectionPool {
             Arc::new(WriteAdmission::new(None, 0))
         };
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
-        let writer = open_writer_connection(&config, read_only_open_target.as_deref())?;
+        #[cfg(unix)]
+        let identity_before_open = identity_path
+            .as_deref()
+            .map(database_file_identity_if_exists)
+            .transpose()?
+            .flatten();
+        let writer = open_writer_connection(
+            &config,
+            read_only_open_target.as_deref(),
+            identity_path.as_deref(),
+        )?;
+        #[cfg(unix)]
+        let opened_file_identity = identity_path
+            .as_deref()
+            .map(database_file_identity)
+            .transpose()?;
+        #[cfg(unix)]
+        if identity_before_open.is_some() && identity_before_open != opened_file_identity {
+            return Err(SqliteError::InvalidData(
+                "database file identity changed while opening the pool".to_string(),
+            ));
+        }
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
 
@@ -1620,6 +1645,8 @@ impl ConnectionPool {
             writer_task_join_stored: AtomicBool::new(false),
             origin,
             identity_path,
+            #[cfg(unix)]
+            opened_file_identity,
             identity_registration: None,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2362,13 +2389,22 @@ impl ConnectionPool {
 
     fn open_reader_connection(&self) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
-        open_reader_connection(path, &self.config)
+        #[cfg(unix)]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(identity_path)?;
+        }
+        let conn = open_reader_connection(path, &self.config)?;
+        #[cfg(unix)]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(identity_path)?;
+        }
+        Ok(conn)
     }
 
     fn read_connection_path(&self) -> Result<&Path, SqliteError> {
         self.read_only_open_target
             .as_deref()
-            .or(self.config.path.as_deref())
+            .or(self.identity_path.as_deref())
             .ok_or_else(|| {
                 SqliteError::InvalidData(
                     "in-memory databases do not support standalone connections".to_string(),
@@ -2405,7 +2441,7 @@ impl ConnectionPool {
     /// write paths must call [`Self::open_standalone_writer`] so their
     /// acquisitions are observable.
     pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
-        let path = self.config.path.as_ref().ok_or_else(|| {
+        let path = self.identity_path.as_deref().ok_or_else(|| {
             SqliteError::InvalidData(
                 "in-memory databases do not support standalone connections".to_string(),
             )
@@ -2417,12 +2453,20 @@ impl ConnectionPool {
             ));
         }
 
+        // The configured spelling may be a symlink that changed since this
+        // pool opened. Use its pinned target, and refuse replacement of that
+        // target before SQLite can execute the diagnostics PASSIVE checkpoint.
+        #[cfg(unix)]
+        self.verify_opened_file_identity(path)?;
+
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        #[cfg(unix)]
+        self.verify_opened_file_identity(path)?;
         register_writer_clock(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
@@ -2441,6 +2485,23 @@ impl ConnectionPool {
         }
 
         Ok(conn)
+    }
+
+    #[cfg(unix)]
+    fn verify_opened_file_identity(&self, path: &Path) -> Result<(), SqliteError> {
+        let Some(expected) = self.opened_file_identity else {
+            return Err(SqliteError::InvalidData(
+                "file-backed pool has no opened database file identity".to_string(),
+            ));
+        };
+        let current = database_file_identity(path).ok();
+        if current != Some(expected) {
+            return Err(SqliteError::InvalidData(
+                "pool database file identity changed since the first open; refusing standalone connection"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Effective `PRAGMA wal_autocheckpoint` for a writer-capable connection
@@ -2675,6 +2736,35 @@ fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), Sql
     ))
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DatabaseFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn database_file_identity(path: &Path) -> Result<DatabaseFileIdentity, SqliteError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path)?;
+    Ok(DatabaseFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn database_file_identity_if_exists(
+    path: &Path,
+) -> Result<Option<DatabaseFileIdentity>, SqliteError> {
+    match database_file_identity(path) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(SqliteError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Follow a (possibly dangling) final-component symlink chain to its
 /// ultimate target, bounded at [`MAX_SYMLINK_DEPTH`] hops. A path that is
 /// not itself a symlink — including one that does not exist at all —
@@ -2721,9 +2811,10 @@ fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
 fn open_writer_connection(
     config: &PoolConfig,
     read_only_open_target: Option<&Path>,
+    identity_path: Option<&Path>,
 ) -> Result<Connection, SqliteError> {
     match config.path.as_ref() {
-        Some(path) => {
+        Some(_) => {
             let flags = if config.read_only {
                 writer_read_only_open_flags()
             } else {
@@ -2736,7 +2827,11 @@ fn open_writer_connection(
                     )
                 })?
             } else {
-                path
+                identity_path.ok_or_else(|| {
+                    SqliteError::InvalidData(
+                        "file-backed writable pool has no canonical open target".to_string(),
+                    )
+                })?
             };
             Connection::open_with_flags(target, flags).map_err(Into::into)
         }
@@ -4740,6 +4835,78 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_and_new_reader_keep_the_first_opened_target_after_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.db");
+        let second = dir.path().join("second.db");
+        for (path, marker) in [(&first, 11), (&second, 22)] {
+            let conn = Connection::open(path).unwrap();
+            conn.execute("CREATE TABLE identity_marker (value INTEGER NOT NULL)", [])
+                .unwrap();
+            conn.execute("INSERT INTO identity_marker (value) VALUES (?1)", [marker])
+                .unwrap();
+        }
+        let alias = dir.path().join("current.db");
+        symlink(&first, &alias).unwrap();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open the first database through its alias");
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+
+        let standalone = pool
+            .open_standalone_writer_untracked()
+            .expect("standalone probe stays on the opened database");
+        let value: i64 = standalone
+            .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 11);
+
+        let reader = pool
+            .open_reader_connection()
+            .expect("a newly opened reader stays on the same database");
+        let value: i64 = reader
+            .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 11);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_writer_refuses_replaced_pinned_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let replacement = dir.path().join("replacement.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open the first database");
+        let replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .unwrap();
+        drop(replacement_conn);
+        fs::rename(&replacement, &path).unwrap();
+
+        let error = pool
+            .open_standalone_writer_untracked()
+            .expect_err("a replaced file must not receive a standalone probe");
+        assert!(
+            error.to_string().contains("file identity changed"),
+            "{error}"
+        );
     }
 
     #[test]

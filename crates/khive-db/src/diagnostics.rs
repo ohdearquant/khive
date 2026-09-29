@@ -2743,6 +2743,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_probe_reports_replaced_pool_file_instead_of_probing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, path) = seeded_pool(&dir);
+        let replacement = dir.path().join("replacement.db");
+        let replacement_conn = Connection::open(&replacement).expect("replacement database");
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .expect("initialize replacement database");
+        drop(replacement_conn);
+        std::fs::rename(&replacement, &path).expect("replace the pool's path");
+
+        let inspection = inspect_pool(&pool);
+        assert!(inspection.checkpoint_probe.is_none());
+        assert!(
+            inspection
+                .checkpoint_probe_error
+                .as_deref()
+                .is_some_and(|error| error.contains("file identity changed")),
+            "replacement must be reported as a probe failure"
+        );
+    }
+
     #[test]
     fn checkpoint_probe_backfill_gap_is_a_row_difference_not_a_pin_claim() {
         let probe = CheckpointProbe {
