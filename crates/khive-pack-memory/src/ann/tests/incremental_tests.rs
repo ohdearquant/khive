@@ -253,10 +253,17 @@ async fn dirty_threshold_publishes_once_and_fresh_state_adopts_hot() {
         assert_eq!(event["ops_applied"], 1);
         written.push((id, text));
     }
-    assert_ne!(
+    assert_eq!(
         commit_record(&rt, MODEL),
         committed,
-        "threshold must rotate the commit record"
+        "a delta checkpoint must preserve the base segment nonce"
+    );
+    assert!(
+        ann_segment_dir(&rt, MODEL)
+            .expect("segment directory")
+            .join(delta::HEAD_FILE)
+            .exists(),
+        "the due checkpoint must publish a delta beside the base segment"
     );
 
     let restarted = new_shared();
@@ -726,6 +733,13 @@ async fn checkpoint_consolidates_updates_and_deletes_with_correct_uuid_mapping()
         .expect("checkpoint policy")
         .consolidate_tau = 1;
     let publications = ann.publication_count.load(Ordering::SeqCst);
+    // Consolidation renumbers ordinals, so it runs only on a full segment
+    // rewrite. Leave exactly the four raw operations below before the bound.
+    {
+        let mut guard = ann.indexes.write().await;
+        let bridge = guard.get_mut(&key).expect("seeded bridge");
+        bridge.delta_raw_ops = delta::compaction_limit(bridge.base_ops) - 4;
+    }
     let updates = [
         (ids[0], "updated first retained memory"),
         (ids[1], "updated second retained memory"),
@@ -843,4 +857,517 @@ async fn pathless_incremental_tail_does_not_hold_shared_writer_after_read() {
         tail.is_some(),
         "an empty tail remains within the replay limit"
     );
+}
+
+fn delta_chunk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("list segment directory")
+        .map(|entry| entry.expect("segment entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("memory_delta-") && name.ends_with(".bin"))
+        })
+        .collect()
+}
+
+#[test]
+fn delta_checkpoints_append_only_new_chunks_until_exact_compaction_bound() {
+    let temp = tempfile::tempdir().expect("segment root");
+    let active_dir = temp.path().join("active-model");
+    let idle_dir = temp.path().join("idle-model");
+    std::fs::create_dir_all(&active_dir).expect("active model directory");
+    std::fs::create_dir_all(&idle_dir).expect("idle model directory");
+    let seed = Uuid::new_v4();
+    let mut base = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![seed], HashSet::new())
+        .expect("build base");
+    base.set_applied_seq(1);
+    base.save_atomic(&active_dir).expect("persist active model");
+    base.save_atomic(&idle_dir).expect("persist idle model");
+    let base_metadata = std::fs::read(active_dir.join("metadata.bin")).expect("base metadata");
+    let idle_files: Vec<_> = [
+        "metadata.bin",
+        "vectors.bin",
+        "graph.bin",
+        "lifecycle.bin",
+        "codes.bin",
+        "external_ids.bin",
+    ]
+    .into_iter()
+    .map(|name| (name, std::fs::read(idle_dir.join(name)).expect("idle file")))
+    .collect();
+
+    // A chunk without a committed HEAD is an orphan from a failed publication.
+    std::fs::write(
+        active_dir.join(format!("memory_delta-{}.bin", Uuid::new_v4())),
+        b"orphan",
+    )
+    .expect("orphan chunk");
+    assert!(
+        AnnBridge::load(&active_dir).is_ok(),
+        "orphan must not affect adoption"
+    );
+
+    let mut bridge = AnnBridge::load(&active_dir).expect("load base");
+    let mut identities = HashSet::new();
+    let mut first_chunk_bytes = None;
+    let mut inserted = Vec::new();
+    for checkpoint in 1..=4 {
+        let id = Uuid::new_v4();
+        let vector = vec![0.0, 1.0, checkpoint as f32, 0.0];
+        let ops = vec![(id, Some(vector))];
+        bridge
+            .apply_final_ops(ops.clone(), checkpoint + 1)
+            .expect("apply new tail");
+        bridge.record_delta_batch(ops, checkpoint + 1, 1_000);
+        assert!(
+            !bridge.needs_full_compaction(),
+            "four checkpoints stay below 5,000 raw ops"
+        );
+        let before = delta_chunk_files(&active_dir).len();
+        let publication = delta::write(&active_dir, &bridge).expect("publish new chunk and HEAD");
+        assert_eq!(
+            delta_chunk_files(&active_dir).len(),
+            before + 1,
+            "each checkpoint writes exactly one new immutable chunk"
+        );
+        let chunk_bytes = std::fs::metadata(
+            active_dir.join(format!("memory_delta-{}.bin", publication.last_nonce)),
+        )
+        .expect("new chunk")
+        .len();
+        assert_eq!(
+            chunk_bytes,
+            *first_chunk_bytes.get_or_insert(chunk_bytes),
+            "later checkpoints must write only their fresh one-op tail"
+        );
+        assert!(
+            identities.insert(publication.identity),
+            "each publication gets a fresh identity"
+        );
+        assert_eq!(
+            std::fs::read(active_dir.join("metadata.bin")).unwrap(),
+            base_metadata,
+            "delta publication must preserve the base segment nonce"
+        );
+        bridge.commit_digest = Some(publication.identity);
+        bridge.last_delta_nonce = Some(publication.last_nonce);
+        bridge.delta_batches.clear();
+        bridge.mark_checkpointed();
+        bridge = AnnBridge::load(&active_dir).expect("adopter replays committed chain");
+        assert_eq!(bridge.commit_digest, Some(publication.identity));
+        assert!(
+            bridge.id_map.contains(&id),
+            "adopter must see the delta's new vector"
+        );
+        inserted.push(id);
+    }
+    for (name, bytes) in &idle_files {
+        assert_eq!(
+            std::fs::read(idle_dir.join(name)).unwrap(),
+            *bytes,
+            "idle second MODEL must remain byte-identical: {name}"
+        );
+    }
+
+    let final_id = Uuid::new_v4();
+    let ops = vec![(final_id, Some(vec![0.0, 0.0, 0.0, 1.0]))];
+    bridge
+        .apply_final_ops(ops.clone(), 6)
+        .expect("apply threshold tail");
+    bridge.record_delta_batch(ops, 6, 1_000);
+    assert!(
+        bridge.needs_full_compaction(),
+        "exactly 5,000 raw ops require one full rewrite"
+    );
+    bridge.save_atomic(&active_dir).expect("full compaction");
+    assert_ne!(
+        std::fs::read(active_dir.join("metadata.bin")).unwrap(),
+        base_metadata
+    );
+    assert!(
+        !active_dir.join(delta::HEAD_FILE).exists(),
+        "compaction empties delta HEAD"
+    );
+    assert!(
+        delta_chunk_files(&active_dir).is_empty(),
+        "compaction reclaims old chunks and orphans"
+    );
+    let adopted = AnnBridge::load(&active_dir).expect("adopt compacted segment");
+    assert!(adopted.id_map.contains(&final_id));
+    assert!(inserted.iter().all(|id| adopted.id_map.contains(id)));
+}
+
+#[test]
+fn compaction_metadata_before_head_cleanup_adopts_new_base() {
+    let temp = tempfile::tempdir().expect("segment directory");
+    let dir = temp.path();
+    let seed = Uuid::new_v4();
+    let added = Uuid::new_v4();
+    let mut base = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![seed], HashSet::new())
+        .expect("build base");
+    base.set_applied_seq(1);
+    base.save_atomic(dir).expect("persist base");
+    let mut bridge = AnnBridge::load(dir).expect("load base");
+    let ops = vec![(added, Some(vec![0.0, 1.0, 0.0, 0.0]))];
+    bridge.apply_final_ops(ops.clone(), 2).expect("apply tail");
+    bridge.record_delta_batch(ops, 2, 1);
+    delta::write(dir, &bridge).expect("publish delta");
+    assert!(dir.join(delta::HEAD_FILE).exists());
+
+    // Simulate a crash after v2 metadata + external IDs commit but before
+    // removing the old HEAD. Its watermark is covered by the new base.
+    bridge
+        .index
+        .save_atomic(dir)
+        .expect("commit new base files");
+    let digest = segment_commit_digest(dir)
+        .expect("read commit")
+        .expect("commit exists");
+    write_external_ids_sidecar(dir, &digest, &bridge.id_map).expect("commit external IDs");
+    assert!(
+        dir.join(delta::HEAD_FILE).exists(),
+        "old HEAD remains during crash window"
+    );
+    let adopted = AnnBridge::load(dir).expect("stale HEAD must not reject new base");
+    assert!(adopted.id_map.contains(&added));
+    assert_eq!(delta::publication_digest(dir).unwrap(), Some(digest));
+    delta::clear(dir).expect("clear old chain");
+    assert!(!dir.join(delta::HEAD_FILE).exists());
+}
+
+#[test]
+fn delta_publication_bytes_follow_new_ops_across_hundredfold_corpus() {
+    fn one_checkpoint(count: usize) -> (u64, u64) {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut vectors = Vec::with_capacity(count * 4);
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            vectors.extend_from_slice(&[1.0, (i % 17) as f32, (i / 17) as f32, 0.5]);
+            ids.push(Uuid::new_v4());
+        }
+        let mut base = AnnBridge::build(vectors, 4, ids, HashSet::new()).expect("build corpus");
+        base.set_applied_seq(1);
+        base.save_atomic(dir).expect("persist corpus");
+        let base_bytes: u64 = [
+            "metadata.bin",
+            "vectors.bin",
+            "graph.bin",
+            "lifecycle.bin",
+            "codes.bin",
+            "external_ids.bin",
+        ]
+        .into_iter()
+        .map(|name| std::fs::metadata(dir.join(name)).unwrap().len())
+        .sum();
+        let mut bridge = AnnBridge::load(dir).expect("load corpus");
+        let id = Uuid::new_v4();
+        let ops = vec![(id, Some(vec![0.0, 0.0, 1.0, 0.0]))];
+        bridge
+            .apply_final_ops(ops.clone(), 2)
+            .expect("apply one new operation");
+        bridge.record_delta_batch(ops, 2, 1);
+        delta::write(dir, &bridge).expect("publish delta");
+        let delta_bytes = std::fs::metadata(dir.join(delta::HEAD_FILE)).unwrap().len()
+            + delta_chunk_files(dir)
+                .into_iter()
+                .map(|path| std::fs::metadata(path).unwrap().len())
+                .sum::<u64>();
+        (base_bytes, delta_bytes)
+    }
+    let (small_base, small_delta) = one_checkpoint(2);
+    let (large_base, large_delta) = one_checkpoint(200);
+    assert!(
+        large_base > small_base * 10,
+        "the fixture must materially enlarge the base segment"
+    );
+    assert_eq!(
+        large_delta, small_delta,
+        "a 100x corpus with one new op must write the same delta bytes"
+    );
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn non_owner_adopts_published_delta_without_build_or_publication() {
+    const MODEL: &str = "ann-delta-non-owner-adoption-model";
+    let (rt, token, host, key, _) = seeded(MODEL).await;
+    let mut final_note = None;
+    for i in 0..4 {
+        let text = format!("published delta note {i}");
+        let id = write_note(&rt, &token, &text).await;
+        bump_generation(&host, &key).await;
+        warm_with_event(&rt, &token, &host, MODEL).await;
+        final_note = Some((id, text));
+    }
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    let head = std::fs::read(dir.join(delta::HEAD_FILE)).expect("published delta HEAD");
+    let metadata = commit_record(&rt, MODEL);
+    let chunks = delta_chunk_files(&dir).len();
+
+    let client = new_shared_for_role(false);
+    let (status, event) = warm_with_event(&rt, &token, &client, MODEL).await;
+    assert!(matches!(status, AnnEnsureStatus::LoadedSnapshot));
+    assert_eq!(event["path"], "segment_load");
+    assert_eq!(client.segment_load_count.load(Ordering::SeqCst), 1);
+    assert_eq!(client.publication_count.load(Ordering::SeqCst), 0);
+    let (id, text) = final_note.expect("fourth note");
+    assert_recalled(&rt, &client, &key, MODEL, id, &text).await;
+    assert_eq!(std::fs::read(dir.join(delta::HEAD_FILE)).unwrap(), head);
+    assert_eq!(commit_record(&rt, MODEL), metadata);
+    assert_eq!(delta_chunk_files(&dir).len(), chunks);
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn stale_tail_publication_recounts_write_between_branch_and_replay() {
+    const MODEL: &str = "ann-stale-tail-branch-race-model";
+    let (rt, token, _seed_host, key, _) = seeded(MODEL).await;
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    let base_seq = read_commit_info(&dir)
+        .expect("read base commit")
+        .expect("base commit")
+        .last_applied_seq
+        .expect("base watermark");
+    let base_digest = segment_commit_digest(&dir)
+        .expect("read base identity")
+        .expect("base identity");
+    let first = write_note(&rt, &token, "first branch-tail write").await;
+
+    let adopter = new_shared();
+    adopter
+        .stale_tail_scope_barrier
+        .store(true, Ordering::SeqCst);
+    let paused = adopter.stale_tail_scope_notify.notified();
+    let task_rt = rt.clone();
+    let task_ann = adopter.clone();
+    let task_dir = dir.clone();
+    let task = tokio::spawn(async move {
+        let mut details = AnnWarmDetails::default();
+        classify_and_adopt_segment(
+            &task_rt,
+            &task_ann,
+            &key,
+            MODEL,
+            &task_dir,
+            0,
+            0,
+            &mut details,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), paused)
+        .await
+        .expect("classifier must pause after branch count");
+    let second = write_note(&rt, &token, "write between count and replay").await;
+    adopter.stale_tail_scope_release.notify_one();
+
+    assert!(matches!(
+        task.await.expect("adopter task"),
+        SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot)
+    ));
+    let (_, raw_count) = delta::read_info(&dir, &base_digest, base_seq)
+        .expect("read delta HEAD")
+        .expect("HEAD exists");
+    assert_eq!(raw_count, 2, "the replay snapshot must count both writes");
+    let published = AnnBridge::load(&dir).expect("replay published delta");
+    assert!(published.id_map.contains(&first));
+    assert!(published.id_map.contains(&second));
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn stale_tail_publication_counts_only_ops_in_its_protected_snapshot() {
+    const MODEL: &str = "ann-stale-tail-one-snapshot-model";
+    let (rt, token, _seed_host, key, _) = seeded(MODEL).await;
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    let base_info = read_commit_info(&dir)
+        .expect("read base commit")
+        .expect("base commit exists");
+    let base_seq = base_info.last_applied_seq.expect("base watermark");
+    let base_digest = segment_commit_digest(&dir)
+        .expect("read base identity")
+        .expect("base identity exists");
+    let first = write_note(&rt, &token, "first stale-tail write").await;
+
+    let adopter = new_shared();
+    adopter.protected_tail_barrier.store(true, Ordering::SeqCst);
+    let paused = adopter.protected_tail_notify.notified();
+    let task_rt = rt.clone();
+    let task_ann = adopter.clone();
+    let task_key = key.clone();
+    let task_dir = dir.clone();
+    let task = tokio::spawn(async move {
+        let mut details = AnnWarmDetails::default();
+        classify_and_adopt_segment(
+            &task_rt,
+            &task_ann,
+            &task_key,
+            MODEL,
+            &task_dir,
+            0,
+            0,
+            &mut details,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), paused)
+        .await
+        .expect("stale-tail replay must reach the protected snapshot seam");
+    let later = write_note(&rt, &token, "write after the protected snapshot").await;
+    adopter.protected_tail_release.notify_one();
+
+    assert!(matches!(
+        task.await.expect("adopter task"),
+        SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot)
+    ));
+    let (published_seq, raw_count) = delta::read_info(&dir, &base_digest, base_seq)
+        .expect("read delta HEAD")
+        .expect("HEAD exists");
+    assert_eq!(
+        raw_count, 1,
+        "the HEAD counts the selected raw row, not the later write"
+    );
+    let published = AnnBridge::load(&dir).expect("replay published delta");
+    assert!(published.id_map.contains(&first));
+    assert!(!published.id_map.contains(&later));
+    assert!(tail_exists(&rt, MODEL, published_seq)
+        .await
+        .expect("later write remains in the SQL tail"));
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_delta_reader_rejects_linked_head() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("segment root");
+    let dir = temp.path().join("model");
+    std::fs::create_dir_all(&dir).expect("segment directory");
+    let mut base = AnnBridge::build(
+        vec![1.0, 0.0, 0.0, 0.0],
+        4,
+        vec![Uuid::new_v4()],
+        HashSet::new(),
+    )
+    .expect("build base");
+    base.set_applied_seq(1);
+    base.save_atomic(&dir).expect("persist base");
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, [0u8; 112]).expect("outside file");
+    symlink(&outside, dir.join(delta::HEAD_FILE)).expect("plant linked HEAD");
+    let reader = khive_vamana::AuxiliarySidecarReader::open(&dir).expect("pinned reader");
+    assert!(
+        reader.read_bounded(delta::HEAD_FILE, 112).is_err(),
+        "the pinned reader must reject the final symlink itself"
+    );
+    assert!(
+        AnnBridge::load(&dir).is_err(),
+        "a linked delta HEAD must be rejected before following it"
+    );
+}
+
+#[test]
+fn memory_delta_reader_rejects_oversized_head_and_chunk() {
+    let temp = tempfile::tempdir().expect("segment root");
+    let dir = temp.path();
+    let mut base = AnnBridge::build(
+        vec![1.0, 0.0, 0.0, 0.0],
+        4,
+        vec![Uuid::new_v4()],
+        HashSet::new(),
+    )
+    .expect("build base");
+    base.set_applied_seq(1);
+    base.save_atomic(dir).expect("persist base");
+    std::fs::write(dir.join(delta::HEAD_FILE), [0u8; 113]).expect("oversized HEAD");
+    let reader = khive_vamana::AuxiliarySidecarReader::open(dir).expect("pinned reader");
+    assert!(reader.read_bounded(delta::HEAD_FILE, 112).is_err());
+    assert!(
+        AnnBridge::load(dir).is_err(),
+        "HEAD must be size-capped before allocation"
+    );
+    std::fs::remove_file(dir.join(delta::HEAD_FILE)).expect("remove malformed HEAD");
+
+    let mut bridge = AnnBridge::load(dir).expect("reload base");
+    let ops = vec![(Uuid::new_v4(), Some(vec![0.0, 1.0, 0.0, 0.0]))];
+    bridge.apply_final_ops(ops.clone(), 2).expect("apply delta");
+    bridge.record_delta_batch(ops, 2, 1);
+    let published = delta::write(dir, &bridge).expect("publish delta");
+    let chunk = dir.join(format!("memory_delta-{}.bin", published.last_nonce));
+    let valid_len = std::fs::metadata(&chunk).expect("chunk size").len();
+    std::fs::write(&chunk, vec![0u8; valid_len as usize + 1]).expect("oversized chunk");
+    assert!(reader
+        .read_bounded(
+            &format!("memory_delta-{}.bin", published.last_nonce),
+            valid_len as usize,
+        )
+        .is_err());
+    assert!(
+        AnnBridge::load(dir).is_err(),
+        "chunk must be size-capped before allocation"
+    );
+}
+
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+async fn service_checkpoint_below_bound_appends_delta_and_keeps_base_files() {
+    const MODEL: &str = "ann-service-delta-checkpoint-model";
+    const BASE_FILES: [&str; 6] = [
+        "metadata.bin",
+        "vectors.bin",
+        "graph.bin",
+        "lifecycle.bin",
+        "codes.bin",
+        "external_ids.bin",
+    ];
+    let (rt, token, ann, key, _) = seeded(MODEL).await;
+    let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    let base: Vec<_> = BASE_FILES
+        .into_iter()
+        .map(|name| (name, std::fs::read(dir.join(name)).expect("base file")))
+        .collect();
+    assert!(
+        !dir.join(delta::HEAD_FILE).exists() && delta_chunk_files(&dir).is_empty(),
+        "a fresh build publishes no delta"
+    );
+    let publications = ann.publication_count.load(Ordering::SeqCst);
+
+    let mut last = None;
+    for i in 0..4 {
+        let text = format!("service delta checkpoint note {i}");
+        let id = write_note(&rt, &token, &text).await;
+        bump_generation(&ann, &key).await;
+        warm_with_event(&rt, &token, &ann, MODEL).await;
+        last = Some((id, text));
+    }
+
+    assert_eq!(
+        ann.publication_count.load(Ordering::SeqCst) - publications,
+        1,
+        "the fourth dirty operation publishes exactly once"
+    );
+    for (name, bytes) in &base {
+        assert_eq!(
+            std::fs::read(dir.join(name)).expect("base file after checkpoint"),
+            *bytes,
+            "a checkpoint below the compaction bound must not rewrite {name}"
+        );
+    }
+    assert!(
+        dir.join(delta::HEAD_FILE).exists(),
+        "the checkpoint must publish a delta HEAD"
+    );
+    assert_eq!(
+        delta_chunk_files(&dir).len(),
+        4,
+        "the checkpoint must append one delta chunk per warmed batch"
+    );
+
+    let restarted = new_shared_for_role(false);
+    let (status, _) = warm_with_event(&rt, &token, &restarted, MODEL).await;
+    assert!(matches!(status, AnnEnsureStatus::LoadedSnapshot));
+    let (id, text) = last.expect("last written note");
+    assert_recalled(&rt, &restarted, &key, MODEL, id, &text).await;
 }

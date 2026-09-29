@@ -27,6 +27,8 @@ mod incremental;
 use incremental::*;
 #[path = "ann/checkpoint_timer.rs"]
 mod checkpoint_timer;
+#[path = "ann/delta.rs"]
+mod delta;
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -65,6 +67,14 @@ pub(crate) struct AnnBridge {
     /// mapped file generation is still current (#2081). Owned builds have no
     /// publication identity until they are persisted and reopened.
     commit_digest: Option<[u8; 32]>,
+    /// The stable v2 commit remains unchanged while memory-owned delta
+    /// publications advance their own nonce and watermark beside it.
+    base_commit_digest: Option<[u8; 32]>,
+    base_applied_seq: u64,
+    base_ops: usize,
+    delta_batches: Vec<delta::DeltaBatch>,
+    delta_raw_ops: u64,
+    last_delta_nonce: Option<Uuid>,
     /// Indexed namespaces, used to skip unnecessary recall over-fetch retries.
     pub(crate) namespace_set: HashSet<String>,
     /// In-process write generation captured before this build's corpus scan.
@@ -229,6 +239,13 @@ pub(crate) struct AnnState {
     /// Releases the incremental-tail post-read pause.
     #[cfg(test)]
     pub(crate) protected_tail_release: tokio::sync::Notify,
+    /// Test seam between the classifier's branch count and protected replay.
+    #[cfg(test)]
+    pub(crate) stale_tail_scope_barrier: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) stale_tail_scope_notify: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) stale_tail_scope_release: tokio::sync::Notify,
     /// Arms the test-only pause in `fresh_tail_reresolve` between its
     /// segment load and its registry-minimum re-check.
     #[cfg(test)]
@@ -313,6 +330,12 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         protected_tail_notify: tokio::sync::Notify::new(),
         #[cfg(test)]
         protected_tail_release: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        stale_tail_scope_barrier: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        stale_tail_scope_notify: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        stale_tail_scope_release: tokio::sync::Notify::new(),
         #[cfg(test)]
         reresolve_race_barrier: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -548,6 +571,13 @@ impl AnnState {
             self.protected_tail_release.notified().await;
         }
     }
+
+    pub(crate) async fn pause_stale_tail_scope_for_test(&self) {
+        if self.stale_tail_scope_barrier.swap(false, Ordering::SeqCst) {
+            self.stale_tail_scope_notify.notify_one();
+            self.stale_tail_scope_release.notified().await;
+        }
+    }
 }
 
 // ── AnnBridge ─────────────────────────────────────────────────────────────────
@@ -591,6 +621,12 @@ impl AnnBridge {
             published_seq: 0,
             last_checkpoint: std::time::Instant::now(),
             commit_digest: None,
+            base_commit_digest: None,
+            base_applied_seq: 0,
+            base_ops: n,
+            delta_batches: Vec::new(),
+            delta_raw_ops: 0,
+            last_delta_nonce: None,
             namespace_set,
             generation: 0,
             epoch_baseline: 0,
@@ -652,6 +688,28 @@ impl AnnBridge {
         self.dirty_ops = 0;
         self.published_seq = self.index.last_applied_seq().unwrap_or(0);
         self.last_checkpoint = std::time::Instant::now();
+    }
+
+    fn record_delta_batch(
+        &mut self,
+        ops: Vec<(Uuid, Option<Vec<f32>>)>,
+        applied_seq: u64,
+        raw_count: u64,
+    ) {
+        if raw_count == 0 {
+            return;
+        }
+        self.delta_batches.push(delta::DeltaBatch {
+            applied_seq,
+            raw_count,
+            ops,
+        });
+        self.delta_raw_ops = self.delta_raw_ops.saturating_add(raw_count);
+    }
+
+    fn needs_full_compaction(&self) -> bool {
+        self.delta_batches.is_empty()
+            || self.delta_raw_ops >= delta::compaction_limit(self.base_ops)
     }
 
     fn rebuild_reverse_map(&mut self) {
@@ -797,7 +855,8 @@ impl AnnBridge {
             .ok_or_else(|| {
                 "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
             })?;
-        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())
+        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())?;
+        delta::clear(dir)
     }
 
     /// Load a bridge from a segment directory written by `save_atomic`. Any
@@ -829,23 +888,46 @@ impl AnnBridge {
                 index.num_vectors()
             ));
         }
-        let published_seq = index.last_applied_seq().unwrap_or(0);
-        Ok(Self {
+        let base_applied_seq = index.last_applied_seq().unwrap_or(0);
+        let base_ops = index.num_vectors();
+        let mut bridge = Self {
             index,
             id_map,
             reverse_map: None,
             #[cfg(test)]
             reverse_map_builds: 0,
             dirty_ops: 0,
-            published_seq,
+            published_seq: base_applied_seq,
             last_checkpoint: std::time::Instant::now(),
             commit_digest: Some(commit_digest),
+            base_commit_digest: Some(commit_digest),
+            base_applied_seq,
+            base_ops,
+            delta_batches: Vec::new(),
+            delta_raw_ops: 0,
+            last_delta_nonce: None,
             namespace_set: HashSet::new(),
             generation: 0,
             epoch_baseline: 0,
             #[cfg(test)]
             drop_probe: None,
-        })
+        };
+        if let Some(overlay) = delta::read(
+            dir,
+            &commit_digest,
+            base_applied_seq,
+            bridge.index.dimensions(),
+            base_ops,
+        )? {
+            for batch in &overlay.batches {
+                bridge.apply_final_ops(batch.ops.clone(), batch.applied_seq)?;
+            }
+            bridge.published_seq = overlay.applied_seq;
+            bridge.commit_digest = Some(overlay.identity);
+            bridge.delta_raw_ops = overlay.raw_count;
+            bridge.last_delta_nonce = Some(overlay.last_nonce);
+        }
+        Ok(bridge)
     }
 
     /// Populate `namespace_set` from an already-queried set of namespace strings.
@@ -1252,7 +1334,7 @@ async fn refresh_rotated_segments_in_root(ann_root: &std::path::Path, ann: &Shar
 
     for (key, expected) in installed {
         let dir = ann_segment_dir_from_root(ann_root, &key.model);
-        match segment_commit_digest(&dir) {
+        match delta::publication_digest(&dir) {
             Ok(Some(observed)) if observed != expected => {
                 refresh_rotated_segment(ann, &key, expected, dir).await;
             }
@@ -1318,7 +1400,7 @@ async fn refresh_rotated_segment(
         }
     };
 
-    let observed = match segment_commit_digest(&dir) {
+    let observed = match delta::publication_digest(&dir) {
         Ok(Some(digest)) if digest != incumbent_digest => digest,
         Ok(_) => return,
         Err(error) => {
@@ -3115,8 +3197,13 @@ pub(crate) async fn fresh_tail_serving(
             // decides whether re-resolution is possible before this
             // snapshot's floor fallback is needed.
             let resolved_new_s = ann_segment_dir(rt, model)
-                .and_then(|dir| read_commit_info(&dir).ok().flatten())
-                .and_then(|info| info.last_applied_seq)
+                .and_then(|dir| {
+                    read_commit_info(&dir).ok().flatten().and_then(|info| {
+                        info.last_applied_seq
+                            .and_then(|base_seq| effective_persisted_state(&dir, base_seq).ok())
+                            .map(|(seq, _)| seq)
+                    })
+                })
                 .filter(|new_s| *new_s >= m);
             return match resolved_new_s {
                 Some(new_s) => {
@@ -3475,6 +3562,11 @@ struct CheckpointPublication {
     authority: WatermarkAuthority,
 }
 
+enum CheckpointResult {
+    Full(Option<Box<AnnBridge>>),
+    Delta(delta::DeltaPublication),
+}
+
 /// Persist `bridge`, raise the wildcard registry row, compact the log, then
 /// reopen the just-written segment via mmap and swap it in for the Owned
 /// build product (ADR-079 Amendment 1 §B; see `docs/ann.md`). A failed
@@ -3523,11 +3615,19 @@ async fn checkpoint_raise_compact_readopt(
     };
 
     match persist_file_checkpoint(rt, ann, model, &dir, &bridge, authority).await {
-        Ok(reopened) => {
-            let mut replacement = reopened.unwrap_or(bridge);
+        Ok(CheckpointResult::Full(reopened)) => {
+            let mut replacement = reopened.map_or(bridge, |reopened| *reopened);
             replacement.mark_checkpointed();
             replacement.set_namespace_set(namespace_set);
             install_replacing(ann, key, stamp(replacement)).await
+        }
+        Ok(CheckpointResult::Delta(publication)) => {
+            bridge.commit_digest = Some(publication.identity);
+            bridge.last_delta_nonce = Some(publication.last_nonce);
+            bridge.delta_batches.clear();
+            bridge.mark_checkpointed();
+            bridge.set_namespace_set(namespace_set);
+            install_replacing(ann, key, stamp(bridge)).await
         }
         Err(unprotected) => {
             if unprotected {
@@ -3548,7 +3648,7 @@ async fn persist_file_checkpoint(
     dir: &std::path::Path,
     bridge: &AnnBridge,
     authority: WatermarkAuthority,
-) -> Result<Option<AnnBridge>, bool> {
+) -> Result<CheckpointResult, bool> {
     let applied = bridge.index.last_applied_seq().unwrap_or(0);
     // Every process writing this model's segment takes the same filesystem
     // lock. Revalidate the durable row only after acquiring it: otherwise a
@@ -3593,14 +3693,43 @@ async fn persist_file_checkpoint(
         return Err(false);
     }
 
-    if let Err(e) = bridge.save_atomic(dir) {
-        tracing::error!(error = %e, "failed to persist memory v2 Vamana segment");
-        // An ordinary active rebuild still has a registry-protected incumbent
-        // and a retained tail. Preserve that stale fallback until a complete
-        // replacement commits; pending/closed paths already evicted before
-        // entering the scan and therefore have nothing unsafe to retain.
-        return Err(false);
+    // A peer may have published a different overlay at the same SQL watermark.
+    // The registry alone cannot distinguish that case: preserve the exact
+    // segment + delta identity this candidate was built from.
+    if let Some(expected) = bridge.commit_digest {
+        match delta::publication_digest(dir) {
+            Ok(Some(observed)) if observed == expected => {}
+            Ok(observed) => {
+                tracing::info!(
+                    model,
+                    ?observed,
+                    "memory ANN checkpoint base changed before publication"
+                );
+                return Err(false);
+            }
+            Err(error) => {
+                tracing::warn!(%error, model, "memory ANN checkpoint identity read failed");
+                return Err(false);
+            }
+        }
     }
+
+    let persisted = if bridge.needs_full_compaction() {
+        bridge.save_atomic(dir).map(|()| None)
+    } else {
+        delta::write(dir, bridge).map(Some)
+    };
+    let delta_publication = match persisted {
+        Ok(publication) => publication,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist memory ANN checkpoint");
+            // An ordinary active rebuild still has a registry-protected incumbent
+            // and a retained tail. Preserve that stale fallback until a complete
+            // replacement commits; pending/closed paths already evicted before
+            // entering the scan and therefore have nothing unsafe to retain.
+            return Err(false);
+        }
+    };
     #[cfg(test)]
     ann.publication_count.fetch_add(1, Ordering::SeqCst);
     if let Err(e) = raise_watermark_with_authority(rt, model, applied, authority).await {
@@ -3614,12 +3743,15 @@ async fn persist_file_checkpoint(
     if let Err(e) = compact_log(rt, model).await {
         tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
     }
-    match load_segment(ann, dir) {
-        Ok(mmap_bridge) => Ok(Some(mmap_bridge)),
-        Err(e) => {
-            tracing::warn!(error = %e, "memory ann mmap re-adoption failed; serving Owned build");
-            Ok(None)
-        }
+    match delta_publication {
+        Some(publication) => Ok(CheckpointResult::Delta(publication)),
+        None => match load_segment(ann, dir) {
+            Ok(mmap_bridge) => Ok(CheckpointResult::Full(Some(Box::new(mmap_bridge)))),
+            Err(e) => {
+                tracing::warn!(error = %e, "memory ann mmap re-adoption failed; serving Owned build");
+                Ok(CheckpointResult::Full(None))
+            }
+        },
     }
 }
 
@@ -3632,6 +3764,12 @@ enum SegmentOutcome {
     Empty,
     /// No trustworthy segment: fall through to the rebuild path.
     Cold,
+}
+
+fn effective_persisted_state(dir: &std::path::Path, base_seq: u64) -> Result<(u64, u64), String> {
+    let base_digest = segment_commit_digest(dir)?
+        .ok_or_else(|| "memory ANN segment commit vanished".to_string())?;
+    Ok(delta::read_info(dir, &base_digest, base_seq)?.unwrap_or((base_seq, 0)))
 }
 
 /// ADR-079 Amendment 1 restart classifier: the 8-rule first-match decision
@@ -3660,10 +3798,17 @@ async fn classify_and_adopt_segment(
     };
 
     // Rule 2: readable but pre-amendment (no watermark) → Cold.
-    let Some(s) = info.last_applied_seq else {
+    let Some(base_seq) = info.last_applied_seq else {
         tracing::info!(model = %model,
             "pre-amendment memory v2 segment (no watermark); Cold rebuild");
         return SegmentOutcome::Cold;
+    };
+    let (s, persisted_delta_ops) = match effective_persisted_state(seg_dir, base_seq) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, model, "memory delta commit is invalid; Cold rebuild");
+            return SegmentOutcome::Cold;
+        }
     };
 
     // Rule 3: configured embedder dimensions ≠ segment dimensions → Cold.
@@ -3735,6 +3880,8 @@ async fn classify_and_adopt_segment(
             return SegmentOutcome::Cold;
         }
     };
+    #[cfg(test)]
+    ann.pause_stale_tail_scope_for_test().await;
 
     // Rule 5: zero live corpus → Empty, regardless of tail contents.
     if live == 0 {
@@ -3744,7 +3891,9 @@ async fn classify_and_adopt_segment(
     // Rule 7: tail within threshold → Stale-tail: mmap load + final-state
     // replay, then checkpoint so the next restart's tail starts empty and the
     // served bridge returns to mmap backing.
-    let threshold = (ann_rebuild_threshold() * live as f64).ceil() as u64;
+    let threshold =
+        delta::compaction_limit(usize::try_from(info.vector_count).unwrap_or(usize::MAX))
+            .saturating_sub(persisted_delta_ops);
     if tail <= threshold {
         let mut bridge = match load_segment(ann, seg_dir) {
             Ok(b) => b,
@@ -3754,22 +3903,34 @@ async fn classify_and_adopt_segment(
                 return SegmentOutcome::Cold;
             }
         };
-        let (ops, new_s) = match fetch_final_tail(rt, model, s, None).await {
-            Ok(t) => t,
+        // The earlier scope count selected this branch, but writes can land
+        // before replay. Read the actual operations, raw count, and terminal
+        // watermark together so the published chunk describes one snapshot.
+        let IncrementalTail {
+            ops,
+            applied: new_s,
+            raw_count,
+        } = match protected_tail(rt, ann, model, s, threshold).await {
+            Ok(Some(tail)) => tail,
+            Ok(None) => {
+                tracing::info!(model, "memory tail grew past replay cap; Cold rebuild");
+                return SegmentOutcome::Cold;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "memory tail replay read failed; Cold rebuild");
                 return SegmentOutcome::Cold;
             }
         };
         details.ops_applied = ops.len() as u64;
+        let recorded_ops = ops.clone();
         if let Err(e) = bridge.apply_final_ops(ops, new_s) {
             tracing::warn!(error = %e, "memory tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
-        // Replay is cheap and in memory; the checkpoint that follows it is a full
-        // segment publication. A process that is not the warm index host serves the
-        // replayed bridge and publishes nothing, so a client warming after a write
-        // does not rewrite the segment for every other reader on the root.
+        bridge.record_delta_batch(recorded_ops, new_s, raw_count);
+        // Replay is cheap and in memory; the checkpoint publishes a delta
+        // below the compaction bound. A non-owner serves the replayed bridge
+        // without publication, so another client does not rewrite the segment.
         if !ann.builds_corpus_indexes {
             details.path = "stale_tail_replay";
             install_replacing(
@@ -3785,9 +3946,12 @@ async fn classify_and_adopt_segment(
             return SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot);
         }
         details.path = "stale_tail_publication";
-        if let Err(error) = bridge.consolidate_if_needed(checkpoint_policy(ann).consolidate_tau) {
-            tracing::warn!(%error, "memory ANN consolidation failed before replay publication");
-            return SegmentOutcome::Cold;
+        if bridge.needs_full_compaction() {
+            if let Err(error) = bridge.consolidate_if_needed(checkpoint_policy(ann).consolidate_tau)
+            {
+                tracing::warn!(%error, "memory ANN consolidation failed before replay publication");
+                return SegmentOutcome::Cold;
+            }
         }
         let installed = checkpoint_raise_compact_readopt(
             rt,
@@ -4547,8 +4711,8 @@ mod tests {
         );
     }
 
-    /// The Stale-tail path replays in memory and then checkpoints, and the
-    /// checkpoint is a full segment publication. A process without corpus-build
+    /// The Stale-tail path replays in memory and then checkpoints the delta.
+    /// A process without corpus-build
     /// authority must serve the replayed bridge and publish nothing, or every
     /// client warming after any write republishes the segment. The search for
     /// the tail note is the witness that the replay path ran rather than a Hot
@@ -4643,10 +4807,14 @@ mod tests {
             matches!(status, AnnEnsureStatus::LoadedSnapshot),
             "control: the host adopts the same segment, got {status:?}"
         );
-        assert_ne!(
+        assert_eq!(
             std::fs::read(&metadata).expect("metadata.bin after host warm"),
             before_metadata,
-            "control: the host checkpoints after replay, so metadata.bin must change"
+            "the host checkpoint must preserve the base segment nonce"
+        );
+        assert!(
+            seg_dir.join(delta::HEAD_FILE).exists(),
+            "the host must publish a delta HEAD after replay"
         );
     }
 

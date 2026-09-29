@@ -110,9 +110,9 @@ pub(super) enum InstalledMaintenance {
 }
 
 pub(super) struct IncrementalTail {
-    ops: Vec<(Uuid, Option<Vec<f32>>)>,
-    applied: u64,
-    raw_count: u64,
+    pub(super) ops: Vec<(Uuid, Option<Vec<f32>>)>,
+    pub(super) applied: u64,
+    pub(super) raw_count: u64,
 }
 
 /// Read the delta and its raw row count under the same registry-protected snapshot.
@@ -149,16 +149,17 @@ pub(super) async fn maintain_installed(
     epoch: u64,
     details: &mut AnnWarmDetails,
 ) -> Result<InstalledMaintenance, RuntimeError> {
-    let Some((applied, live)) = ann.indexes.read().await.get(key).map(|b| {
+    let Some((applied, base_ops, delta_raw_ops)) = ann.indexes.read().await.get(key).map(|b| {
         (
             b.index.last_applied_seq().unwrap_or(0),
-            b.index.live_count(),
+            b.base_ops,
+            b.delta_raw_ops,
         )
     }) else {
         return Ok(InstalledMaintenance::Absent);
     };
     let policy = checkpoint_policy(ann);
-    let max_delta = (policy.rebuild_fraction * live as f64).ceil() as u64;
+    let max_delta = delta::compaction_limit(base_ops).saturating_sub(delta_raw_ops);
     let IncrementalTail {
         ops,
         applied: new_s,
@@ -185,11 +186,13 @@ pub(super) async fn maintain_installed(
             return Ok(InstalledMaintenance::Absent);
         }
         if raw_count > 0 {
+            let recorded_ops = ops.clone();
             if let Err(error) = bridge.apply_final_ops(ops, new_s) {
                 tracing::warn!(%error, model, "memory ANN incremental apply failed; rebuilding");
                 indexes.remove(key);
                 return Ok(InstalledMaintenance::Rebuild);
             }
+            bridge.record_delta_batch(recorded_ops, new_s, raw_count);
         }
         bridge.generation = generation;
         bridge.dirty_ops = bridge.dirty_ops.saturating_add(raw_count);
@@ -198,7 +201,7 @@ pub(super) async fn maintain_installed(
             bridge.namespace_set.clear();
         }
         let publish = policy.due(bridge);
-        if publish {
+        if publish && bridge.needs_full_compaction() {
             bridge
                 .consolidate_if_needed(policy.consolidate_tau)
                 .map_err(RuntimeError::Internal)?;
@@ -220,13 +223,21 @@ pub(super) async fn maintain_installed(
             persist_file_checkpoint(rt, ann, model, &dir, bridge, WatermarkAuthority::Active).await;
         drop(indexes);
         match publication {
-            Ok(Some(mut reopened)) => {
+            Ok(CheckpointResult::Full(Some(mut reopened))) => {
                 reopened.generation = generation;
                 reopened.epoch_baseline = epoch;
-                install_replacing(ann, key, reopened).await;
+                install_replacing(ann, key, *reopened).await;
             }
-            Ok(None) => {
+            Ok(CheckpointResult::Full(None)) => {
                 if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                    bridge.mark_checkpointed();
+                }
+            }
+            Ok(CheckpointResult::Delta(publication)) => {
+                if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                    bridge.commit_digest = Some(publication.identity);
+                    bridge.last_delta_nonce = Some(publication.last_nonce);
+                    bridge.delta_batches.clear();
                     bridge.mark_checkpointed();
                 }
             }

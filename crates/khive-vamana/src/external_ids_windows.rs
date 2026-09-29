@@ -79,6 +79,25 @@ pub(crate) fn open_checkpoint_lock(dir: &std::fs::File) -> std::io::Result<std::
     Ok(file)
 }
 
+pub(crate) fn open_checkpoint_read_file(
+    dir: &std::fs::File,
+    name: &str,
+) -> std::io::Result<Option<std::fs::File>> {
+    let file = match open_relative(
+        dir,
+        name,
+        GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    verify_handle_kind(&file, false, "inspect opened checkpoint sidecar")
+        .map_err(std::io::Error::other)?;
+    Ok(Some(file))
+}
+
 pub(crate) fn stage_checkpoint_file(
     dir: &std::fs::File,
     name: &str,
@@ -116,6 +135,10 @@ pub(crate) fn rename_checkpoint_file(
     )
     .map_err(std::io::Error::other)?;
     rename_relative(&file, dir, to)
+}
+
+pub(crate) fn remove_checkpoint_file(dir: &std::fs::File, name: &str) -> std::io::Result<()> {
+    remove_relative_if_exists(dir, name, "remove checkpoint sidecar").map_err(std::io::Error::other)
 }
 
 fn write_via_dir_handle_with(
