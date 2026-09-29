@@ -1180,9 +1180,6 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
       const parsed = parseReviewInput(JSON.parse(await file.text()));
       if (isReviewReport(parsed)) {
         setCoreReport(parsed);
-        setActivityDraft("");
-        setLocalNotes([]);
-        setDecision("pending");
         showToast({ tone: "success", message: "Loaded a read-only khive CLI review report." });
         return;
       }

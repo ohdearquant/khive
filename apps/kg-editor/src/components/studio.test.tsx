@@ -37,6 +37,40 @@ const zeroPageCases = [
   },
 ] as const;
 
+function cliReviewReport(): ReviewReport {
+  const operation = {
+    ...demoReviewFixture.change_set.operations[0],
+    after: { kind: "entity", entity_kind: "concept", name: "Canonical concept" },
+  };
+  return {
+    schema_version: "khive.review.v1",
+    review_kind: "changeset",
+    capability: {
+      source: "cli",
+      mutability: "read_only",
+      no_writes: true,
+      git_reads: false,
+      khive_reads: true,
+      github_writes: false,
+      wasm: false,
+      persistence: false,
+      unavailable_actions: ["apply", "commit", "push", "publish", "persist_review"],
+    },
+    change_set: { envelope: demoReviewFixture.change_set.envelope, operations: [operation] },
+    tier_summary: {
+      ...demoReviewFixture.tier_summary,
+      operations: 1,
+      tier_1: 1,
+      tier_2: 0,
+      highest_tier: "tier_1",
+      requires_independent_review: false,
+    },
+    validation: demoReviewFixture.validation,
+    findings: [],
+    review_gate: demoReviewFixture.review_gate,
+  };
+}
+
 describe("KG Studio", () => {
   it("makes the no-write and unavailable capability boundary visible", () => {
     render(<Studio initialBundle={demoReviewFixture} />);
@@ -168,37 +202,7 @@ describe("KG Studio", () => {
 
   it("uses explicit entity_kind in core review operation lists", async () => {
     const user = userEvent.setup();
-    const operation = {
-      ...demoReviewFixture.change_set.operations[0],
-      after: { kind: "entity", entity_kind: "concept", name: "Canonical concept" },
-    };
-    const report: ReviewReport = {
-      schema_version: "khive.review.v1",
-      review_kind: "changeset",
-      capability: {
-        source: "cli",
-        mutability: "read_only",
-        no_writes: true,
-        git_reads: false,
-        khive_reads: true,
-        github_writes: false,
-        wasm: false,
-        persistence: false,
-        unavailable_actions: ["apply", "commit", "push", "publish", "persist_review"],
-      },
-      change_set: { envelope: demoReviewFixture.change_set.envelope, operations: [operation] },
-      tier_summary: {
-        ...demoReviewFixture.tier_summary,
-        operations: 1,
-        tier_1: 1,
-        tier_2: 0,
-        highest_tier: "tier_1",
-        requires_independent_review: false,
-      },
-      validation: demoReviewFixture.validation,
-      findings: [],
-      review_gate: demoReviewFixture.review_gate,
-    };
+    const report = cliReviewReport();
     const serialized = JSON.stringify(report);
     const imported = new File([serialized], "core-review.json", { type: "application/json" });
     Object.defineProperty(imported, "text", { value: () => Promise.resolve(serialized) });
@@ -208,6 +212,30 @@ describe("KG Studio", () => {
 
     expect(await screen.findByRole("heading", { name: "Attributed change-set review" })).toBeVisible();
     expect(container.querySelector('.core-operation-list [data-kind="concept"]')).toHaveTextContent("Concept");
+  });
+
+  it("keeps the underlying review decision, notes, and draft after a CLI report import", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
+
+    await user.click(screen.getByRole("button", { name: "Request changes" }));
+    expect(screen.getByText(/Local decision: changes requested/i)).toBeVisible();
+    await user.click(screen.getAllByRole("button", { name: /^Activity/i })[0]);
+    const comment = screen.getByRole("textbox", { name: "Review comment" });
+    await user.type(comment, "Keep this note");
+    await user.click(screen.getByRole("button", { name: "Add local note" }));
+    await user.type(comment, "Unsent draft");
+
+    const serialized = JSON.stringify(cliReviewReport());
+    const imported = new File([serialized], "core-review.json", { type: "application/json" });
+    Object.defineProperty(imported, "text", { value: () => Promise.resolve(serialized) });
+    await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, imported);
+    expect(await screen.findByRole("heading", { name: "Attributed change-set review" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Use demo review bundle" }));
+    expect(screen.getByText(/Local decision: changes requested/i)).toBeVisible();
+    expect(screen.getByText("Keep this note")).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Review comment" })).toHaveValue("Unsent draft");
   });
 
   it("refuses same-family approval and records no approval state", async () => {
