@@ -35,6 +35,11 @@ base relation, `links_to` (Structure category, state-like coherence class), and 
 endpoint pair, `Document links_to Document`, expanding the closed set from 17 → 18. The web's
 hyperlink is a first-class relation because no existing relation expresses it without a false
 claim — see ADR-191 D2 for the rationale and the ADR-076 certificate disposition.
+**Amended by [ADR-196](ADR-196-located-in-relation.md)**: adds one new base relation,
+`located_in` (Structure category, order-like coherence class, no cascade), and one base endpoint
+pair, `Concept located_in Concept`, expanding the closed set from 18 → 19. Location — a finding
+in an organ, a device in a region — is neither constitution nor reference, and no existing
+relation expresses it without a false claim.
 
 ## Context
 
@@ -56,21 +61,24 @@ classification ambiguity.
 
 ## Decision
 
-**18 canonical relations, grouped into 9 categories. No others.**
+**19 canonical relations, grouped into 9 categories. No others.**
 
 > **Amended 2026-06-14 ([ADR-055](ADR-055-epistemic-edge-relations.md))**: added Category 9
 > (Epistemic / Evidential) with `supports` and `refutes`, expanding the closed set from 15 → 17.
 > **Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: added `links_to`
 > to Category 1 (Structure), expanding the closed set from 17 → 18.
+> **Amended ([ADR-196](ADR-196-located-in-relation.md))**: added `located_in` to Category 1
+> (Structure), expanding the closed set from 18 → 19.
 
 ### Category 1: Structure (composition, classification, and reference)
 
-| Relation      | Direction          | When                                                        |
-| ------------- | ------------------ | ----------------------------------------------------------- |
-| `contains`    | parent → child     | Crate contains module, system contains component            |
-| `part_of`     | child → parent     | Member/constitution; distinct from `contains`               |
-| `instance_of` | specific → general | One is a case of the other (GPT-4 → Transformer)            |
-| `links_to`    | source → target    | Hyperlink: a document references another document (ADR-191) |
+| Relation      | Direction          | When                                                            |
+| ------------- | ------------------ | --------------------------------------------------------------- |
+| `contains`    | parent → child     | Crate contains module, system contains component                |
+| `part_of`     | child → parent     | Member/constitution; distinct from `contains`                   |
+| `instance_of` | specific → general | One is a case of the other (GPT-4 → Transformer)                |
+| `links_to`    | source → target    | Hyperlink: a document references another document (ADR-191)     |
+| `located_in`  | located → location | Location: a finding in an organ, a device in a region (ADR-196) |
 
 ### Category 2: Derivation (intellectual lineage)
 
@@ -237,10 +245,10 @@ non-symmetric — is legal at the storage layer for every relation. Three reason
 semantically coherent. For curation and validation-pipeline use (advisory — never
 write-time enforcement):
 
-| Class                                   | Relations                                                                                                                              | Reciprocal pair means                                                                                                                                                                                          |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                         |
-| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`                                                                             | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other). Not findings (ADR-191). |
+| Class                                   | Relations                                                                                                                                            | Reciprocal pair means                                                                                                                                                                                          |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements`, `located_in` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                         |
+| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`                                                                                           | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other). Not findings (ADR-191). |
 
 `annotates` is note-sourced, so it cannot form an entity-endpoint reciprocal pair and
 sits outside the entity census below. Note→note reciprocal `annotates` pairs (note A
@@ -401,6 +409,7 @@ allowlist but cannot remove base rules.
 | any entity | `instance_of` | `Concept`  |
 | `Service`  | `instance_of` | `Project`  |
 | `Document` | `links_to`    | `Document` |
+| `Concept`  | `located_in`  | `Concept`  |
 
 > **Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: added
 > `Document links_to Document` for the web's hyperlink. Deliberately one row: a link's target is
@@ -408,6 +417,11 @@ allowlist but cannot remove base rules.
 > that hosts it — `Document links_to Service` and `Service links_to Document` are both out (see
 > ADR-191 D2/F10 for the reasoning). No qualifier inference: unlike `depends_on`, `links_to`
 > carries no governed metadata and the runtime does not infer one for it.
+
+> **Amended ([ADR-196](ADR-196-located-in-relation.md))**: added `Concept located_in Concept`
+> for location. Deliberately one row: rows for other base kinds are left to the first pack that
+> emits them, through the additive `EDGE_RULES` mechanism, and a domain pack narrows the meaning
+> with typed endpoint rules for its own subtypes.
 
 #### Derivation relations
 
@@ -657,6 +671,7 @@ For provenance/lineage-sensitive relations, hard-delete cascade emits a warning 
 | `precedes`             | cascade edge; emit temporal-sequence-loss warning   |
 | `supports` / `refutes` | cascade edge; emit evidential-link-loss warning     |
 | `annotates`            | cascade as documented                               |
+| `located_in`           | cascade normally                                    |
 | others                 | cascade normally                                    |
 
 Warnings use the existing `audit` event kind and target the hard-deleted record. The runtime
@@ -706,6 +721,16 @@ The third expansion (→ 18, [ADR-191](ADR-191-web-pack-ontology-and-operations.
   that is simply wrong for an ordinary hyperlink. See [ADR-191](ADR-191-web-pack-ontology-and-operations.md)
   D2 for the full analysis, including why a second `mentions` label was considered and rejected.
 
+The fourth expansion (→ 19, [ADR-196](ADR-196-located-in-relation.md)) adds `located_in` to the
+**Structure** category:
+
+- **Location queries** ("which conditions affect this organ", "what is located in this region")
+  need `located_in`. `part_of` asserts constitution and `contains` asserts composition, so either
+  one places a disorder or a device inside the composition tree of the structure that hosts it.
+  `links_to` is a document reference. A property is invisible to `neighbors`, traversal and
+  export. See [ADR-196](ADR-196-located-in-relation.md) for the analysis and the ADR-076
+  certificate.
+
 ### How is the closed set calculable and auditable?
 
 [ADR-076](ADR-076-relation-calculability-and-system-role.md) records why there is no
@@ -728,10 +753,12 @@ The audit disposition for the current set is:
   keeps both as top-level relations under an explicit system-role exception so polarity remains
   visible to planners, indexes, federation, and the public API rather than residing in open
   metadata.
-- The live base-plus-KG-pack endpoint-signature audit finds only the ratified
-  `supports`/`refutes` collision. An identical signature is a signal to run Er analysis, not by
-  itself proof of redundancy; relations with the same legal endpoint kinds can still answer
-  different questions.
+- The live base-plus-KG-pack endpoint-signature audit finds the ratified `supports`/`refutes`
+  collision and, since [ADR-196](ADR-196-located-in-relation.md), one more: `extends` and
+  `located_in` both carry the single pair `Concept -> Concept`. The second is resolved by a
+  passing Er fixture in `located_in`'s certificate, not by the ratified list. An identical
+  signature is a signal to run Er analysis, not by itself proof of redundancy; relations with the
+  same legal endpoint kinds can still answer different questions.
 
 Accordingly, the audit does not replace the stored vocabulary with a smaller inferred generating
 set. The only demonstrated algebraic collapse is retained by a declared system role, and khive
@@ -852,7 +879,7 @@ pub enum EdgeCategory {
 
 pub enum EdgeRelation {
     // Structure
-    Contains, PartOf, InstanceOf, LinksTo,
+    Contains, PartOf, InstanceOf, LinksTo, LocatedIn,
     // Derivation
     Extends, VariantOf, IntroducedBy, Supersedes,
     // Provenance

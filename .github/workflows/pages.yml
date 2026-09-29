@@ -260,7 +260,7 @@ jobs:
             echo "# khive"
             echo
             echo "> A research knowledge graph runtime for AI agents: typed entities, a closed"
-            echo "> 17-relation edge ontology, hybrid FTS+vector search, and GQL/SPARQL queries,"
+            echo "> 19-relation edge ontology, hybrid FTS+vector search, and GQL/SPARQL queries,"
             echo "> all dispatched through one MCP tool (\`request\`). 140 verbs across 14 packs."
             echo
             echo "## Docs"

@@ -24,7 +24,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **140 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
-| **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
+| **Typed edges**             | 19 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
 | **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths                                 |
 | **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                                                   |
@@ -95,8 +95,8 @@ concept A, that concept C is a variant of concept A, or that concept D was super
 E last month. Cosine distance carries no direction and no type. It can't tell you what a
 relationship _is_, only that something is nearby.
 
-khive's graph carries both signals. Every edge is one of 17 closed relations across 9
-categories: structure (`contains`, `part_of`, `instance_of`), derivation (`extends`,
+khive's graph carries both signals. Every edge is one of 19 closed relations across 9
+categories: structure (`contains`, `part_of`, `instance_of`, `links_to`, `located_in`), derivation (`extends`,
 `variant_of`, `introduced_by`, `supersedes`), provenance (`derived_from`), temporal
 (`precedes`), dependency (`depends_on`, `enables`), implementation (`implements`), lateral
 (`competes_with`, `composed_with`), annotation (`annotates`), and epistemic (`supports`,
@@ -401,7 +401,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**Main after v0.7.0.** 140 verbs across 14 packs, 9 entity kinds, 17 edge relations, daemon warm startup
+**Main after v0.7.0.** 140 verbs across 14 packs, 9 entity kinds, 19 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
