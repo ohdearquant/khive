@@ -100,10 +100,13 @@ uses this form:
 multiple live project anchors resolve to the same repo identity; selected <id> by canonical resolution order; duplicate or conflicting anchors: <ids>
 ```
 
-If ingest fails after duplicate anchors have been identified, the handler
-emits that same sentence at WARN level, including the selected and duplicate
-anchor ids. It returns the original error unchanged, preserving its kind,
-message, and any typed storage retry semantics.
+If ingest fails after anchor resolution, the error keeps the original message,
+and its source and `refusal_source()` retain the typed storage or remote-fetch
+failure and its retry classification. Its `details.resolution` object names the
+selected `project_id`, `duplicate_anchor_ids`, `slug_backfilled`,
+`project_created`, `orphaned_project_id`, and `orphaned_note_count`. A duplicate
+anchor warning still emits the same sentence at WARN level, including the
+selected and duplicate anchor ids.
 
 Candidate queries use `created_at ASC, id ASC`; tier precedence, selection,
 and warning-id order are deterministic. An anchor id appears at most once in
