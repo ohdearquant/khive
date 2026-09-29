@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::stores::note::transport::{SenderAssurance, SenderEnvelope, SenderTransportStore};
 use crate::StorageBackend;
 use khive_storage::{DeleteMode, NoteStore};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -45,6 +46,56 @@ fn counts(backend: &StorageBackend) -> [i64; 4] {
             .unwrap()
     })
 }
+
+#[tokio::test]
+async fn non_khive_outbound_parent_classifies_inbound_message_as_reply() {
+    let (backend, mut input) = fixture();
+    let parent_logical_id = Uuid::new_v4();
+    let mut parent = Note::new("local", "message", "parent");
+    parent.properties = Some(serde_json::json!({
+        "direction": "outbound",
+        "from_actor": "lambda:receiver",
+        "to_actor": input.note.properties.as_ref().unwrap()["from_actor"]
+    }));
+    let outbound_note_id = parent.id;
+    SqlNoteStore::new(backend.pool_arc(), false)
+        .upsert_note(parent)
+        .await
+        .unwrap();
+    let envelope = SenderEnvelope {
+        namespace: "local".into(),
+        logical_message_id: parent_logical_id,
+        outbound_note_id,
+        kind: "email".into(),
+        slug: "test-route".into(),
+        credential_ref: "keys/test-route".into(),
+        recipient_address: format!("khive1:example/{}", input.sender_agent_id),
+        protocol_version: 1,
+        sender_agent_id: input.binding["recipient_agent_id"].as_str().unwrap().into(),
+        sender_assurance: SenderAssurance::Claimed,
+        recipient_agent_id: input.sender_agent_id.clone(),
+        recipient_device_id: Uuid::new_v4(),
+        recipient_key_epoch: 1,
+        contact_generation: 1,
+        sender_key_epoch: 1,
+        recipient_key_fingerprint: "ab".repeat(32),
+        enc: vec![1; 32],
+        ciphertext: vec![2],
+    };
+    SenderTransportStore::new(backend.pool_arc())
+        .create(envelope, false)
+        .await
+        .unwrap();
+    input.in_reply_to = Some(parent_logical_id);
+    let inbound = RecipientTransportStore::new(backend.pool_arc())
+        .commit(input)
+        .await
+        .unwrap()
+        .note
+        .unwrap();
+    assert_eq!(inbound.properties.unwrap()["message_kind"], "reply");
+}
+
 #[tokio::test]
 async fn sequential_and_concurrent_duplicates_write_one_note() {
     let (backend, first) = fixture();

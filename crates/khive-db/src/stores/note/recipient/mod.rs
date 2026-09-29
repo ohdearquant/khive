@@ -90,7 +90,7 @@ const REPLAY_SQL: &str = concat!(
 const OUTBOUND_PARENT_SQL: &str = concat!(
     "SELECT EXISTS(SELECT 1 FROM comm_sender_transport AS t JOIN notes AS n ",
     "ON n.id=t.outbound_note_id AND n.namespace=t.namespace WHERE ",
-    "t.namespace=?1 AND t.kind='khive' AND t.logical_message_id=?2 AND ",
+    "t.namespace=?1 AND t.logical_message_id=?2 AND ",
     "t.sender_agent_id=?3 AND t.recipient_agent_id=?4 AND ",
     "n.kind='message' AND n.deleted_at IS NULL AND ",
     "json_extract(n.properties,'$.direction')='outbound')",
