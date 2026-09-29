@@ -893,6 +893,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_queued_reservation_is_not_overtaken_by_a_later_small_one() {
+        let store = HydrationReadStore::immediate(b"x".to_vec());
+        let hydrator = BlobHydrator::new(
+            Arc::clone(&store) as Arc<dyn BlobStore>,
+            khive_storage::MAX_BLOB_WHOLE_BYTES,
+        )
+        .expect("minimum budget");
+        let content_ref = ContentRef::from_hex("a".repeat(64)).expect("fixture digest");
+        let first = hydrator
+            .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES - 1)
+            .await
+            .expect("first verified buffer holds all but one permit");
+        assert_eq!(hydrator.admission.available_permits(), 1);
+        assert_eq!(store.calls(), 1);
+
+        let mut large =
+            Box::pin(hydrator.hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES));
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(large.as_mut(), cx).is_pending(),
+                "large reservation must wait behind the retained buffer"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        let mut small = Box::pin(hydrator.hydrate_verified(&content_ref, 1));
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(small.as_mut(), cx).is_pending(),
+                "later one-byte reservation must not overtake the queued large request"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut small)
+                .await
+                .is_err(),
+            "small waiter must stay queued behind the large reservation"
+        );
+        assert_eq!(store.calls(), 1, "neither waiter entered the backend");
+
+        drop(large);
+        let verified = tokio::time::timeout(std::time::Duration::from_secs(1), small)
+            .await
+            .expect("small waiter should acquire after large cancellation")
+            .expect("small hydration should succeed");
+        assert_eq!(verified.bytes(), b"x");
+        assert_eq!(
+            store.calls(),
+            2,
+            "cancelled large read never entered backend"
+        );
+        drop(verified);
+        drop(first);
+    }
+
+    #[tokio::test]
     #[serial(background_tasks)]
     async fn cancelling_while_queued_starts_no_backend_work() {
         let before = crate::background_task_count();
