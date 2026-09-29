@@ -30,7 +30,34 @@ const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 const DB_FREE_SPACE_FLOOR_ENV: &str = "KHIVE_DB_FREE_SPACE_FLOOR_BYTES";
 const DEFAULT_DB_FREE_SPACE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+const DATABASE_ID_TABLE: &str = "_khive_database_identity";
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityOpenStage {
+    AfterInitialIdentityWrite,
+    BeforeStandaloneOpen,
+    AfterStandaloneOpen,
+}
+
+#[cfg(test)]
+type IdentityOpenHook = Box<dyn Fn(&Path, IdentityOpenStage, Option<&Connection>)>;
+
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_OPEN_HOOK: std::cell::RefCell<Option<IdentityOpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_identity_open_hook(path: &Path, stage: IdentityOpenStage, conn: Option<&Connection>) {
+    IDENTITY_OPEN_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path, stage, conn);
+        }
+    });
+}
 
 #[cfg(test)]
 type SpaceProbe = dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync;
@@ -767,6 +794,9 @@ pub struct ConnectionPool {
     /// Later standalone opens refuse a replacement at that path.
     #[cfg(unix)]
     opened_file_identity: Option<DatabaseFileIdentity>,
+    /// A persistent nonce read through SQLite's opened main database, rather
+    /// than through the pathname that may have been replaced during open.
+    opened_database_id: Option<uuid::Uuid>,
     /// Registered only after every connection opens successfully. RAII removes
     /// the path when the last pool for it drops, including failed construction.
     identity_registration: Option<PoolIdentityRegistration>,
@@ -1605,21 +1635,63 @@ impl ConnectionPool {
             .map(database_file_identity_if_exists)
             .transpose()?
             .flatten();
-        let writer = open_writer_connection(
+        let mut writer = open_writer_connection(
             &config,
             read_only_open_target.as_deref(),
             identity_path.as_deref(),
         )?;
+        // A read of main.sqlite_master forces SQLite's main file open without
+        // changing either database. Reject an already-swapped target before
+        // installing a nonce into a legacy or initially empty database.
+        let initial_database_id = if identity_path.is_some() {
+            read_database_id(&writer)?
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let identity_before_write = identity_path
+            .as_deref()
+            .map(database_file_identity)
+            .transpose()?;
+        #[cfg(unix)]
+        if identity_before_open.is_some() && identity_before_open != identity_before_write {
+            return Err(SqliteError::InvalidData(
+                "database file identity changed while opening the pool".to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        if identity_path.is_some() {
+            verify_sqlite_opened_file_still_at_path(&writer)?;
+        }
+        let opened_database_id =
+            if identity_path.is_some() && !config.read_only && initial_database_id.is_none() {
+                write_admission.check()?;
+                Some(initialize_database_id(&mut writer)?)
+            } else {
+                initial_database_id
+            };
+        #[cfg(test)]
+        if let Some(path) = identity_path.as_deref() {
+            run_identity_open_hook(
+                path,
+                IdentityOpenStage::AfterInitialIdentityWrite,
+                Some(&writer),
+            );
+        }
         #[cfg(unix)]
         let opened_file_identity = identity_path
             .as_deref()
             .map(database_file_identity)
             .transpose()?;
         #[cfg(unix)]
-        if identity_before_open.is_some() && identity_before_open != opened_file_identity {
+        if identity_before_write != opened_file_identity {
             return Err(SqliteError::InvalidData(
                 "database file identity changed while opening the pool".to_string(),
             ));
+        }
+        #[cfg(unix)]
+        if identity_path.is_some() {
+            verify_sqlite_opened_file_still_at_path(&writer)?;
         }
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
@@ -1647,6 +1719,7 @@ impl ConnectionPool {
             identity_path,
             #[cfg(unix)]
             opened_file_identity,
+            opened_database_id,
             identity_registration: None,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2397,7 +2470,9 @@ impl ConnectionPool {
         #[cfg(unix)]
         if let Some(identity_path) = self.identity_path.as_deref() {
             self.verify_opened_file_identity(identity_path)?;
+            verify_sqlite_opened_file_still_at_path(&conn)?;
         }
+        self.verify_opened_database_id(&conn)?;
         Ok(conn)
     }
 
@@ -2459,14 +2534,22 @@ impl ConnectionPool {
         #[cfg(unix)]
         self.verify_opened_file_identity(path)?;
 
+        #[cfg(test)]
+        run_identity_open_hook(path, IdentityOpenStage::BeforeStandaloneOpen, None);
+
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        #[cfg(test)]
+        run_identity_open_hook(path, IdentityOpenStage::AfterStandaloneOpen, Some(&conn));
         #[cfg(unix)]
         self.verify_opened_file_identity(path)?;
+        self.verify_opened_database_id(&conn)?;
+        #[cfg(unix)]
+        verify_sqlite_opened_file_still_at_path(&conn)?;
         register_writer_clock(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
@@ -2498,6 +2581,16 @@ impl ConnectionPool {
         if current != Some(expected) {
             return Err(SqliteError::InvalidData(
                 "pool database file identity changed since the first open; refusing standalone connection"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_opened_database_id(&self, conn: &Connection) -> Result<(), SqliteError> {
+        if self.identity_path.is_some() && read_database_id(conn)? != self.opened_database_id {
+            return Err(SqliteError::InvalidData(
+                "pool database identity changed since the first open; refusing standalone connection"
                     .to_string(),
             ));
         }
@@ -2737,7 +2830,7 @@ fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), Sql
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DatabaseFileIdentity {
     device: u64,
     inode: u64,
@@ -2763,6 +2856,87 @@ fn database_file_identity_if_exists(
         Err(SqliteError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// The nonce lives in the main database and is read through the connection
+/// SQLite actually opened. A pathname stat alone can observe a different file
+/// when another process renames entries during `sqlite3_open_v2`.
+fn read_database_id(conn: &Connection) -> Result<Option<uuid::Uuid>, SqliteError> {
+    let table_exists: bool = conn.query_row(
+        "SELECT count(*) != 0 FROM main.sqlite_master WHERE type = 'table' AND name = ?1",
+        [DATABASE_ID_TABLE],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        // Older read-only snapshots cannot be initialized here. Their Unix
+        // file-control and inode checks still apply; writable opens backfill.
+        return Ok(None);
+    }
+    let id: String = conn.query_row(
+        &format!("SELECT id FROM main.{DATABASE_ID_TABLE} WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )?;
+    let id = uuid::Uuid::parse_str(&id).map_err(|error| {
+        SqliteError::InvalidData(format!("invalid stored database identity: {error}"))
+    })?;
+    Ok(Some(id))
+}
+
+fn initialize_database_id(conn: &mut Connection) -> Result<uuid::Uuid, SqliteError> {
+    if let Some(id) = read_database_id(conn)? {
+        return Ok(id);
+    }
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS main.{DATABASE_ID_TABLE} (\
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+             id TEXT NOT NULL\
+         )"
+    ))?;
+    transaction.execute(
+        &format!("INSERT OR IGNORE INTO main.{DATABASE_ID_TABLE} (singleton, id) VALUES (1, ?1)"),
+        [uuid::Uuid::new_v4().to_string()],
+    )?;
+    let id: String = transaction.query_row(
+        &format!("SELECT id FROM main.{DATABASE_ID_TABLE} WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )?;
+    let id = uuid::Uuid::parse_str(&id).map_err(|error| {
+        SqliteError::InvalidData(format!("invalid stored database identity: {error}"))
+    })?;
+    transaction.commit()?;
+    Ok(id)
+}
+
+#[cfg(unix)]
+fn verify_sqlite_opened_file_still_at_path(conn: &Connection) -> Result<(), SqliteError> {
+    let mut moved: std::ffi::c_int = 0;
+    // SAFETY: `conn` remains alive and exclusively borrowed for this call;
+    // the `main` C string and writable integer out-parameter remain valid.
+    // SQLite documents SQLITE_FCNTL_HAS_MOVED as querying the opened file,
+    // and the bundled Unix VFS implements it using its retained inode.
+    // https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK {
+        return Err(SqliteError::InvalidData(format!(
+            "cannot verify opened database file identity (SQLite file control {result})"
+        )));
+    }
+    if moved != 0 {
+        return Err(SqliteError::InvalidData(
+            "database file identity changed while SQLite held the opened file".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Follow a (possibly dangling) final-component symlink chain to its
@@ -3379,6 +3553,43 @@ mod runtime_write_routing_tests;
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    struct IdentityOpenHookReset;
+
+    impl Drop for IdentityOpenHookReset {
+        fn drop(&mut self) {
+            IDENTITY_OPEN_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn install_identity_open_hook(
+        hook: impl Fn(&Path, IdentityOpenStage, Option<&Connection>) + 'static,
+    ) -> IdentityOpenHookReset {
+        IDENTITY_OPEN_HOOK.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "identity open hook already installed"
+            );
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        IdentityOpenHookReset
+    }
+
+    #[cfg(unix)]
+    fn rename_pair_on_other_thread(from_a: &Path, to_a: &Path, from_b: &Path, to_b: &Path) {
+        let paths = (
+            from_a.to_path_buf(),
+            to_a.to_path_buf(),
+            from_b.to_path_buf(),
+            to_b.to_path_buf(),
+        );
+        std::thread::spawn(move || {
+            fs::rename(paths.0, paths.1).unwrap();
+            fs::rename(paths.2, paths.3).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
@@ -4906,6 +5117,127 @@ mod tests {
         assert!(
             error.to_string().contains("file identity changed"),
             "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initially_absent_path_replacement_cannot_pin_a_different_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.db");
+        let pinned_path = mint_db_identity(&path).unwrap().1;
+        let parked = dir.path().join("opened-writer.db");
+        let replacement = dir.path().join("replacement.db");
+        let replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .unwrap();
+        drop(replacement_conn);
+        assert!(!path.exists(), "exercise the absent first-open path");
+
+        let replacement_ran = std::rc::Rc::new(Cell::new(false));
+        let _hook = install_identity_open_hook({
+            let path = path.clone();
+            let replacement_ran = std::rc::Rc::clone(&replacement_ran);
+            move |target, stage, conn| {
+                if target != pinned_path.as_path()
+                    || stage != IdentityOpenStage::AfterInitialIdentityWrite
+                {
+                    return;
+                }
+                assert!(
+                    read_database_id(conn.expect("opened writer"))
+                        .unwrap()
+                        .is_some(),
+                    "the first writer's identity must be committed before replacement"
+                );
+                rename_pair_on_other_thread(&path, &parked, &replacement, &path);
+                replacement_ran.set(true);
+            }
+        });
+        let error = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .err()
+        .expect("an absent path must not pin a replacement after SQLite opened its writer");
+        assert!(replacement_ran.get(), "the replacement hook must execute");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_swap_cannot_return_a_standalone_connection_to_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let pinned_path = mint_db_identity(&path).unwrap().1;
+        let parked = dir.path().join("parked.db");
+        let replacement = dir.path().join("replacement.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE identity_marker (value INTEGER); \
+                            INSERT INTO identity_marker (value) VALUES (11)",
+            )
+            .unwrap();
+        let mut replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch(
+                "CREATE TABLE identity_marker (value INTEGER); \
+                            INSERT INTO identity_marker (value) VALUES (22)",
+            )
+            .unwrap();
+        let replacement_id = initialize_database_id(&mut replacement_conn).unwrap();
+        assert_ne!(pool.opened_database_id, Some(replacement_id));
+        drop(replacement_conn);
+
+        let swap_ran = std::rc::Rc::new(Cell::new(false));
+        let restore_ran = std::rc::Rc::new(Cell::new(false));
+        let _hook = install_identity_open_hook({
+            let path = path.clone();
+            let swap_ran = std::rc::Rc::clone(&swap_ran);
+            let restore_ran = std::rc::Rc::clone(&restore_ran);
+            move |target, stage, conn| {
+                if target != pinned_path.as_path() {
+                    return;
+                }
+                match stage {
+                    IdentityOpenStage::BeforeStandaloneOpen => {
+                        rename_pair_on_other_thread(&path, &parked, &replacement, &path);
+                        swap_ran.set(true);
+                    }
+                    IdentityOpenStage::AfterStandaloneOpen => {
+                        let opened = conn.expect("SQLite opened the swapped path");
+                        let marker: i64 = opened
+                            .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
+                            .unwrap();
+                        assert_eq!(marker, 22, "the opened handle belongs to the replacement");
+                        rename_pair_on_other_thread(&path, &replacement, &parked, &path);
+                        restore_ran.set(true);
+                    }
+                    IdentityOpenStage::AfterInitialIdentityWrite => {}
+                }
+            }
+        });
+        let error = pool
+            .open_standalone_writer_untracked()
+            .expect_err("both pathname stats see the original, but SQLite opened replacement");
+        assert!(swap_ran.get(), "the swap hook must execute");
+        assert!(restore_ran.get(), "the restore hook must execute");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert_eq!(
+            database_file_identity(&path).unwrap(),
+            pool.opened_file_identity.unwrap()
         );
     }
 
