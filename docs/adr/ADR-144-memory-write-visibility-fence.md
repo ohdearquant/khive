@@ -206,11 +206,12 @@ the interleaved compaction test red.
 
 **Status**: Proposed for owner sign-off. This amendment combines the #3619
 visibility-token ruling with the #3549 pre-V45 keyed-replay ruling. It
-supersedes Amendment 1's public version-1 JSON receipt shape and refines its
-missing-receipt result. Amendment 1's durable per-model fences, zero-model
-distinction, bounded wait, and one-snapshot coverage proof remain in force.
-The joint cutover below supersedes the original receipt-first, fence-second
-implementation order.
+supersedes Amendment 1's public version-1 JSON receipt shape, refines its
+missing-receipt result, and narrows its coverage predicate to requested models
+that have a fence in the token. Amendment 1's durable per-model fences,
+zero-model distinction, bounded wait, and one-snapshot coverage proof remain in
+force. The joint cutover below supersedes the original receipt-first,
+fence-second implementation order.
 
 ### Confidentiality boundary and token contract
 
