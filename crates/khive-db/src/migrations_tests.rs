@@ -1891,7 +1891,7 @@ fn v43_vector_provenance_sidecar_starts_empty() {
 }
 
 #[test]
-fn v44_indexes_memory_visibility_receipts_by_note_id() {
+fn v45_indexes_memory_visibility_receipts_by_note_id() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("apply core migrations");
 
