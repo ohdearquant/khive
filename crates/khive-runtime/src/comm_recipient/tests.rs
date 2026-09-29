@@ -1,6 +1,60 @@
 use super::*;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use khive_channel::DeliveryReceiptBinding;
 use khive_db::stores::note::transport::{SenderAssurance, SenderEnvelope};
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+use tokio::sync::Notify;
+
+use crate::embedder_registry::EmbedderProvider;
+
+const RECIPIENT_RACE_MODEL: &str = "recipient-race-test";
+
+#[derive(Default)]
+struct PausedRecipientEmbedder {
+    started: Notify,
+    proceed: Notify,
+}
+
+#[async_trait]
+impl EmbeddingService for PausedRecipientEmbedder {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.started.notify_one();
+        self.proceed.notified().await;
+        Ok(texts.iter().map(|_| vec![0.5; 4]).collect())
+    }
+
+    fn supports_model(&self, _: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        RECIPIENT_RACE_MODEL
+    }
+}
+
+struct PausedRecipientProvider(Arc<PausedRecipientEmbedder>);
+
+#[async_trait]
+impl EmbedderProvider for PausedRecipientProvider {
+    fn name(&self) -> &str {
+        RECIPIENT_RACE_MODEL
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(self.0.clone())
+    }
+}
+
 fn fixture() -> (
     KhiveRuntime,
     NamespaceToken,
@@ -27,6 +81,91 @@ fn fixture() -> (
         delivery_attempt_id: Uuid::new_v4(),
     };
     (runtime, NamespaceToken::local(), local, binding)
+}
+
+#[tokio::test]
+async fn recipient_embedding_publishes_only_the_live_committed_revision() {
+    for change in ["unchanged", "updated", "soft deleted", "hard deleted"] {
+        let (runtime, token, local, binding) = fixture();
+        let embedder = Arc::new(PausedRecipientEmbedder::default());
+        runtime.register_embedder(PausedRecipientProvider(embedder.clone()));
+        let vectors = runtime
+            .vectors_for_model(&token, RECIPIENT_RACE_MODEL)
+            .unwrap();
+
+        let ingest_runtime = runtime.clone();
+        let ingest_token = token.clone();
+        let ingest = tokio::spawn(async move {
+            ingest_runtime
+                .ingest_verified_recipient(
+                    &ingest_token,
+                    &local,
+                    InboundReceiptTicket::new(binding, 1),
+                    payload(None),
+                    vec![],
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            embedder.started.notified(),
+        )
+        .await
+        .expect("recipient commit must reach embedding");
+        // The receipt is durable before embedding starts. Change that exact note
+        // while its original vector is still being computed.
+        let notes = runtime
+            .list_notes(&token, Some("message"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "hello");
+        let note_id = notes[0].id;
+        match change {
+            "updated" => {
+                let patch = crate::curation::NotePatch::new(
+                    None,
+                    Some("newer content".into()),
+                    None,
+                    None,
+                    None,
+                )
+                .with_write_options(crate::note_write::NoteWriteOptions {
+                    expected_version: Some(1),
+                    embed: Some(false),
+                    ..Default::default()
+                });
+                assert_eq!(
+                    runtime
+                        .update_note(&token, note_id, patch)
+                        .await
+                        .unwrap()
+                        .version,
+                    2
+                );
+            }
+            "soft deleted" | "hard deleted" => {
+                assert!(runtime
+                    .delete_note(&token, note_id, change == "hard deleted")
+                    .await
+                    .unwrap());
+            }
+            "unchanged" => {}
+            _ => unreachable!(),
+        }
+        embedder.proceed.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), ingest)
+            .await
+            .expect("recipient ingest must finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.note_id, note_id);
+        assert_eq!(
+            vectors.count().await.unwrap(),
+            u64::from(change == "unchanged"),
+            "{change}"
+        );
+    }
 }
 fn payload(correlation: Option<String>) -> VerifiedInboundContent {
     VerifiedInboundContent::Message {

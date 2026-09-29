@@ -278,19 +278,11 @@ impl KhiveRuntime {
                     .await
                 {
                     Ok(outcome) => {
-                        if let Ok(vectors) = self.vectors_for_model(token, &model) {
-                            if let Err(error) = vectors
-                                .insert(
-                                    note.id,
-                                    khive_storage::SubstrateKind::Note,
-                                    token.namespace().as_str(),
-                                    "note.content",
-                                    vec![outcome.vector],
-                                )
-                                .await
-                            {
-                                tracing::warn!(note_id=%note.id,error=%error,"verified ingest vector indexing failed");
-                            }
+                        if let Err(error) = self
+                            .publish_note_vector_revision(token, note, &model, &outcome.vector)
+                            .await
+                        {
+                            tracing::warn!(note_id=%note.id,error=%error,"verified ingest vector indexing failed");
                         }
                     }
                     Err(error) => {
