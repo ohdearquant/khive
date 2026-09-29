@@ -243,7 +243,6 @@ no stored identity the replacement cannot be detected. Truncation still restarts
 regardless of backfill. Subsequent unchanged polls use the new witness and retain the cheap
 length guard. The reader verifies that the opened file still has the identity observed by the
 service's metadata probe before it can advance the cursor.
-
 Regular-file checks and no-follow opens keep a symlinked transcript from making the mirror read a
 target outside its configured tree. A symlink supplied as a configured export root is refused once
 at discovery and is not polled; entries reached while walking a configured directory are also
