@@ -28,6 +28,7 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+rusqlite = { workspace = true }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
 # Test-only: builds a bare `PoolConfig { write_queue_enabled: true, .. }` +
