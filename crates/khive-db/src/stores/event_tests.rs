@@ -99,10 +99,15 @@ async fn operation_attribution_rejects_unpaired_values_before_append() {
 #[tokio::test]
 async fn profile_state_version_refuses_overflow_before_any_event_is_persisted() {
     let store = setup_memory_store();
-    let valid = make_event("default").with_profile_state_version(i64::MAX as u64);
+    let candidate = Uuid::new_v4();
+    let mut valid = make_event("default").with_profile_state_version(i64::MAX as u64);
+    valid.payload = json!({
+        "result_kind": "note",
+        "candidates": [candidate.to_string()],
+    });
     let overflow = make_event("default").with_profile_state_version(i64::MAX as u64 + 1);
 
-    assert!(event_insert_statements(&valid).is_ok());
+    assert_eq!(event_insert_statements(&valid).unwrap().len(), 2);
     assert!(event_insert_statements(&overflow).is_err());
     assert!(store.preflight_event(&overflow).is_err());
     assert!(store.append_event(overflow.clone()).await.is_err());
@@ -110,13 +115,16 @@ async fn profile_state_version_refuses_overflow_before_any_event_is_persisted() 
         .append_events(vec![valid.clone(), overflow.clone()])
         .await
         .is_err());
+    assert!(observations_for(&store, valid.id).await.is_empty());
     assert!(store
         .append_events_idempotent(vec![valid.clone(), overflow.clone()])
         .await
         .is_err());
     assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+    assert!(observations_for(&store, valid.id).await.is_empty());
 
     store.append_event(valid.clone()).await.unwrap();
+    assert_eq!(observations_for(&store, valid.id).await.len(), 1);
     assert_eq!(
         store.get_event(valid.id).await.unwrap(),
         Some(valid.clone())
@@ -143,6 +151,158 @@ async fn profile_state_version_refuses_overflow_before_any_event_is_persisted() 
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn prepared_event_insert_stores_and_reads_i64_max_profile_state_version() {
+    let store = setup_memory_store();
+    let event = make_event("default").with_profile_state_version(i64::MAX as u64);
+    let statements = event_insert_statements(&event).expect("boundary value is representable");
+
+    {
+        let writer = store.pool.writer().unwrap();
+        let conn = writer.conn();
+        for statement in statements {
+            let mut prepared = conn.prepare(&statement.sql).unwrap();
+            crate::sql_bridge::bind_params(&mut prepared, &statement.params).unwrap();
+            assert_eq!(prepared.raw_execute().unwrap(), 1);
+        }
+        let stored: i64 = conn
+            .query_row(
+                "SELECT profile_state_version FROM events WHERE id = ?1",
+                [event.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, i64::MAX);
+    }
+
+    assert_eq!(store.get_event(event.id).await.unwrap(), Some(event));
+}
+
+#[tokio::test]
+async fn batch_failure_rolls_back_event_and_observation_rows() {
+    let store = setup_memory_store();
+    let candidate = Uuid::new_v4();
+    let mut first = make_event("default");
+    first.payload = json!({
+        "result_kind": "note",
+        "candidates": [candidate.to_string()],
+    });
+    assert_eq!(decode_event_observations(&first).unwrap().len(), 1);
+
+    let mut rejected = make_event("default");
+    rejected.payload = json!({"result_kind": "edge"});
+    assert!(store
+        .append_events(vec![first.clone(), rejected.clone()])
+        .await
+        .is_err());
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+    assert!(observations_for(&store, first.id).await.is_empty());
+    assert!(observations_for(&store, rejected.id).await.is_empty());
+}
+
+#[tokio::test]
+async fn profile_state_version_audit_finds_preexisting_unreadable_rows() {
+    let store = setup_memory_store();
+    let valid_null = make_event("default");
+    let valid_max = make_event("default").with_profile_state_version(i64::MAX as u64);
+    let negative = make_event("default");
+    let text = make_event("default");
+    let real = make_event("default");
+    for event in [
+        valid_null.clone(),
+        valid_max.clone(),
+        negative.clone(),
+        text.clone(),
+        real.clone(),
+    ] {
+        store.append_event(event).await.unwrap();
+    }
+
+    // Simulate rows written before the profile-version guard existed.
+    {
+        let writer = store.pool.writer().unwrap();
+        let conn = writer.conn();
+        for (id, value) in [
+            (negative.id, rusqlite::types::Value::Integer(-1)),
+            (
+                text.id,
+                rusqlite::types::Value::Text("not-an-integer".into()),
+            ),
+            (real.id, rusqlite::types::Value::Real(1.5)),
+        ] {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE events SET profile_state_version = ?1 WHERE id = ?2",
+                    rusqlite::params![value, id.to_string()],
+                )
+                .unwrap(),
+                1,
+            );
+        }
+    }
+
+    let rows: Vec<(String, String, String, String)> = {
+        let reader = store.pool.reader().unwrap();
+        let mut statement = reader
+            .conn()
+            .prepare(include_str!(
+                "../../docs/api/event-profile-state-version-audit.sql"
+            ))
+            .unwrap();
+        let found = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        found
+    };
+    let mut expected = vec![
+        (
+            negative.id.to_string(),
+            "default".to_string(),
+            "integer".to_string(),
+            "-1".to_string(),
+        ),
+        (
+            text.id.to_string(),
+            "default".to_string(),
+            "text".to_string(),
+            "'not-an-integer'".to_string(),
+        ),
+        (
+            real.id.to_string(),
+            "default".to_string(),
+            "real".to_string(),
+            "1.5".to_string(),
+        ),
+    ];
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(rows, expected);
+    assert_eq!(
+        store.get_event(valid_null.id).await.unwrap(),
+        Some(valid_null)
+    );
+    assert_eq!(
+        store.get_event(valid_max.id).await.unwrap(),
+        Some(valid_max)
+    );
+    for id in [negative.id, text.id, real.id] {
+        assert!(store.get_event(id).await.is_err());
+    }
+    assert!(store
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .is_err());
 }
 
 #[tokio::test]
