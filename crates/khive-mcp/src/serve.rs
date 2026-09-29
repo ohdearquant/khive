@@ -3291,6 +3291,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    registry.call_register_note_search_ann_providers(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_search_ann_providers(rt);
+    }
     // Note-write identity: install the pack-owned kind set and the pack-owned
     // note-write validator so identity properties are derived at the write and
     // preserved through merge/update on every path, including the ones that

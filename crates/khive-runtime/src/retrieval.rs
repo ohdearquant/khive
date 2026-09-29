@@ -678,6 +678,41 @@ impl KhiveRuntime {
         Ok(hits?)
     }
 
+    /// The note-search vector leg uses the pack-owned graph when that model
+    /// has an installed, consumer-protected bridge. Only a missing graph for
+    /// this consumer takes the existing exact sqlite-vec route.
+    pub(crate) async fn note_search_vector_search(
+        &self,
+        token: &NamespaceToken,
+        query_embedding: Option<Vec<f32>>,
+        query_text: &str,
+        top_k: u32,
+    ) -> RuntimeResult<Vec<VectorSearchHit>> {
+        let embedding = match query_embedding {
+            Some(embedding) => embedding,
+            None => self.embed_query_for_token(token, query_text).await?,
+        };
+        let model = self.default_embedder_name();
+        if !model.is_empty() {
+            if let Some(provider) = self.note_search_ann_provider()? {
+                if let Some(hits) = provider.search(token, model, &embedding, top_k).await? {
+                    crate::note_search_ann::record_ann_route();
+                    crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
+                    return Ok(hits);
+                }
+            }
+        }
+        crate::note_search_ann::record_fallback_route();
+        self.vector_search(
+            token,
+            Some(embedding),
+            None,
+            top_k,
+            Some(SubstrateKind::Note),
+        )
+        .await
+    }
+
     /// Hybrid search: text (FTS5) + vector retrieval fused via Reciprocal Rank Fusion.
     ///
     /// - Always performs text search over `query_text`.

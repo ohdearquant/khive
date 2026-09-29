@@ -24,6 +24,7 @@ use crate::config::{
     sanitize_key, vec_model_key,
 };
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::note_search_ann::NoteSearchAnnProvider;
 use crate::pack::KindHook;
 
 #[cfg(all(test, target_os = "macos"))]
@@ -340,6 +341,9 @@ pub struct KhiveRuntime {
     /// no pack cares about note-mutation notifications) — the call becomes a
     /// no-op check of an `Option`.
     note_mutation_hook: Arc<RwLock<Option<NoteMutationHookFn>>>,
+    /// Backend-matched, pack-installed ANN source for note search. Absent on a
+    /// bare runtime or when no memory graph provider serves this backend.
+    note_search_ann_provider: Arc<RwLock<Option<Arc<dyn NoteSearchAnnProvider>>>>,
     /// Pack-installed note-write validator.
     ///
     /// When `Some`, every runtime note-materialisation site that accepts
@@ -544,6 +548,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_search_ann_provider: Arc::new(RwLock::new(None)),
             note_write_validator: Arc::new(RwLock::new(None)),
             entity_kind_hooks: Arc::new(RwLock::new(Vec::new())),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
@@ -690,6 +695,7 @@ impl KhiveRuntime {
                     valid_note_kinds: self.valid_note_kinds.clone(),
                     entity_type_validator: self.entity_type_validator.clone(),
                     note_mutation_hook: self.note_mutation_hook.clone(),
+                    note_search_ann_provider: self.note_search_ann_provider.clone(),
                     note_write_validator: self.note_write_validator.clone(),
                     entity_kind_hooks: self.entity_kind_hooks.clone(),
                     pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
@@ -882,6 +888,9 @@ impl KhiveRuntime {
         report
             .writer_contention
             .audit_obligation_append_failures_unavailable_reason = None;
+        let (ann_routes, fallback_routes) = crate::note_search_ann::route_totals();
+        report.note_search_ann_route_total = ann_routes;
+        report.note_search_fallback_route_total = fallback_routes;
         Ok(report)
     }
 
@@ -1844,6 +1853,46 @@ impl KhiveRuntime {
         if let Ok(mut guard) = self.note_mutation_hook.write() {
             *guard = Some(f);
         }
+    }
+
+    /// Clone read-side backend and embedder handles without retaining this
+    /// runtime's pack callback slots. Providers stored in one of those slots
+    /// must not hold a clone that points back to their own installation Arc,
+    /// including indirectly through another hook's captured runtime.
+    pub fn detached_for_note_search_ann_provider(&self) -> Self {
+        let mut detached = self.clone();
+        detached.note_search_ann_provider = Arc::new(RwLock::new(None));
+        detached.note_mutation_hook = Arc::new(RwLock::new(None));
+        detached.entity_type_validator = Arc::new(RwLock::new(None));
+        detached.note_write_validator = Arc::new(RwLock::new(None));
+        detached.entity_kind_hooks = Arc::new(RwLock::new(Vec::new()));
+        detached.fusion_executors = Arc::new(RwLock::new(HashMap::new()));
+        detached
+    }
+
+    /// Install the memory pack's note-search provider only on its own opened
+    /// backend. A same-named but separate store keeps the exact search route.
+    pub fn install_note_search_ann_provider(&self, provider: Arc<dyn NoteSearchAnnProvider>) {
+        if !provider.serves_backend(self) {
+            return;
+        }
+        if let Ok(mut guard) = self.note_search_ann_provider.write() {
+            *guard = Some(provider);
+        }
+    }
+
+    pub(crate) fn note_search_ann_provider(
+        &self,
+    ) -> RuntimeResult<Option<Arc<dyn NoteSearchAnnProvider>>> {
+        self.note_search_ann_provider
+            .read()
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|provider| provider.serves_backend(self))
+                    .cloned()
+            })
+            .map_err(|_| RuntimeError::Internal("note-search ANN provider lock poisoned".into()))
     }
 
     /// Install the pack-aggregated entity-kind update hooks (issue #2943).
