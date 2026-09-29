@@ -12,8 +12,9 @@ adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI;
 (accepted 2026-09-25, binding only with Amendment 1), which names the issues Amendment 1 item 7
 answers and the blob writer census population; Amendment 3 below (accepted 2026-09-26), which ships a
 read-only report of attachment rows whose record was not found and states what any code that removes
-such rows must first supply; and Amendments 4 and 5 below (both accepted 2026-09-28), which record
-the reviewed core-schema epochs for blob GC.\
+such rows must first supply; Amendments 4 and 5 below (both accepted 2026-09-28), which record
+the reviewed core-schema epochs for blob GC; and Amendment 6 below (proposed 2026-09-29), which counts
+staged uploads as root content.\
 **Depends on**:
 
 - [ADR-111](ADR-111-blob-store.md) — BlobStore (the content-addressed storage capability,
@@ -1125,10 +1126,12 @@ stated, in the change that adds them. This row set does not cover them.
 
 ## Amendment 6 (2026-09-29): staged uploads count as root content
 
-**Status: Proposed (2026-09-29).** This amendment changes two places in Amendment 1 item 8 and nothing else
-in Amendment 1: the sentence that defines an empty root, "no blob objects and no root ownership marker of
-any owner", and the acceptance entry for a root with exactly one object. It concerns the filesystem blob
-root. It binds the implementing change, because the fresh-root bind and item 7's owner validation are not
+**Status: Proposed (2026-09-29).** This amendment changes Amendment 1 in three places and nothing else in it:
+item 8's sentence that defines an empty root, "no blob objects and no root ownership marker of any owner";
+item 8's fresh bind, which now holds its locks through the completing transaction; and item 7's writer
+rules, to which it adds the binding check `begin_upload` makes before it stages a file. It adds acceptance
+entries (a) to (d) and leaves Amendment 1's existing entries, the one-object entry included, as they are.
+It concerns the filesystem blob root. It binds the implementing change, because the fresh-root bind and item 7's owner validation are not
 in code yet. Line references are at commit `2d30ab6d249a6db524c22d578e9df2af35f17f3b`, where the migration
 chain ends at V43 `vector_provenance` (`crates/khive-db/src/migrations.rs:454-458`) and `blob_pack_owners`,
 `store_binding` and `REVIEWED_SCHEMA_EPOCH` appear in no crate.
@@ -1158,7 +1161,7 @@ upload that was progressing normally is lost.
    with this predicate, including the recovery recheck and the rule for a database cut over before item 8.
 2. **The orphan collector never removes staged uploads.** The collector does not enter `.uploads` today. It
    lists the root through `read_dir_names_no_follow`, which drops every dot-leading name
-   (`blob.rs:1385-1392`), and `.uploads` is one. [ADR-173](ADR-173-blob-chunked-upload.md) §3 and §4 already
+   (`blob.rs:1385-1392`), and `.uploads` is one. [ADR-173](ADR-173-blob-chunked-upload.md) §3b and §4 already
    record this. This clause pins the existing behavior: a transactional sweep in either mode reads and
    deletes nothing under `.uploads`, and a change that makes the walk enter dot-leading directories must
    exclude `.uploads` explicitly.
