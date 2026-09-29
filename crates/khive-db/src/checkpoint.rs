@@ -19,9 +19,9 @@
 //!
 //! If the dedicated connection is unavailable (never opened yet, or dropped
 //! after a prior tick's connection-level pragma failure), the tick reports
-//! `CheckpointTick::Skipped` and the next tick lazily reopens it — this is
-//! now the ONLY source of a Skipped tick; a busy pool writer no longer causes
-//! one.
+//! `CheckpointTick::Skipped` and the next tick lazily reopens it. A busy PASSIVE
+//! result also skips pressure decisions without replacing the last valid WAL
+//! sample; a busy pool writer does not cause either kind of skip.
 //!
 //! `warn_pages` / `high_water_pages` WARNs fire at most once per below→above
 //! crossing; a skipped tick leaves crossing state unchanged. An age-based
@@ -68,15 +68,13 @@ static TRUNCATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 /// gauge every time `note_truncate_outcome` runs.
 static TRUNCATE_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// Count of checkpoint ticks skipped because the task's dedicated
-/// `CheckpointConnection` was unavailable that tick (never opened yet, or
-/// dropped after a prior connection-level pragma failure — ADR-091
-/// checkpoint-pressure telemetry), across this process's lifetime. Never
-/// reset outside `#[cfg(test)]`.
+/// Count of checkpoint ticks without a usable WAL frame observation because
+/// the dedicated connection was unavailable or SQLite returned a busy row.
+/// Never reset outside `#[cfg(test)]`.
 static CHECKPOINT_SKIPPED_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Current run-length of consecutive skipped ticks. Reset to 0 the next time
-/// a tick is actually observed (dedicated connection available), so a
+/// a tick has a valid WAL frame observation, so a
 /// sustained skip streak is visible even between two successful
 /// observations.
 static CHECKPOINT_CONSECUTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -360,7 +358,7 @@ pub(crate) fn checkpoint_run_snapshot(
 }
 
 /// Process-lifetime totals for actual routine PASSIVE calls on one store.
-/// Skipped ticks and post-TRUNCATE probes are excluded. Busy counts only
+/// Ticks with no PASSIVE call and post-TRUNCATE probes are excluded. Busy counts only
 /// SQLite's returned busy flag, never an incomplete checkpoint's pending frames.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -482,13 +480,13 @@ pub fn truncate_attempts() -> u64 {
     TRUNCATE_ATTEMPTS.load(Ordering::Relaxed)
 }
 
-/// Current consecutive TRUNCATE-attempt failure count.
+/// Current measured TRUNCATE-failure streak; unmeasured attempts leave it unchanged.
 pub fn truncate_consecutive_failures() -> u64 {
     TRUNCATE_CONSECUTIVE_FAILURES.load(Ordering::Relaxed)
 }
 
-/// Total checkpoint ticks skipped (dedicated connection unavailable) in this
-/// process's lifetime.
+/// Total checkpoint ticks without an available WAL frame observation in this
+/// process's lifetime (dedicated connection unavailable or SQLite busy).
 pub fn checkpoint_skipped_ticks() -> u64 {
     CHECKPOINT_SKIPPED_TICKS.load(Ordering::Relaxed)
 }
@@ -552,7 +550,7 @@ pub fn checkpoint_lifecycle_enqueue_drops() -> u64 {
     CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.load(Ordering::Relaxed)
 }
 
-/// A tick's dedicated checkpoint connection was unavailable: bump the
+/// A tick had no usable WAL frame observation: bump the
 /// lifetime and consecutive-skip counters and snapshot the last-known WAL
 /// pressure so an operator can see how bad the WAL was heading into the skip
 /// streak.
@@ -564,7 +562,7 @@ fn note_checkpoint_skipped() {
     }
 }
 
-/// A tick was actually observed (writer free): close out any prior skip
+/// A tick had a valid WAL frame observation: close out any prior skip
 /// streak. `_wal_pages` is accepted for call-site symmetry with
 /// `note_checkpoint_skipped` and to leave room for a future observed-side
 /// gauge without changing this function's signature again.
@@ -602,18 +600,14 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
 
 /// Outcome of a single checkpoint attempt.
 ///
-/// `Skipped` is returned when the task's dedicated `CheckpointConnection`
-/// is unavailable that tick (the tick is a no-op) — never because a
-/// concurrent pool writer was busy; a checkpoint tick no longer checks out
-/// the pool's writer mutex at all. `Observed` carries the WAL page count read
-/// during the tick. The distinction matters for threshold-crossing WARN
-/// rate-limiting: a skipped tick must leave the above/below state unchanged
-/// so that it cannot spuriously re-arm the rate limit while WAL pressure is
-/// still elevated.
+/// `Skipped` is returned when the dedicated connection is unavailable or its
+/// PASSIVE result is busy and has no usable WAL frame observation. A concurrent
+/// pool writer does not cause a skip: the task never checks out its writer
+/// mutex. `Observed` carries the WAL page count read during the tick. A skipped
+/// tick leaves threshold-crossing state unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointTick {
-    /// The dedicated checkpoint connection was unavailable; no checkpoint
-    /// was issued this tick.
+    /// No usable WAL frame observation was available this tick.
     Skipped,
     /// A checkpoint was issued; the value is the observed WAL page count.
     Observed(u64),
@@ -654,9 +648,9 @@ pub struct CheckpointConfig {
     ///
     /// The periodic task always runs PASSIVE regardless; this threshold signals
     /// only that the WAL is not draining. Whether an old snapshot is pinning it
-    /// is decided at the crossing from the transaction registry, against
-    /// `tx_warn_secs` — see `log_wal_high_water_warn`, which names a holder when
-    /// one exists and rules the hypothesis out when none does. Either way an
+    /// is informed at the crossing by the in-process transaction registry,
+    /// against `tx_warn_secs` — see `log_wal_high_water_warn`. This registry
+    /// cannot exclude readers in another process. Either way an
     /// operator can schedule a blocking TRUNCATE at a safe moment outside
     /// normal write traffic; the two cases differ in what else is worth doing.
     ///
@@ -892,10 +886,10 @@ pub struct TruncateState {
     /// of whether it succeeded in reclaiming pages. `None` means no attempt
     /// has ever run, so the first armed tick is immediately eligible.
     last_attempt: Option<Instant>,
-    /// Count of consecutive TRUNCATE attempts that failed to bring `wal_pages`
-    /// back below `warn_pages`. Resets to 0 the first time an attempt clears
-    /// `warn_pages`; used to fire a one-shot escalated WARN at exactly 3
-    /// consecutive failures (does not repeat every subsequent attempt).
+    /// Count of measured TRUNCATE outcomes that failed to bring `wal_pages`
+    /// below `warn_pages`, ignoring attempts whose post-TRUNCATE measurement
+    /// was unavailable. A measured clearing result resets it; a one-shot
+    /// escalated WARN fires at exactly 3 failures.
     consecutive_failures: u32,
     /// Fallback freshness cadence for legacy sidecar records that do not
     /// declare their producer interval. Captured once when the daemon task
@@ -2221,7 +2215,8 @@ async fn run_fts_maintenance_off_worker(
 /// guarantee is admission-only: an armed TRUNCATE still takes SQLite's writer
 /// lock and can block new write transactions, on any connection, for up to
 /// `truncate_busy_timeout` (see `CheckpointConnection`'s contract). A tick is
-/// `Skipped` only when that dedicated connection is itself unavailable. A
+/// `Skipped` when that connection is unavailable or SQLite returns a busy
+/// PASSIVE row without a usable pressure observation. A
 /// WARNING fires once per below→above threshold crossing, not every tick.
 ///
 /// `lifecycle_owner` (ADR-094): exactly one task in a multi-backend fan-out
@@ -2464,7 +2459,13 @@ pub async fn run_checkpoint_task(
                             );
                         }
                     }
-                    CheckpointTick::Observed(outcome.wal_pages)
+                    match outcome.wal_pages {
+                        Some(wal_pages) => CheckpointTick::Observed(wal_pages),
+                        None => {
+                            note_checkpoint_skipped();
+                            CheckpointTick::Skipped
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -2478,7 +2479,7 @@ pub async fn run_checkpoint_task(
             }
         };
 
-        // A successful no-progress TRUNCATE returns a bounded attribution
+        // A no-progress or unmeasured TRUNCATE returns a bounded attribution
         // request alongside the core outcome. Consume it before any
         // report-derived decision or ordinary housekeeping for this tick.
         // The await is intentional: enumeration may perform up to 512
@@ -2501,9 +2502,9 @@ pub async fn run_checkpoint_task(
         // MUST run on every tick, including a Skipped one — deliberately
         // BEFORE the Skipped early-continue below. Since the dedicated
         // checkpoint connection amendment, a `Skipped` tick means that
-        // connection was itself unavailable, not that some registered span
-        // was holding the pool's writer mutex (a checkpoint tick no longer
-        // touches it at all) — but the sweep still must not go blind for the
+        // connection was unavailable or its PASSIVE result was busy, not that
+        // some registered span held the pool's writer mutex (a checkpoint
+        // tick no longer touches it at all) — but the sweep must not go blind for the
         // duration of that outage, and the two failure surfaces are
         // independent: a registry span can go stale
         // (KHIVE_TX_WARN_SECS / KHIVE_TX_MAX_AGE_SECS) while wal_pages sits
@@ -2837,26 +2838,9 @@ fn log_truncate_no_progress_warn(
 /// tick already read instead of asserting a cause the evidence beside it can
 /// refute.
 ///
-/// The previous text named "a long-lived reader ... pinning an old snapshot"
-/// unconditionally, immediately after `log_tx_registry_snapshot_warn` printed
-/// the registry. In a capture of six consecutive crossings the oldest open
-/// transaction was never older than six milliseconds and was a writer every
-/// time, so the line sent an operator hunting a reader that did not exist
-/// while the WAL grew monotonically. The two cases have disjoint remedies —
-/// find the holder, versus checkpoint cadence, autocheckpoint threshold and
-/// write batching — which is why naming the wrong one costs more than naming
-/// none.
-///
-/// `warn_after` is `tx_warn_secs`, the same threshold the age ladder earlier
-/// in the tick already uses to call an open span old; a second, private
-/// threshold here would let the two disagree about the same registry. An entry
-/// at or past it is named with its age and label. Anything younger, and an
-/// empty registry, take the other branch, which states what was measured and
-/// rules the pin hypothesis OUT rather than leaving it standing.
-///
-/// The age field carries `Option` on that branch rather than a zero: a young
-/// entry and no entry are different observations, and a fabricated 0.0 would
-/// make them read the same.
+/// The registry only covers this process. An old registered transaction may
+/// hold a snapshot; a young or empty registry cannot rule out an external
+/// reader. `warn_after` is the same threshold as the transaction-age ladder.
 fn log_wal_high_water_warn(
     wal_pages: u64,
     high_water: u64,
@@ -2869,8 +2853,8 @@ fn log_wal_high_water_warn(
             high_water,
             oldest_tx_age_secs = span.age.as_secs_f64(),
             oldest_tx_label = span.label.as_deref().unwrap_or("<unlabeled>"),
-            "WAL high-water mark exceeded; an open transaction older than the age \
-             threshold is pinning a snapshot PASSIVE cannot reclaim"
+            "WAL high-water mark exceeded; an in-process registered transaction is older \
+             than the age threshold and may hold a snapshot"
         ),
         None => tracing::warn!(
             wal_pages,
@@ -2879,8 +2863,9 @@ fn log_wal_high_water_warn(
             oldest_tx_label = oldest
                 .and_then(|span| span.label.as_deref())
                 .unwrap_or("<none>"),
-            "WAL high-water mark exceeded with no open transaction old enough to pin \
-             a snapshot; the WAL is growing faster than PASSIVE checkpoints reclaim it"
+            "WAL high-water mark exceeded; no in-process transaction older than the age \
+             threshold is visible; a reader in another process may hold the snapshot, \
+             or writes may outpace PASSIVE checkpoints"
         ),
     }
 }
@@ -2892,7 +2877,7 @@ fn log_wal_high_water_warn(
 #[derive(Debug)]
 #[must_use]
 struct CheckpointCoreOutcome {
-    wal_pages: u64,
+    wal_pages: Option<u64>,
     sidecar_attribution: Option<WalpinAttributionRequest>,
 }
 
@@ -2900,12 +2885,10 @@ struct CheckpointCoreOutcome {
 /// connection (`conn` — see `CheckpointConnection`; NEVER the pool's writer
 /// mutex).
 ///
-/// Returns the observed WAL page count on success. Returns `Err` only for a
-/// connection-level pragma failure (the PASSIVE pragma itself erroring) — the
-/// caller (`run_checkpoint_task`) treats that as a signal to drop `conn` and
-/// lazily reopen a fresh one next tick, reporting the tick `Skipped`. Every
-/// other error (e.g. a TRUNCATE attempt failing) is logged at warn level and
-/// treated as non-fatal; the next tick retries against the same connection.
+/// Returns the observed WAL page count on success. A busy PASSIVE row has no
+/// usable observation and the compatibility wrapper returns `SQLITE_BUSY`.
+/// A connection-level pragma error is also returned; the task caller drops
+/// that connection and reopens next tick. TRUNCATE errors remain non-fatal.
 ///
 /// The caller owns all threshold-crossing WARN logging so that warnings fire
 /// at most once per crossing, not every tick.
@@ -2925,7 +2908,16 @@ pub fn checkpoint_once(
     config: &CheckpointConfig,
     truncate_state: &mut TruncateState,
 ) -> Result<u64, rusqlite::Error> {
-    checkpoint_once_core(pool, conn, config, truncate_state).map(|outcome| outcome.wal_pages)
+    checkpoint_once_core(pool, conn, config, truncate_state)?
+        .wal_pages
+        .ok_or_else(|| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some(
+                    "PASSIVE checkpoint returned a busy row without a WAL frame observation".into(),
+                ),
+            )
+        })
 }
 
 /// Synchronous PASSIVE/TRUNCATE core used by the async task. Unlike the
@@ -2966,21 +2958,22 @@ fn checkpoint_once_core(
             raw_observation.checkpointed_frames,
         )),
     );
-    let observation = record_routine_wal_observation(pool, raw_observation);
-    let wal_pages = observation.log_frames;
-    LAST_WAL_PAGES.store(wal_pages, Ordering::Relaxed);
-    note_checkpoint_observed(wal_pages);
-
-    if raw_observation.busy != 0 {
+    let Some(wal_pages) = observed_wal_pages(raw_observation) else {
         tracing::debug!(
             busy = raw_observation.busy,
             wal_log_frames = raw_observation.log_frames,
             wal_checkpointed_frames = raw_observation.checkpointed_frames,
-            wal_pending_frames = observation.pending_frames,
-            wal_physical_bytes = ?observation.physical_wal_bytes,
-            "WAL PASSIVE checkpoint reported incomplete progress"
+            elapsed_us,
+            "WAL PASSIVE checkpoint returned a busy row; frame observation unavailable"
         );
-    }
+        return Ok(CheckpointCoreOutcome {
+            wal_pages: None,
+            sidecar_attribution: None,
+        });
+    };
+    let observation = record_routine_wal_observation(pool, raw_observation);
+    LAST_WAL_PAGES.store(wal_pages, Ordering::Relaxed);
+    note_checkpoint_observed(wal_pages);
     tracing::debug!(
         wal_pages,
         elapsed_us,
@@ -2994,9 +2987,13 @@ fn checkpoint_once_core(
     let sidecar_attribution = maybe_truncate(pool, conn, config, wal_pages, truncate_state);
 
     Ok(CheckpointCoreOutcome {
-        wal_pages,
+        wal_pages: Some(wal_pages),
         sidecar_attribution,
     })
+}
+
+fn truncate_needs_attribution(wal_pages_before: u64, wal_pages_after: Option<u64>) -> bool {
+    wal_pages_after.is_none_or(|pages| pages >= wal_pages_before)
 }
 
 /// Evaluate and, if due, attempt a TRUNCATE escalation on the same dedicated
@@ -3072,17 +3069,33 @@ fn maybe_truncate(
     match outcome {
         Ok(_) => {
             let wal_pages_after = query_wal_pages(pool, conn);
-            tracing::info!(
-                wal_pages_before,
-                wal_pages_after,
-                elapsed_ms = elapsed.as_millis() as u64,
-                "WAL TRUNCATE checkpoint attempted"
-            );
+            if let Some(pages) = wal_pages_after {
+                tracing::info!(
+                    wal_pages_before,
+                    wal_pages_after = pages,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "WAL TRUNCATE checkpoint attempted"
+                );
+            } else {
+                tracing::info!(
+                    wal_pages_before,
+                    wal_pages_after_unavailable = true,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "WAL TRUNCATE checkpoint attempted"
+                );
+            }
 
-            let made_progress = wal_pages_after < wal_pages_before;
-            if !made_progress {
+            if truncate_needs_attribution(wal_pages_before, wal_pages_after) {
                 let snapshot = khive_storage::tx_registry::snapshot();
-                log_truncate_no_progress_warn(wal_pages_before, wal_pages_after, &snapshot);
+                if let Some(pages) = wal_pages_after {
+                    log_truncate_no_progress_warn(wal_pages_before, pages, &snapshot);
+                } else {
+                    tracing::warn!(
+                        wal_pages_before,
+                        "WAL TRUNCATE progress unmeasured; checking possible holders in this process and others"
+                    );
+                    log_tx_registry_entries_warn(wal_pages_before, &snapshot);
+                }
                 #[cfg(test)]
                 if let Some(path) = pool.canonical_path() {
                     truncate_report_test_sync::after_no_progress_before_report(path);
@@ -3105,7 +3118,7 @@ fn maybe_truncate(
         Err(e) => {
             tracing::warn!(error = %e, wal_pages_before, "WAL TRUNCATE attempt failed");
             log_tx_registry_snapshot_warn(wal_pages_before);
-            note_truncate_outcome(config, wal_pages_before, truncate_state);
+            note_truncate_outcome(config, Some(wal_pages_before), truncate_state);
         }
     }
     #[cfg(unix)]
@@ -3281,14 +3294,13 @@ mod walpin_attribution_test_sync {
     }
 }
 
-/// ADR-091 Plank 2: track consecutive TRUNCATE attempts that fail to bring
-/// `wal_pages` back below `warn_pages`, firing a one-shot escalated WARN at
-/// exactly the third consecutive failure (does not repeat every attempt
-/// thereafter — mirrors the crossing-WARN debounce used elsewhere in this
-/// module). A single attempt that clears `warn_pages` resets the counter.
+/// ADR-091 Plank 2: track measured TRUNCATE outcomes that fail to bring
+/// `wal_pages` below `warn_pages`, firing a one-shot escalated WARN at the
+/// third such failure. An unmeasured attempt leaves the streak unchanged;
+/// only a measured result below `warn_pages` resets it.
 fn note_truncate_outcome(
     config: &CheckpointConfig,
-    wal_pages_after: u64,
+    wal_pages_after: Option<u64>,
     state: &mut TruncateState,
 ) {
     // Metrics read-surface (load/perf harness): this function runs exactly
@@ -3297,17 +3309,19 @@ fn note_truncate_outcome(
     // counts total attempts without a separate call site.
     TRUNCATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 
-    if wal_pages_after >= config.warn_pages {
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        if state.consecutive_failures == 3 {
-            tracing::warn!(
-                wal_pages_after,
-                warn_threshold = config.warn_pages,
-                "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts"
-            );
+    if let Some(wal_pages_after) = wal_pages_after {
+        if wal_pages_after >= config.warn_pages {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.consecutive_failures == 3 {
+                tracing::warn!(
+                    wal_pages_after,
+                    warn_threshold = config.warn_pages,
+                    "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts"
+                );
+            }
+        } else {
+            state.consecutive_failures = 0;
         }
-    } else {
-        state.consecutive_failures = 0;
     }
 
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
@@ -3636,7 +3650,9 @@ fn log_walpin_sidecar_report(
 /// ADR-091 Amendment 2 Plank C: on a TRUNCATE no-progress event, run a fresh
 /// `PRAGMA wal_checkpoint(PASSIVE)` (never blocks readers or writers) and
 /// report the one-row backfill gap as `log` minus `checkpointed` from its
-/// 3-column return row. A gap alone does not establish a reader pin. Zero
+/// 3-column return row when that row is informative. A busy or malformed row
+/// reports the gap as unavailable, never as zero. A gap alone does not
+/// establish a reader pin. Zero
 /// dependence on SQLite's shm WAL-index layout (ADR-091 Amendment 22).
 fn log_backfill_gap(pool: &ConnectionPool, conn: &rusqlite::Connection) {
     match query_backfill_gap(conn) {
@@ -3649,16 +3665,25 @@ fn log_backfill_gap(pool: &ConnectionPool, conn: &rusqlite::Connection) {
                     observation.checkpointed_frames,
                 )),
             );
-            tracing::warn!(
-                busy = observation.busy,
-                wal_log_frames = observation.log_frames,
-                wal_checkpointed_frames = observation.checkpointed_frames,
-                backfill_gap_frames = observation
-                    .log_frames
-                    .saturating_sub(observation.checkpointed_frames)
-                    .max(0),
-                "ADR-091 Plank C: WAL backfill gap after TRUNCATE no-progress"
-            );
+            if observed_wal_pages(observation).is_some() {
+                tracing::warn!(
+                    busy = observation.busy,
+                    wal_log_frames = observation.log_frames,
+                    wal_checkpointed_frames = observation.checkpointed_frames,
+                    backfill_gap_frames = observation
+                        .log_frames
+                        .saturating_sub(observation.checkpointed_frames)
+                        .max(0),
+                    "ADR-091 Plank C: WAL backfill gap after TRUNCATE no-progress"
+                );
+            } else {
+                tracing::warn!(
+                    busy = observation.busy,
+                    wal_log_frames = observation.log_frames,
+                    wal_checkpointed_frames = observation.checkpointed_frames,
+                    "ADR-091 Plank C: WAL backfill gap unavailable after TRUNCATE"
+                );
+            }
         }
         Err(e) => {
             record_checkpoint_run_result(pool, None);
@@ -3707,6 +3732,18 @@ struct RawCheckpointObservation {
     checkpointed_frames: i64,
 }
 
+fn observed_wal_pages(observation: RawCheckpointObservation) -> Option<u64> {
+    if observation.busy != 0 {
+        return None;
+    }
+    if observation.log_frames == -1 && observation.checkpointed_frames == -1 {
+        // SQLite reports an absent WAL with two -1 frame columns.
+        return Some(0);
+    }
+    (observation.log_frames >= 0 && observation.checkpointed_frames >= 0)
+        .then_some(observation.log_frames as u64)
+}
+
 /// Issue one PASSIVE checkpoint and retain the complete SQLite result row.
 /// This is the periodic task's one routine checkpoint call: the same row
 /// drives thresholds and the logical-backlog monitoring sample (#1849).
@@ -3739,7 +3776,7 @@ fn query_truncate_observation(
 /// Used only for rare post-TRUNCATE outcome measurement. The ordinary
 /// periodic path calls [`query_checkpoint_observation`] directly and stores
 /// its complete row, avoiding the former double-checkpoint pass.
-fn query_wal_pages(pool: &ConnectionPool, conn: &rusqlite::Connection) -> u64 {
+fn query_wal_pages(pool: &ConnectionPool, conn: &rusqlite::Connection) -> Option<u64> {
     let observation = query_checkpoint_observation(conn);
     record_checkpoint_run_result(
         pool,
@@ -3751,15 +3788,11 @@ fn query_wal_pages(pool: &ConnectionPool, conn: &rusqlite::Connection) -> u64 {
             )
         }),
     );
-    let pages = observation
-        .map(|observation| observation.log_frames)
-        .unwrap_or(0)
-        .max(0) as u64;
-    // Metrics read-surface (load/perf harness): mirror every observation into
-    // the process-wide gauge, regardless of which caller (`checkpoint_once`
-    // or `maybe_truncate`) triggered it.
-    LAST_WAL_PAGES.store(pages, Ordering::Relaxed);
-    note_checkpoint_observed(pages);
+    let pages = observation.ok().and_then(observed_wal_pages);
+    if let Some(pages) = pages {
+        LAST_WAL_PAGES.store(pages, Ordering::Relaxed);
+        note_checkpoint_observed(pages);
+    }
     pages
 }
 
@@ -3770,7 +3803,7 @@ mod tests {
     use crate::writer_task::WriterTaskHandle;
     use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tracing::field::{Field, Visit};
 
     static LIVE_CHECKPOINT_BUSY_HANDLER_ENTERED: AtomicBool = AtomicBool::new(false);
@@ -4915,7 +4948,7 @@ mod tests {
     /// label. This is the branch the old unconditional text was right about.
     #[test]
     #[serial(tx_registry)]
-    fn high_water_warn_names_the_pin_when_an_aged_entry_exists() {
+    fn high_water_warn_names_an_aged_registered_transaction_without_asserting_a_pin() {
         let threshold = Duration::from_secs(30);
         let (aged, _young) = spans_straddling(threshold);
 
@@ -4926,8 +4959,10 @@ mod tests {
             .find_map(|e| e.message.clone())
             .expect("one WARN is emitted");
         assert!(
-            message.contains("is pinning a snapshot"),
-            "an aged entry must produce the pin wording, got {message:?}"
+            message.contains("in-process registered transaction is older")
+                && message.contains("may hold a snapshot")
+                && !message.contains("is pinning a snapshot"),
+            "an aged entry is evidence of age, not proof of a pin: {message:?}"
         );
         assert_eq!(
             events.iter().find_map(|e| e.oldest_tx_label.clone()),
@@ -4936,11 +4971,10 @@ mod tests {
         );
     }
 
-    /// WAL over the high-water mark with nothing old enough to be pinning:
-    /// different text, and the control below is the point of the arm.
+    /// A young in-process entry does not rule out a reader in another process.
     #[test]
     #[serial(tx_registry)]
-    fn high_water_warn_rules_the_pin_out_when_the_oldest_entry_is_young() {
+    fn high_water_warn_keeps_external_reader_and_write_rate_hypotheses_when_young() {
         let threshold = Duration::from_secs(30);
         let (aged, young) = spans_straddling(threshold);
 
@@ -4960,13 +4994,13 @@ mod tests {
             "the two registry states must produce different text"
         );
         assert!(
-            young_message.contains("no open transaction old enough to pin"),
+            young_message.contains("no in-process transaction older than the age threshold")
+                && young_message.contains("a reader in another process may hold the snapshot")
+                && young_message.contains("writes may outpace PASSIVE checkpoints"),
             "got {young_message:?}"
         );
-        // THE CONTROL, and it is the exact failure being fixed: the young
-        // branch must not carry the pin hypothesis in any form.
         assert!(
-            !young_message.contains("pinning"),
+            !young_message.contains("is pinning a snapshot"),
             "the young branch must not assert a pin, got {young_message:?}"
         );
         assert!(
@@ -4975,18 +5009,19 @@ mod tests {
         );
     }
 
-    /// An empty registry is the same branch as a young entry, and it must not
-    /// be reached by the aged path through a `None` that compares as old.
+    /// An empty local registry still cannot exclude an external reader.
     #[test]
     #[serial(tx_registry)]
-    fn high_water_warn_with_an_empty_registry_takes_the_no_pin_branch() {
+    fn high_water_warn_with_an_empty_registry_keeps_external_reader_visible() {
         let events = capture(|| log_wal_high_water_warn(6003, 6000, None, Duration::from_secs(30)));
         let message = events
             .iter()
             .find_map(|e| e.message.clone())
             .expect("one WARN is emitted");
         assert!(
-            message.contains("no open transaction old enough to pin"),
+            message.contains("no in-process transaction older than the age threshold")
+                && message.contains("a reader in another process may hold the snapshot")
+                && message.contains("writes may outpace PASSIVE checkpoints"),
             "got {message:?}"
         );
         assert_eq!(
@@ -7046,6 +7081,7 @@ mod tests {
     /// `warn_pages`, and does not repeat on a fourth consecutive failure. A
     /// single attempt that clears `warn_pages` resets the counter.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn note_truncate_outcome_warns_once_at_third_consecutive_failure() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {
@@ -7060,11 +7096,11 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             // Three consecutive attempts that fail to clear warn_pages.
-            note_truncate_outcome(&config, 5000, &mut state);
-            note_truncate_outcome(&config, 5000, &mut state);
-            note_truncate_outcome(&config, 5000, &mut state);
+            note_truncate_outcome(&config, Some(5000), &mut state);
+            note_truncate_outcome(&config, Some(5000), &mut state);
+            note_truncate_outcome(&config, Some(5000), &mut state);
             // A fourth consecutive failure must not re-fire the escalation.
-            note_truncate_outcome(&config, 5000, &mut state);
+            note_truncate_outcome(&config, Some(5000), &mut state);
         });
 
         assert_eq!(state.consecutive_failures, 4);
@@ -7085,7 +7121,7 @@ mod tests {
         );
 
         // A clearing attempt resets the counter.
-        note_truncate_outcome(&config, 100, &mut state);
+        note_truncate_outcome(&config, Some(100), &mut state);
         assert_eq!(
             state.consecutive_failures, 0,
             "an attempt that clears warn_pages must reset the consecutive-failure counter"
@@ -7923,6 +7959,111 @@ mod tests {
             );
         }
         delivered
+    }
+
+    #[test]
+    fn busy_row_does_not_close_or_rearm_an_observed_pressure_episode() {
+        let config = CheckpointConfig {
+            warn_pages: 10,
+            high_water_pages: 15,
+            warn_sustained_cycles: 2,
+            ..CheckpointConfig::default()
+        };
+        let rows = [
+            RawCheckpointObservation {
+                busy: 0,
+                log_frames: 20,
+                checkpointed_frames: 5,
+            },
+            RawCheckpointObservation {
+                busy: 1,
+                log_frames: -1,
+                checkpointed_frames: -1,
+            },
+            RawCheckpointObservation {
+                busy: 0,
+                log_frames: 20,
+                checkpointed_frames: 5,
+            },
+            RawCheckpointObservation {
+                busy: 0,
+                log_frames: 5,
+                checkpointed_frames: 5,
+            },
+        ];
+        let ticks: Vec<(bool, u64)> = rows
+            .iter()
+            .filter_map(|row| observed_wal_pages(*row))
+            .map(|pages| (pages >= config.warn_pages, pages))
+            .collect();
+        assert_eq!(ticks, vec![(true, 20), (true, 20), (false, 5)]);
+
+        let elevated = drive_pressure_ticks(&config, &ticks[..2], |_| false);
+        assert_eq!(
+            elevated.len(),
+            1,
+            "busy must not emit a recovery or new elevation"
+        );
+        assert!(elevated[0].above_warn);
+        let complete = drive_pressure_ticks(&config, &ticks, |_| false);
+        assert_eq!(complete.len(), 2, "one elevation and one real recovery");
+        assert!(!complete[1].above_warn);
+        assert_eq!(complete[1].episode_elevated_ticks, Some(2));
+
+        let mut severity = CheckpointSeverityState::default();
+        let mut was_above_high_water = false;
+        let mut high_water_warnings = 0;
+        let mut rungs = Vec::new();
+        for row in rows {
+            if let Some(pages) = observed_wal_pages(row) {
+                high_water_warnings += usize::from(crossing_warn(
+                    pages >= config.high_water_pages,
+                    &mut was_above_high_water,
+                ));
+                rungs.extend(
+                    severity
+                        .observe_wal_pages(pages, &config)
+                        .into_iter()
+                        .map(|e| e.rung),
+                );
+            }
+        }
+        assert_eq!(high_water_warnings, 1);
+        assert_eq!(
+            rungs,
+            vec![CheckpointSeverityRung::Info, CheckpointSeverityRung::Warn]
+        );
+        assert!(
+            !was_above_high_water,
+            "only the measured recovery rearms high-water"
+        );
+        assert_eq!(
+            observed_wal_pages(RawCheckpointObservation {
+                busy: 1,
+                log_frames: 100,
+                checkpointed_frames: 99,
+            }),
+            None,
+            "a populated busy row is neutral too"
+        );
+        assert_eq!(
+            observed_wal_pages(RawCheckpointObservation {
+                busy: 0,
+                log_frames: -1,
+                checkpointed_frames: -1,
+            }),
+            Some(0),
+            "a nonbusy row with no WAL is a measured zero"
+        );
+        assert_eq!(
+            observed_wal_pages(RawCheckpointObservation {
+                busy: 0,
+                log_frames: 20,
+                checkpointed_frames: -1,
+            }),
+            None,
+            "a malformed frame pair must not be clamped into a measurement"
+        );
     }
 
     /// #1857 regression: a dropped recovery handoff must not fold the next,
@@ -9555,6 +9696,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .unwrap();
         conn.execute_batch("INSERT INTO t VALUES (2);").unwrap();
+        let config = CheckpointConfig {
+            truncate_high_water_pages: u64::MAX,
+            ..CheckpointConfig::default()
+        };
+        let first_pages = checkpoint_once(&pool, &conn, &config, &mut TruncateState::default())
+            .expect("initial PASSIVE observation");
+        assert!(first_pages > 0);
+        let first_sample = routine_wal_observation(&pool).expect("initial routine sample");
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
@@ -9577,25 +9726,28 @@ mod tests {
             result = Some(checkpoint_once(
                 &pool,
                 &conn,
-                &CheckpointConfig {
-                    truncate_high_water_pages: u64::MAX,
-                    ..CheckpointConfig::default()
-                },
+                &config,
                 &mut TruncateState::default(),
             ));
+            log_backfill_gap(&pool, &conn);
         });
         release_tx.send(()).unwrap();
         let competing_busy = competing.join().unwrap().unwrap();
         reader.execute_batch("COMMIT").unwrap();
-        result.unwrap().unwrap();
+        assert!(matches!(
+            result.unwrap(),
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
         assert_eq!(competing_busy, 1);
         assert_eq!(
-            routine_wal_observation(&pool).unwrap().busy,
-            1,
-            "fixture must reach SQLite busy"
+            routine_wal_observation(&pool),
+            Some(first_sample),
+            "a real busy row must preserve the last valid routine sample"
         );
+        assert_eq!(last_observed_wal_pages(), Some(first_pages));
         let timing = checkpoint_timing(&pool);
-        assert_eq!(timing.ticks, 1);
+        assert_eq!(timing.ticks, 2);
         assert_eq!(
             timing.busy_ticks, 1,
             "SQLite busy result must increment busy ticks"
@@ -9603,10 +9755,23 @@ mod tests {
         assert_eq!(timing.error_ticks, 0);
         let issued = events
             .iter()
-            .find(|event| event.message.as_deref() == Some("WAL checkpoint issued"))
-            .expect("existing tick record");
+            .find(|event| {
+                event.message.as_deref()
+                    == Some(
+                        "WAL PASSIVE checkpoint returned a busy row; frame observation unavailable",
+                    )
+            })
+            .expect("busy tick record");
         assert_eq!(issued.busy, Some(1), "tick record must retain SQLite busy");
-        assert_eq!(issued.elapsed_us, Some(timing.elapsed_us_sum));
+        assert!(issued.elapsed_us.is_some());
+        let gap = events
+            .iter()
+            .find(|event| {
+                event.message.as_deref()
+                    == Some("ADR-091 Plank C: WAL backfill gap unavailable after TRUNCATE")
+            })
+            .expect("busy probe must report an unavailable backfill gap");
+        assert_eq!(gap.backfill_gap_frames, None);
     }
 
     #[test]
@@ -9644,6 +9809,79 @@ mod tests {
             timing,
             "post-TRUNCATE observation is not a routine tick"
         );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn failed_post_truncate_measurement_preserves_last_sample_and_failure_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("unmeasured_truncate.db"));
+        let conn = checkpoint_conn(&pool);
+        let previous_pages = LAST_WAL_PAGES.swap(73, Ordering::Relaxed);
+        let previous_attempts = TRUNCATE_ATTEMPTS.load(Ordering::Relaxed);
+        let previous_failures = TRUNCATE_CONSECUTIVE_FAILURES.load(Ordering::Relaxed);
+        let checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let authorizer_calls = Arc::clone(&checkpoint_calls);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
+                if pragma_name.eq_ignore_ascii_case("wal_checkpoint"))
+            {
+                // Allow TRUNCATE, then fail exactly its post-attempt PASSIVE
+                // re-measurement. The later backfill-gap probe may still run.
+                if authorizer_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .unwrap();
+        let config = CheckpointConfig {
+            warn_pages: 10,
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::ZERO,
+            ..CheckpointConfig::default()
+        };
+        let mut state = TruncateState {
+            consecutive_failures: 2,
+            ..TruncateState::default()
+        };
+        let events = capture(|| {
+            let _ = maybe_truncate(&pool, &conn, &config, 73, &mut state);
+        });
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert!(checkpoint_calls.load(Ordering::SeqCst) >= 2);
+        assert!(state.last_attempt.is_some());
+        assert_eq!(truncate_attempts(), previous_attempts + 1);
+        assert_eq!(last_observed_wal_pages(), Some(73));
+        assert_eq!(state.consecutive_failures, 2);
+        assert_eq!(truncate_consecutive_failures(), 2);
+        assert!(events.iter().any(|event| event.message.as_deref()
+            == Some("WAL TRUNCATE progress unmeasured; checking possible holders in this process and others")));
+        assert!(truncate_needs_attribution(73, None));
+        assert!(truncate_needs_attribution(73, Some(73)));
+        assert!(!truncate_needs_attribution(73, Some(0)));
+
+        let events = capture(|| note_truncate_outcome(&config, Some(20), &mut state));
+        assert_eq!(state.consecutive_failures, 3);
+        assert_eq!(truncate_consecutive_failures(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.message.as_deref()
+                    == Some(
+                        "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts"
+                    ))
+                .count(),
+            1,
+            "unmeasured attempt must preserve the streak for the next measured failure"
+        );
+        LAST_WAL_PAGES.store(previous_pages, Ordering::Relaxed);
+        TRUNCATE_ATTEMPTS.store(previous_attempts, Ordering::Relaxed);
+        TRUNCATE_CONSECUTIVE_FAILURES.store(previous_failures, Ordering::Relaxed);
     }
 
     #[test]
