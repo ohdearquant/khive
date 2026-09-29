@@ -4352,6 +4352,8 @@ impl VerbRegistry {
     ///   event with a freshly generated id and no natural key at all.
     /// - `telemetry.emit` can append a durable stream record with a fresh
     ///   identity and sequence, depending on the configured channel policy.
+    /// - `tool.check` appends a `tool_check_decided` receipt with a fresh
+    ///   event id for every evaluated decision (ADR-180 Amendment 6).
     ///
     /// The speech-act category alone cannot rule this out — it describes
     /// what the verb tells the *caller*, not what it schedules against
@@ -4359,7 +4361,7 @@ impl VerbRegistry {
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
     pub const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
-        &["memory.recall", "search", "telemetry.emit"];
+        &["memory.recall", "search", "telemetry.emit", "tool.check"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
@@ -6612,6 +6614,7 @@ pub(crate) mod tests {
             ("search", "/../khive-pack-kg/src/handler_defs.rs"),
             ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
             ("telemetry.emit", "/../khive-pack-telemetry/src/pack.rs"),
+            ("tool.check", "/../khive-pack-tool/src/vocab.rs"),
         ];
         assert_eq!(
             sources.len(),
