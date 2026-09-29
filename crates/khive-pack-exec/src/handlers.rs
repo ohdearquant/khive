@@ -26,13 +26,21 @@ use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
-use crate::capture::{drain, walk, CaptureRead, Tail};
+#[cfg(unix)]
+use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
 
 const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOOL_BINARY_BYTES: u64 = MAX_RUN_INPUT_BYTES;
+#[cfg(unix)]
+const OUTPUT_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+type CaptureBeforeReadHook = (PathBuf, Arc<dyn Fn(&Path) + Send + Sync>);
+#[cfg(test)]
+static CAPTURE_BEFORE_READ_HOOK: Mutex<Vec<CaptureBeforeReadHook>> = Mutex::new(Vec::new());
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -1415,6 +1423,9 @@ async fn execute(
         return Ok(());
     }
     receipt.owned_run_dir = Some(run_dir.clone());
+    let capture_root = CaptureRoot::open(&run_dir).map_err(|error| {
+        RuntimeError::Unconfigured(format!("open capture root {}: {error}", run_dir.display()))
+    })?;
     if let Err(error) = receipts::event(
         rt,
         ns,
@@ -1536,8 +1547,9 @@ async fn execute(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
     let cap = cfg.max_output_bytes;
-    let out_task = tokio::spawn(async move { drain(stdout, cap).await });
-    let err_task = tokio::spawn(async move { drain(stderr, cap).await });
+    let deadline = wall_started + req.timeout;
+    let out_task = tokio::spawn(async move { drain_until(stdout, cap, deadline).await });
+    let err_task = tokio::spawn(async move { drain_until(stderr, cap, deadline).await });
 
     let (enforced, waited) = collect_report_and_wait(
         wall_started,
@@ -1570,8 +1582,15 @@ async fn execute(
     };
     // Whatever the child left behind in its group ends with the run.
     kill_group(pid);
-    let out: Tail = out_task.await.unwrap_or_else(|_| Tail::new(cap));
-    let err: Tail = err_task.await.unwrap_or_else(|_| Tail::new(cap));
+    let out = collect_stream(out_task, deadline, cap).await;
+    let err = collect_stream(err_task, deadline, cap).await;
+    if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
+        receipt.timed_out = true;
+        append_failure_reason(receipt, "output collection reached the run deadline".into());
+    }
+    if out.stop == DrainStop::ReadError || err.stop == DrainStop::ReadError {
+        append_failure_reason(receipt, "output collection failed to read a stream".into());
+    }
     receipt.finished_at = Some(receipts::now_micros());
     if let Err(error) = receipts::event(
         rt,
@@ -1592,18 +1611,18 @@ async fn execute(
     }
 
     // Outputs.
-    receipt.stdout_produced = out.produced();
-    receipt.stderr_produced = err.produced();
-    let out_bytes = out.retained();
-    let err_bytes = err.retained();
+    receipt.stdout_produced = out.tail.produced();
+    receipt.stderr_produced = err.tail.produced();
+    let out_bytes = out.tail.retained();
+    let err_bytes = err.tail.retained();
     receipt.stdout_retained = out_bytes.len() as u64;
     receipt.stderr_retained = err_bytes.len() as u64;
-    receipt.stdout_capture = if out.complete() {
+    receipt.stdout_capture = if out.stop == DrainStop::Eof && out.tail.complete() {
         "complete"
     } else {
         "incomplete"
     };
-    receipt.stderr_capture = if err.complete() {
+    receipt.stderr_capture = if err.stop == DrainStop::Eof && err.tail.complete() {
         "complete"
     } else {
         "incomplete"
@@ -1615,7 +1634,8 @@ async fn execute(
     // receipt rather than propagating past receipt insertion in `run`.
     let captured: Result<(), RuntimeError> = async {
         let (found, skipped) =
-            walk(&run_dir).map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
+            walk(&capture_root)
+                .map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
         receipt.skipped = skipped;
         let input: BTreeMap<&str, &TreeEntry> =
             ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -1636,6 +1656,16 @@ async fn execute(
                     out_entries.push((*old).clone());
                 }
                 continue;
+            }
+            #[cfg(test)]
+            if let Some(hook) = CAPTURE_BEFORE_READ_HOOK
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(root, _)| run_dir.starts_with(root))
+                .map(|(_, hook)| Arc::clone(hook))
+            {
+                hook(&run_dir.join(path));
             }
             let captured = file
                 .read_content_bounded(khive_storage::MAX_BLOB_WHOLE_BYTES)
@@ -1831,6 +1861,29 @@ fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
 }
 
 #[cfg(unix)]
+async fn collect_stream(
+    mut task: tokio::task::JoinHandle<Drained>,
+    deadline: tokio::time::Instant,
+    cap: u64,
+) -> Drained {
+    match tokio::time::timeout_at(deadline + OUTPUT_CLOSE_GRACE, &mut task).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => Drained {
+            tail: Tail::new(cap),
+            stop: DrainStop::ReadError,
+        },
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Drained {
+                tail: Tail::new(cap),
+                stop: DrainStop::Deadline,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn collect_report_and_wait<R, W, T>(
     started: tokio::time::Instant,
     timeout: Duration,
@@ -1896,6 +1949,10 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]
 mod grant_pin_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "capture_run_tests.rs"]
+mod capture_run_tests;
 
 #[cfg(all(test, unix))]
 mod tests {
