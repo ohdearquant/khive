@@ -16,7 +16,7 @@ use khive_storage::{
 use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
-use crate::policy::{self, actor_label, now_micros, Decision};
+use crate::policy::{self, actor_label, now_micros, Decision, DecisionCaller, DecisionInvocation};
 use crate::vocab::{
     CAPABILITY_TAG, DECISIONS, KINDS, REGISTRY_ENTITY_KIND, REGISTRY_TAG, SIDE_EFFECTS,
     TRUST_ORIGINS,
@@ -836,24 +836,58 @@ async fn decision_for(
     token: &NamespaceToken,
     reference: &str,
     actor: &str,
+    with_receipt: bool,
 ) -> Result<(String, bool, Decision), RuntimeError> {
     let ns = token.namespace().as_str().to_string();
     match resolve_tool(rt, token, reference).await {
         Ok(entity) => {
             let registration = RegistryPin::from_entity(&entity)?;
-            let d = policy::decide(
-                rt,
-                &ns,
-                actor,
-                &entity.name,
-                side_effect_of(&entity).as_deref(),
-                Some(&registration),
-            )
-            .await?;
+            let side_effect = side_effect_of(&entity);
+            let d = if with_receipt {
+                policy::decide_with_receipt(
+                    rt,
+                    DecisionInvocation {
+                        token,
+                        actor,
+                        tool: &entity.name,
+                        registered: true,
+                        caller: DecisionCaller::ToolCheck,
+                    },
+                    side_effect.as_deref(),
+                    Some(&registration),
+                )
+                .await?
+            } else {
+                policy::decide(
+                    rt,
+                    &ns,
+                    actor,
+                    &entity.name,
+                    side_effect.as_deref(),
+                    Some(&registration),
+                )
+                .await?
+            };
             Ok((entity.name.clone(), true, d))
         }
         Err(RuntimeError::NotFound(_)) => {
-            let d = policy::decide(rt, &ns, actor, reference, None, None).await?;
+            let d = if with_receipt {
+                policy::decide_with_receipt(
+                    rt,
+                    DecisionInvocation {
+                        token,
+                        actor,
+                        tool: reference,
+                        registered: false,
+                        caller: DecisionCaller::ToolCheck,
+                    },
+                    None,
+                    None,
+                )
+                .await?
+            } else {
+                policy::decide(rt, &ns, actor, reference, None, None).await?
+            };
             Ok((reference.to_string(), false, d))
         }
         Err(e) => Err(e),
@@ -867,7 +901,7 @@ pub(crate) async fn check(
 ) -> Result<Value, RuntimeError> {
     let reference = req_str(&params, "tool")?;
     let actor = opt_str(&params, "actor")?.unwrap_or_else(|| actor_label(token));
-    let (name, registered, decision) = decision_for(rt, token, &reference, &actor).await?;
+    let (name, registered, decision) = decision_for(rt, token, &reference, &actor, true).await?;
     let mut v = decision.to_json();
     v["ok"] = json!(true);
     v["tool"] = json!(name);
@@ -889,7 +923,7 @@ pub(crate) async fn request(
     let notify = opt_str(&params, "notify")?;
     let ns = token.namespace().as_str().to_string();
 
-    let (name, registered, decision) = decision_for(rt, token, &reference, &actor).await?;
+    let (name, registered, decision) = decision_for(rt, token, &reference, &actor, false).await?;
     if decision.decision == "allow" {
         let mut v = decision.to_json();
         v["ok"] = json!(true);
@@ -1074,6 +1108,9 @@ pub(crate) async fn policies(
 #[cfg(test)]
 #[path = "claim_tests.rs"]
 mod claim_tests;
+#[cfg(test)]
+#[path = "decision_receipt_tests.rs"]
+mod decision_receipt_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

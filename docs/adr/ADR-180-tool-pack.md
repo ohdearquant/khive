@@ -575,3 +575,68 @@ and linked to.
   code fix.
 
 Refs: #3307, #3308.
+
+## Amendment 6 (2026-09-29): policy checks leave ordered decision receipts
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent
+implementation merges.**
+
+`tool.check` answers a policy question, but a caller cannot distinguish a gate
+refusal from a policy decision by counting generic dispatch audit rows. The
+ADR-018 gate already appends an `Audit` event when it refuses a read-classified
+verb before its handler runs (`crates/khive-runtime/src/pack.rs`, the denied
+dispatch branch around lines 3221–3247). It also appends a generic `Audit` row
+after an allowed dispatch (the same file around lines 3550–3595). Those rows
+remain untouched. A policy decision needs a separate typed event kind.
+
+1. Once either `tool.check` or the `exec.run` policy preflight has computed a
+   decision, the shared tool-policy seam appends exactly one event of kind
+   `tool_check_decided`, verb `tool.check`, substrate `event`, and the caller's
+   namespace and authenticated actor. Its typed data is `{actor, tool,
+   registered, decision, source, id, scope, caller_verb}`. `actor` is the actor
+   whose use was evaluated, which may differ from the authenticated event
+   actor; `id` is the deciding grant or policy row id, or null for a default;
+   `caller_verb` is `tool.check` or `exec.run`. `scope` is null when the
+   evaluation supplies none, including current `exec.run` preflight. The
+   event outcome is `success` when evaluation completed, even if the policy
+   decision was `deny` or `ask`; readers use `data.decision` for that result.
+   The existing response shape does not change. A failed event append prevents a
+   successful decision response or an allowed exec preflight.
+2. A gate refusal of `tool.check` or `exec.run` never reaches the policy seam
+   and leaves zero `tool_check_decided` events. The generic `Audit` event for
+   that refusal may still exist. Other policy probes (`tool.suggest`,
+   `tool.describe`, and `tool.request`) do not emit this kind; they are not
+   invocations of the two named decision paths. The receipt records the
+   decision having been taken, not a mutation of the policy or graph
+   substrates, so `tool.check` remains assertive under ADR-025.
+3. The caller reads `list(kind="event", event_kinds=["tool_check_decided"],
+   verb="tool.check", actor=<authenticated actor>, since=<microseconds>)`.
+   The current `event_kinds` wire field maps to `EventFilter.kinds`
+   (`crates/khive-pack-kg/src/handler_defs.rs` and
+   `crates/khive-pack-kg/src/handlers/common.rs`). The list returns newest
+   first by `(created_at DESC, event_id DESC)` as ADR-022 specifies. The
+   caller retains the largest processed pair `(created_at, event_id)`, where
+   `created_at` is converted to microseconds, and requests
+   `since=max(created_at-1, 0)` on the next poll. It discards returned rows
+   with `created_at < cursor.created_at`, or with equal `created_at` and
+   `event_id <= cursor.event_id`; the remaining rows are after the cursor.
+   The one-microsecond overlap is necessary because the shipped `since`
+   predicate is strictly `created_at > since`. Event id breaks ties by
+   canonical UUID order, giving a stable replay order rather than a claim of
+   causal insertion order among same-microsecond events.
+4. `tool_check_decided` is `age_archivable`, the same ADR-168 class as
+   `RecallExecuted`, `RerankExecuted`, and `SearchExecuted` (Table A rows
+   10–12). It is pure decision telemetry without a graph referent. An
+   archive horizon is disclosed under ADR-168; a live list does not promise
+   indefinite retention.
+
+Acceptance: a gate refusal yields no decision-kind row after the cursor; an
+allowed `tool.check` yields exactly one with the evaluated actor and tool;
+deny-then-allow and allow-then-deny checks yield distinguishable decision
+sequences when ordered by the event cursor; `exec.run` preflight yields the
+same data with `caller_verb="exec.run"`. A pair forced to share one
+microsecond remains recoverable through the overlap and id filter. Removing
+the shared emission call, emitting before the gate, or dropping `caller_verb`
+must turn the corresponding acceptance arm red.
+
+Refs: #2687, ADR-004, ADR-018, ADR-022, ADR-025, ADR-168, ADR-181.
