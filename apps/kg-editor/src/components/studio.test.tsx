@@ -283,4 +283,37 @@ describe("KG Studio", () => {
     expect(await screen.findByText(/Loaded review bundle/i)).toBeVisible();
     expect(screen.queryByText("Only for review 184")).not.toBeInTheDocument();
   });
+
+  it("uses the same command palette for review views and excludes approval actions", async () => {
+    const user = userEvent.setup();
+    render(<Studio initialBundle={demoReviewFixture} />);
+    await user.keyboard("{Control>}k{/Control}");
+    const dialog = screen.getByRole("dialog", { name: "Review commands" });
+    expect(within(dialog).getByRole("option", { name: /Repository showcase/i }))
+      .toBeVisible();
+    expect(within(dialog).queryByRole("option", { name: /Approve locally/i }))
+      .not.toBeInTheDocument();
+
+    await user.type(screen.getByRole("combobox", { name: "Search review commands" }), "Activity");
+    await user.keyboard("{Enter}");
+    expect(screen.queryByRole("dialog", { name: "Review commands" }))
+      .not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Activity" })).toBeVisible();
+  });
+
+  it("traverses actionable change rows with j/k and opens one with Enter", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
+    const rows = Array.from(container.querySelectorAll<HTMLButtonElement>(
+      ".change-list [data-keyboard-row]",
+    ));
+    expect(rows.length).toBeGreaterThan(1);
+    rows[0].focus();
+    await user.keyboard("j");
+    expect(rows[1]).toHaveFocus();
+    await user.keyboard("k");
+    expect(rows[0]).toHaveFocus();
+    await user.keyboard("j{Enter}");
+    expect(rows[1]).toHaveAttribute("aria-expanded", "true");
+  });
 });

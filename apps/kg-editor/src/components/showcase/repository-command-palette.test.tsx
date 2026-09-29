@@ -8,6 +8,11 @@ import { RepositoryCommandPalette } from "@/components/showcase/repository-comma
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
 import { REPOSITORY_VIEW_IDS } from "@/lib/repository-location";
 
+type RepoPaletteProps = Extract<
+  React.ComponentProps<typeof RepositoryCommandPalette>,
+  { bundle: RepoBundle }
+>;
+
 const goldenPath = resolve(
   process.cwd(),
   "../../docs/schemas/examples/khive-repo-v1-khive.json",
@@ -18,11 +23,10 @@ function golden(): RepoBundle {
 }
 
 function renderPalette(
-  overrides: Partial<React.ComponentProps<typeof RepositoryCommandPalette>> =
-    {},
+  overrides: Partial<RepoPaletteProps> = {},
 ) {
   const bundle = golden();
-  const props: React.ComponentProps<typeof RepositoryCommandPalette> = {
+  const props: RepoPaletteProps = {
     bundle,
     activeView: "structure_graph",
     selectedModuleId: bundle.graph.modules.items[0]?.id ?? null,
@@ -206,6 +210,20 @@ describe("repository command palette", () => {
       ),
     )).toHaveTextContent(/Truncated.*module page reached its export bound/i);
     expect(screen.getByText(/Up to 8 module matches/i)).toBeVisible();
+  });
+
+  it("registers app navigation without exposing review decisions", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.keyboard("{Control>}k{/Control}");
+
+    const dialog = screen.getByRole("dialog", { name: "Repository commands" });
+    expect(within(dialog).getByRole("option", { name: /Repository showcase/i }))
+      .toBeVisible();
+    expect(within(dialog).getByRole("option", { name: /KG review/i }))
+      .toBeVisible();
+    expect(within(dialog).queryByRole("option", { name: /Approve locally/i }))
+      .not.toBeInTheDocument();
   });
 
   it("does not claim complete module search coverage when a next page exists", async () => {

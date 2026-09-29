@@ -35,7 +35,7 @@ import {
   X,
   XCircle,
 } from "@/icons";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   edgeDirectionMark,
@@ -48,7 +48,9 @@ import {
   RelationMark,
 } from "@/components/ontology-mark";
 import { DataState } from "@/components/data-state";
+import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
 import { settleGraphLayout } from "@/lib/graph-layout";
+import { handleKeyboardRows } from "@/lib/keyboard-rows";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import {
   isReviewReport,
@@ -183,10 +185,12 @@ function Header({
   bundle,
   onImport,
   onDownload,
+  commandPalette,
 }: {
   bundle: ReviewBundle;
   onImport: () => void;
   onDownload: () => void;
+  commandPalette: ReactNode;
 }) {
   return (
     <header className="topbar">
@@ -199,11 +203,7 @@ function Header({
         <span className="brand-name">khive</span>
         <span className="brand-product">KG Studio</span>
       </div>
-      <div className="global-search" aria-label="Global search preview">
-        <Search aria-hidden="true" />
-        <span>Search this graph</span>
-        <kbd>⌘ K</kbd>
-      </div>
+      {commandPalette}
       <div className="topbar-actions">
         <button className="button quiet" type="button" onClick={onImport} aria-label="Import review bundle">
           <Upload aria-hidden="true" />
@@ -243,13 +243,15 @@ function Sidebar({ bundle, activeView, onView }: { bundle: ReviewBundle; activeV
         <ChevronDown aria-hidden="true" />
       </div>
 
-      <nav className="side-nav" aria-label="Review navigation">
+      <nav className="side-nav" aria-label="Review navigation" data-keyboard-list>
         <span className="side-label">Review</span>
         {navigation.map((item) => {
           const Icon = item.icon;
           return (
             <button
               key={item.id}
+              data-keyboard-row
+              aria-keyshortcuts="J K Enter"
               className={activeView === item.id ? "active" : ""}
               type="button"
               onClick={() => onView(item.id)}
@@ -348,10 +350,12 @@ function WorkspaceTabs({ activeView, onView, bundle }: { activeView: View; onVie
     { id: "activity", label: "Conversation", count: bundle.activity.items.length },
   ];
   return (
-    <div className="workspace-tabs" role="tablist" aria-label="Review views">
+    <div className="workspace-tabs" role="tablist" aria-label="Review views" data-keyboard-list>
       {tabs.map((tab) => (
         <button
           type="button"
+          data-keyboard-row
+          aria-keyshortcuts="J K Enter"
           role="tab"
           aria-selected={activeView === tab.id}
           className={activeView === tab.id ? "active" : ""}
@@ -406,7 +410,7 @@ function ChangeOntologyMark({ change }: { change: ReviewChange }) {
 function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; selected: boolean; onSelect: () => void }) {
   return (
     <article className={`change-card ${change.change} ${selected ? "selected" : ""}`}>
-      <button className="change-summary" type="button" onClick={onSelect} aria-expanded={selected}>
+      <button className="change-summary" type="button" data-keyboard-row aria-keyshortcuts="J K Enter" onClick={onSelect} aria-expanded={selected}>
         <span className="change-sign" aria-hidden="true">
           {change.change === "added" ? "+" : change.change === "removed" ? "−" : "~"}
         </span>
@@ -466,7 +470,7 @@ function ChangesView({
         <span><i className="removed" /> {grouped.removed.length} removed</span>
         <span className="content-hash"><Box aria-hidden="true" /> {bundle.snapshot_identity.hash_status === "fixture" ? "Fixture KG" : "KG"} {displaySnapshotHash(bundle, 10)}</span>
       </div>
-      <div className="change-list">
+      <div className="change-list" data-keyboard-list>
         {filtered.map((change) => (
           <ChangeCard
             key={change.id}
@@ -658,6 +662,8 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
               <li key={`${edge.id}-summary`}>
                 <button
                   type="button"
+                  data-keyboard-row
+                  aria-keyshortcuts="J K Enter"
                   className={selection.type === "edge" && edge.id === selection.id ? "selected" : ""}
                   aria-pressed={selection.type === "edge" && edge.id === selection.id}
                   onClick={() => selectEdge(edge.id)}
@@ -1037,18 +1043,22 @@ function CoreReviewStudio({
   onUseDemo: () => void;
 }) {
   return (
-    <div className="app-shell core-report-shell">
+    <div className="app-shell core-report-shell" onKeyDown={handleKeyboardRows}>
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
           <span className="brand-name">khive</span>
           <span className="brand-product">KG Studio</span>
         </div>
-        <div className="global-search core-report-label">
-          <FileJson2 aria-hidden="true" />
-          <span>khive.review.v1 · headless report</span>
-          <kbd>read only</kbd>
-        </div>
+        <RepositoryCommandPalette
+          surface="review"
+          triggerClassName="global-search"
+          views={[]}
+          activeReviewView="core-report"
+          onSelectReviewView={() => undefined}
+          onDownloadReview={onDownload}
+          downloadSubject="report"
+        />
         <div className="topbar-actions">
           <button className="button quiet" type="button" onClick={onUseDemo} aria-label="Use demo review bundle"><Database aria-hidden="true" /><span className="mobile-action-label">Use demo</span></button>
           <button className="button quiet" type="button" onClick={onImport} aria-label="Import review report"><Upload aria-hidden="true" /><span className="mobile-action-label">Import</span></button>
@@ -1243,8 +1253,26 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
   }
 
   return (
-    <div className="app-shell">
-      <Header bundle={bundle} onImport={() => fileInput.current?.click()} onDownload={downloadBundle} />
+    <div className="app-shell" onKeyDown={handleKeyboardRows}>
+      <Header
+        bundle={bundle}
+        onImport={() => fileInput.current?.click()}
+        onDownload={downloadBundle}
+        commandPalette={
+          <RepositoryCommandPalette
+            surface="review"
+            triggerClassName="global-search"
+            views={Object.entries(viewLabels).map(([id, label]) => ({ id, label }))}
+            activeReviewView={activeView}
+            onSelectReviewView={(view) => {
+              setActiveView(view as View);
+              queueMicrotask(() => document.querySelector<HTMLElement>(".review-surface")?.focus());
+            }}
+            onCopyCli={copyCli}
+            onDownloadReview={downloadBundle}
+          />
+        }
+      />
       {filePicker}
       <button className="mobile-menu" type="button" onClick={() => setSidebarOpen((open) => !open)} aria-label="Toggle navigation"><Menu /></button>
       <div className="app-body">
@@ -1256,7 +1284,7 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
           <PullRequestHeader bundle={bundle} onCopy={() => void copyCli()} />
           <WorkspaceTabs activeView={activeView} onView={setActiveView} bundle={bundle} />
           <div className="review-layout">
-            <section className="review-surface" aria-label={viewLabels[activeView]}>
+            <section className="review-surface" aria-label={viewLabels[activeView]} data-keyboard-scope tabIndex={-1}>
               <ViewSurface
                 key={`${bundle.repository.owner}/${bundle.repository.name}#${bundle.pull_request.number}@${bundle.pull_request.head_sha}`}
                 activeView={activeView}
