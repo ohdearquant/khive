@@ -1766,7 +1766,7 @@ impl KhiveRuntime {
         // only the embedding re-insert needs an async step outside it.
         if !dry_run && !embedding_plan.is_empty() {
             match self
-                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan)
+                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan, None)
                 .await
             {
                 Ok(report) => summary.embedding_truncation = report,
@@ -1908,6 +1908,34 @@ impl KhiveRuntime {
         ]
     }
 
+    pub(crate) async fn publish_entity_vector_revision(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        model_name: &str,
+        vector: &[f32],
+    ) -> RuntimeResult<bool> {
+        self.vectors_for_model(token, model_name)?;
+        let (storage_model, dimensions) = self.vector_model_metadata(model_name)?;
+        if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "non-finite entity vector at index {index}"
+            )));
+        }
+        if vector.len() != dimensions {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity vector has {} dimensions; expected {dimensions}",
+                vector.len()
+            )));
+        }
+        let table = format!("vec_{}", crate::config::sanitize_key(&storage_model));
+        let statements =
+            Self::entity_vector_insert_statements(&table, entity, &storage_model, vector);
+        #[cfg(test)]
+        race_seam::pause_before_entity_vector_publish().await;
+        self.apply_entity_index_revision(entity, statements).await
+    }
+
     /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
     /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
@@ -1926,7 +1954,18 @@ impl KhiveRuntime {
         entity: &Entity,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         let embedding_plan = EmbeddingModelPlan::capture(self);
-        self.reindex_entity_with_plan(token, entity, &embedding_plan)
+        self.reindex_entity_with_plan(token, entity, &embedding_plan, None)
+            .await
+    }
+
+    pub(crate) async fn reindex_entity_with_precomputed(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        mut precomputed: HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>,
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        self.reindex_entity_with_plan(token, entity, &embedding_plan, Some(&mut precomputed))
             .await
     }
 
@@ -1935,6 +1974,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         entity: &Entity,
         embedding_plan: &EmbeddingModelPlan,
+        mut precomputed: Option<&mut HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>>,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         // Test-only fault seam: force the post-commit FTS leg to fail after a
         // merge or update has already persisted its entity row.
@@ -1965,75 +2005,30 @@ impl KhiveRuntime {
 
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
-            match self
-                .embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
-                .await
+            let embedding = match precomputed
+                .as_mut()
+                .and_then(|outcomes| outcomes.remove(model_name))
             {
+                Some(outcome) => Ok(outcome),
+                None => {
+                    self.embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
+                        .await
+                }
+            };
+            match embedding {
                 Ok(outcome) => {
                     report.observe(&outcome);
-                    match self.vectors_for_model(token, model_name) {
-                        Ok(_) => {
-                            if let Some(index) =
-                                outcome.vector.iter().position(|value| !value.is_finite())
-                            {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %entity.id,
-                                    index,
-                                    "reindex_entity: non-finite vector, skipping model"
-                                );
-                                continue;
-                            }
-                            let (storage_model, dimensions) = match self
-                                .vector_model_metadata(model_name)
-                            {
-                                Ok(metadata) => metadata,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        model = model_name,
-                                        id = %entity.id,
-                                        "reindex_entity: could not resolve vector model, skipping: {e}"
-                                    );
-                                    continue;
-                                }
-                            };
-                            if outcome.vector.len() != dimensions {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %entity.id,
-                                    "reindex_entity: vector dimensions do not match model, skipping"
-                                );
-                                continue;
-                            }
-                            let table =
-                                format!("vec_{}", crate::config::sanitize_key(&storage_model));
-                            let statements = Self::entity_vector_insert_statements(
-                                &table,
-                                entity,
-                                &storage_model,
-                                &outcome.vector,
-                            );
-                            #[cfg(test)]
-                            race_seam::pause_before_entity_vector_publish().await;
-                            match self.apply_entity_index_revision(entity, statements).await {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        model = model_name,
-                                        id = %entity.id,
-                                        "reindex_entity: vector insert failed, skipping model: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                model = model_name,
-                                id = %entity.id,
-                                "reindex_entity: could not access vector store for model, skipping: {e}"
-                            );
-                        }
+                    match self
+                        .publish_entity_vector_revision(token, entity, model_name, &outcome.vector)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => tracing::warn!(
+                            model = model_name,
+                            id = %entity.id,
+                            "reindex_entity: vector insert failed, skipping model: {error}"
+                        ),
                     }
                 }
                 Err(e) => {
@@ -13610,7 +13605,7 @@ mod tests {
         let embedding_plan = EmbeddingModelPlan::capture(&rt);
         rt.register_embedder(MergeTestVecProvider::new(LATE, DIMS));
 
-        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan)
+        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan, None)
             .await
             .expect("reindex entity with captured merge plan");
 
