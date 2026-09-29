@@ -33,12 +33,13 @@ SQLite itself never required. Production evidence for the original design's
 cost: 22 caller-side `pool.writer()` admission timeouts on 2026-08-02 across
 the fleet, sustained bursts, against a persistent 64MiB WAL — a PASSIVE pass
 over a WAL that large ran long enough to starve every concurrent writer for
-the tick's duration. A tick is `Skipped` only when the dedicated connection
+the tick's duration. A tick is `Skipped` when the dedicated connection
 itself is unavailable (never opened yet, e.g. an in-memory or read-only
 pool, or dropped after a prior tick's connection-level pragma failure, which
-`CheckpointConnection::ensure_open` lazily reopens on the next tick) — a busy
-pool writer no longer produces a Skipped tick at all; PASSIVE now runs
-unconditionally on every tick regardless of concurrent write traffic.
+`CheckpointConnection::ensure_open` lazily reopens on the next tick), or when
+its PASSIVE result supplies no usable frame observation. A busy pool writer
+no longer produces a Skipped tick at all; PASSIVE runs on the dedicated
+connection regardless of concurrent write traffic.
 
 _Original design (superseded above, kept for history):_ `checkpoint_once`
 used `try_writer_nowait` (zero-wait `try_lock`) so a tick was skipped
@@ -70,7 +71,7 @@ for the full admission-vs-SQLite-lock distinction.
 
 **Threshold-crossing WARN semantics**: both the `warn_pages` and
 `high_water_pages` warnings fire at most once per below→above crossing.
-Skipped ticks (dedicated connection unavailable or a busy PASSIVE row) leave the crossing state
+Skipped ticks (dedicated connection unavailable or a busy or inconsistent PASSIVE row) leave the crossing state
 unchanged so that a skip cannot spuriously re-arm the rate limit while WAL
 pressure is still elevated. The ADR-091 Plank 0 open-transaction-registry
 WARNs (oldest-entry escalation and the high-water snapshot enumeration) ride
@@ -256,11 +257,14 @@ severity, high-water, and lifecycle episode states unchanged. A direct
 `checkpoint_once` caller receives `SQLITE_BUSY` for that unavailable sample.
 The sample's timestamp remains the time of the last valid row. A nonbusy
 `(-1, -1)` frame pair means no WAL and is measured as zero; a mixed negative
-pair is unavailable rather than clamped to zero.
+pair is unavailable rather than clamped to zero. A nonbusy inconsistent pair
+is reported as an inconsistent-result `SQLITE_ERROR`, never as a busy row;
+the periodic task skips that tick without replacing the last valid sample.
 
 The `WAL checkpoint issued` DEBUG record carries `elapsed_us` and the raw
 SQLite `busy` result for a measured row; an unavailable row has a separate
-DEBUG record with the same timing and busy fields. `checkpoint_timing(pool)`
+DEBUG record for busy or WARN record for inconsistent frames, each retaining
+the raw timing and busy fields. `checkpoint_timing(pool)`
 reads cumulative per-store
 routine PASSIVE call count, elapsed-microsecond sum/max, busy count, and error count.
 Timing encloses only the actual PASSIVE call; a busy row counts as a call, while a
