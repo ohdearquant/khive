@@ -52,22 +52,33 @@ impl Fixture {
     }
 
     async fn decisions(&self, since: i64) -> Vec<Value> {
-        let result = self
-            .registry
-            .dispatch(
-                "list",
-                json!({
-                    "kind": "event",
-                    "event_kinds": ["tool_check_decided"],
-                    "verb": "tool.check",
-                    "actor": format!("{}:{}", self.token.actor().kind, self.token.actor().id),
-                    "since": since,
-                    "limit": 20,
-                }),
-            )
-            .await
-            .expect("list decision events");
-        result["items"].as_array().expect("list items").clone()
+        let mut offset = 0_u32;
+        let mut items = Vec::new();
+        loop {
+            let result = self
+                .registry
+                .dispatch(
+                    "list",
+                    json!({
+                        "kind": "event",
+                        "event_kinds": ["tool_check_decided"],
+                        "verb": "tool.check",
+                        "actor": format!("{}:{}", self.token.actor().kind, self.token.actor().id),
+                        "since": since,
+                        "limit": 20,
+                        "offset": offset,
+                    }),
+                )
+                .await
+                .expect("list decision events");
+            let page = result["items"].as_array().expect("list items");
+            items.extend(page.iter().cloned());
+            if !result["has_more"].as_bool().expect("has_more flag") {
+                return items;
+            }
+            assert!(!page.is_empty(), "has_more requires a nonempty page");
+            offset += u32::try_from(page.len()).expect("bounded page length");
+        }
     }
 
     async fn set_policy(&self, tool: &str, decision: &str, replaces: Option<&str>) -> String {
@@ -324,25 +335,23 @@ async fn credential_shaped_check_input_leaves_no_receipt_carrying_it() {
     }
 }
 
-/// Caller side of the catch-up procedure in the ADR: re-read a window behind
-/// the newest row seen, and deduplicate by event id instead of by id order.
+/// Caller side of the catch-up procedure in the ADR: keep the exclusive floor
+/// fixed and deduplicate every returned id for the observation horizon.
 struct DecisionPoller {
-    window: i64,
-    newest: i64,
+    since: i64,
     seen: HashMap<Uuid, i64>,
 }
 
 impl DecisionPoller {
-    fn new(window: i64) -> Self {
+    fn new(since: i64) -> Self {
         Self {
-            window,
-            newest: 0,
+            since,
             seen: HashMap::new(),
         }
     }
 
     async fn poll(&mut self, fixture: &Fixture) -> Vec<Uuid> {
-        let since = self.newest.saturating_sub(self.window + 1).max(0);
+        let since = self.since;
         let mut fresh = Vec::new();
         for row in fixture.decisions(since).await {
             let at = khive_runtime::rfc3339_to_utc_micros(row["created_at"].as_str().unwrap())
@@ -351,16 +360,13 @@ impl DecisionPoller {
             if self.seen.insert(id, at).is_none() {
                 fresh.push((at, id));
             }
-            self.newest = self.newest.max(at);
         }
-        let floor = self.newest - self.window;
-        self.seen.retain(|_, at| *at >= floor);
         fresh.sort();
         fresh.into_iter().map(|(_, id)| id).collect()
     }
 }
 
-async fn append_receipt(fixture: &Fixture, id: Uuid, created_at: i64) {
+fn receipt(fixture: &Fixture, id: Uuid, created_at: i64) -> khive_storage::Event {
     let mut event = khive_storage::Event::new(
         "local",
         "tool.check",
@@ -371,6 +377,10 @@ async fn append_receipt(fixture: &Fixture, id: Uuid, created_at: i64) {
     .with_payload(json!({"actor":"agent:receipt","tool":"late"}));
     event.id = id;
     event.created_at = created_at;
+    event
+}
+
+async fn append_receipt_event(fixture: &Fixture, event: khive_storage::Event) {
     fixture
         .runtime
         .events(&fixture.token)
@@ -380,12 +390,16 @@ async fn append_receipt(fixture: &Fixture, id: Uuid, created_at: i64) {
         .expect("receipt append");
 }
 
+async fn append_receipt(fixture: &Fixture, id: Uuid, created_at: i64) {
+    append_receipt_event(fixture, receipt(fixture, id, created_at)).await;
+}
+
 #[tokio::test]
 async fn late_arrival_sharing_the_cursor_microsecond_is_returned() {
     let fixture = Fixture::new(false);
     let timestamp = now_micros();
     let first = Uuid::from_u128(2);
-    let mut poller = DecisionPoller::new(1_000_000);
+    let mut poller = DecisionPoller::new(timestamp.saturating_sub(1));
 
     append_receipt(&fixture, first, timestamp).await;
     assert_eq!(poller.poll(&fixture).await, vec![first]);
@@ -398,33 +412,73 @@ async fn late_arrival_sharing_the_cursor_microsecond_is_returned() {
 }
 
 #[tokio::test]
-async fn late_arrival_older_than_the_cursor_is_returned_inside_the_window_only() {
+async fn receipt_visible_after_the_old_window_is_recovered() {
     let fixture = Fixture::new(false);
-    let window = 1_000_000;
+    let old_window = 60_000_000;
     let timestamp = now_micros();
-    let mut poller = DecisionPoller::new(window);
+    let delayed = Uuid::from_u128(4);
+    let delayed_at = timestamp - old_window * 2;
+    let mut poller = DecisionPoller::new(delayed_at.saturating_sub(1));
+    let held_receipt = receipt(&fixture, delayed, delayed_at);
+    let events = fixture.runtime.events(&fixture.token).expect("event store");
+    let (release, wait_for_release) = tokio::sync::oneshot::channel();
+    let (started, wait_for_start) = tokio::sync::oneshot::channel();
+    let pending_append = tokio::spawn(async move {
+        started.send(()).expect("signal held append started");
+        wait_for_release.await.expect("release delayed receipt");
+        events
+            .append_event(held_receipt)
+            .await
+            .expect("delayed receipt append");
+    });
+    wait_for_start.await.expect("held append started");
 
     append_receipt(&fixture, Uuid::from_u128(5), timestamp).await;
-    poller.poll(&fixture).await;
+    assert_eq!(poller.poll(&fixture).await, vec![Uuid::from_u128(5)]);
 
-    // Stamped before the cursor row but committed after it was read.
-    let inside = Uuid::from_u128(3);
-    let outside = Uuid::from_u128(4);
-    append_receipt(&fixture, inside, timestamp - window / 2).await;
-    append_receipt(&fixture, outside, timestamp - window * 2).await;
-    assert_eq!(poller.poll(&fixture).await, vec![inside]);
+    // Hold the append before it enters storage to model delayed visibility.
+    // Its timestamp is beyond the former 60-second cutoff, and the append
+    // future stays pending longer than this short scan-lag window.
+    let scan_lag_window = std::time::Duration::from_millis(5);
+    let wait_started = std::time::Instant::now();
+    tokio::time::sleep(scan_lag_window + std::time::Duration::from_millis(5)).await;
+    assert!(
+        wait_started.elapsed() > scan_lag_window,
+        "the append must remain invisible for longer than W"
+    );
+    assert!(!pending_append.is_finished());
+    assert!(poller.poll(&fixture).await.is_empty());
+    release.send(()).expect("release pending append");
+    pending_append.await.expect("delayed append task");
+    assert_eq!(poller.poll(&fixture).await, vec![delayed]);
+    assert!(poller.poll(&fixture).await.is_empty());
 }
 
 #[tokio::test]
-async fn poller_keeps_only_the_ids_inside_the_window() {
+async fn poller_retains_ids_for_the_whole_observation_horizon() {
     let fixture = Fixture::new(false);
-    let window = 1_000_000;
     let timestamp = now_micros();
-    let mut poller = DecisionPoller::new(window);
+    let old_window = 60_000_000;
+    let older = timestamp - old_window * 10;
+    let mut poller = DecisionPoller::new(older.saturating_sub(1));
 
-    append_receipt(&fixture, Uuid::from_u128(7), timestamp - window * 10).await;
+    append_receipt(&fixture, Uuid::from_u128(7), older).await;
     append_receipt(&fixture, Uuid::from_u128(8), timestamp).await;
     assert_eq!(poller.poll(&fixture).await.len(), 2);
-    assert_eq!(poller.seen.len(), 1);
+    assert_eq!(poller.seen.len(), 2);
+    assert!(poller.seen.contains_key(&Uuid::from_u128(7)));
     assert!(poller.seen.contains_key(&Uuid::from_u128(8)));
+    assert!(poller.poll(&fixture).await.is_empty());
+}
+
+#[tokio::test]
+async fn poller_drains_every_page_from_the_fixed_floor() {
+    let fixture = Fixture::new(false);
+    let timestamp = now_micros();
+    let mut poller = DecisionPoller::new(timestamp.saturating_sub(1));
+    for id in 1..=25 {
+        append_receipt(&fixture, Uuid::from_u128(id), timestamp).await;
+    }
+    assert_eq!(poller.poll(&fixture).await.len(), 25);
+    assert!(poller.poll(&fixture).await.is_empty());
 }

@@ -630,31 +630,35 @@ remain untouched. A policy decision needs a separate typed event kind.
    cursor's microsecond can sort below the cursor's id. A caller that discards
    rows at or below its saved `(created_at, event_id)` loses both.
 
-   The catch-up procedure keeps ids instead of an id order. The caller
-   chooses an overlap window `W`, in microseconds, and keeps `newest`, the
-   largest `created_at` it has processed (microseconds, converted from the
-   listed timestamp), and `seen`, a map from event id to `created_at` for
-   every processed row with `created_at >= newest - W`. Each poll requests
-   `since=max(newest - W - 1, 0)`, pages until `has_more` is false, and
-   processes exactly the returned rows whose id is not in `seen`. It then
-   raises `newest`, adds the processed ids, and drops from `seen` every entry
-   with `created_at < newest - W`. A dropped id cannot be returned again,
-   because the next request excludes everything at or before
-   `newest - W - 1`. Paging newest first can repeat a row when an event lands
-   between pages, and `seen` absorbs the repeat. Rows recovered
-   late are delivered late; a reader that needs replay order sorts by
+   This amendment chooses option (b), latency-independent recovery: the
+   catch-up procedure keeps ids instead of advancing a timestamp cursor.
+   Before the first target action, the caller samples the event clock in
+   microseconds and stores a fixed `floor=max(sample-1, 0)`; the subtraction
+   includes a receipt stamped in the sample's microsecond because `since` is
+   exclusive. For the entire observation horizon, each poll requests
+   `since=floor`, pages until `has_more` is false, and processes only ids not
+   already in `seen`. It retains every processed id in `seen` for that horizon.
+   Paging newest first can repeat a row when an event lands between offset
+   pages; `seen` absorbs the repeat, and another poll from the same floor
+   catches a displaced row once concurrent writes settle. Rows recovered late
+   are delivered late; a reader that needs replay order sorts by
    `(created_at, event_id)`, which orders same-microsecond rows stably but
    makes no claim about their insertion order.
 
-   The state is bounded by the number of receipts inside one window. The
-   guarantee is bounded by `W`: a row is recovered when it becomes visible
-   within `W` microseconds of its own `created_at`. That gap is the writer
-   queue wait plus the commit. The queue admission deadline defaults to 2000 ms
-   and is capped at 10 000 ms (ADR-131, `write_admission_deadline_ms`), and the
-   pool busy timeout defaults to 30 s (`KHIVE_BUSY_TIMEOUT_SECS`), so
-   `W = 60_000_000` is a conservative choice for the shipped defaults; a
-   deployment that raises either setting raises `W` with it. A row that becomes visible later than
-   `W` after its timestamp is not returned by this procedure.
+   An implementation may first scan a recent `W`-microsecond lookback to
+   report prompt arrivals, but it must complete the fixed-floor re-read before
+   claiming a poll is complete. `W` is a scan-lag optimization, never a receipt
+   eligibility cutoff. A receipt with stored `created_at > floor` remains
+   eligible whenever its append becomes visible.
+   The writer admission deadline bounds only queue admission; it does not bound the
+   accepted job's wait for completion. This procedure rescans all live rows
+   since the floor on every poll and retains all their ids, so time and state
+   grow with the observation horizon. It is suitable for a finite assertion
+   interval, not a perpetual bounded cursor. Its recovery guarantee applies
+   only while receipts remain live under the ADR-168 archive policy below;
+   archival can remove an unread row. A perpetual bounded reader requires a
+   separately specified insertion-order cursor and retention/acknowledgment
+   contract, which this event list does not expose.
 4. `tool_check_decided` is `age_archivable`, the same ADR-168 class as
    `RecallExecuted`, `RerankExecuted`, and `SearchExecuted` (Table A rows
    10–12). It is pure decision telemetry without a graph referent. An
@@ -667,9 +671,15 @@ allowed `tool.check` yields exactly one with the evaluated actor and tool;
 deny-then-allow and allow-then-deny checks yield distinguishable decision
 sequences when ordered by `(created_at, event_id)`; `exec.run` preflight yields
 the same data with `caller_verb="exec.run"`. A row appended after the cursor
-was saved is returned by the next poll whether it shares the cursor's
-microsecond with a lower id or carries an older timestamp inside `W`, and the
-`seen` map holds only ids inside the window. Removing
+was saved is returned by a subsequent fixed-floor poll even when it shares the
+cursor's microsecond with a lower id. In a delayed-visibility fixture, a
+constructed receipt remains invisible for longer than a short `W` and carries
+a timestamp over 60 seconds behind the newest receipt; releasing its append
+returns it on the next fixed-floor poll. The fixture blocks before
+`append_event`, modeling queue visibility delay without claiming to test
+actual writer admission or reply timing. Polling drains every page and retains
+`seen` ids for the full observation horizon. An append failure surfaces an
+explicit storage error rather than a successful decision without a receipt. Removing
 the shared emission call, emitting before the gate, or dropping `caller_verb`
 must turn the corresponding acceptance arm red.
 
