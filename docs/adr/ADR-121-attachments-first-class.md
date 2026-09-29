@@ -1216,9 +1216,12 @@ emptiness check fails the one-object control" stands, and entry (a) is its count
   `transactional_gc_preserves_committed_and_staging_then_upload_sweep_only_reaps_staging`
   (`crates/khive-pack-blob/src/uploads/tests.rs:1426-1515`) covers the live-mode sweep before any binding
   exists. This entry adds the dry-run sweep and runs both on a bound root.
-- **(d) A begin cannot land inside the bind.** With a test hook holding the bind between its emptiness check
-  and its completing transaction, a `blob.begin` on the same root creates no staging file until the bind
-  ends, and then follows the outcome for the binding state it finds. A begin that completed before the check
-  is seen by the check, which refuses. A begin against a root whose binding is pending refuses and creates
-  no file. A mutant that releases the root write lock after the check lets the begin stage a file inside
-  the window and fails this entry.
+- **(d) A begin cannot land inside the bind.** A test hook holds the bind after its emptiness check and
+  before its pending-ID write. At that point no binding exists, so only the root write lock keeps a begin
+  out. A `blob.begin` on the same root started there creates no staging file until the bind ends, and then
+  follows the outcome for the binding state it finds. A mutant that releases the root write lock after the
+  check lets that begin find no binding and stage a file inside the window, and fails this entry; a hook
+  placed after the pending-ID write cannot detect that mutant, because the pending binding alone makes the
+  begin refuse. Separately, a begin that completed before the check is seen by the check, which refuses, and
+  a begin against a root whose binding was left pending by an attempt that ended before its completing
+  transaction refuses and creates no file.
