@@ -417,6 +417,11 @@ pub trait PackRuntime: Send + Sync {
     /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
 
+    /// Install a backend-matched note-search ANN candidate source. The
+    /// memory pack supplies it after registration; packs without a matching
+    /// graph leave the runtime's exact vector-store route in place.
+    fn register_note_search_ann_provider(&self, _runtime: &KhiveRuntime) {}
+
     /// Install a note-write validator on the runtime, called at pack
     /// initialisation with the same timing as `register_note_mutation_hook`.
     ///
@@ -4264,6 +4269,14 @@ impl VerbRegistry {
     pub fn call_register_note_mutation_hooks(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_note_mutation_hook(runtime);
+        }
+    }
+
+    /// Install pack-owned note-search candidate sources before warm-up or
+    /// dispatch, following the same registration timing as mutation hooks.
+    pub fn call_register_note_search_ann_providers(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_note_search_ann_provider(runtime);
         }
     }
 

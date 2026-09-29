@@ -1727,6 +1727,7 @@ impl KhiveMcpServer {
         // update/delete verbs notify caching packs even though there is no
         // crate-level dependency between them.
         registry.call_register_note_mutation_hooks(&runtime);
+        registry.call_register_note_search_ann_providers(&runtime);
         // Note-write identity: the pack-owned kind set drives `update`'s
         // properties refusal and `merge`'s identity preservation; the
         // validator derives owned identity properties at every note-write.

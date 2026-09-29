@@ -41,6 +41,25 @@ pub fn try_score_from_distance(
     Ok(DeterministicScore::from_f64(similarity))
 }
 
+/// Canonical cosine conversion with the f32 endpoint tolerance used by
+/// sqlite-vec's distance arithmetic. ANN consumers pass cosine distance here
+/// as well, so both routes produce the same fixed-point score contract.
+pub fn try_cosine_score_with_f32_tolerance(
+    distance: f64,
+) -> Result<DeterministicScore, ScoreError> {
+    const BOUNDARY_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
+    if !distance.is_finite() {
+        return Err(ScoreError::NonFiniteDistance);
+    }
+    if !(-BOUNDARY_EPSILON..=2.0 + BOUNDARY_EPSILON).contains(&distance) {
+        return Err(ScoreError::InvalidDistanceRange {
+            metric_name: "Cosine",
+            dist_bits: (distance as f32).to_bits(),
+        });
+    }
+    try_score_from_distance(distance.clamp(0.0, 2.0) as f32, DistanceMetric::Cosine)
+}
+
 /// Convert a distance, mapping every invalid input to [`DeterministicScore::NEG_INF`].
 ///
 /// See `crates/khive-score/docs/api/distance-conversion.md`.
