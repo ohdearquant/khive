@@ -252,6 +252,19 @@ effective namespace and require its models to be within the requested model
 set. The encrypted sequence is never echoed in errors, logs, metrics, or
 verbose responses.
 
+A requested model that has no fence in the token carries no coverage
+obligation under that token. The fence list names every model the write
+produced a vector under, and Amendment 1's expected model count keeps a
+missing fence from reading as an absent one, so the write left nothing under
+that model for the session to prove. That model's candidates are served as
+under eventual consistency, with no wait and no `freshness_unmet` entry for
+it. This is the per-model form of Amendment 1's rule that an empty fence list
+has no coverage obligation, and it fixes the reading of Amendment 1's coverage
+predicate: "each requested model" there means each requested model that has
+a fence in the token. The requested set need not equal the token's model set,
+so a caller may recall over more models than one write touched; a token model
+outside the requested set remains `InvalidInput`.
+
 Use XChaCha20-Poly1305 through RustCrypto's `chacha20poly1305` crate. Pin its
 version and subject it to the existing cargo-deny advisories audit. Use a
 256-bit server key and a fresh 192-bit nonce from the operating system's
@@ -344,8 +357,9 @@ through migration and replay.
   grow through decimal digit boundaries.
 - The #3549 writer and #3619 source land together; no version-1 token is
   issued. Session recall rejects a clear version-1 token, tampering, a foreign
-  namespace, malformed envelope, and model-set mismatch; an unavailable or
-  unknown key ID gets the named retryable refusal, never a stale success.
+  namespace, malformed envelope, and a token model outside the requested model
+  set; an unavailable or unknown key ID gets the named retryable refusal, never
+  a stale success.
 - A token survives server restart and key rotation while its ID remains in
   the decrypt-only ring and its 24-hour age has not elapsed. An authenticated
   expired token gets `visibility_token_expired` with `retryable: false`; a
@@ -357,5 +371,8 @@ through migration and replay.
 - A V44-written keyed row without a receipt replays terminal with
   `legacy_receipt_absent`; a V45-written row with a transiently missing
   receipt remains retryable. A present zero-model receipt is neither case.
+- A session recall whose requested models include one absent from the token
+  succeeds on the token models' coverage alone, applying no wait and no
+  `freshness_unmet` entry to the absent model.
 - The one-snapshot proof, timeout cap, cancellation, and no-unproven-success
   tests from Amendment 1 remain review-blocking.
