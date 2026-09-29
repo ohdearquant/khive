@@ -24,6 +24,7 @@ enum ReadFailure {
 struct ObservedBlobStore {
     inner: Arc<dyn BlobStore>,
     reads: AtomicUsize,
+    sizes: AtomicUsize,
     last_max_bytes: AtomicU64,
     puts: AtomicUsize,
     reported_size: Mutex<Option<Option<u64>>>,
@@ -94,6 +95,7 @@ impl BlobStore for ObservedBlobStore {
     }
 
     async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        self.sizes.fetch_add(1, Ordering::SeqCst);
         if self.unsupported_size.load(Ordering::SeqCst) {
             return Err(StorageError::Unsupported {
                 capability: khive_storage::StorageCapability::Blob,
@@ -124,6 +126,7 @@ fn fixture() -> (
     let store = Arc::new(ObservedBlobStore {
         inner: Arc::new(inner),
         reads: AtomicUsize::new(0),
+        sizes: AtomicUsize::new(0),
         last_max_bytes: AtomicU64::new(0),
         puts: AtomicUsize::new(0),
         reported_size: Mutex::new(None),
@@ -148,6 +151,34 @@ fn fixture() -> (
     runtime.install_blob_store(store.clone()).unwrap();
     let registry = registry(&runtime);
     (runtime, registry, store, dir)
+}
+
+#[tokio::test]
+async fn source_size_stops_before_backend_on_expired_deadline_or_cancellation() {
+    let (_runtime, _registry, store, _dir) = fixture();
+    let content_ref = ContentRef::from_digest_bytes(blake3::hash(b"source").as_bytes());
+    let expired = khive_storage::RequestReadDeadline::after(Duration::ZERO);
+    let error = khive_storage::scope_request_read_deadline_at(
+        expired,
+        super::super::source_blob_size(store.as_ref(), &content_ref),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StorageError::Timeout { ref operation }
+        if operation == "web_extract_blob_size"));
+
+    let (_cancel, cancelled) = tokio::sync::watch::channel(true);
+    let error = khive_storage::scope_request_read_cancellation(
+        cancelled,
+        super::super::source_blob_size(store.as_ref(), &content_ref),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StorageError::Timeout { ref operation }
+        if operation == "web_extract_blob_size"));
+    assert_eq!(store.sizes.load(Ordering::SeqCst), 0);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(store.puts.load(Ordering::SeqCst), 0);
 }
 
 fn registry(runtime: &KhiveRuntime) -> khive_runtime::VerbRegistry {

@@ -385,7 +385,13 @@ async fn prepare_source_raster(
     content_ref: &ContentRef,
 ) -> Result<PreparedRaster, RuntimeError> {
     let hydrator = require_blob_hydrator(runtime)?;
-    let size = match require_blob_store(runtime)?.size(content_ref).await {
+    let blob_store = require_blob_store(runtime)?;
+    let size = match khive_storage::await_request_read_phase(
+        "moodboard_search_blob_size",
+        blob_store.size(content_ref),
+    )
+    .await?
+    {
         Ok(Some(size)) => size,
         Ok(None)
         | Err(StorageError::Unsupported {
@@ -692,6 +698,7 @@ mod tests {
         first_expected_max: u64,
         started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
         calls: AtomicUsize,
+        size_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -730,6 +737,7 @@ mod tests {
             &self,
             content_ref: &ContentRef,
         ) -> khive_storage::StorageResult<Option<u64>> {
+            self.size_calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(content_ref, &self.content_ref);
             if self.unsupported_size {
                 return Err(StorageError::Unsupported {
@@ -837,6 +845,7 @@ mod tests {
             first_expected_max: source_size,
             started: StdMutex::new(Some(started_tx)),
             calls: AtomicUsize::new(0),
+            size_calls: AtomicUsize::new(0),
         });
         let mut config = RuntimeConfig::no_embeddings();
         config.db_path = None;
@@ -905,6 +914,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_size_stops_before_backend_on_expired_deadline_or_cancellation() {
+        let bytes = b"source".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        let store = Arc::new(OrderedHydrationStore {
+            bytes,
+            content_ref: content_ref.clone(),
+            reported_size: Some(6),
+            unsupported_size: false,
+            first_expected_max: 6,
+            started: StdMutex::new(None),
+            calls: AtomicUsize::new(0),
+            size_calls: AtomicUsize::new(0),
+        });
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.packs = vec!["kg".to_string()];
+        let runtime = KhiveRuntime::new(config).expect("memory runtime");
+        runtime
+            .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+            .expect("install blob store");
+        let pack = MoodboardPack::new(runtime.clone());
+
+        let expired = khive_storage::RequestReadDeadline::after(Duration::ZERO);
+        let error = khive_storage::scope_request_read_deadline_at(
+            expired,
+            prepare_source_raster(&pack, &runtime, &content_ref),
+        )
+        .await
+        .expect_err("expired deadline must stop source size");
+        assert!(matches!(error,
+            RuntimeError::Storage(StorageError::Timeout { ref operation })
+            if operation == "moodboard_search_blob_size"));
+
+        let (_cancel, cancelled) = tokio::sync::watch::channel(true);
+        let error = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            prepare_source_raster(&pack, &runtime, &content_ref),
+        )
+        .await
+        .expect_err("cancelled request must stop source size");
+        assert!(matches!(error,
+            RuntimeError::Storage(StorageError::Timeout { ref operation })
+            if operation == "moodboard_search_blob_size"));
+        assert_eq!(store.size_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn source_hydration_refuses_underreported_or_oversized_object() {
         let bytes = b"not a raster".to_vec();
         let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
@@ -918,6 +975,7 @@ mod tests {
                 first_expected_max: reported_size.min(MAX_OBJECT_BYTES as u64),
                 started: StdMutex::new(None),
                 calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
             });
             let mut config = RuntimeConfig::no_embeddings();
             config.db_path = None;
@@ -971,6 +1029,7 @@ mod tests {
                 first_expected_max: MAX_OBJECT_BYTES as u64,
                 started: StdMutex::new(None),
                 calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
             });
             let mut config = RuntimeConfig::no_embeddings();
             config.db_path = None;

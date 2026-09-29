@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use khive_runtime::{EdgeListFilter, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
-use khive_storage::{EdgeRelation, StorageCapability, StorageError};
+use khive_storage::{BlobStore, ContentRef, EdgeRelation, StorageCapability, StorageError};
 use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
@@ -104,6 +104,14 @@ async fn admit_derived_buffers(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.extract: derived admission closed: {error}"))
     })
+}
+
+async fn source_blob_size(
+    store: &dyn BlobStore,
+    content_ref: &ContentRef,
+) -> khive_storage::StorageResult<Option<u64>> {
+    khive_storage::await_request_read_phase("web_extract_blob_size", store.size(content_ref))
+        .await?
 }
 
 fn decode_body(raw: &[u8], decoded_bytes: usize) -> String {
@@ -1223,7 +1231,8 @@ async fn run_extract_with_link_selection(
         )
     })?;
     verify_source_body(runtime, token, target_id, &source_content_ref).await?;
-    let size = match crate::blob_store(runtime)?.size(&content_ref).await {
+    let blob_store = crate::blob_store(runtime)?;
+    let size = match source_blob_size(blob_store.as_ref(), &content_ref).await {
         Ok(Some(size)) => size,
         Ok(None)
         | Err(StorageError::Unsupported {
