@@ -1,11 +1,20 @@
 //! Session pack vocabulary: handler definitions and shared constants.
 
-use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
+use khive_types::{
+    HandlerDef, IdResolutionMode, PackColumnAddition, PackColumnAffinity, ParamDef, VerbCategory,
+    Visibility,
+};
 
 pub(crate) const SESSION_KIND: &str = "session";
 pub(crate) const DEFAULT_LIMIT: u32 = 20;
 pub(crate) const MAX_LIMIT: u32 = 200;
 pub(crate) const VALID_EXPORT_FORMATS: &[&str] = &["json", "markdown"];
+
+pub(crate) static SESSION_SCHEMA_COLUMN_ADDITIONS: [PackColumnAddition; 1] = [PackColumnAddition {
+    table: "session_mirror_cursor",
+    column: "file_identity",
+    affinity: PackColumnAffinity::Text,
+}];
 
 /// Pack-auxiliary schema for the session mirror tables.
 ///
@@ -61,7 +70,8 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 10] = [
         file_path   TEXT PRIMARY KEY,\
         session_id  TEXT,\
         byte_offset INTEGER NOT NULL DEFAULT 0,\
-        updated_at  INTEGER NOT NULL\
+        updated_at  INTEGER NOT NULL,\
+        file_identity TEXT\
     )",
 ];
 

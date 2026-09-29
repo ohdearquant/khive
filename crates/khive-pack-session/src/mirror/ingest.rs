@@ -122,6 +122,53 @@ pub struct MirrorStats {
     /// still have claimed. The dispatch loop treats the advance as
     /// uncontested only when the same pass also `scanned` no ordinary line.
     pub skipped_oversized_bytes: bool,
+    /// Identity of the file handle read for this pass. Persisted with an
+    /// advancing cursor so a same-path replacement cannot inherit its offset.
+    pub file_identity: Option<String>,
+}
+
+/// Stable across appends, but different for a replacement file at the same
+/// path. The fallback keeps the code portable where Unix file IDs are absent.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!("unix:{}:{}", metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        format!("created:{:?}", metadata.created().ok())
+    }
+}
+
+fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn checked_identity(
+    metadata: &std::fs::Metadata,
+    expected_identity: Option<&str>,
+) -> std::io::Result<String> {
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mirror source is not a regular file",
+        ));
+    }
+    let identity = file_identity(metadata);
+    if expected_identity.is_some_and(|expected| expected != identity.as_str()) {
+        return Err(std::io::Error::other(
+            "mirror source was replaced after its metadata probe",
+        ));
+    }
+    Ok(identity)
 }
 
 /// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
@@ -212,6 +259,17 @@ pub async fn mirror_file_deferred(
     source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
+    mirror_file_deferred_checked(runtime, path, start_offset, source, codex_session_id, None).await
+}
+
+pub(crate) async fn mirror_file_deferred_checked(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    source: LineTailSource,
+    codex_session_id: Option<&str>,
+    expected_identity: Option<&str>,
+) -> Result<MirrorStats, RuntimeError> {
     mirror_file_inner(
         runtime,
         path,
@@ -220,6 +278,7 @@ pub async fn mirror_file_deferred(
         codex_session_id,
         MirrorLimits::production(),
         false,
+        expected_identity,
     )
     .await
 }
@@ -235,9 +294,16 @@ pub async fn mirror_file_deferred(
 pub async fn commit_empty_advance(
     runtime: &KhiveRuntime,
     path: &Path,
-    new_offset: u64,
+    stats: &MirrorStats,
 ) -> Result<(), RuntimeError> {
-    write_cursor_only(runtime, path, &None, new_offset).await
+    write_cursor_only(
+        runtime,
+        path,
+        &None,
+        stats.new_offset,
+        stats.file_identity.as_deref(),
+    )
+    .await
 }
 
 /// A single bounded read pass: at most `limits.max_bytes_per_pass` bytes and
@@ -248,6 +314,7 @@ struct MirrorChunk {
     new_offset: u64,
     /// See [`MirrorStats::skipped_oversized_bytes`].
     skipped_oversized_bytes: bool,
+    file_identity: String,
 }
 
 /// Outcome of `read_line_bounded` for one line. See
@@ -341,15 +408,19 @@ fn read_bounded_chunk(
     source: LineTailSource,
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
+    expected_identity: Option<&str>,
 ) -> std::io::Result<MirrorChunk> {
-    let mut file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let mut file = open_source_file(path)?;
+    let metadata = file.metadata()?;
+    let identity = checked_identity(&metadata, expected_identity)?;
+    let file_len = metadata.len();
     if start_offset >= file_len {
         return Ok(MirrorChunk {
             events: Vec::new(),
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
+            file_identity: identity,
         });
     }
 
@@ -454,6 +525,7 @@ fn read_bounded_chunk(
         scanned,
         new_offset,
         skipped_oversized_bytes,
+        file_identity: identity,
     })
 }
 
@@ -474,6 +546,7 @@ async fn mirror_file_with_limits(
         codex_session_id,
         limits,
         true,
+        None,
     )
     .await
 }
@@ -484,6 +557,7 @@ async fn mirror_file_with_limits(
 /// if no later candidate inserts rows for the same span (see
 /// `candidate_dispatch` in `service.rs`). When true (every non-dispatch
 /// caller and test), the cursor is committed immediately as before.
+#[allow(clippy::too_many_arguments)]
 async fn mirror_file_inner(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -492,14 +566,22 @@ async fn mirror_file_inner(
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
     commit_empty_advance: bool,
+    expected_identity: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
-    let chunk =
-        read_bounded_chunk(path, start_offset, source, codex_session_id, limits).map_err(|e| {
-            RuntimeError::Internal(format!(
-                "mirror_file: failed to read {:?} at offset {start_offset}: {e}",
-                path
-            ))
-        })?;
+    let chunk = read_bounded_chunk(
+        path,
+        start_offset,
+        source,
+        codex_session_id,
+        limits,
+        expected_identity,
+    )
+    .map_err(|e| {
+        RuntimeError::Internal(format!(
+            "mirror_file: failed to read {:?} at offset {start_offset}: {e}",
+            path
+        ))
+    })?;
 
     if chunk.new_offset == start_offset {
         // Nothing was consumed this pass (EOF, or only a partial trailing
@@ -510,6 +592,7 @@ async fn mirror_file_inner(
             scanned: 0,
             new_offset: chunk.new_offset,
             skipped_oversized_bytes: false,
+            file_identity: Some(chunk.file_identity),
         });
     }
 
@@ -528,7 +611,14 @@ async fn mirror_file_inner(
         // silently swallowing it would let the cursor and the
         // already-consumed bytes drift apart.
         if commit_empty_advance {
-            write_cursor_only(runtime, path, &None, chunk.new_offset).await?;
+            write_cursor_only(
+                runtime,
+                path,
+                &None,
+                chunk.new_offset,
+                Some(&chunk.file_identity),
+            )
+            .await?;
         }
         return Ok(MirrorStats {
             inserted: 0,
@@ -536,6 +626,7 @@ async fn mirror_file_inner(
             scanned: chunk.scanned,
             new_offset: chunk.new_offset,
             skipped_oversized_bytes: chunk.skipped_oversized_bytes,
+            file_identity: Some(chunk.file_identity),
         });
     }
 
@@ -547,6 +638,7 @@ async fn mirror_file_inner(
         &chunk.events,
         chunk.scanned,
         chunk.new_offset,
+        &chunk.file_identity,
     )
     .await
 }
@@ -648,7 +740,32 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
     start_offset: u64,
     max_bytes: u64,
 ) -> Result<MirrorStats, RuntimeError> {
-    mirror_whole_file_export(runtime, path, start_offset, max_bytes, CHATGPT_EXPORT_SPEC).await
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        max_bytes,
+        CHATGPT_EXPORT_SPEC,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn mirror_chatgpt_export_file_checked(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    expected_identity: &str,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        chatgpt_max_bytes(),
+        CHATGPT_EXPORT_SPEC,
+        Some(expected_identity),
+    )
+    .await
 }
 
 /// Read a whole claude.ai export `conversations.json`, parse its
@@ -675,6 +792,24 @@ async fn mirror_claude_ai_export_file_with_max_bytes(
         start_offset,
         max_bytes,
         CLAUDE_AI_EXPORT_SPEC,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn mirror_claude_ai_export_file_checked(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    expected_identity: &str,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        claude_ai_max_bytes(),
+        CLAUDE_AI_EXPORT_SPEC,
+        Some(expected_identity),
     )
     .await
 }
@@ -685,10 +820,21 @@ async fn mirror_whole_file_export(
     start_offset: u64,
     max_bytes: u64,
     spec: WholeFileExportSpec,
+    expected_identity: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
-    let file_len = std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
+    let file = open_source_file(path).map_err(|e| {
+        RuntimeError::Internal(format!("{}: failed to open {path:?}: {e}", spec.operation))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
         RuntimeError::Internal(format!("{}: failed to stat {path:?}: {e}", spec.operation))
     })?;
+    let identity = checked_identity(&metadata, expected_identity).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "{}: failed to verify {path:?}: {e}",
+            spec.operation
+        ))
+    })?;
+    let file_len = metadata.len();
 
     if file_len <= start_offset {
         return Ok(MirrorStats {
@@ -697,6 +843,7 @@ async fn mirror_whole_file_export(
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
+            file_identity: Some(identity),
         });
     }
 
@@ -715,11 +862,27 @@ async fn mirror_whole_file_export(
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
+            file_identity: Some(identity),
         });
     }
 
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        RuntimeError::Internal(format!("{}: failed to read {path:?}: {e}", spec.operation))
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            RuntimeError::Internal(format!("{}: failed to read {path:?}: {e}", spec.operation))
+        })?;
+    if bytes.len() as u64 != file_len {
+        return Err(RuntimeError::Internal(format!(
+            "{}: {path:?} changed size during read; retrying",
+            spec.operation
+        )));
+    }
+    let content = String::from_utf8(bytes).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "{}: invalid UTF-8 in {path:?}: {e}",
+            spec.operation
+        ))
     })?;
 
     let parsed = (spec.parser)(&content).ok_or_else(|| {
@@ -739,6 +902,7 @@ async fn mirror_whole_file_export(
         &parsed.events,
         scanned,
         file_len,
+        &identity,
     )
     .await
 }
@@ -749,6 +913,7 @@ async fn mirror_whole_file_export(
 /// whole-file paths. See
 /// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
 /// for the ADR-099 D5 suspension-free rationale.
+#[allow(clippy::too_many_arguments)]
 async fn write_events_and_cursor(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -757,6 +922,7 @@ async fn write_events_and_cursor(
     events: &[parse::ParsedEvent],
     scanned: u64,
     new_offset: u64,
+    file_identity: &str,
 ) -> Result<MirrorStats, RuntimeError> {
     let now_us = Utc::now().timestamp_micros();
     let sql = runtime.sql();
@@ -764,6 +930,7 @@ async fn write_events_and_cursor(
     let sessions_owned: Vec<parse::ParsedSession> = sessions.to_vec();
     let events_owned: Vec<parse::ParsedEvent> = events.to_vec();
     let path_owned: PathBuf = path.to_path_buf();
+    let identity_owned = file_identity.to_string();
 
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
         Box::pin(async move {
@@ -777,6 +944,7 @@ async fn write_events_and_cursor(
                     scanned,
                     new_offset,
                     now_us,
+                    file_identity: &identity_owned,
                 },
             )
             .await
@@ -860,10 +1028,11 @@ async fn ensure_session_on_writer(
 /// entirely — this function must not, and does not, issue its own
 /// `BEGIN`/`COMMIT`/`ROLLBACK`.
 #[derive(Clone, Copy)]
-struct MirrorWriteProgress {
+struct MirrorWriteProgress<'a> {
     scanned: u64,
     new_offset: u64,
     now_us: i64,
+    file_identity: &'a str,
 }
 
 async fn write_events_and_cursor_on_writer(
@@ -872,12 +1041,13 @@ async fn write_events_and_cursor_on_writer(
     source_value: &'static str,
     sessions: &[parse::ParsedSession],
     events: &[parse::ParsedEvent],
-    progress: MirrorWriteProgress,
+    progress: MirrorWriteProgress<'_>,
 ) -> khive_storage::types::StorageResult<MirrorStats> {
     let MirrorWriteProgress {
         scanned,
         new_offset,
         now_us,
+        file_identity,
     } = progress;
     let mut inserted: u64 = 0;
     let mut replay_mismatches: u64 = 0;
@@ -1090,7 +1260,15 @@ async fn write_events_and_cursor_on_writer(
         }
     }
 
-    upsert_cursor_on_writer(writer, path, last_session_id.as_deref(), new_offset, now_us).await?;
+    upsert_cursor_on_writer(
+        writer,
+        path,
+        last_session_id.as_deref(),
+        new_offset,
+        now_us,
+        Some(file_identity),
+    )
+    .await?;
     if replay_mismatches > 0 {
         tracing::warn!(
             source = source_value,
@@ -1108,6 +1286,7 @@ async fn write_events_and_cursor_on_writer(
         scanned,
         new_offset,
         skipped_oversized_bytes: false,
+        file_identity: Some(file_identity.to_string()),
     })
 }
 
@@ -1126,17 +1305,19 @@ async fn upsert_cursor_on_writer(
     session_id: Option<&str>,
     new_offset: u64,
     now_us: i64,
+    file_identity: Option<&str>,
 ) -> khive_storage::types::StorageResult<()> {
     let path_str = path.to_string_lossy().into_owned();
     writer
         .execute(SqlStatement {
             sql:
-                "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
-              VALUES(?1, ?2, ?3, ?4) \
+                "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at, file_identity) \
+              VALUES(?1, ?2, ?3, ?4, ?5) \
               ON CONFLICT(file_path) DO UPDATE SET \
                 session_id=excluded.session_id, \
                 byte_offset=excluded.byte_offset, \
-                updated_at=excluded.updated_at"
+                updated_at=excluded.updated_at, \
+                file_identity=excluded.file_identity"
                     .into(),
             params: vec![
                 SqlValue::Text(path_str),
@@ -1145,6 +1326,9 @@ async fn upsert_cursor_on_writer(
                     .unwrap_or(SqlValue::Null),
                 SqlValue::Integer(new_offset as i64),
                 SqlValue::Integer(now_us),
+                file_identity
+                    .map(|identity| SqlValue::Text(identity.to_string()))
+                    .unwrap_or(SqlValue::Null),
             ],
             label: Some("session_mirror_cursor_upsert".into()),
         })
@@ -1173,6 +1357,7 @@ async fn write_cursor_only(
     path: &Path,
     session_id: &Option<String>,
     new_offset: u64,
+    file_identity: Option<&str>,
 ) -> Result<(), RuntimeError> {
     let now_us = Utc::now().timestamp_micros();
     let path_str = path.to_string_lossy().into_owned();
@@ -1182,12 +1367,13 @@ async fn write_cursor_only(
         .await
         .map_err(|e| RuntimeError::Internal(format!("mirror_file: cursor writer: {e}")))?;
     w.execute(SqlStatement {
-        sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
-              VALUES(?1, ?2, ?3, ?4) \
+        sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at, file_identity) \
+              VALUES(?1, ?2, ?3, ?4, ?5) \
               ON CONFLICT(file_path) DO UPDATE SET \
                 session_id=COALESCE(excluded.session_id, session_mirror_cursor.session_id), \
                 byte_offset=excluded.byte_offset, \
-                updated_at=excluded.updated_at"
+                updated_at=excluded.updated_at, \
+                file_identity=excluded.file_identity"
             .into(),
         params: vec![
             SqlValue::Text(path_str),
@@ -1197,6 +1383,9 @@ async fn write_cursor_only(
                 .unwrap_or(SqlValue::Null),
             SqlValue::Integer(new_offset as i64),
             SqlValue::Integer(now_us),
+            file_identity
+                .map(|identity| SqlValue::Text(identity.to_string()))
+                .unwrap_or(SqlValue::Null),
         ],
         label: Some("session_mirror_cursor_only".into()),
     })
@@ -1218,6 +1407,16 @@ mod tests {
 
     use super::*;
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
+
+    #[cfg(unix)]
+    #[test]
+    fn source_open_refuses_a_symlink() {
+        let dir = TempDir::new().expect("tempdir");
+        let outside = NamedTempFile::new().expect("outside file");
+        let link = dir.path().join("linked.jsonl");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        assert!(open_source_file(&link).is_err());
+    }
 
     /// Build a file-backed runtime (exercises the real `atomic_unit`
     /// single-writer path) and apply the session schema. Caller must keep
@@ -2008,7 +2207,7 @@ mod tests {
         );
 
         // Dispatch ends without an inserting candidate: the loop commits.
-        commit_empty_advance(&rt, &path, stats.new_offset)
+        commit_empty_advance(&rt, &path, &stats)
             .await
             .expect("end-of-dispatch commit");
         assert_eq!(
@@ -3247,7 +3446,17 @@ mod tests {
         let stats = mirror_claude_ai_export_file_with_max_bytes(&rt, &path, 0, 1)
             .await
             .expect("oversized export is skipped");
-        assert_eq!(stats, MirrorStats::default());
+        // The pass reports the identity it observed (the in-memory poll state
+        // needs it), but persists nothing: no cursor row is written.
+        assert_eq!(
+            stats,
+            MirrorStats {
+                file_identity: Some(file_identity(
+                    &std::fs::metadata(&path).expect("export metadata")
+                )),
+                ..MirrorStats::default()
+            }
+        );
         assert_eq!(cursor_offset(&rt, &path.to_string_lossy()).await, None);
     }
 
@@ -3279,7 +3488,7 @@ mod tests {
 
                 // Cursor advance succeeds too — mirrors `upsert_cursor_on_writer`
                 // running near the end of `write_events_and_cursor_on_writer`.
-                upsert_cursor_on_writer(writer, &path_owned, Some("mid-tx-session"), 999, 1)
+                upsert_cursor_on_writer(writer, &path_owned, Some("mid-tx-session"), 999, 1, None)
                     .await?;
 
                 // Third write fails with a genuine (non-suppressed) SQL error —
@@ -3373,6 +3582,7 @@ mod tests {
                         scanned: 1,
                         new_offset: 100,
                         now_us,
+                        file_identity: "test-file",
                     },
                 )
                 .await
@@ -3473,6 +3683,7 @@ mod tests {
                         scanned: 1,
                         new_offset: 100,
                         now_us,
+                        file_identity: "test-file",
                     },
                 )
                 .await

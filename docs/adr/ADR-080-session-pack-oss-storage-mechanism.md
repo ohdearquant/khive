@@ -225,7 +225,20 @@ assigned backend is a read-only snapshot.
 parses complete lines, and advances the cursor to the last complete line boundary — with
 one exception added by §7, where a line already known to exceed the cap checkpoints a
 bounded discarded prefix mid-line. A file whose length has not grown past the cursor is
-skipped without being opened.
+skipped without being opened only while its stored file identity still matches and its length
+has not fallen below the cursor.
+
+**File replacement amendment (2026-09-28, #1761).** Each cursor advance stores a nullable
+`file_identity` in the same row and transaction as its byte offset. The identity is stable
+across appends and changes when a new file replaces the path (device and inode on Unix; file
+creation time where Unix IDs are unavailable). A different identity, a file shorter than the
+stored offset, or a legacy cursor with no identity restarts ingestion at byte zero. Replaying a
+legacy cursor once is safe under the existing insert-once event keys; subsequent unchanged polls
+use the new witness and retain the cheap length guard. The reader verifies that the opened file
+still has the identity observed by the service's metadata probe before it can advance the cursor.
+Regular-file checks and no-follow opens keep a symlinked transcript from making the mirror read a
+target outside its configured tree. A same-inode rewrite that grows beyond the old cursor remains
+indistinguishable from an append without reading and hashing previously consumed bytes.
 
 A single line is never buffered past a hard per-line byte cap (`MirrorLimits::max_line_bytes`,
 PACKSESSION-AUD-003): a complete line (terminated by `\n`) over the cap is skipped —
@@ -337,7 +350,8 @@ three indexes: `sessions` (one row per session or conversation: provider id, sou
 git branch, slug, message count, first/last seen), `session_messages` (one row per
 transcript event: uuid key, session id, per-session `seq`, parent uuid, sidechain flag,
 role, type, masked text, masked raw, timestamp), and `session_mirror_cursor` (one row per
-watched file: byte offset, session id, updated-at).
+watched file: byte offset, session id, updated-at, nullable file identity). The pack's
+nullable column-addition plan upgrades existing cursor tables without clearing their offsets.
 
 #### Invariants (normative for every source)
 

@@ -294,6 +294,19 @@ mod config_tests {
             Some(&DiscoveredKind::ClaudeAiExport)
         ));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_ignores_symlinked_transcript_outside_root() {
+        let root = tempfile::TempDir::new().expect("root");
+        let outside = tempfile::NamedTempFile::new().expect("outside transcript");
+        let link = root.path().join("linked.jsonl");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("file symlink");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(root.path(), DirectoryKind::ClaudeCodeProject, true);
+        assert!(!discovery.files.contains_key(&link));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,6 +358,27 @@ struct TrackedFile {
     /// `FILE_MISSING_PROBES_BEFORE_REMOVAL` in a row so a transient
     /// NotFound (atomic replace, FS hiccup) gets one grace probe.
     missing_probes: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CursorState {
+    byte_offset: u64,
+    file_identity: Option<String>,
+}
+
+impl CursorState {
+    fn reset_if_replaced(&mut self, identity: &str, file_len: u64) -> bool {
+        let prior = self.file_identity.as_deref();
+        let identity_changed = prior.is_some_and(|old| old != identity);
+        let legacy_without_witness = prior.is_none();
+        let truncated = file_len < self.byte_offset;
+        if !identity_changed && !legacy_without_witness && !truncated {
+            return false;
+        }
+        self.byte_offset = 0;
+        self.file_identity = Some(identity.to_string());
+        true
+    }
 }
 
 struct ScheduledFile {
@@ -575,6 +609,9 @@ impl DiscoveryIndex {
                                 fingerprint = None;
                                 continue;
                             };
+                            if file_type.is_symlink() {
+                                continue;
+                            }
                             let Some(classified) =
                                 classify_entry(directory_kind, &child_path, file_type.is_dir())
                             else {
@@ -795,6 +832,9 @@ impl DiscoveryIndex {
                     continue;
                 }
             };
+            if file_type.is_symlink() {
+                continue;
+            }
             for kind in kinds {
                 let Some(classified) = classify_entry(*kind, &child_path, file_type.is_dir())
                 else {
@@ -1248,7 +1288,7 @@ async fn finalize_dispatch_stats(
                          sibling candidate error — the skip is source-independent"
                     );
                 }
-                match ingest::commit_empty_advance(runtime, path, stats.new_offset).await {
+                match ingest::commit_empty_advance(runtime, path, &stats).await {
                     Ok(()) => Some(stats),
                     Err(error) => {
                         // A failed deferred cursor commit is an ingest error
@@ -1359,8 +1399,8 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         "session mirror service starting"
     );
 
-    // Seed in-memory offsets from the persisted cursor table.
-    let mut offsets: HashMap<PathBuf, u64> = match load_cursors(&runtime).await {
+    // Seed in-memory offsets and file identities from the persisted cursor table.
+    let mut cursors: HashMap<PathBuf, CursorState> = match load_cursors(&runtime).await {
         Ok(map) => map,
         Err(e) => {
             tracing::warn!(error = %e, "session mirror: failed to load cursors (starting from empty)");
@@ -1387,14 +1427,14 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         let removed_files = discovery.take_removed_files();
         if !removed_files.is_empty() {
             for removed in &removed_files {
-                offsets.remove(removed);
+                cursors.remove(removed);
             }
             queue_cursor_deletes(&mut pending_cursor_deletes, &removed_files);
         }
         let blocked_cursor_restores = drain_pending_cursor_deletes(
             &runtime,
             &discovery,
-            &mut offsets,
+            &mut cursors,
             &mut pending_cursor_deletes,
         )
         .await;
@@ -1410,7 +1450,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         let mut rows_inserted: u64 = 0;
 
         for scheduled_file in scheduled {
-            let metadata = match std::fs::metadata(&scheduled_file.path) {
+            let metadata = match std::fs::symlink_metadata(&scheduled_file.path) {
                 Ok(metadata) => metadata,
                 Err(e) => {
                     let missing = e.kind() == io::ErrorKind::NotFound;
@@ -1435,12 +1475,34 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                     continue;
                 }
             };
+            if !metadata.is_file() {
+                discovery.record_probe_error(&scheduled_file.path, scheduled_file.was_cold, false);
+                tracing::warn!(
+                    path = %scheduled_file.path.display(),
+                    "session mirror: refusing a non-regular file or symlink"
+                );
+                continue;
+            }
             let file_len = metadata.len();
             let modified = metadata.modified().ok();
+            let observed_identity = ingest::file_identity(&metadata);
 
-            let offset = *offsets
+            let cursor = cursors
                 .entry(scheduled_file.path.clone())
-                .or_insert(if config.backfill { 0 } else { file_len });
+                .or_insert_with(|| CursorState {
+                    byte_offset: if config.backfill { 0 } else { file_len },
+                    file_identity: Some(observed_identity.clone()),
+                });
+            let previous_offset = cursor.byte_offset;
+            if cursor.reset_if_replaced(&observed_identity, file_len) {
+                tracing::info!(
+                    path = %scheduled_file.path.display(),
+                    previous_offset,
+                    file_len,
+                    "session mirror: file replacement or truncation; restarting at byte zero"
+                );
+            }
+            let offset = cursor.byte_offset;
 
             if file_len <= offset {
                 discovery.record_unchanged(
@@ -1473,22 +1535,33 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                         // candidates cannot strand a committed cursor past
                         // uninserted rows. The commit happens below, only when
                         // dispatch ends without an inserting candidate.
-                        ingest::mirror_file_deferred(
+                        ingest::mirror_file_deferred_checked(
                             &runtime,
                             &scheduled_file.path,
                             offset,
                             source,
                             session_id.as_deref(),
+                            Some(&observed_identity),
                         )
                         .await
                     }
                     DiscoveredKind::ChatGptExport => {
-                        ingest::mirror_chatgpt_export_file(&runtime, &scheduled_file.path, offset)
-                            .await
+                        ingest::mirror_chatgpt_export_file_checked(
+                            &runtime,
+                            &scheduled_file.path,
+                            offset,
+                            &observed_identity,
+                        )
+                        .await
                     }
                     DiscoveredKind::ClaudeAiExport => {
-                        ingest::mirror_claude_ai_export_file(&runtime, &scheduled_file.path, offset)
-                            .await
+                        ingest::mirror_claude_ai_export_file_checked(
+                            &runtime,
+                            &scheduled_file.path,
+                            offset,
+                            &observed_identity,
+                        )
+                        .await
                     }
                 };
                 if candidate_dispatch.record(result, offset) {
@@ -1539,7 +1612,13 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 // cursors; guard the write side too so the stored offset can
                 // only advance or hold.
                 if stats.new_offset >= offset {
-                    offsets.insert(scheduled_file.path.clone(), stats.new_offset);
+                    cursors.insert(
+                        scheduled_file.path.clone(),
+                        CursorState {
+                            byte_offset: stats.new_offset,
+                            file_identity: stats.file_identity,
+                        },
+                    );
                 }
                 if stats.inserted > 0 || stats.new_offset > offset {
                     files_mirrored += 1;
@@ -1577,11 +1656,13 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
     }
 }
 
-/// Load persisted `(file_path, byte_offset)` pairs from `session_mirror_cursor`.
+/// Load persisted offsets and file identities from `session_mirror_cursor`.
 ///
 /// Missing table (e.g. schema not yet applied) returns an empty map rather
 /// than an error — the service self-bootstraps on the first successful write.
-async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, RuntimeError> {
+async fn load_cursors(
+    runtime: &KhiveRuntime,
+) -> Result<HashMap<PathBuf, CursorState>, RuntimeError> {
     let sql = runtime.sql();
     let mut reader = sql
         .reader()
@@ -1590,7 +1671,7 @@ async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, R
 
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT file_path, byte_offset FROM session_mirror_cursor".into(),
+            sql: "SELECT file_path, byte_offset, file_identity FROM session_mirror_cursor".into(),
             params: vec![],
             label: Some("mirror_load_cursors".into()),
         })
@@ -1613,7 +1694,17 @@ async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, R
                     Some(SqlValue::Integer(n)) => *n as u64,
                     _ => 0,
                 };
-                map.insert(file_path, byte_offset);
+                let file_identity = match row.get("file_identity") {
+                    Some(SqlValue::Text(identity)) => Some(identity.clone()),
+                    _ => None,
+                };
+                map.insert(
+                    file_path,
+                    CursorState {
+                        byte_offset,
+                        file_identity,
+                    },
+                );
             }
             Ok(map)
         }
@@ -1711,7 +1802,7 @@ fn queue_cursor_deletes(pending: &mut VecDeque<PathBuf>, removed: &[PathBuf]) {
 async fn drain_pending_cursor_deletes(
     runtime: &KhiveRuntime,
     discovery: &DiscoveryIndex,
-    offsets: &mut HashMap<PathBuf, u64>,
+    cursors: &mut HashMap<PathBuf, CursorState>,
     pending: &mut VecDeque<PathBuf>,
 ) -> HashSet<PathBuf> {
     let mut blocked = HashSet::new();
@@ -1729,12 +1820,12 @@ async fn drain_pending_cursor_deletes(
     });
     let mut restore_failed = Vec::new();
     for path in &cancelled {
-        if offsets.contains_key(path) {
+        if cursors.contains_key(path) {
             continue;
         }
-        match read_cursor_offset(runtime, path).await {
-            Ok(Some(offset)) => {
-                offsets.insert(path.clone(), offset);
+        match read_cursor_state(runtime, path).await {
+            Ok(Some(cursor)) => {
+                cursors.insert(path.clone(), cursor);
             }
             Ok(None) => {}
             Err(error) => {
@@ -1787,26 +1878,33 @@ async fn drain_pending_cursor_deletes(
     blocked
 }
 
-/// Read one persisted cursor offset. `Ok(None)` means the query succeeded but
+/// Read one persisted cursor. `Ok(None)` means the query succeeded but
 /// no row exists; an acquisition or query failure is returned so a cancelled
 /// delete can remain pending instead of allowing an EOF seed.
-async fn read_cursor_offset(
+async fn read_cursor_state(
     runtime: &KhiveRuntime,
     path: &Path,
-) -> Result<Option<u64>, RuntimeError> {
+) -> Result<Option<CursorState>, RuntimeError> {
     let sql = runtime.sql();
     let mut reader = sql.reader().await?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT byte_offset FROM session_mirror_cursor WHERE file_path=?1".into(),
+            sql: "SELECT byte_offset, file_identity FROM session_mirror_cursor WHERE file_path=?1"
+                .into(),
             params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
             label: Some("mirror_cursor_read".into()),
         })
         .await?;
-    Ok(match rows.first().and_then(|row| row.get("byte_offset")) {
-        Some(SqlValue::Integer(offset)) => Some(*offset as u64),
-        _ => None,
-    })
+    Ok(rows.first().map(|row| CursorState {
+        byte_offset: match row.get("byte_offset") {
+            Some(SqlValue::Integer(offset)) => *offset as u64,
+            _ => 0,
+        },
+        file_identity: match row.get("file_identity") {
+            Some(SqlValue::Text(identity)) => Some(identity.clone()),
+            _ => None,
+        },
+    }))
 }
 
 /// Extract the session UUID from a Codex filename of the form
@@ -2637,12 +2735,12 @@ mod discovery_tests {
 #[cfg(test)]
 mod cursor_retry_tests {
     use super::{
-        delete_cursors, drain_pending_cursor_deletes, finalize_dispatch_stats,
-        queue_cursor_deletes, tally_dispatch_errors, CandidateDispatch, DiscoveredKind,
-        DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
+        delete_cursors, drain_pending_cursor_deletes, finalize_dispatch_stats, load_cursors,
+        queue_cursor_deletes, tally_dispatch_errors, CandidateDispatch, CursorState,
+        DiscoveredKind, DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
     };
-    use crate::mirror::ingest::{mirror_file, LineTailSource, MirrorStats};
-    use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
+    use crate::mirror::ingest::{file_identity, mirror_file, LineTailSource, MirrorStats};
+    use crate::vocab::{SESSION_SCHEMA_COLUMN_ADDITIONS, SESSION_SCHEMA_PLAN_STMTS};
     use khive_runtime::{
         AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, RuntimeError,
     };
@@ -2743,6 +2841,117 @@ mod cursor_retry_tests {
         })
     }
 
+    #[test]
+    fn cursor_preserves_unchanged_and_append_offsets() {
+        let mut cursor = CursorState {
+            byte_offset: 100,
+            file_identity: Some("old-file".into()),
+        };
+        assert!(!cursor.reset_if_replaced("old-file", 100));
+        assert!(!cursor.reset_if_replaced("old-file", 150));
+        assert_eq!(cursor.byte_offset, 100, "an append keeps its offset");
+    }
+
+    #[test]
+    fn cursor_truncation_rewinds_from_previous_offset() {
+        let mut cursor = CursorState {
+            byte_offset: 100,
+            file_identity: Some("old-file".into()),
+        };
+        assert!(cursor.reset_if_replaced("old-file", 50));
+        assert_eq!(cursor.byte_offset, 0, "truncation restarts from zero");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_size_atomic_replacement_is_reingested_after_cursor_reload() {
+        let (rt, dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = dir.path().join("transcript.jsonl");
+        let original = concat!(
+            r#"{"uuid":"event-a","sessionId":"sess-replace","type":"user","timestamp":"2026-08-05T10:00:00Z","message":{"role":"user","content":"first"}}"#,
+            "\n"
+        );
+        let replacement = original.replace("event-a", "event-b");
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&path, original).expect("original transcript");
+        let first = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("first ingest");
+        assert_eq!(first.inserted, 1);
+
+        let mut cursor = load_cursors(&rt)
+            .await
+            .expect("reload cursor")
+            .remove(&path)
+            .expect("stored cursor");
+        assert_eq!(cursor.byte_offset, original.len() as u64);
+        assert_eq!(
+            cursor.file_identity.as_deref(),
+            Some(file_identity(&std::fs::metadata(&path).expect("original metadata")).as_str())
+        );
+        assert!(!cursor.reset_if_replaced(
+            &file_identity(&std::fs::metadata(&path).expect("unchanged metadata")),
+            original.len() as u64,
+        ));
+
+        let staged = dir.path().join("replacement.jsonl");
+        std::fs::write(&staged, replacement).expect("replacement transcript");
+        std::fs::rename(&staged, &path).expect("atomic replacement");
+        let new_identity = file_identity(&std::fs::metadata(&path).expect("replacement metadata"));
+        assert!(cursor.reset_if_replaced(&new_identity, original.len() as u64));
+        assert_eq!(cursor.byte_offset, 0);
+        let second = mirror_file(
+            &rt,
+            &path,
+            cursor.byte_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("replacement ingest");
+        assert_eq!(second.inserted, 1);
+        let saved = load_cursors(&rt)
+            .await
+            .expect("reload replacement cursor")
+            .remove(&path)
+            .expect("replacement cursor");
+        assert_eq!(saved.byte_offset, original.len() as u64);
+        assert_eq!(saved.file_identity.as_deref(), Some(new_identity.as_str()));
+    }
+
+    #[tokio::test]
+    async fn legacy_cursor_schema_adds_identity_without_losing_offset() {
+        let (rt, _dir) = runtime_without_schema();
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute_script(
+                "CREATE TABLE session_mirror_cursor (file_path TEXT PRIMARY KEY, session_id TEXT, byte_offset INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)"
+                    .to_string(),
+            )
+            .await
+            .expect("legacy cursor table");
+        drop(writer);
+        let path = PathBuf::from("/projects/legacy.jsonl");
+        insert_cursor_row(&rt, &path, 123).await;
+
+        rt.backend()
+            .apply_pack_ddl_statements_with_columns(
+                &SESSION_SCHEMA_PLAN_STMTS,
+                &SESSION_SCHEMA_COLUMN_ADDITIONS,
+            )
+            .expect("pack column upgrade");
+        let mut cursor = load_cursors(&rt)
+            .await
+            .expect("load upgraded cursor")
+            .remove(&path)
+            .expect("legacy row retained");
+        assert_eq!(cursor.byte_offset, 123);
+        assert_eq!(cursor.file_identity, None);
+        assert!(cursor.reset_if_replaced("current-file", 123));
+        assert_eq!(cursor.byte_offset, 0, "legacy row must replay once");
+    }
+
     #[tokio::test]
     async fn failed_cursor_delete_stays_pending_and_is_retried_next_tick() {
         let (rt, _dir) = runtime_without_schema();
@@ -2796,8 +3005,8 @@ mod cursor_retry_tests {
         assert!(pending.is_empty(), "re-tracked path cancels its delete");
         assert!(cursor_row_exists(&rt, &path).await, "fresh row preserved");
         assert_eq!(
-            offsets.get(&path),
-            Some(&512),
+            offsets.get(&path).map(|cursor| cursor.byte_offset),
+            Some(512),
             "canceling the delete restores the in-memory offset from the preserved row"
         );
     }
@@ -2824,7 +3033,13 @@ mod cursor_retry_tests {
         discovery.remove_file(&path, false);
         let removed = discovery.take_removed_files();
         assert_eq!(removed, vec![path.clone()]);
-        let mut offsets = HashMap::from([(path.clone(), 4096u64)]);
+        let mut offsets = HashMap::from([(
+            path.clone(),
+            CursorState {
+                byte_offset: 4096,
+                file_identity: None,
+            },
+        )]);
         for removed_path in &removed {
             offsets.remove(removed_path);
         }
@@ -2845,8 +3060,8 @@ mod cursor_retry_tests {
             "the preserved cursor row survives the cancel"
         );
         assert_eq!(
-            offsets.get(&path),
-            Some(&4096),
+            offsets.get(&path).map(|cursor| cursor.byte_offset),
+            Some(4096),
             "the cancel restores the in-memory offset from the preserved row, \
              so backfill=false seeding never falls back to EOF and skips bytes"
         );
@@ -2902,11 +3117,20 @@ mod cursor_retry_tests {
             drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
         assert!(blocked.is_empty());
         assert!(pending.is_empty());
-        assert_eq!(offsets.get(&path), Some(&true_offset));
+        assert_eq!(
+            offsets.get(&path).map(|cursor| cursor.byte_offset),
+            Some(true_offset)
+        );
 
         // The restored offset points at the new line, proving the retry does
         // not skip bytes that followed the already mirrored prefix.
-        let restored_offset = *offsets.entry(path.clone()).or_insert(file_len);
+        let restored_offset = offsets
+            .entry(path.clone())
+            .or_insert(CursorState {
+                byte_offset: file_len,
+                file_identity: None,
+            })
+            .byte_offset;
         assert_eq!(restored_offset, true_offset);
         let stats = mirror_file(
             &rt,
@@ -2988,6 +3212,7 @@ mod cursor_retry_tests {
                 new_offset: 4096,
                 skipped_oversized_bytes: true,
                 replay_mismatches: 0,
+                file_identity: None,
             }),
             start_offset,
         ));
@@ -3037,6 +3262,7 @@ mod cursor_retry_tests {
                 new_offset: 4200,
                 skipped_oversized_bytes: true,
                 replay_mismatches: 0,
+                file_identity: None,
             }),
             start_offset,
         ));
