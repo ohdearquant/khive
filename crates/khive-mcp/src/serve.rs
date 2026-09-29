@@ -791,6 +791,7 @@ async fn quarantine_channel_ingest_failure(
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
         "external_id": external_id,
+        "correlation_external_id": envelope.correlation_external_id.clone(),
         "metadata": {
             "quarantined": "true",
             "quarantine_classification": classification.name(),
@@ -14271,6 +14272,139 @@ backend = "kg-backend"
                 .unwrap()
                 .expect("retry restores the GC root");
             assert_eq!(repaired.content_ref.as_str(), content_ref);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn correlated_content_refusal_routes_quarantine_to_original_sender() {
+            const EXTERNAL_ID: &str = "imap:correlated-quarantine:11:7";
+            const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
+
+            let config = RuntimeConfig {
+                db_path: None,
+                actor_id: Some("lambda:original-sender".to_string()),
+                ..RuntimeConfig::no_embeddings()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory sender runtime");
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            builder.with_actor_id(runtime.config().actor_id.clone());
+            let registry = builder.build().expect("registry builds");
+            ensure_channel_quarantine_storage(&registry)
+                .await
+                .expect("quarantine storage preflight");
+
+            let sent = registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to": "email:recipient@example.com", "content": "original outbound"}),
+                )
+                .await
+                .expect("original sender's outbound message");
+            assert_eq!(sent["from"], "lambda:original-sender");
+            let thread_id = sent["thread_id"]
+                .as_str()
+                .expect("outbound thread ID")
+                .to_string();
+            let envelope = ChannelEnvelope::new(
+                "email:recipient@example.com",
+                "email:mailbox@example.com",
+                REFUSED_BODY,
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_correlation(thread_id.clone())
+            .with_quarantine_replay(
+                REFUSED_BODY.as_bytes().to_vec(),
+                "email:recipient@example.com",
+            );
+
+            let refused = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "local",
+                        "from": envelope.from.clone(),
+                        "to": envelope.to.clone(),
+                        "content": envelope.content.clone(),
+                        "channel_kind": "email",
+                        "external_id": EXTERNAL_ID,
+                        "correlation_external_id": thread_id.clone(),
+                        "default_inbound_actor": "channel:email",
+                    }),
+                )
+                .await
+                .expect_err("the real content gate must refuse the reply");
+            assert!(matches!(
+                refused,
+                khive_runtime::RuntimeError::SecretDetected(_)
+            ));
+
+            let mut channels = ChannelRegistry::new();
+            channels.register(Arc::new(ContentRefusalOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(channels),
+                registry.clone(),
+                "local".to_string(),
+                "channel:email".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor lookup");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a refused correlated message must quarantine and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let listed = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list messages");
+            let quarantined: Vec<_> = listed["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .filter(|note| note["properties"]["external_id"] == EXTERNAL_ID)
+                .collect();
+            assert_eq!(quarantined.len(), 1, "one quarantine for the refused reply");
+            let props = &quarantined[0]["properties"];
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["to_actor"], "lambda:original-sender");
+            assert_ne!(props["to_actor"], "channel:email");
+            assert_eq!(props["thread_id"], sent["thread_id"]);
+            assert_eq!(props["quarantine_reason"], "SecretDetected");
         }
 
         /// A real quarantine note plus GC-rooted original in one isolated
