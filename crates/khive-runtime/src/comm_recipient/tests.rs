@@ -31,6 +31,7 @@ fn payload(correlation: Option<String>) -> VerifiedInboundContent {
     VerifiedInboundContent::Message {
         content: "hello".into(),
         subject: None,
+        kind: None,
         correlation,
         sent_at: "2026-09-01T12:34:56Z".into(),
     }
@@ -58,6 +59,40 @@ async fn inbound_message_preserves_sender_sent_at_and_local_received_at() {
     assert!(received_at >= before && received_at <= after);
 }
 #[tokio::test]
+async fn inbound_message_persists_declared_or_unspecified_kind() {
+    for (declared, expected) in [
+        (Some(DeclaredMessageKind::Announce), "announce"),
+        (Some(DeclaredMessageKind::Report), "report"),
+        (Some(DeclaredMessageKind::Ask), "ask"),
+        (None, "unspecified"),
+    ] {
+        let (runtime, token, local, binding) = fixture();
+        let mut message = payload(None);
+        let VerifiedInboundContent::Message { kind, .. } = &mut message else {
+            unreachable!("payload fixture is a message")
+        };
+        *kind = declared;
+        let result = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(binding, 1),
+                message,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let persisted = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(result.note_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.properties.unwrap()["message_kind"], expected);
+    }
+}
+#[tokio::test]
 async fn invalid_sender_timestamp_is_quarantined_without_message_body() {
     for sent_at in ["not-a-timestamp", "2026-09-01T12:34:56+01:00"] {
         let (runtime, token, local, binding) = fixture();
@@ -69,6 +104,7 @@ async fn invalid_sender_timestamp_is_quarantined_without_message_body() {
                 VerifiedInboundContent::Message {
                     content: "private body".into(),
                     subject: None,
+                    kind: Some(DeclaredMessageKind::Ask),
                     correlation: None,
                     sent_at: sent_at.into(),
                 },
@@ -82,6 +118,7 @@ async fn invalid_sender_timestamp_is_quarantined_without_message_body() {
         let props = note.properties.unwrap();
         assert_eq!(props["quarantined"], true);
         assert!(props.get("sent_at").is_none());
+        assert!(props.get("message_kind").is_none());
         assert!(props["received_at"].is_string());
     }
 }
@@ -150,6 +187,11 @@ async fn correlation_is_confined_to_authenticated_pair() {
             .await
             .unwrap();
         let note = result.note.unwrap();
+        assert_eq!(
+            note.properties.as_ref().unwrap()["message_kind"],
+            "unspecified",
+            "thread correlation alone does not prove a reply"
+        );
         assert_eq!(
             note.properties.unwrap()["thread_id"],
             if same_pair {

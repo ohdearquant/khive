@@ -1,4 +1,23 @@
 //! Trusted in-process recipient ingest. No registry verb dispatches this API.
+//!
+//! The authenticated node-loop issuer is not yet present, so this entry point
+//! is unavailable to callers outside the runtime crate.
+//!
+//! ```compile_fail
+//! use khive_runtime::KhiveRuntime;
+//! fn main() { let _ = KhiveRuntime::ingest_verified_recipient; }
+//! ```
+//!
+//! ```compile_fail
+//! use khive_runtime::comm_recipient::LocalRecipientBinding;
+//! fn main() { let _ = std::mem::size_of::<LocalRecipientBinding>(); }
+//! ```
+//!
+//! ```compile_fail
+//! use khive_runtime::comm_recipient::VerifiedInboundContent;
+//! fn main() { let _ = std::mem::size_of::<VerifiedInboundContent>(); }
+//! ```
+#![allow(dead_code)] // The verified node-loop caller is supplied by #3537.
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 use khive_channel::InboundReceiptTicket;
 pub use khive_db::stores::note::recipient::{
@@ -13,7 +32,7 @@ use uuid::Uuid;
 
 /// Local enrollment authority, supplied by the trusted slug owner. Never fill
 /// this from plaintext or a wire request. Actor labels are local, not agent UUIDs.
-pub struct LocalRecipientBinding {
+pub(crate) struct LocalRecipientBinding {
     pub actor: String,
     pub realm: String,
     pub slug: String,
@@ -21,12 +40,30 @@ pub struct LocalRecipientBinding {
     pub device_id: Uuid,
     pub key_epoch: u64,
 }
+/// The only purpose values a protocol-v1 sender may declare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclaredMessageKind {
+    Announce,
+    Report,
+    Ask,
+}
+impl DeclaredMessageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Announce => "announce",
+            Self::Report => "report",
+            Self::Ask => "ask",
+        }
+    }
+}
+
 /// Content has deliberately no sender, recipient, namespace or actor field.
 /// Identity comes exclusively from local binding and an authenticated ticket.
-pub enum VerifiedInboundContent {
+pub(crate) enum VerifiedInboundContent {
     Message {
         content: String,
         subject: Option<String>,
+        kind: Option<DeclaredMessageKind>,
         correlation: Option<String>,
         sent_at: String,
     },
@@ -52,7 +89,7 @@ impl KhiveRuntime {
     /// at 98,304 bytes by the protocol request limit. No blob store is involved.
     /// A failure commits nothing and returns no recipient disposition. Retryable
     /// storage errors must not be converted into quarantine by the caller.
-    pub async fn ingest_verified_recipient(
+    pub(crate) async fn ingest_verified_recipient(
         &self,
         token: &NamespaceToken,
         local: &LocalRecipientBinding,
@@ -100,10 +137,12 @@ impl KhiveRuntime {
         self.validate_note_kind("message")?;
         let from = format!("khive1:{}/{}", local.realm, binding.sender_agent_id);
         let received_at = chrono::Utc::now().to_rfc3339();
-        let (content, subject, correlation, disposition, quarantine, sent_at) = match payload {
+        let (content, subject, kind, correlation, disposition, quarantine, sent_at) = match payload
+        {
             VerifiedInboundContent::Message {
                 content,
                 subject,
+                kind,
                 correlation,
                 sent_at,
             } => {
@@ -121,6 +160,7 @@ impl KhiveRuntime {
                     (
                         content,
                         subject,
+                        Some(kind.map_or("unspecified", DeclaredMessageKind::as_str)),
                         correlation,
                         RecipientDisposition::Stored,
                         None,
@@ -135,6 +175,7 @@ impl KhiveRuntime {
                         "Quarantined authenticated message".into(),
                         None,
                         None,
+                        None,
                         RecipientDisposition::Quarantined,
                         Some(QuarantineRecord {
                             reason: QuarantineReason::InvalidPlaintext,
@@ -146,6 +187,7 @@ impl KhiveRuntime {
             }
             VerifiedInboundContent::Quarantine { reason } => (
                 "Quarantined authenticated message".into(),
+                None,
                 None,
                 None,
                 RecipientDisposition::Quarantined,
@@ -176,6 +218,9 @@ impl KhiveRuntime {
         }
         if let Some(subject) = subject {
             props["subject"] = json!(subject);
+        }
+        if let Some(kind) = kind {
+            props["message_kind"] = json!(kind);
         }
         if disposition == RecipientDisposition::Quarantined {
             props["quarantined"] = json!(true);
