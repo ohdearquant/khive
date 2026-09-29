@@ -242,6 +242,21 @@ pub struct DaemonStoreGuard {
     _bound_database: Option<std::fs::File>,
 }
 
+#[cfg(unix)]
+impl Drop for DaemonStoreGuard {
+    fn drop(&mut self) {
+        // An inherited or duplicated descriptor can outlive this guard.
+        // Closing only this descriptor would keep its flock alive.
+        if let Err(error) = self._sidecar.unlock() {
+            tracing::warn!(
+                database = %self.database.display(),
+                %error,
+                "cannot release daemon store lock"
+            );
+        }
+    }
+}
+
 /// Placeholder for platforms where serving daemons and store claims are unavailable.
 #[cfg(not(unix))]
 #[derive(Debug)]
@@ -7090,6 +7105,25 @@ mod tests {
         drop(independent);
         drop(first);
         acquire_daemon_store_guards([second_path]).expect("second store released");
+    }
+
+    #[test]
+    fn store_guard_drop_releases_lock_with_duplicated_descriptor() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().canonicalize().expect("canonical fixture");
+        let database = root.join("store.db");
+        let guards = acquire_daemon_store_guards([database.clone()]).expect("first claim");
+        let duplicate = guards[0]._sidecar.try_clone().expect("duplicate lock fd");
+
+        let error = acquire_daemon_store_guards([database.clone()])
+            .expect_err("a live guard must still exclude another claim");
+        assert!(error.to_string().contains("already running"), "{error}");
+
+        drop(guards);
+        let replacement = acquire_daemon_store_guards([database])
+            .expect("dropping the guard must unlock even while a duplicate fd remains open");
+        drop(replacement);
+        drop(duplicate);
     }
 
     #[test]
