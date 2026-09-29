@@ -2968,6 +2968,27 @@ fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
             Ok(key)
         },
     )?;
+    // The outbox's legacy retry predicate used parse_from_rfc3339, while the
+    // general key above accepts Chrono's relaxed DateTime FromStr grammar.
+    // Keep the strict grammar separate so a relaxed-only future value still
+    // fails open as malformed, instead of postponing the message forever.
+    conn.create_scalar_function(
+        "khive_rfc3339_strict_key",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let text = match ctx.get_raw(0) {
+                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let key = text
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)));
+            Ok(key)
+        },
+    )?;
     Ok(())
 }
 

@@ -4377,6 +4377,72 @@ async fn instant_ordered_window_excludes_outside_rows() {
 }
 
 #[tokio::test]
+async fn rfc3339_due_or_invalid_filter_keeps_legacy_values() {
+    use khive_storage::note::{FilterOp, PropertyFilter};
+
+    let store = setup_memory_store();
+    let values = [
+        (
+            1,
+            serde_json::json!({"next_attempt_at": "2099-01-01T05:00:00-05:00"}),
+        ),
+        (
+            2,
+            serde_json::json!({"next_attempt_at": "2099-01-01T10:00:00.000001Z"}),
+        ),
+        (3, serde_json::json!({"next_attempt_at": "not-a-timestamp"})),
+        (4, serde_json::json!({"next_attempt_at": null})),
+        (5, serde_json::json!({"next_attempt_at": 42})),
+        (6, serde_json::json!({})),
+        (
+            7,
+            serde_json::json!({"next_attempt_at": "2999-01-01T00:00:00+0000"}),
+        ),
+        (
+            8,
+            serde_json::json!({"next_attempt_at": "2099-01-01T10:00:00.000000999Z"}),
+        ),
+    ];
+    for (id, properties) in values {
+        let mut note = make_note("local", "message", "retry fixture");
+        note.id = Uuid::from_u128(id);
+        note.created_at = id as i64;
+        note.updated_at = note.created_at;
+        note.properties = Some(properties);
+        store.upsert_note(note).await.unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".into()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.next_attempt_at".into(),
+            op: FilterOp::Rfc3339LteOrInvalid,
+            value: SqlValue::Text("2099-01-01T10:00:00.000000999Z".into()),
+        }],
+        ..Default::default()
+    };
+    let page = store
+        .query_notes_filtered_count_free(
+            "local",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        vec![8, 7, 6, 5, 4, 3, 1]
+            .into_iter()
+            .map(Uuid::from_u128)
+            .collect::<Vec<_>>(),
+        "missing, null, non-text, and strictly malformed deadlines are due; a value in the current microsecond is due and the next microsecond is not"
+    );
+}
+
+#[tokio::test]
 async fn instant_window_handles_utc_years_outside_rfc3339_text_range() {
     use khive_storage::note::{FilterOp, PropertyFilter, SortDir};
 

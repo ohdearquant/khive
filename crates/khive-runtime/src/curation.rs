@@ -2543,10 +2543,9 @@ impl KhiveRuntime {
     ///
     /// Fetches live `message` notes matching the SQL-side pending predicate
     /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
-    /// cap, and returns those that are still due, capped at `limit`.
-    /// Direction, `delivered_at`, terminal `delivery` state and the optional
-    /// `to_actor` channel prefix are all filtered by SQLite; only a valid
-    /// `next_attempt_at` remains a Rust check. Pending means `delivered_at`
+    /// cap. Direction, `delivered_at`, terminal `delivery` state, the optional
+    /// `to_actor` channel prefix, and `next_attempt_at` are filtered by SQLite
+    /// before the page bound. Pending means `delivered_at`
     /// is absent or null, `properties.delivery` carries no terminal state
     /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
     /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
@@ -2559,7 +2558,7 @@ impl KhiveRuntime {
     /// channel's rows once enough other rows sort ahead of them. The prefix
     /// renders as an index range served by
     /// `idx_comm_message_outbound_recipient`, and the newest-first order
-    /// means a future predicate miss still surfaces new rows first.
+    /// means due rows are returned in the same order as the prior scan.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2634,6 +2633,12 @@ impl KhiveRuntime {
             return Ok(Vec::new());
         }
         let now_micros = chrono::Utc::now().timestamp_micros();
+        // The former Rust predicate compared `timestamp_micros()`, so a
+        // deadline within the current microsecond counted as due. Preserve
+        // that boundary when comparing the SQL function's nanosecond keys.
+        let due_through = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(now_micros)
+            .expect("current UTC time fits a chrono timestamp")
+            + chrono::Duration::nanoseconds(999);
         let mut property_filters = vec![
             PropertyFilter {
                 json_path: "$.direction".to_string(),
@@ -2657,6 +2662,11 @@ impl KhiveRuntime {
                 json_path: "$.delivery_hold".to_string(),
                 op: FilterOp::JsonTypeMissingOrNullIndexed,
                 value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.next_attempt_at".to_string(),
+                op: FilterOp::Rfc3339LteOrInvalid,
+                value: SqlValue::Timestamp(due_through),
             },
         ];
         if let Some(prefix) = to_prefix {
@@ -2684,36 +2694,18 @@ impl KhiveRuntime {
             property_filters,
             ..Default::default()
         };
-        let candidates = self
+        let page = self
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit: MAX_SCAN_TOTAL,
+                    limit: limit.min(MAX_SCAN_TOTAL),
                     offset: 0,
                 },
             )
-            .await?
-            .items;
-
-        let mut collected: Vec<khive_storage::note::Note> = Vec::new();
-        for note in candidates {
-            let props = note.properties.as_ref().and_then(|v| v.as_object());
-            let retry_deferred = props
-                .and_then(|p| p.get("next_attempt_at"))
-                .and_then(|v| v.as_str())
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
-            if retry_deferred {
-                continue;
-            }
-            collected.push(note);
-            if collected.len() >= limit as usize {
-                return Ok(collected);
-            }
-        }
-        Ok(collected)
+            .await?;
+        Ok(page.items)
     }
 
     /// Load a live outbound `message` note, returning `InvalidInput`
@@ -6037,7 +6029,14 @@ mod tests {
         }));
         let malformed_id = malformed.id;
 
-        for note in [future, overdue, malformed] {
+        let mut relaxed_only = outbound_message_note();
+        relaxed_only.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "next_attempt_at": "2999-01-01T00:00:00+0000",
+        }));
+        let relaxed_only_id = relaxed_only.id;
+
+        for note in [future, overdue, malformed, relaxed_only] {
             store.upsert_note(note).await.expect("seed note");
         }
 
@@ -6054,6 +6053,63 @@ mod tests {
         assert!(
             ids.contains(&malformed_id),
             "malformed legacy retry state must fail open instead of stranding the note"
+        );
+        assert!(
+            ids.contains(&relaxed_only_id),
+            "a relaxed-only date is malformed under the former strict RFC 3339 parser"
+        );
+    }
+
+    /// Future retries on the same channel must not fill the bounded SQL page
+    /// and hide an older message whose retry deadline has passed (#1760).
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_due_row_past_future_retry_window() {
+        const FUTURE_RETRIES: usize = 10_050;
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut future_rows = Vec::with_capacity(FUTURE_RETRIES);
+        for i in 0..FUTURE_RETRIES {
+            let mut note = outbound_message_note();
+            note.created_at += i as i64;
+            note.updated_at = note.created_at;
+            note.properties = Some(serde_json::json!({
+                "direction": "outbound",
+                "to_actor": "email:recipient@example.test",
+                "next_attempt_at": "2999-01-01T00:00:00Z",
+            }));
+            future_rows.push(note);
+        }
+        let summary = store
+            .upsert_notes(future_rows)
+            .await
+            .expect("seed deferred retries");
+        assert_eq!(summary.affected as usize, FUTURE_RETRIES);
+
+        let mut due = outbound_message_note();
+        due.created_at -= 1_000_000;
+        due.updated_at = due.created_at;
+        due.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "to_actor": "email:recipient@example.test",
+            "next_attempt_at": "2000-01-01T00:00:00Z",
+        }));
+        let due_id = due.id;
+        store
+            .upsert_note(due)
+            .await
+            .expect("seed older due message");
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 1)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            hits.iter().map(|note| note.id).collect::<Vec<_>>(),
+            vec![due_id],
+            "a due row behind {FUTURE_RETRIES} deferred rows remains deliverable"
         );
     }
 
