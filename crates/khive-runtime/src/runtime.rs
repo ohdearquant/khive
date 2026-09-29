@@ -1782,7 +1782,9 @@ impl KhiveRuntime {
         }
     }
 
-    pub(crate) fn embedding_models_for_note_kind(&self, kind: &str) -> Vec<String> {
+    /// Registered models selected by the installed embedding policy for a note kind.
+    /// Unknown kinds retain the all-models default.
+    pub fn embedding_models_for_note_kind(&self, kind: &str) -> Vec<String> {
         let policy = self
             .valid_note_kinds
             .read()

@@ -290,7 +290,10 @@ None invokes an embedding pass, and `kkernel kg` has no `embed` subcommand.
 
 The shipped behavior has two parts:
 
-1. Runtime create and update paths embed inline for every configured engine.
+1. Runtime create and update paths embed entities and ordinary notes inline for every
+   configured engine. Pack-declared note-kind policies may narrow the set: the comm
+   pack's `message` notes use only the default engine unless a caller explicitly
+   selects another model.
    `kkernel mcp --no-embed` (or `KHIVE_NO_EMBED=1`) starts the MCP runtime without any
    built-in embedding engine, so those writes remain text-only.
 2. `kkernel reindex` is the explicit maintenance and repair command. It rebuilds vectors and
@@ -300,19 +303,20 @@ The shipped behavior has two parts:
 Examples using only shipped flags:
 
 ```bash
-# Re-embed entities and notes with every configured engine; knowledge uses the default.
+# Re-embed entities with every configured engine and notes per kind policy;
+# knowledge uses the default engine.
 kkernel reindex --db ~/.khive/khive.db --namespace local
 
 # Repair only the graph substrate and keep vectors that already exist.
 kkernel reindex --db ~/.khive/khive.db --namespace local \
   --no-knowledge --keep-existing
 
-# Rebuild entity/note vectors with one named engine.
+# Rebuild entity/note vectors with one named engine, overriding note-kind policy.
 kkernel reindex --db ~/.khive/khive.db --namespace local \
   --no-knowledge --model all-minilm-l6-v2
 ```
 
-Without `--keep-existing`, every staged record is re-embedded and each prior vector is
+Without `--keep-existing`, every eligible staged record is re-embedded and each prior vector is
 replaced atomically with its new value; a failed embed or insert leaves the prior vector in
 place rather than deleting it first. With `--keep-existing`, records already embedded for
 the selected model and namespace are skipped. FTS backfill still runs in either mode. The
@@ -402,9 +406,10 @@ the names and dimensions that `EmbedderRegistry::from_config` uses to instantiat
 
 The current Rust runtime does not consume `[embed]` or validate `embed.model` against that
 registry. `[[engines]]` is the shipped source of truth: `default = true` selects the default
-engine, inline create/update fans out across the registered set, and `kkernel reindex` does the
-same for entities and notes unless `--model` narrows the pass. The `[embed]` shape above is
-retained as the original decision record, not described as a second live selector.
+engine, inline entity create/update fans out across the registered set, and note create/update
+uses each note kind's installed embedding policy. `kkernel reindex` follows the same entity
+and note selection unless `--model` explicitly overrides it for that run. The `[embed]`
+shape above is retained as the original decision record, not described as a second live selector.
 
 ## Rationale
 
@@ -538,7 +543,8 @@ as separating source files from build artifacts in a standard software project.
 - [ADR-028](ADR-028-pack-scoped-backends.md) — pack-scoped backends; `[[backends]]`,
   `[[engines]]`, and `[packs.*]` sections live in the same selected TOML file this ADR governs
 - [ADR-031](ADR-031-multi-engine-retrieval.md) — `EmbedderRegistry`; `kkernel reindex`
-  fans entity/note work across registered engines unless `--model` narrows it
+  fans entity work across registered engines and applies note-kind embedding policy
+  unless `--model` narrows it
 - [ADR-034](ADR-034-kg-validation-pipelines.md) — validation pipelines remain separate from
   the explicit reindex maintenance path
 
@@ -562,3 +568,20 @@ Knowledge records its event before calling the profile hook. There is no
 cross-backend atomic transaction. If profile persistence subsequently fails, the
 error identifies the committed knowledge event and states that the profile
 outcome is unconfirmed. Callers must inspect before retrying.
+
+## 2026-09-29 amendment — note-kind embedding policy in reindex (#2227)
+
+The comm pack's note-kind embedding policy governs both inline writes and an
+unqualified `kkernel reindex` when that pack is selected. It declares `message`
+as default-model-only; ordinary notes retain the all-models default. Reindex groups
+notes by kind before embedding, including under `--keep-existing`, so it does not
+fill secondary-model message rows during an ordinary repair pass. Entities still use
+every registered model. An explicit `kkernel reindex --model <name>` selects that engine for
+entities and notes and overrides the note-kind policy; knowledge retains its
+default-engine behavior. An ordinary `kkernel reindex` does not itself migrate or
+delete preexisting secondary-model message rows.
+
+When an inline update removes an excluded model's historical vector, the cleanup
+must match the row's stored model identity. Two model names may sanitize to one
+table key; cleanup for the excluded name must preserve a selected model's row
+and provenance in that table, including when replacement embedding fails.

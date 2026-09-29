@@ -2101,37 +2101,49 @@ impl KhiveRuntime {
                 .strip_prefix("vec_")
                 .expect("runtime vector tables use the vec_ prefix");
             let subject = note.id.to_string();
+            // A selected and an excluded model may sanitize to the same table
+            // key. Check the stored model before touching either row or sidecar.
             let statements = vec![
                 SqlStatement {
                     sql: format!(
                         "INSERT INTO ann_write_log \
-                         (namespace, embedding_model, kind, field, subject_id, op) \
-                         SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
-                         FROM {table} WHERE subject_id=?1 AND namespace=?2"
+                     (namespace, embedding_model, kind, field, subject_id, op) \
+                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                     FROM {table} WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
                     ),
                     params: vec![
                         SqlValue::Text(subject.clone()),
                         SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
                     ],
                     label: Some("note-reindex-excluded-log-delete".into()),
                 },
                 SqlStatement {
-                    sql: format!("DELETE FROM {table} WHERE subject_id=?1 AND namespace=?2"),
-                    params: vec![
-                        SqlValue::Text(subject.clone()),
-                        SqlValue::Text(note.namespace.clone()),
-                    ],
-                    label: Some("note-reindex-excluded-vector-delete".into()),
-                },
-                SqlStatement {
-                    sql: "DELETE FROM vector_provenance \
-                          WHERE model_key=?1 AND subject_id=?2"
-                        .into(),
+                    sql: format!(
+                        "DELETE FROM vector_provenance \
+                         WHERE model_key=?1 AND subject_id=?2 \
+                         AND EXISTS (SELECT 1 FROM {table} \
+                                     WHERE subject_id=?2 AND namespace=?3 AND embedding_model=?4)"
+                    ),
                     params: vec![
                         SqlValue::Text(model_key.to_string()),
-                        SqlValue::Text(subject),
+                        SqlValue::Text(subject.clone()),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
                     ],
                     label: Some("note-reindex-excluded-provenance-delete".into()),
+                },
+                SqlStatement {
+                    sql: format!(
+                        "DELETE FROM {table} \
+                         WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
+                    ),
+                    params: vec![
+                        SqlValue::Text(subject),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-vector-delete".into()),
                 },
             ];
             if !self.apply_note_index_revision(note, statements).await? {
@@ -13930,6 +13942,179 @@ mod tests {
                 .unwrap();
             assert!(matches!(sidecar, Some(SqlValue::Integer(0))));
         }
+    }
+
+    #[tokio::test]
+    async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, RuntimeConfig};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct FailingProvider {
+            name: String,
+            dimensions: usize,
+            attempts: Arc<AtomicUsize>,
+        }
+
+        struct FailingService(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl EmbeddingService for FailingService {
+            async fn embed(
+                &self,
+                _texts: &[String],
+                _model: EmbeddingModel,
+            ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(EmbedError::InferenceFailed(
+                    "injected default embed failure".into(),
+                ))
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "failing-default-vector"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::embedder_registry::EmbedderProvider for FailingProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dimensions
+            }
+
+            async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+                Ok(Arc::new(FailingService(Arc::clone(&self.attempts))))
+            }
+        }
+
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let excluded_name = "all.minilm.l6.v2";
+        assert_eq!(
+            crate::config::sanitize_key(&primary_name),
+            crate::config::sanitize_key(excluded_name)
+        );
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(
+            &primary_name,
+            primary.dimensions(),
+        ));
+        let note = Note::new("local", "message", "message before policy narrowing");
+        rt.notes(&tok)
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        rt.reindex_note(&tok, &note).await.unwrap();
+        assert_eq!(
+            rt.vectors_for_model(&tok, &primary_name)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "fixture must seed the default vector before the failing update"
+        );
+
+        let model_key = crate::config::sanitize_key(&primary_name);
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO vector_provenance \
+                      (model_key, subject_id, namespace, embedding_digest) \
+                      VALUES (?1, ?2, ?3, ?4)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key.clone()),
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text("0".repeat(64)),
+                ],
+                label: Some("test-colliding-excluded-seed-provenance".into()),
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        rt.register_embedder(MergeTestVecProvider::new(
+            excluded_name,
+            primary.dimensions(),
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(FailingProvider {
+            name: primary_name.clone(),
+            dimensions: primary.dimensions(),
+            attempts: Arc::clone(&attempts),
+        });
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+
+        rt.update_note(
+            &tok,
+            note.id,
+            NotePatch {
+                content: Some("message after policy narrowing".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("best-effort default embed failure does not fail note update");
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+
+        let table = format!("vec_{model_key}");
+        let mut reader = rt.sql().reader().await.unwrap();
+        let retained_model = reader
+            .query_scalar(SqlStatement {
+                sql: format!(
+                    "SELECT embedding_model FROM {table} WHERE subject_id=?1 AND namespace=?2"
+                ),
+                params: vec![
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".into()),
+                ],
+                label: Some("test-colliding-excluded-default-retained".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(retained_model.as_ref(), Some(SqlValue::Text(model)) if model == &primary_name),
+            "default vector row was lost or replaced: {retained_model:?}"
+        );
+        let provenance = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance \
+                      WHERE model_key=?1 AND subject_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+                label: Some("test-colliding-excluded-provenance-retained".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(provenance, Some(SqlValue::Integer(1))));
     }
 
     /// merge_entity must delete from_id vectors from ALL registered model tables.
