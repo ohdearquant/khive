@@ -128,33 +128,50 @@ pub struct MirrorStats {
 }
 
 /// Stable across appends, but different for a replacement file at the same
-/// path. The fallback keeps the code portable where Unix file IDs are absent.
+/// path. Creation time is the ADR-080 identity where Unix file IDs are absent.
 pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         format!("unix:{}:{}", metadata.dev(), metadata.ino())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Keep the existing cursor spelling when `created()` is available.
+        // Windows always exposes raw creation time even if that conversion fails.
+        metadata
+            .created()
+            .map(|created| format!("created:{:?}", Some(created)))
+            .unwrap_or_else(|_| format!("created:windows:{}", metadata.creation_time()))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         format!("created:{:?}", metadata.created().ok())
     }
 }
 
 fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        return windows_source_open::open_file(path);
     }
-    options.open(path)
+    #[cfg(not(windows))]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(path)
+    }
 }
 
 /// Open a scheduled source through its configured directory, refusing linked
 /// ancestors as well as a linked final file. Each directory handle pins the
-/// component used by the next `openat`, so replacing a parent during the walk
+/// component used by the next handle-relative open, so replacing a parent during the walk
 /// cannot redirect the remaining components outside `root`.
 #[derive(Clone, Copy)]
 pub(crate) struct TrustedSource<'a> {
@@ -260,7 +277,228 @@ pub(crate) fn open_source_file_beneath(
     unreachable!("nonempty component iterator must return its final file")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) use windows_source_open::open_source_file_beneath;
+
+#[cfg(windows)]
+mod windows_source_open {
+    use std::ffi::OsStr;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::path::{Component, Path};
+
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, HANDLE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    use super::file_identity;
+
+    fn invalid(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message)
+    }
+
+    fn verify_handle(file: &File, directory: bool) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || (directory && !metadata.is_dir())
+            || (!directory && !metadata.is_file())
+        {
+            return Err(invalid(
+                "mirror source component has the wrong kind or is a reparse point",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_root(root: &Path) -> io::Result<File> {
+        let root = if root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            root
+        };
+        let absolute = if root.is_absolute() {
+            root.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(root)
+        };
+        let mut pinned = Vec::new();
+        // Pin every configured-root ancestor without delete sharing. A later
+        // absolute open cannot traverse a swapped-in junction above `root`.
+        for ancestor in absolute.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(ancestor)?;
+            verify_handle(&file, true)?;
+            pinned.push(file);
+        }
+        pinned
+            .pop()
+            .ok_or_else(|| invalid("mirror source root is empty"))
+    }
+
+    pub(super) fn open_file(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        verify_handle(&file, false)?;
+        Ok(file)
+    }
+
+    fn open_child(directory: &File, name: &OsStr, last: bool) -> io::Result<File> {
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        if wide.is_empty()
+            || wide.iter().any(|unit| {
+                *unit == 0
+                    || *unit == u16::from(b'/')
+                    || *unit == u16::from(b'\\')
+                    || *unit == u16::from(b':')
+            })
+        {
+            return Err(invalid(
+                "mirror source contains an invalid Windows path component",
+            ));
+        }
+        let byte_len = wide
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| invalid("mirror source component is too long"))?;
+        let unicode_name = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: directory.as_raw_handle(),
+            ObjectName: &raw const unicode_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let desired_access = if last {
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        } else {
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        };
+        let create_options = if last {
+            FILE_NON_DIRECTORY_FILE
+        } else {
+            FILE_DIRECTORY_FILE
+        } | FILE_OPEN_REPARSE_POINT
+            | FILE_SYNCHRONOUS_IO_NONALERT;
+        // SAFETY: the name buffer, structures, and pinned parent handle remain
+        // live for the call. The successful child handle is owned by `File`.
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut handle,
+                desired_access,
+                &raw const attributes,
+                &raw mut io_status,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                create_options,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: translating a returned NTSTATUS has no preconditions.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: `handle` was freshly returned by `NtCreateFile` and is
+        // transferred exactly once.
+        let file = unsafe { File::from_raw_handle(handle as RawHandle) };
+        verify_handle(&file, !last)?;
+        Ok(file)
+    }
+
+    pub(crate) fn open_source_file_beneath(
+        root: &Path,
+        path: &Path,
+        expected_directories: Option<&[String]>,
+    ) -> io::Result<(File, Vec<String>)> {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| invalid("mirror source is outside its configured root"))?;
+        let mut components = relative.components().peekable();
+        if components.peek().is_none() {
+            return Err(invalid(
+                "mirror source does not name a file beneath its configured root",
+            ));
+        }
+
+        let mut directory = open_root(root)?;
+        let root_identity = file_identity(&directory.metadata()?);
+        if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
+            return Err(io::Error::other(
+                "mirror source root changed after its metadata probe",
+            ));
+        }
+        let mut directory_identities = Vec::new();
+        if expected_directories.is_none() {
+            directory_identities.push(root_identity);
+        }
+        let mut directory_depth = 1;
+
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid(
+                    "mirror source contains a non-normal path component",
+                ));
+            };
+            let last = components.peek().is_none();
+            let opened = open_child(&directory, name, last)?;
+            if last {
+                if expected_directories.is_some_and(|expected| expected.len() != directory_depth) {
+                    return Err(io::Error::other(
+                        "mirror source ancestor count changed after its metadata probe",
+                    ));
+                }
+                return Ok((opened, directory_identities));
+            }
+            let identity = file_identity(&opened.metadata()?);
+            if expected_directories
+                .is_some_and(|expected| expected.get(directory_depth) != Some(&identity))
+            {
+                return Err(io::Error::other(
+                    "mirror source parent changed after its metadata probe",
+                ));
+            }
+            if expected_directories.is_none() {
+                directory_identities.push(identity);
+            }
+            directory_depth += 1;
+            directory = opened;
+        }
+        unreachable!("nonempty component iterator must return its final file")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn open_source_file_beneath(
     _root: &Path,
     _path: &Path,
@@ -1620,6 +1858,59 @@ mod tests {
             }),
         )
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mirror_windows_file_identity_uses_creation_time() {
+        use std::os::windows::fs::MetadataExt;
+
+        let source = NamedTempFile::new().expect("source file");
+        let metadata = source.as_file().metadata().expect("source metadata");
+        assert_eq!(
+            file_identity(&metadata),
+            format!(
+                "created:{:?}",
+                Some(metadata.created().expect("creation time"))
+            )
+        );
+        assert_ne!(metadata.creation_time(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mirror_windows_scheduled_file_rejects_parent_and_file_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("root");
+        let parent = root.join("staged");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&parent).expect("inside parent");
+        std::fs::create_dir_all(&outside).expect("outside parent");
+        let source = parent.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("inside source");
+        let outside_source = outside.join("source.jsonl");
+        std::fs::write(&outside_source, b"outside\n").expect("outside source");
+
+        let (_, directory_identities) =
+            open_source_file_beneath(&root, &source, None).expect("initial probe");
+        std::fs::rename(&parent, root.join("staged-old")).expect("move inside parent");
+        symlink_dir(&outside, &parent).expect("create parent link");
+        assert!(open_source_file_beneath(&root, &source, None).is_err());
+        assert!(open_source_file_beneath(&root, &source, Some(&directory_identities)).is_err());
+
+        std::fs::remove_dir(&parent).expect("remove parent link");
+        std::fs::create_dir(&parent).expect("restore parent");
+        symlink_file(&outside_source, &source).expect("link source");
+        assert!(open_source_file_beneath(&root, &source, None).is_err());
+        assert!(open_source_file(&source).is_err());
+
+        let linked_root_parent = dir.path().join("linked-root-parent");
+        symlink_dir(&root, &linked_root_parent).expect("link root parent");
+        let nested_root = linked_root_parent.join("staged-old");
+        let nested_source = nested_root.join("source.jsonl");
+        assert!(open_source_file_beneath(&nested_root, &nested_source, None).is_err());
     }
 
     /// Build a file-backed runtime (exercises the real `atomic_unit`

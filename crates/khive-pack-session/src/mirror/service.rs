@@ -21,6 +21,41 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::ingest::{self, LineTailSource};
 
+fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn discovered_entry_is_link_or_reparse(
+    path: &Path,
+    file_type: &std::fs::FileType,
+) -> io::Result<bool> {
+    if file_type.is_symlink() {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    {
+        Ok(is_link_or_reparse(&std::fs::symlink_metadata(path)?))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
 /// How a discovered file should be ingested.
 ///
 /// Provider exports are `MirrorSource` variants (ADR-080's closed
@@ -327,6 +362,98 @@ mod config_tests {
         assert!(discovery.directories.is_empty());
         assert!(discovery.schedule_files().is_empty());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_export_file_replaced_by_symlink_is_not_rescheduled() {
+        let root = tempfile::TempDir::new().expect("configured root");
+        let outside = tempfile::TempDir::new().expect("outside root");
+        let export = root.path().join("conversations.json");
+        let outside_export = outside.path().join("conversations.json");
+        std::fs::write(&export, "[]").expect("configured export");
+        std::fs::write(&outside_export, "[{}]").expect("outside export");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&export, DirectoryKind::ChatGptExport, true);
+        assert!(discovery.files.get(&export).is_some_and(|file| file.pinned));
+
+        std::fs::remove_file(&export).expect("remove configured export");
+        std::os::unix::fs::symlink(&outside_export, &export).expect("replace with symlink");
+        discovery.add_directory_tree(&export, DirectoryKind::ChatGptExport, true);
+        discovery.probe_directories();
+
+        assert!(!discovery.files.contains_key(&export));
+        assert!(discovery
+            .directories
+            .get(&export)
+            .is_some_and(|dir| dir.pinned));
+        assert!(discovery.schedule_files().is_empty());
+        assert!(super::ingest::open_source_file_beneath(root.path(), &export, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mirror_windows_junction_is_neither_discovered_nor_opened() {
+        use std::os::windows::fs::MetadataExt;
+        use std::process::Command;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let inside_file = root.join("conversations.json");
+        std::fs::write(&inside_file, "[]").expect("inside export");
+        std::fs::write(outside.join("conversations.json"), "[]").expect("outside export");
+        let junction = root.join("linked");
+        let output = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .expect("create junction");
+        assert!(
+            output.status.success(),
+            "junction creation failed: {output:?}"
+        );
+        let metadata = std::fs::symlink_metadata(&junction).expect("junction metadata");
+        assert_ne!(
+            metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+            0
+        );
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&root, DirectoryKind::ChatGptExport, true);
+        assert!(discovery.files.contains_key(&inside_file));
+        assert!(!discovery.directories.contains_key(&junction));
+        assert!(!discovery
+            .files
+            .contains_key(&junction.join("conversations.json")));
+        let fingerprint =
+            DirectoryFingerprint::from_metadata(&std::fs::metadata(&root).expect("root metadata"));
+        discovery
+            .refresh_directory(&root, &[DirectoryKind::ChatGptExport], fingerprint, true)
+            .expect("refresh root");
+        assert!(!discovery.directories.contains_key(&junction));
+        assert!(ingest::open_source_file_beneath(
+            &root,
+            &junction.join("conversations.json"),
+            None,
+        )
+        .is_err());
+
+        let mut configured = DiscoveryIndex::default();
+        configured.add_export_root(
+            &junction,
+            DirectoryKind::ChatGptExport,
+            DiscoveredKind::ChatGptExport,
+        );
+        assert!(configured.files.is_empty());
+        assert!(configured.directories.is_empty());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -580,10 +707,10 @@ impl DiscoveryIndex {
         directory_kind: DirectoryKind,
         file_kind: DiscoveredKind,
     ) {
-        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| is_link_or_reparse(&metadata)) {
             tracing::warn!(
                 path = %path.display(),
-                "session mirror: refusing a symlinked configured export root"
+                "session mirror: refusing a linked configured export root"
             );
             return;
         }
@@ -616,7 +743,9 @@ impl DiscoveryIndex {
                 self.remove_file(&path, false);
             }
 
-            let metadata = match std::fs::metadata(&path) {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if is_link_or_reparse(&metadata) && is_pinned => None,
+                Ok(metadata) if is_link_or_reparse(&metadata) => continue,
                 Ok(metadata) if metadata.is_dir() => Some(metadata),
                 Ok(metadata)
                     if is_pinned
@@ -660,7 +789,17 @@ impl DiscoveryIndex {
                                 fingerprint = None;
                                 continue;
                             };
-                            if file_type.is_symlink() {
+                            let linked = match discovered_entry_is_link_or_reparse(
+                                &child_path,
+                                &file_type,
+                            ) {
+                                Ok(linked) => linked,
+                                Err(_) => {
+                                    fingerprint = None;
+                                    continue;
+                                }
+                            };
+                            if linked {
                                 continue;
                             }
                             let Some(classified) =
@@ -739,7 +878,10 @@ impl DiscoveryIndex {
             let force_rescan = directory.unchanged_probes >= DIRECTORY_FORCE_RESCAN_PROBES;
             stats.metadata_probes += 1;
 
-            match std::fs::metadata(&path) {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if is_link_or_reparse(&metadata) => {
+                    self.remove_directory_tree(&path, true);
+                }
                 Ok(metadata) if metadata.is_dir() => {
                     // A path tracked as a directory that is one again must
                     // not keep a stale file record left by an intervening
@@ -883,7 +1025,14 @@ impl DiscoveryIndex {
                     continue;
                 }
             };
-            if file_type.is_symlink() {
+            let linked = match discovered_entry_is_link_or_reparse(&child_path, &file_type) {
+                Ok(linked) => linked,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            if linked {
                 continue;
             }
             for kind in kinds {
@@ -1369,10 +1518,8 @@ fn classify_entry(
     path: &Path,
     is_directory: bool,
 ) -> Option<ClassifiedEntry> {
-    // `is_directory` comes from `DirEntry::file_type()`, which does not
-    // follow symlinks: a symlinked directory arrives here as NOT a
-    // directory and is never queued for traversal by `add_directory_tree`
-    // or `refresh_directory`, so discovery cannot loop on symlink cycles.
+    // Callers reject symlinks and Windows reparse points before classification,
+    // so discovery cannot loop through a linked directory.
     // Traversal depth is therefore bounded by the real on-disk tree depth,
     // and `remove_directory_tree` (which descends only into tracked
     // directories) inherits the same bound — no depth cap is needed.
@@ -2240,6 +2387,40 @@ mod discovery_tests {
         discovery.probe_directories();
         assert!(discovery.files.contains_key(&transcript));
         assert!(discovery.hot_files.contains(&transcript));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_directory_replaced_by_symlink_is_removed_on_next_refresh() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let tracked = temp.path().join("tracked");
+        let moved = temp.path().join("moved");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        std::fs::create_dir(&tracked).expect("tracked dir");
+        let transcript = tracked.join("session.jsonl");
+        std::fs::write(&transcript, "inside\n").expect("inside transcript");
+        std::fs::write(outside.path().join("session.jsonl"), "outside\n")
+            .expect("outside transcript");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&tracked, DirectoryKind::ClaudeCodeProject, false);
+        assert!(discovery.files.contains_key(&transcript));
+        assert!(discovery
+            .schedule_files()
+            .iter()
+            .any(|file| file.path == transcript));
+
+        std::fs::rename(&tracked, &moved).expect("move tracked dir");
+        std::os::unix::fs::symlink(outside.path(), &tracked).expect("replace with symlink");
+        discovery.probe_directories();
+
+        assert!(!discovery.directories.contains_key(&tracked));
+        assert!(!discovery.files.contains_key(&transcript));
+        assert!(!discovery
+            .schedule_files()
+            .iter()
+            .any(|file| file.path == transcript));
+        assert!(discovery.take_removed_files().contains(&transcript));
     }
 
     #[test]
