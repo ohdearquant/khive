@@ -1122,3 +1122,99 @@ A later migration invalidates this review, as Amendment 4 already requires. In p
 and blob root-binding migrations for Amendment 1 items 7 and 8 add blob owners and a store binding. They take
 the next free versions when they land, and they need their own reviewed rows, with their liveness effect
 stated, in the change that adds them. This row set does not cover them.
+
+## Amendment 6 (2026-09-29): staged uploads count as root content
+
+**Status: Proposed (2026-09-29).** This amendment changes two places in Amendment 1 item 8 and nothing else
+in Amendment 1: the sentence that defines an empty root, "no blob objects and no root ownership marker of
+any owner", and the acceptance entry for a root with exactly one object. It concerns the filesystem blob
+root. It binds the implementing change, because the fresh-root bind and item 7's owner validation are not
+in code yet. Line references are at commit `2d30ab6d249a6db524c22d578e9df2af35f17f3b`, where the migration
+chain ends at V43 `vector_provenance` (`crates/khive-db/src/migrations.rs:454-458`) and `blob_pack_owners`,
+`store_binding` and `REVIEWED_SCHEMA_EPOCH` appear in no crate.
+
+### Why
+
+Item 8 lets a daemon boot bind a configured root to its main database when it proves the root empty. A
+staged multipart upload is neither a blob object nor a root marker. `blob.begin` creates one regular file at
+`<root>/.uploads/<id>`, and each `blob.put_part` appends to that file and syncs it
+(`crates/khive-db/src/stores/blob_uploads.rs:27`, `157-192`, `236-240`). The object walk skips every
+dot-leading name (`crates/khive-db/src/stores/blob.rs:1385-1392`, walk at `1433`), so an emptiness proof
+built on that walk reads a root whose only content is one database's open upload as empty. A second database
+could then bind that root. Item 7 refuses the first database's next part write, and a refused append aborts
+the upload and removes its staged file (`crates/khive-pack-blob/src/uploads.rs:345-357`, `194-203`). An
+upload that was progressing normally is lost.
+
+### Decision
+
+1. **Open uploads are root content.** The empty-root predicate in item 8 becomes: no blob objects, no entry
+   in `<root>/.uploads`, and no root ownership marker of any owner. A root whose only content is staged
+   uploads is not empty. The automatic fresh-root bind refuses it, binds nothing, and does not open, modify,
+   move or remove a staged file. An absent or empty `.uploads` directory is not content. A `.uploads` that
+   cannot be listed as a real directory is content, so the bind refuses as item 8 already does for missing
+   or corrupt evidence. An entry counts whatever its name. The expiry path in clause 3 removes only entries
+   named as upload ids (`blob_uploads.rs:406-408`), so a stray entry keeps the root out of the fresh path
+   until an operator removes it. Every use of "empty", "populated" and "no blob objects" in item 8 reads
+   with this predicate, including the recovery recheck and the rule for a database cut over before item 8.
+2. **The orphan collector never removes staged uploads.** The collector does not enter `.uploads` today. It
+   lists the root through `read_dir_names_no_follow`, which drops every dot-leading name
+   (`blob.rs:1385-1392`), and `.uploads` is one. [ADR-173](ADR-173-blob-chunked-upload.md) §3 and §4 already
+   record this. This clause pins the existing behavior: a transactional sweep in either mode reads and
+   deletes nothing under `.uploads`, and a change that makes the walk enter dot-leading directories must
+   exclude `.uploads` explicitly.
+3. **Abandoned uploads leave through the upload expiry path.** Upload ids do not survive a process restart
+   (`uploads.rs:142`), so a staged file left by an earlier daemon process has no live state. The daemon's
+   upload sweeper removes it. `UploadManager::sweep` discards records idle past the bound and calls
+   `sweep_uploads`, which unlinks every id-named file under `.uploads` whose modification time is at least
+   the bound old (`uploads.rs:437-476`, `blob_uploads.rs:385-447`). The bound is
+   `KHIVE_BLOB_UPLOAD_IDLE_SECS`, default 3600 seconds (`uploads.rs:56`). The sweeper ticks every
+   `KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS`, default 600 seconds, and its first tick comes one interval after
+   daemon start (`uploads.rs:57`, `crates/khive-mcp/src/components.rs:172-192`). The bind and the orphan
+   collector never remove a staged file. A root holding an abandoned upload younger than the bound refuses
+   the bind on that boot, and the first boot after the sweeper has removed the file can bind it.
+4. **An upload begin cannot land inside the bind.** Item 8 says the emptiness check runs "under database GC
+   ownership and the root write lock". That sentence keeps the check itself apart from any upload begin,
+   because `begin_upload` takes the root write lock: the store's per-root mutex and the
+   `.khive-blob-write.lock` file lock (`blob_uploads.rs:42`, `67-68`; `blob.rs:40`, `745-783`), the same pair
+   the orphan sweep takes (`blob.rs:2976`, `2989`). It does not say the bind keeps those locks through the
+   pending-ID write, the marker write and the completing transaction. Item 8 says that only of adoption
+   ("holds them through the durable update and verification"). `begin_upload` also takes no database handle
+   and validates no binding (`blob_uploads.rs:157`, `uploads.rs:255`). Two rules close the window.
+   - The fresh bind holds the database GC owner and the root write lock from the emptiness check until the
+     completing transaction commits or the attempt ends. The recovery recheck takes the same locks.
+   - Under that root write lock, and before it creates a staging file, `begin_upload` reads the binding
+     state and takes one of three outcomes. With no binding and none in progress it proceeds, and its entry
+     then counts as content for any later fresh bind under clause 1. With a completed binding it validates
+     against that binding as item 7 requires. With a pending binding it refuses with a retryable error and
+     stages nothing.
+
+   A begin therefore either runs before the check, where the check sees its staged file and refuses, or runs
+   after the bind has ended, where it finds the completed binding or none.
+
+### Acceptance
+
+These entries join the item 8 entries in Amendment 1's list. Its sentence "A mutant that removes the
+emptiness check fails the one-object control" stands, and entry (a) is its counterpart for `.uploads`.
+
+- **(a) Uploads-only root.** A database cut over with no live references, and a configured root whose only
+  content is one open upload's staged file (`blob.begin`, then one `blob.put_part`), refuses the automatic
+  fresh bind on daemon boot. It records no pending ID and no marker, and the main database is unchanged. The
+  staged file keeps its bytes and modification time, and the upload accepts its next part and commits, with
+  `blob.get` returning the whole object. A mutant whose emptiness check skips `.uploads` binds the root and
+  fails this entry.
+- **(b) Abandoned upload control.** The same root, with the staged file aged past
+  `KHIVE_BLOB_UPLOAD_IDLE_SECS` and no live upload record, refuses the bind on one boot and leaves the file
+  in place. One expiry pass removes the file. The next boot binds the root with the pending ID, verified
+  marker and single completing transaction that Amendment 1's empty-root entry requires.
+- **(c) Sweeps leave open uploads alone.** On a bound root with one open upload, a transactional sweep in
+  dry-run mode and another in live mode each leave the staged file with its bytes and modification time,
+  count it in no counter, and the upload then commits. The test
+  `transactional_gc_preserves_committed_and_staging_then_upload_sweep_only_reaps_staging`
+  (`crates/khive-pack-blob/src/uploads/tests.rs:1426-1515`) covers the live-mode sweep before any binding
+  exists. This entry adds the dry-run sweep and runs both on a bound root.
+- **(d) A begin cannot land inside the bind.** With a test hook holding the bind between its emptiness check
+  and its completing transaction, a `blob.begin` on the same root creates no staging file until the bind
+  ends, and then follows the outcome for the binding state it finds. A begin that completed before the check
+  is seen by the check, which refuses. A begin against a root whose binding is pending refuses and creates
+  no file. A mutant that releases the root write lock after the check lets the begin stage a file inside
+  the window and fails this entry.
