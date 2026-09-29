@@ -29,20 +29,22 @@ project entity's prior outcome.
 Unknown record reasons, malformed JSON,
 missing lint fields, ambiguous primary spans, and paths outside the repository are
 reported with the input line number. The caller must supply repo, branch, commit,
-and scope strings. A run without an explicit `source_run` uses the producer ID and
-commit, independent of observation date.
+and scope strings. On Unix, a literal backslash in a filename remains a backslash;
+on Windows, native backslash separators become `/`. A run without an explicit
+`source_run` uses the producer ID and commit, independent of observation date.
 
 Severity mapping is `error` → `high`, `warning` → `medium`, and
 `note`/`help`/`failure-note` → `info`; other levels are refused. The primary span
 provides repository-relative path, start/end lines, and start/end columns in
 evidence. The stable producer fingerprint uses producer ID, repository, normalized path,
 lint code, diagnostic message, verbatim primary-span source text, and columns.
-It excludes line numbers, so lines inserted elsewhere in the file do not change it;
-edits within the source snippet, including literal whitespace, do. The existing
+For a unique diagnostic it excludes line numbers, so lines inserted elsewhere in
+the file do not change it; edits within the source snippet, including literal
+whitespace, do. When otherwise identical diagnostics occur more than once, their
+positions disambiguate the entire group regardless of record order. The existing
 finding note ID remains content-versioned and can change when the evidence line
-changes; the fingerprint in `finding_id` and `raw.fingerprint` is the stable
-cross-run correlation key. Identical duplicate diagnostic records are collapsed;
-different spans that collide on the stable fingerprint are refused.
+changes; the fingerprint in `finding_id` and `raw.fingerprint` is the cross-run
+correlation key. Identical duplicate diagnostic records are collapsed.
 
 The adapter test builds a miniature JSON-lines stream from synthetic records in
 code. It contains only repository-relative example paths and no host paths.

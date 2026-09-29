@@ -75,7 +75,13 @@ fn positive_integer(
 }
 
 fn relative_path(raw: &str, line: usize) -> Result<String, ClippyAdapterError> {
+    // Clippy emits native paths. A backslash is a separator on Windows, but a
+    // legal filename character on Unix; rewriting it there merges distinct
+    // source files into one evidence path.
+    #[cfg(windows)]
     let slash_path = raw.replace('\\', "/");
+    #[cfg(not(windows))]
+    let slash_path = raw;
     if slash_path.starts_with('/') || slash_path.contains('\0') || slash_path.contains(':') {
         return Err(line_error(
             line,
@@ -243,8 +249,10 @@ fn finding_from_message(
 /// `no_marker`); a missing marker still yields usable diagnostics but never attests completeness.
 /// Other documented Cargo records and non-Clippy compiler messages are ignored. Invalid JSON
 /// and incomplete Clippy records fail the whole conversion with an input-line reason. The finding
-/// fingerprint omits line numbers; the versioned note ID still follows
-/// `ingest_findings_json`'s content identity contract.
+/// fingerprint omits line numbers for a unique diagnostic; repeated occurrences
+/// of the same lint/snippet are disambiguated by their source position. The
+/// versioned note ID still follows `ingest_findings_json`'s content identity
+/// contract.
 pub fn ingest_clippy_json_lines(
     input: &[u8],
     provenance: ClippyProvenance<'_>,
@@ -272,8 +280,8 @@ pub fn ingest_clippy_json_lines(
         line_error(line, "invalid UTF-8")
     })?;
 
-    let mut findings = Vec::new();
-    let mut seen = BTreeMap::new();
+    let mut findings: Vec<Value> = Vec::new();
+    let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut build_outcome = None;
     for (index, raw) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -296,12 +304,11 @@ pub fn ingest_clippy_json_lines(
                     let id = finding["id"]
                         .as_str()
                         .expect("adapter constructs a string id");
-                    if let Some(previous) = seen.insert(id.to_owned(), finding.clone()) {
-                        if previous != finding {
-                            return Err(line_error(line_number, format!("ambiguous Clippy fingerprint {id}: distinct diagnostic records share one fingerprint")));
-                        }
+                    let occurrences = seen.entry(id.to_owned()).or_default();
+                    if occurrences.iter().any(|&index| findings[index] == finding) {
                         continue;
                     }
+                    occurrences.push(findings.len());
                     findings.push(finding);
                 }
             }
@@ -325,6 +332,30 @@ pub fn ingest_clippy_json_lines(
                     format!("unsupported Cargo reason {reason:?}"),
                 ))
             }
+        }
+    }
+
+    // Retain the stable, line-independent fingerprint for unique diagnostics.
+    // Only a repeated lint with otherwise identical fingerprint parts needs
+    // position in its identity. Resolve the whole group after parsing so Cargo
+    // record order cannot decide which occurrence keeps the old ID.
+    for (base_id, occurrences) in seen {
+        if occurrences.len() < 2 {
+            continue;
+        }
+        for index in occurrences {
+            let evidence = &findings[index]["evidence"][0];
+            let position = (
+                base_id.as_str(),
+                evidence["line"].as_u64().expect("validated start line"),
+                evidence["end_line"].as_u64().expect("validated end line"),
+                findings[index]["severity"]
+                    .as_str()
+                    .expect("adapter severity"),
+            );
+            let fingerprint = Uuid::new_v5(&CODE_INGEST_NAMESPACE, &serde_json::to_vec(&position)?);
+            findings[index]["id"] = json!(format!("clippy-v1:{fingerprint}"));
+            findings[index]["fingerprint"] = json!(fingerprint.to_string());
         }
     }
 

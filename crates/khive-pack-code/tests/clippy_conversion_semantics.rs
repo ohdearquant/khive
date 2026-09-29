@@ -186,19 +186,19 @@ fn non_whitespace_literal_edit_changes_fingerprint() {
 }
 
 #[test]
-fn same_fingerprint_at_distinct_lines_is_explicitly_refused() {
-    let err = ingest(
+fn same_lint_at_distinct_lines_keeps_both_findings() {
+    let batch = ingest(
         &[diagnostic(SOURCE_A, 12), diagnostic(SOURCE_A, 32)],
         "synthetic-commit",
     )
-    .expect_err("same stable fingerprint at distinct spans is ambiguous");
-    match err {
-        ClippyAdapterError::Line { line, reason } => {
-            assert_eq!(line, 2);
-            assert!(reason.contains("ambiguous Clippy fingerprint"), "{reason}");
-        }
-        other => panic!("expected a line-specific ambiguity, got {other}"),
-    }
+    .expect("both lint occurrences are valid");
+    assert_eq!(batch.notes.len(), 2);
+    assert_eq!(props(&batch, 0)["evidence"][0]["line"], 12);
+    assert_eq!(props(&batch, 1)["evidence"][0]["line"], 32);
+    assert_ne!(
+        props(&batch, 0)["finding_id"],
+        props(&batch, 1)["finding_id"]
+    );
 }
 
 #[test]
