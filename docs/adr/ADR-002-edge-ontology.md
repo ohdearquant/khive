@@ -756,7 +756,8 @@ The audit disposition for the current set is:
 - The live base-plus-KG-pack endpoint-signature audit finds the ratified `supports`/`refutes`
   collision and, since [ADR-196](ADR-196-located-in-relation.md), one more: `extends` and
   `located_in` both carry the single pair `Concept -> Concept`. The second is resolved by a
-  passing Er fixture in `located_in`'s certificate, not by the ratified list. An identical
+  passing Er fixture in `located_in`'s certificate that tests `located_in` against `extends`
+  directly, not by the ratified list. An identical
   signature is a signal to run Er analysis, not by itself proof of redundancy; relations with the
   same legal endpoint kinds can still answer different questions.
 

@@ -7,7 +7,9 @@
 //! The fixture is the one ADR-196 names: `lung`, `respiratory system` and `right lung`
 //! (anatomy), `pneumonia` (disorder), with `right lung part_of lung`,
 //! `lung part_of respiratory system` and `pneumonia located_in lung`; the Er fixture adds
-//! `thoracic cavity` and `lung located_in thoracic cavity`.
+//! `thoracic cavity` and `lung located_in thoracic cavity`. A second Er fixture tests
+//! `located_in` against `extends`, the relation it shares the base `concept -> concept`
+//! endpoint signature with.
 //!
 //! Every check derives both answers from the fixture graph. Each check is generic over the
 //! relations present in the graph, so the negative controls at the bottom of the file feed
@@ -135,6 +137,48 @@ const ER: Fixture = Fixture {
     ],
     query: "what occupies the thoracic cavity, and what is in the lung?",
     check: er_check,
+};
+
+/// Are the `located_in` pairs `extends` over the shared `concept -> concept` signature?
+///
+/// `extends` asserts intellectual lineage (a Derivation relation). Stored as `extends`,
+/// `pneumonia located_in lung` would make a lineage reader list pneumonia, and through it
+/// bacterial pneumonia, among the descendants of the lung, and `lung located_in
+/// thoracic_cavity` would make an organ a derivative of a space. The fixture carries one
+/// real lineage pair, so the restricted relation answers a different question.
+fn er_extends_check(graph: &'static [GraphTriple]) -> EliminatorCheck {
+    let r = all_pairs(graph, R);
+    let restricted: Pairs = all_pairs(graph, "extends")
+        .into_iter()
+        .filter(|(s, t)| kind_of(graph, s) == Some("concept") && kind_of(graph, t) == Some("concept"))
+        .collect();
+    if !r.is_empty() && r == restricted {
+        EliminatorCheck::Eliminated {
+            shared_answer: fmt_pairs(&r),
+            reason: "located_in equals extends over concept -> concept".to_string(),
+        }
+    } else {
+        EliminatorCheck::Passes {
+            cheaper: fmt_pairs(&restricted),
+            r_answer: fmt_pairs(&r),
+        }
+    }
+}
+
+const ER_EXTENDS: Fixture = Fixture {
+    eliminator: "Er",
+    cheaper_encoding: "extends restricted to the shared concept -> concept signature",
+    graph: &[
+        ("lung", "kind", "concept"),
+        ("thoracic_cavity", "kind", "concept"),
+        ("pneumonia", "kind", "concept"),
+        ("bacterial_pneumonia", "kind", "concept"),
+        ("bacterial_pneumonia", "extends", "pneumonia"),
+        ("pneumonia", "located_in", "lung"),
+        ("lung", "located_in", "thoracic_cavity"),
+    ],
+    query: "what descends from pneumonia by lineage, and what is located in the lung?",
+    check: er_extends_check,
 };
 
 // ── At: existing relation plus a metadata attribute value ────────────────────
@@ -332,8 +376,9 @@ const SR: Fixture = Fixture {
 
 // ── Positive tests ───────────────────────────────────────────────────────────
 
-/// The seven positive fixtures, exported for the closed-set coverage gate.
-pub const FIXTURES: &[Fixture] = &[CV, ER, AT, PO, CH, MV, SR];
+/// The positive fixtures, one per eliminator family plus the second Er fixture for the
+/// `extends` signature collision, exported for the closed-set coverage gate.
+pub const FIXTURES: &[Fixture] = &[CV, ER, ER_EXTENDS, AT, PO, CH, MV, SR];
 
 #[test]
 fn cv_located_in_is_not_converse_of_contains() {
@@ -343,6 +388,11 @@ fn cv_located_in_is_not_converse_of_contains() {
 #[test]
 fn er_located_in_is_not_part_of_restricted_to_disorder_anatomy() {
     assert_defeats_eliminator(R, &ER);
+}
+
+#[test]
+fn er_located_in_is_not_extends_over_the_shared_concept_signature() {
+    assert_defeats_eliminator(R, &ER_EXTENDS);
 }
 
 #[test]
@@ -382,6 +432,25 @@ fn er_fixture_contains_the_anatomy_to_anatomy_pair() {
     assert_eq!(kind_of(ER.graph, "thoracic_cavity"), Some("anatomy"));
 }
 
+/// The `extends` fixture carries a real lineage pair beside both location pairs, every
+/// endpoint on the shared `concept -> concept` signature, so the restricted relation is
+/// non-empty and still differs from `located_in`.
+#[test]
+fn er_extends_fixture_pairs_lineage_with_location_on_the_shared_signature() {
+    assert!(ER_EXTENDS
+        .graph
+        .contains(&("bacterial_pneumonia", "extends", "pneumonia")));
+    assert!(ER_EXTENDS
+        .graph
+        .contains(&("pneumonia", "located_in", "lung")));
+    assert!(ER_EXTENDS
+        .graph
+        .contains(&("lung", "located_in", "thoracic_cavity")));
+    for node in ["lung", "thoracic_cavity", "pneumonia", "bacterial_pneumonia"] {
+        assert_eq!(kind_of(ER_EXTENDS.graph, node), Some("concept"));
+    }
+}
+
 #[test]
 fn full_certificate_located_in_defeats_all_seven_eliminators() {
     run_certificate(R, FIXTURES);
@@ -411,6 +480,20 @@ fn er_control_located_in_as_restricted_part_of_is_eliminated() {
             ("pneumonia", "located_in", "lung"),
         ],
         ..ER
+    };
+    assert_eliminated_by(R, &G);
+}
+
+#[test]
+fn er_control_located_in_as_concept_extends_is_eliminated() {
+    const G: Fixture = Fixture {
+        graph: &[
+            ("a", "kind", "concept"),
+            ("b", "kind", "concept"),
+            ("a", "extends", "b"),
+            ("a", "located_in", "b"),
+        ],
+        ..ER_EXTENDS
     };
     assert_eliminated_by(R, &G);
 }
