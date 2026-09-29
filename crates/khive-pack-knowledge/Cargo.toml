@@ -14,6 +14,11 @@ description = "Knowledge verb pack — lore corpus (atoms/domains), TF-IDF retri
 [lib]
 bench = false
 
+[features]
+# #3514 source experiment only: a paired V48/prototype search harness. This
+# does not select a tokenizer or change an index in ordinary builds.
+namespace-trigram-proto = ["khive-db/namespace-trigram-proto"]
+
 [dependencies]
 khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
 khive-brain-core = { version = "0.9.0", path = "../khive-brain-core" }
