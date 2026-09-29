@@ -64,7 +64,10 @@ pub use migrations::{
     run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
     MIGRATIONS,
 };
-pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, ReaderRow, WriterGuard};
+pub use pool::{
+    CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,
+    WriterGuard,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;
 pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};
