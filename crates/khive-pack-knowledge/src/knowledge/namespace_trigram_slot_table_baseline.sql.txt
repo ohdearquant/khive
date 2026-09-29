@@ -1,4 +1,4 @@
--- V48: Assign each knowledge namespace one exact trigram posting key.
+-- Design baseline: assign each knowledge namespace one exact trigram posting key.
 -- Three Private Use Area codepoints are unchanged by FTS5's case fold and
 -- tokenize as exactly one trigram. The persistent, unique slot map gives
 -- disjoint generated namespace-key matches; unlike a hex phrase, no shared leading

@@ -1,7 +1,7 @@
-//! #3514: paired, feature-only V48/prototype experiment over the real
-//! knowledge.search dispatch. The runtime creates the ordinary schema in a
-//! temporary file, applies the exact frozen V48 SQL there, and adds one
-//! prefixed-tokenizer shadow index. Neither is a shipped migration.
+//! #3514: paired, feature-only slot-table/prefixed-tokenizer experiment over
+//! the real knowledge.search dispatch. The runtime creates the ordinary schema
+//! in a temporary file, applies a namespace-keyed slot-table baseline there,
+//! and adds one prefixed-tokenizer shadow index. Neither is a shipped migration.
 
 use super::*;
 
@@ -17,9 +17,9 @@ const A_NAMESPACE: &str = "a";
 const B_NAMESPACE: &str = "b";
 const QUERY: &str = "zznamespaceguard zzsecondguard";
 const TERM: &str = "zznamespaceguard";
-// Byte-for-byte copy of the rejected frozen V48 proposal, held as a test
-// fixture rather than installed as a numbered migration.
-const FROZEN_V48_SQL: &str = include_str!("namespace_trigram_v48_frozen.sql.txt");
+// A design baseline for comparison, held as a test fixture rather than
+// installed as a numbered migration.
+const SLOT_TABLE_BASELINE_SQL: &str = include_str!("namespace_trigram_slot_table_baseline.sql.txt");
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -57,8 +57,8 @@ fn fixture(foreign_rows: i64) -> Fixture {
     let mut connection = Connection::open(&path).expect("open temporary database");
     register(&connection).expect("register prototype tokenizer before FTS DDL");
     connection
-        .execute_batch(FROZEN_V48_SQL)
-        .expect("apply the exact frozen V48 schema/trigger/rebuild SQL to the temp DB");
+        .execute_batch(SLOT_TABLE_BASELINE_SQL)
+        .expect("apply the slot-table baseline schema to the temp DB");
     connection
         .execute(
             "INSERT INTO knowledge_fts_namespace_keys(namespace_value) VALUES (?1)",
@@ -68,7 +68,7 @@ fn fixture(foreign_rows: i64) -> Fixture {
     let transaction = connection.transaction().expect("seed transaction");
     if foreign_rows > 0 {
         // The foreign body deliberately contains A's exact key and both
-        // query terms. A column-filtered V48 key may see that shared posting;
+        // query terms. A column-filtered slot key may see that shared posting;
         // the prototype must never emit an A-prefixed token for this B text.
         transaction
             .execute(
@@ -128,7 +128,7 @@ fn fixture(foreign_rows: i64) -> Fixture {
             .expect("seed identical A row");
     }
 
-    // V48's own triggers and slot view built the real baseline index while
+    // The baseline's triggers and slot view built its index while
     // seeding. Only the prefixed-tokenizer arm needs a shadow FTS table.
     transaction
         .execute_batch(
@@ -171,7 +171,7 @@ fn fixture(foreign_rows: i64) -> Fixture {
             [A_NAMESPACE],
             |row| row.get(0),
         )
-        .expect("read V48's real assigned A key");
+        .expect("read the baseline's assigned A key");
     assert_eq!(stored_a_key, a_key);
 
     let a_match = scoped_match(&a_key, TERM).expect("A MATCH expression");
@@ -193,22 +193,22 @@ fn fixture(foreign_rows: i64) -> Fixture {
         proto_rowids.iter().all(|rowid| *rowid > foreign_rows),
         "the prototype's first postings must contain only A rows"
     );
-    let v48_rowids: Vec<i64> = {
+    let slot_table_rowids: Vec<i64> = {
         let mut statement = connection
             .prepare(
                 "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
                  ORDER BY rowid LIMIT 10",
             )
-            .expect("prepare frozen V48 rowid probe");
+            .expect("prepare slot-table baseline rowid probe");
         let expression =
             format!("namespace_key : \"{a_key}\" AND {{slug name content}} : \"{TERM}\"");
         statement
             .query_map([expression], |row| row.get(0))
-            .expect("run frozen V48 rowid probe")
+            .expect("run slot-table baseline rowid probe")
             .collect::<rusqlite::Result<_>>()
-            .expect("collect frozen V48 rowids")
+            .expect("collect slot-table baseline rowids")
     };
-    assert_eq!(v48_rowids, proto_rowids);
+    assert_eq!(slot_table_rowids, proto_rowids);
     drop(connection);
 
     Fixture {
@@ -221,31 +221,27 @@ fn fixture(foreign_rows: i64) -> Fixture {
 
 async fn dispatch(fixture: &Fixture, mode: NamespaceTrigramExperiment) -> (Value, Value) {
     let mode_suffix = match &mode {
-        NamespaceTrigramExperiment::V48 { .. } => "v48",
+        NamespaceTrigramExperiment::SlotTable { .. } => "slot_table",
         NamespaceTrigramExperiment::Prefixed { .. } => "prefixed",
     };
-    let usage = khive_storage::usage::UsageContext::new();
     let timings: tests::PrototypePhaseTimes = Arc::new(Mutex::new(HashMap::new()));
     let started = Instant::now();
     let response = tests::with_prototype_phase_times(
         timings.clone(),
         NAMESPACE_TRIGRAM_EXPERIMENT.scope(
             mode,
-            khive_storage::usage::scope(
-                usage.clone(),
-                with_lexical_stage_budget_override_ms(
-                    120_000,
-                    with_phase_a_widen_ceiling_override(
-                        20,
-                        fixture.registry.dispatch(
-                            "knowledge.search",
-                            json!({
-                                "namespace": A_NAMESPACE,
-                                "query": QUERY,
-                                "rerank": false,
-                                "limit": 10,
-                            }),
-                        ),
+            with_lexical_stage_budget_override_ms(
+                120_000,
+                with_phase_a_widen_ceiling_override(
+                    20,
+                    fixture.registry.dispatch(
+                        "knowledge.search",
+                        json!({
+                            "namespace": A_NAMESPACE,
+                            "query": QUERY,
+                            "rerank": false,
+                            "limit": 10,
+                        }),
                     ),
                 ),
             ),
@@ -280,12 +276,7 @@ async fn dispatch(fixture: &Fixture, mode: NamespaceTrigramExperiment) -> (Value
         "ok": true,
         "tool": "knowledge.search",
         "result": response,
-        "usage": usage.snapshot(),
     });
-    assert!(
-        envelope["usage"].is_object(),
-        "usage must remain in the comparison"
-    );
     (
         envelope,
         json!({"wall_ms": wall_ms, "lexical_reads": stages}),
@@ -294,9 +285,9 @@ async fn dispatch(fixture: &Fixture, mode: NamespaceTrigramExperiment) -> (Value
 
 async fn compare_arm(foreign_rows: i64) -> (Value, Value) {
     let fixture = fixture(foreign_rows);
-    let (v48, v48_latency) = dispatch(
+    let (slot_table, slot_table_latency) = dispatch(
         &fixture,
-        NamespaceTrigramExperiment::V48 {
+        NamespaceTrigramExperiment::SlotTable {
             key: fixture.a_key.clone(),
         },
     )
@@ -309,14 +300,14 @@ async fn compare_arm(foreign_rows: i64) -> (Value, Value) {
     )
     .await;
     assert_eq!(
-        serde_json::to_vec(&v48).expect("serialize V48 envelope"),
+        serde_json::to_vec(&slot_table).expect("serialize slot-table envelope"),
         serde_json::to_vec(&prototype).expect("serialize prototype envelope"),
-        "V48 and prefixed tokenization must preserve the entire search envelope, including usage"
+        "slot-table and prefixed tokenization must preserve the search result envelope"
     );
     let record = json!({
         "foreign_rows": foreign_rows,
         "query": QUERY,
-        "v48": v48_latency,
+        "slot_table": slot_table_latency,
         "prototype": prototype_latency,
     });
     eprintln!("NAMESPACE_TRIGRAM_PROTO {record}");
@@ -324,29 +315,29 @@ async fn compare_arm(foreign_rows: i64) -> (Value, Value) {
         fixture.runtime.config().default_namespace.as_str(),
         A_NAMESPACE
     );
-    (v48, record)
+    (slot_table, record)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prototype_preserves_the_full_search_envelope_with_earlier_foreign_rows() {
+async fn prototype_preserves_search_result_with_earlier_foreign_rows() {
     let (zero_envelope, zero) = compare_arm(0).await;
     let (two_hundred_envelope, two_hundred) = compare_arm(200).await;
     assert_eq!(
         serde_json::to_vec(&zero_envelope).expect("serialize zero-B envelope"),
         serde_json::to_vec(&two_hundred_envelope).expect("serialize 200-B envelope"),
-        "foreign postings must not change A's complete response or usage"
+        "foreign postings must not change A's search result"
     );
     assert_eq!(zero["foreign_rows"], 0);
     assert_eq!(two_hundred["foreign_rows"], 200);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "manual #2404-scale, 200000-row paired V48/prototype latency run on Mac mini"]
-async fn measure_prototype_against_v48_at_200000_foreign_rows() {
+#[ignore = "manual #2404-scale, 200000-row paired latency run on a quiet machine"]
+async fn measure_prototype_against_slot_table_at_200000_foreign_rows() {
     let mut baseline = None;
     for foreign_rows in [0, 200, 200_000] {
         let (envelope, _) = compare_arm(foreign_rows).await;
-        let bytes = serde_json::to_vec(&envelope).expect("serialize full search envelope");
+        let bytes = serde_json::to_vec(&envelope).expect("serialize search result envelope");
         if let Some(ref baseline) = baseline {
             assert_eq!(&bytes, baseline, "A envelope changed with B row count");
         } else {

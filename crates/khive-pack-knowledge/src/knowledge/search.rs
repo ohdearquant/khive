@@ -410,11 +410,11 @@ fn fts5_candidate_terms(raw_query: &str) -> Vec<String> {
 
 // The #3514 experiment substitutes only the FTS access path. The ordinary
 // production build always uses `fts_knowledge`; the feature-gated test scopes
-// two frozen index shapes around the same real knowledge.search dispatch.
+// two temporary index shapes around the same real knowledge.search dispatch.
 #[cfg(all(test, feature = "namespace-trigram-proto"))]
 #[derive(Clone)]
 enum NamespaceTrigramExperiment {
-    V48 { key: String },
+    SlotTable { key: String },
     Prefixed { key: String },
 }
 
@@ -429,7 +429,7 @@ fn prototype_fts_target(term: &str) -> Option<(&'static str, String)> {
         .try_with(Clone::clone)
         .ok()
         .map(|experiment| match experiment {
-            NamespaceTrigramExperiment::V48 { key } => (
+            NamespaceTrigramExperiment::SlotTable { key } => (
                 "fts_knowledge",
                 format!(
                     "namespace_key : {} AND {{slug name content}} : {term}",
@@ -980,9 +980,9 @@ async fn fetch_fts_candidates(
     let mut reader = reader;
     #[cfg(all(test, feature = "namespace-trigram-proto"))]
     if let Ok(experiment) = NAMESPACE_TRIGRAM_EXPERIMENT.try_with(Clone::clone) {
-        // The frozen V48 path resolves its persistent namespace slot once per
-        // lexical pass. Both paired arms retain that real indexed lookup, so
-        // the full dispatch usage and timing include the same key-read cost.
+        // The slot-table baseline resolves its namespace slot once per
+        // lexical pass. Both paired arms retain that indexed lookup, so their
+        // timings include the same key-read cost.
         let key_row = match stage
             .read(
                 LexicalPhase::ReaderOpen,
@@ -1013,12 +1013,12 @@ async fn fetch_fts_candidates(
                 RuntimeError::Internal(format!("missing knowledge FTS namespace key for {ns:?}"))
             })?;
         let expected = match experiment {
-            NamespaceTrigramExperiment::V48 { key }
+            NamespaceTrigramExperiment::SlotTable { key }
             | NamespaceTrigramExperiment::Prefixed { key } => key,
         };
         if found != expected {
             return Err(RuntimeError::Internal(
-                "prototype namespace key differs from frozen V48 slot map".into(),
+                "prototype namespace key differs from slot-table baseline".into(),
             ));
         }
     }
@@ -4529,19 +4529,19 @@ mod tests {
             if prefixed {
                 "term_frequency_prefixed"
             } else {
-                "term_frequency_v48"
+                "term_frequency_slot_table"
             }
         } else if sql.starts_with("SELECT rowid FROM") {
             if prefixed {
                 "phase_a_rowids_prefixed"
             } else {
-                "phase_a_rowids_v48"
+                "phase_a_rowids_slot_table"
             }
         } else if sql.starts_with("SELECT a.* FROM fts_") {
             if prefixed {
                 "eligibility_fallback_prefixed"
             } else {
-                "eligibility_fallback_v48"
+                "eligibility_fallback_slot_table"
             }
         } else if sql.starts_with("SELECT a.*, a.rowid AS rowid") {
             "phase_b_hydration"
@@ -4549,7 +4549,7 @@ mod tests {
             if prefixed {
                 "namespace_existence_prefixed"
             } else {
-                "namespace_existence_v48"
+                "namespace_existence_slot_table"
             }
         } else if sql.starts_with("SELECT 1 AS present FROM knowledge_atoms") {
             "namespace_membership"
