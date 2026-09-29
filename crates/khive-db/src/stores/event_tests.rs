@@ -97,6 +97,55 @@ async fn operation_attribution_rejects_unpaired_values_before_append() {
 }
 
 #[tokio::test]
+async fn profile_state_version_refuses_overflow_before_any_event_is_persisted() {
+    let store = setup_memory_store();
+    let valid = make_event("default").with_profile_state_version(i64::MAX as u64);
+    let overflow = make_event("default").with_profile_state_version(i64::MAX as u64 + 1);
+
+    assert!(event_insert_statements(&valid).is_ok());
+    assert!(event_insert_statements(&overflow).is_err());
+    assert!(store.preflight_event(&overflow).is_err());
+    assert!(store.append_event(overflow.clone()).await.is_err());
+    assert!(store
+        .append_events(vec![valid.clone(), overflow.clone()])
+        .await
+        .is_err());
+    assert!(store
+        .append_events_idempotent(vec![valid.clone(), overflow.clone()])
+        .await
+        .is_err());
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+
+    store.append_event(valid.clone()).await.unwrap();
+    assert_eq!(
+        store.get_event(valid.id).await.unwrap(),
+        Some(valid.clone())
+    );
+    let mut invalid_retry = valid;
+    invalid_retry.profile_state_version = overflow.profile_state_version;
+    assert!(store
+        .append_events_idempotent(vec![invalid_retry])
+        .await
+        .is_err());
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0
+                }
+            )
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_append_and_get_event() {
     let store = setup_memory_store();
 
