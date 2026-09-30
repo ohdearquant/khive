@@ -24,9 +24,10 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
-    NoteLifecycleSpec, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef,
-    VerbCategory, VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode,
+    NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec,
+    PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -313,6 +314,11 @@ pub trait PackRuntime: Send + Sync {
     /// and future enforcement.  Defaults to empty so existing packs compile
     /// without changes.
     fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        &[]
+    }
+
+    /// Per-kind write-time embedding policy; unlisted kinds use every model.
+    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
         &[]
     }
 
@@ -4215,6 +4221,14 @@ impl VerbRegistry {
         self.packs
             .iter()
             .flat_map(|p| p.note_kind_specs().iter())
+            .collect()
+    }
+
+    /// Collect pack-declared embedding policies for registered note kinds.
+    pub fn all_note_embedding_policies(&self) -> Vec<NoteEmbeddingPolicySpec> {
+        self.packs
+            .iter()
+            .flat_map(|pack| pack.note_embedding_policies().iter().copied())
             .collect()
     }
 

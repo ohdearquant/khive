@@ -112,7 +112,7 @@ A child process spawned in the same project scope resolves its actor identity fr
 
 ### send-single-txn: atomic dual-write coverage
 
-`dual_write_message` now commits both message copies (row + FTS + one vector row per registered embedding model) through `khive_runtime::create_notes_atomic` — ONE writer transaction for the pair instead of one writer acquisition per row/FTS/vector write. This test covers the multi-model vector fan-out count landing inside the single atomic unit.
+`dual_write_message` commits both message copies (row + FTS + one vector row in the configured default model for each copy) through `khive_runtime::create_notes_atomic` in one writer transaction. The policy regression also checks that an ordinary note still writes every configured model.
 
 ## Extended per-test notes
 
@@ -338,9 +338,9 @@ This is the "no bug" baseline the fix must not regress.
 
 This must now be a loud error, never a silent delivery into the sender's own inbox.
 
-### `send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts`
+### `send_uses_default_space_while_ordinary_note_uses_all_models`
 
-Two stub models are registered: the vector-row count for each model must be exactly 2 (outbound + inbound).
+Two models are configured with stub providers. Two distinct self-addressed sends create four message notes and two embedding calls: the shared text in each outbound/inbound pair is embedded once. Each message copy has one row in the default model and none in the second model. A generic observation note then adds one row and one embedding call in each model. A paired all/default/default/all diagnostic then times sends concurrent with ordinary note writes in the same process. Each arm asserts the second-space row count, and the test prints both elapsed totals under `--nocapture`; those times are diagnostic data, not a timing assertion.
 
 ### `update_refuses_to_forge_owner_established_properties_on_message_note`
 

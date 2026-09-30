@@ -260,6 +260,13 @@ struct CoreEmbedderState {
     additional_embedding_models: Vec<EmbeddingModel>,
 }
 
+#[derive(Clone)]
+struct NoteKindEntry {
+    name: String,
+    embedding_policy: crate::NoteEmbeddingPolicy,
+    registered: bool,
+}
+
 /// An already-open serving backend eligible for operator diagnostics.
 /// Aliases of the same canonical database file share one entry.
 #[derive(Clone)]
@@ -330,7 +337,7 @@ pub struct KhiveRuntime {
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
     /// `VerbRegistry` is built. Empty until installed
     edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
-    /// Pack-aggregated valid entity and note kind strings.
+    /// Pack-aggregated valid entity kinds and note-kind policy entries.
     ///
     /// Installed by the transport layer after building the `VerbRegistry`.
     /// When non-empty, `create_entity`, `create_note_inner`, and `import_kg`
@@ -338,7 +345,7 @@ pub struct KhiveRuntime {
     /// bare runtime in unit tests), kind validation is skipped — the pack
     /// handler layer is the primary enforcement point.
     valid_entity_kinds: Arc<RwLock<Vec<String>>>,
-    valid_note_kinds: Arc<RwLock<Vec<String>>>,
+    valid_note_kinds: Arc<RwLock<Vec<NoteKindEntry>>>,
     /// Pack-installed entity-type validator.
     ///
     /// When `Some`, `create_many` calls this function to validate and normalise
@@ -1863,7 +1870,64 @@ impl KhiveRuntime {
             *guard = entity_kinds;
         }
         if let Ok(mut guard) = self.valid_note_kinds.write() {
-            *guard = note_kinds;
+            let prior = std::mem::take(&mut *guard);
+            *guard = note_kinds
+                .into_iter()
+                .map(|name| NoteKindEntry {
+                    embedding_policy: prior
+                        .iter()
+                        .find(|entry| entry.name == name)
+                        .map(|entry| entry.embedding_policy)
+                        .unwrap_or_default(),
+                    name,
+                    registered: true,
+                })
+                .collect();
+        }
+    }
+
+    /// Install pack-declared embedding policy on the note-kind registry.
+    /// The transport calls this for every runtime after pack registration.
+    pub fn install_note_embedding_policies(&self, policies: &[crate::NoteEmbeddingPolicySpec]) {
+        if let Ok(mut guard) = self.valid_note_kinds.write() {
+            for spec in policies {
+                if let Some(entry) = guard.iter_mut().find(|entry| entry.name == spec.kind) {
+                    entry.embedding_policy = spec.policy;
+                } else {
+                    guard.push(NoteKindEntry {
+                        name: spec.kind.to_owned(),
+                        embedding_policy: spec.policy,
+                        registered: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Registered models selected by the installed embedding policy for a note kind.
+    /// Unknown kinds retain the all-models default.
+    pub fn embedding_models_for_note_kind(&self, kind: &str) -> Vec<String> {
+        let policy = self
+            .valid_note_kinds
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .iter()
+                    .find(|entry| entry.name == kind)
+                    .map(|entry| entry.embedding_policy)
+            })
+            .unwrap_or_default();
+        let models = self.registered_embedding_model_names();
+        match policy {
+            crate::NoteEmbeddingPolicy::AllModels => models,
+            crate::NoteEmbeddingPolicy::DefaultModel => {
+                let default = self.default_embedder_name();
+                models
+                    .into_iter()
+                    .filter(|name| name.as_str() == default)
+                    .collect()
+            }
         }
     }
 
@@ -1918,15 +1982,24 @@ impl KhiveRuntime {
         let guard = self.valid_note_kinds.read().map_err(|_| {
             crate::RuntimeError::Internal("note kind registry lock poisoned".into())
         })?;
-        if guard.is_empty() {
+        if !guard.iter().any(|entry| entry.registered) {
             return Ok(());
         }
-        if guard.iter().any(|k| k == kind) {
+        if guard
+            .iter()
+            .any(|entry| entry.registered && entry.name == kind)
+        {
             Ok(())
         } else {
+            let valid = guard
+                .iter()
+                .filter(|entry| entry.registered)
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             Err(crate::RuntimeError::InvalidInput(format!(
                 "unknown note kind {kind:?}; valid: {}",
-                guard.join(", ")
+                valid
             )))
         }
     }
