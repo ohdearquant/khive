@@ -328,6 +328,14 @@ instead of looping unboundedly. On the terminal round, the last loaded candidate
 floored at the last observed minimum — coherent, at the cost of the `(s_loaded, m]` window
 not being provably retained in the log.
 
+The preflight reads only the delta HEAD, not the chunk chain it names, so a valid HEAD can
+promise a watermark the segment load then refuses to deliver (a missing or corrupt chunk).
+Any load failure inside `fresh_tail_reresolve` therefore takes the file-backed mismatch
+fallback above — the caller's candidates plus the tail above the registry minimum, read in
+one new snapshot and never below the minimum the preflight observed — rather than skipping,
+which would serve the stale candidates with no tail at all. A SQL failure while assembling
+that fallback drops the stale candidates with a disclosed `Replace`.
+
 ### Outcome disclosure contract
 
 `FreshTailOutcome` has three variants, and `outcome_into_candidates` is the single mapping

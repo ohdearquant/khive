@@ -3232,7 +3232,7 @@ pub(crate) async fn fresh_tail_serving(
                 Some(new_s) => {
                     end_read_snapshot(reader.as_mut()).await;
                     drop(reader);
-                    fresh_tail_reresolve(rt, ann, key, model, search, new_s, consumer).await
+                    fresh_tail_reresolve(rt, ann, key, model, search, new_s, m, consumer).await
                 }
                 None => {
                     // Re-resolution isn't possible: floor at the
@@ -3386,7 +3386,9 @@ const FRESH_TAIL_RERESOLVE_MAX_ROUNDS: u32 = 3;
 /// stale-bridge candidates. Reloads on a further mismatch instead of
 /// immediately flooring, up to [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`]; see
 /// `docs/ann.md` for why that reload converges and why flooring immediately
-/// would silently drop committed writes.
+/// would silently drop committed writes. `floor` is the registry minimum the
+/// caller observed when it chose re-resolution.
+#[allow(clippy::too_many_arguments)]
 async fn fresh_tail_reresolve(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -3394,10 +3396,12 @@ async fn fresh_tail_reresolve(
     model: &str,
     search: FreshTailSearch<'_>,
     new_s: u64,
+    floor: u64,
     consumer: Option<&str>,
 ) -> FreshTailOutcome {
     let FreshTailSearch { query, k, route } = search;
     let mut expected_s = new_s;
+    let mut floor = floor;
     for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
         let Some(dir) = ann_segment_dir(rt, model) else {
             bump_generation(ann, key).await;
@@ -3408,12 +3412,14 @@ async fn fresh_tail_reresolve(
         let bridge = match AnnBridge::load(&dir) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
-                bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped(SkipReason::with_error(
-                    "fresh-tail: re-resolved segment load failed",
-                    e,
-                ));
+                // The caller chose re-resolution from the delta HEAD alone. A
+                // load that rejects the segment (a missing or corrupt chunk on
+                // the chain HEAD names included) cannot deliver the watermark
+                // HEAD promised, so re-resolution is impossible after all:
+                // floor exactly as a mismatch with no newer segment does,
+                // instead of skipping and serving the stale candidates.
+                tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; flooring at the registry minimum");
+                return fresh_tail_floored_fallback(rt, ann, key, model, floor, consumer).await;
             }
         };
         let s_loaded = bridge.index.last_applied_seq().unwrap_or(expected_s);
@@ -3537,8 +3543,78 @@ async fn fresh_tail_reresolve(
         // Reload the currently published segment next round — by the
         // compaction invariant above it is now at or past `m`.
         expected_s = m;
+        floor = floor.max(m);
     }
     unreachable!("the loop always returns on or before its terminal round")
+}
+
+/// The mismatch fallback for a re-resolution that turned out to be
+/// impossible: the caller's candidates plus the tail above the registry
+/// minimum, read in one snapshot and never below `observed_floor`, exactly the
+/// pair `fresh_tail_serving` serves when no newer segment exists. A SQL
+/// failure here drops the stale candidates rather than serving them without
+/// any tail.
+async fn fresh_tail_floored_fallback(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    model: &str,
+    observed_floor: u64,
+    consumer: Option<&str>,
+) -> FreshTailOutcome {
+    // Force re-adoption so a future query gets a fresh bridge.
+    bump_generation(ann, key).await;
+    let mut reader = match rt.sql().reader().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: floored fallback reader open failed; dropping stale ANN candidates");
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: floored fallback reader open failed; dropped stale candidates"),
+            );
+        }
+    };
+    if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
+        tracing::warn!(error = %e, model, "fresh-tail: floored fallback snapshot begin failed; dropping stale ANN candidates");
+        return FreshTailOutcome::Replace(
+            Vec::new(),
+            Some("fresh-tail: floored fallback snapshot begin failed; dropped stale candidates"),
+        );
+    }
+    if let Some(consumer) = consumer {
+        let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+        if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
+            end_read_snapshot(reader.as_mut()).await;
+            return FreshTailOutcome::Skipped(SkipReason::bare(
+                "note-search ANN consumer is not active in floored fallback snapshot",
+            ));
+        }
+    }
+    let floor = match registry_min_watermark_on(reader.as_mut(), model).await {
+        Ok(v) => v
+            .and_then(|value| u64::try_from(value).ok())
+            .map_or(observed_floor, |m| m.max(observed_floor)),
+        Err(e) => {
+            end_read_snapshot(reader.as_mut()).await;
+            tracing::warn!(error = %e, model, "fresh-tail: floored fallback registry-min read failed; dropping stale ANN candidates");
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: floored fallback registry-min read failed; dropped stale candidates"),
+            );
+        }
+    };
+    let outcome = fetch_final_tail_on(reader.as_mut(), model, floor, None).await;
+    end_read_snapshot(reader.as_mut()).await;
+    match outcome {
+        Ok((ops, _)) => FreshTailOutcome::Ops(ops),
+        Err(e) => {
+            tracing::warn!(error = %e, model, "fresh-tail: floored fallback tail fetch failed; dropping stale ANN candidates");
+            FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: floored fallback tail fetch failed; dropped stale candidates"),
+            )
+        }
+    }
 }
 
 /// Tier 2 (§3): no serving index at all. A cheap, log-only existence probe
@@ -7399,6 +7475,150 @@ mod tests {
             current_generation(&ann, &key).await > generation_before,
             "re-resolution must still force re-adoption so a future query \
              installs this segment as the served bridge"
+        );
+    }
+
+    /// A delta HEAD can be valid while a chunk it names is gone. Its watermark
+    /// then promises a re-resolution the segment load cannot deliver, and the
+    /// leg must take the same floored fallback as a mismatch with no newer
+    /// segment, never a skip that serves the stale candidates unmerged.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_floors_when_a_valid_delta_head_names_a_missing_chunk() {
+        const MODEL: &str = "adr118-reresolve-broken-delta-chain-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("broken delta chain seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "broken delta chain note inside the published delta",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create delta note");
+
+        // A peer publishes a delta checkpoint over the persisted base, then
+        // raises the registry to the delta watermark and compacts through it,
+        // leaving this process's in-memory bridge pinned at `s1`.
+        let dir = ann_segment_dir(&rt, MODEL).expect("segment dir (file-backed test runtime)");
+        let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+        let (ops, delta_s) = fetch_final_tail(&rt, MODEL, s1, None)
+            .await
+            .expect("fetch tail for peer replay");
+        assert!(
+            delta_s > s1,
+            "sanity: the delta must cover a write above s1"
+        );
+        let raw_count = ops.len() as u64;
+        peer_bridge
+            .apply_final_ops(ops.clone(), delta_s)
+            .expect("apply peer replay");
+        peer_bridge.record_delta_batch(ops, delta_s, raw_count);
+        assert!(
+            !peer_bridge.needs_full_compaction(),
+            "sanity: the peer checkpoint must publish a delta, not a full segment"
+        );
+        let publication = delta::write(&dir, &peer_bridge).expect("publish peer delta");
+        raise_watermark(&rt, MODEL, delta_s)
+            .await
+            .expect("raise registry watermark to the delta watermark");
+        compact_log(&rt, MODEL).await.expect("compact log");
+        assert!(
+            AnnBridge::load(&dir).is_ok(),
+            "control: the intact chain must load before its chunk is removed"
+        );
+
+        std::fs::remove_file(dir.join(format!("memory_delta-{}.bin", publication.last_nonce)))
+            .expect("remove the chunk the delta HEAD names");
+        let base_seq = read_commit_info(&dir)
+            .expect("read base commit")
+            .and_then(|info| info.last_applied_seq)
+            .expect("base watermark");
+        assert_eq!(
+            effective_persisted_state(&dir, base_seq)
+                .expect("the delta HEAD alone is still valid")
+                .0,
+            delta_s,
+            "precondition: the HEAD still promises the delta watermark, so the \
+             mismatch preflight chooses re-resolution"
+        );
+        assert!(
+            AnnBridge::load(&dir).is_err(),
+            "precondition: the segment load must reject the broken chain"
+        );
+
+        // A write the log still retains above the registry minimum: the
+        // floored fallback serves it, a skip would silently drop it.
+        let after = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "broken delta chain note above the registry minimum",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note above the registry minimum");
+
+        let generation_before = current_generation(&ann, &key).await;
+        let query = fnv_to_vec("broken delta chain note above the registry minimum", DIMS);
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
+        let ops = match outcome {
+            FreshTailOutcome::Ops(ops) => ops,
+            FreshTailOutcome::Replace(candidates, reason) => panic!(
+                "a chain the load rejects cannot re-resolve, got Replace \
+                 {candidates:?} with reason {reason:?}"
+            ),
+            FreshTailOutcome::Skipped(reason) => panic!(
+                "a rejected delta chain must take the floored fallback, not skip \
+                 and serve the stale candidates unmerged: {reason}"
+            ),
+        };
+        assert!(
+            ops.iter().any(|(id, _)| *id == after.id),
+            "the floored fallback must merge the write above the registry \
+             minimum, got: {ops:?}"
+        );
+        assert!(
+            current_generation(&ann, &key).await > generation_before,
+            "the fallback must force re-adoption so a future query gets a \
+             fresh bridge"
         );
     }
 
