@@ -9,8 +9,9 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::Visit;
 use syn::{
-    Attribute, Block, Expr, ExprCall, ExprLit, ExprMethodCall, FnArg, ImplItemFn, ItemFn, ItemImpl,
-    ItemMod, ItemUse, Lit, Local, Macro, Pat, PatIdent, Stmt, UseTree,
+    Attribute, Block, Expr, ExprCall, ExprLit, ExprMethodCall, FnArg, ImplItemFn, ItemConst,
+    ItemEnum, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias,
+    ItemType, ItemUnion, ItemUse, Lit, Local, Macro, Pat, PatIdent, Stmt, UseTree,
 };
 
 use super::declaration::{
@@ -84,6 +85,14 @@ const NOTE_BUILDERS: &[&str] = &[
 // store-method detectors. Both statements insert a whole note properties
 // object, even when an ON CONFLICT clause does not replace an existing row.
 const NOTE_PROPERTY_SQL_CONSTANTS: &[&str] = &["NOTE_UPSERT_SQL", "NOTE_INSERT_IF_ABSENT_SQL"];
+
+// Evidence for a site that reaches a note SQL constant only if a name that the
+// census cannot classify is not a type. The census refuses it wherever it
+// occurs, instead of routing or dropping it.
+const UNRESOLVED_CONSTANT: &str = "UNRESOLVED note SQL constant";
+
+// Evidence prefix for a path that resolves to a note SQL constant.
+const SQL_CONSTANT_EVIDENCE: &str = "SQL constant ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DetectedClass {
@@ -266,12 +275,22 @@ enum Binding {
     /// name but never the leading segment of a path, which Rust resolves in
     /// the module namespace.
     Local,
-    /// An import that is neither a note SQL constant nor a scanned module.
-    /// Its name cannot tell a type from a function or constant, so it never
-    /// hides a module or crate of the same name at the head of a path: the
-    /// census may report a path that Rust resolves through the import, but
-    /// never drops one that reaches a note SQL constant.
+    /// An import whose item the census cannot see, such as one from a crate
+    /// outside the workspace. Its name cannot tell a type from a function or
+    /// constant. A type lives in the module namespace, so Rust resolves the
+    /// head of a path through it and never reaches a module or crate of the
+    /// same name, while a function or constant leaves that module or crate
+    /// visible. The strict census resolution therefore stops at it, and the
+    /// lenient one looks past it.
     Other,
+    /// A struct, enum, union, trait or type alias declared in a scanned
+    /// module. It lives in the module namespace, so it hides a child module
+    /// or crate of the same name at the head of a path: `Ty::NAME` is the
+    /// type's associated item, never an item of a module or crate `Ty`.
+    Type,
+    /// A function, constant or static declared in a scanned module. It lives
+    /// in the value namespace, so it never hides a module or crate.
+    Value,
     /// A note properties SQL constant, by its declared name.
     Constant(String),
     /// A scanned module, so a path through this name resolves inside it.
@@ -289,7 +308,8 @@ struct ModuleId {
 type ModuleBindings = BTreeMap<ModuleId, SqlBindings>;
 
 /// Name that a `use` tree records for a glob import. It is not an identifier,
-/// so it cannot collide with an imported name.
+/// so it cannot collide with an imported name. A scope binds it to `Other`
+/// while it holds a glob import that the census cannot open.
 const GLOB_IMPORT: &str = "*";
 
 fn use_tree_imports(
@@ -347,6 +367,7 @@ fn import_target(
     current_module: Option<&SqlBindings>,
     module_id: &ModuleId,
     modules: &ModuleBindings,
+    strict: bool,
 ) -> Option<Binding> {
     let (original, prefix) = path.split_last()?;
     if NOTE_PROPERTY_SQL_CONSTANTS.contains(&original.as_str()) {
@@ -371,7 +392,16 @@ fn import_target(
         _ => None,
     }
     .or_else(|| {
-        qualified_target(path, module_id, modules, &|first| {
+        qualified_target(
+            path,
+            module_id,
+            modules,
+            &|first| import_scope_binding(first, known, current_module),
+            strict,
+        )
+    })
+    .or_else(|| {
+        declared_target(path, module_id, modules, &|first| {
             import_scope_binding(first, known, current_module)
         })
     })
@@ -415,15 +445,20 @@ fn crate_root(name: &str, modules: &ModuleBindings) -> Option<ModuleId> {
 }
 
 /// The scanned module a path prefix names, or `None` when the prefix leaves
-/// the scanned sources. A leading plain name resolves as Rust resolves it:
-/// through an import in scope, then a child module, then a workspace crate.
-/// A name the scope binds to anything but a module keeps the lookup going.
-/// Each later segment follows a child module or a re-exported module alias.
+/// the scanned sources. A leading plain name resolves in Rust's order: an
+/// import in scope, then a child module, then a workspace crate. A type
+/// import hides a child module or crate of the same name, so it ends the
+/// lookup. The census cannot tell a type from a function or constant by the
+/// name of an import it cannot see, and a glob import it cannot open may bring
+/// a type of any name. A `strict` resolution ends the lookup at either, and a
+/// lenient one looks past them to the child module or crate. Each later
+/// segment follows a child module or a re-exported module alias.
 fn resolve_module(
     prefix: &[String],
     current: &ModuleId,
     modules: &ModuleBindings,
     in_scope: &dyn Fn(&str) -> Option<Binding>,
+    strict: bool,
 ) -> Option<ModuleId> {
     let Some((first, rest)) = prefix.split_first() else {
         return Some(current.clone());
@@ -447,13 +482,23 @@ fn resolve_module(
             parent.segments.truncate(keep);
             (parent, &prefix[depth..])
         }
-        name => (
-            match in_scope(name) {
-                Some(Binding::Module(module)) => module,
-                _ => child_module(current, name, modules).or_else(|| crate_root(name, modules))?,
-            },
-            rest,
-        ),
+        name => {
+            let bound = in_scope(name);
+            (
+                match bound {
+                    Some(Binding::Module(module)) => module,
+                    Some(Binding::Type) => return None,
+                    _ if strict
+                        && (bound == Some(Binding::Other) || in_scope(GLOB_IMPORT).is_some()) =>
+                    {
+                        return None;
+                    }
+                    _ => child_module(current, name, modules)
+                        .or_else(|| crate_root(name, modules))?,
+                },
+                rest,
+            )
+        }
     };
     for part in rest {
         if matches!(part.as_str(), "crate" | "self" | "super") {
@@ -472,9 +517,10 @@ fn qualified_target(
     current: &ModuleId,
     modules: &ModuleBindings,
     in_scope: &dyn Fn(&str) -> Option<Binding>,
+    strict: bool,
 ) -> Option<Binding> {
     let (name, prefix) = path.split_last()?;
-    let module = resolve_module(prefix, current, modules, in_scope)?;
+    let module = resolve_module(prefix, current, modules, in_scope, strict)?;
     resolved(modules.get(&module).and_then(|bindings| bindings.get(name)))
         .or_else(|| child_module(&module, name, modules).map(Binding::Module))
         // `use khive_db;` names the workspace crate itself.
@@ -487,15 +533,37 @@ fn qualified_target(
         })
 }
 
+/// The namespace of the item a path names when a scanned module declares it,
+/// as a type or as a value.
+fn declared_target(
+    path: &[String],
+    current: &ModuleId,
+    modules: &ModuleBindings,
+    in_scope: &dyn Fn(&str) -> Option<Binding>,
+) -> Option<Binding> {
+    let (name, prefix) = path.split_last()?;
+    // A head bound to an unclassified import still names the module whose
+    // declarations classify this import; the classification never routes.
+    let module = resolve_module(prefix, current, modules, in_scope, false)?;
+    modules
+        .get(&module)?
+        .get(name)
+        .filter(|binding| matches!(binding, Binding::Type | Binding::Value))
+        .cloned()
+}
+
 /// The names a glob import of `module` brings: its resolved imports, glob
-/// imports included, and its child modules.
+/// imports included, its types and its child modules. A declared value is not
+/// listed: it never hides a module, so a path resolves the same without it.
 fn glob_names(module: &ModuleId, modules: &ModuleBindings) -> Vec<(String, Binding)> {
     let mut names = modules
         .get(module)
         .into_iter()
         .flatten()
         .filter_map(|(name, binding)| {
-            resolved(Some(binding)).map(|binding| (name.clone(), binding))
+            resolved(Some(binding))
+                .or_else(|| (*binding == Binding::Type).then(|| binding.clone()))
+                .map(|binding| (name.clone(), binding))
         })
         .collect::<Vec<_>>();
     names.extend(
@@ -522,6 +590,7 @@ fn resolve_imports(
     current_module: Option<&SqlBindings>,
     module_id: &ModuleId,
     modules: &ModuleBindings,
+    strict: bool,
 ) -> SqlBindings {
     let mut bindings = imports
         .iter()
@@ -536,33 +605,60 @@ fn resolve_imports(
             }
             bindings.insert(
                 name.clone(),
-                import_target(path, &known, parents, current_module, module_id, modules)
-                    .unwrap_or(Binding::Other),
+                import_target(
+                    path,
+                    &known,
+                    parents,
+                    current_module,
+                    module_id,
+                    modules,
+                    strict,
+                )
+                .unwrap_or(Binding::Other),
             );
         }
         // Every explicit name is already bound, and explicit imports shadow
         // glob imports, so a glob only fills the names left unbound.
+        let mut opaque_glob = false;
         for (_, path) in imports.iter().filter(|(name, _)| name == GLOB_IMPORT) {
-            let Some(source) = resolve_module(path, module_id, modules, &|first| {
-                import_scope_binding(first, &known, current_module)
-            }) else {
+            // The marker for an opaque glob must not hide the module that a
+            // glob path names, or one opaque glob would make every glob opaque.
+            let Some(source) = resolve_module(
+                path,
+                module_id,
+                modules,
+                &|first| {
+                    (first != GLOB_IMPORT)
+                        .then(|| import_scope_binding(first, &known, current_module))
+                        .flatten()
+                },
+                strict,
+            ) else {
+                // A glob outside the scanned sources may bring a type of any
+                // name, which then hides a same-named module or crate.
+                opaque_glob = true;
                 continue;
             };
             for (name, binding) in glob_names(&source, modules) {
                 // A module's own child module is an item of that module, and
                 // an item shadows a glob import of the same name in the same
                 // namespace. A child module lives in the type namespace, so it
-                // shadows a glob-imported module but never a glob-imported
-                // constant, which a value position still reaches. A block's
+                // shadows a glob-imported module or type but never a
+                // glob-imported constant, which a value position still reaches. A block's
                 // glob import still shadows the enclosing module's items.
                 if current_module.is_none()
-                    && matches!(binding, Binding::Module(_))
+                    && matches!(binding, Binding::Module(_) | Binding::Type)
                     && child_module(module_id, &name, modules).is_some()
                 {
                     continue;
                 }
                 bindings.entry(name).or_insert(binding);
             }
+        }
+        if opaque_glob {
+            bindings.insert(GLOB_IMPORT.to_owned(), Binding::Other);
+        } else {
+            bindings.remove(GLOB_IMPORT);
         }
         if known == bindings {
             break;
@@ -577,12 +673,20 @@ fn use_bindings<'a>(
     current_module: Option<&SqlBindings>,
     module_id: &ModuleId,
     modules: &ModuleBindings,
+    strict: bool,
 ) -> SqlBindings {
     let mut imports = Vec::new();
     for item in uses {
         use_tree_imports(&item.tree, &mut Vec::new(), &mut imports);
     }
-    resolve_imports(&imports, parents, current_module, module_id, modules)
+    resolve_imports(
+        &imports,
+        parents,
+        current_module,
+        module_id,
+        modules,
+        strict,
+    )
 }
 
 #[derive(Default)]
@@ -616,6 +720,7 @@ struct SourceCollector<'modules> {
     parent_module_bindings: Vec<SqlBindings>,
     module_id: ModuleId,
     modules: &'modules ModuleBindings,
+    strict: bool,
 }
 
 impl<'modules> SourceCollector<'modules> {
@@ -703,8 +808,10 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                     None,
                     &child_module,
                     self.modules,
+                    self.strict,
                 )
             });
+        let module_bindings = with_declared_types(module_bindings, &child_module, self.modules);
         let outer_bindings = std::mem::replace(&mut self.bindings, vec![module_bindings]);
         let outer_module = std::mem::replace(&mut self.module_id, child_module);
         self.parent_module_bindings
@@ -764,7 +871,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
-        let block_bindings = use_bindings(
+        let mut block_bindings = use_bindings(
             block.stmts.iter().filter_map(|stmt| {
                 if let Stmt::Item(syn::Item::Use(item)) = stmt {
                     Some(item)
@@ -776,7 +883,15 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
             self.bindings.first(),
             &self.module_id,
             self.modules,
+            self.strict,
         );
+        for stmt in &block.stmts {
+            if let Stmt::Item(item) = stmt {
+                block_bindings.extend(
+                    declared_binding(item).filter(|(_, binding)| *binding == Binding::Type),
+                );
+            }
+        }
         self.bindings.push(block_bindings);
         syn::visit::visit_block(self, block);
         self.bindings.pop();
@@ -897,15 +1012,19 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                         .iter()
                         .map(|part| part.ident.to_string())
                         .collect::<Vec<_>>();
-                    qualified_target(&path, &self.module_id, self.modules, &|first| {
-                        self.scoped_binding(first)
-                    })
+                    qualified_target(
+                        &path,
+                        &self.module_id,
+                        self.modules,
+                        &|first| self.scoped_binding(first),
+                        self.strict,
+                    )
                 };
                 if let Some(Binding::Constant(constant)) = binding {
                     self.record(
                         Substrate::Note,
                         DetectedClass::WholeObject,
-                        format!("SQL constant {constant}"),
+                        format!("{SQL_CONSTANT_EVIDENCE}{constant}"),
                     );
                 }
             }
@@ -942,6 +1061,52 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 }
 
+/// The type that an item declares, or the value. A type lives in the module
+/// namespace, so it hides a module or crate of the same name at the head of a
+/// path, and a value never does.
+fn declared_binding(item: &syn::Item) -> Option<(String, Binding)> {
+    match item {
+        syn::Item::Struct(ItemStruct { ident, attrs, .. })
+        | syn::Item::Enum(ItemEnum { ident, attrs, .. })
+        | syn::Item::Union(ItemUnion { ident, attrs, .. })
+        | syn::Item::Trait(ItemTrait { ident, attrs, .. })
+        | syn::Item::TraitAlias(ItemTraitAlias { ident, attrs, .. })
+        | syn::Item::Type(ItemType { ident, attrs, .. })
+            if !test_only(attrs) =>
+        {
+            Some((ident.to_string(), Binding::Type))
+        }
+        syn::Item::Fn(ItemFn { sig, attrs, .. }) if !test_only(attrs) => {
+            Some((sig.ident.to_string(), Binding::Value))
+        }
+        syn::Item::Const(ItemConst { ident, attrs, .. })
+        | syn::Item::Static(ItemStatic { ident, attrs, .. })
+            if !test_only(attrs) =>
+        {
+            Some((ident.to_string(), Binding::Value))
+        }
+        _ => None,
+    }
+}
+
+/// The types that a module declares join the names in scope in its own
+/// source, so `Ty::NAME` in the module that declares `Ty` is the type's
+/// associated item.
+fn with_declared_types(
+    mut bindings: SqlBindings,
+    module_id: &ModuleId,
+    modules: &ModuleBindings,
+) -> SqlBindings {
+    for (name, binding) in modules.get(module_id).into_iter().flatten() {
+        if *binding == Binding::Type {
+            bindings
+                .entry(name.clone())
+                .or_insert_with(|| binding.clone());
+        }
+    }
+    bindings
+}
+
 fn module_parents(module_id: &ModuleId, modules: &ModuleBindings) -> Vec<SqlBindings> {
     (0..module_id.segments.len())
         .map(|depth| {
@@ -961,6 +1126,7 @@ fn scan_source(
     source: &str,
     module_id: ModuleId,
     modules: &ModuleBindings,
+    strict: bool,
 ) -> Result<Vec<Site>, syn::Error> {
     let file = syn::parse_file(source)?;
     let parents = module_parents(&module_id, modules);
@@ -973,7 +1139,9 @@ fn scan_source(
         None,
         &module_id,
         modules,
+        strict,
     );
+    let bindings = with_declared_types(bindings, &module_id, modules);
     let mut collector = SourceCollector {
         path: path.to_owned(),
         scope: Vec::new(),
@@ -983,6 +1151,7 @@ fn scan_source(
         parent_module_bindings: parents,
         module_id,
         modules,
+        strict,
     };
     collector.visit_file(&file);
     Ok(collector.sites.into_values().collect())
@@ -1268,6 +1437,8 @@ struct ModuleImportTraversal<'a> {
     parsed: &'a BTreeMap<String, syn::File>,
     paths: &'a BTreeSet<String>,
     imports: BTreeMap<ModuleId, Vec<(String, Vec<String>)>>,
+    /// The types and values each module declares, by name.
+    declared: BTreeMap<ModuleId, SqlBindings>,
     file_modules: BTreeMap<String, ModuleId>,
     visited: BTreeSet<(String, ModuleId)>,
 }
@@ -1290,9 +1461,12 @@ fn collect_module_imports(
         .entry(path.to_owned())
         .or_insert_with(|| module_id.clone());
     let module_imports = traversal.imports.entry(module_id.clone()).or_default();
+    let module_declared = traversal.declared.entry(module_id.clone()).or_default();
     for item in items {
         if let syn::Item::Use(item) = item {
             use_tree_imports(&item.tree, &mut Vec::new(), module_imports);
+        } else if let Some((name, binding)) = declared_binding(item) {
+            module_declared.insert(name, binding);
         }
     }
     let parsed = traversal.parsed;
@@ -1349,6 +1523,7 @@ fn index_module_bindings(
     sources: &[(String, String)],
     skipped: &BTreeSet<String>,
     roots: &BTreeSet<String>,
+    strict: bool,
 ) -> Result<(ModuleBindings, BTreeMap<String, ModuleId>), String> {
     let mut parsed = BTreeMap::new();
     for (path, source) in sources {
@@ -1365,6 +1540,7 @@ fn index_module_bindings(
         parsed: &parsed,
         paths: &paths,
         imports: BTreeMap::new(),
+        declared: BTreeMap::new(),
         file_modules: BTreeMap::new(),
         visited: BTreeSet::new(),
     };
@@ -1408,10 +1584,16 @@ fn index_module_bindings(
         let previous = modules.clone();
         for (module_id, module_imports) in &traversal.imports {
             let parents = module_parents(module_id, &previous);
-            modules.insert(
-                module_id.clone(),
-                resolve_imports(module_imports, &parents, None, module_id, &previous),
-            );
+            let mut bindings =
+                resolve_imports(module_imports, &parents, None, module_id, &previous, strict);
+            // An import shadows a declaration of the same name only across
+            // namespaces, so the import stays and the declaration fills in.
+            for (name, binding) in traversal.declared.get(module_id).into_iter().flatten() {
+                bindings
+                    .entry(name.clone())
+                    .or_insert_with(|| binding.clone());
+            }
+            modules.insert(module_id.clone(), bindings);
         }
         if modules == previous {
             break;
@@ -1422,23 +1604,60 @@ fn index_module_bindings(
 
 fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
     let (skipped, roots) = test_module_files(sources).map_err(|error| error.to_string())?;
-    let (modules, file_modules) = index_module_bindings(sources, &skipped, &roots)?;
-    let mut all = Vec::new();
-    for (path, source) in sources {
-        if skipped.contains(path) || path.contains("/tests/") || path.contains("/benches/") {
+    // The census resolves every path twice. The strict resolution stops at a
+    // name that it cannot classify as a module, and the lenient one looks past
+    // it. A path that only the lenient resolution takes to a note SQL constant
+    // would be a route if the name were a function and no route if it were a
+    // type, so the census refuses it instead of choosing.
+    let mut strict = BTreeMap::new();
+    let mut lenient = Vec::new();
+    for is_strict in [true, false] {
+        let (modules, file_modules) = index_module_bindings(sources, &skipped, &roots, is_strict)?;
+        for (path, source) in sources {
+            if skipped.contains(path) || path.contains("/tests/") || path.contains("/benches/") {
+                continue;
+            }
+            let module_id = file_modules
+                .get(path)
+                .cloned()
+                .expect("indexed production source");
+            let sites = scan_source(path, source, module_id, &modules, is_strict)
+                .map_err(|error| format!("{path}: {error}"))?;
+            if is_strict {
+                strict.extend(sites.into_iter().map(|site| (site.key.clone(), site)));
+            } else {
+                lenient.extend(sites);
+            }
+        }
+    }
+    for site in lenient {
+        let unproven = site
+            .evidence
+            .iter()
+            .filter_map(|evidence| evidence.strip_prefix(SQL_CONSTANT_EVIDENCE))
+            .filter(|constant| {
+                !strict.get(&site.key).is_some_and(|proven| {
+                    proven
+                        .evidence
+                        .contains(&format!("{SQL_CONSTANT_EVIDENCE}{constant}"))
+                })
+            })
+            .map(|constant| format!("{UNRESOLVED_CONSTANT} {constant}"))
+            .collect::<Vec<_>>();
+        if unproven.is_empty() {
             continue;
         }
-        let module_id = file_modules
-            .get(path)
-            .cloned()
-            .expect("indexed production source");
-        all.extend(
-            scan_source(path, source, module_id, &modules)
-                .map_err(|error| format!("{path}: {error}"))?,
-        );
+        strict
+            .entry(site.key.clone())
+            .or_insert_with(|| Site {
+                evidence: BTreeSet::new(),
+                ..site
+            })
+            .evidence
+            .extend(unproven);
     }
-    all.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(all)
+    // A map keyed by the site key is already in key order.
+    Ok(strict.into_values().collect())
 }
 
 fn check_inventory(
@@ -1460,6 +1679,16 @@ fn check_inventory(
     let mut seen = BTreeSet::new();
     for site in sites {
         seen.insert(site.key.as_str());
+        for evidence in site
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.starts_with(UNRESOLVED_CONSTANT))
+        {
+            failures.push(format!(
+                "{}: cannot tell whether this site reaches a note SQL constant ({evidence})",
+                site.key
+            ));
+        }
         let Some(row) = rows.get(site.key.as_str()) else {
             failures.push(format!("unmapped {}: {:?}", site.key, site.evidence));
             continue;
@@ -1956,7 +2185,8 @@ fn module_paths_to_reexported_note_sql_are_reported() {
     )];
     // (description, writer source, extra sample files)
     type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
-    let cases: [Case; 16] = [
+    let helper_fn = [("sample/src/helpers.rs", "pub fn dbx() {}")];
+    let cases: [Case; 14] = [
         (
             "renamed module import",
             "use crate::sql_alias as db;
@@ -2029,33 +2259,19 @@ fn module_paths_to_reexported_note_sql_are_reported() {
              fn write(conn: &Connection) { conn.prepare_cached(sql_alias::MERGE_SQL); }",
             &[],
         ),
+        // A function lives in the value namespace, so it never hides a crate.
         (
-            "workspace crate behind a function import of the same name",
-            "use std::cmp::max as dbx;
+            "workspace crate behind a scanned function of the same name",
+            "use crate::helpers::dbx;
              fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
-            &other_crate,
+            &[helper_fn[0], other_crate[0]],
         ),
         (
-            "import path through a function import of the same name",
-            "use std::cmp::max as dbx;
+            "import path through a scanned function of the same name",
+            "use crate::helpers::dbx;
              use dbx::MERGE_SQL as merge;
              fn write(conn: &Connection) { conn.prepare_cached(merge); }",
-            &other_crate,
-        ),
-        // The census cannot tell a type import from a value import by its
-        // name, so a type import under a crate's name still reports the crate.
-        (
-            "workspace crate behind a type import of the same name",
-            "use std::collections::HashMap as dbx;
-             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
-            &other_crate,
-        ),
-        (
-            "import path through a type import of the same name",
-            "use std::collections::HashMap as dbx;
-             use dbx::MERGE_SQL as merge;
-             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
-            &other_crate,
+            &[helper_fn[0], other_crate[0]],
         ),
     ];
     for (form, writer, extra) in cases {
@@ -2092,6 +2308,270 @@ fn module_paths_to_reexported_note_sql_are_reported() {
     assert!(relative[0]
         .evidence
         .contains("SQL constant NOTE_UPSERT_SQL"));
+}
+
+/// A writer module that reserves the note properties, with the given items and
+/// imports ahead of a function that prepares the given SQL expression.
+fn reserved_note_writer(items: &str, sql: &str) -> String {
+    format!(
+        "{items}
+         fn write(conn: &Connection) {{
+             reject_reserved_secret_gate_property(merged_props);
+             conn.prepare_cached({sql});
+         }}"
+    )
+}
+
+/// The workspace crate `Ty`, which re-exports the note upsert statement.
+const TY_CRATE: (&str, &str) = (
+    "Ty/src/lib.rs",
+    "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
+);
+
+// A type lives in the module namespace, so an imported type hides a same-named
+// child module or workspace crate at the head of a path: `Ty::NAME` is the
+// type's associated item, never an item of a crate `Ty`. The census resolves
+// that path through a type declared in a scanned module, so it names no route.
+// It cannot see what an import from outside the scanned sources is, so it
+// refuses a path that would reach a note SQL constant through a same-named
+// module or crate instead of routing or dropping it.
+#[test]
+fn an_import_that_is_not_a_module_never_routes_to_a_same_named_crate() {
+    let type_crate = [TY_CRATE, ("sample/src/types.rs", "pub struct Ty;")];
+    let route = RouteInventoryEntry {
+        site: "sample/src/writer.rs::write",
+        ..qualified_reexport_route()
+    };
+    let writer = reserved_note_writer;
+
+    // The imported type `Ty` is not a module. Rust resolves the path through
+    // the type, so the crate `Ty` is not reached and nothing is routed.
+    for (form, imports) in [
+        ("type import", "use crate::types::Ty;"),
+        ("glob import", "use crate::types::*;"),
+    ] {
+        let through_type = scan_sources(&module_path_sources(
+            &writer(imports, "Ty::MERGE_SQL"),
+            &type_crate,
+        ))
+        .unwrap();
+        assert!(
+            through_type.is_empty(),
+            "{form}: routed past the type: {through_type:?}"
+        );
+    }
+
+    // Positive controls: the crate itself, by import and by bare path, is
+    // still the crate, and the inventoried route passes.
+    for (form, imports) in [("crate import", "use Ty;"), ("bare crate path", "")] {
+        let through_crate = scan_sources(&module_path_sources(
+            &writer(imports, "Ty::MERGE_SQL"),
+            &type_crate,
+        ))
+        .unwrap();
+        assert_eq!(through_crate.len(), 1, "{form}: {through_crate:?}");
+        assert!(
+            through_crate[0]
+                .evidence
+                .contains("SQL constant NOTE_UPSERT_SQL"),
+            "{form}: {through_crate:?}"
+        );
+        assert!(
+            check_inventory(&through_crate, &[route], 0).is_ok(),
+            "{form}"
+        );
+    }
+
+    let other_crate = [(
+        "dbx/src/lib.rs",
+        "pub mod sub;
+         pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
+    )];
+    let other_crate_with_module = [
+        other_crate[0],
+        (
+            "dbx/src/sub.rs",
+            "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
+        ),
+    ];
+    let facade = [
+        other_crate[0],
+        other_crate_with_module[1],
+        (
+            "sample/src/facade.rs",
+            "use std::collections::HashMap as dbx;
+             pub use dbx::sub as db;",
+        ),
+    ];
+    // (description, writer source, extra files)
+    type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let cases: [Case; 8] = [
+        (
+            "type import under the crate's name",
+            "use std::collections::HashMap as dbx;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
+            "function import under the crate's name",
+            "use std::cmp::max as dbx;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
+            "import path through a type import",
+            "use std::collections::HashMap as dbx;
+             use dbx::MERGE_SQL as merge;
+             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
+            &other_crate,
+        ),
+        (
+            "import path through a function import",
+            "use std::cmp::max as dbx;
+             use dbx::MERGE_SQL as merge;
+             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
+            &other_crate,
+        ),
+        (
+            "module of the crate behind a type import",
+            "use std::collections::HashMap as dbx;
+             use dbx::sub as db;
+             fn write(conn: &Connection) { conn.prepare_cached(db::MERGE_SQL); }",
+            &other_crate_with_module,
+        ),
+        (
+            "module re-exported from a type import",
+            "fn write(conn: &Connection) { conn.prepare_cached(crate::facade::db::MERGE_SQL); }",
+            &facade,
+        ),
+        (
+            "glob import the census cannot open",
+            "use external::prelude::*;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
+            "block-level type import",
+            "fn write(conn: &Connection) {
+                 use std::collections::HashMap as dbx;
+                 conn.prepare_cached(dbx::MERGE_SQL);
+             }",
+            &other_crate,
+        ),
+    ];
+    for (form, writer, extra) in cases {
+        let sites = scan_sources(&module_path_sources(writer, extra)).unwrap();
+        assert_eq!(sites.len(), 1, "{form}: {sites:?}");
+        assert_eq!(sites[0].key, "sample/src/writer.rs::write", "{form}");
+        assert!(
+            !sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"),
+            "{form}: routed to the crate: {sites:?}"
+        );
+        assert!(
+            sites[0]
+                .evidence
+                .contains("UNRESOLVED note SQL constant NOTE_UPSERT_SQL"),
+            "{form}: {sites:?}"
+        );
+        // An inventoried row does not excuse it.
+        assert!(
+            check_inventory(&sites, &[route], 0)
+                .unwrap_err()
+                .contains("cannot tell whether this site reaches a note SQL constant"),
+            "{form}"
+        );
+    }
+
+    // A non-module import or an opaque glob refuses only a path that would
+    // reach a note SQL constant through a same-named module or crate.
+    for (form, writer) in [
+        (
+            "type import with no crate of that name",
+            "use std::collections::HashMap as other;
+             fn write(conn: &Connection) { conn.prepare_cached(other::MERGE_SQL); }",
+        ),
+        (
+            "opaque glob with no crate of that name",
+            "use external::prelude::*;
+             fn write(conn: &Connection) { conn.prepare_cached(other::MERGE_SQL); }",
+        ),
+    ] {
+        let sites = scan_sources(&module_path_sources(writer, &other_crate)).unwrap();
+        assert!(sites.is_empty(), "{form}: {sites:?}");
+    }
+}
+
+// A type with an associated constant named like a workspace crate's note SQL
+// constant: `Ty::MERGE_SQL` is the associated constant, whatever crate `Ty`
+// exists. The path must not become a route to the crate's constant, so the
+// inventory row that names the crate's route finds no site and stays an orphan.
+#[test]
+fn an_associated_constant_never_satisfies_an_inventory_row_for_a_crate_constant() {
+    let route = RouteInventoryEntry {
+        site: "sample/src/writer.rs::write",
+        ..qualified_reexport_route()
+    };
+    let associated = "pub struct Ty;
+         impl Ty { pub const MERGE_SQL: &str = \"SELECT 1\"; }";
+    let types_module = [TY_CRATE, ("sample/src/types.rs", associated)];
+    // (label, writer source, extra crate files)
+    type Case<'a> = (&'a str, String, &'a [(&'a str, &'a str)]);
+    let cases: [Case<'_>; 5] = [
+        (
+            "type declared in the writer module",
+            reserved_note_writer(associated, "Ty::MERGE_SQL"),
+            &[TY_CRATE],
+        ),
+        (
+            "type declared in an inline module",
+            reserved_note_writer(
+                &format!("mod types {{ {associated} }} use types::Ty;"),
+                "Ty::MERGE_SQL",
+            ),
+            &[TY_CRATE],
+        ),
+        (
+            "type imported from another module",
+            reserved_note_writer("use crate::types::Ty;", "Ty::MERGE_SQL"),
+            &types_module,
+        ),
+        (
+            "type imported by a glob",
+            reserved_note_writer("use crate::types::*;", "Ty::MERGE_SQL"),
+            &types_module,
+        ),
+        (
+            "type declared in the function body",
+            format!(
+                "fn write(conn: &Connection) {{
+                     reject_reserved_secret_gate_property(merged_props);
+                     {associated}
+                     conn.prepare_cached(Ty::MERGE_SQL);
+                 }}"
+            ),
+            &[TY_CRATE],
+        ),
+    ];
+    for (form, writer, extra) in cases {
+        let sites = scan_sources(&module_path_sources(&writer, extra)).unwrap();
+        assert!(sites.is_empty(), "{form}: {sites:?}");
+        let failure = check_inventory(&sites, &[route], 0).unwrap_err();
+        assert!(
+            failure.contains("orphan route curation.merge.note at sample/src/writer.rs::write"),
+            "{form}: {failure}"
+        );
+    }
+
+    // Control: with no type of that name the path is the crate's constant, and
+    // the same row is satisfied.
+    let sites = scan_sources(&module_path_sources(
+        &reserved_note_writer("", "Ty::MERGE_SQL"),
+        &[TY_CRATE],
+    ))
+    .unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"));
+    assert!(check_inventory(&sites, &[route], 0).is_ok());
 }
 
 // A module's own child module shadows a module of the same name that a glob
