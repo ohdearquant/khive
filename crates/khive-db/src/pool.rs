@@ -2533,6 +2533,10 @@ impl ConnectionPool {
         #[cfg(feature = "namespace-trigram-proto")]
         register_namespace_trigram(&conn)?;
         register_writer_clock(&conn)?;
+        // Expression indexes over these keys are maintained by every writer
+        // (the write-queue task and per-store standalone writers included), so
+        // each of them needs the same functions the pooled writer registers.
+        register_rfc3339_key(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
             .configure_wal_autocheckpoint(&conn)?;
@@ -3064,7 +3068,17 @@ pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec
     key
 }
 
-fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+/// The outbox deadline grammar is stricter than the general timestamp filter.
+/// This is shared by app-maintained stored keys, V44 backfill, and the read
+/// residual; no schema expression calls an application-defined function.
+pub(crate) fn strict_rfc3339_key(text: &str) -> Option<Vec<u8>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)))
+}
+
+/// Register timestamp-key functions for read filters on pooled connections.
+pub(crate) fn register_rfc3339_key(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     use rusqlite::types::ValueRef;
 
@@ -3100,9 +3114,7 @@ fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
                 ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
                 _ => None,
             };
-            let key = text
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)));
+            let key = text.and_then(strict_rfc3339_key);
             Ok(key)
         },
     )?;
@@ -4942,6 +4954,73 @@ mod tests {
             .expect("standalone rollback-journal writer open");
         assert_eq!(current_journal_mode(&standalone).unwrap(), "delete");
         assert_eq!(journal_size_limit_bytes(&standalone), sqlite_default);
+    }
+
+    #[test]
+    fn every_writer_capable_connection_maintains_rfc3339_expression_indexes() {
+        const INSERT: &str = "INSERT INTO deadlines(id, due) VALUES (?1, ?2)";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rfc3339_expression_index.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("file-backed pool open");
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE deadlines(id INTEGER PRIMARY KEY, due TEXT);
+                     CREATE INDEX idx_deadlines_strict \
+                         ON deadlines(ifnull(khive_rfc3339_strict_key(due), x''));
+                     CREATE INDEX idx_deadlines_relaxed \
+                         ON deadlines(khive_rfc3339_key(due));",
+                )
+                .expect("pooled writer registers both key functions");
+        }
+
+        // Control: a connection that did not go through the pool's
+        // initialization cannot maintain these indexes. This is the
+        // failure every unregistered writer used to hit.
+        let bare = Connection::open(&path).expect("bare connection");
+        let refused = bare
+            .execute(INSERT, rusqlite::params![1, "2026-01-01T00:00:00Z"])
+            .expect_err("an unregistered connection cannot maintain the index");
+        assert!(
+            refused.to_string().contains("unknown function"),
+            "unexpected refusal: {refused}"
+        );
+        drop(bare);
+
+        let tracked = pool.open_standalone_writer().expect("tracked standalone");
+        let untracked = pool
+            .open_standalone_writer_untracked()
+            .expect("untracked standalone");
+        for (id, conn) in [(2, &tracked), (3, &untracked)] {
+            conn.execute(INSERT, rusqlite::params![id, "2026-01-01T00:00:00Z"])
+                .unwrap_or_else(|error| panic!("standalone writer {id}: {error}"));
+        }
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute(INSERT, rusqlite::params![4, "2026-01-01T00:00:00Z"])
+                .expect("pooled writer");
+        }
+        let reader = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .expect("standalone reader");
+        let indexed: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM deadlines \
+                 WHERE ifnull(khive_rfc3339_strict_key(due), x'') <= khive_rfc3339_strict_key(?1)",
+                ["2026-06-01T00:00:00Z"],
+                |row| row.get(0),
+            )
+            .expect("standalone reader registers the key functions");
+        assert_eq!(indexed, 3);
     }
 
     #[test]
