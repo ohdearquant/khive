@@ -4267,6 +4267,7 @@ fn build_pack_runtime(
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
+        .with_diagnostic_observer_from(main_runtime)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
